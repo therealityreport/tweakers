@@ -1,0 +1,43 @@
+name: Stable Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: node scripts/verify-release.mjs
+      - run: npm run sync:tweaks -- --check
+      - run: npm run check:public-history
+      - run: npm test
+      - run: npm run build
+      - name: Verify generated files are committed
+        run: git diff --exit-code -- store/index.json packages/installer/assets/runtime
+      - name: Build release tarball + checksums
+        run: |
+          TARBALL="tweakers-${GITHUB_REF_NAME}.tar.gz"
+          git archive --format=tar.gz --prefix="tweakers-${GITHUB_REF_NAME}/" -o "$TARBALL" "$GITHUB_REF_NAME"
+          shasum -a 256 "$TARBALL" > SHA256SUMS
+          # OPTIONAL (documented, not required): if a signing key is configured, emit a detached
+          # signature, e.g. `minisign -Sm SHA256SUMS` or `cosign sign-blob`. CI does not require a
+          # signer to be present; the SHA256SUMS asset is the mandatory integrity anchor.
+      - name: Verify release assets exist
+        run: node scripts/verify-release.mjs --assets
+      - name: Publish stable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "Tweakers $GITHUB_REF_NAME" "tweakers-${GITHUB_REF_NAME}.tar.gz" SHA256SUMS

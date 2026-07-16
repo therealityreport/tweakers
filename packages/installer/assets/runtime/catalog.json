@@ -1,0 +1,329 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-10T00:00:00.000Z",
+  "entries": [
+    {
+      "id": "co.tweakers.account-switcher",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.account-switcher"
+      },
+      "manifest": {
+        "id": "co.tweakers.account-switcher",
+        "name": "Easy Account Switcher",
+        "version": "0.1.4",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Switch existing local Codex sessions from the account menu without duplicating credentials.",
+        "author": "The Reality Report",
+        "tags": [
+          "accounts",
+          "sessions",
+          "security"
+        ],
+        "scope": "both",
+        "permissions": [
+          "ipc",
+          "filesystem"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.appshots",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.appshots"
+      },
+      "manifest": {
+        "id": "co.tweakers.appshots",
+        "name": "AppShots",
+        "version": "0.1.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Capture the frontmost window and attach a PNG plus Accessibility context to the active composer.",
+        "author": {
+          "name": "Tweakers"
+        },
+        "homepage": "https://github.com/therealityreport/tweakers",
+        "tags": [
+          "capture",
+          "composer",
+          "shortcut"
+        ],
+        "scope": "both",
+        "main": "index.js",
+        "minRuntime": ">=1.1.0",
+        "permissions": [
+          "settings",
+          "ipc",
+          "screen-capture",
+          "accessibility",
+          "global-shortcut"
+        ]
+      },
+      "approvedAt": "2026-07-13T23:25:44.476Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.developer-tools",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.developer-tools"
+      },
+      "manifest": {
+        "id": "co.tweakers.developer-tools",
+        "name": "Developer Tools",
+        "version": "0.3.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Inspect Codex tools, models, runtime capabilities, and source evidence. Manage CLI feature flags in Config.",
+        "author": "The Reality Report",
+        "tags": [
+          "developer",
+          "tools",
+          "features",
+          "models"
+        ],
+        "scope": "both",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "ipc",
+          "settings",
+          "filesystem"
+        ]
+      },
+      "approvedAt": "2026-07-12T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.followup",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/followup"
+      },
+      "manifest": {
+        "id": "co.tweakers.followup",
+        "name": "Codex Follow-up",
+        "version": "0.2.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Context-aware next-step prompts for Codex conversations.",
+        "author": "The Reality Report",
+        "tags": [
+          "followups",
+          "productivity"
+        ],
+        "scope": "both",
+        "permissions": [
+          "settings",
+          "ipc"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.projects",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.projects"
+      },
+      "manifest": {
+        "id": "co.tweakers.projects",
+        "name": "Projects",
+        "version": "0.4.7",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Nested projects with connection references and per-project GitHub identities.",
+        "author": "The Reality Report",
+        "tags": [
+          "projects",
+          "connections",
+          "github"
+        ],
+        "scope": "both",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "ipc",
+          "settings",
+          "filesystem",
+          "network"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.shadcn-codex-ui",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.shadcn-codex-ui"
+      },
+      "manifest": {
+        "id": "co.tweakers.shadcn-codex-ui",
+        "name": "Shadcn Codex UI",
+        "version": "0.2.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Render supported rich assistant blocks in an owned, native-safe message section.",
+        "author": "The Reality Report",
+        "tags": [
+          "ui",
+          "messages",
+          "rich-blocks"
+        ],
+        "scope": "renderer",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "settings"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.thread-summary-profiles",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.thread-summary-profiles"
+      },
+      "manifest": {
+        "id": "co.tweakers.thread-summary-profiles",
+        "name": "Thread Summary Profiles",
+        "version": "0.2.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Show read-only connection profiles for the active thread project.",
+        "author": "The Reality Report",
+        "tags": [
+          "ui",
+          "profiles",
+          "projects",
+          "read-only"
+        ],
+        "scope": "renderer",
+        "permissions": [
+          "ipc"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.titlebar-controls",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/titlebar-controls"
+      },
+      "manifest": {
+        "id": "co.tweakers.titlebar-controls",
+        "name": "Titlebar Controls",
+        "version": "0.2.2",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Reversible native titlebar controls aligned with the customized interface.",
+        "author": "The Reality Report",
+        "tags": [
+          "ui",
+          "titlebar",
+          "macos"
+        ],
+        "scope": "renderer",
+        "permissions": []
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.ui-improvements",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/ui-improvements"
+      },
+      "manifest": {
+        "id": "co.tweakers.ui-improvements",
+        "name": "UI Improvements",
+        "version": "0.2.3",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Four independent interface improvements with reversible lifecycle cleanup.",
+        "author": "The Reality Report",
+        "tags": [
+          "ui",
+          "productivity"
+        ],
+        "scope": "renderer",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "settings"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.usage-limit-resets-tracker",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/usage-limit-resets-tracker"
+      },
+      "manifest": {
+        "id": "co.tweakers.usage-limit-resets-tracker",
+        "name": "Usage Limit Resets Tracker",
+        "version": "0.2.1",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Track observed usage-limit resets and clearly label observed versus estimated times.",
+        "author": "The Reality Report",
+        "tags": [
+          "usage",
+          "history",
+          "limits"
+        ],
+        "scope": "renderer",
+        "permissions": [
+          "settings"
+        ]
+      },
+      "approvedAt": "2026-07-10T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    },
+    {
+      "id": "co.tweakers.user-questions",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/user-questions"
+      },
+      "manifest": {
+        "id": "co.tweakers.user-questions",
+        "name": "User Questions",
+        "version": "0.4.8",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Native task-scoped questions shown one at a time, with conditional inline Other input and rounded-square multi-select controls.",
+        "author": "The Reality Report",
+        "tags": [
+          "questions",
+          "productivity",
+          "forms"
+        ],
+        "scope": "both",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "settings",
+          "filesystem"
+        ],
+        "mcp": {
+          "command": "node",
+          "args": [
+            "mcp-server.js"
+          ]
+        }
+      },
+      "approvedAt": "2026-07-12T00:00:00.000Z",
+      "approvedBy": "tweakers"
+    }
+  ]
+}

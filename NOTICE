@@ -1,0 +1,8 @@
+Tweakers includes software from Codex++ under the MIT License.
+Copyright (c) 2026 Bennett.
+
+The following planned imports are intentionally absent because their source
+repositories do not publish a license:
+
+- legacy Tweakers tweak sources
+- `therealityreport/codex-tweaks` mode-switcher

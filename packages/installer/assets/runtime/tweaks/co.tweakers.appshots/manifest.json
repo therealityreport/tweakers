@@ -1,0 +1,16 @@
+{
+  "id": "co.tweakers.appshots",
+  "name": "AppShots",
+  "version": "0.1.1",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Capture the frontmost window and attach a PNG plus Accessibility context to the active composer.",
+  "author": {
+    "name": "Tweakers"
+  },
+  "homepage": "https://github.com/therealityreport/tweakers",
+  "tags": ["capture", "composer", "shortcut"],
+  "scope": "both",
+  "main": "index.js",
+  "minRuntime": ">=1.1.0",
+  "permissions": ["settings", "ipc", "screen-capture", "accessibility", "global-shortcut"]
+}

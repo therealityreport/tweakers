@@ -1,0 +1,16 @@
+{
+  "id": "co.tweakers.user-questions",
+  "name": "User Questions",
+  "version": "0.4.8",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Native task-scoped questions shown one at a time, with conditional inline Other input and rounded-square multi-select controls.",
+  "author": "The Reality Report",
+  "tags": ["questions", "productivity", "forms"],
+  "scope": "both",
+  "permissions": ["settings", "filesystem"],
+  "minRuntime": ">=1.0.0",
+  "mcp": {
+    "command": "node",
+    "args": ["mcp-server.js"]
+  }
+}

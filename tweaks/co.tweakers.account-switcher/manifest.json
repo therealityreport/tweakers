@@ -1,0 +1,18 @@
+{
+  "id": "co.tweakers.account-switcher",
+  "name": "Easy Account Switcher",
+  "version": "0.1.4",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Switch existing local Codex sessions from the account menu without duplicating credentials.",
+  "author": "The Reality Report",
+  "tags": [
+    "accounts",
+    "sessions",
+    "security"
+  ],
+  "scope": "both",
+  "permissions": [
+    "ipc",
+    "filesystem"
+  ]
+}

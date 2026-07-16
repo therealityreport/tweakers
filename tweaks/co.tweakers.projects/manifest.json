@@ -1,0 +1,12 @@
+{
+  "id": "co.tweakers.projects",
+  "name": "Projects",
+  "version": "0.4.7",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Nested projects with connection references and per-project GitHub identities.",
+  "author": "The Reality Report",
+  "tags": ["projects", "connections", "github"],
+  "scope": "both",
+  "permissions": ["ipc", "settings", "filesystem", "network"],
+  "minRuntime": ">=1.0.0"
+}

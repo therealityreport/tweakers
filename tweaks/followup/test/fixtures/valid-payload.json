@@ -1,0 +1,11 @@
+{
+  "codex_follow_up": true,
+  "title": "Follow-up",
+  "items": [
+    { "prompt": "Improve the current behavior", "achieves": ["The next change is clear"] },
+    { "prompt": "Make the workflow easier to use", "achieves": ["Fewer manual steps"] },
+    { "prompt": "Keep the saved settings consistent", "achieves": ["Existing choices remain intact"] },
+    { "prompt": "Refine the visible wording", "achieves": ["The result is easier to understand"] },
+    { "prompt": "Harden the recovery path", "achieves": ["Failures remain actionable"] }
+  ]
+}
