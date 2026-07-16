@@ -1,0 +1,35 @@
+import type { ChildProcess, SpawnOptions } from "node:child_process";
+declare const INSTALL_MARKER: unique symbol;
+/**
+ * The native browser peer authorizer validates three generations of process
+ * ancestry. A locally re-signed desktop app therefore cannot be the direct
+ * grandparent of the signed Codex browser processes. This tiny signed-Node
+ * parent keeps the desktop app outside that three-process window without
+ * changing the native host or its authorization policy.
+ */
+export declare const CODEX_APP_SERVER_PARENT_SOURCE: string;
+export type SpawnFunction = (command: string, args?: readonly string[] | SpawnOptions, options?: SpawnOptions) => ChildProcess;
+export interface MutableChildProcessModule {
+    spawn: SpawnFunction;
+    [INSTALL_MARKER]?: InstalledParent;
+}
+interface InstalledParent {
+    originalSpawn: SpawnFunction;
+    wrappedSpawn: SpawnFunction;
+}
+export interface CodexAppServerParentInstallOptions {
+    childProcess?: MutableChildProcessModule;
+    resourcesPath?: string;
+    platform?: NodeJS.Platform;
+    pathExists?: (path: string) => boolean;
+}
+export interface CodexAppServerParentInstallResult {
+    installed: boolean;
+    bundledNodePath: string | null;
+    reason: "installed" | "already-installed" | "unsupported-platform" | "missing-bundled-node";
+    uninstall(): void;
+}
+export declare function isCodexAppServerSpawn(command: unknown, args: unknown, options?: SpawnOptions): command is string;
+export declare function buildCodexAppServerParentArgs(command: string, args: readonly string[]): string[];
+export declare function installCodexAppServerParent(options?: CodexAppServerParentInstallOptions): CodexAppServerParentInstallResult;
+export {};

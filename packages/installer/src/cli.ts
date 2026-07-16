@@ -1,0 +1,317 @@
+#!/usr/bin/env node
+import sade from "sade";
+import kleur from "kleur";
+import { install } from "./commands/install.js";
+import { uninstall } from "./commands/uninstall.js";
+import { repair } from "./commands/repair.js";
+import { updateCodex } from "./commands/update-codex.js";
+import { selfUpdate } from "./commands/self-update.js";
+import { status } from "./commands/status.js";
+import { debug } from "./commands/debug.js";
+import { browserUi } from "./commands/browser-ui.js";
+import { doctor } from "./commands/doctor.js";
+import { safeMode } from "./commands/safe-mode.js";
+import { migrate } from "./commands/migrate.js";
+import { CODEX_PLUSPLUS_VERSION } from "./version.js";
+import { buildCliFailureIssueUrl, showPatchFailedAlert } from "./alerts.js";
+import { capKnownLogFiles } from "./logging.js";
+import { createTweakersVariant } from "./commands/create-variant.js";
+
+interface InstallCliOpts {
+  app?: string;
+  fuse?: boolean;
+  resign?: boolean;
+  local?: boolean;
+  localSigning?: boolean;
+  "local-signing"?: boolean;
+  watcher?: boolean;
+  verbose?: boolean;
+  candidateOnly?: boolean;
+  "candidate-only"?: boolean;
+  coordinatedRefresh?: boolean;
+  "coordinated-refresh"?: boolean;
+  adHoc?: boolean;
+  "ad-hoc"?: boolean;
+}
+
+interface RepairCliOpts {
+  app?: string;
+  quiet?: boolean;
+  force?: boolean;
+  local?: boolean;
+  localSigning?: boolean;
+  "local-signing"?: boolean;
+  watcher?: boolean;
+}
+
+function wrap<T extends (...args: never[]) => unknown | Promise<unknown>>(fn: T): T {
+  return ((...args: Parameters<T>) => {
+    Promise.resolve()
+      .then(() => fn(...args))
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        const command = process.argv[2];
+        console.error("\n" + kleur.red().bold("✗ Tweakers failed"));
+        console.error(msg);
+        console.error("");
+        console.error(
+          kleur.yellow("If the message above does not explain how to fix it, please report this on GitHub:"),
+        );
+        console.error(buildCliFailureIssueUrl(command, msg));
+        maybeShowPatchFailedAlert(msg);
+        process.exit(1);
+      });
+  }) as unknown as T;
+}
+
+function runInstall(opts: InstallCliOpts): Promise<void> {
+  return install({
+    ...opts,
+    candidateOnly: opts.candidateOnly ?? opts["candidate-only"],
+    candidateOnlyReason: opts.coordinatedRefresh === true || opts["coordinated-refresh"] === true ? "coordinated-refresh" : "explicit",
+    localSigning: opts.adHoc === true || opts["ad-hoc"] === true ? false : resolveLocalSigning(opts),
+  });
+}
+
+function runRepair(opts: RepairCliOpts): Promise<void> {
+  return repair({
+    ...opts,
+    localSigning: resolveLocalSigning(opts),
+  });
+}
+
+function resolveLocalSigning(opts: {
+  local?: boolean;
+  localSigning?: boolean;
+  "local-signing"?: boolean;
+}): boolean | undefined {
+  if (opts.local === false || opts.localSigning === false || opts["local-signing"] === false) {
+    return false;
+  }
+  return opts.localSigning ?? opts["local-signing"] ?? opts.local;
+}
+
+async function runCreateTweak(target: string, opts: never): Promise<void> {
+  const { createTweak } = await import("./commands/create-tweak.js");
+  return createTweak(target, opts);
+}
+
+async function runValidateTweak(target?: string): Promise<void> {
+  const { validateTweak } = await import("./commands/validate-tweak.js");
+  return validateTweak(target);
+}
+
+async function runDevTweak(target: string | undefined, opts: never): Promise<void> {
+  const { devTweak } = await import("./commands/dev-tweak.js");
+  return devTweak(target, opts);
+}
+
+async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolean }): Promise<void> {
+  const { devSync } = await import("./commands/dev-sync.js");
+  return devSync(opts);
+}
+
+async function runRefreshLocal(opts: { source?: "smart" | "development" | "stable"; app?: string }): Promise<void> {
+  const { refreshLocal } = await import("./commands/refresh-local.js");
+  return refreshLocal(opts);
+}
+
+async function runMode(target: string, opts: { json?: boolean; yes?: boolean; app?: string }): Promise<void> {
+  const { mode } = await import("./commands/mode.js");
+  return mode(target, opts);
+}
+
+async function runRefreshStatus(): Promise<void> {
+  const { getLocalRefreshStatus } = await import("./commands/refresh-local.js");
+  const { ensureUserPaths } = await import("./paths.js");
+  console.log(JSON.stringify(getLocalRefreshStatus(ensureUserPaths().root)));
+}
+
+function maybeShowPatchFailedAlert(message: string): void {
+  const command = process.argv[2];
+  if (command !== "repair") return;
+  showPatchFailedAlert(message);
+}
+
+const prog = sade("tweakers")
+  .version(CODEX_PLUSPLUS_VERSION)
+  .describe("Tweak system for the Codex desktop app");
+
+capKnownLogFiles();
+
+prog
+  .command("install")
+  .describe("Patch Codex.app to load the tweak runtime")
+  .option("--app", "Path to Codex.app / install dir (auto-detected if omitted)")
+  .option("--fuse", "Flip Electron's embedded asar integrity fuse", true)
+  .option("--resign", "Code sign Codex.app on macOS", true)
+  .option("--local", "Use a stable local signing identity on macOS")
+  .option("--local-signing", "Alias for --local")
+  .option("--watcher", "Install the auto-repair watcher", true)
+  .option("--candidate-only", "Build and validate a disposable signed candidate without changing the live app")
+  .option("--coordinated-refresh", "Hold the candidate for the internal quit-and-promote refresh flow")
+  .option("--ad-hoc", "Use ad-hoc signing for an explicit candidate-only build; this candidate can never promote")
+  .option("--verbose", "Show low-level patching details")
+  .action(wrap(runInstall));
+
+prog
+  .command("create-variant")
+  .describe("Create an isolated Tweakers ChatGPT app while keeping the official app untouched")
+  .option("--source", "Verified official OpenAI-signed ChatGPT.app to copy")
+  .option("--app", "Target path (default: /Applications/Tweakers ChatGPT.app)")
+  .option("--user-root", "Isolated Tweakers state directory")
+  .option("--user-data", "Isolated Electron user-data directory")
+  .action(wrap(createTweakersVariant));
+
+prog
+  .command("uninstall")
+  .describe("Restore Codex.app from backup and remove the watcher")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--purge", "Delete tweaks, config, logs, backups, and Tweakers user data")
+  .action(wrap(uninstall));
+
+prog
+  .command("repair")
+  .describe("Re-apply the patch (use after a Sparkle auto-update)")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--quiet", "Suppress non-error output")
+  .option("--force", "Re-apply even if the patch appears intact")
+  .option("--local", "Use a stable local signing identity on macOS")
+  .option("--local-signing", "Alias for --local")
+  .option("--watcher", "Run from the auto-repair watcher")
+  .action(wrap(runRepair));
+
+prog
+  .command("update-chatgpt")
+  .describe("Restore signed Codex.app so the official ChatGPT updater can run, then reapply Tweakers after restart")
+  .option("--app", "Path to Codex.app / install dir")
+  .action(wrap(updateCodex));
+
+// Compatibility alias retained for existing codexplusplus installs.
+prog
+  .command("update-codex")
+  .describe("Alias for update-chatgpt")
+  .option("--app", "Path to Codex.app / install dir")
+  .action(wrap(updateCodex));
+
+prog
+  .command("update")
+  .describe("Update Tweakers from the latest GitHub release, rebuild, then repair the app patch")
+  .option("--repo", "GitHub repo to download (default: therealityreport/tweakers)")
+  .option("--ref", "Git ref to download (default: latest GitHub release)")
+  .option("--repair", "Run repair after updating", true)
+  .option("--quiet", "Suppress non-error output")
+  .option("--watcher", "Run in watcher mode and respect automatic refresh settings")
+  .option("--force", "Download and rebuild even if the selected release is already installed")
+  .action(wrap(selfUpdate));
+
+prog
+  .command("self-update")
+  .describe("Legacy alias for update")
+  .option("--repo", "GitHub repo to download (default: therealityreport/tweakers)")
+  .option("--ref", "Git ref to download (default: latest GitHub release)")
+  .option("--repair", "Run repair after updating", true)
+  .option("--quiet", "Suppress non-error output")
+  .option("--watcher", "Run in watcher mode and respect automatic refresh settings")
+  .option("--force", "Download and rebuild even if the selected release is already installed")
+  .action(wrap(selfUpdate));
+
+prog
+  .command("mode <target>")
+  .describe("Switch ChatGPT.app between the pristine official app (chatgpt) and the patched app (tweakers), or show mode status")
+  .option("--json", "Print machine-readable output (status only)")
+  .option("--yes", "Skip the confirmation prompt")
+  .option("--app", "Path to ChatGPT.app / install dir")
+  .action(wrap(runMode));
+
+prog
+  .command("status")
+  .describe("Show patch status, paths, version")
+  .action(status);
+
+prog
+  .command("doctor")
+  .describe("Diagnose common issues (signature, fuses, asar integrity, perms)")
+  .action(doctor);
+
+prog
+  .command("debug")
+  .describe("Show install, runtime, data paths, open state, and bridge status")
+  .option("--app", "Path to Codex.app / install dir")
+  .action(wrap(debug));
+
+prog
+  .command("browser")
+  .describe("Open the Codex UI in a browser tab backed by a hidden host")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--port", "Local browser UI port", 8765)
+  .option("--open", "Open the browser tab after launch", true)
+  .option("--keep-window", "Leave the desktop window visible")
+  .action(wrap(browserUi));
+
+prog
+  .command("create-tweak <target>")
+  .describe("Scaffold a new local tweak")
+  .option("--id", "Manifest id, e.g. com.you.my-tweak")
+  .option("--name", "Human-readable tweak name")
+  .option("--repo", "GitHub repo in owner/repo form")
+  .option("--scope", "renderer, main, or both")
+  .option("--force", "Write into an existing empty directory")
+  .action(wrap(runCreateTweak));
+
+prog
+  .command("validate-tweak [target]")
+  .describe("Validate a tweak manifest and entry point")
+  .action(wrap(runValidateTweak));
+
+prog
+  .command("dev [target]")
+  .describe("Link a local tweak into the Tweakers tweaks directory")
+  .option("--name", "Override linked directory name; defaults to manifest id")
+  .option("--replace", "Replace an existing symlink at the target tweak id")
+  .option("--no-watch", "Link once and exit instead of watching for changes")
+  .action(wrap(runDevTweak));
+
+prog
+  .command("dev-sync")
+  .describe("Validate, build, and publish the development checkout without changing Git state")
+  .option("--watch", "Watch the checkout and publish each successful validated build")
+  .option("--off", "Disable dev mode and restore the bundled tweak copies")
+  .option("--quiet", "Suppress output")
+  .action(wrap(runDevSync));
+
+prog
+  .command("refresh-local")
+  .describe("Validate, quit, refresh, and reopen the local ChatGPT app")
+  .option("--source", "Refresh source: smart, development, or stable", "smart")
+  .option("--app", "Path to ChatGPT.app / install dir")
+  .action(wrap(runRefreshLocal));
+
+prog.command("refresh-status").describe("Print local ChatGPT refresh status as JSON").action(wrap(runRefreshStatus));
+
+prog.command("tweaks").describe("List and manage installed tweaks").action(() => console.log("Tweaks are stored in the user data directory."));
+prog.command("migrate")
+  .describe("Dry-run or apply the legacy Projects/GitHub Accounts migration")
+  .option("--dry-run", "Inventory and report exact actions without writing")
+  .option("--apply", "Apply the reported migration; legacy roots remain unchanged")
+  .option("--legacy-root", "Explicit legacy root (otherwise known roots are detected)")
+  .option("--target-root", "Tweakers user root (defaults to the active user root)")
+  .action(wrap(migrate));
+prog.command("watcher-run").describe("Run one internal watcher cycle").action(wrap(() => repair({ watcher: true, quiet: true })));
+
+prog
+  .command("safe-mode")
+  .describe("Temporarily disable all tweaks without deleting them. Leave safe mode with: tweakers safe-mode --off")
+  .option("--on", "Enable safe mode (default)")
+  .option("--off", "Disable safe mode and return to normal tweak loading")
+  .option("--status", "Print current safe mode status")
+  .action(wrap(safeMode));
+
+const argv = process.argv.length <= 2 ? [...process.argv, "--help"] : process.argv;
+
+prog.parse(argv, {
+  unknown: (flag) => {
+    console.error(kleur.red(`Unknown flag: ${flag}`));
+    process.exit(1);
+  },
+});

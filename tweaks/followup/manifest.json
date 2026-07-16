@@ -1,0 +1,11 @@
+{
+  "id": "co.tweakers.followup",
+  "name": "Codex Follow-up",
+  "version": "0.2.1",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Context-aware next-step prompts for Codex conversations.",
+  "author": "The Reality Report",
+  "tags": ["followups", "productivity"],
+  "scope": "both",
+  "permissions": ["settings", "ipc"]
+}

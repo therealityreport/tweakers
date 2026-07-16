@@ -1,0 +1,11 @@
+{
+  "id": "co.tweakers.thread-summary-profiles",
+  "name": "Thread Summary Profiles",
+  "version": "0.2.1",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Show read-only connection profiles for the active thread project.",
+  "author": "The Reality Report",
+  "tags": ["ui", "profiles", "projects", "read-only"],
+  "scope": "renderer",
+  "permissions": ["ipc"]
+}

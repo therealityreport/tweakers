@@ -1,0 +1,5 @@
+[
+  { "prompt": "Keep this", "achieves": ["First"] },
+  { "prompt": "Keep this", "achieves": ["Duplicate"] },
+  { "prompt": "Then this", "achieves": ["Second"] }
+]

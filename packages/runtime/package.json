@@ -1,0 +1,21 @@
+{
+  "name": "@therealityreport/tweakers-runtime",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "dist/main.js",
+  "description": "In-app runtime: discovers tweaks, injects settings UI, hot-reloads.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ./scripts/bundle-renderer.mjs && node ./scripts/copy-native-host.mjs"
+  },
+  "dependencies": {
+    "@therealityreport/tweakers-sdk": "*",
+    "chokidar": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "electron": "^41.3.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT"
+}

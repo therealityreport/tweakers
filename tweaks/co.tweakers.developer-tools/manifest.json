@@ -1,0 +1,12 @@
+{
+  "id": "co.tweakers.developer-tools",
+  "name": "Developer Tools",
+  "version": "0.3.1",
+  "githubRepo": "therealityreport/tweakers",
+  "description": "Inspect Codex tools, models, runtime capabilities, and source evidence. Manage CLI feature flags in Config.",
+  "author": "The Reality Report",
+  "tags": ["developer", "tools", "features", "models"],
+  "scope": "both",
+  "permissions": ["ipc", "settings", "filesystem"],
+  "minRuntime": ">=1.0.0"
+}

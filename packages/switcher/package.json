@@ -1,0 +1,11 @@
+{
+  "name": "@therealityreport/tweakers-switcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "macOS menu-bar mode switcher for the Tweakers app mode toggle",
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "license": "MIT"
+}

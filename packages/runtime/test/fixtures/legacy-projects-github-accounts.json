@@ -1,0 +1,36 @@
+{
+  "legacyProjects": {
+    "nodes": [
+      {
+        "id": "project-revi",
+        "name": "revi",
+        "projectPath": "/legacy/workspaces/revi"
+      }
+    ]
+  },
+  "legacyGithubAccounts": {
+    "accounts": [
+      {
+        "id": "github-main",
+        "label": "Main GitHub",
+        "login": "example-user"
+      }
+    ],
+    "assignments": {
+      "project-revi": "github-main"
+    }
+  },
+  "legacyRoots": [
+    "co.tweakers.projects",
+    "co.tweakers.github-accounts",
+    "co.tweakers.account-switcher",
+    "co.tweakers.shadcn-codex-ui",
+    "followup",
+    "mode-switcher",
+    "co.tweakers.thread-summary-profiles",
+    "titlebar-controls",
+    "ui-improvements",
+    "usage-limit-resets-tracker",
+    "co.example.unallowlisted-code"
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "name": "@therealityreport/tweakers",
+  "private": true,
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "Tweak system for the OpenAI Codex desktop app",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/therealityreport/tweakers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/therealityreport/tweakers/issues"
+  },
+  "homepage": "https://github.com/therealityreport/tweakers#readme",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
+    "lint": "eslint packages/*/src --ext .ts --no-error-on-unmatched-pattern",
+    "check:tweak-catalog": "node scripts/check-tweak-catalog.mjs store/index.json",
+    "sync:tweaks": "node scripts/sync-tweaks.mjs",
+    "check:public-history": "scripts/check-public-history.sh",
+    "clean": "rm -rf packages/*/dist packages/installer/assets/runtime",
+    "test": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && node --import tsx --test packages/*/test/*.test.ts && node --test scripts/*.test.mjs",
+    "typecheck": "tsc --noEmit -p packages/installer/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p packages/sdk/tsconfig.json",
+    "audit": "npm audit --workspaces --include-workspace-root",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/parser": "^8.64.0",
+    "eslint": "^10.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "tweakers": "bin/codexplusplus.js",
+    "codexplusplus": "bin/codexplusplus.js",
+    "codex-plusplus": "bin/codexplusplus.js"
+  },
+  "dependencies": {
+    "@electron/asar": "^3.4.0",
+    "kleur": "^4.1.5",
+    "plist": "^3.1.0",
+    "prompts": "^2.4.2",
+    "sade": "^1.8.1",
+    "tar": "^7.5.2"
+  }
+}
