@@ -28,7 +28,10 @@ jobs:
         run: |
           # The native host is compiled and ad-hoc signed with the runner's
           # Xcode SDK and Node headers, so its Mach-O bytes are environment-specific.
+          # The runtime fingerprint intentionally covers those exact bytes and
+          # therefore changes with the same runner-specific native artifact.
           git diff --exit-code -- \
             store/index.json \
             packages/installer/assets/runtime \
-            ':(exclude)packages/installer/assets/runtime/native/codexpp_native_host.node'
+            ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
+            ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json'

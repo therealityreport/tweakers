@@ -18,8 +18,8 @@ export { isDeveloperIdSignedBackup };
 import { readPlist } from "../plist.js";
 import { readState, writeState } from "../state.js";
 import { installWatcher, type WatcherKind } from "../watcher.js";
-import { CODEX_PLUSPLUS_VERSION } from "../version.js";
-import { formatCliShimResult, installCliShims } from "../cli-shim.js";
+import { TWEAKER_VERSION } from "../version.js";
+import { formatCliShimResult } from "../cli-shim.js";
 import { findSourceRoot } from "../source-root.js";
 import {
   CODEX_WINDOW_SERVICES_KEY,
@@ -31,6 +31,7 @@ import { chownForTargetUser, targetUserHome } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
+import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
 import {
@@ -41,14 +42,17 @@ import {
   readProductionHealthReceipt,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
+  type TransactionResult,
 } from "../transaction.js";
 import { migrateAutomatically } from "./migrate.js";
 import { readDevTweaksRoot } from "../config.js";
-import { ensureManagedRuntime } from "../managed-runtime.js";
+import { ensureManagedRuntime, reconcileManagedCliShims } from "../managed-runtime.js";
 import { reconcileDock, reconcileLaunchServices } from "../macos-app-identity.js";
 import { applyMacAppIdentity, type MacAppIdentity } from "../macos-variant.js";
 import { parkedPayloadRoot } from "../mode-transition.js";
-import { ensureSwitcherInstalled } from "../switcher-setup.js";
+import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
+import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
+import { migrateLegacyTweakNamespaces, prepareLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
 
 interface Opts {
   app?: string;
@@ -70,8 +74,10 @@ interface Opts {
   macAppIdentity?: MacAppIdentity;
   /** Internal only: patch/sign a disposable candidate without global side effects. */
   candidateContext?: { paths: UserPaths; finalUserRoot: string };
+  /** Internal only: repair already reconciles shims before its fast paths. */
+  reconcileCliShims?: boolean;
   /**
-   * Internal only: set by `tweakers mode tweakers` so the deliberate mode
+   * Internal only: set by `tweaker mode tweakers` so the deliberate mode
    * switch may patch the live app while state.mode is still "chatgpt".
    */
   modeTransition?: boolean;
@@ -80,6 +86,96 @@ interface Opts {
 const here = dirname(fileURLToPath(import.meta.url));
 const assetsDir = resolve(here, "..", "..", "assets");
 const sourceRoot = findSourceRoot(here);
+export const STAGED_NATIVE_HOST_RELATIVE_PATH = join(
+  "Contents",
+  "Resources",
+  "tweakers",
+  "native",
+  "tweaker_native_host.node",
+);
+
+export function stagedNativeHostPath(appRoot: string): string {
+  return join(appRoot, STAGED_NATIVE_HOST_RELATIVE_PATH);
+}
+
+/** Copy the native host into the app before the app's final inside-out sign. */
+export function stageNativeHostInsideApp(appRoot: string, runtimeRoot: string): string {
+  const source = join(runtimeRoot, "native", "tweaker_native_host.node");
+  if (!existsSync(source)) throw new Error(`Tweakers native host is missing from staged runtime at ${source}`);
+  const destination = stagedNativeHostPath(appRoot);
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(source, destination);
+  return destination;
+}
+
+export function verifyStagedNativeHostForApp(
+  appRoot: string,
+  deps: {
+    verify?: typeof verifySignature;
+    signature?: typeof signatureInfo;
+    designatedRequirement?: (path: string) => string;
+  } = {},
+): string {
+  const host = stagedNativeHostPath(appRoot);
+  if (!existsSync(host)) throw new Error(`Signed candidate is missing its staged native host at ${host}`);
+  verifyNativeHostMatchesApp(appRoot, host, deps);
+  return host;
+}
+
+export function verifyNativeHostMatchesApp(
+  appRoot: string,
+  host: string,
+  deps: {
+    verify?: typeof verifySignature;
+    signature?: typeof signatureInfo;
+    designatedRequirement?: (path: string) => string;
+  } = {},
+): void {
+  if (!existsSync(host)) throw new Error(`Native host is missing at ${host}`);
+  const verify = deps.verify ?? verifySignature;
+  const signature = deps.signature ?? signatureInfo;
+  const appStrict = verify(appRoot);
+  const hostStrict = verify(host);
+  if (!appStrict.ok) throw new Error(`Signed candidate failed strict verification: ${appStrict.output}`);
+  if (!hostStrict.ok) throw new Error(`Staged native host failed strict verification: ${hostStrict.output}`);
+  const appIdentity = signature(appRoot);
+  const hostIdentity = signature(host);
+  if (!appIdentity.ok || !hostIdentity.ok) throw new Error("Candidate or staged native-host signing identity is unreadable");
+  if (appIdentity.teamIdentifier !== hostIdentity.teamIdentifier) {
+    throw new Error(
+      `Staged native host Team ID does not match its containing candidate (${hostIdentity.teamIdentifier ?? "none"} != ${appIdentity.teamIdentifier ?? "none"})`,
+    );
+  }
+  if (appIdentity.teamIdentifier === null) {
+    const appAuthorities = appIdentity.authority.join("\n");
+    const hostAuthorities = hostIdentity.authority.join("\n");
+    if (appIdentity.adHoc !== hostIdentity.adHoc
+      || appAuthorities.length === 0
+      || appAuthorities !== hostAuthorities) {
+      throw new Error("Staged native host does not share the candidate's local signing identity");
+    }
+    const designatedRequirement = deps.designatedRequirement ?? readDesignatedRequirement;
+    const appLeaf = certificateLeafHash(designatedRequirement(appRoot));
+    const hostLeaf = certificateLeafHash(designatedRequirement(host));
+    if (appLeaf === null || hostLeaf === null || appLeaf !== hostLeaf) {
+      throw new Error("Staged native host does not share the candidate's exact local signing certificate");
+    }
+  }
+}
+
+function readDesignatedRequirement(path: string): string {
+  const result = spawnSync("/usr/bin/codesign", ["-dr", "-", path], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  if (result.status !== 0) throw new Error(`Could not read the designated requirement for ${path}`);
+  return output;
+}
+
+function certificateLeafHash(requirement: string): string | null {
+  return /certificate leaf = H"([a-f0-9]+)"/i.exec(requirement)?.[1]?.toLowerCase() ?? null;
+}
 
 export function spawnHiddenHealthProbe(
   executable: string,
@@ -107,11 +203,16 @@ export function spawnHiddenHealthProbe(
 
 export async function install(opts: Opts = {}): Promise<void> {
   if (opts.candidateContext) return installCandidateInPlace(opts);
+  const paths = ensureUserPaths();
+  return withLifecycleLock(lifecycleLockFile(paths.root), "install or repair promotion", () => installWithLifecycle(opts, paths));
+}
+
+async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void> {
+  assertLifecycleReceiptsIdle(paths.root);
   if (opts.localSigning === false && opts.candidateOnly !== true) {
     throw new Error("Ad-hoc signing is allowed only with explicit --candidate-only and can never be promoted.");
   }
 
-  const paths = ensureUserPaths();
   // Mutation-site mode guard: while ChatGPT mode is active the official app
   // stays pristine, so no caller (CLI, watcher repair, held promotion re-entry)
   // may patch it without the deliberate mode-switch flag. This is what closes
@@ -121,7 +222,7 @@ export async function install(opts: Opts = {}): Promise<void> {
     throw new Error(
       "Refusing to install while ChatGPT mode is active.\n" +
         "The app at the official path stays pristine in ChatGPT mode.\n" +
-        `Run ${kleur.cyan("tweakers mode tweakers")} to switch back to the patched app.`,
+        `Run ${kleur.cyan("tweaker mode tweakers")} to switch back to the patched app.`,
     );
   }
 
@@ -179,6 +280,7 @@ export async function install(opts: Opts = {}): Promise<void> {
   const adapters = filesystemTransactionAdapters({
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
+      resetCandidateUserRootForBuild(candidateUserRoot);
       await installCandidateInPlace({
         ...opts,
         app: candidateRoot,
@@ -306,6 +408,9 @@ export async function install(opts: Opts = {}): Promise<void> {
       return readProductionHealthReceipt(receiptFile, expected);
     },
     openApp: (appRoot) => {
+      // Promotion has committed and the visible app is still closed. Migrate
+      // persistent IDs before the new runtime's health probe can read config.
+      prepareLegacyTweakNamespaces(paths.root, paths.configFile);
       writeHealthRequest(join(paths.root, "health", "request.json"), {
         schemaVersion: 1,
         requestedAt: new Date().toISOString(),
@@ -339,7 +444,17 @@ export async function install(opts: Opts = {}): Promise<void> {
     signingMode,
   }, adapters);
 
+  if (shouldReconcileCliShims(result.status, candidateOnly, opts.reconcileCliShims)) {
+    const cliShims = reconcileManagedCliShims(sourceRoot, paths.root, paths.binDir);
+    if (!opts.quiet) console.log(formatCliStep(formatCliShimResult(cliShims)));
+  }
+
   if (result.status === "promoted") {
+    if (!reportsMainProcessRunning(getOpenReport(codex))) {
+      migrateLegacyTweakNamespaces(paths.root, paths.configFile);
+    } else if (!opts.quiet) {
+      console.warn(kleur.yellow("Legacy tweak data migration is deferred until Codex is closed."));
+    }
     // An older healthy transaction can predate full-app backup promotion. Its
     // validated candidate-user backup is still the authoritative repair source;
     // repair that continuity without touching or reopening the live app.
@@ -378,17 +493,18 @@ export async function install(opts: Opts = {}): Promise<void> {
     // A promoted live app is by definition in Tweakers mode, and any parked
     // ChatGPT-mode payload predates this promotion (now stale) — discard it.
     finalizePromotedModeState(paths.stateFile, paths.root);
-    // The menu-bar switcher rides along with every promotion (nonfatal): it is
-    // the only in-GUI way back to Tweakers mode after a switch to ChatGPT
-    // mode, but an app promotion must never fail over a menu-bar helper.
+    // Mode controls live in the existing Menu Bar app. Refresh its durable CLI
+    // coordinator metadata and retire the old second status item nonfatally.
     if (codex.platform === "darwin") {
       try {
-        const switcher = await ensureSwitcherInstalled();
-        if (!switcher.installed && !opts.quiet) {
-          console.warn(kleur.yellow(`Menu-bar switcher install skipped: ${switcher.reason ?? "unknown reason"}`));
+        const coordinator = await ensureModeCoordinatorConfigured();
+        if (!coordinator.configured && !opts.quiet) {
+          console.warn(kleur.yellow(`Menu Bar restart coordinator setup skipped: ${coordinator.reason ?? "unknown reason"}`));
         }
+        const standalone = await removeStandaloneSwitcher();
+        if (standalone.removed && !opts.quiet) console.log(kleur.dim("Retired the standalone Tweakers status item."));
       } catch (error) {
-        if (!opts.quiet) console.warn(kleur.yellow(`Menu-bar switcher install failed: ${errorMessage(error)}`));
+        if (!opts.quiet) console.warn(kleur.yellow(`Menu Bar coordinator migration failed: ${errorMessage(error)}`));
       }
     }
     try {
@@ -429,13 +545,13 @@ export async function install(opts: Opts = {}): Promise<void> {
         console.log(kleur.green().bold("✓ Candidate validated (candidate-only)."));
         console.log(`  The live app at ${kleur.cyan(liveAppRoot)} was not modified.`);
         console.log(`  Disposable candidate + backup live under ${kleur.cyan(paths.transactionRoot)}.`);
-        console.log(`  To go live: rerun ${kleur.cyan("tweakers install")} without --candidate-only.`);
+        console.log(`  To go live: rerun ${kleur.cyan("tweaker install")} without --candidate-only.`);
       }
       return;
     case "held":
       console.log(kleur.yellow().bold("• Candidate validated and held."));
       console.log(`  Codex is currently running, so the live app was not changed.`);
-      if (process.env.CODEX_PLUSPLUS_WATCHER === "1") {
+      if (process.env.TWEAKER_WATCHER === "1" || process.env[LEGACY_WATCHER_ENV] === "1") {
         return runHeldPromotion(
           {
             getReport: () => getOpenReport(locateCodex(liveAppRoot)),
@@ -460,7 +576,7 @@ export async function install(opts: Opts = {}): Promise<void> {
           { coordinatedQuit: opts.coordinatedQuit === true },
         );
       }
-      console.log(`  Quit Codex, then rerun ${kleur.cyan("tweakers install")} (or let the watcher promote it).`);
+      console.log(`  Quit Codex, then rerun ${kleur.cyan("tweaker install")} (or let the watcher promote it).`);
       return;
     case "rolled-back":
       throw new Error(
@@ -473,13 +589,95 @@ export async function install(opts: Opts = {}): Promise<void> {
       throw new Error(
         `A previous promotion left the install in a degraded state and auto-recovery is blocked.\n` +
           `Reason: ${result.state.failure ?? "unknown"}\n` +
-          `Quit Codex and run "tweakers repair --force", or restore from ${result.state.lastKnownGoodRoot}.`,
+          `Quit Codex and run "tweaker repair --force", or restore from ${result.state.lastKnownGoodRoot}.`,
       );
     case "invalidated":
       throw new Error(formatInvalidatedInstallError(liveAppRoot, result.state.failure, result.state.pendingReason));
     default:
       throw new Error(`Install finished in an unexpected state: ${(result as { status: string }).status}`);
   }
+}
+
+export interface BuildPatchedCandidateOnlyInput {
+  sourceApp: string;
+  destinationApp: string;
+  finalUserRoot: string;
+}
+
+/**
+ * Build and sign a Tweakers app payload entirely inside a disposable
+ * destination. This is the environment coordinator's production candidate
+ * builder: it never quits, opens, replaces, or mutates the source/live app.
+ */
+export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnlyInput): Promise<void> {
+  const sourceApp = resolve(input.sourceApp);
+  const destinationApp = resolve(input.destinationApp);
+  const finalUserRoot = resolve(input.finalUserRoot);
+  if (!isAbsolute(input.sourceApp) || sourceApp !== input.sourceApp) {
+    throw new Error("Patched candidate source must be an exact absolute path");
+  }
+  if (!isAbsolute(input.destinationApp) || destinationApp !== input.destinationApp) {
+    throw new Error("Patched candidate destination must be an exact absolute path");
+  }
+  if (!isAbsolute(input.finalUserRoot) || finalUserRoot !== input.finalUserRoot) {
+    throw new Error("Patched candidate user root must be an exact absolute path");
+  }
+  const sourceToDestination = relative(sourceApp, destinationApp);
+  const destinationToSource = relative(destinationApp, sourceApp);
+  const contains = (value: string): boolean => value === "" || (!value.startsWith("../") && value !== "..");
+  if (contains(sourceToDestination) || contains(destinationToSource)) {
+    throw new Error("Patched candidate source and destination must be disjoint paths");
+  }
+  const source = locateCodex(sourceApp);
+  if (source.platform !== "darwin") throw new Error("Environment candidates are supported only for macOS app bundles");
+  if (source.bundleId !== "com.openai.codex" && source.bundleId !== "com.openai.codex.beta") {
+    throw new Error("Patched candidate source has an unsupported app bundle identifier");
+  }
+  const sourceSignature = verifySignature(sourceApp);
+  const sourceIdentity = signatureInfo(sourceApp);
+  if (!sourceSignature.ok || sourceIdentity.teamIdentifier !== "2DC432GLL2") {
+    throw new Error("Patched candidate source is not a strict OpenAI Developer ID app");
+  }
+  if (readAsarMarker(source.asarPath) !== "absent") {
+    throw new Error("Patched candidate source must be pristine");
+  }
+
+  const candidateUserRoot = `${destinationApp}.tweakers-build-user`;
+  rmSync(destinationApp, { recursive: true, force: true });
+  rmSync(candidateUserRoot, { recursive: true, force: true });
+  try {
+    cloneAppTree(sourceApp, destinationApp);
+    await installCandidateInPlace({
+      app: destinationApp,
+      fuse: true,
+      resign: true,
+      localSigning: true,
+      watcher: false,
+      quiet: true,
+      candidateContext: {
+        paths: transactionUserPaths(candidateUserRoot),
+        finalUserRoot,
+      },
+    });
+    const candidate = locateCodex(destinationApp);
+    if (candidate.bundleId !== source.bundleId) throw new Error("Patched candidate changed the app bundle identifier");
+    if (readAsarMarker(candidate.asarPath) !== "present") throw new Error("Patched candidate marker is absent");
+    const candidateSignature = verifySignature(destinationApp);
+    if (!candidateSignature.ok) throw new Error(`Patched candidate signature is invalid: ${candidateSignature.output}`);
+  } catch (error) {
+    rmSync(destinationApp, { recursive: true, force: true });
+    throw error;
+  } finally {
+    rmSync(candidateUserRoot, { recursive: true, force: true });
+  }
+}
+
+export function shouldReconcileCliShims(
+  status: TransactionResult["status"],
+  candidateOnly: boolean,
+  enabled = true,
+): boolean {
+  return enabled && !candidateOnly && (status === "promoted" || status === "held");
 }
 
 async function installCandidateInPlace(opts: Opts): Promise<void> {
@@ -515,7 +713,6 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
 
   const paths = opts.candidateContext?.paths ?? ensureUserPaths();
   step.detail(`User dir: ${kleur.cyan(paths.root)}`);
-  if (!opts.candidateContext) step(formatCliStep(formatCliShimResult(installCliShims(paths.binDir))));
   const launcher = opts.candidateContext ? null : installWindowsManagedAppLauncher(codex);
   if (launcher) step(`Installed patched Tweakers launcher${launcher.shortcutPaths.length === 1 ? "" : "s"}: ${launcher.shortcutPaths.map((p) => kleur.cyan(p)).join(", ")}`);
 
@@ -530,7 +727,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   let appBackupSeededFromPreserved = false;
   if (pristineAppBackup) {
     appBackupRefreshed = backupUnpatchedApp(codex.appRoot, pristineAppBackup, {
-      hasPatchMarker: hasCodexPlusPlusAsarMarker(codex.asarPath),
+      hasPatchMarker: hasTweakerAsarMarker(codex.asarPath),
       step: step.detail,
     });
     appBackupRefreshedFromLiveApp = appBackupRefreshed;
@@ -578,6 +775,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
 
   // 2. Stage runtime + loader into the user dir.
   stageAssets(paths.runtime);
+  if (codex.platform === "darwin") stageNativeHostInsideApp(codex.appRoot, paths.runtime);
   step("Runtime staged");
 
   // 3. Patch app.asar entry point to require our loader.
@@ -640,6 +838,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     } else {
       step("Signing: ad-hoc");
     }
+    verifyStagedNativeHostForApp(codex.appRoot);
   }
 
   // 7. Auto-repair watcher.
@@ -655,7 +854,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
 
   // 8. Persist state.
   writeState(paths.stateFile, {
-    version: CODEX_PLUSPLUS_VERSION,
+    version: TWEAKER_VERSION,
     installedAt: new Date().toISOString(),
     appRoot: codex.appRoot,
     originalAsarHash,
@@ -680,7 +879,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
 
   if (!opts.quiet && !opts.candidateContext) {
     console.log();
-    console.log(kleur.green().bold("✓ tweakers installed."));
+    console.log(kleur.green().bold("✓ tweaker installed."));
     console.log(`  Tweaks: ${kleur.cyan(paths.tweaks)}`);
     console.log(`  Logs:   ${kleur.cyan(paths.logDir)}`);
     if (launcher) {
@@ -875,7 +1074,12 @@ export function replaceAppBundlePreservingIdentity(
     throw new Error("App bundle replacement requires source and destination Contents directories");
   }
 
-  const swap = adapters.swapDirectories ?? atomicSwapDirectories;
+  // The incoming swap path below is a bare copied Contents directory, not a
+  // signed app root. Resolve, verify, and load the native host from the actual
+  // signed source/destination payloads before creating that copy so identity
+  // provenance cannot be accidentally inferred from the live destination.
+  const swap = adapters.swapDirectories
+    ?? prepareAtomicSwapDirectories(sourceContents, destinationContents);
   const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   // A stable path makes cleanup debt recoverable: the next serialized
   // promotion removes any old payload left here before preparing its swap.
@@ -951,15 +1155,49 @@ function moveDirectoryAcrossVolumes(source: string, destination: string): void {
   }
 }
 
-let nativeAppIdentityHost: { swapDirectories(first: string, second: string): void } | null = null;
+type NativeAppIdentityHost = { swapDirectories(first: string, second: string): void };
 
-function atomicSwapDirectories(first: string, second: string): void {
+function prepareAtomicSwapDirectories(
+  sourceContents: string,
+  destinationContents: string,
+): (first: string, second: string) => void {
   if (process.platform !== "darwin") throw new Error("Atomic app bundle exchange is available only on macOS");
-  if (!nativeAppIdentityHost) {
-    const require = createRequire(import.meta.url);
-    nativeAppIdentityHost = require(join(assetsDir, "runtime", "native", "codexpp_native_host.node")) as typeof nativeAppIdentityHost;
+  const require = createRequire(import.meta.url);
+  const evidence = resolveStagedSwapNativeHostEvidence(sourceContents, destinationContents);
+  verifyNativeHostMatchesApp(evidence.containingAppRoot, evidence.hostPath);
+  const nativeHost = require(evidence.hostPath) as NativeAppIdentityHost;
+  return (first, second) => nativeHost.swapDirectories(first, second);
+}
+
+export interface StagedSwapNativeHostEvidence {
+  hostPath: string;
+  containingAppRoot: string;
+}
+
+/**
+ * Resolve a native host together with the signed app payload that contains it.
+ * Callers must pass real App.app/Contents paths, never the bare incoming swap
+ * copy, so host identity is checked against its actual signing container.
+ */
+export function resolveStagedSwapNativeHostEvidence(
+  firstContents: string,
+  secondContents: string,
+): StagedSwapNativeHostEvidence {
+  for (const contents of [firstContents, secondContents]) {
+    const hostPath = join(contents, "Resources", "tweakers", "native", "tweaker_native_host.node");
+    if (existsSync(hostPath)) {
+      return {
+        hostPath,
+        containingAppRoot: dirname(contents),
+      };
+    }
   }
-  nativeAppIdentityHost!.swapDirectories(first, second);
+  throw new Error("No signed staged native host exists in either app payload; refusing repo/runtime dlopen fallback");
+}
+
+/** Resolve only a native host that was staged inside a signed app payload. */
+export function resolveStagedSwapNativeHost(firstContents: string, secondContents: string): string {
+  return resolveStagedSwapNativeHostEvidence(firstContents, secondContents).hostPath;
 }
 
 function renameDirectory(source: string, destination: string): void {
@@ -968,6 +1206,16 @@ function renameDirectory(source: string, destination: string): void {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Candidate-user state is private build scratch space, not durable truth.
+ * Clear it before every new candidate build so a still-valid Developer-ID
+ * backup from an older desktop build cannot be promoted over the current
+ * preserved pristine backup.
+ */
+export function resetCandidateUserRootForBuild(candidateUserRoot: string): void {
+  rmSync(candidateUserRoot, { recursive: true, force: true });
 }
 
 export function readCodexVersion(metaPath: string | null): string | null {
@@ -1146,19 +1394,28 @@ export function finalizePromotedModeState(stateFile: string, userRoot: string): 
   rmSync(parkedPayloadRoot(userRoot), { recursive: true, force: true });
 }
 
-export function hasCodexPlusPlusAsarMarker(asarPath: string): boolean {
+export function hasTweakerAsarMarker(asarPath: string): boolean {
   return readAsarMarker(asarPath) === "present";
 }
 
 export type AsarMarker = "present" | "absent" | "unreadable";
+export type AsarPatchSchema = "current" | "legacy" | "absent" | "unreadable";
 
 export function readAsarMarker(asarPath: string): AsarMarker {
+  const schema = readAsarPatchSchema(asarPath);
+  return schema === "current" || schema === "legacy" ? "present" : schema;
+}
+
+export function readAsarPatchSchema(asarPath: string): AsarPatchSchema {
   try {
     const pkg = JSON.parse(readFileInAsar(asarPath, "package.json").toString("utf8")) as {
       main?: unknown;
-      __codexpp?: unknown;
+      __tweaker?: unknown;
+      [LEGACY_ASAR_META_KEY]?: unknown;
     };
-    return pkg.main === "codex-plusplus-loader.cjs" || typeof pkg.__codexpp === "object" ? "present" : "absent";
+    if (pkg.main === "tweaker-loader.cjs" || typeof pkg.__tweaker === "object") return "current";
+    if (pkg.main === LEGACY_LOADER_FILE || typeof pkg[LEGACY_ASAR_META_KEY] === "object") return "legacy";
+    return "absent";
   } catch {
     return "unreadable";
   }
@@ -1191,13 +1448,15 @@ async function injectLoader(
     if (!originalMain) throw new Error("app.asar package.json has no `main` field");
 
     // Preserve the original entry across repairs while refreshing isolated paths.
-    if (pkg["__codexpp"]) originalMain = String(pkg["__codexpp"].originalMain);
-    pkg["__codexpp"] = {
+    if (pkg["__tweaker"]) originalMain = String(pkg["__tweaker"].originalMain);
+    if (pkg[LEGACY_ASAR_META_KEY]) originalMain = String(pkg[LEGACY_ASAR_META_KEY].originalMain);
+    pkg["__tweaker"] = {
       originalMain,
       userRoot,
-      loader: "codex-plusplus-loader.cjs",
+      loader: "tweaker-loader.cjs",
       ...(appUserDataRoot ? { appUserDataRoot } : {}),
     };
+    delete pkg[LEGACY_ASAR_META_KEY];
     // The owl Electron fork resolves userData/singleton paths natively from
     // the asar's productName BEFORE any JS runs and ignores a later
     // app.setPath("userData"). A variant must therefore carry its own
@@ -1206,7 +1465,7 @@ async function injectLoader(
     if (appDisplayName) {
       pkg.productName = appDisplayName;
     }
-    pkg.main = "codex-plusplus-loader.cjs";
+    pkg.main = "tweaker-loader.cjs";
     writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
     // Copy our loader stub into the asar root.
@@ -1217,9 +1476,9 @@ async function injectLoader(
       if (!existsSync(devLoader)) {
         throw new Error(`loader.cjs not found at ${loaderSrc} or ${devLoader}`);
       }
-      cpSync(devLoader, join(dir, "codex-plusplus-loader.cjs"));
+      cpSync(devLoader, join(dir, "tweaker-loader.cjs"));
     } else {
-      cpSync(loaderSrc, join(dir, "codex-plusplus-loader.cjs"));
+      cpSync(loaderSrc, join(dir, "tweaker-loader.cjs"));
     }
 
     patchCodexWindowServices(dir, originalMain, step);
@@ -1420,7 +1679,10 @@ export function stageBundledTweaks(
     entries?: Array<{ id?: unknown; source?: { kind?: unknown; path?: unknown } }>;
   };
   const devRoot = opts.devTweaksRoot ?? null;
-  const devSnapshotFolders = readDevSnapshotFolders(join(tweaksDir, ".codexpp-dev-snapshot.json"));
+  const devSnapshotFolders = readDevSnapshotFolders(
+    join(tweaksDir, ".tweaker-dev-snapshot.json"),
+    join(tweaksDir, LEGACY_DEV_SNAPSHOT_FILE),
+  );
   const bundledFolders = new Set<string>();
   for (const entry of catalog.entries ?? []) {
     if (entry.source?.kind !== "bundled" || typeof entry.id !== "string" || !/^[a-zA-Z0-9._-]+$/.test(entry.id)) continue;
@@ -1494,9 +1756,10 @@ export function pruneRetiredTweaks(
   }
   // A dev-snapshot record naming a retired folder would make a later staging
   // pass keep whatever reappears at that path — scrub retired ids from it.
-  const snapshotFile = join(tweaksDir, ".codexpp-dev-snapshot.json");
-  try {
-    const parsed = JSON.parse(readFileSync(snapshotFile, "utf8")) as { folders?: unknown };
+  const snapshotFile = join(tweaksDir, ".tweaker-dev-snapshot.json");
+  const legacySnapshotFile = join(tweaksDir, LEGACY_DEV_SNAPSHOT_FILE);
+  for (const sourceFile of [snapshotFile, legacySnapshotFile]) try {
+    const parsed = JSON.parse(readFileSync(sourceFile, "utf8")) as { folders?: unknown };
     if (Array.isArray(parsed.folders)) {
       const kept = parsed.folders.filter(
         (value) => typeof value === "string" && !RETIRED_BUNDLED_TWEAKS.includes(value),
@@ -1508,18 +1771,21 @@ export function pruneRetiredTweaks(
   } catch {
     // No snapshot record (or unreadable) — nothing to scrub.
   }
+  if (existsSync(snapshotFile)) rmSync(legacySnapshotFile, { force: true });
 }
 
-function readDevSnapshotFolders(path: string): Set<string> {
-  try {
+function readDevSnapshotFolders(...paths: string[]): Set<string> {
+  const folders = new Set<string>();
+  for (const path of paths) try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as { folders?: unknown };
-    if (!Array.isArray(parsed.folders)) return new Set();
-    return new Set(parsed.folders.filter((value): value is string =>
-      typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value),
-    ));
+    if (!Array.isArray(parsed.folders)) continue;
+    for (const value of parsed.folders) {
+      if (typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value)) folders.add(value);
+    }
   } catch {
-    return new Set();
+    // Missing or unreadable compatibility manifest.
   }
+  return folders;
 }
 
 function isRealDevSnapshotDirectory(dest: string, folder: string, snapshotFolders: Set<string>): boolean {
@@ -1576,8 +1842,8 @@ export function preflightWritableTargets(
  * App Management TCC denials before we begin destructive work.
  */
 function preflightWritableDirectory(targetDir: string, platform: string): void {
-  const probe = join(targetDir, ".codexpp-write-probe");
-  const copyProbe = join(targetDir, ".codexpp-copy-probe");
+  const probe = join(targetDir, ".tweaker-write-probe");
+  const copyProbe = join(targetDir, ".tweaker-copy-probe");
   try {
     const fd = openSync(probe, "w");
     closeSync(fd);
@@ -1631,10 +1897,10 @@ function writableError(e: unknown, target: string, platform: string): unknown {
 function macAppManagementFix(target: string, code: string | undefined): string {
   const permissionSteps =
     `macOS App Management is blocking modification of ${target}.\n` +
-    `Run "tweakers repair" in your terminal.\n`;
+    `Run "tweaker repair" in your terminal.\n`;
   const sudoFallback =
     code === "EACCES"
-      ? `If Codex.app is root-owned and repair still cannot write to it, run "sudo tweakers repair".\n`
+      ? `If Codex.app is root-owned and repair still cannot write to it, run "sudo tweaker repair".\n`
       : "";
 
   return permissionSteps + sudoFallback;
@@ -1706,7 +1972,9 @@ function escapePowerShellSingleQuotedString(value: string): string {
 
 function installWindowsManagedAppLauncher(codex: CodexInstall): { shortcutPaths: string[] } | null {
   if (codex.platform !== "win32") return null;
-  if (!/\\codex-plusplus\\store-apps\\/i.test(`${codex.appRoot.replace(/\//g, "\\")}\\`)) {
+  const normalizedRoot = `${codex.appRoot.replace(/\//g, "\\")}\\`;
+  if (!/\\tweaker\\store-apps\\/i.test(normalizedRoot)
+    && !normalizedRoot.toLowerCase().includes(`\\${LEGACY_DATA_DIR}\\store-apps\\`)) {
     return null;
   }
 
@@ -1715,7 +1983,7 @@ function installWindowsManagedAppLauncher(codex: CodexInstall): { shortcutPaths:
 
   const shimDir = join(localAppData, "Microsoft", "WindowsApps");
   mkdirSync(shimDir, { recursive: true });
-  const commandPath = join(shimDir, "codex-plusplus-codex.cmd");
+  const commandPath = join(shimDir, "tweaker-codex.cmd");
   writeFileSync(
     commandPath,
     `@echo off\r\nstart "" "${codex.executable}" %*\r\n`,

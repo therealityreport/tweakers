@@ -1,5 +1,6 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { installCliShims, type CliShimOptions, type CliShimResult } from "./cli-shim.js";
 
 export function managedSourceRoot(userRoot: string): string {
   return join(userRoot, "managed-runtime", "current");
@@ -56,6 +57,23 @@ export function ensureManagedRuntime(sourceRoot: string, userRoot: string): stri
   return existsSync(managedCliPath(userRoot))
     ? managedSourceRoot(userRoot)
     : installManagedRuntime(sourceRoot, userRoot);
+}
+
+/**
+ * Restore the public CLI entrypoints against the durable managed runtime.
+ *
+ * This is intentionally separate from candidate staging: normal install and
+ * manual repair may call it even when no app promotion is required, while
+ * watcher and disposable-candidate flows must remain side-effect free.
+ */
+export function reconcileManagedCliShims(
+  sourceRoot: string,
+  userRoot: string,
+  shimDir: string,
+  options: CliShimOptions = {},
+): CliShimResult {
+  ensureManagedRuntime(sourceRoot, userRoot);
+  return installCliShims(shimDir, managedCliPath(userRoot), options);
 }
 
 export function hasReleaseProvenance(sourceRoot: string, ref: string): boolean {

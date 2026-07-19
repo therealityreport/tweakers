@@ -1,4 +1,4 @@
-export const CODEX_PLUSPLUS_VERSION = "1.0.0";
+export const TWEAKER_VERSION = "1.0.0";
 
 const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
 

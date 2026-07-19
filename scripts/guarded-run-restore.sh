@@ -33,7 +33,7 @@ if [ ! -f "$backup_dir/manifest.json" ]; then
 fi
 
 app_path=${GUARDED_RUN_APP_PATH:-/Applications/ChatGPT.app}
-state_root=${GUARDED_RUN_STATE_ROOT:-$home/Library/Application\ Support/codex-plusplus}
+state_root=${GUARDED_RUN_STATE_ROOT:-$home/Library/Application\ Support/tweaker}
 watcher_plist=${GUARDED_RUN_WATCHER_PLIST:-$home/Library/LaunchAgents/com.therealityreport.tweakers.watcher.plist}
 
 restore_failures=0

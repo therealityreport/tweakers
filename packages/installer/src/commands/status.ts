@@ -7,15 +7,16 @@ import { readHeaderHash } from "../asar.js";
 import { getIntegrity } from "../integrity.js";
 import { readFuses, FuseV1 } from "../fuses.js";
 import { existsSync, readFileSync } from "node:fs";
-import { hasCodexPlusPlusAsarMarker, readCodexVersion } from "./install.js";
+import { readAsarMarker, readCodexVersion } from "./install.js";
 import { describeUpdateMode, readUpdateMode } from "../update-mode.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
+import { readConfigFile } from "../config.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
   const state = readState(paths.stateFile);
 
-  console.log(kleur.bold("codex-plusplus status"));
+  console.log(kleur.bold("tweaker status"));
   console.log(`  user dir:     ${paths.root}`);
   console.log(`  tweaks dir:   ${paths.tweaks}`);
   console.log(`  log dir:      ${paths.logDir}`);
@@ -23,7 +24,7 @@ export async function status(): Promise<void> {
   console.log();
 
   if (!state) {
-    console.log(kleur.yellow("Not installed. Run `tweakers install`."));
+    console.log(kleur.yellow("Not installed. Run `tweaker install`."));
     return;
   }
 
@@ -63,9 +64,14 @@ export async function status(): Promise<void> {
   console.log(kleur.bold("integrity"));
   if (existsSync(codex.asarPath)) {
     const { headerHash } = readHeaderHash(codex.asarPath);
-    const markerPresent = hasCodexPlusPlusAsarMarker(codex.asarPath);
-    const mode = resolveMode(state, markerPresent);
-    console.log(`  mode:         ${mode}${state.mode ? "" : kleur.dim(" (inferred)")}`);
+    const marker = readAsarMarker(codex.asarPath);
+    const markerPresent = marker === "present";
+    const mode = marker === "present"
+      ? "tweakers"
+      : marker === "absent"
+        ? "chatgpt"
+        : resolveMode(state, false);
+    console.log(`  mode:         ${mode}${marker === "unreadable" ? kleur.dim(" (state fallback)") : kleur.dim(" (live)")}`);
     if (mode === "chatgpt") {
       const payloadMeta = readPayloadMetadata(payloadMetadataFile(paths.root));
       const parkedVersion = payloadMeta?.baseVersion
@@ -133,7 +139,7 @@ export function describeChatgptModeAsar(input: {
     (input.payloadPatchedAsarHash !== null && input.headerHash === input.payloadPatchedAsarHash);
   if (matchesPatched || input.markerPresent) {
     return {
-      label: "patched while ChatGPT mode is recorded — run `tweakers mode status`",
+      label: "patched while ChatGPT mode is recorded — run `tweaker mode status`",
       tone: "red",
     };
   }
@@ -144,13 +150,6 @@ export function describeChatgptModeAsar(input: {
 }
 
 function readSafeMode(configFile: string): boolean {
-  if (!existsSync(configFile)) return false;
-  try {
-    const config = JSON.parse(readFileSync(configFile, "utf8")) as {
-      codexPlusPlus?: { safeMode?: boolean };
-    };
-    return config.codexPlusPlus?.safeMode === true;
-  } catch {
-    return false;
-  }
+  const config = readConfigFile(configFile) as { tweaker?: { safeMode?: boolean } };
+  return config.tweaker?.safeMode === true;
 }

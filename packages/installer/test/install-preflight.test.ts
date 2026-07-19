@@ -8,6 +8,7 @@ import {
   prepareCodexForPatching,
   preflightWritableTargets,
   promoteVerifiedSignedBackup,
+  resetCandidateUserRootForBuild,
   restoreSignedBackupSnapshot,
   snapshotSignedBackup,
   shouldBackupUnpatchedApp,
@@ -60,7 +61,7 @@ test("install preflight checks Info.plist before patching", { skip: process.plat
         },
         /Cannot write to .*Info\.plist/,
       );
-      assert.match(String(error), /tweakers repair/);
+      assert.match(String(error), /tweaker repair/);
     } finally {
       chmodSync(metaPath, 0o644);
     }
@@ -152,6 +153,24 @@ test("install refreshes full app backup only for unpatched apps", () => {
     }),
     false,
   );
+});
+
+test("each candidate build discards stale candidate-user backup state before seeding the current pristine app", () => {
+  withTempDir((root) => {
+    const candidateUserRoot = join(root, "transactions", "candidate-user");
+    const staleBackup = join(candidateUserRoot, "backup", "Codex.app", "version");
+    mkdirSync(join(staleBackup, ".."), { recursive: true });
+    writeFileSync(staleBackup, "5440");
+
+    resetCandidateUserRootForBuild(candidateUserRoot);
+
+    assert.equal(existsSync(candidateUserRoot), false);
+    const source = readFileSync(join(process.cwd(), "packages", "installer", "src", "commands", "install.ts"), "utf8");
+    const resetIndex = source.indexOf("resetCandidateUserRootForBuild(candidateUserRoot)");
+    const buildIndex = source.indexOf("await installCandidateInPlace({", resetIndex);
+    assert.ok(resetIndex >= 0, "candidate build must reset its private user root");
+    assert.ok(buildIndex > resetIndex, "candidate-user reset must happen before the candidate installer reads its backup");
+  });
 });
 
 test("signed backup promotion verifies staging and atomically replaces the live backup", () => {
@@ -347,7 +366,7 @@ test("install preflight never quits or prompts a running macOS Codex", () => {
 });
 
 function withTempDir(fn: (root: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-install-preflight-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-install-preflight-"));
   try {
     fn(root);
   } finally {

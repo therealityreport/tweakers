@@ -6,13 +6,13 @@ import test from "node:test";
 const mainSource = readFileSync(resolve("packages/runtime/src/main.ts"), "utf8");
 
 test("main tweak discovery is deferred off synchronous module evaluation", () => {
-  assert.match(mainSource, /setImmediate\(\s*\(\)\s*=>\s*loadAllMainTweaks\(\)\s*\)/);
+  assert.match(mainSource, /setImmediate\(\(\) => \{[\s\S]*?loadTweaksInitially\(tweakLifecycleDeps\)/);
   assert.doesNotMatch(mainSource, /^loadAllMainTweaks\(\);$/m);
 });
 
 test("managed Codex CLI bootstrap remains synchronous before tweak deferral", () => {
   const bootstrap = mainSource.indexOf("applyManagedCodexCliLaneAtBootstrap(");
-  const deferral = mainSource.indexOf("setImmediate(() => loadAllMainTweaks())");
+  const deferral = mainSource.indexOf("setImmediate(() => {");
   assert.ok(bootstrap >= 0, "missing synchronous managed-lane bootstrap");
   assert.ok(deferral >= 0, "missing deferred tweak load");
   assert.ok(bootstrap < deferral, "managed lane must remain before tweak deferral");

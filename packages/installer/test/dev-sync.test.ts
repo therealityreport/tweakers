@@ -18,7 +18,7 @@ import { readConfigFile, readDevTweaksRoot, updateConfigFile } from "../src/conf
 import { isSymlinkInto } from "../src/symlinks";
 
 function fixture(): { root: string; repoTweaks: string; liveTweaks: string } {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-dev-sync-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-dev-sync-"));
   const repoTweaks = join(root, "repo", "tweaks");
   const liveTweaks = join(root, "live", "tweaks");
   mkdirSync(repoTweaks, { recursive: true });
@@ -55,8 +55,8 @@ test("reconcile links valid repo tweak folders by basename", () => {
     // Folder ≠ id never produces an id-named second entry (double-load guard).
     assert.ok(!existsSync(join(f.liveTweaks, "co.tweakers.followup")));
     // Reload marker at the tweaks-dir root, not through a link.
-    assert.ok(existsSync(join(f.liveTweaks, ".codexpp-dev-reload")));
-    assert.ok(!existsSync(join(f.repoTweaks, "followup", ".codexpp-dev-reload")));
+    assert.ok(existsSync(join(f.liveTweaks, ".tweaker-dev-reload")));
+    assert.ok(!existsSync(join(f.repoTweaks, "followup", ".tweaker-dev-reload")));
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -131,35 +131,35 @@ test("reconcile is idempotent", () => {
     writeTweak(f.repoTweaks, "followup", "co.tweakers.followup");
     assert.ok(reconcileDevTweaks(f.liveTweaks, f.repoTweaks).changed);
 
-    const markerBefore = readFileSync(join(f.liveTweaks, ".codexpp-dev-reload"), "utf8");
+    const markerBefore = readFileSync(join(f.liveTweaks, ".tweaker-dev-reload"), "utf8");
     const second = reconcileDevTweaks(f.liveTweaks, f.repoTweaks);
 
     assert.equal(second.changed, false);
     assert.deepEqual(second.linked, []);
-    assert.equal(readFileSync(join(f.liveTweaks, ".codexpp-dev-reload"), "utf8"), markerBefore);
+    assert.equal(readFileSync(join(f.liveTweaks, ".tweaker-dev-reload"), "utf8"), markerBefore);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
 
 test("config helpers preserve unknown keys and read devTweaksRoot", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-config-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-config-"));
   try {
     const file = join(root, "config.json");
-    writeFileSync(file, JSON.stringify({ tweakUpdateChecks: { x: 1 }, codexPlusPlus: { autoUpdate: true } }));
+    writeFileSync(file, JSON.stringify({ tweakUpdateChecks: { x: 1 }, tweaker: { autoUpdate: true } }));
 
     updateConfigFile(file, (config) => {
-      const section = (config.codexPlusPlus ??= {}) as Record<string, unknown>;
+      const section = (config.tweaker ??= {}) as Record<string, unknown>;
       section.devTweaksRoot = "/repo/tweaks";
     });
 
     const config = readConfigFile(file);
     assert.deepEqual(config.tweakUpdateChecks, { x: 1 });
-    assert.equal((config.codexPlusPlus as Record<string, unknown>).autoUpdate, true);
+    assert.equal((config.tweaker as Record<string, unknown>).autoUpdate, true);
     assert.equal(readDevTweaksRoot(file), "/repo/tweaks");
 
     updateConfigFile(file, (c) => {
-      delete ((c.codexPlusPlus ?? {}) as Record<string, unknown>).devTweaksRoot;
+      delete ((c.tweaker ?? {}) as Record<string, unknown>).devTweaksRoot;
     });
     assert.equal(readDevTweaksRoot(file), null);
   } finally {
@@ -168,7 +168,7 @@ test("config helpers preserve unknown keys and read devTweaksRoot", () => {
 });
 
 test("isSymlinkInto matches only links resolving inside the root", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-symlinks-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-symlinks-"));
   try {
     const repo = join(root, "repo");
     mkdirSync(join(repo, "tweak"), { recursive: true });
@@ -212,7 +212,7 @@ test("validated dev sync publishes built tweaks without symlinking the checkout"
     const live = join(f.liveTweaks, "followup");
     assert.equal(lstatSync(live).isSymbolicLink(), false);
     assert.match(readFileSync(join(live, "index.js"), "utf8"), /built: true/);
-    assert.ok(existsSync(join(f.liveTweaks, ".codexpp-dev-reload")));
+    assert.ok(existsSync(join(f.liveTweaks, ".tweaker-dev-reload")));
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -227,7 +227,7 @@ test("managed CLI dev sync uses the registered development checkout", () => {
     mkdirSync(join(f.root, "repo", "packages", "installer"), { recursive: true });
     writeFileSync(join(f.root, "repo", "package.json"), "{}");
     updateConfigFile(configFile, (config) => {
-      config.codexPlusPlus = { developmentSourceRoot: join(f.root, "repo") };
+      config.tweaker = { developmentSourceRoot: join(f.root, "repo") };
     });
 
     assert.equal(resolveDevSyncSourceRoot(configFile, managedRoot), join(f.root, "repo"));
@@ -296,7 +296,7 @@ test("snapshot mode clears legacy source symlinks so repair cannot bypass valida
     const source = writeTweak(f.repoTweaks, "followup", "co.tweakers.followup");
     symlinkSync(source, join(f.liveTweaks, "followup"), "dir");
     const configFile = join(f.root, "config.json");
-    writeFileSync(configFile, JSON.stringify({ codexPlusPlus: { devTweaksRoot: f.repoTweaks } }));
+    writeFileSync(configFile, JSON.stringify({ tweaker: { devTweaksRoot: f.repoTweaks } }));
 
     clearLegacyDevMode(configFile, f.liveTweaks);
 

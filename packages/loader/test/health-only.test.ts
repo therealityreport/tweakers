@@ -15,7 +15,7 @@ test("health-check-only loader starts the isolated runtime without requiring ori
     mkdirSync(runtime, { recursive: true });
     cpSync(resolve("packages/loader/loader.cjs"), join(app, "loader.cjs"));
     writeFileSync(join(app, "package.json"), JSON.stringify({
-      __codexpp: { originalMain: "original.cjs", userRoot: join(root, "live-user") },
+      __tweaker: { originalMain: "original.cjs", userRoot: join(root, "live-user") },
     }));
     writeFileSync(join(app, "original.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(join(root, "original-loaded"))}, "yes")`);
     writeFileSync(join(runtime, "main.js"), `require("node:fs").writeFileSync(${JSON.stringify(join(root, "runtime-loaded"))}, "yes")`);

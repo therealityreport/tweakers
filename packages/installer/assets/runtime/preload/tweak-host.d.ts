@@ -18,3 +18,9 @@ export declare function startTweakHost(): Promise<void>;
  * source strings directly — each load creates a fresh scope.
  */
 export declare function teardownTweakHost(): void;
+export declare const rendererStorage: (id: string, storage?: Storage) => {
+    get: <T>(name: string, fallback?: T) => T;
+    set: (name: string, value: unknown) => void;
+    delete: (name: string) => void;
+    all: () => Record<string, unknown>;
+};

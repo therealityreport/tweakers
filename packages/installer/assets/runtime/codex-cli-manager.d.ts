@@ -13,6 +13,7 @@ export interface ManagedCodexCliReceipt {
     version: string;
     releaseTag: string;
     digest: string;
+    binaryDigest: string;
     architecture: string;
     relativeDirectory: string;
     binaryRelativePath: string;
@@ -66,10 +67,11 @@ export interface CodexCliManager {
     listManagedVersions(): string[];
     listStagingOperations(): string[];
 }
-export declare function deriveCodexCliPaths(home: string): CodexCliPaths;
+export declare function deriveCodexCliPaths(home: string, activeUserRoot?: string): CodexCliPaths;
 export declare function validateArchiveEntries(entries: ArchiveEntry[]): void;
 export declare function createCodexCliManager(input: {
     home: string;
+    userRoot?: string;
     deps: CodexCliManagerDependencies;
 }): CodexCliManager;
 export interface BootstrapLaneResult {
@@ -80,10 +82,21 @@ export interface BootstrapLaneResult {
     fallback: boolean;
     error: string | null;
 }
+export interface SelectedManagedCodexCli {
+    binaryPath: string;
+    version: string;
+    fingerprint: string;
+}
 export declare function applyManagedCodexCliLaneAtBootstrap(input: {
     lane?: CodexCliLane | null;
     home: string;
+    userRoot?: string;
     env?: NodeJS.ProcessEnv;
+    selectedManagedCli?: SelectedManagedCodexCli | null;
+    validateSelectedManagedBinary?: (selected: SelectedManagedCodexCli) => {
+        valid: boolean;
+        error?: string;
+    };
     validateManagedBinary?: (binary: string, receipt: ManagedCodexCliReceipt) => {
         valid: boolean;
         error?: string;

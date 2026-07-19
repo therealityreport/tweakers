@@ -683,11 +683,33 @@ export function readTransactionState(stateFile: string): TransactionState | null
 export function writeTransactionState(stateFile: string, state: TransactionState): void {
   state.ownerPid = process.pid;
   mkdirSync(dirname(stateFile), { recursive: true });
-  const temporary = `${stateFile}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, stateFile);
-  chmodSync(stateFile, 0o600);
+  const temporary = `${stateFile}.${process.pid}.${Date.now()}.tmp`;
+  let fd: number | null = null;
+  try {
+    fd = openSync(temporary, "wx", 0o600);
+    writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, stateFile);
+    chmodSync(stateFile, 0o600);
+    fsyncDirectory(dirname(stateFile));
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort after the primary failure */ }
+    }
+    try { unlinkSync(temporary); } catch { /* absent or already renamed */ }
+  }
+}
+
+function fsyncDirectory(directory: string): void {
+  const fd = openSync(directory, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function transactionLockFile(stateFile: string): string {
@@ -727,9 +749,8 @@ export function archiveTransactionState(stateFile: string, state: TransactionSta
   const archived = `${stateFile.replace(/\.json$/, "")}.${stamp}.${state.phase}.json`;
   try {
     renameSync(stateFile, archived);
-  } catch {
-    try { unlinkSync(stateFile); } catch { /* already gone */ }
-  }
+    fsyncDirectory(dirname(stateFile));
+  } catch { /* preserve the source journal when archival cannot be completed */ }
 }
 
 export function filesystemTransactionAdapters(overrides: Partial<TransactionAdapters> = {}): TransactionAdapters {

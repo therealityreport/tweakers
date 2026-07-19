@@ -6,13 +6,16 @@
 // injected UI), so this menu bar item is the only in-GUI way back to Tweakers
 // mode — it must stay dumb and reliable:
 //
-//   - It only READS installer state (state.json) — it never touches bundles.
-//   - Mode changes use `tweakers mode <target> --yes`; development reloads use
-//     the registered checkout's `tweakers refresh-local --source development`.
+//   - It only READS installer state, cached appcast metadata, and signed live
+//     bundle evidence — it never touches bundles or performs network requests.
+//   - Mode changes use `tweaker mode <target>`; that CLI prepares the complete
+//     environment first, then owns the one confirmation and verified restart.
+//     Development reloads use
+//     the registered checkout's `tweaker refresh-local --source development`.
 //     Both are spawned fully detached (new session, no wait) so they survive
 //     the app quitting during promotion.
 //   - The CLI invocation comes from a sidecar config the installer writes at
-//     `tweakers mode setup` time (switcher.json in the Tweakers user root) —
+//     `tweaker mode setup` time (switcher.json in the Tweakers user root) —
 //     nothing machine-specific is baked into this binary.
 //
 // Lifecycle: launched by the com.therealityreport.tweakers.switcher
@@ -23,6 +26,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -33,22 +37,27 @@
 static NSString *const TWSModeChatgpt = @"chatgpt";
 static NSString *const TWSModeTweakers = @"tweakers";
 static NSString *const TWSModeUnknown = @"unknown";
+static NSString *const TWSOpenAITeamIdentifier = @"2DC432GLL2";
 
 /// Refresh cadence while the menu is closed; the menu itself refreshes on open.
 static const uint64_t TWSRefreshIntervalSeconds = 5;
+/// Cached update metadata older than this is not authoritative enough to call
+/// the installed desktop current.
+static const NSTimeInterval TWSAppcastFreshnessSeconds = 24 * 60 * 60;
+static const NSTimeInterval TWSAppcastFutureToleranceSeconds = 5 * 60;
 
 #pragma mark - Installer state access
 
 /// Resolves the Tweakers user root exactly like the installer's paths.ts:
-/// TWEAKERS_HOME -> CODEX_PLUSPLUS_HOME -> ~/Library/Application Support with
-/// the legacy codex-plusplus directory staying authoritative while it exists.
+/// TWEAKERS_HOME -> TWEAKER_HOME -> ~/Library/Application Support with
+/// the legacy tweaker directory staying authoritative while it exists.
 static NSString *TWSUserRoot(void) {
   NSDictionary<NSString *, NSString *> *env = NSProcessInfo.processInfo.environment;
   if (env[@"TWEAKERS_HOME"].length > 0) return env[@"TWEAKERS_HOME"];
-  if (env[@"CODEX_PLUSPLUS_HOME"].length > 0) return env[@"CODEX_PLUSPLUS_HOME"];
+  if (env[@"TWEAKER_HOME"].length > 0) return env[@"TWEAKER_HOME"];
   NSString *appSupport =
       [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
-  NSString *legacy = [appSupport stringByAppendingPathComponent:@"codex-plusplus"];
+  NSString *legacy = [appSupport stringByAppendingPathComponent:@"tweaker"];
   if ([NSFileManager.defaultManager fileExistsAtPath:legacy]) return legacy;
   return [appSupport stringByAppendingPathComponent:@"Tweakers"];
 }
@@ -60,18 +69,62 @@ static NSDictionary *TWSReadJSONDictionary(NSString *path) {
   return [parsed isKindOfClass:[NSDictionary class]] ? parsed : nil;
 }
 
-/// Current mode from the installer's state.json. Anything other than an
-/// explicit "chatgpt"/"tweakers" string reports as "unknown" — this app never
-/// guesses about bundle contents.
+static NSString *TWSAppRoot(void);
+
+static NSString *TWSLiveAsarIntegrityHash(NSString *appRoot) {
+  NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+      [appRoot stringByAppendingPathComponent:@"Contents/Info.plist"]];
+  NSDictionary *integrity = [info[@"ElectronAsarIntegrity"] isKindOfClass:[NSDictionary class]]
+      ? info[@"ElectronAsarIntegrity"]
+      : nil;
+  NSDictionary *asar = [integrity[@"Resources/app.asar"] isKindOfClass:[NSDictionary class]]
+      ? integrity[@"Resources/app.asar"]
+      : nil;
+  id hash = asar[@"hash"];
+  return [hash isKindOfClass:[NSString class]] && [hash length] > 0 ? hash : nil;
+}
+
+static BOOL TWSHasValidOpenAISignature(NSString *appRoot) {
+  SecStaticCodeRef code = NULL;
+  NSURL *url = [NSURL fileURLWithPath:appRoot];
+  if (SecStaticCodeCreateWithPath((__bridge CFURLRef)url, kSecCSDefaultFlags, &code) != errSecSuccess) {
+    return NO;
+  }
+  BOOL valid = SecStaticCodeCheckValidity(code, kSecCSStrictValidate, NULL) == errSecSuccess;
+  CFDictionaryRef rawInfo = NULL;
+  if (valid && SecCodeCopySigningInformation(code, kSecCSSigningInformation, &rawInfo) == errSecSuccess) {
+    NSDictionary *signing = CFBridgingRelease(rawInfo);
+    id team = signing[(__bridge NSString *)kSecCodeInfoTeamIdentifier];
+    valid = [team isKindOfClass:[NSString class]] && [team isEqualToString:TWSOpenAITeamIdentifier];
+  } else {
+    valid = NO;
+  }
+  CFRelease(code);
+  return valid;
+}
+
+static NSString *TWSModeFromEvidence(
+    NSString *patchedHash,
+    NSString *liveHash,
+    BOOL validOpenAISignature) {
+  if (patchedHash.length > 0 && liveHash.length > 0 && [patchedHash isEqualToString:liveHash]) {
+    return TWSModeTweakers;
+  }
+  if (validOpenAISignature) return TWSModeChatgpt;
+  return TWSModeUnknown;
+}
+
+/// Report observed bundle reality, never stale persisted intent. state.json's
+/// patched hash proves Tweakers; a strict OpenAI Team signature proves ChatGPT.
 static NSString *TWSCurrentMode(void) {
   NSDictionary *state =
       TWSReadJSONDictionary([TWSUserRoot() stringByAppendingPathComponent:@"state.json"]);
-  id mode = state[@"mode"];
-  if ([mode isKindOfClass:[NSString class]] &&
-      ([mode isEqualToString:TWSModeChatgpt] || [mode isEqualToString:TWSModeTweakers])) {
-    return mode;
-  }
-  return TWSModeUnknown;
+  NSString *appRoot = TWSAppRoot();
+  id patchedHash = state[@"patchedAsarHash"];
+  return TWSModeFromEvidence(
+      [patchedHash isKindOfClass:[NSString class]] ? patchedHash : nil,
+      TWSLiveAsarIntegrityHash(appRoot),
+      TWSHasValidOpenAISignature(appRoot));
 }
 
 static NSString *TWSAppRoot(void) {
@@ -83,9 +136,209 @@ static NSString *TWSAppRoot(void) {
       : @"/Applications/ChatGPT.app";
 }
 
+#pragma mark - Read-only desktop update status
+
+typedef NS_ENUM(NSInteger, TWSDesktopUpdateKind) {
+  TWSDesktopUpdateCheckNeeded = 0,
+  TWSDesktopUpdateCurrent = 1,
+  TWSDesktopUpdateAvailable = 2,
+};
+
+@interface TWSDesktopUpdateStatus : NSObject
+@property(nonatomic) TWSDesktopUpdateKind kind;
+@property(nonatomic, copy) NSString *currentVersion;
+@property(nonatomic, copy) NSString *latestVersion;
+@property(nonatomic, copy) NSString *detail;
+@end
+
+@implementation TWSDesktopUpdateStatus
+@end
+
+static NSString *TWSNonEmptyString(id value) {
+  if (![value isKindOfClass:[NSString class]]) return nil;
+  NSString *trimmed = [(NSString *)value
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  return trimmed.length > 0 ? trimmed : nil;
+}
+
+static BOOL TWSIsDecimalString(NSString *value) {
+  if (value.length == 0) return NO;
+  return [value rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet]
+             .location == NSNotFound;
+}
+
+static BOOL TWSIsDottedNumericVersion(NSString *value) {
+  if (value.length == 0) return NO;
+  NSArray<NSString *> *parts = [value componentsSeparatedByString:@"."];
+  if (parts.count == 0) return NO;
+  for (NSString *part in parts) {
+    if (!TWSIsDecimalString(part)) return NO;
+  }
+  return YES;
+}
+
+/// Compares arbitrarily long unsigned decimal strings without integer
+/// overflow. Callers validate the strings first.
+static NSComparisonResult TWSCompareDecimalStrings(NSString *left, NSString *right) {
+  NSUInteger leftIndex = 0;
+  while (leftIndex + 1 < left.length && [left characterAtIndex:leftIndex] == '0') leftIndex += 1;
+  NSUInteger rightIndex = 0;
+  while (rightIndex + 1 < right.length && [right characterAtIndex:rightIndex] == '0') rightIndex += 1;
+  NSString *normalizedLeft = [left substringFromIndex:leftIndex];
+  NSString *normalizedRight = [right substringFromIndex:rightIndex];
+  if (normalizedLeft.length < normalizedRight.length) return NSOrderedAscending;
+  if (normalizedLeft.length > normalizedRight.length) return NSOrderedDescending;
+  return [normalizedLeft compare:normalizedRight];
+}
+
+static NSComparisonResult TWSCompareDottedNumericVersions(
+    NSString *left,
+    NSString *right,
+    BOOL *valid) {
+  if (!TWSIsDottedNumericVersion(left) || !TWSIsDottedNumericVersion(right)) {
+    if (valid != NULL) *valid = NO;
+    return NSOrderedSame;
+  }
+  if (valid != NULL) *valid = YES;
+  NSArray<NSString *> *leftParts = [left componentsSeparatedByString:@"."];
+  NSArray<NSString *> *rightParts = [right componentsSeparatedByString:@"."];
+  NSUInteger count = MAX(leftParts.count, rightParts.count);
+  for (NSUInteger index = 0; index < count; index += 1) {
+    NSString *leftPart = index < leftParts.count ? leftParts[index] : @"0";
+    NSString *rightPart = index < rightParts.count ? rightParts[index] : @"0";
+    NSComparisonResult comparison = TWSCompareDecimalStrings(leftPart, rightPart);
+    if (comparison != NSOrderedSame) return comparison;
+  }
+  return NSOrderedSame;
+}
+
+static NSDate *TWSParseISO8601Date(NSString *raw) {
+  if (raw.length == 0) return nil;
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime |
+      NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *date = [formatter dateFromString:raw];
+  if (date != nil) return date;
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+  return [formatter dateFromString:raw];
+}
+
+static NSString *TWSDesktopVersionDisplay(NSString *marketing, NSString *build) {
+  BOOL marketingValid = TWSIsDottedNumericVersion(marketing);
+  BOOL buildValid = TWSIsDecimalString(build);
+  if (marketingValid && buildValid) {
+    return [NSString stringWithFormat:@"%@ (%@)", marketing, build];
+  }
+  if (marketingValid) return marketing;
+  if (buildValid) return [NSString stringWithFormat:@"build %@", build];
+  return nil;
+}
+
+static TWSDesktopUpdateStatus *TWSDesktopUpdateCheckNeededStatus(NSString *detail) {
+  TWSDesktopUpdateStatus *status = [[TWSDesktopUpdateStatus alloc] init];
+  status.kind = TWSDesktopUpdateCheckNeeded;
+  status.detail = detail;
+  return status;
+}
+
+/// Pure comparison seam used by the focused native regression harness.
+static TWSDesktopUpdateStatus *TWSDesktopUpdateStatusFromMetadata(
+    NSDictionary *appcast,
+    NSDictionary *appInfo,
+    NSDate *now) {
+  if (![appcast isKindOfClass:[NSDictionary class]]) {
+    return TWSDesktopUpdateCheckNeededStatus(@"Cached OpenAI appcast information is missing.");
+  }
+  NSString *checkedAtRaw = TWSNonEmptyString(appcast[@"checkedAt"]);
+  NSDate *checkedAt = TWSParseISO8601Date(checkedAtRaw);
+  if (checkedAt == nil) {
+    return TWSDesktopUpdateCheckNeededStatus(@"Cached OpenAI appcast check time is missing or invalid.");
+  }
+  NSDate *effectiveNow = now ?: [NSDate date];
+  NSTimeInterval age = [effectiveNow timeIntervalSinceDate:checkedAt];
+  if (age > TWSAppcastFreshnessSeconds || age < -TWSAppcastFutureToleranceSeconds) {
+    return TWSDesktopUpdateCheckNeededStatus(@"Cached OpenAI appcast information is stale.");
+  }
+  if (![appInfo isKindOfClass:[NSDictionary class]]) {
+    return TWSDesktopUpdateCheckNeededStatus(@"Installed ChatGPT metadata is unavailable.");
+  }
+
+  NSString *currentMarketing = TWSNonEmptyString(appInfo[@"CFBundleShortVersionString"]);
+  NSString *currentBuild = TWSNonEmptyString(appInfo[@"CFBundleVersion"]);
+  NSString *latestMarketing = TWSNonEmptyString(appcast[@"marketingVersion"]);
+  NSString *latestBuild = TWSNonEmptyString(appcast[@"build"]);
+
+  NSComparisonResult comparison = NSOrderedSame;
+  BOOL comparisonValid = NO;
+  if (TWSIsDecimalString(currentBuild) && TWSIsDecimalString(latestBuild)) {
+    comparison = TWSCompareDecimalStrings(currentBuild, latestBuild);
+    comparisonValid = YES;
+  } else {
+    comparison = TWSCompareDottedNumericVersions(
+        currentMarketing, latestMarketing, &comparisonValid);
+  }
+  if (!comparisonValid) {
+    return TWSDesktopUpdateCheckNeededStatus(
+        @"Installed or cached ChatGPT version metadata is incomplete or invalid.");
+  }
+
+  TWSDesktopUpdateStatus *status = [[TWSDesktopUpdateStatus alloc] init];
+  status.kind = comparison == NSOrderedAscending
+      ? TWSDesktopUpdateAvailable
+      : TWSDesktopUpdateCurrent;
+  status.currentVersion = TWSDesktopVersionDisplay(currentMarketing, currentBuild);
+  status.latestVersion = TWSDesktopVersionDisplay(latestMarketing, latestBuild);
+  status.detail = [NSString stringWithFormat:@"Installed %@ · Cached latest %@ · Checked %@",
+      status.currentVersion ?: @"unknown",
+      status.latestVersion ?: @"unknown",
+      checkedAtRaw];
+  return status;
+}
+
+static NSDictionary *TWSCachedAppcastMetadata(void) {
+  NSDictionary *config =
+      TWSReadJSONDictionary([TWSUserRoot() stringByAppendingPathComponent:@"config.json"]);
+  id section = config[@"tweaker"];
+  if (![section isKindOfClass:[NSDictionary class]]) section = config[@"codexPlusPlus"];
+  id appcast = [section isKindOfClass:[NSDictionary class]]
+      ? ((NSDictionary *)section)[@"codexAppcastCache"]
+      : nil;
+  return [appcast isKindOfClass:[NSDictionary class]] ? appcast : nil;
+}
+
+static NSDictionary *TWSInstalledAppMetadata(NSString *appRoot) {
+  NSString *path = [appRoot stringByAppendingPathComponent:@"Contents/Info.plist"];
+  NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:path];
+  return [info isKindOfClass:[NSDictionary class]] ? info : nil;
+}
+
+static TWSDesktopUpdateStatus *TWSCurrentDesktopUpdateStatus(void) {
+  NSString *appRoot = TWSAppRoot();
+  return TWSDesktopUpdateStatusFromMetadata(
+      TWSCachedAppcastMetadata(),
+      TWSInstalledAppMetadata(appRoot),
+      [NSDate date]);
+}
+
+static NSString *TWSDesktopUpdateMenuTitle(TWSDesktopUpdateStatus *status) {
+  switch (status.kind) {
+    case TWSDesktopUpdateAvailable:
+      return status.latestVersion.length > 0
+          ? [NSString stringWithFormat:@"ChatGPT update available · %@", status.latestVersion]
+          : @"ChatGPT update available";
+    case TWSDesktopUpdateCurrent:
+      return status.currentVersion.length > 0
+          ? [NSString stringWithFormat:@"ChatGPT update: Current · %@", status.currentVersion]
+          : @"ChatGPT update: Current";
+    case TWSDesktopUpdateCheckNeeded:
+    default:
+      return @"ChatGPT update: Check needed";
+  }
+}
+
 /// CLI invocation (argv prefix) from the sidecar the installer writes at setup
 /// time. Returns nil when missing/malformed so the UI can point at
-/// `tweakers mode setup` instead of spawning garbage.
+/// `tweaker mode setup` instead of spawning garbage.
 static NSArray<NSString *> *TWSCliInvocation(void) {
   NSDictionary *config =
       TWSReadJSONDictionary([TWSUserRoot() stringByAppendingPathComponent:@"switcher.json"]);
@@ -108,7 +361,7 @@ static NSArray<NSString *> *TWSRefreshCliInvocation(void) {
 
   NSDictionary *config =
       TWSReadJSONDictionary([TWSUserRoot() stringByAppendingPathComponent:@"config.json"]);
-  id section = config[@"codexPlusPlus"];
+  id section = config[@"tweaker"];
   id sourceRoot = [section isKindOfClass:[NSDictionary class]]
       ? ((NSDictionary *)section)[@"developmentSourceRoot"]
       : nil;
@@ -254,6 +507,17 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
   // No action => stays disabled under automatic menu-item validation.
   [_menu addItemWithTitle:indicator action:nil keyEquivalent:@""];
 
+  // Update availability is independent of the selected app experience. Keep
+  // this row read-only: the official app or the durable installer transaction
+  // owns update actions, while the switcher only reports fresh cached truth.
+  TWSDesktopUpdateStatus *desktopUpdate = TWSCurrentDesktopUpdateStatus();
+  NSMenuItem *desktopUpdateItem =
+      [_menu addItemWithTitle:TWSDesktopUpdateMenuTitle(desktopUpdate)
+                       action:nil
+                keyEquivalent:@""];
+  desktopUpdateItem.enabled = NO;
+  desktopUpdateItem.toolTip = desktopUpdate.detail;
+
   // A coordinated local refresh is only valid while the patched payload owns
   // the live app. refresh-local itself re-checks the mode before any mutation.
   if ([_mode isEqualToString:TWSModeTweakers]) {
@@ -265,7 +529,7 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
     reload.target = refreshAvailable ? self : nil;
     reload.enabled = refreshAvailable;
     if (!reload.enabled) {
-      reload.toolTip = @"Run tweakers dev-sync to register and build a development checkout first.";
+      reload.toolTip = @"Run tweaker dev-sync to register and build a development checkout first.";
     }
   }
 
@@ -282,8 +546,11 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
                                       action:@selector(terminate:)
                                keyEquivalent:@""];
   quit.target = NSApp; // clean exit(0): KeepAlive={SuccessfulExit:false} stays quit
-  _statusItem.button.toolTip =
-      [NSString stringWithFormat:@"Tweakers — current mode: %@", _mode];
+  NSString *updateSuffix = desktopUpdate.kind == TWSDesktopUpdateAvailable
+      ? @" · ChatGPT update available"
+      : @"";
+  _statusItem.button.toolTip = [NSString stringWithFormat:
+      @"Tweakers — current mode: %@%@", _mode, updateSuffix];
 }
 
 - (void)addSwitchItemWithTitle:(NSString *)title target:(NSString *)targetMode {
@@ -311,7 +578,7 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
   if (cli == nil) {
     [self showSpawnErrorWithTitle:@"Could not start the Tweakers reload"
                            reason:@"The registered development checkout or its CLI runtime is missing."
-                           repair:@"Run “tweakers dev-sync” in Terminal to register and build the checkout."];
+                           repair:@"Run “tweaker dev-sync” in Terminal to register and build the checkout."];
     return;
   }
   NSArray<NSString *> *argv =
@@ -321,40 +588,27 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
   if (!TWSSpawnDetached(argv)) {
     [self showSpawnErrorWithTitle:@"Could not start the Tweakers reload"
                            reason:@"The development CLI could not be started."
-                           repair:@"Run “tweakers dev-sync” in Terminal to repair the development checkout."];
+                           repair:@"Run “tweaker dev-sync” in Terminal to repair the development checkout."];
   }
 }
 
 - (void)switchMode:(NSMenuItem *)sender {
   NSString *target = sender.representedObject;
   if (![target isKindOfClass:[NSString class]]) return;
-  [self activateForModal];
-
-  BOOL toTweakers = [target isEqualToString:TWSModeTweakers];
-  NSAlert *confirm = [[NSAlert alloc] init];
-  confirm.messageText =
-      toTweakers ? @"Switch to Tweakers mode?" : @"Switch to ChatGPT mode?";
-  confirm.informativeText = [NSString stringWithFormat:
-      @"ChatGPT will quit and restart as the %@.\n"
-      @"Some macOS permissions may need re-granting after the switch.",
-      toTweakers ? @"patched Tweakers app" : @"official ChatGPT app"];
-  [confirm addButtonWithTitle:@"Switch"];
-  [confirm addButtonWithTitle:@"Cancel"];
-  if ([confirm runModal] != NSAlertFirstButtonReturn) return;
 
   NSArray<NSString *> *cli = TWSCliInvocation();
   if (cli == nil) {
     [self showSpawnErrorWithTitle:@"Could not start the mode switch"
                            reason:@"The switcher configuration is missing or unreadable."
-                           repair:@"Run “tweakers mode setup” in Terminal to repair the switcher."];
+                           repair:@"Run “tweaker mode setup” in Terminal to repair the switcher."];
     return;
   }
   NSArray<NSString *> *argv =
-      [cli arrayByAddingObjectsFromArray:@[ @"mode", target, @"--yes" ]];
+      [cli arrayByAddingObjectsFromArray:@[ @"mode", target ]];
   if (!TWSSpawnDetached(argv)) {
     [self showSpawnErrorWithTitle:@"Could not start the mode switch"
                            reason:@"The Tweakers CLI could not be started."
-                           repair:@"Run “tweakers mode setup” in Terminal to repair the switcher."];
+                           repair:@"Run “tweaker mode setup” in Terminal to repair the switcher."];
   }
 }
 
@@ -389,6 +643,7 @@ static BOOL TWSSpawnDetached(NSArray<NSString *> *argv) {
 /// independent of optimizer behavior.
 static TWSAppDelegate *sDelegate;
 
+#if !defined(TWS_TESTING)
 int main(void) {
   @autoreleasepool {
     // Detached children (the mode CLI) are never waited on; auto-reap them.
@@ -401,3 +656,4 @@ int main(void) {
   }
   return 0;
 }
+#endif

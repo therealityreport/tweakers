@@ -152,7 +152,7 @@ test("legacy mode-switcher migration is a safe no-op for missing, clean, and cor
 });
 
 function withTempDir(fn: (root: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-storage-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-storage-"));
   try {
     fn(root);
   } finally {

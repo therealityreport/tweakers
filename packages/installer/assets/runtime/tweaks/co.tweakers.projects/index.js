@@ -16,8 +16,9 @@ const PROFILE_CONNECTION_TYPES = Object.freeze([
 const PROFILE_API_VERSION = 1;
 const MAX_NODES = 200;
 const MAX_DEPTH = 8;
-const PROJECT_COLOR_MENU_ATTR = "data-codexpp-project-color-menu";
-const PROJECT_COLOR_STYLE_ID = "codexpp-project-colors";
+const MAX_NATIVE_PROJECTS = 100;
+const PROJECT_COLOR_MENU_ATTR = "data-tweaker-project-color-menu";
+const PROJECT_COLOR_STYLE_ID = "tweaker-project-colors";
 const PROJECT_COLOR_DISPOSE = Symbol("projectColorDispose");
 const PROJECT_COLOR_OPTIONS = Object.freeze([
   { id: "neutral", label: "Neutral", value: "#404040" },
@@ -89,6 +90,9 @@ module.exports = {
     projectColorForeground,
     normalizeOverlayIntensity,
     mergeLegacyProjectColors,
+    normalizeNativeLocalProjects,
+    bindNativeProjectIdentities,
+    projectForNativeIdentity,
     injectProjectColorMenu,
     openProjectColorSubmenu,
     applyNativeProjectColors,
@@ -152,6 +156,7 @@ function createService(api) {
               state: clone(publicState),
               revision: revisionForState(publicState),
               storageStatus,
+              nativeProjects: readNativeLocalProjects(),
               connections: await getConnections(Date.now(), message?.refreshConnections === true),
             };
           }
@@ -203,6 +208,46 @@ function createService(api) {
       githubRefs.clear();
     },
   };
+}
+
+function readNativeLocalProjects(env = process.env) {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  try {
+    const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
+      ? env.CODEX_HOME.trim()
+      : path.join(env.HOME || "", ".codex");
+    if (!path.isAbsolute(codexHome)) return [];
+    const file = path.join(codexHome, ".codex-global-state.json");
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) return [];
+    return normalizeNativeLocalProjects(JSON.parse(fs.readFileSync(file, "utf8")));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeNativeLocalProjects(value) {
+  if (!isRecord(value) || !isRecord(value["local-projects"])) return [];
+  const projects = [];
+  for (const [key, candidate] of Object.entries(value["local-projects"])) {
+    if (projects.length >= MAX_NATIVE_PROJECTS) break;
+    if (!isRecord(candidate)) continue;
+    try {
+      const id = safeId(candidate.id || key);
+      if (id !== key) continue;
+      const name = safeText(candidate.name, 120);
+      const rootPaths = [...new Set((Array.isArray(candidate.rootPaths) ? candidate.rootPaths : [])
+        .slice(0, 8)
+        .map((rootPath) => {
+          try { return normalizeWorkspacePath(rootPath); } catch { return null; }
+        })
+        .filter(Boolean))];
+      if (!rootPaths.length) continue;
+      projects.push({ id, name, rootPaths });
+    } catch {}
+  }
+  return projects;
 }
 
 function readLegacyProjectColorPreferences(dataDir) {
@@ -775,17 +820,27 @@ function mergeLegacyAssignments(projectState, legacy) {
 function startRenderer(api) {
   let latestState = null;
   let latestRevision = null;
+  let latestNativeProjects = [];
+  let latestSurfaceFingerprint = null;
+  let aliasRefreshRequest = 0;
   const apply = () => applyNativeProjectColors(api, latestState);
+  const acceptResponse = (response) => {
+    if (!response?.ok) return false;
+    if (Array.isArray(response.nativeProjects)) latestNativeProjects = response.nativeProjects;
+    latestState = bindNativeProjectIdentities(response.state, latestNativeProjects);
+    latestRevision = response.revision;
+    return true;
+  };
   const saveAppearance = async (projectId, choice) => {
     if (!latestState || !projectId) return;
     try {
       const nodes = latestState.nodes.map((node) => node.id === projectId ? { ...node, ...choice } : node);
       const response = await api.ipc.invoke(IPC, { action: "save", state: { ...latestState, nodes }, baseRevision: latestRevision });
       if (!response?.ok) { api.log?.warn?.("project appearance save failed", response?.error?.code || "unknown"); window.alert("Could not save the project color."); return; }
-      latestState = response.state;
+      latestState = bindNativeProjectIdentities(response.state, latestNativeProjects);
       latestRevision = response.revision;
       apply();
-      window.dispatchEvent(new CustomEvent("codexpp:projects-color-change", { detail: { projectId } }));
+      window.dispatchEvent(new CustomEvent("tweaker:projects-color-change", { detail: { projectId } }));
     } catch (error) {
       api.log?.warn?.("project appearance save failed", String(error));
       window.alert("Could not save the project color.");
@@ -793,7 +848,7 @@ function startRenderer(api) {
   };
   const removeRevision = api.ipc.on("revision", (payload) => {
     if (typeof payload?.revision === "string" && /^[a-f0-9]{32}$/.test(payload.revision)) {
-      window.dispatchEvent(new CustomEvent("codexpp:projects-revision", { detail: { revision: payload.revision } }));
+      window.dispatchEvent(new CustomEvent("tweaker:projects-revision", { detail: { revision: payload.revision } }));
     }
   });
   const handle = api.settings.registerPage({
@@ -801,14 +856,28 @@ function startRenderer(api) {
     title: "Projects",
     description: "Organize the projects shown in your ChatGPT sidebar.",
     iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block shrink-0 align-middle" aria-hidden="true"><path d="M2.5 5.5h6l1.5 2h7.5v7.5a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V5.5Z" stroke="currentColor" stroke-width="1.5"/></svg>',
-    render(root) { return renderProjectsPage(api, root, (state, revision) => { latestState = state; latestRevision = revision; apply(); }); },
+    render(root) { return renderProjectsPage(api, root, (state, revision, nativeProjects) => {
+      if (Array.isArray(nativeProjects)) latestNativeProjects = nativeProjects;
+      latestState = bindNativeProjectIdentities(state, latestNativeProjects);
+      latestRevision = revision;
+      apply();
+    }); },
   });
   api.ipc.invoke(IPC, { action: "get" }).then((response) => {
-    if (response?.ok) { latestState = response.state; latestRevision = response.revision; apply(); }
+    if (acceptResponse(response)) apply();
   }).catch(() => {});
-  const removeHostObserver = api.react?.host?.observe?.(["projects"], apply);
+  const removeHostObserver = api.react?.host?.observe?.(["projects"], () => {
+    apply();
+    const fingerprint = nativeProjectSurfaceFingerprint(api);
+    if (fingerprint === latestSurfaceFingerprint) return;
+    latestSurfaceFingerprint = fingerprint;
+    const request = ++aliasRefreshRequest;
+    api.ipc.invoke(IPC, { action: "get" }).then((response) => {
+      if (request === aliasRefreshRequest && acceptResponse(response)) apply();
+    }).catch(() => {});
+  });
   const removeColorControls = installProjectColorControls(api, () => latestState, saveAppearance);
-  module.exports._page = { unregister() { removeRevision?.(); removeHostObserver?.(); removeColorControls?.(); removeProjectColorArtifacts(); handle.unregister?.(); } };
+  module.exports._page = { unregister() { aliasRefreshRequest += 1; removeRevision?.(); removeHostObserver?.(); removeColorControls?.(); removeProjectColorArtifacts(); handle.unregister?.(); } };
 }
 
 function renderProjectsPage(api, root, onState) {
@@ -823,13 +892,13 @@ function renderProjectsPage(api, root, onState) {
       const nodes = names.map((name, index) => ({ id: nativeProjectId(name, index), type: "project", parentId: null, name, icon: { kind: "emoji", value: "📁" }, colorMode: "auto", overlayIntensity: "medium", connections: {} }));
       return api.ipc.invoke(IPC, { action: "save", state: { schemaVersion: 1, nodes }, baseRevision: response.revision }).then(load);
     }
-    if (response?.ok) onState?.(response.state, response.revision);
+    if (response?.ok) onState?.(response.state, response.revision, response.nativeProjects);
     renderState(api, root, response, load);
   }).catch(() => { if (!disposed) root.textContent = "Projects are unavailable."; });
   const onColorChange = () => void load();
-  window.addEventListener("codexpp:projects-color-change", onColorChange);
+  window.addEventListener("tweaker:projects-color-change", onColorChange);
   void load();
-  return () => { disposed = true; window.removeEventListener("codexpp:projects-color-change", onColorChange); root.textContent = ""; };
+  return () => { disposed = true; window.removeEventListener("tweaker:projects-color-change", onColorChange); root.textContent = ""; };
 }
 
 function renderState(api, root, response, reload) {
@@ -1271,13 +1340,6 @@ function resolveProjectContext(api, state, target) {
   const projects = state.nodes
     .filter((node) => node.type === "project")
     .sort((a, b) => b.name.length - a.name.length);
-  const projectForLabel = (label, identity) => {
-    if (identity) {
-      const exact = projects.find((node) => node.id === identity || node.projectPath === identity);
-      if (exact) return exact;
-    }
-    return projects.find((node) => label === node.name || label.startsWith(`${node.name} `) || label.startsWith(`${node.name} ·`));
-  };
   const targetContainer = target.closest?.('[role="listitem"]');
 
   for (const match of api.react?.host?.query?.("projects") || []) {
@@ -1286,7 +1348,7 @@ function resolveProjectContext(api, state, target) {
     const container = element.closest?.('[role="listitem"]') || element;
     if (!(element === target || element.contains(target) || target.contains?.(element) || (targetContainer && targetContainer === container))) continue;
     const identity = element.getAttribute?.("data-app-action-sidebar-project-id") || element.getAttribute?.("data-workspace-path") || element.getAttribute?.("data-project-path");
-    const project = projectForLabel(projectLabelForRow(element), identity);
+    const project = projectForNativeIdentity(projects, projectLabelForRow(element), identity);
     if (project) return { project, element, container, source: "semantic" };
   }
 
@@ -1296,9 +1358,57 @@ function resolveProjectContext(api, state, target) {
   if (!donorRowShape) return null;
   const label = projectLabelForRow(projectAction instanceof HTMLElement ? projectAction : targetContainer);
   const identity = projectAction?.getAttribute?.("data-app-action-sidebar-project-id") || targetContainer.getAttribute?.("data-workspace-path") || targetContainer.getAttribute?.("data-project-path");
-  const project = projectForLabel(label, identity);
+  const project = projectForNativeIdentity(projects, label, identity);
   if (!project) return null;
   return { project, element: projectAction instanceof HTMLElement ? projectAction : targetContainer, container: targetContainer, source: "live-row" };
+}
+
+function bindNativeProjectIdentities(state, nativeProjects) {
+  if (!state?.nodes) return state;
+  const runtimeState = clone(state);
+  const projectsByPath = new Map();
+  for (const node of runtimeState.nodes) {
+    delete node.nativeProjectIds;
+    delete node.nativeProjectNames;
+    if (node.type !== "project" || !node.projectPath) continue;
+    const matches = projectsByPath.get(node.projectPath) || [];
+    matches.push(node);
+    projectsByPath.set(node.projectPath, matches);
+  }
+  for (const nativeProject of Array.isArray(nativeProjects) ? nativeProjects : []) {
+    const matches = new Set();
+    for (const rootPath of nativeProject?.rootPaths || []) {
+      for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
+    }
+    if (matches.size !== 1) continue;
+    const [project] = matches;
+    project.nativeProjectIds = [...new Set([...(project.nativeProjectIds || []), nativeProject.id])];
+    project.nativeProjectNames = [...new Set([...(project.nativeProjectNames || []), nativeProject.name])];
+  }
+  return runtimeState;
+}
+
+function projectNativeNames(project) {
+  return [...new Set([project?.name, ...(Array.isArray(project?.nativeProjectNames) ? project.nativeProjectNames : [])]
+    .filter((name) => typeof name === "string" && name.trim()))];
+}
+
+function projectForNativeIdentity(projects, label, identity) {
+  if (identity) {
+    const exact = projects.find((project) => project.id === identity || project.projectPath === identity ||
+      (Array.isArray(project.nativeProjectIds) && project.nativeProjectIds.includes(identity)));
+    if (exact) return exact;
+  }
+  return projects.find((project) => projectNativeNames(project)
+    .some((name) => label === name || label.startsWith(`${name} `) || label.startsWith(`${name} ·`)));
+}
+
+function nativeProjectSurfaceFingerprint(api) {
+  return (api.react?.host?.query?.("projects") || []).map((match) => {
+    const element = match?.element;
+    const identity = element?.getAttribute?.("data-app-action-sidebar-project-id") || element?.getAttribute?.("data-workspace-path") || element?.getAttribute?.("data-project-path") || "";
+    return `${identity}\0${projectLabelForRow(element)}`;
+  }).sort().join("\n");
 }
 
 function findNativeProjectMenu(doc, context = {}) {
@@ -1321,42 +1431,42 @@ function ensureProjectColorStyle() {
   style = document.createElement("style");
   style.id = PROJECT_COLOR_STYLE_ID;
   style.textContent = `
-    [data-codexpp-project-color-group] {
-      --codexpp-project-task-tint: 10%;
-      --codexpp-project-task-foreground: var(--codexpp-project-color);
-      --codexpp-project-header-tint: 16%;
-      --codexpp-project-header-foreground: color-mix(in srgb, var(--codexpp-project-color) 72%, var(--color-token-text-primary));
+    [data-tweaker-project-color-group] {
+      --tweaker-project-task-tint: 10%;
+      --tweaker-project-task-foreground: var(--tweaker-project-color);
+      --tweaker-project-header-tint: 16%;
+      --tweaker-project-header-foreground: color-mix(in srgb, var(--tweaker-project-color) 72%, var(--color-token-text-primary));
     }
-    [data-codexpp-project-color-group][data-codexpp-project-overlay="off"] { --codexpp-project-task-tint: 0%; }
-    [data-codexpp-project-color-group][data-codexpp-project-overlay="subtle"] { --codexpp-project-task-tint: 6%; }
-    [data-codexpp-project-color-group][data-codexpp-project-overlay="medium"] { --codexpp-project-task-tint: 10%; }
-    [data-codexpp-project-color-group][data-codexpp-project-overlay="strong"] { --codexpp-project-task-tint: 15%; }
-    .electron-dark [data-codexpp-project-color-group] {
-      --codexpp-project-task-foreground: color-mix(in srgb, var(--codexpp-project-color) 42%, white);
-      --codexpp-project-header-tint: 24%;
-      --codexpp-project-header-foreground: color-mix(in srgb, var(--codexpp-project-color) 45%, var(--color-token-text-primary));
+    [data-tweaker-project-color-group][data-tweaker-project-overlay="off"] { --tweaker-project-task-tint: 0%; }
+    [data-tweaker-project-color-group][data-tweaker-project-overlay="subtle"] { --tweaker-project-task-tint: 6%; }
+    [data-tweaker-project-color-group][data-tweaker-project-overlay="medium"] { --tweaker-project-task-tint: 10%; }
+    [data-tweaker-project-color-group][data-tweaker-project-overlay="strong"] { --tweaker-project-task-tint: 15%; }
+    .electron-dark [data-tweaker-project-color-group] {
+      --tweaker-project-task-foreground: color-mix(in srgb, var(--tweaker-project-color) 42%, white);
+      --tweaker-project-header-tint: 24%;
+      --tweaker-project-header-foreground: color-mix(in srgb, var(--tweaker-project-color) 45%, var(--color-token-text-primary));
     }
-    .electron-dark [data-codexpp-project-color-group][data-codexpp-project-overlay="subtle"] { --codexpp-project-task-tint: 11%; }
-    .electron-dark [data-codexpp-project-color-group][data-codexpp-project-overlay="medium"] { --codexpp-project-task-tint: 18%; }
-    .electron-dark [data-codexpp-project-color-group][data-codexpp-project-overlay="strong"] { --codexpp-project-task-tint: 24%; }
-    [data-codexpp-project-color-row] {
+    .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="subtle"] { --tweaker-project-task-tint: 11%; }
+    .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="medium"] { --tweaker-project-task-tint: 18%; }
+    .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="strong"] { --tweaker-project-task-tint: 24%; }
+    [data-tweaker-project-color-row] {
       width: 100%;
       border-radius: var(--radius-lg, 0.625rem) !important;
-      background-color: var(--codexpp-project-color) !important;
-      color: var(--codexpp-project-foreground) !important;
+      background-color: var(--tweaker-project-color) !important;
+      color: var(--tweaker-project-foreground) !important;
     }
-    [data-codexpp-project-color-row]:hover {
+    [data-tweaker-project-color-row]:hover {
       background-image: linear-gradient(rgb(255 255 255 / 8%), rgb(255 255 255 / 8%));
     }
-    [data-codexpp-project-color-row][data-codexpp-project-selected="true"] {
+    [data-tweaker-project-color-row][data-tweaker-project-selected="true"] {
       position: relative;
       background-color: var(--gray-1000) !important;
       color: var(--gray-0) !important;
     }
-    [data-codexpp-project-color-row][data-codexpp-project-selected="true"] * {
+    [data-tweaker-project-color-row][data-tweaker-project-selected="true"] * {
       color: var(--gray-0) !important;
     }
-    [data-codexpp-project-color-row][data-codexpp-project-selected="true"]::after {
+    [data-tweaker-project-color-row][data-tweaker-project-selected="true"]::after {
       content: "";
       position: absolute;
       inset: 0;
@@ -1364,40 +1474,40 @@ function ensureProjectColorStyle() {
       border-radius: inherit;
       pointer-events: none;
     }
-    [data-codexpp-project-color-icon] { color: var(--codexpp-project-foreground) !important; }
-    [data-codexpp-project-color-row][data-codexpp-project-selected="true"] [data-codexpp-project-color-icon] {
+    [data-tweaker-project-color-icon] { color: var(--tweaker-project-foreground) !important; }
+    [data-tweaker-project-color-row][data-tweaker-project-selected="true"] [data-tweaker-project-color-icon] {
       color: var(--gray-0) !important;
     }
-    [data-codexpp-project-color-title] {
-      color: var(--codexpp-project-foreground) !important;
+    [data-tweaker-project-color-title] {
+      color: var(--tweaker-project-foreground) !important;
       font-weight: 700 !important;
       text-transform: uppercase !important;
     }
-    [data-codexpp-project-color-row][data-codexpp-project-selected="true"] [data-codexpp-project-color-title] {
+    [data-tweaker-project-color-row][data-tweaker-project-selected="true"] [data-tweaker-project-color-title] {
       color: var(--gray-0) !important;
     }
-    [data-codexpp-project-color-task] {
+    [data-tweaker-project-color-task] {
       border-radius: var(--radius-lg, 0.625rem) !important;
-      background-color: color-mix(in srgb, var(--codexpp-project-color) var(--codexpp-project-task-tint), transparent) !important;
+      background-color: color-mix(in srgb, var(--tweaker-project-color) var(--tweaker-project-task-tint), transparent) !important;
     }
-    [data-codexpp-project-color-task]:hover {
+    [data-tweaker-project-color-task]:hover {
       background-image: linear-gradient(color-mix(in srgb, var(--color-token-list-hover-background, transparent) 70%, transparent), color-mix(in srgb, var(--color-token-list-hover-background, transparent) 70%, transparent));
     }
-    [data-codexpp-project-task-label] {
-      color: var(--codexpp-project-task-foreground) !important;
+    [data-tweaker-project-task-label] {
+      color: var(--tweaker-project-task-foreground) !important;
       font-weight: 400 !important;
     }
-    [data-codexpp-project-color-task][data-codexpp-project-selected="true"] {
-      background-color: var(--codexpp-project-color) !important;
-      color: var(--codexpp-project-foreground) !important;
+    [data-tweaker-project-color-task][data-tweaker-project-selected="true"] {
+      background-color: var(--tweaker-project-color) !important;
+      color: var(--tweaker-project-foreground) !important;
     }
-    [data-codexpp-project-color-task][data-codexpp-project-selected="true"] [data-codexpp-project-task-label],
-    [data-codexpp-project-color-task][data-codexpp-project-selected="true"] svg {
-      color: var(--codexpp-project-foreground) !important;
+    [data-tweaker-project-color-task][data-tweaker-project-selected="true"] [data-tweaker-project-task-label],
+    [data-tweaker-project-color-task][data-tweaker-project-selected="true"] svg {
+      color: var(--tweaker-project-foreground) !important;
     }
-    [data-codexpp-project-show-more] {
+    [data-tweaker-project-show-more] {
       background: transparent !important;
-      color: var(--codexpp-project-task-foreground) !important;
+      color: var(--tweaker-project-task-foreground) !important;
       font-weight: 600 !important;
     }
     [${PROJECT_COLOR_MENU_ATTR}="submenu"] { color-scheme: light dark; }
@@ -1417,18 +1527,19 @@ function applyNativeProjectColors(api, state) {
     if (!(row instanceof HTMLElement)) continue;
     const label = projectLabelForRow(row);
     const identity = row.getAttribute?.("data-app-action-sidebar-project-id") || row.getAttribute?.("data-workspace-path") || row.getAttribute?.("data-project-path");
-    const project = projects.find((candidate) => identity && (candidate.id === identity || candidate.projectPath === identity)) ||
-      projects.find((candidate) => label === candidate.name || label.startsWith(`${candidate.name} ·`) || label.startsWith(`${candidate.name} `));
+    const project = projectForNativeIdentity(projects, label, identity);
     if (!project) continue;
     const container = closestProjectContainer(row) || row;
     const header = projectHeaderForMatch(row, container, project);
-    markProjectColorNode(container, "data-codexpp-project-color-group", project);
-    markProjectColorNode(header, "data-codexpp-project-color-row", project);
-    for (const icon of header.querySelectorAll?.("svg") || []) icon.setAttribute?.("data-codexpp-project-color-icon", "true");
-    const title = [...(header.querySelectorAll?.("span") || [])].find((node) => String(node.textContent || "").trim() === project.name);
-    title?.setAttribute?.("data-codexpp-project-color-title", "true");
+    markProjectColorNode(container, "data-tweaker-project-color-group", project);
+    markProjectColorNode(header, "data-tweaker-project-color-row", project);
+    for (const icon of header.querySelectorAll?.("svg") || []) icon.setAttribute?.("data-tweaker-project-color-icon", "true");
+    const projectNames = new Set(projectNativeNames(project));
+    const title = [...(header.querySelectorAll?.("span") || [])]
+      .find((node) => projectNames.has(String(node.textContent || "").trim()) || String(node.textContent || "").trim() === label);
+    title?.setAttribute?.("data-tweaker-project-color-title", "true");
     const hasSelectedTask = markProjectTaskRows(container, project, header);
-    if (isNativeSelected(header) || hasNativeSelectionAttribute(container) || hasSelectedTask) header.setAttribute("data-codexpp-project-selected", "true");
+    if (isNativeSelected(header) || hasNativeSelectionAttribute(container) || hasSelectedTask) header.setAttribute("data-tweaker-project-selected", "true");
   }
 }
 
@@ -1446,16 +1557,15 @@ function nativeProjectMatches(api, projects) {
     const element = match?.element;
     const identity = element?.getAttribute?.("data-app-action-sidebar-project-id") || element?.getAttribute?.("data-workspace-path") || element?.getAttribute?.("data-project-path");
     const label = projectLabelForRow(element);
-    for (const project of projects) {
-      if ((identity && (project.id === identity || project.projectPath === identity)) || label === project.name) represented.add(project.id);
-    }
+    const project = projectForNativeIdentity(projects, label, identity);
+    if (project) represented.add(project.id);
   }
   if (projects.every((project) => represented.has(project.id))) return matches;
   const scope = projectNavigationScope(projects);
   for (const element of scope?.querySelectorAll?.('button, a, [role="button"]') || []) {
     if (!element.querySelector?.("svg")) continue;
     const label = projectLabelForRow(element);
-    if (projects.some((project) => label === project.name)) add(element);
+    if (projectForNativeIdentity(projects, label, null)) add(element);
   }
   return matches;
 }
@@ -1468,7 +1578,7 @@ function projectNavigationScope(projects) {
     while (cursor) {
       if (cursor.tagName === "NAV" || cursor.tagName === "ASIDE" || cursor.getAttribute?.("role") === "navigation") {
         const labels = [...(cursor.querySelectorAll?.('button, a, [role="button"]') || [])].map(projectLabelForRow);
-        if (projects.some((project) => labels.includes(project.name))) return cursor;
+        if (projects.some((project) => labels.some((label) => projectForNativeIdentity([project], label, null)))) return cursor;
         break;
       }
       cursor = cursor.parentElement;
@@ -1494,7 +1604,7 @@ function projectHeaderForMatch(row, container, project) {
   const pathAction = container.querySelector?.("[data-app-action-sidebar-project-id]");
   if (pathAction instanceof HTMLElement) return pathAction;
   return [...(container.querySelectorAll?.("button") || [])]
-    .find((node) => projectLabelForRow(node) === project.name) || row;
+    .find((node) => projectForNativeIdentity([project], projectLabelForRow(node), null)) || row;
 }
 
 function markProjectTaskRows(container, project, header) {
@@ -1503,17 +1613,17 @@ function markProjectTaskRows(container, project, header) {
   for (const list of lists) {
     for (const task of list.querySelectorAll?.('[role="listitem"]') || []) {
       if (nearestRoleList(task) !== list) continue;
-      markProjectColorNode(task, "data-codexpp-project-color-task", project);
-      taskLabelForRow(task)?.setAttribute?.("data-codexpp-project-task-label", "true");
+      markProjectColorNode(task, "data-tweaker-project-color-task", project);
+      taskLabelForRow(task)?.setAttribute?.("data-tweaker-project-task-label", "true");
       if (isNativeSelected(task)) {
-        task.setAttribute("data-codexpp-project-selected", "true");
+        task.setAttribute("data-tweaker-project-selected", "true");
         hasSelectedTask = true;
       }
     }
     const showMore = [...(list.querySelectorAll?.("button") || []), ...(list.querySelectorAll?.('[role="button"]') || [])]
       .find((node) => String(node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "show more");
     if (showMore) {
-      markProjectColorNode(showMore, "data-codexpp-project-show-more", project);
+      markProjectColorNode(showMore, "data-tweaker-project-show-more", project);
     }
   }
   if (!lists.length && container.classList?.contains?.("group/cwd")) {
@@ -1522,13 +1632,13 @@ function markProjectTaskRows(container, project, header) {
       const label = String(task.textContent || "").replace(/\s+/g, " ").trim();
       if (!label) continue;
       if (label.toLowerCase() === "show more") {
-        markProjectColorNode(task, "data-codexpp-project-show-more", project);
+        markProjectColorNode(task, "data-tweaker-project-show-more", project);
         continue;
       }
-      markProjectColorNode(task, "data-codexpp-project-color-task", project);
-      taskLabelForRow(task)?.setAttribute?.("data-codexpp-project-task-label", "true");
+      markProjectColorNode(task, "data-tweaker-project-color-task", project);
+      taskLabelForRow(task)?.setAttribute?.("data-tweaker-project-task-label", "true");
       if (isNativeSelected(task)) {
-        task.setAttribute("data-codexpp-project-selected", "true");
+        task.setAttribute("data-tweaker-project-selected", "true");
         hasSelectedTask = true;
       }
     }
@@ -1592,26 +1702,26 @@ function projectColorForeground(color) {
 
 function markProjectColorNode(node, attribute, project) {
   node.setAttribute(attribute, "true");
-  node.setAttribute("data-codexpp-project-overlay", project.overlayIntensity || "medium");
-  node.style.setProperty("--codexpp-project-color", project.color);
-  node.style.setProperty("--codexpp-project-foreground", projectColorForeground(project.color));
+  node.setAttribute("data-tweaker-project-overlay", project.overlayIntensity || "medium");
+  node.style.setProperty("--tweaker-project-color", project.color);
+  node.style.setProperty("--tweaker-project-foreground", projectColorForeground(project.color));
 }
 
 function clearNativeProjectColors() {
-  for (const node of document.querySelectorAll("[data-codexpp-project-color-group], [data-codexpp-project-color-row], [data-codexpp-project-color-task], [data-codexpp-project-show-more]")) {
-    node.removeAttribute("data-codexpp-project-color-group");
-    node.removeAttribute("data-codexpp-project-color-row");
-    node.removeAttribute("data-codexpp-project-color-task");
-    node.removeAttribute("data-codexpp-project-show-more");
-    node.removeAttribute("data-codexpp-project-selected");
-    node.removeAttribute("data-codexpp-project-overlay");
-    node.style.removeProperty("--codexpp-project-color");
-    node.style.removeProperty("--codexpp-project-foreground");
+  for (const node of document.querySelectorAll("[data-tweaker-project-color-group], [data-tweaker-project-color-row], [data-tweaker-project-color-task], [data-tweaker-project-show-more]")) {
+    node.removeAttribute("data-tweaker-project-color-group");
+    node.removeAttribute("data-tweaker-project-color-row");
+    node.removeAttribute("data-tweaker-project-color-task");
+    node.removeAttribute("data-tweaker-project-show-more");
+    node.removeAttribute("data-tweaker-project-selected");
+    node.removeAttribute("data-tweaker-project-overlay");
+    node.style.removeProperty("--tweaker-project-color");
+    node.style.removeProperty("--tweaker-project-foreground");
   }
-  for (const node of document.querySelectorAll("[data-codexpp-project-color-icon], [data-codexpp-project-color-title], [data-codexpp-project-task-label]")) {
-    node.removeAttribute("data-codexpp-project-color-icon");
-    node.removeAttribute("data-codexpp-project-color-title");
-    node.removeAttribute("data-codexpp-project-task-label");
+  for (const node of document.querySelectorAll("[data-tweaker-project-color-icon], [data-tweaker-project-color-title], [data-tweaker-project-task-label]")) {
+    node.removeAttribute("data-tweaker-project-color-icon");
+    node.removeAttribute("data-tweaker-project-color-title");
+    node.removeAttribute("data-tweaker-project-task-label");
   }
 }
 

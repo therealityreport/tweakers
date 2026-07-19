@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { inferCodexChannel, locateCodex, resolveLinuxInstall } from "../src/platform";
+import {
+  inferCodexChannel,
+  locateCodex,
+  locateCodexAtExactPath,
+  resolveLinuxInstall,
+} from "../src/platform";
 
 test("inferCodexChannel detects stable and beta metadata", () => {
   assert.equal(inferCodexChannel("com.openai.codex", "Codex"), "stable");
@@ -13,7 +18,7 @@ test("inferCodexChannel detects stable and beta metadata", () => {
 });
 
 test("locateCodex reads beta bundle metadata from override path on macOS", { skip: process.platform !== "darwin" }, () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-platform-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-platform-"));
   try {
     const app = join(root, "Codex (Beta).app");
     mkdirSync(join(app, "Contents", "Resources"), { recursive: true });
@@ -43,8 +48,15 @@ test("locateCodex reads beta bundle metadata from override path on macOS", { ski
   }
 });
 
+test("exact-path lookup never falls back to another installed desktop", { skip: process.platform !== "darwin" }, () => {
+  assert.throws(
+    () => locateCodexAtExactPath("/path/that/does/not/exist/ChatGPT.app"),
+    /Exact Codex app path is not a valid com\.openai\.codex bundle/,
+  );
+});
+
 test("resolveLinuxInstall supports am-will codex-app install directory", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-platform-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-platform-"));
   try {
     const app = join(root, "codex-desktop");
     mkdirSync(join(app, "resources"), { recursive: true });
@@ -63,7 +75,7 @@ test("resolveLinuxInstall supports am-will codex-app install directory", () => {
 });
 
 test("resolveLinuxInstall accepts a launcher symlink override", { skip: process.platform === "win32" }, () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-platform-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-platform-"));
   try {
     const app = join(root, "codex-desktop");
     const bin = join(root, "bin");

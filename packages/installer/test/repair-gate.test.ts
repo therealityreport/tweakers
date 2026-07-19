@@ -7,12 +7,16 @@ import {
   isConfirmedOfficialUpdateDrift,
   OFFICIAL_CODEX_BUNDLE_ID,
   repair,
+  repairWithOutcome,
   type OfficialUpdateDriftInput,
 } from "../src/commands/repair";
 import { readDeferredRepair, writeDeferredRepair } from "../src/deferred-repair";
 import { ensureUserPaths } from "../src/paths";
 import { readState, writeState, type InstallerState } from "../src/state";
 import { transactionLockFile } from "../src/transaction";
+import { readAutoRepairState } from "../src/auto-repair-state";
+import { lifecycleLockFile } from "../src/lifecycle-lock";
+import { acquireProcessLock } from "../src/process-lock";
 
 const APP = "/Applications/ChatGPT.app";
 
@@ -34,7 +38,7 @@ function makeInput(overrides: Partial<OfficialUpdateDriftInput> = {}): OfficialU
     },
     watcherRepair: true,
     force: false,
-    updateModeFile: join(tmpdir(), "codexpp-nonexistent-update-mode.json"),
+    updateModeFile: join(tmpdir(), "tweaker-nonexistent-update-mode.json"),
     readVersion: () => "26.707.51957",
     verifyAppSignature: () => ({
       ok: true,
@@ -47,6 +51,32 @@ function makeInput(overrides: Partial<OfficialUpdateDriftInput> = {}): OfficialU
 
 test("all conditions true → coordinated quit eligible", () => {
   assert.equal(isConfirmedOfficialUpdateDrift(makeInput()), true);
+});
+
+test("repair owns the shared lifecycle lease before any fast-path mutation", async () => {
+  await withTweakersHome(async (root) => {
+    const lock = acquireProcessLock(lifecycleLockFile(root));
+    let reconciled = 0;
+    let installed = 0;
+    try {
+      await assert.rejects(
+        repairWithOutcome({ quiet: true }, {
+          reconcileCliShims: () => { reconciled += 1; },
+          install: async () => { installed += 1; },
+        }),
+        /Another Tweakers lifecycle operation is active/i,
+      );
+      const watcher = await repairWithOutcome({ watcher: true, quiet: true }, {
+        reconcileCliShims: () => { reconciled += 1; },
+        install: async () => { installed += 1; },
+      });
+      assert.deepEqual(watcher, { status: "deferred", reason: "active-transaction" });
+      assert.equal(reconciled, 0);
+      assert.equal(installed, 0);
+    } finally {
+      lock.release();
+    }
+  });
 });
 
 test("non-watcher execution → passive hold", () => {
@@ -107,7 +137,7 @@ test("bad signature and no fresh update-mode marker → passive hold", () => {
 });
 
 test("fresh update-mode marker substitutes for the signature check; stale does not", () => {
-  const dir = mkdtempSync(join(tmpdir(), "codexpp-update-mode-"));
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-update-mode-"));
   try {
     const file = join(dir, "update-mode.json");
     const badSignature = () => ({ ok: false, adHoc: true, authority: [] as string[] });
@@ -224,6 +254,7 @@ test("watcher repair yields while a local refresh holds the lock", async () => {
         install: async () => {
           counts.installs += 1;
         },
+        reconcileCliShims: () => assert.fail("watcher repair must not reconcile public CLI shims"),
       },
     );
 
@@ -264,7 +295,7 @@ test("watcher repair yields while an install transaction lock is held", async ()
   });
 });
 
-test("unchanged asar watcher pass skips all heavy repair work", async () => {
+test("unchanged asar without verified active runtime bytes enters repair instead of using the fast path", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
     seedRepairState(root, fixture);
@@ -295,16 +326,156 @@ test("unchanged asar watcher pass skips all heavy repair work", async () => {
       },
     );
 
-    assert.equal(counts.header, 0);
-    assert.equal(counts.tree, 0);
-    assert.equal(counts.settle, 0);
-    assert.equal(counts.processes, 0);
+    assert.equal(counts.header, 1);
+    assert.equal(counts.tree, 1);
+    assert.equal(counts.settle, 1);
+    assert.equal(counts.processes, 1);
     assert.equal(counts.installs, 0);
-    assert.equal(readState(join(root, "state.json"))?.watcherStatGuardPasses, 1);
+    assert.equal(readState(join(root, "state.json"))?.watcherStatGuardPasses, 0);
   });
 });
 
-test("sixth unchanged asar watcher pass runs hygiene without an osascript scan", async () => {
+test("unchanged asar plus equal runtime fingerprint preserves the zero-tree fast path", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture);
+    let treeChecks = 0;
+
+    await repair({ watcher: true, quiet: true }, {
+      statAsar: () => fixture.asarStat,
+      readExpectedRuntimeFingerprint: () => "same",
+      readActiveRuntimeFingerprint: () => "same",
+      isAppRunning: () => true,
+      runtimeAssetsMatch: () => {
+        treeChecks += 1;
+        return true;
+      },
+    });
+
+    assert.equal(treeChecks, 0);
+    assert.equal(readAutoRepairState(root)?.runtime?.status, "current");
+  });
+});
+
+test("unchanged asar plus runtime drift records pending while the app is running", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture);
+    let settles = 0;
+    let installs = 0;
+
+    const outcome = await repairWithOutcome({ watcher: true, quiet: true }, {
+      statAsar: () => fixture.asarStat,
+      readExpectedRuntimeFingerprint: () => "new",
+      readActiveRuntimeFingerprint: () => "old",
+      isAppRunning: () => true,
+      waitForSettle: async () => { settles += 1; },
+      install: async () => { installs += 1; },
+    });
+
+    assert.equal(settles, 0);
+    assert.equal(installs, 0);
+    assert.deepEqual(outcome, { status: "deferred", reason: "runtime-drift-app-running" });
+    assert.deepEqual(readAutoRepairState(root)?.runtime, {
+      status: "pending",
+      expectedFingerprint: "new",
+      activeFingerprint: "old",
+      checkedAt: readAutoRepairState(root)?.runtime?.checkedAt,
+      error: null,
+    });
+  });
+});
+
+test("unchanged asar plus runtime drift stages verified assets after the app closes", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture);
+    let treeChecks = 0;
+    let staged = 0;
+
+    await repair({ watcher: true, quiet: true }, {
+      statAsar: () => fixture.asarStat,
+      readExpectedRuntimeFingerprint: () => "new",
+      readActiveRuntimeFingerprint: () => staged > 0 ? "new" : "old",
+      isAppRunning: () => false,
+      waitForSettle: async () => {},
+      readHeaderHash: () => ({ headerHash: "patched", header: {} }),
+      readAsarPatchSchema: () => "current",
+      runtimeAssetsMatch: () => {
+        treeChecks += 1;
+        return false;
+      },
+      stageAssets: () => { staged += 1; },
+      stageBundledTweaks: () => {},
+      listProcesses: () => [],
+    });
+
+    assert.equal(treeChecks, 1);
+    assert.equal(staged, 1);
+    assert.equal(readAutoRepairState(root)?.runtime?.status, "current");
+  });
+});
+
+test("runtime staging without portable fingerprints remains unknown rather than falsely current", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture, 5);
+    let staged = 0;
+
+    await repair({ watcher: true, quiet: true }, {
+      statAsar: () => fixture.asarStat,
+      readExpectedRuntimeFingerprint: () => null,
+      readActiveRuntimeFingerprint: () => null,
+      isAppRunning: () => false,
+      waitForSettle: async () => {},
+      readHeaderHash: () => ({ headerHash: "patched", header: {} }),
+      readAsarPatchSchema: () => "current",
+      runtimeAssetsMatch: () => false,
+      stageAssets: () => { staged += 1; },
+      stageBundledTweaks: () => {},
+      listProcesses: () => [],
+    });
+
+    assert.equal(staged, 1);
+    assert.deepEqual(readAutoRepairState(root)?.runtime, {
+      status: "unknown",
+      expectedFingerprint: null,
+      activeFingerprint: null,
+      checkedAt: readAutoRepairState(root)?.runtime?.checkedAt,
+      error: null,
+    });
+  });
+});
+
+test("failed runtime staging keeps drift pending with an actionable receipt", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture);
+
+    await assert.rejects(
+      repair({ watcher: true, quiet: true }, {
+        statAsar: () => fixture.asarStat,
+        readExpectedRuntimeFingerprint: () => "new",
+        readActiveRuntimeFingerprint: () => "old",
+        isAppRunning: () => false,
+        waitForSettle: async () => {},
+        readHeaderHash: () => ({ headerHash: "patched", header: {} }),
+        readAsarPatchSchema: () => "current",
+        runtimeAssetsMatch: () => false,
+        stageAssets: () => { throw new Error("atomic replacement failed"); },
+        stageBundledTweaks: () => {},
+        listProcesses: () => [],
+      }),
+      /atomic replacement failed/,
+    );
+
+    assert.equal(readAutoRepairState(root)?.runtime?.status, "failed");
+    assert.equal(readAutoRepairState(root)?.runtime?.activeFingerprint, "old");
+    assert.match(readAutoRepairState(root)?.runtime?.error ?? "", /atomic replacement failed/);
+  });
+});
+
+test("sixth unchanged asar pass without fingerprints runs bounded heavy verification", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
     seedRepairState(root, fixture, 5);
@@ -333,9 +504,9 @@ test("sixth unchanged asar watcher pass runs hygiene without an osascript scan",
     );
 
     assert.equal(counts.processes, 1);
-    assert.equal(counts.header, 0);
-    assert.equal(counts.tree, 0);
-    assert.equal(counts.settle, 0);
+    assert.equal(counts.header, 1);
+    assert.equal(counts.tree, 1);
+    assert.equal(counts.settle, 1);
     assert.equal(readState(join(root, "state.json"))?.watcherStatGuardPasses, 0);
   });
 });
@@ -346,6 +517,7 @@ test("changed asar stat falls through to the normal repair path", async () => {
     seedRepairState(root, fixture);
     let settles = 0;
     let installs = 0;
+    let delegatedReconcile: boolean | undefined;
 
     await repair(
       { watcher: true, quiet: true },
@@ -356,14 +528,17 @@ test("changed asar stat falls through to the normal repair path", async () => {
         },
         readHeaderHash: () => ({ headerHash: "changed", header: {} }),
         signingAvailable: () => true,
-        install: async () => {
+        reconcileCliShims: () => assert.fail("unblocked watcher repair must not reconcile public CLI shims"),
+        install: async (options) => {
           installs += 1;
+          delegatedReconcile = options.reconcileCliShims;
         },
       },
     );
 
     assert.ok(settles >= 1);
     assert.equal(installs, 1);
+    assert.equal(delegatedReconcile, false);
   });
 });
 
@@ -427,6 +602,7 @@ test("interactive repair clears a deferred marker after install succeeds", async
         install: async () => { installs += 1; },
         signingAvailable: () => true,
         notifySigningUnavailable: () => assert.fail("interactive repair must not notify"),
+        reconcileCliShims: () => {},
       },
     );
 

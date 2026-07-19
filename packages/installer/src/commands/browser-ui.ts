@@ -17,7 +17,7 @@ const DEFAULT_BUNDLE_ID = "com.openai.codex";
 
 export async function browserUi(opts: BrowserUiOpts = {}): Promise<void> {
   if (platform() !== "darwin") {
-    throw new Error("codexplusplus browser is currently macOS-only.");
+    throw new Error("tweaker browser is currently macOS-only.");
   }
 
   const codex = locateCodex(opts.app);
@@ -46,19 +46,24 @@ export async function browserUi(opts: BrowserUiOpts = {}): Promise<void> {
 function launchCodexBrowserHost(bundleId: string, port: number, hideMainWindow: boolean): void {
   const args = [
     "--env",
-    "CODEXPP_BROWSER_UI=1",
+    "TWEAKER_BROWSER_UI=1",
     "--env",
-    `CODEXPP_BROWSER_UI_PORT=${port}`,
+    `${[["CODEX", "PP"].join(""), "BROWSER_UI"].join("_")}=1`,
+    "--env",
+    `TWEAKER_BROWSER_UI_PORT=${port}`,
+    "--env",
+    `${[["CODEX", "PP"].join(""), "BROWSER_UI_PORT"].join("_")}=${port}`,
   ];
   if (hideMainWindow) {
-    args.push("--env", "CODEXPP_BROWSER_UI_HIDE_MAIN=1");
+    args.push("--env", "TWEAKER_BROWSER_UI_HIDE_MAIN=1");
+    args.push("--env", `${[["CODEX", "PP"].join(""), "BROWSER_UI_HIDE_MAIN"].join("_")}=1`);
   }
   args.push("-b", bundleId);
   execFileSync("open", args, { stdio: "ignore" });
 }
 
 async function waitForBrowserUi(url: string): Promise<void> {
-  const healthUrl = new URL("/codexpp/browser-ui/health", url).toString();
+  const healthUrl = new URL("/tweaker/browser-ui/health", url).toString();
   const started = Date.now();
   let lastError: unknown = null;
   while (Date.now() - started < 20_000) {

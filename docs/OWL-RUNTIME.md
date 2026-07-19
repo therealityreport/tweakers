@@ -1,18 +1,18 @@
 # Owl Runtime Surface
 
-This documents the Owl runtime surface Codex++ can observe in the current
+This documents the Owl runtime surface Tweaker can observe in the current
 packaged Codex app. It is based on the local stable app at Codex
 `26.527.31326`.
 
 Owl is private upstream implementation detail. Treat every API below as
-unstable unless it is wrapped by `@codex-plusplus/sdk`.
+unstable unless it is wrapped by `@therealityreport/tweakers-sdk`.
 
 See [Owl Bridge Roadmap](./OWL-BRIDGE-ROADMAP.md) for the plan to turn this
-private surface into stable Codex++ APIs.
+private surface into stable Tweaker APIs.
 
 ## Runtime Detection
 
-On macOS, Codex++ reports `runtime.type = "owl"` when the app bundle contains:
+On macOS, Tweaker reports `runtime.type = "owl"` when the app bundle contains:
 
 ```text
 Codex.app/Contents/Frameworks/Codex Framework.framework
@@ -32,7 +32,7 @@ scripts such as `owl`, `build:owl`, and `owl:package`.
 
 ## What Owl Is
 
-For Codex++ purposes, Owl is a native Codex shell plus a Chromium runtime that
+For Tweaker purposes, Owl is a native Codex shell plus a Chromium runtime that
 keeps enough Electron compatibility for the existing desktop JavaScript app to
 run.
 
@@ -58,16 +58,16 @@ nodeIntegration: false;
 CDP is still available because Owl is Chromium-based. It is not enabled by
 default.
 
-Codex++ enables CDP before `app.whenReady()` when:
+Tweaker enables CDP before `app.whenReady()` when:
 
 ```sh
-CODEXPP_REMOTE_DEBUG=1
+TWEAKER_REMOTE_DEBUG=1
 ```
 
 Launch Codex with CDP enabled:
 
 ```sh
-open --env CODEXPP_REMOTE_DEBUG=1 --env CODEXPP_REMOTE_DEBUG_PORT=9222 -a Codex
+open --env TWEAKER_REMOTE_DEBUG=1 --env TWEAKER_REMOTE_DEBUG_PORT=9222 -a Codex
 ```
 
 List targets:
@@ -80,7 +80,7 @@ The app page target normally has an `app://-/index.html?...` URL.
 
 ## Electron Compatibility
 
-The main process can still `require("electron")`. Codex++ currently imports and
+The main process can still `require("electron")`. Tweaker currently imports and
 uses these Electron-compatible exports:
 
 ```ts
@@ -129,7 +129,7 @@ webContents
 ```
 
 This does not mean every Electron API behaves identically to stock Electron.
-Use Codex++ wrappers where possible, and probe before relying on a new Electron
+Use Tweaker wrappers where possible, and probe before relying on a new Electron
 export.
 
 The current main bundle also uses normal Node APIs:
@@ -225,17 +225,17 @@ and forwards that port to:
 codex_desktop:connect-app-host
 ```
 
-Codex++ renderer tweaks should not call `electronBridge` directly unless they
+Tweaker renderer tweaks should not call `electronBridge` directly unless they
 are intentionally targeting private Codex internals. Prefer the tweak SDK and
 DOM APIs.
 
 ## Main Window Services
 
-Codex++ patches the current Owl main bundle so the Codex window-services object
+Tweaker patches the current Owl main bundle so the Codex window-services object
 is available at:
 
 ```ts
-globalThis.__codexpp_window_services__
+globalThis.__tweaker_window_services__
 ```
 
 Observed top-level shape:
@@ -266,7 +266,7 @@ interface OwlWindowServices {
 }
 ```
 
-Codex++ currently uses this object only through guarded runtime code. The SDK
+Tweaker currently uses this object only through guarded runtime code. The SDK
 does not expose the full private object to tweaks.
 
 ## Window Manager
@@ -394,7 +394,7 @@ interface OwlCreateWindowOptions {
 `createWindow()` installs Codex's own preload, registers diagnostics and native
 context menus, tracks the window under a `hostId`, and loads the app route.
 
-## Codex++ Stable Wrappers
+## Tweaker Stable Wrappers
 
 The stable tweak-facing surface is namespaced and serialized. Tweaks receive
 capabilities and handles, never raw Owl service objects:
@@ -428,7 +428,7 @@ const panel = await api.codex.native.createPanel({
 `contentView.addChildView(view.webContentsView)` path when available and falls
 back to `BrowserWindow.addBrowserView(view)`.
 
-`createPanel()` and `attachView()` use the bundled Codex++ native host when
+`createPanel()` and `attachView()` use the bundled Tweaker native host when
 `moduleId` is omitted. Tweak-owned `.node` modules can still be loaded with
 `api.codex.native.loadModule()` when a tweak needs custom Swift/Objective-C++.
 

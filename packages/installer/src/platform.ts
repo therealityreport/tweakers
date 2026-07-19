@@ -51,6 +51,21 @@ export function locateCodex(override?: string): CodexInstall {
   return locateLinux(override);
 }
 
+/**
+ * Resolve one concrete macOS desktop bundle without discovery or fallback.
+ * Environment transitions must never silently launch a different installed
+ * copy when their selected path disappears or changes identity.
+ */
+export function locateCodexAtExactPath(appRoot: string): CodexInstall {
+  if (detectPlatform() !== "darwin") {
+    throw new Error("Exact Codex desktop paths are currently supported only on macOS.");
+  }
+  if (!isMacCodexApp(appRoot)) {
+    throw new Error(`Exact Codex app path is not a valid com.openai.codex bundle: ${appRoot}`);
+  }
+  return macInstallAtRoot(appRoot);
+}
+
 function locateMac(override?: string): CodexInstall {
   const candidates = [
     override,
@@ -73,9 +88,13 @@ function locateMac(override?: string): CodexInstall {
         `Ensure the Codex / ChatGPT desktop app (bundle id com.openai.codex) is installed in /Applications or ~/Applications.\n` +
         `Tried:\n  ${unique(candidates).join("\n  ")}\n\n` +
         `If it is somewhere else, rerun with:\n` +
-        `  tweakers install --app "/path/to/ChatGPT.app"`,
+        `  tweaker install --app "/path/to/ChatGPT.app"`,
     );
   }
+  return macInstallAtRoot(appRoot);
+}
+
+function macInstallAtRoot(appRoot: string): CodexInstall {
   const info = readMacAppInfo(appRoot);
   const resourcesDir = join(appRoot, "Contents", "Resources");
   return {
@@ -285,7 +304,7 @@ function ensureWindowsStoreMirror(storeAppRoot: string): string {
   const packageRoot = dirname(sourceAppRoot);
   const packageName = basename(packageRoot);
   const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-  const mirrorAppRoot = join(local, "codex-plusplus", "store-apps", packageName, "app");
+  const mirrorAppRoot = join(local, "tweaker", "store-apps", packageName, "app");
   mirrorDirectory(sourceAppRoot, mirrorAppRoot);
   return mirrorAppRoot;
 }

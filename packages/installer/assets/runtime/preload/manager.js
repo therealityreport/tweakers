@@ -12,18 +12,18 @@ exports.mountManager = mountManager;
 const electron_1 = require("electron");
 const settings_injector_1 = require("./settings-injector");
 async function mountManager() {
-    const tweaks = (await electron_1.ipcRenderer.invoke("codexpp:list-tweaks"));
-    const paths = (await electron_1.ipcRenderer.invoke("codexpp:user-paths"));
+    const tweaks = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
+    const paths = (await electron_1.ipcRenderer.invoke("tweaker:user-paths"));
     (0, settings_injector_1.registerSection)({
-        id: "codex-plusplus:manager",
+        id: "tweaker:manager",
         title: "Tweak Manager",
         description: `${tweaks.length} tweak(s) installed. User dir: ${paths.userRoot}`,
         render(root) {
             root.style.cssText = "display:flex;flex-direction:column;gap:8px;";
             const actions = document.createElement("div");
             actions.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
-            actions.appendChild(button("Open tweaks folder", () => electron_1.ipcRenderer.invoke("codexpp:reveal", paths.tweaksDir).catch(() => { })));
-            actions.appendChild(button("Open logs", () => electron_1.ipcRenderer.invoke("codexpp:reveal", paths.logDir).catch(() => { })));
+            actions.appendChild(button("Open tweaks folder", () => electron_1.ipcRenderer.invoke("tweaker:reveal", paths.tweaksDir).catch(() => { })));
+            actions.appendChild(button("Open logs", () => electron_1.ipcRenderer.invoke("tweaker:reveal", paths.logDir).catch(() => { })));
             actions.appendChild(button("Reload window", () => location.reload()));
             root.appendChild(actions);
             if (tweaks.length === 0) {

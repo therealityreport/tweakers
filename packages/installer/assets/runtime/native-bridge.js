@@ -269,7 +269,7 @@ class NativeBridge {
             this.syncParentState(instance, parentWindow, "created");
         }
         this.log("info", `created native ${kind} ${ctx.id}:${id}`, {
-            moduleId: moduleId ?? "codexpp.native-host",
+            moduleId: moduleId ?? "tweaker.native-host",
             factory,
             windowId,
         });

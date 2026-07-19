@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -52,7 +53,7 @@ test("switcher offers a coordinated development reload only in Tweakers mode", (
   assert.match(source, /refreshCli\[refreshCli\.count - 1\] = developmentCli/);
   assert.match(source, /build the registered development checkout and validate a disposable candidate while ChatGPT remains open/);
   assert.match(source, /If validation or promotion fails, the current app is kept or restored/);
-  assert.match(source, /tweakers dev-sync/);
+  assert.match(source, /tweaker dev-sync/);
   assert.match(source, /if \(!TWSSpawnDetached\(argv\)\)/);
 });
 
@@ -62,6 +63,65 @@ test("switcher gives development refreshes the configured Node toolchain PATH", 
   assert.match(source, /childEnv\[@"PATH"\] = \[NSString stringWithFormat:@"%@:%@", runtimeBin, existingPath\]/);
   assert.match(source, /posix_spawn\(&pid, cargv\[0\], &actions, &attr, cargv, cenv\)/);
   assert.doesNotMatch(source, /posix_spawn\([^;]*cargv, environ\)/);
+});
+
+test("switcher delegates preparation, confirmation, and verified restart to the mode coordinator", () => {
+  const source = readFileSync(join(process.cwd(), "packages/switcher/src/tweakers_switcher.m"), "utf8");
+  assert.match(source, /arrayByAddingObjectsFromArray:@\[ @"mode", target \]/);
+  assert.doesNotMatch(source, /@"mode", target, @"--yes"/);
+  assert.doesNotMatch(source, /confirm\.messageText[\s\S]*Switch to Tweakers mode/);
+});
+
+test("switcher reports cached desktop update truth independently of app mode", () => {
+  const source = readFileSync(join(process.cwd(), "packages/switcher/src/tweakers_switcher.m"), "utf8");
+  assert.match(source, /TWSDesktopUpdateStatusFromMetadata/);
+  assert.match(source, /@"codexAppcastCache"/);
+  assert.match(source, /@"Contents\/Info\.plist"/);
+  assert.match(source, /TWSAppcastFreshnessSeconds = 24 \* 60 \* 60/);
+  assert.match(
+    source,
+    /TWSDesktopUpdateStatus \*desktopUpdate = TWSCurrentDesktopUpdateStatus\(\);[\s\S]*addItemWithTitle:TWSDesktopUpdateMenuTitle\(desktopUpdate\)[\s\S]*if \(\[_mode isEqualToString:TWSModeTweakers\]\)/,
+  );
+  assert.doesNotMatch(source, /NSURLSession|dataTaskWithRequest|dataTaskWithURL/);
+});
+
+test("switcher desktop update comparison handles current, available, missing, and stale data", {
+  skip: process.platform !== "darwin",
+}, (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "tweakers-switcher-update-test-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const binary = join(directory, "desktop-update-regression");
+  const sdk = spawnSync("xcrun", ["--show-sdk-path"], { encoding: "utf8" });
+  assert.equal(sdk.status, 0, `xcrun --show-sdk-path failed: ${sdk.stderr}`);
+  const compile = spawnSync("xcrun", [
+    "clang",
+    "-fobjc-arc",
+    "-mmacosx-version-min=13.0",
+    "-isysroot",
+    sdk.stdout.trim(),
+    "-framework",
+    "AppKit",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Security",
+    join(process.cwd(), "packages/switcher/test/desktop_update_harness.m"),
+    "-o",
+    binary,
+  ], { encoding: "utf8" });
+  assert.equal(compile.status, 0, `desktop update harness compile failed: ${compile.stderr}`);
+
+  const run = spawnSync(binary, [], { encoding: "utf8" });
+  assert.equal(run.status, 0, `desktop update harness failed: ${run.stderr}`);
+  assert.match(run.stdout, /desktop update regression checks passed/);
+});
+
+test("switcher mode indicator uses live bundle evidence instead of state.mode", () => {
+  const source = readFileSync(join(process.cwd(), "packages/switcher/src/tweakers_switcher.m"), "utf8");
+  assert.match(source, /TWSLiveAsarIntegrityHash/);
+  assert.match(source, /TWSHasValidOpenAISignature/);
+  assert.match(source, /TWSModeFromEvidence/);
+  assert.doesNotMatch(source, /return mode;/);
 });
 
 test("switcher app passes ad-hoc codesign verification", { skip: process.platform !== "darwin" }, () => {

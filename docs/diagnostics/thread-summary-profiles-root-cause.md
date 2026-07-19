@@ -65,7 +65,7 @@ The current renderer is
 - Projects `revision` included in the render signature;
 - deep route observation and cleanup of mounts, listeners, observer, and style;
 - existing mount invalidation on project route and
-  `codexpp:projects-revision` changes.
+  `tweaker:projects-revision` changes.
 
 Run the current regression suite from this repository:
 

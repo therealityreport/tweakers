@@ -46,11 +46,16 @@ import {
   tweaksPageCounts,
   type TweaksPageFilter,
 } from "./tweaks-page-model";
-import { appModeLabel, type AppModeTarget } from "../app-mode";
+import {
+  ConfigCardUpdateCoordinator,
+  createEnvironmentConfigController,
+  desktopUpdateStatusPresentation,
+  restoreEnvironmentFocus,
+  type EnvironmentConfirmationDecision,
+} from "./environment-config-controller";
 import type {
   CodexCliLane,
   CodexCliVersionState,
-  CodexDesktopVersionState,
   CodexFeatureEntry,
   CodexFeatureStage,
   CodexInstallProgress,
@@ -85,18 +90,18 @@ interface TweakUpdateCheck {
   error?: string;
 }
 
-interface CodexPlusPlusConfig {
+interface TweakerConfig {
   version: string;
   autoUpdate: boolean;
   updateChannel: SelfUpdateChannel;
   updateRepo: string;
   updateRef: string;
-  updateCheck: CodexPlusPlusUpdateCheck | null;
+  updateCheck: TweakerUpdateCheck | null;
   selfUpdate: SelfUpdateState | null;
   installationSource: InstallationSource;
 }
 
-interface CodexPlusPlusUpdateCheck {
+interface TweakerUpdateCheck {
   checkedAt: string;
   currentVersion: string;
   latestVersion: string | null;
@@ -130,6 +135,140 @@ interface InstallationSource {
   detail: string;
 }
 
+type EnvironmentAppExperience = "chatgpt" | "tweakers";
+type EnvironmentReleaseProfile = "stable" | "alpha";
+
+interface EnvironmentSelection {
+  appExperience: EnvironmentAppExperience;
+  releaseProfile: EnvironmentReleaseProfile;
+  selectedDesktopPath?: string;
+  selectedDesktopBundleId?: string;
+  backendLane?: string;
+  requestedAt?: string;
+  appliedAt?: string | null;
+}
+
+interface EnvironmentChannelStatus {
+  available: boolean;
+  unavailableReasons?: string[];
+  availability?: Record<EnvironmentAppExperience, {
+    available: boolean;
+    unavailableReasons?: string[];
+  }>;
+  selectedDesktopPath?: string;
+  selectedDesktopBundleId?: string;
+  releaseProfile: EnvironmentReleaseProfile;
+}
+
+interface EnvironmentStatus {
+  schemaVersion: 1;
+  selected: EnvironmentSelection;
+  channels: Record<EnvironmentReleaseProfile, EnvironmentChannelStatus>;
+  observation?: {
+    appExperience: EnvironmentAppExperience | null;
+    selectionDrift: boolean;
+    lifecycleContended: boolean;
+    commitJournalPresent: boolean;
+    transitionJournalPresent: boolean;
+    freshness: "current" | "contended";
+  };
+}
+
+interface EnvironmentHelperSubmission {
+  kind?: "environment-commit-helper";
+  transactionId: string;
+  phase: "submitted" | "submit-failed";
+  error?: string | null;
+}
+
+interface EnvironmentHelperOutcome {
+  phase?: "not-started" | "running" | "succeeded" | "failed";
+  exitCode?: number | null;
+  error?: string | null;
+}
+
+interface EnvironmentHelperStatus {
+  submission?: EnvironmentHelperSubmission | null;
+  outcome?: EnvironmentHelperOutcome | null;
+  stdout?: string | null;
+  stderr?: string | null;
+}
+
+interface EnvironmentTransaction {
+  schemaVersion?: 1;
+  transactionId: string;
+  phase: string;
+  error: string | null;
+  source?: EnvironmentSelection;
+  requested?: EnvironmentSelection;
+  prepared?: {
+    candidate?: {
+      desktopPath?: string;
+      bundleId?: string;
+      version?: string;
+      build?: string;
+    };
+    backend?: {
+      lane?: string;
+      binaryPath?: string;
+      version?: string;
+    };
+    rollback?: {
+      selection?: EnvironmentSelection;
+      desktopPath?: string;
+      backendLane?: string;
+    };
+  } | null;
+  helper?: EnvironmentHelperStatus | null;
+  updatedAt?: string;
+}
+
+interface McpSyncState {
+  status?: string;
+  summary?: string;
+  checkedAt?: string;
+  completedAt?: string;
+  desiredNames?: string[];
+  appliedNames?: string[];
+  conflicts?: Array<{
+    name?: string;
+    observedName?: string;
+    canonicalName?: string;
+    detail?: string;
+    reason?: string;
+  }>;
+  restartRequired?: boolean;
+  error?: string;
+}
+
+interface DesktopUpdateCheckResult {
+  status?: "update-available" | "current" | "stale" | "unavailable" | "error";
+  profile?: "stable" | "alpha" | null;
+  installed?: { marketingVersion?: string | null; build?: string | null };
+  latest?: { marketingVersion?: string | null; build?: string | null };
+  reason?: string | null;
+  checkedAt?: string;
+  updateAndReloadRequested?: boolean;
+  nativeUpdateControlActive?: boolean;
+  javaScriptUpdaterManagerAvailable?: boolean;
+  javaScriptUpdaterManagerReason?: string | null;
+  setupRequired?: "register-beta" | "launch-beta" | null;
+}
+
+interface DesktopUpdateTransactionState {
+  schemaVersion?: 1;
+  kind?: "desktop-update";
+  transactionId: string | null;
+  phase: string;
+  ownerPid?: number;
+  safeOfficialMode?: boolean;
+  resumable?: boolean;
+  nativeUpdateHandoffAt?: string | null;
+  refreshSource?: "development" | "stable" | null;
+  error?: string | null;
+  updatedAt?: string;
+}
+
 type CodexUiReload = (mode?: "operation-start" | "operation-stop") => void;
 
 interface WatcherHealth {
@@ -139,6 +278,14 @@ interface WatcherHealth {
   summary: string;
   watcher: string;
   checks: WatcherHealthCheck[];
+  latestCompletedCycle?: WatcherCycleReceipt;
+}
+
+interface WatcherCycleReceipt {
+  cycleId: string;
+  completedAt: string;
+  outcome: "completed" | "failed";
+  repair: { status: "succeeded" | "failed" | "skipped" | "pending"; error: string | null };
 }
 
 interface WatcherHealthCheck {
@@ -212,7 +359,7 @@ interface InjectorState {
   navGroup: HTMLElement | null;
   navButtons: Partial<Record<BuiltinPage, HTMLButtonElement>> | null;
   /** Sidebar update pill shown only when GitHub has a newer Tweakers release. */
-  codexPlusPlusUpdateButton: HTMLButtonElement | null;
+  tweakerUpdateButton: HTMLButtonElement | null;
   /** Our "Tweaks" nav group (per-tweak pages). Created lazily. */
   pagesGroup: HTMLElement | null;
   pagesGroupKey: string | null;
@@ -242,7 +389,7 @@ const state: InjectorState = {
   nativeNavHeader: null,
   navGroup: null,
   navButtons: null,
-  codexPlusPlusUpdateButton: null,
+  tweakerUpdateButton: null,
   pagesGroup: null,
   pagesGroupKey: null,
   pageNavButtons: new Map(),
@@ -266,7 +413,7 @@ let activeBuiltinPageCleanup: (() => void) | null = null;
 
 function plog(msg: string, extra?: unknown): void {
   ipcRenderer.send(
-    "codexpp:preload-log",
+    "tweaker:preload-log",
     "info",
     `[settings-injector] ${msg}${extra === undefined ? "" : " " + safeStringify(extra)}`,
   );
@@ -298,10 +445,10 @@ export function startSettingsInjector(): void {
     const orig = history[m];
     history[m] = function (this: History, ...args: Parameters<typeof orig>) {
       const r = orig.apply(this, args);
-      window.dispatchEvent(new Event(`codexpp-${m}`));
+      window.dispatchEvent(new Event(`tweaker-${m}`));
       return r;
     } as typeof orig;
-    window.addEventListener(`codexpp-${m}`, onNav);
+    window.addEventListener(`tweaker-${m}`, onNav);
   }
 
   tryInject();
@@ -530,31 +677,31 @@ function tryInject(): void {
     state.panelHost = null;
   }
 
-  const existingCodexPpNavGroup =
-    outer.querySelector<HTMLElement>(':scope > [data-codexpp="nav-group"]') ??
-    outer.querySelector<HTMLElement>('[data-codexpp="nav-group"]');
+  const existingTweakerNavGroup =
+    outer.querySelector<HTMLElement>(':scope > [data-tweaker="nav-group"]') ??
+    outer.querySelector<HTMLElement>('[data-tweaker="nav-group"]');
 
-  if (existingCodexPpNavGroup) {
-    state.navGroup = existingCodexPpNavGroup;
-    state.codexPlusPlusUpdateButton = existingCodexPpNavGroup.querySelector<HTMLButtonElement>(
-      "[data-codexpp-sidebar-update]",
+  if (existingTweakerNavGroup) {
+    state.navGroup = existingTweakerNavGroup;
+    state.tweakerUpdateButton = existingTweakerNavGroup.querySelector<HTMLButtonElement>(
+      "[data-tweaker-sidebar-update]",
     );
     state.sidebarRoot = outer;
     syncPagesGroup();
-    refreshSidebarCodexPlusPlusUpdateButton();
+    refreshSidebarTweakerUpdateButton();
     if (state.activePage !== null) syncCodexNativeNavActive(true);
     return;
   }
 
   // ── Group container ───────────────────────────────────────────────────
   const group = document.createElement("div");
-  group.dataset.codexpp = "nav-group";
+  group.dataset.tweaker = "nav-group";
   group.className = "flex flex-col gap-px";
 
   const updateButton = sidebarUpdatePillButton();
-  state.codexPlusPlusUpdateButton = updateButton;
+  state.tweakerUpdateButton = updateButton;
   group.appendChild(sidebarGroupHeader("Tweakers", "pt-3", updateButton));
-  refreshSidebarCodexPlusPlusUpdateButton();
+  refreshSidebarTweakerUpdateButton();
 
   // ── Sidebar items ────────────────────────────────────────────────────
   const configBtn = makeSidebarItem("Config", configIconSvg());
@@ -613,7 +760,7 @@ function syncNativeSettingsHeader(itemsGroup: HTMLElement, outer: HTMLElement): 
   if (state.nativeNavHeader && outer.contains(state.nativeNavHeader)) return;
 
   const header = sidebarGroupHeader("General");
-  header.dataset.codexpp = "native-nav-header";
+  header.dataset.tweaker = "native-nav-header";
   if (outer === itemsGroup) outer.prepend(header);
   else outer.insertBefore(header, itemsGroup);
   state.nativeNavHeader = header;
@@ -628,10 +775,10 @@ function bindSettingsSearch(root: HTMLElement): void {
   input.addEventListener("input", () => {
     const query = input.value.trim().toLocaleLowerCase();
     for (const button of Array.from(root.querySelectorAll<HTMLButtonElement>("button"))) {
-      if (!button.closest("[data-codexpp]")) continue;
+      if (!button.closest("[data-tweaker]")) continue;
       button.hidden = !!query && !compactSettingsText(button.textContent ?? "").toLocaleLowerCase().includes(query);
     }
-    for (const group of Array.from(root.querySelectorAll<HTMLElement>("[data-codexpp='nav-group'], [data-codexpp='pages-group']"))) {
+    for (const group of Array.from(root.querySelectorAll<HTMLElement>("[data-tweaker='nav-group'], [data-tweaker='pages-group']"))) {
       const buttons = Array.from(group.querySelectorAll<HTMLButtonElement>("button"));
       group.hidden = buttons.length > 0 && buttons.every((button) => button.hidden);
     }
@@ -662,14 +809,14 @@ function scheduleSettingsSurfaceHidden(): void {
 }
 
 function isSettingsTextVisible(): boolean {
-  return isCodexPpSettingsLabelSet(codexPpSettingsLabelsFrom(document));
+  return isTweakerSettingsLabelSet(tweakerSettingsLabelsFrom(document));
 }
 
 function compactSettingsText(value: string): string {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
-const CODEXPP_CORE_SETTINGS_LABELS = [
+const TWEAKER_CORE_SETTINGS_LABELS = [
   "General",
   "常规",
   "通用",
@@ -680,9 +827,9 @@ const CODEXPP_CORE_SETTINGS_LABELS = [
   "默认权限",
   "Personalization",
   "个性化",
-].map(normalizeCodexPpSettingsLabel);
+].map(normalizeTweakerSettingsLabel);
 
-const CODEXPP_EXTENDED_SETTINGS_LABELS = [
+const TWEAKER_EXTENDED_SETTINGS_LABELS = [
   "Account",
   "账户",
   "账号",
@@ -712,9 +859,9 @@ const CODEXPP_EXTENDED_SETTINGS_LABELS = [
   "Connections",
   "Plugins",
   "Skills",
-].map(normalizeCodexPpSettingsLabel);
+].map(normalizeTweakerSettingsLabel);
 
-const CODEXPP_SETTINGS_ONLY_LABELS = [
+const TWEAKER_SETTINGS_ONLY_LABELS = [
   "General",
   "常规",
   "通用",
@@ -739,9 +886,9 @@ const CODEXPP_SETTINGS_ONLY_LABELS = [
   "Cloud Environments",
   "Worktrees",
   "Connections",
-].map(normalizeCodexPpSettingsLabel);
+].map(normalizeTweakerSettingsLabel);
 
-const CODEXPP_MAIN_APP_NAV_LABELS = [
+const TWEAKER_MAIN_APP_NAV_LABELS = [
   "New chat",
   "Quick chat",
   "快速对话",
@@ -761,9 +908,9 @@ const CODEXPP_MAIN_APP_NAV_LABELS = [
   "Settings",
   "设置",
   "Work locally",
-].map(normalizeCodexPpSettingsLabel);
+].map(normalizeTweakerSettingsLabel);
 
-function normalizeCodexPpSettingsLabel(value: string): string {
+function normalizeTweakerSettingsLabel(value: string): string {
   return compactSettingsText(value)
     .toLocaleLowerCase()
     .normalize("NFD")
@@ -773,8 +920,8 @@ function normalizeCodexPpSettingsLabel(value: string): string {
     .trim();
 }
 
-function codexPpControlLabel(el: HTMLElement): string {
-  return normalizeCodexPpSettingsLabel(
+function tweakerControlLabel(el: HTMLElement): string {
+  return normalizeTweakerSettingsLabel(
     el.getAttribute("aria-label") ||
       el.getAttribute("title") ||
       el.textContent ||
@@ -782,7 +929,7 @@ function codexPpControlLabel(el: HTMLElement): string {
   );
 }
 
-function codexPpSettingsLabelsFrom(root: ParentNode): string[] {
+function tweakerSettingsLabelsFrom(root: ParentNode): string[] {
   const controls = Array.from(
     root.querySelectorAll<HTMLElement>("button,a,[role='button'],[role='link']"),
   );
@@ -790,57 +937,57 @@ function codexPpSettingsLabelsFrom(root: ParentNode): string[] {
   return [
     ...new Set(
       controls
-        .map(codexPpControlLabel)
+        .map(tweakerControlLabel)
         .filter(Boolean),
     ),
   ];
 }
 
-function codexPpSettingsLabelScore(labels: string[]): { core: number; total: number } {
+function tweakerSettingsLabelScore(labels: string[]): { core: number; total: number } {
   const core = new Set<string>();
   const total = new Set<string>();
 
   for (const label of labels) {
-    for (const marker of CODEXPP_CORE_SETTINGS_LABELS) {
-      if (codexPpLabelMatchesMarker(label, marker)) core.add(marker);
+    for (const marker of TWEAKER_CORE_SETTINGS_LABELS) {
+      if (tweakerLabelMatchesMarker(label, marker)) core.add(marker);
     }
 
-    for (const marker of CODEXPP_EXTENDED_SETTINGS_LABELS) {
-      if (codexPpLabelMatchesMarker(label, marker)) total.add(marker);
+    for (const marker of TWEAKER_EXTENDED_SETTINGS_LABELS) {
+      if (tweakerLabelMatchesMarker(label, marker)) total.add(marker);
     }
   }
 
   return { core: core.size, total: total.size };
 }
 
-function codexPpLabelMatchesMarker(label: string, marker: string): boolean {
+function tweakerLabelMatchesMarker(label: string, marker: string): boolean {
   return label === marker || label.includes(marker);
 }
 
-function codexPpMarkerCount(labels: string[], markers: string[]): number {
+function tweakerMarkerCount(labels: string[], markers: string[]): number {
   const matched = new Set<string>();
   for (const label of labels) {
     for (const marker of markers) {
-      if (codexPpLabelMatchesMarker(label, marker)) matched.add(marker);
+      if (tweakerLabelMatchesMarker(label, marker)) matched.add(marker);
     }
   }
   return matched.size;
 }
 
-function hasCodexPpSettingsOnlySignal(labels: string[]): boolean {
-  return codexPpMarkerCount(labels, CODEXPP_SETTINGS_ONLY_LABELS) > 0;
+function hasTweakerSettingsOnlySignal(labels: string[]): boolean {
+  return tweakerMarkerCount(labels, TWEAKER_SETTINGS_ONLY_LABELS) > 0;
 }
 
 function hasMainAppSidebarSignals(labels: string[]): boolean {
-  return codexPpMarkerCount(labels, CODEXPP_MAIN_APP_NAV_LABELS) >= 2;
+  return tweakerMarkerCount(labels, TWEAKER_MAIN_APP_NAV_LABELS) >= 2;
 }
 
-function isCodexPpSettingsLabelSet(labels: string[]): boolean {
-  const score = codexPpSettingsLabelScore(labels);
+function isTweakerSettingsLabelSet(labels: string[]): boolean {
+  const score = tweakerSettingsLabelScore(labels);
   return score.core >= 2 && score.total >= 3;
 }
 
-function codexPpVisibleBox(el: HTMLElement): DOMRect | null {
+function tweakerVisibleBox(el: HTMLElement): DOMRect | null {
   if (!el.isConnected) return null;
   const style = getComputedStyle(el);
   if (style.display === "none" || style.visibility === "hidden") return null;
@@ -855,10 +1002,10 @@ function setSettingsSurfaceVisible(visible: boolean, reason: string): void {
   state.settingsSurfaceVisible = visible;
   if (visible) warmTweakStore();
   try {
-    (window as Window & { __codexppSettingsSurfaceVisible?: boolean }).__codexppSettingsSurfaceVisible = visible;
-    document.documentElement.dataset.codexppSettingsSurface = visible ? "true" : "false";
+    (window as Window & { __tweakerSettingsSurfaceVisible?: boolean }).__tweakerSettingsSurfaceVisible = visible;
+    document.documentElement.dataset.tweakerSettingsSurface = visible ? "true" : "false";
     window.dispatchEvent(
-      new CustomEvent("codexpp:settings-surface", {
+      new CustomEvent("tweaker:settings-surface", {
         detail: { visible, reason },
       }),
     );
@@ -908,7 +1055,7 @@ function syncPagesGroup(): void {
   let group = state.pagesGroup;
   if (!group || !outer.contains(group)) {
     group = document.createElement("div");
-    group.dataset.codexpp = "pages-group";
+    group.dataset.tweaker = "pages-group";
     group.className = "flex flex-col gap-px";
     group.appendChild(sidebarGroupHeader("Tweaks", "pt-3"));
     outer.appendChild(group);
@@ -922,8 +1069,8 @@ function syncPagesGroup(): void {
   for (const p of pages) {
     const icon = p.iconSvg ?? defaultPageIconSvg();
     const btn = makeSidebarItem(p.title, icon);
-    btn.dataset.codexpp = `nav-page-${p.tweakId}`;
-    btn.dataset.codexppLifecycle = p.lifecycle;
+    btn.dataset.tweaker = `nav-page-${p.tweakId}`;
+    btn.dataset.tweakerLifecycle = p.lifecycle;
     if (p.lifecycle !== "enabled") btn.title = lifecycleLabel(p.lifecycle, p.warning);
     btn.addEventListener("click", (e) => {
       e.preventDefault();
@@ -963,7 +1110,7 @@ function makeSidebarItem(label: string, iconSvg: string): HTMLButtonElement {
   // Class string copied verbatim from Codex's sidebar buttons (General etc).
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.dataset.codexpp = `nav-${label.toLowerCase()}`;
+  btn.dataset.tweaker = `nav-${label.toLowerCase()}`;
   btn.setAttribute("aria-label", label);
   btn.className =
     "focus-visible:outline-token-border relative px-row-x py-row-y cursor-interaction shrink-0 items-center overflow-hidden rounded-lg text-left text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50 gap-2 flex w-full hover:bg-token-list-hover-background font-normal";
@@ -981,7 +1128,7 @@ function appendSidebarStoreUpdateBadge(btn: HTMLButtonElement): void {
   const inner = btn.firstElementChild as HTMLElement | null;
   if (!inner) return;
   const badge = document.createElement("span");
-  badge.dataset.codexppStoreUpdateBadge = "true";
+  badge.dataset.tweakerStoreUpdateBadge = "true";
   badge.hidden = true;
   badge.title = "Installed tweaks with approved updates";
   badge.className = "inline-flex shrink-0 items-center justify-center";
@@ -1041,7 +1188,7 @@ function syncCodexNativeNavActive(mute: boolean): void {
   const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>("button"));
   for (const btn of buttons) {
     // Skip our own buttons.
-    if (btn.dataset.codexpp) continue;
+    if (btn.dataset.tweaker) continue;
     if (btn.getAttribute("aria-current") === "page") {
       btn.removeAttribute("aria-current");
     }
@@ -1092,16 +1239,16 @@ function activatePage(page: ActivePage): void {
 
   // Hide Codex's content children, show ours.
   for (const child of Array.from(content.children) as HTMLElement[]) {
-    if (child.dataset.codexpp === "tweaks-panel") continue;
-    if (child.dataset.codexppHidden === undefined) {
-      child.dataset.codexppHidden = child.style.display || "";
+    if (child.dataset.tweaker === "tweaks-panel") continue;
+    if (child.dataset.tweakerHidden === undefined) {
+      child.dataset.tweakerHidden = child.style.display || "";
     }
     child.style.display = "none";
   }
-  let panel = content.querySelector<HTMLElement>('[data-codexpp="tweaks-panel"]');
+  let panel = content.querySelector<HTMLElement>('[data-tweaker="tweaks-panel"]');
   if (!panel) {
     panel = document.createElement("div");
-    panel.dataset.codexpp = "tweaks-panel";
+    panel.dataset.tweaker = "tweaks-panel";
     panel.style.cssText = "width:100%;height:100%;overflow:auto;";
     content.appendChild(panel);
   }
@@ -1120,7 +1267,7 @@ function activatePage(page: ActivePage): void {
       if (!target) return;
       if (state.navGroup?.contains(target)) return; // our buttons
       if (state.pagesGroup?.contains(target)) return; // our page buttons
-      if (target.closest("[data-codexpp-settings-search]")) return;
+      if (target.closest("[data-tweaker-settings-search]")) return;
       restoreCodexView();
     };
     state.sidebarRestoreHandler = handler;
@@ -1136,9 +1283,9 @@ function restoreCodexView(): void {
   if (state.panelHost) state.panelHost.style.display = "none";
   for (const child of Array.from(content.children) as HTMLElement[]) {
     if (child === state.panelHost) continue;
-    if (child.dataset.codexppHidden !== undefined) {
-      child.style.display = child.dataset.codexppHidden;
-      delete child.dataset.codexppHidden;
+    if (child.dataset.tweakerHidden !== undefined) {
+      child.style.display = child.dataset.tweakerHidden;
+      delete child.dataset.tweakerHidden;
     }
   }
   state.activePage = null;
@@ -1216,7 +1363,7 @@ function rerender(): void {
   host.appendChild(root.outer);
   if (ap.kind === "tweaks") activeBuiltinPageCleanup = renderTweaksPage(root.sectionsWrap);
   else if (ap.kind === "store") renderTweakStorePage(root.sectionsWrap, root.headerActions);
-  else renderConfigPage(root.sectionsWrap, root.subtitle);
+  else activeBuiltinPageCleanup = renderConfigPage(root.sectionsWrap, root.subtitle);
 }
 
 function teardownRenderedPages(): void {
@@ -1260,7 +1407,7 @@ function renderFallbackTweakPage(root: HTMLElement, item: SettingsNavigationItem
     row.appendChild(rowCopy("Recovery", "Clear the failure and retry this Tweaker without removing its data."));
     const recover = compactButton("Recover", () => {
       recover.disabled = true;
-      void ipcRenderer.invoke("codexpp:recover-tweak", item.tweakId).finally(() => { recover.disabled = false; });
+      void ipcRenderer.invoke("tweaker:recover-tweak", item.tweakId).finally(() => { recover.disabled = false; });
     });
     row.appendChild(recover);
     card.appendChild(row);
@@ -1285,28 +1432,32 @@ function rowCopy(title: string, detail: string): HTMLElement {
 function renderConfigPage(
   sectionsWrap: HTMLElement,
   subtitle?: HTMLElement,
-): void {
-  renderCodexVersionsSection(sectionsWrap);
-  renderModeSection(sectionsWrap);
+): () => void {
+  const cleanups: Array<() => void> = [];
+  const cardUpdates = new ConfigCardUpdateCoordinator<unknown>();
+  cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderDesktopUpdateSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
 
   const section = document.createElement("section");
   section.className = "flex flex-col gap-2";
   section.appendChild(sectionTitle("Tweakers Updates"));
   const card = roundedCard();
-  card.dataset.codexppConfigCard = "true";
+  card.dataset.tweakerConfigCard = "true";
   const loading = rowSimple("Loading update settings", "Checking current Tweakers configuration.");
   card.appendChild(loading);
   section.appendChild(card);
   sectionsWrap.appendChild(section);
 
   void ipcRenderer
-    .invoke("codexpp:get-config")
+    .invoke("tweaker:get-config")
     .then((config) => {
       if (subtitle) {
-        subtitle.textContent = `You have Tweakers ${(config as CodexPlusPlusConfig).version} installed.`;
+        subtitle.textContent = `You have Tweakers ${(config as TweakerConfig).version} installed.`;
       }
       card.textContent = "";
-      renderCodexPlusPlusConfig(card, config as CodexPlusPlusConfig);
+      renderTweakerConfig(card, config as TweakerConfig);
     })
     .catch((e) => {
       if (subtitle) subtitle.textContent = "Could not load installed Tweakers version.";
@@ -1314,14 +1465,7 @@ function renderConfigPage(
       card.appendChild(rowSimple("Could not load update settings", String(e)));
     });
 
-  const watcher = document.createElement("section");
-  watcher.className = "flex flex-col gap-2";
-  watcher.appendChild(sectionTitle("Auto-Repair Watcher"));
-  const watcherCard = roundedCard();
-  watcherCard.appendChild(rowSimple("Checking watcher", "Verifying the updater repair service."));
-  watcher.appendChild(watcherCard);
-  sectionsWrap.appendChild(watcher);
-  renderWatcherHealthCard(watcherCard);
+  renderAdvancedRuntimeSection(sectionsWrap);
 
   const maintenance = document.createElement("section");
   maintenance.className = "flex flex-col gap-2";
@@ -1331,20 +1475,1351 @@ function renderConfigPage(
   maintenanceCard.appendChild(reportBugRow());
   maintenance.appendChild(maintenanceCard);
   sectionsWrap.appendChild(maintenance);
+  return () => {
+    for (const cleanup of cleanups.splice(0)) {
+      try { cleanup(); } catch {}
+    }
+  };
 }
 
-function renderCodexVersionsSection(sectionsWrap: HTMLElement): void {
+/**
+ * Codex-native environment controls. App experience and release profile are
+ * deliberately independent selections: changing either one only stages a
+ * pending value until the user chooses Apply & Restart.
+ */
+function renderEnvironmentSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
   const section = document.createElement("section");
   section.className = "flex flex-col gap-2";
-  section.dataset.codexppCodexSection = "true";
+  section.appendChild(sectionTitle("App Mode & Desktop Release"));
+  const card = roundedCard();
+  card.dataset.tweakerEnvironmentCard = "true";
+  card.appendChild(rowSimple("Loading environment", "Checking available app experiences and release profiles."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  let environment: EnvironmentStatus | null = null;
+  let transaction: EnvironmentTransaction | null = null;
+  let externalBusy = false;
+  let environmentActionError: string | null = null;
+  let transactionPolling: ReturnType<typeof setTimeout> | null = null;
+
+  const currentSelection = (): EnvironmentSelection | null => environment?.selected ?? null;
+  const hasPendingChanges = (): boolean => environment !== null && environmentController.snapshot.hasPendingChanges;
+  const isEnvironmentBusy = (): boolean => externalBusy || environmentController.snapshot.busy;
+
+  const restorePersistedRequest = (): void => {
+    if (!transaction || (transaction.phase !== "preparing" && transaction.phase !== "prepared")) return;
+    const requested = environmentTransactionRequestedSelection(transaction);
+    if (requested) environmentController.restorePending(requested);
+  };
+
+  const scheduleEnvironmentTransactionPoll = (): void => {
+    if (transactionPolling) clearTimeout(transactionPolling);
+    transactionPolling = null;
+    if (
+      !card.isConnected
+      || !transaction
+      || environmentTransactionIsTerminal(transaction.phase)
+    ) return;
+    transactionPolling = setTimeout(() => {
+      transactionPolling = null;
+      void loadEnvironmentTransaction();
+    }, 900);
+  };
+
+  async function prepareEnvironmentSelection(
+    requested: Pick<EnvironmentSelection, "appExperience" | "releaseProfile">,
+  ): Promise<EnvironmentTransaction> {
+    cardUpdates.invalidate("environment-status");
+    const update = cardUpdates.begin("environment-transaction");
+    const prepared = await ipcRenderer.invoke("tweaker:prepare-environment", requested);
+    if (!cardUpdates.isCurrent(update)) throw new Error("Environment preparation was superseded");
+    const receipt = normalizeEnvironmentTransaction(prepared);
+    if (!receipt) throw new Error("Environment preparation returned no transaction receipt");
+    transaction = receipt;
+    scheduleEnvironmentTransactionPoll();
+    return receipt;
+  }
+
+  async function commitPreparedEnvironment(receipt: EnvironmentTransaction): Promise<void> {
+    cardUpdates.invalidate("environment-status");
+    const update = cardUpdates.begin("environment-transaction");
+    let result: unknown;
+    try {
+      result = await ipcRenderer.invoke("tweaker:commit-environment", { transactionId: receipt.transactionId });
+    } catch (error) {
+      const detail = `Could not submit environment change: ${safeUiError(error)}`;
+      transaction = { ...receipt, error: detail };
+      scheduleEnvironmentTransactionPoll();
+      throw new Error(detail);
+    }
+    if (!cardUpdates.isCurrent(update)) throw new Error("Environment coordinator submission was superseded");
+    const submission = normalizeEnvironmentHelperSubmission(result);
+    const observed = normalizeEnvironmentTransaction(result);
+    transaction = submission
+      ? {
+        ...receipt,
+        error: submission.error ?? null,
+        helper: { ...(receipt.helper ?? {}), submission },
+      }
+      : observed ?? receipt;
+    restorePersistedRequest();
+    if (submission?.phase === "submit-failed") {
+      const detail = `Could not submit environment change: ${submission.error || "Environment coordinator submission failed"}`;
+      transaction = { ...transaction, error: detail };
+      scheduleEnvironmentTransactionPoll();
+      throw new Error(detail);
+    }
+    void loadEnvironmentTransaction();
+  }
+
+  async function cancelPreparedEnvironment(receipt: EnvironmentTransaction): Promise<void> {
+    const update = cardUpdates.begin("environment-transaction");
+    try {
+      const result = await ipcRenderer.invoke("tweaker:cancel-environment", { transactionId: receipt.transactionId });
+      if (!cardUpdates.isCurrent(update)) throw new Error("Environment cancellation was superseded");
+      transaction = normalizeEnvironmentTransaction(result) ?? receipt;
+      if (transaction.phase !== "cancelled") {
+        throw new Error(`Environment cancellation returned ${transaction.phase}`);
+      }
+      scheduleEnvironmentTransactionPoll();
+    } catch (error) {
+      const detail = `Could not cancel environment transaction: ${safeUiError(error)}`;
+      transaction = { ...receipt, error: detail };
+      scheduleEnvironmentTransactionPoll();
+      throw new Error(detail);
+    }
+  }
+
+  const environmentController = createEnvironmentConfigController<EnvironmentTransaction>(
+    { appExperience: "chatgpt", releaseProfile: "stable" },
+    {
+      prepare: prepareEnvironmentSelection,
+      confirm: (requested, receipt) => openEnvironmentConfirmModal(requested, receipt),
+      commit: commitPreparedEnvironment,
+      cancel: cancelPreparedEnvironment,
+    },
+    {
+      onChange: (snapshot) => {
+        environmentActionError = snapshot.error;
+        if (card.isConnected) draw();
+      },
+    },
+  );
+
+  function openPreparedEnvironmentConfirmation(
+    requested: Pick<EnvironmentSelection, "appExperience" | "releaseProfile">,
+    receipt: EnvironmentTransaction,
+  ): void {
+    if (receipt.phase !== "prepared") return;
+    void environmentController.resumePrepared(requested, receipt);
+  }
+
+  function cancelEnvironmentTransaction(receipt: EnvironmentTransaction): void {
+    if (isEnvironmentBusy() || (receipt.phase !== "preparing" && receipt.phase !== "prepared")) return;
+    environmentActionError = null;
+    externalBusy = true;
+    draw();
+    void cancelPreparedEnvironment(receipt)
+      .then(() => {
+        const selected = currentSelection();
+        if (transaction?.phase === "cancelled" && selected) {
+          environmentController.setSelected(selected);
+        }
+      })
+      .catch((error) => {
+        environmentActionError = safeUiError(error);
+      })
+      .finally(() => {
+        externalBusy = false;
+        draw();
+      });
+  }
+
+  function recoverEnvironmentTransaction(receipt: EnvironmentTransaction): void {
+    if (isEnvironmentBusy() || !environmentTransactionCanRecover(receipt)) return;
+    environmentActionError = null;
+    externalBusy = true;
+    draw();
+    void ipcRenderer
+      .invoke("tweaker:rollback-environment", { transactionId: receipt.transactionId })
+      .then((result) => {
+        transaction = normalizeEnvironmentTransaction(result) ?? receipt;
+        environmentActionError = null;
+        externalBusy = false;
+        draw();
+        scheduleEnvironmentTransactionPoll();
+      })
+      .catch((error) => {
+        environmentActionError = `Could not recover the app mode safely: ${safeUiError(error)}`;
+        transaction = {
+          ...receipt,
+          error: environmentActionError,
+        };
+        externalBusy = false;
+        draw();
+        scheduleEnvironmentTransactionPoll();
+      });
+  }
+
+  function appendEnvironmentTransactionRow(): void {
+    if (!transaction) return;
+    const receipt = transaction;
+    const requested = environmentTransactionRequestedSelection(receipt);
+    const helperInFlight = environmentHelperIsInFlight(receipt);
+    card.appendChild(environmentTransactionRow(receipt, {
+      busy: isEnvironmentBusy(),
+      onResume: receipt.phase === "prepared" && requested && !helperInFlight
+        ? () => openPreparedEnvironmentConfirmation(requested, receipt)
+        : undefined,
+      onCancel: (receipt.phase === "preparing" || receipt.phase === "prepared") && !helperInFlight
+        ? () => cancelEnvironmentTransaction(receipt)
+        : undefined,
+      onRecover: environmentTransactionCanRecover(receipt)
+        ? () => recoverEnvironmentTransaction(receipt)
+        : undefined,
+    }));
+  }
+
+  const draw = (): void => {
+    card.textContent = "";
+    const selected = currentSelection();
+    if (!selected || !environment) {
+      card.appendChild(rowSimple("Environment unavailable", "The current environment selection could not be loaded."));
+      appendEnvironmentTransactionRow();
+      if (environmentActionError && environmentActionError !== transaction?.error) {
+        card.appendChild(rowSimple("Environment action failed", environmentActionError));
+      }
+      return;
+    }
+    const pending = environmentController.snapshot.pending;
+    const busy = isEnvironmentBusy();
+    const observedExperience = environment.observation?.appExperience;
+    const observationNeedsRepair = environment.observation !== undefined
+      && (observedExperience === null
+        || observedExperience !== selected.appExperience
+        || environment.observation.transitionJournalPresent);
+    const environmentSelectionLocked = busy
+      || observationNeedsRepair
+      || (transaction !== null && (
+        !environmentTransactionIsTerminal(transaction.phase)
+        || environmentTransactionCanRecover(transaction)
+      ));
+
+    if (observationNeedsRepair) {
+      const detail = environment.observation?.transitionJournalPresent
+        ? "A legacy mode transition is still present. Run tweaker repair in Terminal before switching."
+        : observedExperience === null || observedExperience === undefined
+          ? "The live app marker could not be verified. Run tweaker repair in Terminal before switching."
+          : `Saved mode is ${environmentExperienceLabel(selected.appExperience)}, but the live app proves ${environmentExperienceLabel(observedExperience)}. Run tweaker repair in Terminal.`;
+      card.appendChild(rowSimple("Environment needs repair", detail));
+    }
+
+    const pendingAvailability = environmentSelectionAvailability(environment, pending);
+    const chatgptAvailability = environmentSelectionAvailability(environment, {
+      appExperience: "chatgpt",
+      releaseProfile: pending.releaseProfile,
+    });
+    const tweakersAvailability = environmentSelectionAvailability(environment, {
+      appExperience: "tweakers",
+      releaseProfile: pending.releaseProfile,
+    });
+
+    card.appendChild(environmentChoiceRow(
+      "App Mode",
+      "ChatGPT disables every tweak. Tweakers restores the tweaks you previously enabled.",
+      [
+        {
+          value: "chatgpt",
+          label: "ChatGPT",
+          description: chatgptAvailability.available
+            ? "OpenAI's standard app experience."
+            : environmentUnavailableReason(chatgptAvailability, "ChatGPT is unavailable for this release profile."),
+          disabled: environmentSelectionLocked || !chatgptAvailability.available,
+          disabledReason: environmentSelectionLocked
+            ? "Finish, cancel, or recover the current environment transaction first."
+            : environmentUnavailableReason(chatgptAvailability, "ChatGPT is unavailable for this release profile."),
+        },
+        {
+          value: "tweakers",
+          label: "Tweakers",
+          description: tweakersAvailability.available
+            ? "The standard app with enabled Tweakers features."
+            : environmentUnavailableReason(tweakersAvailability, "Tweakers is unavailable for this release profile."),
+          disabled: environmentSelectionLocked || !tweakersAvailability.available,
+          disabledReason: environmentSelectionLocked
+            ? "Finish, cancel, or recover the current environment transaction first."
+            : environmentUnavailableReason(tweakersAvailability, "Tweakers is unavailable for this release profile."),
+        },
+      ],
+      pending.appExperience,
+      (value) => {
+        environmentController.stageAppExperience(value as EnvironmentAppExperience);
+      },
+    ));
+
+    const stableAvailability = environmentSelectionAvailability(environment, {
+      appExperience: pending.appExperience,
+      releaseProfile: "stable",
+    });
+    const alphaAvailability = environmentSelectionAvailability(environment, {
+      appExperience: pending.appExperience,
+      releaseProfile: "alpha",
+    });
+    const stableReason = environmentUnavailableReason(stableAvailability, "Stable is unavailable for this app experience.");
+    const alphaReason = environmentUnavailableReason(alphaAvailability, "Alpha (Pre-release) is unavailable on this Mac.");
+    card.appendChild(environmentChoiceRow(
+      "Desktop Release",
+      "Choose OpenAI's Stable or Alpha desktop app independently of app mode. Its embedded Codex backend can have a different version label.",
+      [
+        {
+          value: "stable",
+          label: "Stable",
+          description: stableAvailability.available ? "The supported stable desktop release." : stableReason,
+          disabled: environmentSelectionLocked || !stableAvailability.available,
+          disabledReason: environmentSelectionLocked
+            ? "Finish, cancel, or recover the current environment transaction first."
+            : stableReason,
+        },
+        {
+          value: "alpha",
+          label: "Alpha (Pre-release)",
+          description: alphaAvailability.available ? "OpenAI's verified pre-release desktop and matching backend." : alphaReason,
+          disabled: environmentSelectionLocked || !alphaAvailability.available,
+          disabledReason: environmentSelectionLocked
+            ? "Finish, cancel, or recover the current environment transaction first."
+            : alphaReason,
+        },
+      ],
+      pending.releaseProfile,
+      (value) => {
+        environmentController.stageReleaseProfile(value as EnvironmentReleaseProfile);
+      },
+    ));
+    if (!alphaAvailability.available) {
+      const chooser = actionRow(
+        "Alpha (Pre-release) unavailable",
+        `${alphaReason} Choose a verified OpenAI Beta app to register it for this profile.`,
+      );
+      const chooserActions = chooser.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+      const choose = compactButton("Choose Beta App…", () => {
+        if (isEnvironmentBusy()) return;
+        externalBusy = true;
+        environmentActionError = null;
+        draw();
+        void ipcRenderer.invoke("tweaker:choose-alpha-environment")
+          .then((result) => {
+            if (result && typeof result === "object" && "canceled" in result && result.canceled === true) return;
+          })
+          .catch((error) => {
+            environmentActionError = `Could not register OpenAI Beta: ${safeUiError(error)}`;
+          })
+          .finally(() => {
+            externalBusy = false;
+            void load();
+          });
+      });
+      choose.disabled = isEnvironmentBusy();
+      chooserActions?.appendChild(choose);
+      card.appendChild(chooser);
+    }
+
+    const summary = actionRow(
+      "Pending changes",
+      hasPendingChanges()
+        ? pendingAvailability.available
+          ? `${environmentExperienceLabel(pending.appExperience)} · ${environmentProfileLabel(pending.releaseProfile)} will apply after restart.`
+          : `Unavailable: ${environmentUnavailableReason(pendingAvailability, "This environment cannot be prepared.")}`
+        : `Current: ${environmentExperienceLabel(selected.appExperience)} · ${environmentProfileLabel(selected.releaseProfile)}.`,
+    );
+    const actions = summary.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+    const apply = compactButton("Apply & Restart", () => {
+      if (isEnvironmentBusy() || !hasPendingChanges()) return;
+      environmentActionError = null;
+      void environmentController.applyAndRestart()
+        .then((result) => {
+          if (result.outcome === "prepare-failed") {
+            environmentActionError = result.error;
+          }
+          if (result.outcome.endsWith("failed")) {
+            draw();
+          }
+          void loadEnvironmentTransaction();
+        });
+    });
+    apply.disabled = environmentSelectionLocked
+      || !hasPendingChanges()
+      || !pendingAvailability.available;
+    actions?.appendChild(apply);
+    card.appendChild(summary);
+    appendEnvironmentTransactionRow();
+    if (environmentActionError && environmentActionError !== transaction?.error) {
+      card.appendChild(rowSimple("Environment action failed", environmentActionError));
+    }
+  };
+
+  async function loadEnvironmentTransaction(): Promise<void> {
+    const update = cardUpdates.begin("environment-transaction");
+    try {
+      const result = await ipcRenderer.invoke("tweaker:get-environment-transaction");
+      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      const previous = transaction;
+      transaction = normalizeEnvironmentTransaction(result);
+      if (
+        transaction?.phase === "prepared"
+        && !transaction.helper
+        && previous?.transactionId === transaction.transactionId
+        && previous.helper
+      ) {
+        transaction = {
+          ...transaction,
+          error: transaction.error ?? previous.error,
+          helper: previous.helper,
+        };
+      }
+      restorePersistedRequest();
+      draw();
+      if (transaction && environmentTransactionIsTerminal(transaction.phase)) {
+        try {
+          const statusUpdate = cardUpdates.begin("environment-status");
+          const statusResult = await ipcRenderer.invoke("tweaker:get-environment-status");
+          if (!cardUpdates.isCurrent(update) || !cardUpdates.isCurrent(statusUpdate) || !card.isConnected) return;
+          environment = normalizeEnvironmentStatus(statusResult) ?? environment;
+          const selected = currentSelection();
+          if (selected) environmentController.setSelected(selected);
+          draw();
+        } catch (error) {
+          transaction = {
+            ...transaction,
+            error: transaction.error ?? `Could not refresh environment status: ${safeUiError(error)}`,
+          };
+          draw();
+        }
+      }
+    } catch (error) {
+      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      if (transaction) {
+        transaction = {
+          ...transaction,
+          error: `Could not refresh environment transaction: ${safeUiError(error)}`,
+        };
+      }
+      draw();
+    } finally {
+      if (cardUpdates.isCurrent(update)) scheduleEnvironmentTransactionPoll();
+    }
+  }
+
+  const load = async (): Promise<void> => {
+    const statusUpdate = cardUpdates.begin("environment-status");
+    const transactionUpdate = cardUpdates.begin("environment-transaction");
+    try {
+      const [statusResult, transactionResult] = await Promise.all([
+        ipcRenderer.invoke("tweaker:get-environment-status"),
+        ipcRenderer.invoke("tweaker:get-environment-transaction"),
+      ]);
+      if (!card.isConnected) return;
+      const statusIsCurrent = cardUpdates.isCurrent(statusUpdate);
+      const transactionIsCurrent = cardUpdates.isCurrent(transactionUpdate);
+      if (!statusIsCurrent && !transactionIsCurrent) return;
+      if (statusIsCurrent) {
+        environment = normalizeEnvironmentStatus(statusResult);
+        if (environment?.selected) environmentController.setSelected(environment.selected);
+      }
+      if (transactionIsCurrent) {
+        transaction = normalizeEnvironmentTransaction(transactionResult);
+        restorePersistedRequest();
+      }
+      draw();
+      scheduleEnvironmentTransactionPoll();
+    } catch (error) {
+      if ((!cardUpdates.isCurrent(statusUpdate) && !cardUpdates.isCurrent(transactionUpdate)) || !card.isConnected) return;
+      card.textContent = "";
+      card.appendChild(rowSimple("Could not load environment", safeUiError(error)));
+    }
+  };
+
+  void load();
+  return () => {
+    cardUpdates.invalidate("environment-status");
+    cardUpdates.invalidate("environment-transaction");
+    if (transactionPolling) clearTimeout(transactionPolling);
+    transactionPolling = null;
+  };
+}
+
+function environmentTransactionRequestedSelection(
+  transaction: EnvironmentTransaction,
+): Pick<EnvironmentSelection, "appExperience" | "releaseProfile"> | null {
+  const requested = transaction.requested;
+  if (!requested) return null;
+  if (requested.appExperience !== "chatgpt" && requested.appExperience !== "tweakers") return null;
+  if (requested.releaseProfile !== "stable" && requested.releaseProfile !== "alpha") return null;
+  return { appExperience: requested.appExperience, releaseProfile: requested.releaseProfile };
+}
+
+function environmentTransactionIsTerminal(phase: string): boolean {
+  return ["committed", "completed", "rolled-back", "rolled_back", "failed", "cancelled"].includes(phase);
+}
+
+function environmentChoiceRow(
+  title: string,
+  description: string,
+  choices: Array<{ value: string; label: string; description: string; disabled?: boolean; disabledReason?: string }>,
+  selected: string,
+  onChange: (value: string) => void,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "flex flex-wrap items-start justify-between gap-4 p-3";
+  const left = rowCopy(title, description);
+  const actions = document.createElement("div");
+  actions.className = "flex shrink-0 flex-wrap rounded-lg bg-token-foreground/5 p-0.5";
+  actions.setAttribute("role", "group");
+  actions.setAttribute("aria-label", title);
+  for (const choice of choices) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = choice.label;
+    button.disabled = choice.disabled === true;
+    button.setAttribute("aria-pressed", String(choice.value === selected));
+    if (choice.disabled) button.setAttribute("aria-disabled", "true");
+    if (choice.disabledReason) button.title = choice.disabledReason;
+    button.className = `rounded-md px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border ${choice.value === selected ? "bg-token-bg-primary shadow-sm text-token-text-primary" : "text-token-text-secondary hover:text-token-text-primary"}`;
+    button.addEventListener("click", () => onChange(choice.value));
+    actions.appendChild(button);
+  }
+  const disabledReason = choices.find((choice) => choice.disabled && choice.disabledReason)?.disabledReason;
+  if (disabledReason) {
+    const reason = document.createElement("div");
+    reason.className = "text-token-text-secondary text-xs";
+    reason.textContent = disabledReason;
+    left.appendChild(reason);
+  }
+  row.append(left, actions);
+  return row;
+}
+
+function environmentExperienceLabel(value: EnvironmentAppExperience): string {
+  return value === "chatgpt" ? "ChatGPT" : "Tweakers";
+}
+
+function environmentSelectionAvailability(
+  environment: EnvironmentStatus,
+  selection: Pick<EnvironmentSelection, "appExperience" | "releaseProfile">,
+): { available: boolean; unavailableReasons?: string[] } {
+  const channel = environment.channels[selection.releaseProfile];
+  return channel.availability?.[selection.appExperience] ?? {
+    available: channel.available,
+    unavailableReasons: channel.unavailableReasons,
+  };
+}
+
+function environmentUnavailableReason(
+  availability: { unavailableReasons?: string[] },
+  fallback: string,
+): string {
+  return availability.unavailableReasons?.filter(Boolean).join(" ") || fallback;
+}
+
+function environmentProfileLabel(value: EnvironmentReleaseProfile): string {
+  return value === "alpha" ? "Alpha (Pre-release)" : "Stable";
+}
+
+function normalizeEnvironmentStatus(value: unknown): EnvironmentStatus | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<EnvironmentStatus>;
+  const selected = candidate.selected;
+  if (!selected || (selected.appExperience !== "chatgpt" && selected.appExperience !== "tweakers") || (selected.releaseProfile !== "stable" && selected.releaseProfile !== "alpha")) return null;
+  const channels = candidate.channels as Partial<Record<EnvironmentReleaseProfile, EnvironmentChannelStatus>> | undefined;
+  const rawObservation = candidate.observation;
+  const observation = rawObservation
+    && (rawObservation.appExperience === null
+      || rawObservation.appExperience === "chatgpt"
+      || rawObservation.appExperience === "tweakers")
+    ? {
+      appExperience: rawObservation.appExperience,
+      selectionDrift: rawObservation.selectionDrift === true,
+      lifecycleContended: rawObservation.lifecycleContended === true,
+      commitJournalPresent: rawObservation.commitJournalPresent === true,
+      transitionJournalPresent: rawObservation.transitionJournalPresent === true,
+      freshness: rawObservation.freshness === "contended" ? "contended" as const : "current" as const,
+    }
+    : undefined;
+  return {
+    schemaVersion: 1,
+    selected,
+    channels: {
+      stable: channels?.stable ?? { available: true, releaseProfile: "stable" },
+      alpha: channels?.alpha ?? { available: false, unavailableReasons: ["Alpha (Pre-release) availability was not reported."], releaseProfile: "alpha" },
+    },
+    ...(observation ? { observation } : {}),
+  };
+}
+
+function normalizeEnvironmentTransaction(value: unknown): EnvironmentTransaction | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<EnvironmentTransaction>;
+  if (typeof candidate.transactionId !== "string" || typeof candidate.phase !== "string") return null;
+  return {
+    ...candidate,
+    transactionId: candidate.transactionId,
+    phase: candidate.phase,
+    error: typeof candidate.error === "string" ? candidate.error : null,
+  };
+}
+
+function normalizeEnvironmentHelperSubmission(value: unknown): EnvironmentHelperSubmission | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<EnvironmentHelperSubmission> & { kind?: unknown };
+  if (candidate.kind !== "environment-commit-helper") return null;
+  if (typeof candidate.transactionId !== "string") return null;
+  if (candidate.phase !== "submitted" && candidate.phase !== "submit-failed") return null;
+  return {
+    kind: "environment-commit-helper",
+    transactionId: candidate.transactionId,
+    phase: candidate.phase,
+    error: typeof candidate.error === "string" ? candidate.error : null,
+  };
+}
+
+function environmentHelperIsInFlight(transaction: EnvironmentTransaction): boolean {
+  const helper = transaction.helper;
+  const outcomePhase = helper?.outcome?.phase;
+  return outcomePhase === "not-started"
+    || outcomePhase === "running"
+    || (helper?.submission?.phase === "submitted" && outcomePhase === undefined);
+}
+
+function environmentTransactionCanRecover(transaction: EnvironmentTransaction): boolean {
+  if (transaction.phase === "failed") return transaction.prepared !== null && transaction.prepared !== undefined;
+  return ["committing", "applying", "reopening", "verifying", "rolling-back"].includes(transaction.phase);
+}
+
+function environmentHelperFailureDetail(transaction: EnvironmentTransaction): string | null {
+  const helper = transaction.helper;
+  if (!helper) return null;
+  const outcome = helper.outcome;
+  const submission = helper.submission;
+  const failed = outcome?.phase === "failed"
+    || submission?.phase === "submit-failed"
+    || typeof outcome?.error === "string"
+    || typeof submission?.error === "string";
+  if (!failed) return null;
+  const stderr = environmentHelperLogSnippet(helper.stderr);
+  const stdout = environmentHelperLogSnippet(helper.stdout);
+  const exitCode = typeof outcome?.exitCode === "number" ? `exit ${outcome.exitCode}` : null;
+  const detail = [
+    "Environment helper failed",
+    exitCode,
+    outcome?.error,
+    submission?.error,
+    stderr ? `stderr: ${stderr}` : null,
+    !stderr && stdout ? `stdout: ${stdout}` : null,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  return [...new Set(detail)].join(" · ");
+}
+
+function environmentHelperLogSnippet(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const compact = value.trim().replace(/\s+/g, " ");
+  if (!compact) return null;
+  return compact.length <= 600 ? compact : `…${compact.slice(-599)}`;
+}
+
+interface EnvironmentTransactionRowActions {
+  busy: boolean;
+  onResume?: () => void;
+  onCancel?: () => void;
+  onRecover?: () => void;
+}
+
+function environmentTransactionRow(
+  transaction: EnvironmentTransaction,
+  actionsConfig?: EnvironmentTransactionRowActions,
+): HTMLElement {
+  const helperFailure = environmentHelperFailureDetail(transaction);
+  const details = [
+    environmentTransactionLabel(transaction.phase),
+    transaction.error,
+    helperFailure,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const row = actionRow(
+    "App mode restart",
+    [...new Set(details)].join(" · "),
+  );
+  const left = row.firstElementChild as HTMLElement | null;
+  if (left) left.prepend(statusBadge(environmentTransactionTone(transaction.phase), environmentTransactionLabel(transaction.phase)));
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  if (actionsConfig?.onResume) {
+    const resume = compactButton("Resume/Confirm", actionsConfig.onResume);
+    resume.disabled = actionsConfig.busy;
+    actions?.appendChild(resume);
+  }
+  if (actionsConfig?.onCancel) {
+    const cancel = compactButton("Cancel", actionsConfig.onCancel);
+    cancel.disabled = actionsConfig.busy;
+    actions?.appendChild(cancel);
+  }
+  if (actionsConfig?.onRecover) {
+    const recover = compactButton("Recover Safely", actionsConfig.onRecover);
+    recover.disabled = actionsConfig.busy;
+    actions?.appendChild(recover);
+  }
+  row.title = `Transaction ${transaction.transactionId}`;
+  row.setAttribute("role", "status");
+  row.setAttribute("aria-live", "polite");
+  return row;
+}
+
+function environmentTransactionLabel(phase: string): string {
+  switch (phase) {
+    case "committed":
+    case "completed":
+      return "Completed";
+    case "rolled-back":
+    case "rolled_back":
+      return "Rolled back";
+    case "cancelled":
+      return "Cancelled";
+    case "failed":
+      return "Failed";
+    case "prepared":
+      return "Prepared";
+    case "preparing":
+      return "Preparing";
+    case "committing":
+      return "Committing";
+    case "reopening":
+      return "Reopening";
+    case "verifying":
+      return "Verifying";
+    case "rolling-back":
+      return "Rolling back";
+    default:
+      return humanizeCodexPhase(phase);
+  }
+}
+
+function environmentTransactionTone(phase: string): "ok" | "warn" | "error" {
+  if (phase === "committed" || phase === "completed") return "ok";
+  if (phase === "failed") return "error";
+  return "warn";
+}
+
+/** One shared, accessible confirmation after prepare; Cancel never commits. */
+function openEnvironmentConfirmModal(
+  requested: Pick<EnvironmentSelection, "appExperience" | "releaseProfile">,
+  transaction: EnvironmentTransaction,
+): Promise<EnvironmentConfirmationDecision> {
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const restoreFocus = (): void => {
+    restoreEnvironmentFocus(
+      opener,
+      () => document.querySelector<HTMLElement>("[data-tweaker-environment-card] button:not([disabled])"),
+    );
+  };
+  let resolveDecision!: (decision: EnvironmentConfirmationDecision) => void;
+  const decision = new Promise<EnvironmentConfirmationDecision>((resolvePromise) => {
+    resolveDecision = resolvePromise;
+  });
+  const overlay = document.createElement("div");
+  overlay.dataset.tweakerEnvironmentModal = "true";
+  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 p-4";
+  const dialog = document.createElement("div");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", "tweaker-environment-confirm-title");
+  dialog.setAttribute("aria-describedby", "tweaker-environment-confirm-body");
+  dialog.className = "border-token-border flex w-full max-w-md flex-col gap-4 rounded-2xl border p-5 shadow-xl";
+  dialog.setAttribute("style", "background-color: var(--color-background-panel, var(--color-token-bg-fog));");
+  const heading = document.createElement("div");
+  heading.id = "tweaker-environment-confirm-title";
+  heading.className = "text-base font-medium text-token-text-primary";
+  const experience = environmentExperienceLabel(requested.appExperience);
+  heading.textContent = `Switch to ${experience} and restart?`;
+  const body = document.createElement("div");
+  body.id = "tweaker-environment-confirm-body";
+  body.className = "text-sm text-token-text-secondary";
+  const candidate = transaction.prepared?.candidate;
+  const backend = transaction.prepared?.backend;
+  const rollback = transaction.prepared?.rollback;
+  const target = candidate?.desktopPath
+    ? `${candidate.desktopPath}${candidate.version ? ` (${candidate.version}${candidate.build ? `, build ${candidate.build}` : ""})` : ""}`
+    : environmentProfileLabel(requested.releaseProfile);
+  const backendTarget = backend?.lane
+    ? `${backend.lane}${backend.version ? ` ${backend.version}` : ""}`
+    : "the verified backend for this environment";
+  const rollbackTarget = rollback?.desktopPath
+    ?? rollback?.selection?.selectedDesktopPath
+    ?? "the last known working environment";
+  const modeEffect = requested.appExperience === "tweakers"
+    ? "ChatGPT will close, reopen in Tweakers mode, and restore your previously enabled tweaks."
+    : "ChatGPT will close and reopen in standard mode. All tweaks will be disabled, but their saved settings will remain available for Tweakers mode.";
+  body.textContent = [
+    modeEffect,
+    `Desktop: ${target}. Embedded Codex backend: ${backendTarget}.`,
+    `If restart verification fails, Tweakers will restore the last known working environment at ${rollbackTarget}.`,
+  ].join("\n");
+  body.style.whiteSpace = "pre-line";
+  const buttons = document.createElement("div");
+  buttons.className = "flex items-center justify-end gap-2";
+  let settled = false;
+  const close = (outcome: "confirm" | "cancel"): void => {
+    if (settled) return;
+    settled = true;
+    document.removeEventListener("keydown", onKeydown, true);
+    overlay.remove();
+    resolveDecision(outcome);
+    window.requestAnimationFrame(restoreFocus);
+  };
+  const onKeydown = (event: KeyboardEvent): void => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      close("cancel");
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [cancel, confirm];
+    const currentIndex = focusable.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.shiftKey
+      ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+      : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+    event.preventDefault();
+    focusable[nextIndex]?.focus();
+  };
+  const cancel = compactButton("Cancel", () => close("cancel"));
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "user-select-none no-drag cursor-interaction inline-flex h-8 items-center whitespace-nowrap rounded-lg bg-token-charts-blue px-3 text-sm text-white enabled:hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border";
+  confirm.textContent = "Apply & Restart";
+  confirm.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    close("confirm");
+  });
+  buttons.append(cancel, confirm);
+  dialog.append(heading, body, buttons);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  confirm.focus();
+  return decision;
+}
+
+function renderDesktopUpdateSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Desktop Update"));
+  const card = roundedCard();
+  card.dataset.tweakerDesktopUpdateCard = "true";
+  card.appendChild(rowSimple("Loading desktop update", "Checking the signed Codex appcast."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  let current: DesktopUpdateCheckResult | null = null;
+  let transaction: DesktopUpdateTransactionState | null = null;
+  let busy = false;
+  let polling: ReturnType<typeof setTimeout> | null = null;
+  let transactionPollFailures = 0;
+  let awaitingTransactionReceiptUntil = 0;
+  let initialResultSuperseded = false;
+
+  const transactionIsActive = (): boolean => {
+    if (!transaction?.transactionId) {
+      return transaction?.phase === "preparing" && Date.now() < awaitingTransactionReceiptUntil;
+    }
+    return !["completed", "failed", "rolled_back"].includes(transaction.phase);
+  };
+  const scheduleTransactionPoll = (delayMs = 2_000): void => {
+    if (polling) clearTimeout(polling);
+    if (!card.isConnected || (!transactionIsActive() && transaction?.resumable !== true)) return;
+    polling = setTimeout(() => {
+      polling = null;
+      void loadTransaction();
+    }, delayMs);
+  };
+  const loadTransaction = async (): Promise<void> => {
+    const update = cardUpdates.begin("desktop-update-transaction");
+    try {
+      const value = await ipcRenderer.invoke("tweaker:get-codex-desktop-update-transaction");
+      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      const observed = normalizeDesktopUpdateTransaction(value);
+      if (observed?.phase === "idle"
+        && observed.transactionId === null
+        && transaction?.phase === "preparing"
+        && transaction.transactionId === null) {
+        if (Date.now() >= awaitingTransactionReceiptUntil) {
+          transaction = {
+            transactionId: null,
+            phase: "failed",
+            error: "The desktop updater did not create a transaction receipt.",
+          };
+        }
+      } else {
+        transaction = observed;
+        if (transaction?.transactionId) awaitingTransactionReceiptUntil = 0;
+      }
+      transactionPollFailures = 0;
+      draw();
+      scheduleTransactionPoll();
+    } catch (error) {
+      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      transaction = {
+        transactionId: transaction?.transactionId ?? null,
+        phase: transaction?.phase ?? "preparing",
+        error: safeUiError(error),
+      };
+      draw();
+      transactionPollFailures += 1;
+      const backoff = Math.min(30_000, 1_000 * (2 ** Math.min(transactionPollFailures - 1, 5)));
+      const jitter = Math.floor(backoff * 0.25 * Math.random());
+      scheduleTransactionPoll(backoff + jitter);
+    }
+  };
+  const draw = (): void => {
+    card.textContent = "";
+    const result = current;
+    const installed = result?.installed?.marketingVersion ?? "Unavailable";
+    const latest = result?.latest?.marketingVersion ?? "Unavailable";
+    const status = desktopUpdateStatusPresentation(result?.status);
+    const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
+    const left = row.firstElementChild as HTMLElement | null;
+    left?.prepend(statusBadge(status.tone, status.label));
+    const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+    const check = compactButton("Check for Updates…", () => {
+      if (busy) return;
+      busy = true;
+      check.disabled = true;
+      void ipcRenderer.invoke("tweaker:check-codex-desktop-update")
+        .then((value) => {
+          const result = value as DesktopUpdateCheckResult;
+          acceptDesktopUpdateResult(result);
+          if (result.updateAndReloadRequested) {
+            awaitingTransactionReceiptUntil = Date.now() + 10_000;
+            transaction = { transactionId: null, phase: "preparing" };
+            void loadTransaction();
+          }
+        })
+        .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
+        .finally(() => { busy = false; draw(); });
+    });
+    check.disabled = busy || !!result?.setupRequired;
+    actions?.appendChild(check);
+    const update = compactButton("Update and Reload", () => {
+      if (busy) return;
+      busy = true;
+      update.disabled = true;
+      void ipcRenderer.invoke("tweaker:start-codex-desktop-update")
+        .then(() => {
+          awaitingTransactionReceiptUntil = Date.now() + 10_000;
+          transaction = { transactionId: null, phase: "preparing" };
+          void loadTransaction();
+        })
+        .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
+        .finally(() => { busy = false; draw(); });
+    });
+    update.disabled = busy
+      || result?.status !== "update-available"
+      || transactionIsActive()
+      || transaction?.resumable === true;
+    actions?.appendChild(update);
+    card.appendChild(row);
+    if (result?.setupRequired) {
+      const setupLabel = result.setupRequired === "register-beta"
+        ? "Register OpenAI Beta"
+        : "Launch OpenAI Beta once";
+      card.appendChild(rowSimple(
+        `Alpha update setup · ${setupLabel}`,
+        result.reason ?? "Alpha update checks stay disabled until Tweakers captures the registered Beta app's own feed.",
+      ));
+    }
+    if (result?.checkedAt) card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
+    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, {
+      busy,
+      onResume: () => {
+        if (busy) return;
+        busy = true;
+        draw();
+        void ipcRenderer.invoke("tweaker:resume-codex-desktop-update")
+          .then(() => {
+            transaction = transaction ? { ...transaction, phase: "awaiting_native_update", resumable: false } : transaction;
+            scheduleTransactionPoll();
+          })
+          .catch((error) => {
+            if (transaction) transaction = { ...transaction, error: safeUiError(error) };
+          })
+          .finally(() => { busy = false; draw(); });
+      },
+      onCancel: () => {
+        if (busy) return;
+        busy = true;
+        draw();
+        void ipcRenderer.invoke("tweaker:cancel-codex-desktop-update")
+          .then((value) => { transaction = normalizeDesktopUpdateTransaction(value) ?? transaction; })
+          .catch((error) => {
+            if (transaction) transaction = { ...transaction, error: safeUiError(error) };
+          })
+          .finally(() => { busy = false; draw(); });
+      },
+    }));
+  };
+  draw();
+  const acceptDesktopUpdateResult = (value: DesktopUpdateCheckResult): void => {
+    const currentTime = current?.checkedAt ? Date.parse(current.checkedAt) : Number.NaN;
+    const nextTime = value.checkedAt ? Date.parse(value.checkedAt) : Number.NaN;
+    if (Number.isFinite(currentTime) && (!Number.isFinite(nextTime) || nextTime < currentTime)) return;
+    current = value;
+    draw();
+  };
+  const onDesktopUpdateChanged = (_event: unknown, value: unknown): void => {
+    if (!card.isConnected) {
+      ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
+      return;
+    }
+    initialResultSuperseded = true;
+    acceptDesktopUpdateResult(value as DesktopUpdateCheckResult);
+  };
+  ipcRenderer.on("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
+  const currentUpdate = cardUpdates.begin("desktop-update-result");
+  void ipcRenderer.invoke("tweaker:get-codex-desktop-update")
+    .then((value) => {
+      if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected || initialResultSuperseded) return;
+      if (value && typeof value === "object") {
+        acceptDesktopUpdateResult(value as DesktopUpdateCheckResult);
+      } else {
+        current = { status: "unavailable", reason: "Update status has not been checked yet." };
+        draw();
+      }
+    })
+    .catch((error) => {
+      if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected) return;
+      current = { status: "error", reason: safeUiError(error) };
+      draw();
+    });
+  void loadTransaction();
+  return () => {
+    cardUpdates.invalidate("desktop-update-result");
+    cardUpdates.invalidate("desktop-update-transaction");
+    ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
+    if (polling) clearTimeout(polling);
+    polling = null;
+  };
+}
+
+function normalizeDesktopUpdateTransaction(value: unknown): DesktopUpdateTransactionState | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<DesktopUpdateTransactionState>;
+  if (candidate.transactionId !== null && typeof candidate.transactionId !== "string") return null;
+  if (typeof candidate.phase !== "string") return null;
+  return {
+    ...candidate,
+    transactionId: candidate.transactionId ?? null,
+    phase: candidate.phase,
+  };
+}
+
+function desktopUpdateTransactionRow(
+  transaction: DesktopUpdateTransactionState,
+  actions: { busy: boolean; onResume: () => void; onCancel: () => void },
+): HTMLElement {
+  const phase = humanizeCodexPhase(transaction.phase);
+  const detail = [
+    transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
+    transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
+    transaction.refreshSource ? `${transaction.refreshSource} Tweakers refresh` : null,
+    transaction.error ?? null,
+  ].filter(Boolean).join(" · ") || "Waiting for the durable updater receipt.";
+  const row = actionRow("Update and Reload", detail);
+  row.setAttribute("role", "status");
+  row.setAttribute("aria-live", "polite");
+  const left = row.firstElementChild as HTMLElement | null;
+  const tone = transaction.phase === "completed"
+    ? "ok"
+    : transaction.phase === "failed" && !transaction.resumable
+      ? "error"
+      : "warn";
+  left?.prepend(statusBadge(tone, phase));
+  const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  const canResume = transaction.resumable === true
+    && (transaction.phase === "failed" || transaction.phase === "rolled_back");
+  const canCancel = transaction.phase === "awaiting_native_update"
+    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase));
+  if (canResume) {
+    const resume = compactButton("Resume", actions.onResume);
+    resume.disabled = actions.busy;
+    controls?.appendChild(resume);
+  }
+  if (canCancel) {
+    const cancel = compactButton("Cancel", actions.onCancel);
+    cancel.disabled = actions.busy;
+    controls?.appendChild(cancel);
+  }
+  return row;
+}
+
+function renderMcpIntegrationSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("MCP Integration Health"));
+  const card = roundedCard();
+  card.dataset.tweakerMcpHealthCard = "true";
+  card.appendChild(rowSimple("Checking MCP integration", "Verifying managed MCP configuration and synchronization."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  const render = (state: McpSyncState | null): void => {
+    card.textContent = "";
+    if (!state) {
+      state = {
+        status: "pending",
+        summary: "Managed MCP reconciliation has not completed yet.",
+      };
+    }
+    const status = state.status ?? (state.error ? "error" : "ok");
+    const tone = status === "error" || state.error
+      ? "error"
+      : status === "conflict" || status === "warn" || status === "pending"
+        ? "warn"
+        : "ok";
+    const row = actionRow("MCP integration", state.summary ?? state.error ?? (tone === "ok" ? "MCP configuration is synchronized." : "MCP configuration needs attention."));
+    const left = row.firstElementChild as HTMLElement | null;
+    left?.prepend(statusBadge(tone, status === "ok" ? "Healthy" : humanizeCodexPhase(status)));
+    const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+    const repair = compactButton("Repair", () => {
+      repair.disabled = true;
+      const update = cardUpdates.begin("mcp");
+      void ipcRenderer.invoke("tweaker:repair-mcp")
+        .then((next) => {
+          if (cardUpdates.complete(update, next)) render(next as McpSyncState);
+        })
+        .catch((error) => {
+          const next = { status: "error", error: safeUiError(error) };
+          if (cardUpdates.complete(update, next)) render(next);
+        });
+    });
+    actions?.appendChild(repair);
+    card.appendChild(row);
+    if (state.restartRequired) {
+      card.appendChild(rowSimple(
+        "New task or restart required",
+        "The canonical MCP name is written. Start a new task, or restart Codex, to replace any already-running legacy MCP process.",
+      ));
+    }
+    if (state.conflicts?.length) {
+      card.appendChild(rowSimple("Conflicts", state.conflicts.map((conflict) => {
+        if (conflict.observedName || conflict.canonicalName) {
+          return `${conflict.observedName ?? "Unknown entry"} → ${conflict.canonicalName ?? "canonical entry"}: ${conflict.reason ?? conflict.detail ?? "ownership conflict"}`;
+        }
+        return conflict.detail ?? conflict.reason ?? conflict.name ?? "Unknown conflict";
+      }).join("; ")));
+    }
+    const checkedAt = state.completedAt ?? state.checkedAt;
+    if (checkedAt) card.appendChild(rowSimple("Last checked", new Date(checkedAt).toLocaleString()));
+  };
+  const onSyncStateChanged = (_event: unknown, value: unknown): void => {
+    if (!card.isConnected) {
+      ipcRenderer.removeListener("tweaker:mcp-sync-state-changed", onSyncStateChanged);
+      return;
+    }
+    const update = cardUpdates.begin("mcp");
+    const next = value && typeof value === "object" ? value as McpSyncState : null;
+    if (cardUpdates.complete(update, next)) render(next);
+  };
+  ipcRenderer.on("tweaker:mcp-sync-state-changed", onSyncStateChanged);
+  const initialUpdate = cardUpdates.begin("mcp");
+  void ipcRenderer.invoke("tweaker:get-mcp-sync-state")
+    .then((value) => {
+      const next = value && typeof value === "object" ? value as McpSyncState : null;
+      if (card.isConnected && cardUpdates.complete(initialUpdate, next)) render(next);
+    })
+    .catch((error) => {
+      const next = { status: "error", error: safeUiError(error) };
+      if (card.isConnected && cardUpdates.complete(initialUpdate, next)) render(next);
+    });
+  return () => {
+    cardUpdates.invalidate("mcp");
+    ipcRenderer.removeListener("tweaker:mcp-sync-state-changed", onSyncStateChanged);
+  };
+}
+
+function renderAutomaticMaintenanceSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Automatic Maintenance"));
+  const card = roundedCard();
+  card.dataset.tweakerMaintenanceCard = "true";
+  card.appendChild(rowSimple("Checking automatic maintenance", "Verifying the updater repair service."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+  let latestHealth: WatcherHealth | null = null;
+  let repairInFlight = false;
+  let repairDisplay: "idle" | "success" | "failure" = "idle";
+  let repairBaselineCycle: WatcherCycleReceipt | null = null;
+  let repairStartedAt = 0;
+  let repairPoll: ReturnType<typeof setTimeout> | null = null;
+  let repairPollCount = 0;
+  const MAX_REPAIR_POLLS = 30;
+
+  const render = (health: WatcherHealth): void => {
+    latestHealth = health;
+    card.textContent = "";
+    if (repairInFlight) {
+      renderWatcherHealth(card, {
+        ...health,
+        status: "warn",
+        title: "Automatic maintenance running",
+        summary: "Repair was started in the background. Waiting for a completed watcher cycle…",
+      }, false);
+      const running = actionRow("Automatic maintenance", "Repair cycle running…");
+      running.setAttribute("role", "status");
+      running.setAttribute("aria-live", "polite");
+      running.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(statusBadge("warn", "Running"));
+      card.appendChild(running);
+      return;
+    }
+    if (repairDisplay === "success") {
+      health = {
+        ...health,
+        status: "ok",
+        title: "Automatic maintenance succeeded",
+        summary: "The watcher completed a fresh repair cycle.",
+      };
+    } else if (repairDisplay === "failure") {
+      health = {
+        ...health,
+        status: "error",
+        title: "Automatic maintenance failed",
+        summary: health.summary || "The watcher repair cycle failed.",
+      };
+    }
+    renderWatcherHealth(card, health, true, startRepair);
+  };
+  const load = (): Promise<WatcherHealth | null> => {
+    const update = cardUpdates.begin("watcher");
+    return ipcRenderer.invoke("tweaker:get-watcher-health")
+      .then((value) => {
+        const health = value as WatcherHealth;
+        if (!card.isConnected || !cardUpdates.complete(update, health)) return null;
+        render(health);
+        return health;
+      })
+      .catch((error) => {
+        const health: WatcherHealth = { checkedAt: new Date().toISOString(), status: "error", title: "Automatic maintenance unavailable", summary: safeUiError(error), watcher: "Watcher", checks: [] };
+        if (!card.isConnected || !cardUpdates.complete(update, health)) return null;
+        render(health);
+        return health;
+      });
+  };
+  const isNewerCycle = (health: WatcherHealth): boolean => {
+    const cycle = health.latestCompletedCycle;
+    if (!cycle) return false;
+    if (!repairBaselineCycle) {
+      return Date.parse(cycle.completedAt) > repairStartedAt;
+    }
+    return cycle.cycleId !== repairBaselineCycle.cycleId
+      && cycle.completedAt > repairBaselineCycle.completedAt;
+  };
+  const finishRepair = (health: WatcherHealth, failed = false): void => {
+    repairInFlight = false;
+    repairDisplay = failed ? "failure" : "success";
+    if (repairPoll) clearTimeout(repairPoll);
+    repairPoll = null;
+    const next = failed
+      ? { ...health, status: "error" as const, title: "Automatic maintenance failed", summary: health.summary || "The watcher repair cycle failed." }
+      : health;
+    render(next);
+  };
+  const pollRepair = (): void => {
+    if (!repairInFlight || !card.isConnected) return;
+    if (repairPollCount++ >= MAX_REPAIR_POLLS) {
+      finishRepair({
+        ...(latestHealth ?? { checkedAt: new Date().toISOString(), status: "error" as const, title: "Automatic maintenance failed", summary: "The watcher did not report a completed cycle in time.", watcher: "Watcher", checks: [] }),
+        status: "error",
+        title: "Automatic maintenance failed",
+        summary: "The watcher did not report a completed cycle in time.",
+      }, true);
+      return;
+    }
+    void load().then((health) => {
+      if (!health || !repairInFlight) return;
+      const cycle = health.latestCompletedCycle;
+      if (isNewerCycle(health)) {
+        finishRepair(health, cycle?.outcome === "failed" || cycle?.repair.status === "failed");
+        return;
+      }
+      render(health);
+      repairPoll = setTimeout(pollRepair, 1_000);
+    });
+  };
+  const startRepair = (): void => {
+    if (repairInFlight) return;
+    repairInFlight = true;
+    repairDisplay = "idle";
+    repairBaselineCycle = latestHealth?.latestCompletedCycle ?? null;
+    repairStartedAt = Date.now();
+    repairPollCount = 0;
+    render(latestHealth ?? { checkedAt: new Date().toISOString(), status: "warn", title: "Automatic maintenance running", summary: "Starting repair…", watcher: "Watcher", checks: [] });
+    void ipcRenderer.invoke("tweaker:repair-auto-maintenance")
+      .then(() => pollRepair())
+      .catch((error) => finishRepair({
+        ...(latestHealth ?? { checkedAt: new Date().toISOString(), status: "error" as const, title: "Automatic maintenance failed", summary: "", watcher: "Watcher", checks: [] }),
+        status: "error",
+        title: "Automatic maintenance failed",
+        summary: safeUiError(error),
+      }, true));
+  };
+  load();
+  return () => {
+    cardUpdates.invalidate("watcher");
+    repairInFlight = false;
+    if (repairPoll) clearTimeout(repairPoll);
+    repairPoll = null;
+  };
+}
+
+function renderAdvancedRuntimeSection(sectionsWrap: HTMLElement): void {
+  renderCodexVersionsSection(sectionsWrap);
+}
+
+function renderCodexVersionsSection(
+  sectionsWrap: HTMLElement,
+  options: { collapsed?: boolean } = {},
+): void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.dataset.tweakerCodexSection = "true";
   const refresh = compactButton("Refresh", () => { void load(true); });
-  const heading = sectionTitle("CODEX", refresh);
-  const headingText = heading.querySelector<HTMLElement>(".text-base");
+  const heading = sectionTitle(options.collapsed ? "Advanced Runtime Details" : "Runtime Versions", refresh);
   section.appendChild(heading);
   const card = roundedCard();
-  card.dataset.codexppCodexCard = "true";
+  card.dataset.tweakerCodexCard = "true";
   card.appendChild(rowSimple("Loading Codex versions", "Using cached version and feature information first."));
-  section.appendChild(card);
+  if (options.collapsed) {
+    const details = document.createElement("details");
+    details.dataset.tweakerAdvancedRuntimeDetails = "true";
+    const summary = document.createElement("summary");
+    summary.className = "cursor-pointer px-1 text-sm text-token-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border";
+    summary.textContent = "Builds, CLI runtimes, releases, and features";
+    const body = document.createElement("div");
+    body.className = "mt-2 flex flex-col gap-2";
+    body.appendChild(card);
+    details.append(summary, body);
+    section.appendChild(details);
+  } else {
+    section.appendChild(card);
+  }
   sectionsWrap.appendChild(section);
 
   let polling: ReturnType<typeof setTimeout> | null = null;
@@ -1364,7 +2839,6 @@ function renderCodexVersionsSection(sectionsWrap: HTMLElement): void {
     void load(false);
   };
   const show = (snapshot: CodexVersionsSnapshot) => {
-    if (headingText) headingText.textContent = snapshot.updateAvailable ? "CODEX (UPDATE AVAILABLE)" : "CODEX";
     card.textContent = "";
     renderCodexVersionsCard(card, snapshot, requestReload);
     schedulePoll(snapshot);
@@ -1374,7 +2848,7 @@ function renderCodexVersionsSection(sectionsWrap: HTMLElement): void {
     refresh.disabled = true;
     try {
       const snapshot = await ipcRenderer.invoke(
-        force ? "codexpp:refresh-codex-versions" : "codexpp:get-codex-versions",
+        force ? "tweaker:refresh-codex-versions" : "tweaker:get-codex-versions",
       ) as CodexVersionsSnapshot;
       if (current !== generation || !card.isConnected) return;
       show(snapshot);
@@ -1397,7 +2871,6 @@ function renderCodexVersionsCard(
   snapshot: CodexVersionsSnapshot,
   reload: CodexUiReload,
 ): void {
-  const desktop = snapshot.desktop;
   const bundled = snapshot.cli.bundled;
   const beta = snapshot.cli.beta;
   const busy = codexProgressBusy(snapshot.installProgress);
@@ -1410,18 +2883,15 @@ function renderCodexVersionsCard(
     ));
   }
 
-  card.appendChild(codexDesktopRow(desktop, codexScopedError(snapshot, "desktop"), busy, reload));
-  card.appendChild(rowSimple(
-    "Build",
-    installedLatestSummary(desktop.installedBuild, desktop.latestBuild, codexScopedError(snapshot, "desktop")),
-  ));
-  card.appendChild(codexCliRow("Bundled Codex CLI", "bundled", bundled, snapshot, busy, reload));
-  card.appendChild(codexCliRow("Beta Codex CLI", "beta", beta, snapshot, busy, reload));
-  card.appendChild(codexRuntimeRow(snapshot, beta, busy, reload));
+  card.appendChild(codexActiveCliRow(snapshot));
+  card.appendChild(codexEmbeddedCliRow(bundled, snapshot));
+  card.appendChild(codexLatestStableReleaseRow(bundled));
+  card.appendChild(codexCliRow("Managed Alpha CLI (Pre-release)", "beta", beta, snapshot, busy, reload));
+  card.appendChild(codexRuntimeRow(snapshot));
 
   const releases = actionRow("GitHub Releases", "View official OpenAI Codex release notes and packages.");
   makeCodexRowResponsive(releases);
-  releases.querySelector<HTMLElement>("[data-codexpp-row-actions]")?.appendChild(
+  releases.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
     compactButton("Open Releases", () => openCodexGithubUrl("https://github.com/openai/codex/releases")),
   );
   card.appendChild(releases);
@@ -1430,7 +2900,7 @@ function renderCodexVersionsCard(
     const p = snapshot.installProgress;
     const amount = formatBytes(p.bytes);
     const detail = p.error || [humanizeCodexPhase(p.phase), p.version, amount].filter(Boolean).join(" · ");
-    card.appendChild(rowSimple("Beta operation", detail));
+    card.appendChild(rowSimple("Alpha operation", detail));
   }
 
   const stateMessage = codexRuntimeMessage(snapshot);
@@ -1438,35 +2908,62 @@ function renderCodexVersionsCard(
   card.appendChild(codexFeatureBrowser(snapshot, busy, reload));
 }
 
-function codexDesktopRow(
-  desktop: CodexDesktopVersionState,
-  error: string | null,
-  busy: boolean,
-  reload: CodexUiReload,
-): HTMLElement {
-  const installed = desktop.installedMarketingVersion;
-  const latest = desktop.latestMarketingVersion;
-  const row = actionRow("Desktop App", installedLatestSummary(installed, latest, error));
+function codexActiveCliRow(snapshot: CodexVersionsSnapshot): HTMLElement {
+  const active = snapshot.activeCli;
+  const version = active.version ?? "Unavailable";
+  const channel = codexVersionChannelLabel(active.versionChannel);
+  const source = active.source === "bundled"
+    ? `${channel} · embedded in the OpenAI desktop app · app-managed`
+    : active.source === "managed-alpha"
+      ? `${channel} · managed by Tweakers`
+      : `${channel} · external CODEX_CLI_PATH override`;
+  const detail = [`Version ${version}`, source, active.path, active.error].filter(Boolean).join(" · ");
+  const row = actionRow("Active Codex backend", detail);
   makeCodexRowResponsive(row);
-  const actions = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
-  const lifecycle = desktop.nativeUpdateLifecycle;
-  const prerequisiteError = desktop.nativeUpdatePrerequisiteError;
-  const nativeUnavailable = prerequisiteError === "The native updater is unavailable.";
-  if (isSafeCodexGithubUrl(desktop.releaseUrl)) {
-    actions?.appendChild(compactButton("Release", () => openCodexGithubUrl(desktop.releaseUrl!)));
+  row.title = active.path;
+  row.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
+    statusBadge(active.available ? "ok" : "error", active.available ? "Active" : "Unavailable"),
+  );
+  return row;
+}
+
+function codexEmbeddedCliRow(
+  cli: CodexCliVersionState,
+  snapshot: CodexVersionsSnapshot,
+): HTMLElement {
+  const version = cli.version ?? "Unavailable";
+  const channel = codexVersionChannelLabel(cli.versionChannel);
+  const detail = [
+    `Version ${version}`,
+    channel,
+    "Embedded in the OpenAI desktop app; it changes only when OpenAI ships a desktop update",
+    cli.path,
+    cli.available ? null : cli.error,
+  ].filter(Boolean).join(" · ");
+  const row = actionRow("Desktop-Embedded Codex CLI", detail);
+  makeCodexRowResponsive(row);
+  row.title = cli.path ?? "";
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  if (snapshot.activeCli.source === "bundled") actions?.appendChild(statusBadge("ok", "Active"));
+  else actions?.appendChild(codexNeutralBadge("App-managed"));
+  if (cli.version) {
+    const releaseUrl = `https://github.com/openai/codex/releases/tag/rust-v${encodeURIComponent(cli.version)}`;
+    actions?.appendChild(compactButton("Release", () => openCodexGithubUrl(releaseUrl)));
   }
-  const check = compactButton("Check", () => runCodexAction(row, "codexpp:check-codex-desktop-update", undefined, reload));
-  // Version checks use the signed appcast and remain available even when the
-  // native installer is unavailable in the locally signed patched process.
-  check.disabled = busy;
-  actions?.appendChild(check);
-  const install = compactButton("Install Update", () => runCodexAction(row, "codexpp:install-codex-desktop-update", undefined, reload));
-  install.disabled = busy || nativeUnavailable || !desktop.nativeUpdateActionable;
-  install.title = prerequisiteError || (install.disabled ? "A verified signed backup and update-ready native updater are required." : "OpenAI's updater may close the app after confirmation.");
-  actions?.appendChild(install);
-  if (lifecycle || prerequisiteError) {
-    const left = row.firstElementChild as HTMLElement | null;
-    left?.appendChild(codexInlineMessage(prerequisiteError || `Native updater: ${humanizeCodexPhase(lifecycle ?? "available")}`));
+  return row;
+}
+
+function codexLatestStableReleaseRow(cli: CodexCliVersionState): HTMLElement {
+  const release = cli.release;
+  const detail = release
+    ? `Latest stable standalone release ${release.version} · This does not replace the desktop-embedded backend.`
+    : `Latest stable standalone release unavailable${cli.error ? ` · ${cli.error}` : ""}`;
+  const row = actionRow("Latest Stable CLI Release", detail);
+  makeCodexRowResponsive(row);
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  actions?.appendChild(codexNeutralBadge("Stable"));
+  if (isSafeCodexGithubUrl(release?.releaseUrl)) {
+    actions?.appendChild(compactButton("Release", () => openCodexGithubUrl(release!.releaseUrl)));
   }
   return row;
 }
@@ -1484,18 +2981,18 @@ function codexCliRow(
   const detail = installedLatestSummary(installed, latest, cli.error || cli.release?.error);
   const row = actionRow(label, detail);
   makeCodexRowResponsive(row);
-  const actions = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   if (snapshot.effectiveLane === lane) actions?.prepend(statusBadge("ok", "Active"));
   const releaseUrl = cli.release?.releaseUrl;
   if (isSafeCodexGithubUrl(releaseUrl)) actions?.appendChild(compactButton("Release", () => openCodexGithubUrl(releaseUrl!)));
   if (lane === "beta") {
     const installLabel = installed && latest && installed !== latest ? "Update" : installed ? "Reinstall" : "Install";
-    const install = compactButton(installLabel, () => runCodexAction(row, "codexpp:install-codex-beta", undefined, reload));
+    const install = compactButton(installLabel, () => runCodexAction(row, "tweaker:install-codex-beta", undefined, reload));
     install.disabled = busy || !latest;
     actions?.appendChild(install);
     const previousVersion = cli.managedPreviousVersion;
     if (previousVersion) {
-      const rollback = compactButton(`Rollback to ${previousVersion}`, () => runCodexAction(row, "codexpp:rollback-codex-beta", undefined, reload));
+      const rollback = compactButton(`Rollback to ${previousVersion}`, () => runCodexAction(row, "tweaker:rollback-codex-beta", undefined, reload));
       rollback.disabled = busy;
       actions?.appendChild(rollback);
     }
@@ -1505,39 +3002,25 @@ function codexCliRow(
 
 function codexRuntimeRow(
   snapshot: CodexVersionsSnapshot,
-  beta: CodexCliVersionState,
-  busy: boolean,
-  reload: CodexUiReload,
 ): HTMLElement {
   const requested = snapshot.requestedLane;
+  const selected = requested
+    ? requested === "beta" ? "Managed Alpha (Pre-release)" : "Desktop-embedded (app-managed)"
+    : snapshot.userOverridePreserved ? "External override" : "Not explicitly selected";
+  const active = snapshot.activeCli.source === "managed-alpha"
+    ? "Managed Alpha"
+    : snapshot.activeCli.source === "bundled"
+      ? "Desktop-embedded"
+      : "External override";
+  const activeChannel = codexVersionChannelLabel(snapshot.activeCli.versionChannel);
+  const activeVersion = snapshot.activeCli.version ? ` ${snapshot.activeCli.version}` : "";
   const row = actionRow(
-    "Runtime",
-    requested
-      ? `${requested === "beta" ? "Beta" : "Bundled"} is selected. Runtime changes apply after restarting the app.`
-      : snapshot.userOverridePreserved
-        ? "An existing CODEX_CLI_PATH override is preserved until you choose a managed runtime."
-        : "No managed runtime is selected.",
+    "Selected runtime",
+    `Selected: ${selected}. Active: ${active}${activeVersion} · ${activeChannel}. Desktop profile and CLI release channel are reported separately.`,
   );
   makeCodexRowResponsive(row);
-  const actions = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
-  actions?.classList.add("flex-wrap", "justify-end");
-  const selector = document.createElement("div");
-  selector.className = "flex shrink-0 rounded-lg bg-token-foreground/5 p-0.5";
-  for (const lane of ["bundled", "beta"] as const) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = lane === "beta" ? "Beta" : "Bundled";
-    button.className = `rounded-md px-3 py-1.5 text-sm ${requested === lane ? "bg-token-bg-primary shadow-sm text-token-text-primary" : "text-token-text-secondary hover:text-token-text-primary"}`;
-    button.disabled = busy || requested === lane || (lane === "beta" && !(beta.managedCurrentVersion ?? beta.version));
-    button.title = lane === "beta" && button.disabled && requested !== lane ? "Install a verified Beta CLI first." : "";
-    button.addEventListener("click", () => {
-      const confirmOverride = snapshot.userOverridePreserved;
-      if (confirmOverride && !window.confirm("Tweakers will replace the existing CODEX_CLI_PATH override with a managed runtime on the next app start. Continue?")) return;
-      void runCodexAction(row, "codexpp:set-codex-cli-lane", { lane, confirmOverride }, reload);
-    });
-    selector.appendChild(button);
-  }
-  actions?.appendChild(selector);
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  actions?.appendChild(codexNeutralBadge("Managed by Environment"));
   return row;
 }
 
@@ -1549,7 +3032,7 @@ function codexFeatureBrowser(
   const wrapper = document.createElement("div");
   wrapper.className = "p-3";
   const details = document.createElement("details");
-  details.dataset.codexppFeatureBrowser = "true";
+  details.dataset.tweakerFeatureBrowser = "true";
   const summary = document.createElement("summary");
   summary.className = "cursor-pointer text-sm text-token-text-primary";
   const features = snapshot.features;
@@ -1621,7 +3104,7 @@ function codexFeatureRow(
     const toggle = switchControl(enabled, async (next) => {
       toggle.disabled = true;
       try {
-        await ipcRenderer.invoke("codexpp:set-codex-feature", { lane, name: feature.name, enabled: next });
+        await ipcRenderer.invoke("tweaker:set-codex-feature", { lane, name: feature.name, enabled: next });
         reload();
       } catch (error) {
         window.alert(`Could not update ${feature.name}: ${safeUiError(error)}`);
@@ -1678,7 +3161,7 @@ function codexNeutralBadge(text: string): HTMLElement {
 
 function makeCodexRowResponsive(row: HTMLElement): void {
   row.classList.add("flex-wrap");
-  row.querySelector<HTMLElement>("[data-codexpp-row-actions]")?.classList.add("flex-wrap", "justify-end");
+  row.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.classList.add("flex-wrap", "justify-end");
 }
 
 function codexInlineMessage(text: string): HTMLElement {
@@ -1707,12 +3190,18 @@ function installedLatestSummary(
 }
 
 function codexRuntimeMessage(snapshot: CodexVersionsSnapshot): string | null {
-  if (snapshot.fallbackReason) return `Beta could not start; Bundled was used. ${snapshot.fallbackReason}`;
+  if (snapshot.fallbackReason) return `Managed Alpha could not start; the desktop-embedded backend was used. ${snapshot.fallbackReason}`;
   if (snapshot.restartRequired) return "Restart the app to apply the selected Codex runtime.";
   if (snapshot.requestedLane && snapshot.effectiveLane && snapshot.requestedLane !== snapshot.effectiveLane) {
-    return `${snapshot.requestedLane === "beta" ? "Beta" : "Bundled"} is selected; ${snapshot.effectiveLane === "beta" ? "Beta" : "Bundled"} remains active until restart.`;
+    return `${snapshot.requestedLane === "beta" ? "Managed Alpha (Pre-release)" : "Desktop-embedded"} is selected; ${snapshot.effectiveLane === "beta" ? "Managed Alpha (Pre-release)" : "Desktop-embedded"} remains active until restart.`;
   }
   return null;
+}
+
+function codexVersionChannelLabel(channel: CodexCliVersionState["versionChannel"]): string {
+  if (channel === "stable") return "Stable";
+  if (channel === "prerelease") return "Pre-release";
+  return "Unknown release channel";
 }
 
 function codexScopedError(
@@ -1742,7 +3231,7 @@ function openCodexGithubUrl(url: string): void {
     plog("blocked non-Codex GitHub URL", url);
     return;
   }
-  void ipcRenderer.invoke("codexpp:open-external", url).catch((error) => plog("open Codex release failed", String(error)));
+  void ipcRenderer.invoke("tweaker:open-external", url).catch((error) => plog("open Codex release failed", String(error)));
 }
 
 function runCodexAction(
@@ -1781,204 +3270,8 @@ function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// Confirmation copy for each switch direction. Switching is a real bundle
-// swap: the installer CLI quits the app, swaps payloads, and relaunches.
-const MODE_SWITCH_COPY: Record<AppModeTarget, { title: string; body: string; restarting: string }> = {
-  chatgpt: {
-    title: "Switch to the official ChatGPT app?",
-    body: "ChatGPT will quit and restart as the official app. Tweaks turn off; the Chrome-extension bridge turns on; some macOS permissions may need re-granting.",
-    restarting: "ChatGPT is quitting and will restart as the official app.",
-  },
-  tweakers: {
-    title: "Switch to Tweakers?",
-    body: "ChatGPT will quit and restart with Tweakers enabled. Tweaks turn on; the Chrome-extension bridge turns off; some macOS permissions may need re-granting.",
-    restarting: "ChatGPT is quitting and will restart with Tweakers enabled.",
-  },
-};
-
-const MODE_DESCRIPTIONS: Record<AppModeTarget, string> = {
-  chatgpt: "OpenAI's standard app experience.",
-  tweakers: "The standard app with your enabled Tweakers features.",
-};
-
-// How long the control may stay parked in "Restarting…" after the switch
-// helper was submitted. A switch that starts quits this app well within this
-// window; if we are still alive afterwards the CLI refused pre-quit (its
-// stdio is discarded behind launchd), and this UI is the only place left to
-// say so.
-const MODE_SWITCH_START_TIMEOUT_MS = 45_000;
-
-function renderModeSection(sectionsWrap: HTMLElement): void {
-  const section = document.createElement("section");
-  section.className = "flex flex-col gap-2";
-  section.appendChild(sectionTitle("App Mode"));
-  const card = roundedCard();
-  const row = document.createElement("div");
-  row.className = "flex items-center justify-between gap-4 p-3";
-  const copy = document.createElement("div");
-  copy.className = "flex min-w-0 flex-col gap-1";
-  const title = document.createElement("div");
-  title.className = "text-sm text-token-text-primary";
-  const detail = document.createElement("div");
-  detail.className = "text-sm text-token-text-secondary";
-  const actions = document.createElement("div");
-  actions.className = "flex shrink-0 rounded-lg bg-token-foreground/5 p-0.5";
-
-  // This settings UI only exists inside the patched bundle, so when this
-  // section renders the live mode is always "tweakers" (in chatgpt mode
-  // nothing is injected). The control stays two-sided anyway: it reflects
-  // both payloads honestly, and the inactive side is the entry point for
-  // switching back to the official app.
-  const currentMode: AppModeTarget = "tweakers";
-  let switchingTo: AppModeTarget | null = null;
-  let switchStartTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const clearSwitchStartTimer = (): void => {
-    if (switchStartTimer !== null) {
-      clearTimeout(switchStartTimer);
-      switchStartTimer = null;
-    }
-  };
-  window.addEventListener("pagehide", clearSwitchStartTimer);
-
-  const startSwitch = (target: AppModeTarget): void => {
-    switchingTo = target;
-    render();
-    void ipcRenderer
-      .invoke("codexpp:switch-app-mode", { target })
-      .then((result: { ok: boolean; message?: string }) => {
-        if (result?.ok) {
-          // ok only means the launchd helper was submitted — the CLI can still
-          // refuse before quitting the app (lock contention, missing backup,
-          // switcher setup failure) with its output discarded. Never park the
-          // control forever: if this app is still alive when the timer fires,
-          // the switch did not start.
-          clearSwitchStartTimer();
-          switchStartTimer = setTimeout(() => {
-            switchStartTimer = null;
-            switchingTo = null;
-            render();
-            detail.textContent =
-              "The switch did not start — check the Tweakers menu-bar switcher or run `tweakers mode status`.";
-          }, MODE_SWITCH_START_TIMEOUT_MS);
-          return;
-        }
-        clearSwitchStartTimer();
-        switchingTo = null;
-        render();
-        detail.textContent = result?.message || "The mode switch could not be started.";
-      })
-      .catch((error) => {
-        clearSwitchStartTimer();
-        switchingTo = null;
-        render();
-        detail.textContent = safeUiError(error);
-        plog("switch app mode failed", String(error));
-      });
-  };
-
-  const render = (): void => {
-    if (switchingTo) {
-      title.textContent = "Restarting…";
-      detail.textContent = MODE_SWITCH_COPY[switchingTo].restarting;
-    } else {
-      title.textContent = appModeLabel(currentMode);
-      detail.textContent = MODE_DESCRIPTIONS[currentMode];
-    }
-    actions.replaceChildren();
-    for (const target of ["chatgpt", "tweakers"] as const) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = appModeLabel(target);
-      button.disabled = switchingTo !== null || target === currentMode;
-      button.className = `rounded-md px-3 py-1.5 text-sm ${target === currentMode ? "bg-token-bg-primary shadow-sm text-token-text-primary" : "text-token-text-secondary hover:text-token-text-primary"}`;
-      if (target !== currentMode) {
-        // Confirmation happens here, in the renderer — the IPC handler never
-        // prompts. Confirm hands off to the installer CLI via launchd.
-        button.addEventListener("click", () => openModeSwitchModal(target, () => startSwitch(target)));
-      }
-      actions.append(button);
-    }
-  };
-  render();
-  copy.append(title, detail); row.append(copy, actions); card.append(row); section.append(card); sectionsWrap.append(section);
-}
-
-/**
- * Styled confirmation modal for mode switches, matching the injected
- * settings look (token classes + panel background) instead of the bare
- * window.confirm used by older flows. Confirm → onConfirm(); Cancel/Escape/
- * backdrop click → dismiss without side effects.
- */
-function openModeSwitchModal(target: AppModeTarget, onConfirm: () => void): void {
-  const overlay = document.createElement("div");
-  overlay.dataset.codexppModeModal = "true";
-  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 p-4";
-  const dialog = document.createElement("div");
-  dialog.setAttribute("role", "dialog");
-  dialog.setAttribute("aria-modal", "true");
-  dialog.className = "border-token-border flex w-full max-w-md flex-col gap-4 rounded-2xl border p-5 shadow-xl";
-  dialog.setAttribute(
-    "style",
-    "background-color: var(--color-background-panel, var(--color-token-bg-fog));",
-  );
-
-  const heading = document.createElement("div");
-  heading.className = "text-base font-medium text-token-text-primary";
-  heading.textContent = MODE_SWITCH_COPY[target].title;
-  const body = document.createElement("div");
-  body.className = "text-sm text-token-text-secondary";
-  body.textContent = MODE_SWITCH_COPY[target].body;
-
-  const buttons = document.createElement("div");
-  buttons.className = "flex items-center justify-end gap-2";
-  const close = (): void => {
-    document.removeEventListener("keydown", onKeydown, true);
-    overlay.remove();
-  };
-  const onKeydown = (event: KeyboardEvent): void => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    event.stopPropagation();
-    close();
-  };
-  const cancel = compactButton("Cancel", close);
-  const confirm = document.createElement("button");
-  confirm.type = "button";
-  confirm.className =
-    "user-select-none no-drag cursor-interaction inline-flex h-8 items-center whitespace-nowrap rounded-lg bg-token-charts-blue px-3 text-sm text-white enabled:hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40";
-  confirm.textContent = "Switch & Restart";
-  confirm.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    close();
-    onConfirm();
-  });
-  buttons.append(cancel, confirm);
-
-  const openedAt = Date.now();
-  let pressBeganOnOverlay = false;
-  overlay.addEventListener("mousedown", (event) => {
-    pressBeganOnOverlay = event.target === overlay;
-  });
-  overlay.addEventListener("click", (event) => {
-    // Backdrop dismissal only counts when the press also BEGAN on the
-    // backdrop, and never inside the open grace period: the second click of a
-    // double-click on the trigger button lands on the overlay that just
-    // appeared over it and must not instantly dismiss the dialog.
-    if (event.target !== overlay || !pressBeganOnOverlay) return;
-    if (Date.now() - openedAt < 250) return;
-    close();
-  });
-  document.addEventListener("keydown", onKeydown, true);
-  dialog.append(heading, body, buttons);
-  overlay.appendChild(dialog);
-  document.body.appendChild(overlay);
-  confirm.focus();
-}
-
-function renderCodexPlusPlusConfig(card: HTMLElement, config: CodexPlusPlusConfig): void {
-  setSidebarCodexPlusPlusUpdateButton(config.updateCheck);
+function renderTweakerConfig(card: HTMLElement, config: TweakerConfig): void {
+  setSidebarTweakerUpdateButton(config.updateCheck);
   card.appendChild(autoUpdateRow(config));
   card.appendChild(updateChannelRow(config));
   card.appendChild(installationSourceRow(config.installationSource));
@@ -1987,7 +3280,7 @@ function renderCodexPlusPlusConfig(card: HTMLElement, config: CodexPlusPlusConfi
   if (config.updateCheck?.releaseNotes) card.appendChild(releaseNotesRow(config.updateCheck));
 }
 
-function autoUpdateRow(config: CodexPlusPlusConfig): HTMLElement {
+function autoUpdateRow(config: TweakerConfig): HTMLElement {
   const row = document.createElement("div");
   row.className = "flex items-center justify-between gap-4 p-3";
   const left = document.createElement("div");
@@ -2003,15 +3296,15 @@ function autoUpdateRow(config: CodexPlusPlusConfig): HTMLElement {
   row.appendChild(left);
   row.appendChild(
     switchControl(config.autoUpdate, async (next) => {
-      await ipcRenderer.invoke("codexpp:set-auto-update", next);
+      await ipcRenderer.invoke("tweaker:set-auto-update", next);
     }),
   );
   return row;
 }
 
-function updateChannelRow(config: CodexPlusPlusConfig): HTMLElement {
+function updateChannelRow(config: TweakerConfig): HTMLElement {
   const row = actionRow("Release channel", updateChannelSummary(config));
-  const action = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
+  const action = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   const select = document.createElement("select");
   select.className =
     "h-8 rounded-lg border border-token-border bg-transparent px-2 text-sm text-token-text-primary focus:outline-none";
@@ -2028,7 +3321,7 @@ function updateChannelRow(config: CodexPlusPlusConfig): HTMLElement {
   }
   select.addEventListener("change", () => {
     void ipcRenderer
-      .invoke("codexpp:set-update-config", { updateChannel: select.value })
+      .invoke("tweaker:set-update-config", { updateChannel: select.value })
       .then(() => refreshConfigCard(row))
       .catch((e) => plog("set update channel failed", String(e)));
   });
@@ -2041,7 +3334,7 @@ function updateChannelRow(config: CodexPlusPlusConfig): HTMLElement {
         const ref = window.prompt("Git ref", config.updateRef || "main");
         if (ref === null) return;
         void ipcRenderer
-          .invoke("codexpp:set-update-config", {
+          .invoke("tweaker:set-update-config", {
             updateChannel: "custom",
             updateRepo: repo,
             updateRef: ref,
@@ -2068,7 +3361,7 @@ function selfUpdateStatusRow(state: SelfUpdateState | null): HTMLElement {
   return row;
 }
 
-function checkForUpdatesRow(config: CodexPlusPlusConfig): HTMLElement {
+function checkForUpdatesRow(config: TweakerConfig): HTMLElement {
   const check = config.updateCheck;
   const row = document.createElement("div");
   row.className = "flex items-center justify-between gap-4 p-3";
@@ -2089,7 +3382,7 @@ function checkForUpdatesRow(config: CodexPlusPlusConfig): HTMLElement {
   if (check?.releaseUrl) {
     actions.appendChild(
       compactButton("Release Notes", () => {
-        void ipcRenderer.invoke("codexpp:open-external", check.releaseUrl);
+        void ipcRenderer.invoke("tweaker:open-external", check.releaseUrl);
       }),
     );
   }
@@ -2097,9 +3390,9 @@ function checkForUpdatesRow(config: CodexPlusPlusConfig): HTMLElement {
     compactButton("Check Now", () => {
       row.style.opacity = "0.65";
       void ipcRenderer
-        .invoke("codexpp:check-codexpp-update", true)
+        .invoke("tweaker:check-tweaker-update", true)
         .then((check) => {
-          setSidebarCodexPlusPlusUpdateButton(check as CodexPlusPlusUpdateCheck);
+          setSidebarTweakerUpdateButton(check as TweakerUpdateCheck);
           refreshConfigCard(row);
         })
         .catch((e) => plog("Tweakers release check failed", String(e)))
@@ -2114,9 +3407,9 @@ function checkForUpdatesRow(config: CodexPlusPlusConfig): HTMLElement {
       const buttons = actions.querySelectorAll("button");
       buttons.forEach((button) => (button.disabled = true));
       void ipcRenderer
-        .invoke("codexpp:run-codexpp-update")
+        .invoke("tweaker:run-tweaker-update")
         .then(() => {
-          refreshSidebarCodexPlusPlusUpdateButton(true);
+          refreshSidebarTweakerUpdateButton(true);
           refreshConfigCard(row);
         })
         .catch((e) => {
@@ -2133,7 +3426,7 @@ function checkForUpdatesRow(config: CodexPlusPlusConfig): HTMLElement {
   return row;
 }
 
-function releaseNotesRow(check: CodexPlusPlusUpdateCheck): HTMLElement {
+function releaseNotesRow(check: TweakerUpdateCheck): HTMLElement {
   const row = document.createElement("div");
   row.className = "flex flex-col gap-2 p-3";
   const title = document.createElement("div");
@@ -2293,7 +3586,7 @@ function appendText(parent: HTMLElement, text: string): void {
 
 function renderWatcherHealthCard(card: HTMLElement): void {
   void ipcRenderer
-    .invoke("codexpp:get-watcher-health")
+    .invoke("tweaker:get-watcher-health")
     .then((health) => {
       card.textContent = "";
       renderWatcherHealth(card, health as WatcherHealth);
@@ -2304,11 +3597,45 @@ function renderWatcherHealthCard(card: HTMLElement): void {
     });
 }
 
-function renderWatcherHealth(card: HTMLElement, health: WatcherHealth): void {
+function renderWatcherHealth(
+  card: HTMLElement,
+  health: WatcherHealth,
+  includeRepair = false,
+  onRepair?: () => void,
+): void {
   card.appendChild(watcherSummaryRow(health));
   for (const check of health.checks) {
     if (check.status === "ok") continue;
     card.appendChild(watcherCheckRow(check));
+  }
+  if (includeRepair) {
+    const row = actionRow(
+      "Automatic maintenance",
+      health.status === "ok"
+        ? "The watcher is healthy and will continue checking automatically."
+        : "Repair the watcher registration and run a fresh health check.",
+    );
+    const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+    actions?.appendChild(compactButton("Repair Now", onRepair ?? (() => {
+      const button = actions.querySelector<HTMLButtonElement>("button");
+      if (button) button.disabled = true;
+      void ipcRenderer.invoke("tweaker:repair-auto-maintenance")
+        .then(() => ipcRenderer.invoke("tweaker:get-watcher-health"))
+        .then((next) => {
+          card.textContent = "";
+          renderWatcherHealth(card, next as WatcherHealth, true);
+        })
+        .catch((error) => {
+          card.textContent = "";
+          renderWatcherHealth(card, {
+            ...health,
+            status: "error",
+            title: "Automatic maintenance repair failed",
+            summary: safeUiError(error),
+        }, true);
+      });
+    })));
+    card.appendChild(row);
   }
 }
 
@@ -2366,7 +3693,7 @@ function statusBadge(status: "ok" | "warn" | "error", label?: string): HTMLEleme
   return badge;
 }
 
-function updateSummary(check: CodexPlusPlusUpdateCheck | null): string {
+function updateSummary(check: TweakerUpdateCheck | null): string {
   if (!check) return "No update check has run yet.";
   const latest = check.latestVersion ? `Latest v${check.latestVersion}. ` : "";
   const checked = `Checked ${new Date(check.checkedAt).toLocaleString()}.`;
@@ -2374,7 +3701,7 @@ function updateSummary(check: CodexPlusPlusUpdateCheck | null): string {
   return `${latest}${checked}`;
 }
 
-function updateChannelSummary(config: CodexPlusPlusConfig): string {
+function updateChannelSummary(config: TweakerConfig): string {
   if (config.updateChannel === "custom") {
     return `${config.updateRepo || "therealityreport/tweakers"} ${config.updateRef || "(no ref set)"}`;
   }
@@ -2412,15 +3739,15 @@ function selfUpdateStatusLabel(status: SelfUpdateStatus): string {
 }
 
 function refreshConfigCard(row: HTMLElement): void {
-  const card = row.closest("[data-codexpp-config-card]") as HTMLElement | null;
+  const card = row.closest("[data-tweaker-config-card]") as HTMLElement | null;
   if (!card) return;
   card.textContent = "";
   card.appendChild(rowSimple("Refreshing", "Loading current Tweakers update status."));
   void ipcRenderer
-    .invoke("codexpp:get-config")
+    .invoke("tweaker:get-config")
     .then((config) => {
       card.textContent = "";
-      renderCodexPlusPlusConfig(card, config as CodexPlusPlusConfig);
+      renderTweakerConfig(card, config as TweakerConfig);
     })
     .catch((e) => {
       card.textContent = "";
@@ -2433,11 +3760,11 @@ function uninstallRow(): HTMLElement {
     "Uninstall Tweakers",
     "Copies the uninstall command. Run it from a terminal after quitting Codex.",
   );
-  const action = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
+  const action = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   action?.appendChild(
     compactButton("Copy Command", () => {
       void ipcRenderer
-        .invoke("codexpp:copy-text", "node ~/.codex-plusplus/source/packages/installer/dist/cli.js uninstall")
+        .invoke("tweaker:copy-text", "node ~/.tweaker/source/packages/installer/dist/cli.js uninstall")
         .catch((e) => plog("copy uninstall command failed", String(e)));
     }),
   );
@@ -2449,7 +3776,7 @@ function reportBugRow(): HTMLElement {
     "Report a bug",
     "Open a GitHub issue with runtime, installer, or tweak-manager details.",
   );
-  const action = row.querySelector<HTMLElement>("[data-codexpp-row-actions]");
+  const action = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   action?.appendChild(
     compactButton("Open Issue", () => {
       const title = encodeURIComponent("[Bug]: ");
@@ -2470,7 +3797,7 @@ function reportBugRow(): HTMLElement {
         ].join("\n"),
       );
       void ipcRenderer.invoke(
-        "codexpp:open-external",
+        "tweaker:open-external",
         `https://github.com/therealityreport/tweakers/issues/new?title=${title}&body=${body}`,
       );
     }),
@@ -2493,7 +3820,7 @@ function actionRow(titleText: string, description: string): HTMLElement {
   left.appendChild(desc);
   row.appendChild(left);
   const actions = document.createElement("div");
-  actions.dataset.codexppRowActions = "true";
+  actions.dataset.tweakerRowActions = "true";
   actions.className = "flex shrink-0 items-center gap-2";
   row.appendChild(actions);
   return row;
@@ -2508,7 +3835,7 @@ function renderTweakStorePage(
 
   const source = document.createElement("span");
   source.hidden = true;
-  source.dataset.codexppStoreSource = "true";
+  source.dataset.tweakerStoreSource = "true";
   source.textContent = "Loading live registry";
 
   const actions = document.createElement("div");
@@ -2527,10 +3854,10 @@ function renderTweakStorePage(
   }
 
   const grid = document.createElement("div");
-  grid.dataset.codexppStoreGrid = "true";
+  grid.dataset.tweakerStoreGrid = "true";
   grid.className = "grid gap-4";
   if (state.tweakStore) {
-    grid.dataset.codexppStore = JSON.stringify(state.tweakStore);
+    grid.dataset.tweakerStore = JSON.stringify(state.tweakStore);
     renderTweakStoreGrid(grid, source);
   } else {
     renderTweakStoreGhostGrid(grid);
@@ -2549,11 +3876,11 @@ function refreshTweakStoreGrid(
 ): void {
   void getTweakStore(force)
     .then((store) => {
-      grid.dataset.codexppStore = JSON.stringify(store);
+      grid.dataset.tweakerStore = JSON.stringify(store);
       renderTweakStoreGrid(grid, source);
     })
     .catch((e) => {
-      grid.dataset.codexppStore = "";
+      grid.dataset.tweakerStore = "";
       grid.removeAttribute("aria-busy");
       source.textContent = "Live registry unavailable";
       updateStoreUpdateBadge(null);
@@ -2579,7 +3906,7 @@ function getTweakStore(force = false): Promise<TweakStoreRegistryView> {
   }
   state.tweakStoreError = null;
   const promise = ipcRenderer
-    .invoke("codexpp:get-tweak-store")
+    .invoke("tweaker:get-tweak-store")
     .then((store) => {
       state.tweakStore = store as TweakStoreRegistryView;
       return state.tweakStore;
@@ -2611,7 +3938,7 @@ function renderTweakStoreGrid(grid: HTMLElement, source: HTMLElement): void {
 }
 
 function parseStoreDataset(grid: HTMLElement): TweakStoreRegistryView | null {
-  const raw = grid.dataset.codexppStore;
+  const raw = grid.dataset.tweakerStore;
   if (!raw) return null;
   try {
     return JSON.parse(raw) as TweakStoreRegistryView;
@@ -2646,7 +3973,7 @@ function tweakStoreCard(entry: TweakStoreEntryView): HTMLElement {
   if (entry.releaseUrl) {
     actions.appendChild(
       compactButton("Release", () => {
-        void ipcRenderer.invoke("codexpp:open-external", entry.releaseUrl);
+        void ipcRenderer.invoke("tweaker:open-external", entry.releaseUrl);
       }),
     );
   }
@@ -2666,12 +3993,12 @@ function tweakStoreCard(entry: TweakStoreEntryView): HTMLElement {
     const installLabel = entry.installed ? "Update" : "Install";
     if (hasUpdate) actions.appendChild(storeStatusPill("Update available", "info"));
     const installButton = storeInstallButton(installLabel, (button) => {
-      const grid = card.closest("[data-codexpp-store-grid]") as HTMLElement | null;
-      const source = grid?.parentElement?.querySelector("[data-codexpp-store-source]") as HTMLElement | null;
+      const grid = card.closest("[data-tweaker-store-grid]") as HTMLElement | null;
+      const source = grid?.parentElement?.querySelector("[data-tweaker-store-source]") as HTMLElement | null;
       showStoreButtonLoading(button, entry.installed ? "Updating" : "Installing");
       actions.querySelectorAll("button").forEach((button) => (button.disabled = true));
       void ipcRenderer
-        .invoke("codexpp:install-store-tweak", entry.id)
+        .invoke("tweaker:install-store-tweak", entry.id)
         .then(() => {
           showStoreToast(`${entry.manifest.name} installed.`);
           showStoreButtonInstalled(button);
@@ -2706,9 +4033,9 @@ function runtimeLockedLabel(runtime: NonNullable<TweakStoreEntryView["runtime"]>
 }
 
 function showStoreCardMessage(card: HTMLElement, message: string): void {
-  card.querySelector("[data-codexpp-store-card-message]")?.remove();
+  card.querySelector("[data-tweaker-store-card-message]")?.remove();
   const notice = document.createElement("div");
-  notice.dataset.codexppStoreCardMessage = "true";
+  notice.dataset.tweakerStoreCardMessage = "true";
   notice.className =
     "rounded-lg border border-token-border/50 bg-token-foreground/5 px-3 py-2 text-sm leading-5 text-token-description-foreground";
   notice.textContent = message;
@@ -2773,7 +4100,7 @@ function tweakStoreReadMoreButton(repo: string): HTMLButtonElement {
   readMore.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    void ipcRenderer.invoke("codexpp:open-external", `https://github.com/${repo}`);
+    void ipcRenderer.invoke("tweaker:open-external", `https://github.com/${repo}`);
   });
   return readMore;
 }
@@ -2888,59 +4215,50 @@ function storeEntryIconUrl(entry: TweakStoreEntryView): string | null {
 function sidebarUpdatePillButton(): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.dataset.codexppSidebarUpdate = "true";
+  btn.dataset.tweakerSidebarUpdate = "true";
   btn.className =
-    "user-select-none no-drag cursor-interaction inline-flex shrink-0 items-center justify-center whitespace-nowrap";
+    "user-select-none no-drag cursor-interaction inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full bg-token-charts-blue text-white hover:bg-token-charts-blue/80";
   Object.assign(btn.style, {
     display: "none",
     height: "20px",
     borderRadius: "9999px",
     border: "0",
-    background: "#0A84FF",
-    color: "#FFFFFF",
     padding: "0 8px",
     fontSize: "10px",
     fontWeight: "700",
     lineHeight: "20px",
     letterSpacing: "0",
     textTransform: "none",
-    boxShadow: "0 1px 2px rgba(0, 0, 0, 0.18)",
   });
   btn.textContent = "Update";
   btn.title = "Open Tweakers update";
-  btn.addEventListener("mouseenter", () => {
-    btn.style.background = "#0071E3";
-  });
-  btn.addEventListener("mouseleave", () => {
-    btn.style.background = "#0A84FF";
-  });
   btn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    void ipcRenderer.invoke("codexpp:open-external", btn.dataset.codexppReleaseUrl || TWEAKERS_RELEASES_URL);
+    void ipcRenderer.invoke("tweaker:open-external", btn.dataset.tweakerReleaseUrl || TWEAKERS_RELEASES_URL);
   });
   return btn;
 }
 
-function refreshSidebarCodexPlusPlusUpdateButton(force = false): void {
-  const btn = state.codexPlusPlusUpdateButton;
+function refreshSidebarTweakerUpdateButton(force = false): void {
+  const btn = state.tweakerUpdateButton;
   if (!btn) return;
   void ipcRenderer
-    .invoke("codexpp:check-codexpp-update", force)
-    .then((check) => setSidebarCodexPlusPlusUpdateButton(check as CodexPlusPlusUpdateCheck))
+    .invoke("tweaker:check-tweaker-update", force)
+    .then((check) => setSidebarTweakerUpdateButton(check as TweakerUpdateCheck))
     .catch((e) => {
       plog("Tweakers sidebar release check failed", String(e));
-      setSidebarCodexPlusPlusUpdateButton(null);
+      setSidebarTweakerUpdateButton(null);
     });
 }
 
-function setSidebarCodexPlusPlusUpdateButton(check: CodexPlusPlusUpdateCheck | null): void {
-  const btn = state.codexPlusPlusUpdateButton;
+function setSidebarTweakerUpdateButton(check: TweakerUpdateCheck | null): void {
+  const btn = state.tweakerUpdateButton;
   if (!btn) return;
   const updateAvailable = check?.updateAvailable === true;
   btn.style.display = updateAvailable ? "inline-flex" : "none";
   btn.hidden = !updateAvailable;
-  btn.dataset.codexppReleaseUrl = check?.releaseUrl || TWEAKERS_RELEASES_URL;
+  btn.dataset.tweakerReleaseUrl = check?.releaseUrl || TWEAKERS_RELEASES_URL;
   btn.title =
     updateAvailable && check?.latestVersion
       ? `Open Tweakers ${check.latestVersion} update`
@@ -2948,9 +4266,9 @@ function setSidebarCodexPlusPlusUpdateButton(check: CodexPlusPlusUpdateCheck | n
 }
 
 function updateStoreUpdateBadge(count: number | null): void {
-  const badge = document.querySelector<HTMLElement>("[data-codexpp-store-update-badge]");
+  const badge = document.querySelector<HTMLElement>("[data-tweaker-store-update-badge]");
   if (!badge) return;
-  badge.dataset.codexppStoreUpdateCount = count === null ? "" : String(count);
+  badge.dataset.tweakerStoreUpdateCount = count === null ? "" : String(count);
   applyStoreUpdateBadgeStyle(badge, count);
   badge.hidden = count === null || count <= 0;
   badge.textContent = count && count > 0 ? String(count) : "";
@@ -2962,25 +4280,25 @@ function updateStoreUpdateBadge(count: number | null): void {
 
 function applyStoreUpdateBadgeStyle(badge: HTMLElement, count: number | null): void {
   const hasUpdates = !!count && count > 0;
+  badge.classList.toggle("bg-token-charts-blue", hasUpdates);
+  badge.classList.toggle("text-white", hasUpdates);
+  badge.classList.toggle("bg-transparent", !hasUpdates);
   Object.assign(badge.style, {
     minWidth: "24px",
     height: "20px",
     borderRadius: "9999px",
     border: "0",
-    background: hasUpdates ? "#0A84FF" : "transparent",
-    color: "#FFFFFF",
     padding: "0 7px",
     fontSize: "12px",
     fontWeight: "700",
     lineHeight: "20px",
     letterSpacing: "0",
-    boxShadow: hasUpdates ? "0 1px 2px rgba(0, 0, 0, 0.22)" : "none",
   });
 }
 
 function currentStoreUpdateBadgeCount(): number {
-  const badge = document.querySelector<HTMLElement>("[data-codexpp-store-update-badge]");
-  const raw = badge?.dataset.codexppStoreUpdateCount;
+  const badge = document.querySelector<HTMLElement>("[data-tweaker-store-update-badge]");
+  const raw = badge?.dataset.tweakerStoreUpdateCount;
   const parsed = raw ? Number(raw) : 0;
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -3144,10 +4462,10 @@ function resetStoreInstallButton(button: HTMLButtonElement, label: string): void
 }
 
 function showStoreToast(message: string): void {
-  let host = document.querySelector<HTMLElement>("[data-codexpp-store-toast-host]");
+  let host = document.querySelector<HTMLElement>("[data-tweaker-store-toast-host]");
   if (!host) {
     host = document.createElement("div");
-    host.dataset.codexppStoreToastHost = "true";
+    host.dataset.tweakerStoreToastHost = "true";
     host.className = "pointer-events-none fixed bottom-5 right-5 z-[9999] flex flex-col items-end gap-2";
     document.body.appendChild(host);
   }
@@ -3233,10 +4551,10 @@ function renderTweaksPage(sectionsWrap: HTMLElement): () => void {
     `</svg>`;
   const searchLabel = document.createElement("label");
   searchLabel.className = "sr-only";
-  searchLabel.htmlFor = "codexpp-tweaks-search";
+  searchLabel.htmlFor = "tweaker-tweaks-search";
   searchLabel.textContent = "Search tweaks";
   const searchInput = document.createElement("input");
-  searchInput.id = "codexpp-tweaks-search";
+  searchInput.id = "tweaker-tweaks-search";
   searchInput.type = "search";
   searchInput.placeholder = "Search tweaks";
   searchInput.value = state.tweaksPageQuery;
@@ -3259,7 +4577,7 @@ function renderTweaksPage(sectionsWrap: HTMLElement): () => void {
       label: "Force Reload",
       onSelect: () => {
         void ipcRenderer
-          .invoke("codexpp:reload-tweaks")
+          .invoke("tweaker:reload-tweaks")
           .catch((e) => plog("force reload (main) failed", String(e)))
           .finally(() => location.reload());
       },
@@ -3267,14 +4585,14 @@ function renderTweaksPage(sectionsWrap: HTMLElement): () => void {
     {
       label: "Open Tweaks Folder",
       onSelect: () => {
-        void ipcRenderer.invoke("codexpp:reveal", tweaksPath());
+        void ipcRenderer.invoke("tweaker:reveal", tweaksPath());
       },
     },
   ]);
   toolbarActions.appendChild(globalMenu.element);
 
   const list = document.createElement("div");
-  list.id = "codexpp-tweaks-list";
+  list.id = "tweaker-tweaks-list";
   list.setAttribute("role", "tabpanel");
   list.className = "flex flex-col gap-2";
   wrap.appendChild(list);
@@ -3290,7 +4608,7 @@ function renderTweaksPage(sectionsWrap: HTMLElement): () => void {
       const selected = state.tweaksPageFilter === filter;
       const button = document.createElement("button");
       button.type = "button";
-      button.id = `codexpp-tweaks-filter-${filter}`;
+      button.id = `tweaker-tweaks-filter-${filter}`;
       button.setAttribute("role", "tab");
       button.setAttribute("aria-controls", list.id);
       button.setAttribute("aria-selected", String(selected));
@@ -3312,7 +4630,7 @@ function renderTweaksPage(sectionsWrap: HTMLElement): () => void {
       });
       tabs.appendChild(button);
     }
-    list.setAttribute("aria-labelledby", `codexpp-tweaks-filter-${state.tweaksPageFilter}`);
+    list.setAttribute("aria-labelledby", `tweaker-tweaks-filter-${state.tweaksPageFilter}`);
 
     const visible = filterTweaksPageItems(
       state.listedTweaks,
@@ -3456,21 +4774,21 @@ function tweakRow(
     rowMenuItems.push({
       label: "Review Release",
       onSelect: () => {
-        void ipcRenderer.invoke("codexpp:open-external", tweak.update!.releaseUrl);
+        void ipcRenderer.invoke("tweaker:open-external", tweak.update!.releaseUrl);
       },
     });
   }
   rowMenuItems.push({
     label: "Open Repository",
     onSelect: () => {
-      void ipcRenderer.invoke("codexpp:open-external", `https://github.com/${manifest.githubRepo}`);
+      void ipcRenderer.invoke("tweaker:open-external", `https://github.com/${manifest.githubRepo}`);
     },
   });
   if (manifest.homepage && manifest.homepage !== `https://github.com/${manifest.githubRepo}`) {
     rowMenuItems.push({
       label: "Open Homepage",
       onSelect: () => {
-        void ipcRenderer.invoke("codexpp:open-external", manifest.homepage);
+        void ipcRenderer.invoke("tweaker:open-external", manifest.homepage);
       },
     });
   }
@@ -3491,27 +4809,27 @@ function tweakRow(
       actions.appendChild(storeStatusPill("Not installed"));
     } else {
       actions.appendChild(compactButton("Install", () => {
-        void ipcRenderer.invoke("codexpp:install-store-tweak", manifest.id)
+        void ipcRenderer.invoke("tweaker:install-store-tweak", manifest.id)
           .then(() => location.reload())
           .catch((e) => plog("catalog install failed", String(e)));
       }));
     }
   } else if (tweak.status === "quarantined") {
     actions.appendChild(compactButton("Recover", () => {
-      void ipcRenderer.invoke("codexpp:recover-tweak", manifest.id)
+      void ipcRenderer.invoke("tweaker:recover-tweak", manifest.id)
         .catch((e) => plog("tweak recovery failed", String(e)));
     }));
   } else {
     if (tweak.status === "failed") {
       actions.appendChild(compactButton("Retry", () => {
-        void ipcRenderer.invoke("codexpp:clear-tweak-health", manifest.id)
+        void ipcRenderer.invoke("tweaker:clear-tweak-health", manifest.id)
           .catch((e) => plog("clear tweak health failed", String(e)));
-        void ipcRenderer.invoke("codexpp:reload-tweaks")
+        void ipcRenderer.invoke("tweaker:reload-tweaks")
           .catch((e) => plog("tweak retry failed", String(e)));
       }));
     }
     const toggle = switchControl(tweak.enabled, async (next) => {
-      await ipcRenderer.invoke("codexpp:set-tweak-enabled", manifest.id, next);
+      await ipcRenderer.invoke("tweaker:set-tweak-enabled", manifest.id, next);
     });
     toggle.setAttribute("aria-label", `${tweak.enabled ? "Disable" : "Enable"} ${manifest.name}`);
     actions.appendChild(toggle);
@@ -3672,11 +4990,11 @@ function tweakStatusPill(tweak: ListedTweak): HTMLElement {
 }
 
 function openPublishTweakDialog(): void {
-  const existing = document.querySelector<HTMLElement>("[data-codexpp-publish-dialog]");
+  const existing = document.querySelector<HTMLElement>("[data-tweaker-publish-dialog]");
   existing?.remove();
 
   const overlay = document.createElement("div");
-  overlay.dataset.codexppPublishDialog = "true";
+  overlay.dataset.tweakerPublishDialog = "true";
   overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 p-4";
 
   const dialog = document.createElement("div");
@@ -3735,11 +5053,11 @@ async function submitPublishTweak(
   status.textContent = "Resolving the repo commit to review.";
   try {
     const submission = await ipcRenderer.invoke(
-      "codexpp:prepare-tweak-store-submission",
+      "tweaker:prepare-tweak-store-submission",
       repoInput.value,
     ) as TweakStorePublishSubmission;
     const url = buildTweakPublishIssueUrl(submission);
-    await ipcRenderer.invoke("codexpp:open-external", url);
+    await ipcRenderer.invoke("tweaker:open-external", url);
     status.textContent = `GitHub review issue opened for ${submission.commitSha.slice(0, 7)}.`;
   } catch (e) {
     status.className = "min-h-5 text-sm text-token-charts-red";
@@ -4010,7 +5328,7 @@ async function resolveIconUrl(
   const rel = url.startsWith("./") ? url.slice(2) : url;
   try {
     return (await ipcRenderer.invoke(
-      "codexpp:read-tweak-asset",
+      "tweaker:read-tweak-asset",
       tweakDir,
       rel,
     )) as string;
@@ -4032,11 +5350,11 @@ function findSidebarItemsGroup(): HTMLElement | null {
   let bestArea = Number.POSITIVE_INFINITY;
 
   for (const candidate of candidates) {
-    if (candidate.dataset.codexpp) continue;
+    if (candidate.dataset.tweaker) continue;
     if (!isSettingsSidebarCandidate(candidate)) continue;
 
-    const labels = codexPpSettingsLabelsFrom(candidate);
-    const score = codexPpSettingsLabelScore(labels);
+    const labels = tweakerSettingsLabelsFrom(candidate);
+    const score = tweakerSettingsLabelScore(labels);
     const rect = candidate.getBoundingClientRect();
     const area = rect.width * rect.height;
     const weighted = score.core * 100 + score.total;
@@ -4053,8 +5371,8 @@ function findSidebarItemsGroup(): HTMLElement | null {
 
 const FORBIDDEN_SETTINGS_SIDEBAR_SELECTOR = [
   "[data-composer-overlay-floating-ui='true']",
-  "[data-codexpp-slash-menu='true']",
-  "[data-codexpp-overlay-noise='true']",
+  "[data-tweaker-slash-menu='true']",
+  "[data-tweaker-overlay-noise='true']",
   ".composer-home-top-menu",
   ".vertical-scroll-fade-mask",
   "[class*='[container-name:home-main-content]']",
@@ -4070,7 +5388,7 @@ function isForbiddenSettingsSidebarSurface(node: Element | null): boolean {
 }
 
 function isSettingsSidebarCandidate(el: HTMLElement): boolean {
-  const rect = codexPpVisibleBox(el);
+  const rect = tweakerVisibleBox(el);
   if (!rect) return false;
 
   // Current Codex Settings sidebar: left column, not the main content panel.
@@ -4078,26 +5396,26 @@ function isSettingsSidebarCandidate(el: HTMLElement): boolean {
   if (rect.height < 80) return false;
   if (rect.left > window.innerWidth * 0.65) return false;
 
-  const labels = codexPpSettingsLabelsFrom(el);
-  if (hasMainAppSidebarSignals(labels) && !hasCodexPpSettingsOnlySignal(labels)) {
+  const labels = tweakerSettingsLabelsFrom(el);
+  if (hasMainAppSidebarSignals(labels) && !hasTweakerSettingsOnlySignal(labels)) {
     return false;
   }
 
-  return isCodexPpSettingsLabelSet(labels);
+  return isTweakerSettingsLabelSet(labels);
 }
 
 function removeMisplacedSettingsGroups(): void {
   const groups = document.querySelectorAll<HTMLElement>(
-    "[data-codexpp='nav-group'], [data-codexpp='pages-group'], [data-codexpp='native-nav-header']",
+    "[data-tweaker='nav-group'], [data-tweaker='pages-group'], [data-tweaker='native-nav-header']",
   );
   for (const group of Array.from(groups)) {
-    if (isCodexPpInjectedSettingsGroupPlacementValid(group)) continue;
-    resetCodexPpInjectedSettingsGroupState(group);
+    if (isTweakerInjectedSettingsGroupPlacementValid(group)) continue;
+    resetTweakerInjectedSettingsGroupState(group);
     group.remove();
   }
 }
 
-function isCodexPpInjectedSettingsGroupPlacementValid(group: HTMLElement): boolean {
+function isTweakerInjectedSettingsGroupPlacementValid(group: HTMLElement): boolean {
   if (isForbiddenSettingsSidebarSurface(group)) return false;
 
   // Trust the injection-time placement while that exact sidebar node is
@@ -4122,11 +5440,11 @@ function isCodexPpInjectedSettingsGroupPlacementValid(group: HTMLElement): boole
   return false;
 }
 
-function resetCodexPpInjectedSettingsGroupState(group: HTMLElement): void {
+function resetTweakerInjectedSettingsGroupState(group: HTMLElement): void {
   if (state.navGroup === group || (state.navGroup && group.contains(state.navGroup))) {
     state.navGroup = null;
     state.navButtons = null;
-    state.codexPlusPlusUpdateButton = null;
+    state.tweakerUpdateButton = null;
   }
   if (state.pagesGroup === group || (state.pagesGroup && group.contains(state.pagesGroup))) {
     state.pagesGroup = null;
@@ -4177,7 +5495,7 @@ function maybeDumpDom(): void {
     }
     let panel: HTMLElement | null = null;
     for (const child of Array.from(content.children) as HTMLElement[]) {
-      if (child.dataset.codexpp === "tweaks-panel") continue;
+      if (child.dataset.tweaker === "tweaks-panel") continue;
       if (child.style.display === "none") continue;
       panel = child;
       break;
@@ -4230,7 +5548,7 @@ function describe(el: HTMLElement): Record<string, unknown> {
 
 function tweaksPath(): string {
   return (
-    (window as unknown as { __codexpp_tweaks_dir__?: string }).__codexpp_tweaks_dir__ ??
+    (window as unknown as { __tweaker_tweaks_dir__?: string }).__tweaker_tweaks_dir__ ??
     "<user dir>/tweaks"
   );
 }

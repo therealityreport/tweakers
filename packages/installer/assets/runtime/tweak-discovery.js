@@ -19,8 +19,16 @@ function discoverTweaks(tweaksDir) {
     const out = [];
     for (const name of (0, node_fs_1.readdirSync)(tweaksDir).sort((a, b) => a.localeCompare(b))) {
         const dir = (0, node_path_1.join)(tweaksDir, name);
-        if (!(0, node_fs_1.statSync)(dir).isDirectory())
+        // A removed development target can leave a dangling top-level symlink.
+        // Treat one unreadable entry as invalid instead of taking every installed
+        // tweak offline.
+        try {
+            if (!(0, node_fs_1.statSync)(dir).isDirectory())
+                continue;
+        }
+        catch {
             continue;
+        }
         const manifestPath = (0, node_path_1.join)(dir, "manifest.json");
         if (!(0, node_fs_1.existsSync)(manifestPath))
             continue;

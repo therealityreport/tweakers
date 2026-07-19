@@ -9,6 +9,7 @@ exports.lifecycleRecordKey = lifecycleRecordKey;
 exports.bindMainTweakStop = bindMainTweakStop;
 exports.recoverInterruptedTweaks = recoverInterruptedTweaks;
 exports.isMainProcessTweakScope = isMainProcessTweakScope;
+exports.loadTweaksInitially = loadTweaksInitially;
 exports.reloadTweaks = reloadTweaks;
 exports.setTweakEnabledAndReload = setTweakEnabledAndReload;
 /**
@@ -136,18 +137,32 @@ function recoverInterruptedTweaks(journal, now = new Date().toISOString()) {
 function isMainProcessTweakScope(scope) {
     return scope !== "renderer";
 }
-function reloadTweaks(reason, deps) {
-    deps.logInfo(`reloading tweaks (${reason})`);
-    deps.stopAllMainTweaks();
-    deps.clearTweakModuleCache();
-    deps.loadAllMainTweaks();
-    deps.broadcastReload();
+let reloadSequence = Promise.resolve();
+function loadTweaksInitially(deps) {
+    const run = async () => {
+        await deps.loadAllMainTweaks();
+    };
+    const operation = reloadSequence.then(run, run);
+    reloadSequence = operation.catch(() => { });
+    return operation;
 }
-function setTweakEnabledAndReload(id, enabled, deps) {
+function reloadTweaks(reason, deps) {
+    const run = async () => {
+        deps.logInfo(`reloading tweaks (${reason})`);
+        deps.stopAllMainTweaks();
+        deps.clearTweakModuleCache();
+        await deps.loadAllMainTweaks();
+        deps.broadcastReload();
+    };
+    const operation = reloadSequence.then(run, run);
+    reloadSequence = operation.catch(() => { });
+    return operation;
+}
+async function setTweakEnabledAndReload(id, enabled, deps) {
     const normalizedEnabled = !!enabled;
     deps.setTweakEnabled(id, normalizedEnabled);
     deps.logInfo(`tweak ${id} enabled=${normalizedEnabled}`);
-    reloadTweaks("enabled-toggle", deps);
+    await reloadTweaks("enabled-toggle", deps);
     return true;
 }
 //# sourceMappingURL=tweak-lifecycle.js.map

@@ -11,6 +11,7 @@ import type {
   CodexReleaseLookupResult,
   CodexSemanticVersion,
   CodexUpdateAvailability,
+  CodexVersionChannel,
   CodexVersionService,
   CodexVersionServiceDependencies,
   GitHubCodexRelease,
@@ -18,7 +19,9 @@ import type {
 } from "./codex-version-types.js";
 
 const CODEX_RELEASE_CACHE_SCHEMA_VERSION = 1 as const;
-const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+// Alpha releases can move several times in one day. An hourly cache keeps the
+// Settings report useful without repeatedly hitting GitHub during one session.
+const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1_000;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 512 * 1_024;
 const DARWIN_ARM64_ASSET_NAMES = ["codex-package-aarch64-apple-darwin.tar.gz"] as const;
@@ -160,6 +163,18 @@ export function resolveCodexReleaseAsset(release: GitHubCodexRelease): CodexRele
 
 export function parseCodexCliVersion(output: string): string | null {
   return EXACT_CLI_VERSION.exec(output)?.[1] ?? null;
+}
+
+/**
+ * Classify the semantic release channel of the exact installed CLI version.
+ * This is deliberately independent of where the binary came from: OpenAI's
+ * production desktop app can embed a prerelease Codex CLI.
+ */
+export function codexVersionChannel(version: string | null | undefined): CodexVersionChannel {
+  if (!version) return "unknown";
+  const parsed = parseCodexVersionTag(`rust-v${version}`);
+  if (!parsed) return "unknown";
+  return parsed.prerelease === null ? "stable" : "prerelease";
 }
 
 export function parseCodexFeatureList(output: string): ParsedCodexFeature[] {

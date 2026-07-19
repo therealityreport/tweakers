@@ -7,7 +7,7 @@ test("watcher refuses a non-pinned repo", () => {
     resolveUpdateRepo(
       { watcher: true },
       { updateRepo: "evil/repo" },
-      { CODEX_PLUSPLUS_REPO: "attacker/x" },
+      { TWEAKER_REPO: "attacker/x" },
     ),
     DEFAULT_UPDATE_REPO,
   );

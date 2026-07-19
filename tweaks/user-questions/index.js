@@ -2,10 +2,10 @@
 
 const states = new WeakMap();
 const MCP_SERVER_NAME = "co-tweakers-user-questions";
-const CHECKBOX_ATTRIBUTE = "data-codexpp-user-questions-checkbox";
-const OTHER_FIELD_ATTRIBUTE = "data-codexpp-user-questions-other-field";
-const OTHER_INPUT_ATTRIBUTE = "data-codexpp-user-questions-other-input";
-const STYLE_ATTRIBUTE = "data-codexpp-user-questions-style";
+const CHECKBOX_ATTRIBUTE = "data-tweaker-user-questions-checkbox";
+const OTHER_FIELD_ATTRIBUTE = "data-tweaker-user-questions-other-field";
+const OTHER_INPUT_ATTRIBUTE = "data-tweaker-user-questions-other-input";
+const STYLE_ATTRIBUTE = "data-tweaker-user-questions-style";
 
 module.exports = {
   start(api) {

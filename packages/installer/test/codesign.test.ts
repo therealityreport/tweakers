@@ -32,7 +32,7 @@ test("parseCodeSigningIdentities extracts valid code signing identities", () => 
 });
 
 test("isInsideCodeSigningRoot rejects sibling and parent traversal paths", () => {
-  const root = resolve("tmp", "codexpp-sign-root");
+  const root = resolve("tmp", "tweaker-sign-root");
 
   assert.equal(isInsideCodeSigningRoot(root, join(root, "native.node")), true);
   assert.equal(isInsideCodeSigningRoot(root, join(root, "nested", "native.node")), true);
@@ -88,10 +88,11 @@ test("portable signing accepts the official or pinned local identity", () => {
   );
 });
 
-test("code signing walks frameworks before unpacked native modules", () => {
+test("code signing walks frameworks, unpacked modules, and the staged Tweakers native host", () => {
   assert.deepEqual(codeSigningWalkRoots("/Apps/Codex.app"), [
     "/Apps/Codex.app/Contents/Frameworks",
     "/Apps/Codex.app/Contents/Resources/app.asar.unpacked",
+    "/Apps/Codex.app/Contents/Resources/tweakers/native",
   ]);
 });
 

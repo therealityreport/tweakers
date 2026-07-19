@@ -81,7 +81,7 @@ export async function patchAsar(
     // a denied write (e.g. macOS App Management TCC) from leaving the bundle
     // without an app.asar. Both the staging file and target must be on the
     // same filesystem for `rename` to be atomic.
-    const stagingPath = `${asarPath}.codexpp-new`;
+    const stagingPath = `${asarPath}.tweaker-new`;
     try {
       cpSync(outAsar, stagingPath);
     } catch (e) {
@@ -219,7 +219,7 @@ function annotatePermError(e: unknown, target: string): Error {
     const msg =
       `Permission denied writing to ${target}.\n\n` +
       `macOS App Management is blocking modification of /Applications/Codex.app.\n` +
-      `Run "tweakers repair" in your terminal.\n\n` +
+      `Run "tweaker repair" in your terminal.\n\n` +
       `Original error: ${err.message}`;
     const wrapped = new Error(msg);
     (wrapped as NodeJS.ErrnoException).code = err.code;

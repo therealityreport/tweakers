@@ -18,6 +18,7 @@ import {
 } from "../src/mode-transition";
 import { ensureUserPaths } from "../src/paths";
 import { transactionLockFile } from "../src/transaction";
+import type { EnvironmentCommandResult } from "../src/commands/environment";
 
 /** A PID that cannot exist on macOS (pid_max is 99999). */
 const DEAD_PID = 987654;
@@ -131,9 +132,19 @@ function makeDeps(overrides: Partial<ModeCommandDeps> = {}): { deps: ModeCommand
       return { installed: true };
     },
     switcherStatus: async () => ({ installed: false, reason: "test stub" }),
+    ensureCoordinator: async () => {
+      calls.push("ensure-coordinator");
+      return { configured: true };
+    },
+    coordinatorStatus: () => ({ configured: false, source: "unavailable", reason: "test stub" }),
+    removeStandaloneSwitcher: async () => {
+      calls.push("remove-standalone");
+      return { removed: true };
+    },
     installApp: async () => {
       calls.push("install");
     },
+    legacyModeEngineForTests: true,
     ...overrides,
   };
   return { deps, calls };
@@ -163,11 +174,68 @@ async function captureLog(run: () => Promise<void>): Promise<string[]> {
   return lines;
 }
 
+function compatibilityEnvironmentResult(
+  phase: "status" | "prepared" | "committed" | "cancelled",
+): EnvironmentCommandResult {
+  const source = {
+    selectedDesktopPath: "/Applications/ChatGPT.app",
+    selectedDesktopBundleId: "com.openai.codex",
+    releaseProfile: "stable",
+    appExperience: "tweakers",
+    backendLane: "bundled",
+    requestedAt: "2026-07-16T00:00:00.000Z",
+    appliedAt: "2026-07-16T00:01:00.000Z",
+  };
+  const requested = {
+    ...source,
+    appExperience: "chatgpt",
+    backendLane: "official-bundled",
+    requestedAt: "2026-07-16T00:02:00.000Z",
+    appliedAt: phase === "committed" ? "2026-07-16T00:03:00.000Z" : null,
+  };
+  if (phase === "status") {
+    return {
+      schemaVersion: 1,
+      selected: source,
+      channels: { stable: {}, alpha: {} },
+      observation: {
+        appExperience: source.appExperience,
+        selectionDrift: false,
+        lifecycleContended: false,
+        commitJournalPresent: false,
+        transitionJournalPresent: false,
+        transaction: null,
+        freshness: "current",
+      },
+    } as unknown as EnvironmentCommandResult;
+  }
+  return {
+    schemaVersion: 1,
+    kind: "environment",
+    transactionId: "mode-compatibility-1",
+    phase,
+    error: null,
+    ownerPid: process.pid,
+    source,
+    requested,
+    prepared: {},
+    applied: phase === "committed" ? {} : null,
+    oldMainPid: 101,
+    newMainPid: phase === "committed" ? 202 : null,
+    attempt: phase === "committed" ? 1 : 0,
+    createdAt: "2026-07-16T00:02:00.000Z",
+    updatedAt: "2026-07-16T00:03:00.000Z",
+    committedAt: phase === "committed" ? "2026-07-16T00:03:00.000Z" : null,
+    rolledBackAt: null,
+    cancelledAt: phase === "cancelled" ? "2026-07-16T00:03:00.000Z" : null,
+  } as unknown as EnvironmentCommandResult;
+}
+
 /* ------------------------------------------------------------------------- */
 /* bootstrap inference                                                       */
 /* ------------------------------------------------------------------------- */
 
-test("resolveMode: explicit state.mode wins; absence infers from the live marker", () => {
+test("resolveMode: explicit repair intent wins while legacy state is inferred", () => {
   const base = { mode: undefined } as unknown as InstallerState;
   assert.equal(resolveMode({ ...base, mode: "chatgpt" }, true), "chatgpt");
   assert.equal(resolveMode({ ...base, mode: "tweakers" }, false), "tweakers");
@@ -175,6 +243,89 @@ test("resolveMode: explicit state.mode wins; absence infers from the live marker
   assert.equal(resolveMode(base, false), "chatgpt");
   assert.equal(resolveMode(null, false), "chatgpt");
   assert.equal(resolveMode(null, true), "tweakers");
+});
+
+test("production mode compatibility prepares before one confirmation and commits through Environment", async () => {
+  await withTweakersHome(async () => {
+    const sequence: string[] = [];
+    const { deps, calls } = makeDeps({
+      legacyModeEngineForTests: false,
+      environmentCommand: async (action, options) => {
+        sequence.push(`${action}:${options.quiet === true ? "quiet" : "loud"}:${options.observe === true ? "observe" : "mutate"}`);
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "commit") return compatibilityEnvironmentResult("committed");
+        throw new Error(`unexpected environment action ${action}`);
+      },
+      confirm: ({ target, appRoot }) => {
+        sequence.push(`confirm:${target}:${appRoot}`);
+        return true;
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+
+    assert.deepEqual(sequence, [
+      "status:quiet:observe",
+      "prepare:quiet:mutate",
+      "confirm:chatgpt:/Applications/ChatGPT.app",
+      "commit:quiet:mutate",
+    ]);
+    assert.equal(calls.includes("quit"), false);
+    assert.equal(calls.includes("open"), false);
+  });
+});
+
+test("production mode refuses a persisted-selection and live-marker drift before no-op", async () => {
+  await withTweakersHome(async () => {
+    const status = compatibilityEnvironmentResult("status") as Extract<
+      EnvironmentCommandResult,
+      { selected: unknown }
+    >;
+    status.observation = {
+      ...status.observation!,
+      appExperience: "chatgpt",
+      selectionDrift: true,
+    };
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      environmentCommand: async (action) => {
+        if (action === "status") return status;
+        throw new Error(`unexpected environment action ${action}`);
+      },
+    });
+
+    await assert.rejects(
+      () => mode("tweakers", {}, deps),
+      /selection says tweakers.*live app proves chatgpt.*tweaker repair/i,
+    );
+  });
+});
+
+test("production mode cancellation closes the prepared receipt without restarting", async () => {
+  await withTweakersHome(async () => {
+    const sequence: string[] = [];
+    const { deps, calls } = makeDeps({
+      legacyModeEngineForTests: false,
+      environmentCommand: async (action) => {
+        sequence.push(action);
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "cancel") return compatibilityEnvironmentResult("cancelled");
+        throw new Error(`unexpected environment action ${action}`);
+      },
+      confirm: () => {
+        sequence.push("confirm");
+        return false;
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+
+    assert.deepEqual(sequence, ["status", "prepare", "confirm", "cancel"]);
+    assert.equal(calls.includes("quit"), false);
+    assert.equal(calls.includes("open"), false);
+  });
 });
 
 /* ------------------------------------------------------------------------- */
@@ -256,7 +407,7 @@ test("preserveOutgoing keeps the rollback-failure evidence path intact", async (
 });
 
 /* ------------------------------------------------------------------------- */
-/* tweakers → chatgpt                                                        */
+/* tweaker → chatgpt                                                        */
 /* ------------------------------------------------------------------------- */
 
 test("mode chatgpt: happy path parks the patched payload and restores pristine", async () => {
@@ -292,8 +443,8 @@ test("mode chatgpt: happy path parks the patched payload and restores pristine",
     assert.ok(calls.includes("quit"));
     assert.ok(calls.includes("settle"));
     assert.ok(calls.includes("open"));
-    // Setup auto-runs (idempotent refresh) before stranding is possible.
-    assert.ok(calls.includes("ensure-switcher"));
+    // The retired standalone status item is no longer a switching dependency.
+    assert.equal(calls.includes("ensure-switcher"), false);
   });
 });
 
@@ -425,7 +576,7 @@ test("mode chatgpt: does not adopt untrusted or invalid replacements from the se
   }
 });
 
-test("mode chatgpt: refuses when the switcher cannot be installed", async () => {
+test("mode chatgpt: does not depend on the retired standalone switcher", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
     makeApp(app, { version: "26.1.0", asar: "patched-asar" });
@@ -436,16 +587,12 @@ test("mode chatgpt: refuses when the switcher cannot be installed", async () => 
     const { deps, calls } = makeDeps({
       ensureSwitcher: async () => ({ installed: false, reason: "asset missing" }),
     });
-    await assert.rejects(
-      () => mode("chatgpt", { yes: true, app }, deps),
-      /menu-bar switcher could not be installed \(asset missing\)/,
-    );
+    await mode("chatgpt", { yes: true, app }, deps);
 
-    // Refused BEFORE any mutation: no quit, no swap, mode unchanged.
-    assert.equal(readFileSync(appAsar(app), "utf8"), "patched-asar");
-    assert.equal(readState(join(root, "state.json"))?.mode, "tweakers");
+    assert.equal(readFileSync(appAsar(app), "utf8"), "pristine-asar");
+    assert.equal(readState(join(root, "state.json"))?.mode, "chatgpt");
     assert.equal(readModeTransition(modeTransitionFile(root)), null);
-    assert.equal(calls.includes("quit"), false);
+    assert.equal(calls.includes("ensure-switcher"), false);
   });
 });
 
@@ -560,7 +707,7 @@ test("mode chatgpt: already unpatched is a loud no-op that records the mode", as
 });
 
 /* ------------------------------------------------------------------------- */
-/* chatgpt → tweakers                                                        */
+/* chatgpt → tweakers                                                       */
 /* ------------------------------------------------------------------------- */
 
 function seedParkedPayload(root: string, opts: { version: string; asar?: string }): void {
@@ -607,13 +754,15 @@ test("mode tweakers: fast path swaps the version-matched payload in and refreshe
     assert.equal(readModeTransition(modeTransitionFile(root)), null);
     assert.ok(calls.includes("probe"));
     assert.ok(calls.includes("open"));
-    // The fast path refreshes the switcher itself (the slow path gets the
-    // refresh inside install()'s promotion bookkeeping).
-    assert.ok(calls.includes("ensure-switcher"));
+    // The fast path refreshes shared Menu Bar coordinator metadata and retires
+    // any leftover second status item.
+    assert.ok(calls.includes("ensure-coordinator"));
+    assert.ok(calls.includes("remove-standalone"));
+    assert.equal(calls.includes("ensure-switcher"), false);
   });
 });
 
-test("mode tweakers: a failing switcher refresh never fails the fast-path switch", async () => {
+test("mode tweakers: a failing Menu Bar coordinator refresh never fails the fast-path switch", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
     makeApp(app, { version: "26.1.0", asar: "pristine-asar" });
@@ -623,8 +772,8 @@ test("mode tweakers: a failing switcher refresh never fails the fast-path switch
     seedState(root, { appRoot: app, mode: "chatgpt", codexVersion: "26.1.0" });
 
     const { deps } = makeDeps({
-      ensureSwitcher: async () => {
-        throw new Error("injected switcher failure");
+      ensureCoordinator: async () => {
+        throw new Error("injected coordinator failure");
       },
     });
     await mode("tweakers", { yes: true, app }, deps);
@@ -945,22 +1094,26 @@ test("mode rejects unknown targets", async () => {
 /* mode setup                                                                */
 /* ------------------------------------------------------------------------- */
 
-test("mode setup installs the switcher and reports success", async () => {
+test("mode setup configures Menu Bar controls and retires the standalone status item", async () => {
   await withTweakersHome(async () => {
     const { deps, calls } = makeDeps();
     const lines = await captureLog(() => mode("setup", {}, deps));
 
-    assert.deepEqual(calls, ["ensure-switcher"]);
-    assert.ok(lines.some((line) => /Menu-bar switcher installed and loaded/.test(line)));
+    assert.deepEqual(calls, ["ensure-coordinator", "remove-standalone"]);
+    assert.ok(lines.some((line) => /Menu Bar restart coordinator configured/.test(line)));
+    assert.ok(lines.some((line) => /existing Menu Bar app/.test(line)));
   });
 });
 
-test("mode setup fails loudly when the switcher cannot be installed", async () => {
+test("mode setup fails loudly when coordinator metadata cannot be configured", async () => {
   await withTweakersHome(async () => {
     const { deps } = makeDeps({
-      ensureSwitcher: async () => ({ installed: false, reason: "codesign refused" }),
+      ensureCoordinator: async () => ({ configured: false, reason: "metadata write refused" }),
     });
-    await assert.rejects(() => mode("setup", {}, deps), /switcher setup failed: codesign refused/);
+    await assert.rejects(
+      () => mode("setup", {}, deps),
+      /Menu Bar restart coordinator setup failed: metadata write refused/,
+    );
   });
 });
 
@@ -1012,7 +1165,7 @@ test("reconcile: dead-owner switch to chatgpt completes and adopts the swap remn
   });
 });
 
-test("reconcile: dead-owner completed switch to tweakers adopts the outgoing pristine copy into the backup", async () => {
+test("reconcile: dead-owner completed switch to tweaker adopts the outgoing pristine copy into the backup", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
     makeApp(app, { version: "26.1.0", asar: "patched-asar" });
@@ -1162,7 +1315,7 @@ test("reconcile: an unreadable live asar blocks classification and keeps the jou
   });
 });
 
-test("mode status reconciles a stale journal instead of reporting the dead switch", async () => {
+test("mode status reports a stale journal without mutating transition or state", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
     makeApp(app, { version: "26.1.0", asar: "patched-asar" });
@@ -1179,12 +1332,80 @@ test("mode status reconciles a stale journal instead of reporting the dead switc
 
     const { deps } = makeDeps();
     const lines = await captureLog(() => mode("status", { json: true, app }, deps));
-    const report = JSON.parse(lines.at(-1) ?? "{}") as { mode: string; transition: unknown };
+    const report = JSON.parse(lines.at(-1) ?? "{}") as {
+      mode: string;
+      modeSource: string;
+      transition: unknown;
+    };
 
     assert.equal(report.mode, "tweakers");
-    assert.equal(report.transition, null);
-    assert.equal(readModeTransition(modeTransitionFile(root)), null);
+    assert.equal(report.modeSource, "live-marker");
+    assert.deepEqual(report.transition, {
+      target: "chatgpt",
+      phase: "preparing",
+      ownerPid: DEAD_PID,
+    });
+    assert.notEqual(readModeTransition(modeTransitionFile(root)), null);
+    assert.equal(readState(join(root, "state.json"))?.mode, "chatgpt");
+  });
+});
+
+test("malformed mode transition journals fail closed", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", asar: "patched-asar" });
+    seedState(root, { appRoot: app, mode: "tweakers" });
+    mkdirSync(join(root, "mode"), { recursive: true });
+    writeFileSync(modeTransitionFile(root), "{not-json\n");
+
+    assert.throws(
+      () => readModeTransition(modeTransitionFile(root)),
+      /journal is unreadable/i,
+    );
+    assert.throws(
+      () => reconcileModeTransition(
+        { root, stateFile: join(root, "state.json") },
+        { marker: "present", appRoot: app },
+      ),
+      /journal is unreadable/i,
+    );
+    const { deps } = makeDeps();
+    await assert.rejects(
+      () => mode("status", { json: true, app }, deps),
+      /journal is unreadable/i,
+    );
     assert.equal(readState(join(root, "state.json"))?.mode, "tweakers");
+    assert.equal(readFileSync(modeTransitionFile(root), "utf8"), "{not-json\n");
+  });
+});
+
+test("mode transition recovery rejects paths outside its private mode root", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", asar: "patched-asar" });
+    seedState(root, { appRoot: app, mode: "tweakers" });
+    const outside = join(root, "must-not-delete.app");
+    makeApp(outside, { version: "26.1.0", asar: "evidence" });
+    seedForeignJournal(root, {
+      schemaVersion: 1,
+      target: "chatgpt",
+      phase: "swapping",
+      ownerPid: DEAD_PID,
+      stagedPath: outside,
+      payloadPath: parkedPayloadApp(root),
+      startedAt: "2026-07-14T00:00:00.000Z",
+    });
+
+    assert.throws(
+      () => reconcileModeTransition(
+        { root, stateFile: join(root, "state.json") },
+        { marker: "present", appRoot: app },
+        { isProcessAlive: () => false },
+      ),
+      /journal is invalid/i,
+    );
+    assert.equal(existsSync(outside), true);
+    assert.equal(existsSync(modeTransitionFile(root)), true);
   });
 });
 
@@ -1213,7 +1434,7 @@ test("mode switch entry refuses while another switch is in progress", async () =
 /* mode status report                                                        */
 /* ------------------------------------------------------------------------- */
 
-test("mode status --json reports mode, marker, payload, backup, and switcher", async () => {
+test("mode status --json keeps the compatibility switcher key backed by coordinator status", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
     makeApp(app, { version: "26.2.0", asar: "pristine-asar" });
@@ -1222,7 +1443,9 @@ test("mode status --json reports mode, marker, payload, backup, and switcher", a
     seedParkedPayload(root, { version: "26.1.0" });
     seedState(root, { appRoot: app, mode: "chatgpt", codexVersion: "26.1.0" });
 
-    const { deps } = makeDeps();
+    const { deps } = makeDeps({
+      coordinatorStatus: () => ({ configured: true, source: "coordinator" }),
+    });
     const lines = await captureLog(() => mode("status", { json: true, app }, deps));
     const report = JSON.parse(lines.at(-1) ?? "{}") as {
       mode: string;
@@ -1235,14 +1458,34 @@ test("mode status --json reports mode, marker, payload, backup, and switcher", a
     };
 
     assert.equal(report.mode, "chatgpt");
-    assert.equal(report.modeSource, "state");
+    assert.equal(report.modeSource, "live-marker");
     assert.equal(report.liveMarker, "absent");
     assert.deepEqual(report.parkedPayload, { present: true, baseVersion: "26.1.0", parkedAt: "2026-07-13T00:00:00.000Z" });
     assert.equal(report.backup.present, true);
     assert.equal(report.backup.developerIdValid, true);
     assert.equal(report.backup.version, "26.2.0");
-    assert.equal(report.switcher.installed, false);
+    assert.equal(report.switcher.installed, true);
     assert.equal(report.transition, null);
+  });
+});
+
+test("mode status reports live ChatGPT when persisted Tweakers state is stale", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.3.0", asar: "pristine-asar" });
+    seedState(root, { appRoot: app, mode: "tweakers", codexVersion: "26.2.0" });
+
+    const { deps } = makeDeps();
+    const lines = await captureLog(() => mode("status", { json: true, app }, deps));
+    const report = JSON.parse(lines.at(-1) ?? "{}") as {
+      mode: string;
+      modeSource: string;
+      liveMarker: string;
+    };
+
+    assert.equal(report.mode, "chatgpt");
+    assert.equal(report.modeSource, "live-marker");
+    assert.equal(report.liveMarker, "absent");
   });
 });
 
@@ -1257,6 +1500,6 @@ test("mode status infers the mode when state has no mode field", async () => {
     const report = JSON.parse(lines.at(-1) ?? "{}") as { mode: string; modeSource: string };
 
     assert.equal(report.mode, "tweakers");
-    assert.equal(report.modeSource, "inferred");
+    assert.equal(report.modeSource, "live-marker");
   });
 });

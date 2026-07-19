@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   collectOwlBridgeReport,
-  codexPlusPlusPaths,
+  tweakerPaths,
   detectRuntime,
   parsePsOutput,
   reportsMainProcessRunning,
@@ -18,7 +18,7 @@ import type { CodexInstall } from "../src/platform";
 import type { UserPaths } from "../src/paths";
 
 test("detectRuntime reports owl when the Codex framework is present", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-debug-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-debug-"));
   try {
     const codex = fakeMacCodex(root);
     mkdirSync(join(codex.appRoot, "Contents", "Frameworks", "Codex Framework.framework"), {
@@ -39,7 +39,7 @@ test("detectRuntime reports owl when the Codex framework is present", () => {
 });
 
 test("detectRuntime reports electron for an asar Electron app", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-debug-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-debug-"));
   try {
     const codex = fakeMacCodex(root);
     mkdirSync(
@@ -96,8 +96,8 @@ test("reportsMainProcessRunning ignores helper-only states", () => {
   }
 });
 
-test("codexPlusPlusPaths reports paths without creating them", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-debug-"));
+test("tweakerPaths reports paths without creating them", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-debug-"));
   const home = join(root, "clean-home");
   const paths: UserPaths = {
     root: home,
@@ -113,7 +113,7 @@ test("codexPlusPlusPaths reports paths without creating them", () => {
   };
 
   try {
-    const reported = codexPlusPlusPaths(paths);
+    const reported = tweakerPaths(paths);
     assert.equal(reported.some((item: DataPath) => item.exists), false);
     assert.equal(reported.find((item) => item.label === "Root")?.path, home);
   } finally {
@@ -122,16 +122,16 @@ test("codexPlusPlusPaths reports paths without creating them", () => {
 });
 
 test("collectOwlBridgeReport reports install-time Owl bridge capabilities while Codex is closed", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-debug-"));
-  const previousPort = process.env.CODEXPP_REMOTE_DEBUG_PORT;
-  process.env.CODEXPP_REMOTE_DEBUG_PORT = "9";
+  const root = mkdtempSync(join(tmpdir(), "tweaker-debug-"));
+  const previousPort = process.env.TWEAKER_REMOTE_DEBUG_PORT;
+  process.env.TWEAKER_REMOTE_DEBUG_PORT = "9";
   try {
     const codex = fakeMacCodex(root);
     const src = join(root, "asar-src");
     mkdirSync(join(src, ".vite", "build"), { recursive: true });
     writeFileSync(
       join(src, ".vite", "build", "main.js"),
-      "globalThis.__codexpp_window_services__ = services;",
+      "globalThis.__tweaker_window_services__ = services;",
     );
     await asar.createPackageWithOptions(src, codex.asarPath, {
       globOptions: { dot: true },
@@ -140,15 +140,15 @@ test("collectOwlBridgeReport reports install-time Owl bridge capabilities while 
     const paths = fakeUserPaths(join(root, "user"));
     mkdirSync(paths.runtime, { recursive: true });
     mkdirSync(join(paths.runtime, "native"), { recursive: true });
-    writeFileSync(join(paths.runtime, "native", "codexpp_native_host.node"), "");
+    writeFileSync(join(paths.runtime, "native", "tweaker_native_host.node"), "");
     writeFileSync(
       join(paths.runtime, "main.js"),
       [
-        "codexpp:native-load-module",
-        "codexpp:codex-view-create",
-        "codexpp:native-create-panel",
-        "codexpp:native-attach-view",
-        "codexpp:native-launch-helper",
+        "tweaker:native-load-module",
+        "tweaker:codex-view-create",
+        "tweaker:native-create-panel",
+        "tweaker:native-attach-view",
+        "tweaker:native-launch-helper",
       ].join("\n"),
     );
 
@@ -176,8 +176,8 @@ test("collectOwlBridgeReport reports install-time Owl bridge capabilities while 
     assert.equal(report.nativePanels, process.platform === "darwin" ? "available" : "unavailable");
     assert.equal(report.metalViews, process.platform === "darwin" ? "available" : "unavailable");
   } finally {
-    if (previousPort === undefined) delete process.env.CODEXPP_REMOTE_DEBUG_PORT;
-    else process.env.CODEXPP_REMOTE_DEBUG_PORT = previousPort;
+    if (previousPort === undefined) delete process.env.TWEAKER_REMOTE_DEBUG_PORT;
+    else process.env.TWEAKER_REMOTE_DEBUG_PORT = previousPort;
     rmSync(root, { recursive: true, force: true });
   }
 });

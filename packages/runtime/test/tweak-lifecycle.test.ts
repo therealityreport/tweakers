@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isMainProcessTweakScope,
+  loadTweaksInitially,
   reloadTweaks,
   setTweakEnabledAndReload,
   type SetTweakEnabledAndReloadDeps,
@@ -17,10 +18,10 @@ test("isMainProcessTweakScope excludes renderer-only tweaks", () => {
   assert.equal(isMainProcessTweakScope("renderer"), false);
 });
 
-test("reloadTweaks stops, clears, loads, then broadcasts", () => {
+test("reloadTweaks stops, clears, loads, then broadcasts", async () => {
   const calls: string[] = [];
 
-  reloadTweaks("manual", deps(calls));
+  await reloadTweaks("manual", deps(calls));
 
   assert.deepEqual(calls, [
     "log:reloading tweaks (manual)",
@@ -31,10 +32,10 @@ test("reloadTweaks stops, clears, loads, then broadcasts", () => {
   ]);
 });
 
-test("setTweakEnabledAndReload enables a tweak and performs a full reload", () => {
+test("setTweakEnabledAndReload enables a tweak and performs a full reload", async () => {
   const calls: string[] = [];
 
-  const result = setTweakEnabledAndReload("com.example.both", true, deps(calls));
+  const result = await setTweakEnabledAndReload("com.example.both", true, deps(calls));
 
   assert.equal(result, true);
   assert.deepEqual(calls, [
@@ -48,10 +49,10 @@ test("setTweakEnabledAndReload enables a tweak and performs a full reload", () =
   ]);
 });
 
-test("setTweakEnabledAndReload disables a tweak and performs a full reload", () => {
+test("setTweakEnabledAndReload disables a tweak and performs a full reload", async () => {
   const calls: string[] = [];
 
-  setTweakEnabledAndReload("com.example.both", false, deps(calls));
+  await setTweakEnabledAndReload("com.example.both", false, deps(calls));
 
   assert.deepEqual(calls, [
     "setTweakEnabled:com.example.both:false",
@@ -64,22 +65,22 @@ test("setTweakEnabledAndReload disables a tweak and performs a full reload", () 
   ]);
 });
 
-test("setTweakEnabledAndReload coerces truthy and falsy enabled values", () => {
+test("setTweakEnabledAndReload coerces truthy and falsy enabled values", async () => {
   const truthyCalls: string[] = [];
   const falsyCalls: string[] = [];
 
-  setTweakEnabledAndReload("com.example.truthy", 1, deps(truthyCalls));
-  setTweakEnabledAndReload("com.example.falsy", "", deps(falsyCalls));
+  await setTweakEnabledAndReload("com.example.truthy", 1, deps(truthyCalls));
+  await setTweakEnabledAndReload("com.example.falsy", "", deps(falsyCalls));
 
   assert.equal(truthyCalls[0], "setTweakEnabled:com.example.truthy:true");
   assert.equal(falsyCalls[0], "setTweakEnabled:com.example.falsy:false");
 });
 
-test("setTweakEnabledAndReload does not reload if persisting the flag fails", () => {
+test("setTweakEnabledAndReload does not reload if persisting the flag fails", async () => {
   const calls: string[] = [];
 
-  assert.throws(
-    () =>
+  await assert.rejects(
+    async () =>
       setTweakEnabledAndReload("com.example.fail", true, {
         ...deps(calls),
         setTweakEnabled() {
@@ -93,11 +94,11 @@ test("setTweakEnabledAndReload does not reload if persisting the flag fails", ()
   assert.deepEqual(calls, ["setTweakEnabled"]);
 });
 
-test("reloadTweaks stops before clearing cache when stop fails", () => {
+test("reloadTweaks stops before clearing cache when stop fails", async () => {
   const calls: string[] = [];
 
-  assert.throws(
-    () =>
+  await assert.rejects(
+    async () =>
       reloadTweaks("manual", {
         ...deps(calls),
         stopAllMainTweaks() {
@@ -109,6 +110,72 @@ test("reloadTweaks stops before clearing cache when stop fails", () => {
   );
 
   assert.deepEqual(calls, ["log:reloading tweaks (manual)", "stopAllMainTweaks"]);
+});
+
+test("reloadTweaks awaits loading before broadcasting and serializes overlapping reloads", async () => {
+  const calls: string[] = [];
+  let releaseFirstLoad!: () => void;
+  const firstLoad = new Promise<void>((resolve) => { releaseFirstLoad = resolve; });
+  let loadCount = 0;
+  const reloadDeps = {
+    ...deps(calls),
+    async loadAllMainTweaks() {
+      loadCount += 1;
+      calls.push(`load:start:${loadCount}`);
+      if (loadCount === 1) await firstLoad;
+      calls.push(`load:end:${loadCount}`);
+    },
+  };
+
+  const first = reloadTweaks("first", reloadDeps);
+  const second = reloadTweaks("second", reloadDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [
+    "log:reloading tweaks (first)",
+    "stopAllMainTweaks",
+    "clearTweakModuleCache",
+    "load:start:1",
+  ]);
+
+  releaseFirstLoad();
+  await Promise.all([first, second]);
+  assert.deepEqual(calls.slice(-6), [
+    "log:reloading tweaks (second)",
+    "stopAllMainTweaks",
+    "clearTweakModuleCache",
+    "load:start:2",
+    "load:end:2",
+    "broadcastReload",
+  ]);
+  assert.equal(calls.at(-1), "broadcastReload");
+});
+
+test("reloadTweaks waits for an in-flight initial load on the same queue", async () => {
+  const calls: string[] = [];
+  let releaseInitial!: () => void;
+  const initialBarrier = new Promise<void>((resolve) => { releaseInitial = resolve; });
+  const initial = loadTweaksInitially({
+    async loadAllMainTweaks() {
+      calls.push("initial:start");
+      await initialBarrier;
+      calls.push("initial:end");
+    },
+  });
+  const reload = reloadTweaks("after-startup", deps(calls));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["initial:start"]);
+  releaseInitial();
+  await Promise.all([initial, reload]);
+  assert.deepEqual(calls, [
+    "initial:start",
+    "initial:end",
+    "log:reloading tweaks (after-startup)",
+    "stopAllMainTweaks",
+    "clearTweakModuleCache",
+    "loadAllMainTweaks",
+    "broadcastReload",
+  ]);
 });
 
 function deps(calls: string[]): SetTweakEnabledAndReloadDeps {

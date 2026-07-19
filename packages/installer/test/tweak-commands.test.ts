@@ -39,7 +39,11 @@ import {
 } from "../src/codex-window-services";
 import { readSelfUpdateState, writeSelfUpdateState } from "../src/self-update-state";
 import { describeInstallationSource } from "../src/source-root";
-import { watcherShellScript } from "../src/watcher";
+import {
+  currentWindowsWatcherTaskNames,
+  legacyWindowsWatcherTaskNames,
+  watcherShellScript,
+} from "../src/watcher";
 import { hashDirectoryTree, stageBundledTweaks } from "../src/commands/install";
 import { hasReleaseProvenance, installManagedRuntime, managedCliPath, managedSourceRoot, writeReleaseProvenance } from "../src/managed-runtime";
 
@@ -189,9 +193,9 @@ test("safeMode enables safe mode without changing per-tweak flags", async () => 
     withSilencedConsole(() => safeMode());
 
     const config = JSON.parse(readFileSync(join(envRoot, "config.json"), "utf8"));
-    assert.equal(config.codexPlusPlus.safeMode, true);
+    assert.equal(config.tweaker.safeMode, true);
     assert.equal(config.tweaks["com.example.keep"].enabled, true);
-    assert.equal(existsSync(join(envRoot, "tweaks", ".codexpp-safe-mode-reload")), true);
+    assert.equal(existsSync(join(envRoot, "tweaks", ".tweaker-safe-mode-reload")), true);
   });
 });
 
@@ -199,13 +203,13 @@ test("safeMode disables safe mode with --off", async () => {
   await withTempEnvAsync(async (envRoot) => {
     writeFileSync(
       join(envRoot, "config.json"),
-      JSON.stringify({ codexPlusPlus: { safeMode: true } }),
+      JSON.stringify({ tweaker: { safeMode: true } }),
     );
 
     withSilencedConsole(() => safeMode({ off: true }));
 
     const config = JSON.parse(readFileSync(join(envRoot, "config.json"), "utf8"));
-    assert.equal(config.codexPlusPlus.safeMode, false);
+    assert.equal(config.tweaker.safeMode, false);
   });
 });
 
@@ -234,14 +238,14 @@ test("window services patch separates the exposed service from the next setup ca
   assert.equal(patched.strategy, "service-factory-fingerprint");
   assert.match(
     patched.source,
-    /;globalThis\.__codexpp_window_services__=M;wD\(\{buildFlavor:a/,
+    /;globalThis\.__tweaker_window_services__=M;globalThis\.[^=]+=M;wD\(\{buildFlavor:a/,
   );
-  assert.doesNotMatch(patched.source, /__codexpp_window_services__=MwD/);
+  assert.doesNotMatch(patched.source, /__tweaker_window_services__=MwD/);
 });
 
 test("window services patch repairs the missing-separator state from Codex 26.429", () => {
   const source =
-    "let M=FM({buildFlavor:a,allowDevtools:p,globalState:j.globalState,getGlobalStateForHost:j.getGlobalStateForHost,desktopRoot:j.desktopRoot,preloadPath:j.preloadPath,repoRoot:j.repoRoot,disposables:k}),N=e=>M.isTrustedIpcSender(e.sender);;globalThis.__codexpp_window_services__=MwD({buildFlavor:a,isTrustedIpcEvent:N}),n.ipcMain.on(Li,e=>{})";
+    "let M=FM({buildFlavor:a,allowDevtools:p,globalState:j.globalState,getGlobalStateForHost:j.getGlobalStateForHost,desktopRoot:j.desktopRoot,preloadPath:j.preloadPath,repoRoot:j.repoRoot,disposables:k}),N=e=>M.isTrustedIpcSender(e.sender);;globalThis.__tweaker_window_services__=MwD({buildFlavor:a,isTrustedIpcEvent:N}),n.ipcMain.on(Li,e=>{})";
 
   const patched = patchCodexWindowServicesSource(source);
 
@@ -250,9 +254,9 @@ test("window services patch repairs the missing-separator state from Codex 26.42
   assert.equal(patched.strategy, "repair-missing-separator");
   assert.match(
     patched.source,
-    /;globalThis\.__codexpp_window_services__=M;wD\(\{buildFlavor:a/,
+    /;globalThis\.__tweaker_window_services__=M;wD\(\{buildFlavor:a/,
   );
-  assert.doesNotMatch(patched.source, /__codexpp_window_services__=MwD/);
+  assert.doesNotMatch(patched.source, /__tweaker_window_services__=MwD/);
 });
 
 test("window services patch does not depend on Codex minified function names", () => {
@@ -265,7 +269,7 @@ test("window services patch does not depend on Codex minified function names", (
   assert.equal(patched.serviceVar, "services");
   assert.match(
     patched.source,
-    /;globalThis\.__codexpp_window_services__=services;Zd\(\{buildFlavor:a/,
+    /;globalThis\.__tweaker_window_services__=services;globalThis\.[^=]+=services;Zd\(\{buildFlavor:a/,
   );
 });
 
@@ -279,7 +283,7 @@ test("window services patch handles reordered factory object properties", () => 
   assert.equal(patched.serviceVar, "M");
   assert.match(
     patched.source,
-    /;globalThis\.__codexpp_window_services__=M;wD\(\{buildFlavor:a/,
+    /;globalThis\.__tweaker_window_services__=M;globalThis\.[^=]+=M;wD\(\{buildFlavor:a/,
   );
 });
 
@@ -291,7 +295,7 @@ test("window services patch handles quoted factory object properties", () => {
 
   assert.ok(patched);
   assert.equal(patched.serviceVar, "M");
-  assert.match(patched.source, /;globalThis\.__codexpp_window_services__=M;next\(\)/);
+  assert.match(patched.source, /;globalThis\.__tweaker_window_services__=M;globalThis\.[^=]+=M;next\(\)/);
 });
 
 test("window services patch is idempotent when the marker is already present", () => {
@@ -316,7 +320,7 @@ test("window services patch falls back to lifecycle registration fingerprint", (
   assert.equal(patched.changed, true);
   assert.equal(patched.strategy, "lifecycle-registration-fingerprint");
   assert.equal(patched.serviceVar, "M");
-  assert.match(patched.source, /;globalThis\.__codexpp_window_services__=M;$/);
+  assert.match(patched.source, /;globalThis\.__tweaker_window_services__=M;$/);
 });
 
 test("window services patch ignores unrelated buildFlavor factories", () => {
@@ -366,7 +370,7 @@ test("CLI failure report URL includes command and environment details", () => {
 
   assert.equal(url.origin + url.pathname, "https://github.com/therealityreport/tweakers/issues/new");
   assert.equal(url.searchParams.get("title"), "Tweakers install failed");
-  assert.match(url.searchParams.get("body") ?? "", /tweakers install/);
+  assert.match(url.searchParams.get("body") ?? "", /tweaker install/);
   assert.match(url.searchParams.get("body") ?? "", /codesign not installed/);
   assert.match(url.searchParams.get("body") ?? "", /Tweakers:/);
   assert.match(url.searchParams.get("body") ?? "", /Node:/);
@@ -413,6 +417,8 @@ test("private release requests use GitHub authentication without requiring it fo
     Accept: "application/vnd.github+json",
   });
   assert.equal(isNoPublishedReleaseError(new Error("No published GitHub release found for example/repo")), true);
+  assert.equal(isNoPublishedReleaseError(new Error("No published releases found for example/repo")), true);
+  assert.equal(isNoPublishedReleaseError(new Error("Release check failed: 500 Server Error")), false);
 });
 
 test("self-update state persists human-readable diagnostics", () => {
@@ -461,13 +467,12 @@ test("watcher self-update checks stay hourly while repair can run more often", (
   });
 });
 
-test("watcher runs self-update and app repair as separate steps", () => {
+test("watcher delegates the complete cycle to the receipt-owning command", () => {
   const script = watcherShellScript(undefined, "/tmp/Tweakers/managed-runtime/current/packages/installer/dist/cli.js");
 
-  assert.match(script, /update --watcher --quiet --no-repair/);
-  assert.match(script, /repair --watcher --quiet/);
-  assert.match(script, /update[\s\S]+continuing with installed runtime[\s\S]+repair/);
-  assert.doesNotMatch(script, /repair --watcher --quiet[^;]*\|\| true/);
+  assert.match(script, /watcher-run/);
+  assert.doesNotMatch(script, /update --watcher --quiet --no-repair/);
+  assert.doesNotMatch(script, /repair --watcher --quiet/);
   assert.match(script, /managed-runtime\/current\/packages\/installer\/dist\/cli\.js/);
   assert.doesNotMatch(script, /Projects\/tweakers/);
 });
@@ -498,25 +503,39 @@ test("managed runtime is atomically copied outside the development checkout", ()
   });
 });
 
+test("Windows watcher task names keep the current interval and documented legacy aliases", () => {
+  assert.deepEqual(currentWindowsWatcherTaskNames(), [
+    "tweaker-watcher",
+    "tweaker-watcher-interval",
+  ]);
+  assert.deepEqual(legacyWindowsWatcherTaskNames(), [
+    "tweaker-watcher-hourly",
+    "tweaker-watcher-daily",
+    "codex-plusplus-watcher",
+    "codex-plusplus-watcher-interval",
+    "codex-plusplus-watcher-hourly",
+    "codex-plusplus-watcher-daily",
+  ]);
+});
+
 test("watcher held branch never uses the helper-blind closed check (regression tripwire)", () => {
   const source = readFileSync(new URL("../src/commands/install.ts", import.meta.url), "utf8");
 
   // The old wait loop deadlocked on orphaned helpers ("background" status).
   // Behavior is covered in watcher-held.test.ts; this only pins the removal.
   assert.doesNotMatch(source, /getOpenReport\(locateCodex\(liveAppRoot\)\)\.status !== "closed"/);
-  assert.match(source, /process\.env\.CODEX_PLUSPLUS_WATCHER === "1"/);
+  assert.match(source, /process\.env\.TWEAKER_WATCHER === "1"/);
   assert.match(source, /runHeldPromotion\(/);
   assert.match(source, /coordinatedQuit: false/);
 });
 
 test("launchd watcher script retains history and timestamps each run", () => {
-  const script = watcherShellScript("/tmp/codex plusplus/watch'er.log");
+  const script = watcherShellScript("/tmp/tweaker/watch'er.log");
 
-  assert.match(script, /^touch '\/tmp\/codex plusplus\/watch'\\''er\.log'; sleep 3; /);
+  assert.match(script, /^touch '\/tmp\/tweaker\/watch'\\''er\.log'; sleep 3; /);
   assert.match(script, /Tweakers watcher start/);
   assert.doesNotMatch(script, /: >/);
-  assert.match(script, /update --watcher --quiet --no-repair/);
-  assert.match(script, /repair --watcher --quiet/);
+  assert.match(script, /watcher-run/);
 });
 
 test("self-update marks the installed CLI executable on unix", () => {
@@ -618,14 +637,14 @@ test("repair staging prunes retired bundled tweaks unless they are dev links", (
   })));
 });
 
-test("repair staging preserves validated dev snapshot directories", () => {
+test("repair staging preserves validated legacy dev snapshot directories", () => {
   withTempDir((runtime) => withTempDir((installed) => {
     mkdirSync(join(runtime, "tweaks", "one"), { recursive: true });
     writeFileSync(join(runtime, "catalog.json"), JSON.stringify({ entries: [{ id: "co.example.one", source: { kind: "bundled", path: "tweaks/one" } }] }));
     writeFileSync(join(runtime, "tweaks", "one", "index.js"), "stale bundled");
     mkdirSync(join(installed, "one"));
     writeFileSync(join(installed, "one", "index.js"), "validated dev snapshot");
-    writeFileSync(join(installed, ".codexpp-dev-snapshot.json"), JSON.stringify({ folders: ["one"] }));
+    writeFileSync(join(installed, [".codex", "pp-dev-snapshot.json"].join("")), JSON.stringify({ folders: ["one"] }));
 
     stageBundledTweaks(installed, runtime);
 
@@ -667,19 +686,19 @@ test("watcher repair reconciles dev tweaks in both intact and reinstall paths", 
   const source = readFileSync(new URL("../src/commands/repair.ts", import.meta.url), "utf8");
 
   assert.match(source, /cleanupStaleHelperGeneration\(codex\.appRoot, opts(?:, dependencies)?\);\s*\n\s*syncDevTweaks\(/);
-  assert.match(source, /coordinatedQuit,\s*\n\s*\}\);\s*\n\s*syncDevTweaks\(/);
-  assert.match(source, /stageBundledTweaks\(paths\.tweaks, paths\.runtime, \{\s*\n\s*devTweaksRoot: readDevTweaksRoot\(paths\.configFile\)/);
+  assert.match(source, /coordinatedQuit,\s*\n\s*reconcileCliShims: false,\s*\n\s*\}\);\s*\n\s*syncDevTweaks\(/);
+  assert.match(source, /stageBundledTweaks\)\(paths\.tweaks, paths\.runtime, \{\s*\n\s*devTweaksRoot: readDevTweaksRoot\(paths\.configFile\)/);
 });
 
 test("self-update command failures include a bounded output tail", () => {
-  const message = formatCommandFailure("/usr/bin/node", ["/tmp/codex plusplus/cli.js", "repair"], {
+  const message = formatCommandFailure("/usr/bin/node", ["/tmp/tweaker/cli.js", "repair"], {
     status: 1,
     signal: null,
     stdout: "stdout detail",
     stderr: "nested repair error",
   });
 
-  assert.match(message, /'\/tmp\/codex plusplus\/cli\.js' repair failed with exit code 1/);
+  assert.match(message, /\/usr\/bin\/node \/tmp\/tweaker\/cli\.js repair failed with exit code 1/);
   assert.match(message, /stderr:\nnested repair error/);
   assert.match(message, /stdout:\nstdout detail/);
 });
@@ -696,7 +715,7 @@ test("cli documents local signing and safe mode recovery", () => {
   assert.match(source, /\.option\("--local", "Use a stable local signing identity on macOS"\)/);
   assert.match(source, /localSigning:\s*resolveLocalSigning\(opts\)/);
   assert.match(source, /opts\.local === false \|\| opts\.localSigning === false \|\| opts\["local-signing"\] === false/);
-  assert.match(source, /Leave safe mode with: tweakers safe-mode --off/);
+  assert.match(source, /Leave safe mode with: tweaker safe-mode --off/);
   assert.match(source, /process\.argv\.length <= 2 \? \[\.\.\.process\.argv, "--help"\] : process\.argv/);
 });
 
@@ -721,13 +740,13 @@ test("installation source labels local checkouts", () => {
     assert.equal(describeInstallationSource(root).kind, "local-dev");
   });
   assert.equal(
-    describeInstallationSource("/opt/homebrew/Cellar/codexplusplus/0.1.4").kind,
+    describeInstallationSource("/opt/homebrew/Cellar/tweaker/0.1.4").kind,
     "homebrew",
   );
 });
 
 function withTempDir(fn: (root: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-tweak-command-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-tweak-command-"));
   try {
     fn(root);
   } finally {
@@ -736,7 +755,7 @@ function withTempDir(fn: (root: string) => void): void {
 }
 
 async function withTempDirAsync(fn: (root: string) => Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-tweak-command-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-tweak-command-"));
   try {
     await fn(root);
   } finally {
@@ -745,14 +764,14 @@ async function withTempDirAsync(fn: (root: string) => Promise<void>): Promise<vo
 }
 
 async function withTempEnvAsync(fn: (root: string) => Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-dev-env-"));
-  const originalHome = process.env.CODEX_PLUSPLUS_HOME;
-  process.env.CODEX_PLUSPLUS_HOME = root;
+  const root = mkdtempSync(join(tmpdir(), "tweaker-dev-env-"));
+  const originalHome = process.env.TWEAKER_HOME;
+  process.env.TWEAKER_HOME = root;
   try {
     await fn(root);
   } finally {
-    if (originalHome === undefined) delete process.env.CODEX_PLUSPLUS_HOME;
-    else process.env.CODEX_PLUSPLUS_HOME = originalHome;
+    if (originalHome === undefined) delete process.env.TWEAKER_HOME;
+    else process.env.TWEAKER_HOME = originalHome;
     rmSync(root, { recursive: true, force: true });
   }
 }

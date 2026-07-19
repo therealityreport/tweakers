@@ -1,6 +1,6 @@
 # Tweak Authoring Docs
 
-Segmented docs for building Codex++ tweaks.
+Segmented docs for building Tweaker tweaks.
 
 - [Getting started](./getting-started.md)
 - [Manifest reference](./manifest.md)
@@ -14,7 +14,7 @@ Segmented docs for building Codex++ tweaks.
 - [Owl runtime surface](../OWL-RUNTIME.md)
 - [Owl bridge roadmap](../OWL-BRIDGE-ROADMAP.md)
 
-The top-level entry point remains [Writing Codex++ Tweaks](../WRITING-TWEAKS.md).
+The top-level entry point remains [Writing Tweaker Tweaks](../WRITING-TWEAKS.md).
 
 Bundled tweaks maintained by this repository use the privacy-safe
 `co.tweakers.*` namespace. Third-party authors should use their own stable

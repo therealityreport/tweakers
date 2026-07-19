@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { removeLocalSigningIdentity, type SecurityCommandRunner } from "../src/codesign";
-import { chooseRestorePlan, cleanupRuntimeAndState, purgeUserData } from "../src/commands/uninstall";
+import { chooseRestorePlan, cleanupRuntimeAndState, purgeUserData, uninstall } from "../src/commands/uninstall";
+import { lifecycleLockFile } from "../src/lifecycle-lock";
+import { acquireProcessLock } from "../src/process-lock";
+import { writeEnvironmentTransactionReceipt } from "../src/environment-transaction";
 
 test("local signing identity removal clears trust before deleting the identity", () => {
   const calls: Array<[string, string[]]> = [];
@@ -82,7 +85,7 @@ test(
   "uninstall explains runtime cleanup permission failures",
   { skip: process.platform === "win32" || process.getuid?.() === 0 },
   () => {
-    const root = mkdtempSync(join(tmpdir(), "codexpp-uninstall-"));
+    const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-"));
     const runtime = join(root, "runtime");
     const stateFile = join(root, "state.json");
     mkdirSync(runtime);
@@ -127,8 +130,80 @@ test("uninstall skips app restore when the current app no longer looks patched",
   assert.match(plan.reason, /does not appear/);
 });
 
+test("uninstall refuses live mutation when an environment rollback failed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-receipt-"));
+  const previousHome = process.env.TWEAKER_HOME;
+  process.env.TWEAKER_HOME = root;
+  try {
+    mkdirSync(join(root, "transactions"), { recursive: true });
+    const source = {
+      selectedDesktopPath: "/Applications/ChatGPT.app",
+      selectedDesktopBundleId: "com.openai.codex" as const,
+      releaseProfile: "stable" as const,
+      appExperience: "tweakers" as const,
+      backendLane: "bundled" as const,
+      requestedAt: "2026-07-17T00:00:00.000Z",
+      appliedAt: "2026-07-17T00:01:00.000Z",
+    };
+    writeEnvironmentTransactionReceipt(join(root, "transactions", "environment.json"), {
+      schemaVersion: 1,
+      kind: "environment",
+      transactionId: "environment-rollback-failed",
+      phase: "failed",
+      error: "Commit failed; rollback failed: source app could not be reopened",
+      ownerPid: 987654,
+      source,
+      requested: {
+        ...source,
+        appExperience: "chatgpt",
+        backendLane: "official-bundled",
+        requestedAt: "2026-07-17T00:02:00.000Z",
+        appliedAt: null,
+      },
+      prepared: null,
+      applied: null,
+      oldMainPid: 101,
+      newMainPid: null,
+      attempt: 1,
+      createdAt: "2026-07-17T00:02:00.000Z",
+      updatedAt: "2026-07-17T00:03:00.000Z",
+      committedAt: null,
+      rolledBackAt: null,
+      cancelledAt: null,
+    });
+
+    await assert.rejects(
+      uninstall(),
+      /environment-rollback-failed.*failed during rollback.*explicit recovery/i,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.TWEAKER_HOME;
+    else process.env.TWEAKER_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uninstall serializes against another lifecycle owner", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-lock-"));
+  const previousHome = process.env.TWEAKER_HOME;
+  process.env.TWEAKER_HOME = root;
+  let lock: ReturnType<typeof acquireProcessLock> | null = null;
+  try {
+    lock = acquireProcessLock(lifecycleLockFile(root));
+    await assert.rejects(
+      uninstall(),
+      /Another Tweakers lifecycle operation is active/i,
+    );
+  } finally {
+    lock?.release();
+    if (previousHome === undefined) delete process.env.TWEAKER_HOME;
+    else process.env.TWEAKER_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("purge removes all Tweakers user data", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-uninstall-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-"));
   mkdirSync(join(root, "tweaks", "example"), { recursive: true });
   mkdirSync(join(root, "backup"), { recursive: true });
   writeFileSync(join(root, "config.json"), "{}");
@@ -141,7 +216,7 @@ test("purge removes all Tweakers user data", () => {
 });
 
 test("uninstall prefers a full app backup for a patched macOS app", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-uninstall-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-"));
   try {
     const backup = join(root, "Codex.app");
     mkdirSync(join(backup, "Contents", "Resources"), { recursive: true });
@@ -175,7 +250,7 @@ test("uninstall prefers a full app backup for a patched macOS app", () => {
 });
 
 test("uninstall refuses partial restore after a Codex version change", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-uninstall-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-uninstall-"));
   try {
     const partial = join(root, "app.asar");
     writeFileSync(partial, "");

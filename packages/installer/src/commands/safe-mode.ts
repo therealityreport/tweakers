@@ -10,8 +10,8 @@ interface SafeModeOpts {
   status?: boolean;
 }
 
-interface CodexPlusPlusConfig {
-  codexPlusPlus?: {
+interface TweakerConfig {
+  tweaker?: {
     autoUpdate?: boolean;
     safeMode?: boolean;
     updateCheck?: unknown;
@@ -22,7 +22,7 @@ interface CodexPlusPlusConfig {
 
 export function safeMode(opts: SafeModeOpts = {}): void {
   const paths = ensureUserPaths();
-  const config = readConfigFile(paths.configFile) as CodexPlusPlusConfig;
+  const config = readConfigFile(paths.configFile) as TweakerConfig;
   const explicitActions = [opts.on === true, opts.off === true, opts.status === true].filter(Boolean).length;
 
   if (explicitActions > 1) {
@@ -30,13 +30,13 @@ export function safeMode(opts: SafeModeOpts = {}): void {
   }
 
   if (opts.status === true) {
-    printStatus(config.codexPlusPlus?.safeMode === true);
+    printStatus(config.tweaker?.safeMode === true);
     return;
   }
 
   const enabled = opts.off === true ? false : true;
   updateConfigFile(paths.configFile, (current) => {
-    const section = (current.codexPlusPlus ??= {}) as Record<string, unknown>;
+    const section = (current.tweaker ??= {}) as Record<string, unknown>;
     section.safeMode = enabled;
   });
   touchRuntimeReload(paths.tweaks);
@@ -52,7 +52,7 @@ export function safeMode(opts: SafeModeOpts = {}): void {
 
 function touchRuntimeReload(tweaksDir: string): void {
   mkdirSync(tweaksDir, { recursive: true });
-  writeFileSync(join(tweaksDir, ".codexpp-safe-mode-reload"), String(Date.now()), "utf8");
+  writeFileSync(join(tweaksDir, ".tweaker-safe-mode-reload"), String(Date.now()), "utf8");
 }
 
 function printStatus(enabled: boolean): void {

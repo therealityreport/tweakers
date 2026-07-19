@@ -1,6 +1,6 @@
 # MCP Servers
 
-Tweaks can declare MCP servers in `manifest.json`. Codex++ syncs enabled
+Tweaks can declare MCP servers in `manifest.json`. Tweaker syncs enabled
 tweak-declared servers into Codex's `~/.codex/config.toml`.
 
 ## Manifest
@@ -24,15 +24,15 @@ tweak-declared servers into Codex's `~/.codex/config.toml`.
 
 ## Generated Config
 
-Codex++ writes managed entries between markers:
+Tweaker writes managed entries between markers:
 
 ```toml
-# BEGIN CODEX++ MANAGED MCP SERVERS
+# BEGIN TWEAKER MANAGED MCP SERVERS
 [mcp_servers.tools]
 command = "node"
 args = ["/absolute/path/to/tweak/mcp-server.js"]
 env = { TOOLS_MODE = "codex" }
-# END CODEX++ MANAGED MCP SERVERS
+# END TWEAKER MANAGED MCP SERVERS
 ```
 
 The managed block is rewritten when tweaks reload.
@@ -44,11 +44,11 @@ The default server name is derived from the tweak id:
 - `co.bennett.project-home` -> `project-home`
 - `com.you.tools` -> `com-you-tools`
 
-If a generated name conflicts with another managed name, Codex++ appends
+If a generated name conflicts with another managed name, Tweaker appends
 `-2`, `-3`, and so on.
 
 If the user already has a manual `[mcp_servers.<name>]` entry outside the
-managed block, Codex++ skips that managed server instead of overwriting it.
+managed block, Tweaker skips that managed server instead of overwriting it.
 
 ## Path Resolution
 

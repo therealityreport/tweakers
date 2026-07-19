@@ -10,11 +10,12 @@ import { uninstallWatcher } from "../watcher.js";
 import { chownForTargetUser } from "../ownership.js";
 import { cleanupWindowsManagedArtifacts } from "../windows-cleanup.js";
 import { readHeaderHash } from "../asar.js";
-import { hasCodexPlusPlusAsarMarker, readCodexVersion } from "./install.js";
+import { hasTweakerAsarMarker, readCodexVersion } from "./install.js";
 import { isCodexRunning } from "../alerts.js";
 import { clearModeTransition, modeTransitionFile, parkedPayloadRoot } from "../mode-transition.js";
 import { removeSwitcher } from "../switcher-setup.js";
 import type { CodexInstall } from "../platform.js";
+import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 
 interface Opts {
   app?: string;
@@ -23,6 +24,13 @@ interface Opts {
 
 export async function uninstall(opts: Opts = {}): Promise<void> {
   const paths = ensureUserPaths();
+  await withLifecycleLock(lifecycleLockFile(paths.root), "uninstall", async () => {
+    assertLifecycleReceiptsIdle(paths.root);
+    await uninstallUnlocked(opts, paths);
+  });
+}
+
+async function uninstallUnlocked(opts: Opts, paths: ReturnType<typeof ensureUserPaths>): Promise<void> {
   const state = readState(paths.stateFile);
   const codex = locateCodex(opts.app ?? state?.appRoot);
 
@@ -41,7 +49,7 @@ export async function uninstall(opts: Opts = {}): Promise<void> {
   const backupAsarUnpacked = join(paths.backup, "app.asar.unpacked");
   const backupPlist = codex.metaPath ? join(paths.backup, "Info.plist") : null;
   const backupFramework = join(paths.backup, "Electron Framework");
-  const hasPatchMarker = hasCodexPlusPlusAsarMarker(codex.asarPath);
+  const hasPatchMarker = hasTweakerAsarMarker(codex.asarPath);
 
   if (shouldSkipRestoreForChatgptMode(state, hasPatchMarker)) {
     // ChatGPT mode: the live app is already the restored pristine official
@@ -84,7 +92,7 @@ export async function uninstall(opts: Opts = {}): Promise<void> {
   console.log(kleur.green("Removed parked mode payload."));
   const switcher = await removeSwitcher();
   if (switcher.removed) {
-    console.log(kleur.green("Removed the menu-bar switcher."));
+    console.log(kleur.green("Removed Menu Bar coordinator metadata and standalone switcher artifacts."));
   }
 
   uninstallWatcher();
@@ -189,8 +197,8 @@ function restoreFullAppBundle(appRoot: string, backupPath: string): void {
   const parent = dirname(appRoot);
   const appName = basename(appRoot);
   const suffix = `${process.pid}-${Date.now()}`;
-  const staged = join(parent, `.${appName}.codexpp-restore-${suffix}`);
-  const replaced = join(parent, `.${appName}.codexpp-replaced-${suffix}`);
+  const staged = join(parent, `.${appName}.tweaker-restore-${suffix}`);
+  const replaced = join(parent, `.${appName}.tweaker-replaced-${suffix}`);
 
   rmSync(staged, { recursive: true, force: true });
   rmSync(replaced, { recursive: true, force: true });
@@ -316,7 +324,7 @@ function cleanupPermissionError(error: unknown, path: string, label: string): Er
     `Cannot remove Tweakers ${label} at ${path}.\n` +
       "This usually means files were left owned by root from a previous sudo install or repair.\n" +
       `Fix ownership with:\n  sudo chown -R "$(id -u)":"$(id -g)" ${shellQuote(path)}\n` +
-      "Then run:\n  codexplusplus uninstall",
+      "Then run:\n  tweaker uninstall",
   );
 }
 

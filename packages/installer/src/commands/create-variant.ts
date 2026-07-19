@@ -56,7 +56,7 @@ export async function createTweakersVariant(
   if (source === target) throw new Error("The Tweakers variant target must differ from the official source app.");
   if (target === "/Applications/ChatGPT.app") {
     throw new Error(
-      "Refusing to create a variant at /Applications/ChatGPT.app. The official app path is managed by the mode toggle — use `tweakers mode tweakers` to patch it and `tweakers mode chatgpt` to restore the pristine app.",
+      "Refusing to create a variant at /Applications/ChatGPT.app. The official app path is managed by the mode toggle — use `tweaker mode tweakers` to patch it and `tweaker mode chatgpt` to restore the pristine app.",
     );
   }
   if (!target.endsWith(".app")) throw new Error("The Tweakers variant target must be a macOS .app bundle.");

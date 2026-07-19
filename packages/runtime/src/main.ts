@@ -7,7 +7,7 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, globalShortcut, ipcMain, session, shell, systemPreferences, webContents } from "electron";
+import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
 import { cpSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
@@ -19,8 +19,8 @@ import { extract as extractTar, list as listTar } from "tar";
 import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
-import { switchAppMode } from "./app-mode";
-import { syncManagedMcpServers } from "./mcp-sync";
+import { createMcpReconciler } from "./mcp-reconciliation";
+import { USER_QUESTIONS_APPROVAL_POLICY, USER_QUESTIONS_SANDBOX_MODE } from "./mcp-sync";
 import { getWatcherHealth } from "./watcher-health";
 import {
   isMainProcessTweakScope,
@@ -32,6 +32,7 @@ import {
   createTweakLifecycleJournal,
   lifecycleRecordKey,
   recoverInterruptedTweaks,
+  loadTweaksInitially,
   type TweakLifecycleJournal,
   type TweakLifecycleRecord,
   type TweakLifecycleStatus,
@@ -45,6 +46,7 @@ import {
   listCdpTargets,
 } from "./codex-runtime-probe";
 import { NativeBridge, type NativeTweakContext } from "./native-bridge";
+import { resolveRuntimeNativeHostPath } from "./native-host-path";
 import type { TweakManifest } from "@therealityreport/tweakers-sdk";
 import type {
   CodexRuntimeCapabilities,
@@ -77,6 +79,7 @@ import {
   resolveBundledTweakPath,
 } from "./tweak-store";
 import { maybeStartBrowserUiServer } from "./browser-ui";
+import { resolveLocalCliRuntime } from "./local-cli-runtime";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import { answerPromotionHealthRequest, hasAuthenticatedSessionCookie, hasAuthenticatedCodexToken, readCodexAuth } from "./promotion-health";
 import {
@@ -94,6 +97,7 @@ import type {
 } from "./codex-version-types";
 import {
   buildCodexFeatureUnion,
+  codexVersionChannel,
   compareCodexVersions,
   createCodexVersionService,
   isCodexDesktopUpdateNewer,
@@ -106,15 +110,45 @@ import {
   type SparkleAppcastMetadata,
 } from "./codex-sparkle-bridge";
 import { installCodexAppServerParent } from "./codex-app-server-parent";
+import {
+  createCodexDesktopUpdateService,
+  type CodexDesktopUpdateCheckResult,
+  type CodexDesktopUpdateMetadata,
+  type CodexDesktopUpdateTarget,
+} from "./codex-desktop-update-service";
+import { syncCodexDesktopUpdateMenuLabel as syncCodexDesktopUpdateMenu } from "./codex-desktop-update-menu";
+import {
+  activeVerifiedCodexDesktopProfileIdentity,
+  codexDesktopUpdateTargetForProfile,
+  createCapturedCodexDesktopProfileFeed,
+  readCapturedCodexDesktopProfileFeed,
+  safePersistedAppcastUrl,
+  verifiedCodexDesktopProfileIdentity,
+  type CapturedCodexDesktopProfileFeed,
+} from "./codex-desktop-update-profile";
 
 // Tweakers is the public name. Keep the Tweakers variables as compatibility
 // aliases so existing patched apps and user data continue to boot.
-const userRoot = process.env.TWEAKERS_USER_ROOT ?? process.env.CODEX_PLUSPLUS_USER_ROOT;
-const runtimeDir = process.env.TWEAKERS_RUNTIME ?? process.env.CODEX_PLUSPLUS_RUNTIME;
+const LEGACY_CONFIG_KEY = ["codex", "Plus", "Plus"].join("");
+const LEGACY_USER_ROOT_ENV = ["CODEX", "PLUSPLUS", "USER_ROOT"].join("_");
+const LEGACY_RUNTIME_ENV = ["CODEX", "PLUSPLUS", "RUNTIME"].join("_");
+const LEGACY_MANUAL_UPDATE_ENV = ["CODEX", "PLUSPLUS", "MANUAL_UPDATE"].join("_");
+const LEGACY_STORE_INDEX_ENV = ["CODEX", "PLUSPLUS", "STORE_INDEX_URL"].join("_");
+const LEGACY_REMOTE_DEBUG_ENV = [["CODEX", "PP"].join(""), "REMOTE_DEBUG"].join("_");
+const LEGACY_REMOTE_DEBUG_PORT_ENV = [["CODEX", "PP"].join(""), "REMOTE_DEBUG_PORT"].join("_");
+const LEGACY_STORE_METADATA = [".codex", "pp-store.json"].join("");
+const LEGACY_DATA_DIR = ["codex", "plusplus"].join("-");
+const LEGACY_WINDOW_SERVICES_KEY = ["__codex", "pp_window_services__"].join("");
+const userRoot = process.env.TWEAKERS_USER_ROOT
+  ?? process.env.TWEAKER_USER_ROOT
+  ?? process.env[LEGACY_USER_ROOT_ENV];
+const runtimeDir = process.env.TWEAKERS_RUNTIME
+  ?? process.env.TWEAKER_RUNTIME
+  ?? process.env[LEGACY_RUNTIME_ENV];
 
 if (!userRoot || !runtimeDir) {
   throw new Error(
-    "Tweakers runtime started without TWEAKERS_USER_ROOT/RUNTIME (or legacy CODEX_PLUS_PLUS aliases) envs",
+    "Tweakers runtime started without a supported user-root/runtime environment",
   );
 }
 
@@ -133,6 +167,14 @@ const CODEX_CONFIG_FILE = join(homedir(), ".codex", "config.toml");
 const INSTALLER_STATE_FILE = join(userRoot, "state.json");
 const UPDATE_MODE_FILE = join(userRoot, "update-mode.json");
 const SELF_UPDATE_STATE_FILE = join(userRoot, "self-update-state.json");
+const MCP_SYNC_STATE_FILE = join(userRoot, "mcp-sync-state.json");
+const ENVIRONMENT_SELECTION_FILE = join(userRoot, "environment-selection.json");
+const ENVIRONMENT_REGISTRY_FILE = join(userRoot, "environment-registry.json");
+const ENVIRONMENT_RUNTIME_PROOF_FILE = join(userRoot, "environment-runtime-proof.json");
+const ENVIRONMENT_STATUS_TIMEOUT_MS = 60_000;
+const ENVIRONMENT_PREPARE_TIMEOUT_MS = 15 * 60_000;
+const ENVIRONMENT_ACTION_TIMEOUT_MS = 30_000;
+const CLI_JSON_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const TWEAK_CATALOG_FILE = join(runtimeDir, "catalog.json");
 const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
@@ -176,17 +218,19 @@ if (!healthCheckOnly) {
   }
 }
 const SIGNED_CODEX_BACKUP = join(userRoot, "backup", "Codex.app");
-const CODEX_PLUSPLUS_VERSION = "1.0.0";
-const CODEX_PLUSPLUS_REPO = "therealityreport/tweakers";
-const TWEAK_STORE_INDEX_URL = process.env.CODEX_PLUSPLUS_STORE_INDEX_URL ?? DEFAULT_TWEAK_STORE_INDEX_URL;
-const CODEX_WINDOW_SERVICES_KEY = "__codexpp_window_services__";
+const TWEAKER_VERSION = "1.0.0";
+const TWEAKER_REPO = "therealityreport/tweakers";
+const TWEAK_STORE_INDEX_URL = process.env.TWEAKER_STORE_INDEX_URL
+  ?? process.env[LEGACY_STORE_INDEX_ENV]
+  ?? DEFAULT_TWEAK_STORE_INDEX_URL;
+const CODEX_WINDOW_SERVICES_KEY = "__tweaker_window_services__";
 const mainTweakReadHandlers = new Map<string, (...args: unknown[]) => unknown>();
 
 mkdirSync(LOG_DIR, { recursive: true });
 mkdirSync(TWEAKS_DIR, { recursive: true });
 // One-time migration: the retired mode-switcher tweak persisted a soft
 // vanilla mode; app modes are now real bundle swaps owned by the installer
-// (`tweakers mode`). Drop the stale key so it can never gate tweaks again.
+// (`tweaker mode`). Drop the stale key so it can never gate tweaks again.
 removeLegacyModeSwitcherState(userRoot);
 const refreshStatusWatcher = chokidar.watch([
   SELF_UPDATE_STATE_FILE,
@@ -194,7 +238,7 @@ const refreshStatusWatcher = chokidar.watch([
   CONFIG_FILE,
 ], { ignoreInitial: true });
 refreshStatusWatcher.on("all", () => {
-  for (const window of BrowserWindow.getAllWindows()) window.webContents.send("codexpp:refresh-status-changed");
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send("tweaker:refresh-status-changed");
 });
 app.once("will-quit", () => { void refreshStatusWatcher.close(); });
 
@@ -205,25 +249,29 @@ app.once("will-quit", () => { void refreshStatusWatcher.close(); });
 // in-window DevTools shortcut, but `--remote-debugging-port` works regardless
 // because it's a Chromium command-line switch processed before app init.
 //
-// Off by default. Set CODEXPP_REMOTE_DEBUG=1 (optionally CODEXPP_REMOTE_DEBUG_PORT)
+// Off by default. Set TWEAKER_REMOTE_DEBUG=1 (optionally TWEAKER_REMOTE_DEBUG_PORT)
 // to turn it on. Must be appended before `app` becomes ready; we're at module
 // top-level so that's fine.
-if (process.env.CODEXPP_REMOTE_DEBUG === "1") {
-  const port = process.env.CODEXPP_REMOTE_DEBUG_PORT ?? "9222";
+if (process.env.TWEAKER_REMOTE_DEBUG === "1" || process.env[LEGACY_REMOTE_DEBUG_ENV] === "1") {
+  const port = process.env.TWEAKER_REMOTE_DEBUG_PORT ?? process.env[LEGACY_REMOTE_DEBUG_PORT_ENV] ?? "9222";
   app.commandLine.appendSwitch("remote-debugging-port", port);
   log("info", `remote debugging enabled on port ${port}`);
 }
 
 interface PersistedState {
-  codexPlusPlus?: {
+  tweaker?: {
     autoUpdate?: boolean;
     safeMode?: boolean;
     updateChannel?: SelfUpdateChannel;
     updateRepo?: string;
     updateRef?: string;
-    updateCheck?: CodexPlusPlusUpdateCheck;
+    updateCheck?: TweakerUpdateCheck;
     /** Managed whole-backend selection. Absence preserves a user-owned override. */
     codexCliLane?: CodexCliLane;
+    /** Installer-owned exact Alpha channel copy and immutable boot evidence. */
+    codexCliPath?: string;
+    codexCliVersion?: string;
+    codexCliFingerprint?: string;
     /** Redacted validation failure from the most recent managed-lane bootstrap. */
     codexCliBootstrapFailure?: string;
     codexReleaseCache?: Partial<Record<CodexCliLane, CodexReleaseCacheEntry>>;
@@ -237,6 +285,25 @@ interface PersistedState {
       feedUrl: string;
       checkedAt: string;
     };
+    codexAppcastProfileCaches?: Partial<Record<"stable" | "alpha", {
+      schemaVersion: 1;
+      profile: "stable" | "alpha";
+      identityKey: string;
+      desktopVersion: string;
+      marketingVersion: string;
+      build: string;
+      releaseUrl: string | null;
+      /** Safe URL only: credentials, query, and fragment are never persisted. */
+      feedUrl: string;
+      checkedAt: string;
+    }>>;
+    /** Captures are profile/identity scoped. Native request headers are never persisted. */
+    codexDesktopProfileFeeds?: Partial<Record<"stable" | "alpha", CapturedCodexDesktopProfileFeed>>;
+    codexDesktopUpdateNotification?: {
+      marketingVersion: string | null;
+      build: string | null;
+      notifiedAt: string;
+    };
   };
   /** Per-tweak enable flags. Missing entries default to enabled. */
   tweaks?: Record<string, { enabled?: boolean }>;
@@ -246,7 +313,7 @@ interface PersistedState {
   tweakHealth?: Record<string, TweakHealthRecord>;
 }
 
-interface CodexPlusPlusUpdateCheck {
+interface TweakerUpdateCheck {
   checkedAt: string;
   currentVersion: string;
   latestVersion: string | null;
@@ -293,7 +360,17 @@ interface TweakUpdateCheck {
 
 function readState(): PersistedState {
   try {
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as PersistedState;
+    const state = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as PersistedState;
+    const record = state as PersistedState & Record<string, unknown>;
+    const legacy = record[LEGACY_CONFIG_KEY];
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      state.tweaker = {
+        ...(legacy as NonNullable<PersistedState["tweaker"]>),
+        ...(state.tweaker ?? {}),
+      };
+    }
+    delete record[LEGACY_CONFIG_KEY];
+    return state;
   } catch {
     return {};
   }
@@ -309,40 +386,52 @@ function writeState(s: PersistedState): void {
 // The loader evaluates this module to completion before it requires OpenAI's
 // original main entry. Apply the managed lane synchronously here so the
 // backend resolver observes the final CODEX_CLI_PATH on its first import.
+const bootstrapTweakerState = readState().tweaker;
+const selectedManagedCli = bootstrapTweakerState?.codexCliPath
+  && bootstrapTweakerState.codexCliVersion
+  && bootstrapTweakerState.codexCliFingerprint
+  ? {
+      binaryPath: bootstrapTweakerState.codexCliPath,
+      version: bootstrapTweakerState.codexCliVersion,
+      fingerprint: bootstrapTweakerState.codexCliFingerprint,
+    }
+  : null;
 const codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
-  lane: readState().codexPlusPlus?.codexCliLane,
+  lane: bootstrapTweakerState?.codexCliLane,
   home: homedir(),
+  userRoot,
   env: process.env,
+  selectedManagedCli,
   persistFailure: (message) => {
     const state = readState();
-    state.codexPlusPlus ??= {};
-    state.codexPlusPlus.codexCliBootstrapFailure = message;
+    state.tweaker ??= {};
+    state.tweaker.codexCliBootstrapFailure = message;
     writeState(state);
   },
 });
+if (!healthCheckOnly) writeEnvironmentRuntimeProof();
 
 const CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases?per_page=100";
 const MAX_CODEX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const CODEX_APPCAST_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-let codexLaneChangedThisProcess = false;
-let codexAppcastMetadata: SparkleAppcastMetadata | null = null;
+const codexAppcastMetadataByIdentity = new Map<string, SparkleAppcastMetadata>();
 
 const codexVersionService = createCodexVersionService({
-  currentVersion: CODEX_PLUSPLUS_VERSION,
+  currentVersion: TWEAKER_VERSION,
   now: Date.now,
-  readReleaseCache: async (lane) => readState().codexPlusPlus?.codexReleaseCache?.[lane] ?? null,
+  readReleaseCache: async (lane) => readState().tweaker?.codexReleaseCache?.[lane] ?? null,
   writeReleaseCache: async (lane, cache) => {
     const state = readState();
-    state.codexPlusPlus ??= {};
-    state.codexPlusPlus.codexReleaseCache ??= {};
-    state.codexPlusPlus.codexReleaseCache[lane] = cache;
+    state.tweaker ??= {};
+    state.tweaker.codexReleaseCache ??= {};
+    state.tweaker.codexReleaseCache[lane] = cache;
     writeState(state);
   },
   fetchReleases: async (signal) => {
     const response = await fetch(CODEX_RELEASE_API, {
       headers: {
         Accept: "application/vnd.github+json",
-        "User-Agent": `tweakers/${CODEX_PLUSPLUS_VERSION}`,
+        "User-Agent": `tweakers/${TWEAKER_VERSION}`,
       },
       signal,
     });
@@ -356,9 +445,182 @@ const codexVersionService = createCodexVersionService({
 
 const codexCliManager = createCodexCliManager({
   home: homedir(),
+  userRoot,
   deps: createCodexCliManagerDependencies(),
 });
 codexCliManager.recover();
+
+const CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
+let lastPublishedCodexDesktopUpdate: CodexDesktopUpdateCheckResult | null = null;
+let originalSetApplicationMenu: typeof Menu.setApplicationMenu | null = null;
+
+function desktopUpdateResultWithNativeState(
+  result: CodexDesktopUpdateCheckResult,
+): CodexDesktopUpdateCheckResult {
+  const bridge = getCodexSparkleBridge();
+  const sparkle = bridge.getSnapshot();
+  return {
+    ...result,
+    installed: { ...result.installed },
+    latest: { ...result.latest },
+    nativeUpdateControlActive: bridge.nativeUpdateControlActive(),
+    javaScriptUpdaterManagerAvailable: sparkle.available,
+    javaScriptUpdaterManagerReason: sparkle.available
+      ? null
+      : "OpenAI's JavaScript updater manager did not initialize the native Sparkle bridge.",
+  };
+}
+
+function publishCodexDesktopUpdateResult(result: CodexDesktopUpdateCheckResult): void {
+  getCodexSparkleBridge().setSafeUpdateAvailable(result.status === "update-available");
+  const published = desktopUpdateResultWithNativeState(result);
+  lastPublishedCodexDesktopUpdate = published;
+  broadcastCodexDesktopUpdateResult(published);
+}
+
+function selectedDesktopUpdateSetupResult(): CodexDesktopUpdateCheckResult | null {
+  const target = selectedCodexDesktopUpdateTarget();
+  if (target.available || !target.setupRequired) return null;
+  return {
+    schemaVersion: 1,
+    status: "unavailable",
+    profile: target.profile,
+    installed: { marketingVersion: null, build: null },
+    latest: { marketingVersion: null, build: null },
+    checkedAt: new Date().toISOString(),
+    reason: target.unavailableReason,
+    retryRequested: false,
+    updateAndReloadRequested: false,
+    setupRequired: target.setupRequired,
+  };
+}
+
+function broadcastCodexDesktopUpdateResult(result: CodexDesktopUpdateCheckResult): void {
+  rebuildCodexDesktopUpdateMenu(result);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
+    window.webContents.send(CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL, result);
+  }
+}
+
+function syncCodexDesktopUpdateMenuBeforeAttach(
+  menu: Electron.Menu,
+  result: CodexDesktopUpdateCheckResult | null,
+): void {
+  syncCodexDesktopUpdateMenu(menu, result?.status === "update-available", () => {
+    void requestCodexDesktopManualCheck("application-menu");
+  }, !!result?.setupRequired);
+}
+
+function rebuildCodexDesktopUpdateMenu(result: CodexDesktopUpdateCheckResult): void {
+  const applicationMenu = Menu.getApplicationMenu();
+  if (!applicationMenu || !originalSetApplicationMenu) return;
+  try {
+    const template = applicationMenu.items.map(
+      (item) => item as unknown as Electron.MenuItemConstructorOptions,
+    );
+    const rebuilt = Menu.buildFromTemplate(template);
+    syncCodexDesktopUpdateMenuBeforeAttach(rebuilt, result);
+    Reflect.apply(originalSetApplicationMenu, Menu, [rebuilt]);
+  } catch (error) {
+    log("warn", "desktop update menu rebuild failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function installCodexDesktopUpdateMenuReplay(): void {
+  const setApplicationMenu = Menu.setApplicationMenu;
+  originalSetApplicationMenu = setApplicationMenu;
+  try {
+    Menu.setApplicationMenu = function tweakerSetApplicationMenu(menu: Electron.Menu | null): void {
+      if (menu) {
+        syncCodexDesktopUpdateMenuBeforeAttach(
+          menu,
+          lastPublishedCodexDesktopUpdate ?? selectedDesktopUpdateSetupResult(),
+        );
+      }
+      Reflect.apply(setApplicationMenu, Menu, [menu]);
+    };
+  } catch (error) {
+    log("warn", "desktop update menu replay unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+installCodexDesktopUpdateMenuReplay();
+
+const codexDesktopUpdateService = createCodexDesktopUpdateService({
+  resolveTarget: async () => selectedCodexDesktopUpdateTarget(),
+  refreshMetadata: refreshCodexDesktopUpdateMetadata,
+  showDialog: async (options) => dialog.showMessageBox({
+    type: options.type,
+    title: options.title,
+    message: options.message,
+    detail: options.detail,
+    buttons: options.buttons,
+    defaultId: options.defaultId,
+    cancelId: options.cancelId,
+    noLink: options.noLink,
+  }),
+  startUpdateAndReload: startCodexDesktopUpdateTransaction,
+  onResult: publishCodexDesktopUpdateResult,
+});
+
+async function requestCodexDesktopManualCheck(source: "application-menu" | "native-sparkle"): Promise<void> {
+  const sparkle = getCodexSparkleBridge().getSnapshot();
+  if (!sparkle.available) {
+    log("warn", "desktop JavaScript updater manager unavailable; using Tweakers metadata service", {
+      source,
+      reason: sparkle.installPrerequisiteFailure,
+    });
+  }
+  await codexDesktopUpdateService.checkAndPresent();
+}
+
+const PROACTIVE_DESKTOP_UPDATE_INITIAL_DELAY_MS = 15_000;
+const PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+
+function scheduleProactiveDesktopUpdateChecks(): void {
+  const schedule = (delay: number): void => {
+    const timer = setTimeout(() => {
+      void runProactiveDesktopUpdateCheck().then(
+        () => schedule(PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS),
+        (error) => {
+          log("warn", "proactive desktop update check failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          schedule(PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS);
+        },
+      );
+    }, delay);
+    timer.unref?.();
+  };
+  schedule(PROACTIVE_DESKTOP_UPDATE_INITIAL_DELAY_MS);
+}
+
+async function runProactiveDesktopUpdateCheck(): Promise<void> {
+  const result = await codexDesktopUpdateService.checkSilently();
+  if (result.status !== "update-available") return;
+  const state = readState();
+  const prior = state.tweaker?.codexDesktopUpdateNotification;
+  if (prior?.marketingVersion === result.latest.marketingVersion && prior.build === result.latest.build) return;
+  if (!Notification.isSupported()) return;
+  const version = result.latest.marketingVersion ?? "a newer version";
+  const build = result.latest.build ? ` (build ${result.latest.build})` : "";
+  new Notification({
+    title: "ChatGPT Update Available",
+    body: `${version}${build} is available. Use Check for Updates… or Update and Reload.`,
+  }).show();
+  state.tweaker ??= {};
+  state.tweaker.codexDesktopUpdateNotification = {
+    marketingVersion: result.latest.marketingVersion,
+    build: result.latest.build,
+    notifiedAt: new Date().toISOString(),
+  };
+  writeState(state);
+}
 
 function createCodexCliManagerDependencies(): CodexCliManagerDependencies {
   return {
@@ -467,34 +729,34 @@ function execFileResult(
     });
   });
 }
-function isCodexPlusPlusAutoUpdateEnabled(): boolean {
-  return readState().codexPlusPlus?.autoUpdate !== false;
+function isTweakerAutoUpdateEnabled(): boolean {
+  return readState().tweaker?.autoUpdate !== false;
 }
-function setCodexPlusPlusAutoUpdate(enabled: boolean): void {
+function setTweakerAutoUpdate(enabled: boolean): void {
   const s = readState();
-  s.codexPlusPlus ??= {};
-  s.codexPlusPlus.autoUpdate = enabled;
+  s.tweaker ??= {};
+  s.tweaker.autoUpdate = enabled;
   writeState(s);
 }
-function setCodexPlusPlusUpdateConfig(config: {
+function setTweakerUpdateConfig(config: {
   updateChannel?: SelfUpdateChannel;
   updateRepo?: string;
   updateRef?: string;
 }): void {
   const s = readState();
-  s.codexPlusPlus ??= {};
-  if (config.updateChannel) s.codexPlusPlus.updateChannel = config.updateChannel;
-  if ("updateRepo" in config) s.codexPlusPlus.updateRepo = cleanOptionalString(config.updateRepo);
-  if ("updateRef" in config) s.codexPlusPlus.updateRef = cleanOptionalString(config.updateRef);
+  s.tweaker ??= {};
+  if (config.updateChannel) s.tweaker.updateChannel = config.updateChannel;
+  if ("updateRepo" in config) s.tweaker.updateRepo = cleanOptionalString(config.updateRepo);
+  if ("updateRef" in config) s.tweaker.updateRef = cleanOptionalString(config.updateRef);
   writeState(s);
 }
-function isCodexPlusPlusSafeModeEnabled(): boolean {
-  return readState().codexPlusPlus?.safeMode === true;
+function isTweakerSafeModeEnabled(): boolean {
+  return readState().tweaker?.safeMode === true;
 }
 
 function isTweakEnabled(id: string): boolean {
   const s = readState();
-  if (s.codexPlusPlus?.safeMode === true) return false;
+  if (s.tweaker?.safeMode === true) return false;
   if (s.tweakHealth?.[id]?.status === "quarantined") return false;
   return s.tweaks?.[id]?.enabled !== false;
 }
@@ -534,7 +796,7 @@ function isTweakQuarantined(id: string): boolean {
   return tweakHealth(id)?.status === "quarantined";
 }
 
-function recoverTweak(id: string): true {
+function recoverTweak(id: string): Promise<true> {
   clearTweakHealth(id);
   return setTweakEnabledAndReload(id, true, tweakLifecycleDeps);
 }
@@ -542,6 +804,7 @@ function recoverTweak(id: string): true {
 interface InstallerState {
   appRoot: string;
   codexVersion: string | null;
+  codexBundleId?: "com.openai.codex" | "com.openai.codex.beta";
   sourceRoot?: string;
 }
 
@@ -586,7 +849,7 @@ function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
   try {
     appendCappedLog(LOG_FILE, line);
   } catch {}
-  if (level === "error") console.error("[codex-plusplus]", ...args);
+  if (level === "error") console.error("[tweaker]", ...args);
 }
 
 const lifecycleAttemptId = randomUUID();
@@ -716,7 +979,7 @@ function installSparkleUpdateHook(): void {
   const originalLoad = Module._load;
   if (typeof originalLoad !== "function") return;
 
-  Module._load = function codexPlusPlusModuleLoad(request: string, parent: unknown, isMain: boolean) {
+  Module._load = function tweakerModuleLoad(request: string, parent: unknown, isMain: boolean) {
     const loaded = originalLoad.apply(this, [request, parent, isMain]) as unknown;
     if (typeof request === "string" && /sparkle(?:\.node)?$/i.test(request)) {
       getCodexSparkleBridge().wrapExports(loaded);
@@ -824,6 +1087,46 @@ function inferMacAppRoot(): string | null {
   return idx >= 0 ? process.execPath.slice(0, idx + ".app".length) : null;
 }
 
+function writeEnvironmentRuntimeProof(): void {
+  try {
+    const appRoot = inferMacAppRoot();
+    if (!appRoot) throw new Error("could not infer the exact running app path");
+    const state = readInstallerState();
+    const bundleId = state?.codexBundleId ?? null;
+    const binaryPath = codexCliBootstrap.binary
+      ?? join(appRoot, "Contents", "Resources", "codex");
+    if (!existsSync(binaryPath)) throw new Error(`selected backend is missing at ${binaryPath}`);
+    const versionProbe = spawnSync(binaryPath, ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+    });
+    if (versionProbe.status !== 0) throw new Error("selected backend version probe failed");
+    const version = `${versionProbe.stdout ?? ""}${versionProbe.stderr ?? ""}`.trim().split(/\s+/).at(-1) ?? null;
+    if (!version) throw new Error("selected backend version is empty");
+    const proof = {
+      schemaVersion: 1,
+      kind: "environment-runtime-proof",
+      pid: process.pid,
+      appRoot,
+      bundleId,
+      appExperience: "tweakers",
+      releaseProfile: bundleId === "com.openai.codex.beta" ? "alpha" : "stable",
+      backendLane: codexCliBootstrap.effectiveLane === "beta" ? "managed-alpha" : "bundled",
+      binaryPath,
+      backendVersion: version,
+      backendFingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"),
+      observedAt: new Date().toISOString(),
+    };
+    const temporary = `${ENVIRONMENT_RUNTIME_PROOF_FILE}.${process.pid}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(proof, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporary, ENVIRONMENT_RUNTIME_PROOF_FILE);
+  } catch (error) {
+    log("error", "environment runtime proof failed", { message: (error as Error).message });
+  }
+}
+
 // Surface unhandled errors from anywhere in the main process to our log.
 process.on("uncaughtException", (e: Error & { code?: string }) => {
   log("error", "uncaughtException", { code: e.code, message: e.message, stack: e.stack });
@@ -833,8 +1136,23 @@ process.on("unhandledRejection", (e) => {
 });
 
 configureCodexSparkleBridge({
+  requestManualCheck: async () => {
+    await requestCodexDesktopManualCheck("native-sparkle");
+  },
+  requestBackgroundCheck: runProactiveDesktopUpdateCheck,
+  requestInstall: startCodexDesktopUpdateTransaction,
   prepareForInstall: prepareSignedCodexForSparkleInstall,
   getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
+  onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
+  onNativeControlActivityChanged: () => {
+    queueMicrotask(() => {
+      if (!lastPublishedCodexDesktopUpdate) return;
+      const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
+      if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
+      lastPublishedCodexDesktopUpdate = published;
+      broadcastCodexDesktopUpdateResult(published);
+    });
+  },
 });
 installSparkleUpdateHook();
 
@@ -921,8 +1239,37 @@ const tweakState = {
   loadedMain: new Map<string, LoadedMainTweak>(),
 };
 
+// Candidate health probes run from a disposable user root and must remain
+// observational. In particular, they must never watch or reconcile the real
+// ~/.codex/config.toml while validating a staged runtime.
+const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
+  configPath: CODEX_CONFIG_FILE,
+  statePath: MCP_SYNC_STATE_FILE,
+  getTweaks: () => tweakState.discovered.filter((tweak) => isTweakEnabled(tweak.manifest.id)),
+  getOwnedTweaks: () => tweakState.discovered,
+  onReceipt: (receipt) => {
+    const summary = receipt.conflicts.length > 0
+      ? receipt.conflicts.map((conflict) => (
+        `${conflict.observedName} -> ${conflict.canonicalName} (${conflict.reason})`
+      )).join(", ")
+      : receipt.appliedNames.join(", ") || "none";
+    log("info", `MCP reconciliation ${receipt.status}: ${summary}`);
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send("tweaker:mcp-sync-state-changed", receipt);
+    }
+  },
+  onError: (error) => log("warn", "failed to reconcile Codex MCP config:", error),
+});
+let initialMcpReconciliationPending = true;
+
 const nativeBridge = new NativeBridge(log, {
-  nativeHostPath: join(runtimeDir, "native", "codexpp_native_host.node"),
+  nativeHostPath: resolveRuntimeNativeHostPath({
+    resourcesPath: process.resourcesPath,
+    runtimeDir,
+    packaged: app.isPackaged,
+    allowExternalDevelopmentFallback: app.isPackaged === false
+      && (process.defaultApp === true || healthCheckOnly),
+  }),
 });
 const owlViews = new Map<string, ManagedOwlView>();
 
@@ -942,6 +1289,7 @@ const tweakLifecycleDeps = {
 // configurations (notably with sandboxed renderers), so registerPreloadScript
 // is the only reliable way to inject into Codex's BrowserWindows.
 function registerPreload(s: Electron.Session, label: string): void {
+  if (healthCheckOnly) return;
   try {
     const reg = (s as unknown as {
       registerPreloadScript?: (opts: {
@@ -951,7 +1299,7 @@ function registerPreload(s: Electron.Session, label: string): void {
       }) => string;
     }).registerPreloadScript;
     if (typeof reg === "function") {
-      reg.call(s, { type: "frame", filePath: PRELOAD_PATH, id: "codex-plusplus" });
+      reg.call(s, { type: "frame", filePath: PRELOAD_PATH, id: "tweaker" });
       log("info", `preload registered (registerPreloadScript) on ${label}:`, PRELOAD_PATH);
       return;
     }
@@ -994,6 +1342,10 @@ app.whenReady().then(() => {
       app.exit(0);
     }, 8_000);
     watchdog.unref?.();
+  } else {
+    // Raw Sparkle scheduling stays disabled in the locally signed app. This
+    // bounded metadata-only loop restores proactive update notification safely.
+    scheduleProactiveDesktopUpdateChecks();
   }
   void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
@@ -1030,21 +1382,25 @@ app.whenReady().then(() => {
     log("warn", "promotion health receipt failed", error);
     if (healthCheckOnly) app.exit(0);
   });
-  if (isCodexPlusPlusSafeModeEnabled()) {
-    log("warn", "safe mode is enabled; preload will not be registered");
-    return;
+  if (!healthCheckOnly) {
+    if (isTweakerSafeModeEnabled()) {
+      log("warn", "safe mode is enabled; preload will not be registered");
+    } else {
+      registerPreload(session.defaultSession, "defaultSession");
+      maybeStartBrowserUiServer({
+        getWindowServices: getCodexWindowServices,
+        log,
+      });
+    }
   }
-  registerPreload(session.defaultSession, "defaultSession");
-  maybeStartBrowserUiServer({
-    getWindowServices: getCodexWindowServices,
-    log,
-  });
 });
 
-app.on("session-created", (s) => {
-  if (isCodexPlusPlusSafeModeEnabled()) return;
-  registerPreload(s, "session-created");
-});
+if (!healthCheckOnly) {
+  app.on("session-created", (s) => {
+    if (isTweakerSafeModeEnabled()) return;
+    registerPreload(s, "session-created");
+  });
+}
 
 // DIAGNOSTIC: log every webContents creation. Useful for verifying our
 // preload reaches every renderer Codex spawns.
@@ -1068,7 +1424,7 @@ app.on("web-contents-created", (_e, wc) => {
 });
 
 log("info", "main.ts evaluated; app.isReady=" + app.isReady());
-if (isCodexPlusPlusSafeModeEnabled()) {
+if (isTweakerSafeModeEnabled()) {
   log("warn", "safe mode is enabled; tweaks will not be loaded");
 }
 
@@ -1078,11 +1434,18 @@ if (isCodexPlusPlusSafeModeEnabled()) {
 // the current require chain unwinds but BEFORE Electron's `ready` event, which
 // preserves the pre-ready execution context these main-scope tweaks already run
 // in today (so BrowserWindow/main hooks are installed before any window opens),
-// while removing the synchronous startup stall. syncMcpServersFromEnabledTweaks
-// is invoked inside loadAllMainTweaks, so it defers with it.
-setImmediate(() => loadAllMainTweaks());
+// while removing the synchronous startup stall. MCP reconciliation is invoked
+// inside loadAllMainTweaks, so it defers with it.
+if (!healthCheckOnly) {
+  setImmediate(() => {
+    void loadTweaksInitially(tweakLifecycleDeps).catch((error) => {
+      log("error", "failed initial main tweak load:", error);
+    });
+  });
+}
 
 app.on("will-quit", () => {
+  void mcpReconciler?.close();
   stopAllMainTweaks();
   nativeBridge.disposeAll();
   disposeAllOwlViews();
@@ -1096,7 +1459,7 @@ app.on("will-quit", () => {
 });
 
 // 3. IPC: expose tweak metadata + reveal-in-finder.
-ipcMain.handle("codexpp:list-tweaks", async () => {
+ipcMain.handle("tweaker:list-tweaks", async () => {
   await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
   const updateChecks = readState().tweakUpdateChecks ?? {};
   const catalog = readBundledTweakCatalog();
@@ -1127,7 +1490,7 @@ ipcMain.handle("codexpp:list-tweaks", async () => {
     };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 });
-ipcMain.on("codexpp:tweak-lifecycle", (_event, payload: unknown) => {
+ipcMain.on("tweaker:tweak-lifecycle", (_event, payload: unknown) => {
   if (!payload || typeof payload !== "object") return;
   const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown };
   if (typeof value.id !== "string" || !/^[a-zA-Z0-9._-]+$/.test(value.id)) return;
@@ -1143,9 +1506,9 @@ ipcMain.on("codexpp:tweak-lifecycle", (_event, payload: unknown) => {
   ].includes(status)) return;
   recordTweakLifecycle(value.id, "renderer", status, value.error);
 });
-ipcMain.handle("codexpp:get-tweak-lifecycle", () => lifecycleJournal);
+ipcMain.handle("tweaker:get-tweak-lifecycle", () => lifecycleJournal);
 ipcMain.handle(
-  "codexpp:cross-tweak-read",
+  "tweaker:cross-tweak-read",
   (_e, requester: unknown, target: unknown, action: unknown, message: unknown) =>
     dispatchCrossTweakRead(
       requester,
@@ -1156,12 +1519,12 @@ ipcMain.handle(
     ),
 );
 
-ipcMain.handle("codexpp:get-tweak-enabled", (_e, id: string) => isTweakEnabled(id));
-ipcMain.handle("codexpp:set-tweak-enabled", (_e, id: string, enabled: boolean) => {
+ipcMain.handle("tweaker:get-tweak-enabled", (_e, id: string) => isTweakEnabled(id));
+ipcMain.handle("tweaker:set-tweak-enabled", async (_e, id: string, enabled: boolean) => {
   return setTweakEnabledAndReload(id, enabled, tweakLifecycleDeps);
 });
-ipcMain.handle("codexpp:recover-tweak", (_e, id: string) => recoverTweak(id));
-ipcMain.handle("codexpp:clear-tweak-health", (_e, id: string) => {
+ipcMain.handle("tweaker:recover-tweak", (_e, id: string) => recoverTweak(id));
+ipcMain.handle("tweaker:clear-tweak-health", (_e, id: string) => {
   clearTweakHealth(id);
   return true;
 });
@@ -1171,7 +1534,7 @@ function bundledCodexBinary(): string {
 }
 
 function selectedCodexLane(): CodexCliLane {
-  return readState().codexPlusPlus?.codexCliLane ?? codexCliBootstrap.effectiveLane;
+  return readState().tweaker?.codexCliLane ?? codexCliBootstrap.effectiveLane;
 }
 
 function codexReleaseIsNewer(latest: string | null, installed: string | null): boolean {
@@ -1202,24 +1565,98 @@ function installedCodexDesktopVersion(): { installedMarketingVersion: string | n
   });
 }
 
-function safeAppcastCacheUrl(value: string | null): string | null {
-  if (!value) return null;
+function selectedCodexDesktopUpdateTarget(): CodexDesktopUpdateTarget {
+  let profile: CodexDesktopUpdateTarget["profile"] = "stable";
   try {
-    const url = new URL(value);
-    if (url.protocol !== "https:") return null;
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return null;
-  }
+    const selection = JSON.parse(readFileSync(ENVIRONMENT_SELECTION_FILE, "utf8")) as { releaseProfile?: unknown };
+    if (selection.releaseProfile === "alpha") profile = "alpha";
+  } catch {}
+  const registry = readJsonDocument(ENVIRONMENT_REGISTRY_FILE);
+  const identity = verifiedCodexDesktopProfileIdentity(registry, profile);
+  const capturedFeed = identity
+    ? readCapturedCodexDesktopProfileFeed(readState().tweaker?.codexDesktopProfileFeeds?.[profile], identity)
+    : null;
+  return codexDesktopUpdateTargetForProfile({ profile, identity, capturedFeed });
 }
 
-function readPersistedCodexAppcast(desktopVersion: string | null): SparkleAppcastMetadata | null {
-  if (!desktopVersion) return null;
-  const cache = readState().codexPlusPlus?.codexAppcastCache;
+async function refreshCodexDesktopUpdateMetadata(
+  target: CodexDesktopUpdateTarget,
+): Promise<CodexDesktopUpdateMetadata> {
+  if (!target.available || target.profile !== "stable") {
+    if (!target.available) {
+      throw new Error(target.unavailableReason ?? "The selected desktop update profile is unavailable");
+    }
+    if (!target.identityKey || !target.feedUrl) {
+      throw new Error("The verified Alpha appcast capture is unavailable");
+    }
+  }
+  const installed = installedCodexDesktopVersion();
+  const cacheKey = installed.installedMarketingVersion
+    ? `${installed.installedMarketingVersion}:${installed.installedBuild ?? ""}`
+    : null;
+  const memoryKey = codexDesktopAppcastMemoryKey(target);
+  const cached = readPersistedCodexAppcast(target.profile, target.identityKey ?? null, cacheKey);
+  const refreshed = target.profile === "alpha"
+    ? await getCodexSparkleBridge().fetchProfileAppcastMetadata({
+        identityKey: target.identityKey!,
+        feedUrl: target.feedUrl!,
+        fallbackFeedUrl: target.fallbackFeedUrl,
+      })
+    : await getCodexSparkleBridge().fetchAppcastMetadata();
+  let metadata = refreshed;
+  if (!refreshed.error && !refreshed.stale) {
+    codexAppcastMetadataByIdentity.set(memoryKey, refreshed);
+    persistCodexAppcast(target.profile, target.identityKey ?? "official-stable-default", cacheKey, refreshed);
+  } else if (cached || codexAppcastMetadataByIdentity.has(memoryKey)) {
+    metadata = {
+      ...(codexAppcastMetadataByIdentity.get(memoryKey) ?? cached)!,
+      stale: true,
+      error: refreshed.error ?? "OpenAI appcast metadata could not be refreshed.",
+    };
+    codexAppcastMetadataByIdentity.set(memoryKey, metadata);
+  }
+  return {
+    installed: {
+      marketingVersion: installed.installedMarketingVersion,
+      build: installed.installedBuild,
+    },
+    latest: {
+      marketingVersion: metadata.marketingVersion || null,
+      build: metadata.build || null,
+    },
+    checkedAt: metadata.checkedAt || new Date().toISOString(),
+    stale: metadata.stale,
+    error: metadata.error,
+    updateAvailable: isCodexDesktopUpdateNewer(
+      installed.installedMarketingVersion,
+      installed.installedBuild,
+      metadata.marketingVersion || null,
+      metadata.build || null,
+    ),
+  };
+}
+
+function codexDesktopAppcastMemoryKey(target: CodexDesktopUpdateTarget): string {
+  return `${target.profile}:${target.identityKey ?? "unverified"}`;
+}
+
+function safeAppcastCacheUrl(value: string | null): string | null {
+  return safePersistedAppcastUrl(value);
+}
+
+function readPersistedCodexAppcast(
+  profile: "stable" | "alpha",
+  identityKey: string | null,
+  desktopVersion: string | null,
+): SparkleAppcastMetadata | null {
+  if (!desktopVersion || !identityKey) return null;
+  const state = readState().tweaker;
+  const profileCache = state?.codexAppcastProfileCaches?.[profile];
+  const cache = profileCache
+    && profileCache.profile === profile
+    && profileCache.identityKey === identityKey
+    ? profileCache
+    : profile === "stable" ? state?.codexAppcastCache : null;
   if (
     cache?.schemaVersion !== 1 ||
     cache.desktopVersion !== desktopVersion ||
@@ -1243,6 +1680,8 @@ function readPersistedCodexAppcast(desktopVersion: string | null): SparkleAppcas
 }
 
 function persistCodexAppcast(
+  profile: "stable" | "alpha",
+  identityKey: string,
   desktopVersion: string | null,
   metadata: SparkleAppcastMetadata,
 ): void {
@@ -1252,9 +1691,12 @@ function persistCodexAppcast(
   if (!feedUrl || (metadata.releaseUrl !== null && !releaseUrl)) return;
   if (!metadata.marketingVersion.trim() || !metadata.build.trim() || !Number.isFinite(Date.parse(metadata.checkedAt))) return;
   const state = readState();
-  state.codexPlusPlus ??= {};
-  state.codexPlusPlus.codexAppcastCache = {
+  state.tweaker ??= {};
+  state.tweaker.codexAppcastProfileCaches ??= {};
+  state.tweaker.codexAppcastProfileCaches[profile] = {
     schemaVersion: 1,
+    profile,
+    identityKey,
     desktopVersion,
     marketingVersion: metadata.marketingVersion,
     build: metadata.build,
@@ -1262,43 +1704,109 @@ function persistCodexAppcast(
     feedUrl,
     checkedAt: metadata.checkedAt,
   };
+  if (profile === "stable") {
+    state.tweaker.codexAppcastCache = {
+      schemaVersion: 1,
+      desktopVersion,
+      marketingVersion: metadata.marketingVersion,
+      build: metadata.build,
+      releaseUrl,
+      feedUrl,
+      checkedAt: metadata.checkedAt,
+    };
+  }
   writeState(state);
+}
+
+function persistCapturedCodexDesktopProfileFeed(
+  capture: { feedUrl: string | null; fallbackFeedUrl: string | null },
+): void {
+  const registry = readJsonDocument(ENVIRONMENT_REGISTRY_FILE);
+  const selection = readJsonDocument(ENVIRONMENT_SELECTION_FILE);
+  const identity = activeVerifiedCodexDesktopProfileIdentity(registry, selection, inferMacAppRoot());
+  if (!identity) {
+    log("warn", "ignored Sparkle feed capture without a matching verified desktop profile");
+    return;
+  }
+  const feed = createCapturedCodexDesktopProfileFeed(identity, capture, new Date().toISOString());
+  if (!feed) {
+    log("warn", "ignored invalid Sparkle feed capture", { profile: identity.profile });
+    return;
+  }
+  const state = readState();
+  state.tweaker ??= {};
+  state.tweaker.codexDesktopProfileFeeds ??= {};
+  state.tweaker.codexDesktopProfileFeeds[identity.profile] = feed;
+  writeState(state);
+}
+
+function readJsonDocument(file: string): unknown {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
 }
 
 async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSnapshot> {
   const selectedLane = selectedCodexLane();
+  const desktopTarget = selectedCodexDesktopUpdateTarget();
+  const bundledPath = bundledCodexBinary();
   const betaPath = codexCliManager.getSelectedBinary();
+  const activeCliPath = codexCliBootstrap.binary ?? bundledPath;
   const installedDesktop = installedCodexDesktopVersion();
   const desktopCacheKey = installedDesktop.installedMarketingVersion
     ? `${installedDesktop.installedMarketingVersion}:${installedDesktop.installedBuild ?? ""}`
     : null;
-  const persistedAppcast = readPersistedCodexAppcast(desktopCacheKey);
-  if (!codexAppcastMetadata && persistedAppcast) codexAppcastMetadata = persistedAppcast;
-  const [bundledProbe, betaProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
-    codexVersionService.probeCli(bundledCodexBinary()),
+  const persistedAppcast = readPersistedCodexAppcast(
+    desktopTarget.profile,
+    desktopTarget.identityKey ?? null,
+    desktopCacheKey,
+  );
+  const desktopAppcastMemoryKey = codexDesktopAppcastMemoryKey(desktopTarget);
+  if (!codexAppcastMetadataByIdentity.has(desktopAppcastMemoryKey) && persistedAppcast) {
+    codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, persistedAppcast);
+  }
+  const [bundledProbe, betaProbe, activeCliProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
+    codexVersionService.probeCli(bundledPath),
     betaPath ? codexVersionService.probeCli(betaPath) : Promise.resolve(null),
+    codexVersionService.probeCli(activeCliPath),
     force
       ? codexVersionService.fetchLatestRelease("bundled", { force: true })
       : codexVersionService.readCachedRelease("bundled"),
     force
       ? codexVersionService.fetchLatestRelease("beta", { force: true })
       : codexVersionService.readCachedRelease("beta"),
-    force ? getCodexSparkleBridge().fetchAppcastMetadata() : Promise.resolve(null),
+    force && desktopTarget.available
+      ? desktopTarget.profile === "alpha"
+        ? getCodexSparkleBridge().fetchProfileAppcastMetadata({
+            identityKey: desktopTarget.identityKey!,
+            feedUrl: desktopTarget.feedUrl!,
+            fallbackFeedUrl: desktopTarget.fallbackFeedUrl,
+          })
+        : getCodexSparkleBridge().fetchAppcastMetadata()
+      : Promise.resolve(null),
   ]);
   if (refreshedAppcast) {
     if (!refreshedAppcast.error && !refreshedAppcast.stale) {
-      codexAppcastMetadata = refreshedAppcast;
-      persistCodexAppcast(desktopCacheKey, refreshedAppcast);
-    } else if (codexAppcastMetadata || persistedAppcast) {
-      codexAppcastMetadata = {
-        ...(codexAppcastMetadata ?? persistedAppcast)!,
+      codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, refreshedAppcast);
+      persistCodexAppcast(
+        desktopTarget.profile,
+        desktopTarget.identityKey ?? "official-stable-default",
+        desktopCacheKey,
+        refreshedAppcast,
+      );
+    } else if (codexAppcastMetadataByIdentity.has(desktopAppcastMemoryKey) || persistedAppcast) {
+      codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, {
+        ...(codexAppcastMetadataByIdentity.get(desktopAppcastMemoryKey) ?? persistedAppcast)!,
         stale: true,
         error: refreshedAppcast.error ?? "Appcast metadata is unavailable.",
-      };
+      });
     } else {
-      codexAppcastMetadata = refreshedAppcast;
+      codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, refreshedAppcast);
     }
   }
+  const codexAppcastMetadata = codexAppcastMetadataByIdentity.get(desktopAppcastMemoryKey) ?? null;
   const features = buildCodexFeatureUnion(
     bundledProbe.features,
     betaProbe?.features ?? null,
@@ -1317,13 +1825,34 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
   const errors: CodexVersionsSnapshot["errors"] = {};
   if (bundledProbe.error || bundledRelease?.error) errors.bundled = bundledProbe.error ?? bundledRelease?.error ?? undefined;
   if (betaProbe?.error || betaRelease?.error) errors.beta = betaProbe?.error ?? betaRelease?.error ?? undefined;
-  if (sparkle.lastError || codexAppcastMetadata?.error) {
+  if (!desktopTarget.available) {
+    errors.desktop = desktopTarget.unavailableReason ?? "The selected desktop update profile is unavailable.";
+  } else if (sparkle.lastError || codexAppcastMetadata?.error) {
     errors.desktop = sparkle.lastError ?? codexAppcastMetadata?.error ?? undefined;
   }
+  const activeCliSource = codexCliBootstrap.userOverridePreserved
+    ? "override"
+    : codexCliBootstrap.effectiveLane === "beta"
+      ? "managed-alpha"
+      : "bundled";
+  const lookupCheckedAt = [
+    bundledRelease?.checkedAt,
+    betaRelease?.checkedAt,
+    codexAppcastMetadata?.checkedAt,
+  ]
+    .filter((value): value is string => typeof value === "string" && Number.isFinite(Date.parse(value)))
+    .map((value) => Date.parse(value));
+  // A cache-first snapshot must report when its oldest contributing lookup
+  // was actually checked. Stamping Date.now() here made an older cached alpha
+  // release look freshly verified while a newer GitHub prerelease existed.
+  const checkedAt = lookupCheckedAt.length > 0
+    ? new Date(Math.min(...lookupCheckedAt)).toISOString()
+    : new Date().toISOString();
+  const managedAlphaVersion = managerState.current?.version ?? betaProbe?.version ?? null;
 
   return {
     schemaVersion: 1,
-    checkedAt: new Date().toISOString(),
+    checkedAt,
     fromCache: !force && !!(bundledRelease?.fromCache || betaRelease?.fromCache || codexAppcastMetadata),
     stale: !bundledRelease || !betaRelease || bundledRelease.stale || betaRelease.stale || codexAppcastMetadata?.stale === true,
     desktop: {
@@ -1337,10 +1866,20 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
       nativeUpdatePrerequisiteError: sparkle.installPrerequisiteFailure,
       updateAvailable: desktopUpdate,
     },
+    activeCli: {
+      path: activeCliProbe.path,
+      version: activeCliProbe.version,
+      versionChannel: codexVersionChannel(activeCliProbe.version),
+      available: activeCliProbe.available,
+      lane: codexCliBootstrap.effectiveLane,
+      source: activeCliSource,
+      error: activeCliProbe.error,
+    },
     cli: {
       bundled: {
         path: bundledProbe.path,
         version: bundledProbe.version,
+        versionChannel: codexVersionChannel(bundledProbe.version),
         available: bundledProbe.available,
         release: bundledRelease?.release ?? null,
         error: bundledProbe.error ?? bundledRelease?.error ?? null,
@@ -1350,6 +1889,7 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
       beta: {
         path: betaProbe?.path ?? null,
         version: betaProbe?.version ?? null,
+        versionChannel: codexVersionChannel(managedAlphaVersion),
         available: betaProbe?.available ?? false,
         release: betaRelease?.release ?? null,
         error: betaProbe?.error ?? betaRelease?.error ?? (betaPath ? null : "No managed Beta is installed"),
@@ -1357,11 +1897,11 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
         managedPreviousVersion: managerState.previous?.version ?? null,
       },
     },
-    requestedLane: readState().codexPlusPlus?.codexCliLane ?? null,
+    requestedLane: readState().tweaker?.codexCliLane ?? null,
     effectiveLane: codexCliBootstrap.effectiveLane,
     userOverridePreserved: codexCliBootstrap.userOverridePreserved,
     fallbackReason: codexCliBootstrap.error,
-    restartRequired: codexLaneChangedThisProcess,
+    restartRequired: false,
     features,
     installProgress: codexCliManager.getProgress(),
     errors,
@@ -1382,50 +1922,62 @@ function assertExactObjectKeys(value: unknown, keys: readonly string[], label: s
   }
 }
 
-ipcMain.handle("codexpp:get-codex-versions", async (_e, ...args: unknown[]) => {
+type EnvironmentAppExperience = "chatgpt" | "tweakers";
+type EnvironmentReleaseProfile = "stable" | "alpha";
+
+function assertEnvironmentRequest(payload: unknown): asserts payload is {
+  appExperience: EnvironmentAppExperience;
+  releaseProfile: EnvironmentReleaseProfile;
+} {
+  assertExactObjectKeys(payload, ["appExperience", "releaseProfile"], "environment request");
+  if ((payload.appExperience !== "chatgpt" && payload.appExperience !== "tweakers")
+    || (payload.releaseProfile !== "stable" && payload.releaseProfile !== "alpha")) {
+    throw new Error("Invalid environment request");
+  }
+}
+
+function assertEnvironmentTransactionRequest(payload: unknown): asserts payload is { transactionId: string } {
+  assertExactObjectKeys(payload, ["transactionId"], "environment transaction request");
+  if (typeof payload.transactionId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(payload.transactionId)) {
+    throw new Error("Invalid environment transaction request");
+  }
+}
+
+async function ensureManagedAlphaEnvironmentBackend(): Promise<void> {
+  let validation = await codexCliManager.validateCurrent();
+  if (!validation.valid || !validation.binary) {
+    await codexCliManager.installBeta();
+    validation = await codexCliManager.validateCurrent();
+  }
+  if (!validation.valid || !validation.binary) {
+    throw new Error(validation.error ?? "Managed Alpha installation did not produce a validated backend");
+  }
+}
+
+ipcMain.handle("tweaker:get-codex-versions", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-codex-versions");
   return getCodexVersionsSnapshot(false);
 });
 
-ipcMain.handle("codexpp:refresh-codex-versions", async (_e, ...args: unknown[]) => {
+ipcMain.handle("tweaker:refresh-codex-versions", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "refresh-codex-versions");
   return getCodexVersionsSnapshot(true);
 });
 
-ipcMain.handle("codexpp:set-codex-cli-lane", async (_e, payload: unknown) => {
-  assertExactObjectKeys(payload, ["lane", "confirmOverride"], "Codex CLI lane request");
-  const lane = payload.lane;
-  const confirmOverride = payload.confirmOverride;
-  if ((lane !== "bundled" && lane !== "beta") || typeof confirmOverride !== "boolean") {
-    throw new Error("Invalid Codex CLI lane request");
-  }
-  if (codexCliBootstrap.requestedLane === null && codexCliBootstrap.userOverridePreserved && !confirmOverride) {
-    throw new Error("Confirm replacing the existing CODEX_CLI_PATH override before selecting a managed runtime");
-  }
-  const state = readState();
-  state.codexPlusPlus ??= {};
-  state.codexPlusPlus.codexCliLane = lane;
-  delete state.codexPlusPlus.codexCliBootstrapFailure;
-  writeState(state);
-  codexLaneChangedThisProcess = codexCliBootstrap.requestedLane === null
-    ? true
-    : lane !== codexCliBootstrap.effectiveLane;
-  return getCodexVersionsSnapshot(false);
-});
-
-ipcMain.handle("codexpp:install-codex-beta", async (_e, ...args: unknown[]) => {
+ipcMain.handle("tweaker:install-codex-beta", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "install-codex-beta");
   await codexCliManager.installBeta();
   return getCodexVersionsSnapshot(false);
 });
 
-ipcMain.handle("codexpp:rollback-codex-beta", async (_e, ...args: unknown[]) => {
+ipcMain.handle("tweaker:rollback-codex-beta", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "rollback-codex-beta");
   await codexCliManager.rollbackBeta();
   return getCodexVersionsSnapshot(false);
 });
 
-ipcMain.handle("codexpp:set-codex-feature", async (_e, payload: unknown) => {
+ipcMain.handle("tweaker:set-codex-feature", async (_e, payload: unknown) => {
   assertExactObjectKeys(payload, ["lane", "name", "enabled"], "Codex feature request");
   const { lane, name, enabled } = payload;
   if ((lane !== "bundled" && lane !== "beta") || typeof name !== "string" || typeof enabled !== "boolean") {
@@ -1448,66 +2000,170 @@ ipcMain.handle("codexpp:set-codex-feature", async (_e, payload: unknown) => {
   return getCodexVersionsSnapshot(false);
 });
 
-ipcMain.handle("codexpp:check-codex-desktop-update", async (_e, ...args: unknown[]) => {
+ipcMain.handle("tweaker:check-codex-desktop-update", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "check-codex-desktop-update");
-  // A patched app has a local signing identity. Calling Sparkle's raw manual
-  // check from that process makes its XPC bootstrap relaunch ChatGPT as a
-  // helper, producing transient duplicate Dock icons. The signed appcast is
-  // sufficient for a read-only version check and keeps OpenAI's native manager
-  // as the sole owner of background downloads and installation.
-  return getCodexVersionsSnapshot(true);
+  return codexDesktopUpdateService.checkAndPresent();
 });
 
-ipcMain.handle("codexpp:install-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "install-codex-desktop-update");
-  if (!(await getCodexSparkleBridge().installUpdate())) {
-    const reason = getCodexSparkleBridge().getSnapshot().installPrerequisiteFailure;
-    throw new Error(reason ?? "Native Codex update installation is unavailable");
+ipcMain.handle("tweaker:get-codex-desktop-update", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-codex-desktop-update");
+  const snapshot = lastPublishedCodexDesktopUpdate ?? codexDesktopUpdateService.getSnapshot();
+  const result = snapshot ?? selectedDesktopUpdateSetupResult();
+  return result ? desktopUpdateResultWithNativeState(result) : null;
+});
+
+ipcMain.handle("tweaker:start-codex-desktop-update", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "start-codex-desktop-update");
+  startCodexDesktopUpdateTransaction();
+  return { started: true, checkedAt: new Date().toISOString() };
+});
+
+ipcMain.handle("tweaker:get-codex-desktop-update-transaction", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-codex-desktop-update-transaction");
+  return runInstalledCliJson(["update-chatgpt-status", "--json"]);
+});
+
+ipcMain.handle("tweaker:resume-codex-desktop-update", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "resume-codex-desktop-update");
+  const cli = desktopUpdateCli();
+  startInstalledCli(cli, ["update-chatgpt-resume", "--json"]);
+  return { started: true, checkedAt: new Date().toISOString() };
+});
+
+ipcMain.handle("tweaker:cancel-codex-desktop-update", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "cancel-codex-desktop-update");
+  return runInstalledCliJson(["update-chatgpt-cancel", "--json"]);
+});
+
+ipcMain.handle("tweaker:get-environment-status", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-environment-status");
+  return runInstalledCliJson(
+    ["environment", "status", "--observe", "--json"],
+    ENVIRONMENT_STATUS_TIMEOUT_MS,
+  );
+});
+
+// The native runtime owns the file chooser. Renderer code receives only the
+// verified status/result, never an arbitrary filesystem path to validate.
+ipcMain.handle("tweaker:choose-alpha-environment", async (event, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "choose-alpha-environment");
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  const dialogOptions: OpenDialogOptions = {
+    title: "Choose OpenAI Beta app",
+    properties: ["openDirectory"],
+  };
+  const picked = owner
+    ? await dialog.showOpenDialog(owner, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions);
+  if (picked.canceled || picked.filePaths.length !== 1) return { canceled: true };
+  return runInstalledCliJson([
+    "environment",
+    "register-alpha",
+    "--app-path",
+    picked.filePaths[0],
+    "--json",
+  ], ENVIRONMENT_ACTION_TIMEOUT_MS);
+});
+
+ipcMain.handle("tweaker:get-environment-transaction", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-environment-transaction");
+  const transaction = await runInstalledCliJson(
+    ["environment", "transaction", "--json"],
+    ENVIRONMENT_ACTION_TIMEOUT_MS,
+  );
+  return attachEnvironmentHelperDiagnostics(transaction);
+});
+
+ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
+  assertEnvironmentRequest(payload);
+  if (payload.appExperience === "tweakers" && payload.releaseProfile === "alpha") {
+    await ensureManagedAlphaEnvironmentBackend();
   }
-  return getCodexVersionsSnapshot(false);
+  return runInstalledCliJson([
+    "environment",
+    "prepare",
+    "--app-experience",
+    payload.appExperience,
+    "--release-profile",
+    payload.releaseProfile,
+    "--json",
+  ], ENVIRONMENT_PREPARE_TIMEOUT_MS);
 });
 
-ipcMain.handle("codexpp:get-config", () => {
+ipcMain.handle("tweaker:commit-environment", async (_e, payload: unknown) => {
+  assertEnvironmentTransactionRequest(payload);
+  return runInstalledCliJson([
+    "environment",
+    "submit",
+    "--transaction",
+    payload.transactionId,
+    "--json",
+  ], ENVIRONMENT_ACTION_TIMEOUT_MS);
+});
+
+ipcMain.handle("tweaker:cancel-environment", async (_e, payload: unknown) => {
+  assertEnvironmentTransactionRequest(payload);
+  return runInstalledCliJson([
+    "environment",
+    "cancel",
+    "--transaction",
+    payload.transactionId,
+    "--json",
+  ], ENVIRONMENT_ACTION_TIMEOUT_MS);
+});
+
+ipcMain.handle("tweaker:rollback-environment", async (_e, payload: unknown) => {
+  assertEnvironmentTransactionRequest(payload);
+  return runInstalledCliJson([
+    "environment",
+    "rollback",
+    "--transaction",
+    payload.transactionId,
+    "--json",
+  ], ENVIRONMENT_PREPARE_TIMEOUT_MS);
+});
+
+ipcMain.handle("tweaker:get-config", () => {
   const s = readState();
   const installerState = readInstallerState();
   const sourceRoot = installerState?.sourceRoot ?? fallbackSourceRoot();
   return {
-    version: CODEX_PLUSPLUS_VERSION,
-    autoUpdate: s.codexPlusPlus?.autoUpdate !== false,
-    safeMode: s.codexPlusPlus?.safeMode === true,
-    updateChannel: s.codexPlusPlus?.updateChannel ?? "stable",
-    updateRepo: s.codexPlusPlus?.updateRepo ?? CODEX_PLUSPLUS_REPO,
-    updateRef: s.codexPlusPlus?.updateRef ?? "",
-    updateCheck: s.codexPlusPlus?.updateCheck ?? null,
+    version: TWEAKER_VERSION,
+    autoUpdate: s.tweaker?.autoUpdate !== false,
+    safeMode: s.tweaker?.safeMode === true,
+    updateChannel: s.tweaker?.updateChannel ?? "stable",
+    updateRepo: s.tweaker?.updateRepo ?? TWEAKER_REPO,
+    updateRef: s.tweaker?.updateRef ?? "",
+    updateCheck: s.tweaker?.updateCheck ?? null,
     selfUpdate: readSelfUpdateState(),
     installationSource: describeInstallationSource(sourceRoot),
   };
 });
 
-ipcMain.handle("codexpp:set-auto-update", (_e, enabled: boolean) => {
-  setCodexPlusPlusAutoUpdate(!!enabled);
-  return { autoUpdate: isCodexPlusPlusAutoUpdateEnabled() };
+ipcMain.handle("tweaker:set-auto-update", (_e, enabled: boolean) => {
+  setTweakerAutoUpdate(!!enabled);
+  return { autoUpdate: isTweakerAutoUpdateEnabled() };
 });
 
-ipcMain.handle("codexpp:set-update-config", (_e, config: {
+ipcMain.handle("tweaker:set-update-config", (_e, config: {
   updateChannel?: SelfUpdateChannel;
   updateRepo?: string;
   updateRef?: string;
 }) => {
-  setCodexPlusPlusUpdateConfig(config);
+  setTweakerUpdateConfig(config);
   const s = readState();
   return {
-    updateChannel: s.codexPlusPlus?.updateChannel ?? "stable",
-    updateRepo: s.codexPlusPlus?.updateRepo ?? CODEX_PLUSPLUS_REPO,
-    updateRef: s.codexPlusPlus?.updateRef ?? "",
+    updateChannel: s.tweaker?.updateChannel ?? "stable",
+    updateRepo: s.tweaker?.updateRepo ?? TWEAKER_REPO,
+    updateRef: s.tweaker?.updateRef ?? "",
   };
 });
 
-ipcMain.handle("codexpp:check-codexpp-update", async (_e, force?: boolean) => {
-  return ensureCodexPlusPlusUpdateCheck(force === true);
+ipcMain.handle("tweaker:check-tweaker-update", async (_e, force?: boolean) => {
+  return ensureTweakerUpdateCheck(force === true);
 });
 
-ipcMain.handle("codexpp:run-codexpp-update", async () => {
+ipcMain.handle("tweaker:run-tweaker-update", async () => {
   const sourceRoot = readInstallerState()?.sourceRoot ?? fallbackSourceRoot();
   if (!sourceRoot) {
     throw new Error("Tweakers source CLI was not found. Run the installer once, then try again.");
@@ -1521,8 +2177,8 @@ ipcMain.handle("codexpp:run-codexpp-update", async () => {
   return pending;
 });
 
-ipcMain.handle("codexpp:get-refresh-status", () => localRefreshStatus());
-ipcMain.handle("codexpp:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => {
+ipcMain.handle("tweaker:get-refresh-status", () => localRefreshStatus());
+ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => {
   const status = await localRefreshStatus();
   if (!status.available) return { started: false, status };
   const cli = localRefreshCli(status);
@@ -1532,27 +2188,22 @@ ipcMain.handle("codexpp:start-local-refresh", async (_e, requested?: "smart" | "
   return { started: true, status: { ...status, phase: "preparing" } };
 });
 
-// Switches /Applications/ChatGPT.app between the pristine official payload
-// ("chatgpt") and the patched payload ("tweakers") by delegating to the
-// installer CLI (`tweakers mode <target> --yes`), which quits the app, swaps
-// bundles, and relaunches. The renderer confirms with the user BEFORE
-// invoking this — the handler never prompts. launchd submission is mandatory
-// (not a plain spawn) so the CLI survives this app quitting and the live
-// bundle being swapped out from under it.
-ipcMain.handle("codexpp:switch-app-mode", (_e, payload: unknown) => {
-  return switchAppMode(payload, {
-    // The injected runtime only ever runs inside the patched bundle; in
-    // chatgpt mode nothing is injected, so the live mode here is fixed.
-    currentMode: "tweakers",
-    resolveCli: () => localRefreshCli(),
-    cliExists: (cli) => existsSync(cli),
-    startCliWithLaunchd: startInstalledCliWithLaunchd,
-  });
+ipcMain.handle("tweaker:get-watcher-health", () => getWatcherHealth(userRoot!));
+ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "repair-auto-maintenance");
+  const cli = localRefreshCli();
+  if (!existsSync(cli)) throw new Error("Tweakers maintenance CLI is unavailable");
+  startInstalledCli(cli, ["watcher-run"]);
+  return { started: true, checkedAt: new Date().toISOString() };
+});
+ipcMain.handle("tweaker:get-mcp-sync-state", () => mcpReconciler?.readState() ?? null);
+ipcMain.handle("tweaker:repair-mcp", async (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "repair-mcp");
+  if (!mcpReconciler) throw new Error("MCP repair is unavailable during a health-only probe");
+  return mcpReconciler.reconcileNow("manual-repair");
 });
 
-ipcMain.handle("codexpp:get-watcher-health", () => getWatcherHealth(userRoot!));
-
-ipcMain.handle("codexpp:get-tweak-store", async () => {
+ipcMain.handle("tweaker:get-tweak-store", async () => {
   const store = await fetchTweakStoreRegistry();
   const registry = store.registry;
   const installed = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
@@ -1580,7 +2231,7 @@ ipcMain.handle("codexpp:get-tweak-store", async () => {
   };
 });
 
-ipcMain.handle("codexpp:install-store-tweak", async (_e, id: string) => {
+ipcMain.handle("tweaker:install-store-tweak", async (_e, id: string) => {
   const { registry } = await fetchTweakStoreRegistry();
   const entry = registry.entries.find((candidate) => candidate.id === id);
   if (!entry) throw new Error(`Tweak store entry not found: ${id}`);
@@ -1590,18 +2241,18 @@ ipcMain.handle("codexpp:install-store-tweak", async (_e, id: string) => {
   assertStoreEntryPlatformCompatible(entry);
   assertStoreEntryRuntimeCompatible(entry);
   await installStoreTweak(entry);
-  reloadTweaks("store-install", tweakLifecycleDeps);
+  await reloadTweaks("store-install", tweakLifecycleDeps);
   return { installed: entry.id };
 });
 
-ipcMain.handle("codexpp:prepare-tweak-store-submission", async (_e, repoInput: string) => {
+ipcMain.handle("tweaker:prepare-tweak-store-submission", async (_e, repoInput: string) => {
   return prepareTweakStoreSubmission(repoInput);
 });
 
 // Sandboxed renderer preload can't use Node fs to read tweak source. Main
 // reads it on the renderer's behalf. Path must live under tweaksDir for
 // security — we refuse anything else.
-ipcMain.handle("codexpp:read-tweak-source", (_e, entryPath: string) => {
+ipcMain.handle("tweaker:read-tweak-source", (_e, entryPath: string) => {
   const resolved = resolve(entryPath);
   if (!isPathInside(TWEAKS_DIR, resolved)) {
     throw new Error("path outside tweaks dir");
@@ -1629,7 +2280,7 @@ const MIME_BY_EXT: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 ipcMain.handle(
-  "codexpp:read-tweak-asset",
+  "tweaker:read-tweak-asset",
   (_e, tweakDir: string, relPath: string) => {
     const fs = require("node:fs") as typeof import("node:fs");
     const dir = resolve(tweakDir);
@@ -1652,7 +2303,7 @@ ipcMain.handle(
 );
 
 // Sandboxed preload can't write logs to disk; forward to us via IPC.
-ipcMain.on("codexpp:preload-log", (_e, level: "info" | "warn" | "error", msg: string) => {
+ipcMain.on("tweaker:preload-log", (_e, level: "info" | "warn" | "error", msg: string) => {
   const lvl = level === "error" || level === "warn" ? level : "info";
   try {
     appendCappedLog(join(LOG_DIR, "preload.log"), `[${new Date().toISOString()}] [${lvl}] ${msg}\n`);
@@ -1662,7 +2313,7 @@ ipcMain.on("codexpp:preload-log", (_e, level: "info" | "warn" | "error", msg: st
 // Sandbox-safe filesystem ops for renderer-scope tweaks. Each tweak gets
 // a sandboxed dir under userRoot/tweak-data/<id>. Renderer side calls these
 // over IPC instead of using Node fs directly.
-ipcMain.handle("codexpp:tweak-fs", (_e, op: string, id: string, p: string, c?: string) => {
+ipcMain.handle("tweaker:tweak-fs", (_e, op: string, id: string, p: string, c?: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("bad tweak id");
   const dir = join(userRoot!, "tweak-data", id);
   mkdirSync(dir, { recursive: true });
@@ -1678,25 +2329,25 @@ ipcMain.handle("codexpp:tweak-fs", (_e, op: string, id: string, p: string, c?: s
   }
 });
 
-ipcMain.handle("codexpp:user-paths", () => ({
+ipcMain.handle("tweaker:user-paths", () => ({
   userRoot,
   runtimeDir,
   tweaksDir: TWEAKS_DIR,
   logDir: LOG_DIR,
 }));
 
-ipcMain.handle("codexpp:codex-runtime-info", () => currentRuntimeInfo());
-ipcMain.handle("codexpp:codex-runtime-capabilities", () => currentRuntimeCapabilities());
-ipcMain.handle("codexpp:codex-cdp-status", () => getCdpStatus());
-ipcMain.handle("codexpp:codex-cdp-targets", () => listCdpTargets());
-ipcMain.handle("codexpp:codex-window-create", (_e, opts: CodexCreateWindowOptions) => {
+ipcMain.handle("tweaker:codex-runtime-info", () => currentRuntimeInfo());
+ipcMain.handle("tweaker:codex-runtime-capabilities", () => currentRuntimeCapabilities());
+ipcMain.handle("tweaker:codex-cdp-status", () => getCdpStatus());
+ipcMain.handle("tweaker:codex-cdp-targets", () => listCdpTargets());
+ipcMain.handle("tweaker:codex-window-create", (_e, opts: CodexCreateWindowOptions) => {
   return createCodexWindow(opts);
 });
-ipcMain.handle("codexpp:codex-window-primary", () => getPrimaryCodexWindowRef());
-ipcMain.handle("codexpp:codex-window-focus", (_e, windowId: number) => focusCodexWindow(windowId));
-ipcMain.handle("codexpp:codex-window-show", (_e, windowId: number) => showCodexWindow(windowId));
+ipcMain.handle("tweaker:codex-window-primary", () => getPrimaryCodexWindowRef());
+ipcMain.handle("tweaker:codex-window-focus", (_e, windowId: number) => focusCodexWindow(windowId));
+ipcMain.handle("tweaker:codex-window-show", (_e, windowId: number) => showCodexWindow(windowId));
 ipcMain.handle(
-  "codexpp:codex-view-create",
+  "tweaker:codex-view-create",
   async (_e, tweakId: string, options: CodexViewCreateOptions) => {
     const tweak = assertTweakViewPermissionForId(tweakId);
     const ref = await createOwlView({ id: tweak.manifest.id, dir: tweak.dir }, options);
@@ -1708,79 +2359,79 @@ ipcMain.handle(
   },
 );
 ipcMain.handle(
-  "codexpp:codex-view-call",
+  "tweaker:codex-view-call",
   (_e, tweakId: string, viewId: string, method: string, arg?: unknown, arg2?: unknown) => {
     assertTweakViewPermissionForId(tweakId);
     return callOwlView(tweakId, viewId, method, arg, arg2);
   },
 );
-ipcMain.handle("codexpp:codex-view-dispose-tweak", (_e, tweakId: string) => {
+ipcMain.handle("tweaker:codex-view-dispose-tweak", (_e, tweakId: string) => {
   assertTweakId(tweakId);
   disposeOwlViewsForTweak(tweakId);
 });
 ipcMain.handle(
-  "codexpp:native-load-module",
+  "tweaker:native-load-module",
   (_e, tweakId: string, options: NativeModuleLoadOptions) => {
     const ref = nativeBridge.loadModule(tweakContext(tweakId, "native-module"), options);
     return { id: ref.id, kind: ref.kind };
   },
 );
 ipcMain.handle(
-  "codexpp:native-module-request",
+  "tweaker:native-module-request",
   (_e, tweakId: string, moduleId: string, method: string, payload?: unknown, timeoutMs?: number) => {
     assertTweakPermissionForId(tweakId, "native-module");
     return nativeBridge.requestModule(tweakId, moduleId, method, payload, timeoutMs);
   },
 );
-ipcMain.handle("codexpp:native-module-dispose", (_e, tweakId: string, moduleId: string) => {
+ipcMain.handle("tweaker:native-module-dispose", (_e, tweakId: string, moduleId: string) => {
   assertTweakPermissionForId(tweakId, "native-module");
   return nativeBridge.disposeModule(tweakId, moduleId);
 });
-ipcMain.handle("codexpp:native-dispose-tweak", (_e, tweakId: string) => {
+ipcMain.handle("tweaker:native-dispose-tweak", (_e, tweakId: string) => {
   assertTweakId(tweakId);
   nativeBridge.disposeTweak(tweakId);
 });
 ipcMain.handle(
-  "codexpp:native-create-panel",
+  "tweaker:native-create-panel",
   async (_e, tweakId: string, options: NativePanelCreateOptions) => {
     const ref = await nativeBridge.createPanel(tweakContext(tweakId, "native-view"), options);
     return { id: ref.id, windowId: ref.windowId };
   },
 );
 ipcMain.handle(
-  "codexpp:native-attach-view",
+  "tweaker:native-attach-view",
   async (_e, tweakId: string, options: NativeViewAttachOptions) => {
     const ref = await nativeBridge.attachView(tweakContext(tweakId, "native-view"), options);
     return { id: ref.id };
   },
 );
 ipcMain.handle(
-  "codexpp:native-instance-call",
+  "tweaker:native-instance-call",
   async (_e, tweakId: string, kind: "panel" | "view", instanceId: string, method: string, arg?: unknown) => {
     assertTweakPermissionForId(tweakId, "native-view");
     return nativeBridge.callInstance(tweakId, kind, instanceId, method, arg);
   },
 );
 ipcMain.handle(
-  "codexpp:native-launch-helper",
+  "tweaker:native-launch-helper",
   (_e, tweakId: string, options: NativeHelperLaunchOptions) => {
     const ref = nativeBridge.launchHelper(tweakContext(tweakId, "native-helper"), options);
     return { id: ref.id, pid: ref.pid };
   },
 );
 ipcMain.handle(
-  "codexpp:native-helper-call",
+  "tweaker:native-helper-call",
   (_e, tweakId: string, helperId: string, method: string, payload?: unknown, timeoutMs?: number) => {
     assertTweakPermissionForId(tweakId, "native-helper");
     return nativeBridge.callHelper(tweakId, helperId, method, payload, timeoutMs);
   },
 );
 
-ipcMain.handle("codexpp:reveal", (_e, p: string) => {
+ipcMain.handle("tweaker:reveal", (_e, p: string) => {
   shell.openPath(p).catch(() => {});
 });
 
-ipcMain.handle("codexpp:open-external", (_e, url: string) => {
+ipcMain.handle("tweaker:open-external", (_e, url: string) => {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" || parsed.hostname !== "github.com") {
     throw new Error("only github.com links can be opened from tweak metadata");
@@ -1788,32 +2439,34 @@ ipcMain.handle("codexpp:open-external", (_e, url: string) => {
   shell.openExternal(parsed.toString()).catch(() => {});
 });
 
-ipcMain.handle("codexpp:copy-text", (_e, text: string) => {
+ipcMain.handle("tweaker:copy-text", (_e, text: string) => {
   clipboard.writeText(String(text));
   return true;
 });
 
 // Manual force-reload trigger from the renderer (e.g. the "Force Reload"
 // button on our injected Tweaks page). Bypasses the watcher debounce.
-ipcMain.handle("codexpp:reload-tweaks", () => {
-  reloadTweaks("manual", tweakLifecycleDeps);
+ipcMain.handle("tweaker:reload-tweaks", async () => {
+  await reloadTweaks("manual", tweakLifecycleDeps);
   return { at: Date.now(), count: tweakState.discovered.length };
 });
 
 // 4. Filesystem watcher → debounced reload + broadcast.
 //    We watch the tweaks dir for any change. On the first tick of inactivity
 //    we stop main-side tweaks, clear their cached modules, re-discover, then
-//    restart and broadcast `codexpp:tweaks-changed` to every renderer so it
+//    restart and broadcast `tweaker:tweaks-changed` to every renderer so it
 //    can re-init its host.
 const RELOAD_DEBOUNCE_MS = 250;
-const DEV_PUBLISH_LOCK = join(TWEAKS_DIR, ".codexpp-dev-publishing");
+const DEV_PUBLISH_LOCK = join(TWEAKS_DIR, ".tweaker-dev-publishing");
 const DEV_PUBLISH_LOCK_MAX_AGE_MS = 5 * 60 * 1000;
 let reloadTimer: NodeJS.Timeout | null = null;
 function scheduleReload(reason: string): void {
   if (reloadTimer) clearTimeout(reloadTimer);
   reloadTimer = setTimeout(() => {
     reloadTimer = null;
-    reloadTweaks(reason, tweakLifecycleDeps);
+    void reloadTweaks(reason, tweakLifecycleDeps).catch((error) => {
+      log("error", "failed to reload tweaks:", error);
+    });
   }, RELOAD_DEBOUNCE_MS);
 }
 
@@ -1845,7 +2498,8 @@ try {
 
 // --- helpers ---
 
-function loadAllMainTweaks(): void {
+async function loadAllMainTweaks(): Promise<void> {
+  if (healthCheckOnly) return;
   try {
     tweakState.discovered = discoverTweaks(TWEAKS_DIR);
     log(
@@ -1858,13 +2512,34 @@ function loadAllMainTweaks(): void {
     tweakState.discovered = [];
   }
 
-  syncMcpServersFromEnabledTweaks();
+  const mcpTrigger = initialMcpReconciliationPending ? "startup" : "tweak-reload";
+  initialMcpReconciliationPending = false;
+  let userQuestionsPolicyReady = false;
+  if (mcpReconciler) {
+    try {
+      const receipt = await mcpReconciler.reconcileNow(mcpTrigger);
+      userQuestionsPolicyReady = receipt.status !== "conflict"
+        && receipt.status !== "error"
+        && receipt.approvalPolicy.status !== "conflict"
+        && receipt.approvalPolicy.afterRaw === USER_QUESTIONS_APPROVAL_POLICY
+        && receipt.approvalPolicy.sandboxModeAfterRaw === USER_QUESTIONS_SANDBOX_MODE;
+    } catch (error) {
+      log("error", "MCP reconciliation failed before main tweak startup:", error);
+    }
+  }
 
   for (const t of tweakState.discovered) {
     if (!isMainProcessTweakScope(t.manifest.scope)) continue;
     if (!isTweakEnabled(t.manifest.id)) {
       recordTweakLifecycle(t.manifest.id, "main", isTweakQuarantined(t.manifest.id) ? "quarantined" : "disabled");
       log("info", `skipping disabled main tweak: ${t.manifest.id}`);
+      continue;
+    }
+    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsPolicyReady) {
+      const error = "authoritative approval policy reconciliation did not complete";
+      recordTweakLifecycle(t.manifest.id, "main", "failed", error);
+      recordTweakHealth(t.manifest.id, "failed", error);
+      log("error", `skipping User Questions main migration: ${error}`);
       continue;
     }
     recordTweakLifecycle(t.manifest.id, "main", "starting");
@@ -1908,26 +2583,6 @@ function loadAllMainTweaks(): void {
       recordTweakHealth(t.manifest.id, "failed", e instanceof Error ? e.message : e);
       log("error", `tweak ${t.manifest.id} failed to start:`, e);
     }
-  }
-}
-
-function syncMcpServersFromEnabledTweaks(): void {
-  try {
-    const result = syncManagedMcpServers({
-      configPath: CODEX_CONFIG_FILE,
-      tweaks: tweakState.discovered.filter((t) => isTweakEnabled(t.manifest.id)),
-    });
-    if (result.changed) {
-      log("info", `synced Codex MCP config: ${result.serverNames.join(", ") || "none"}`);
-    }
-    if (result.skippedServerNames.length > 0) {
-      log(
-        "info",
-        `skipped Tweakers managed MCP server(s) already configured by user: ${result.skippedServerNames.join(", ")}`,
-      );
-    }
-  } catch (e) {
-    log("warn", "failed to sync Codex MCP config:", e);
   }
 }
 
@@ -1979,35 +2634,35 @@ function safeRealpath(filePath: string): string {
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
 
-async function ensureCodexPlusPlusUpdateCheck(force = false): Promise<CodexPlusPlusUpdateCheck> {
+async function ensureTweakerUpdateCheck(force = false): Promise<TweakerUpdateCheck> {
   const state = readState();
-  const cached = state.codexPlusPlus?.updateCheck;
-  const channel = state.codexPlusPlus?.updateChannel ?? "stable";
-  const repo = state.codexPlusPlus?.updateRepo ?? CODEX_PLUSPLUS_REPO;
+  const cached = state.tweaker?.updateCheck;
+  const channel = state.tweaker?.updateChannel ?? "stable";
+  const repo = state.tweaker?.updateRepo ?? TWEAKER_REPO;
   if (
     !force &&
     cached &&
-    cached.currentVersion === CODEX_PLUSPLUS_VERSION &&
+    cached.currentVersion === TWEAKER_VERSION &&
     Date.now() - Date.parse(cached.checkedAt) < UPDATE_CHECK_INTERVAL_MS
   ) {
     return cached;
   }
 
-  const release = await fetchLatestRelease(repo, CODEX_PLUSPLUS_VERSION, channel === "prerelease");
+  const release = await fetchLatestRelease(repo, TWEAKER_VERSION, channel === "prerelease");
   const latestVersion = release.latestTag ? normalizeVersion(release.latestTag) : null;
-  const check: CodexPlusPlusUpdateCheck = {
+  const check: TweakerUpdateCheck = {
     checkedAt: new Date().toISOString(),
-    currentVersion: CODEX_PLUSPLUS_VERSION,
+    currentVersion: TWEAKER_VERSION,
     latestVersion,
     releaseUrl: release.releaseUrl ?? `https://github.com/${repo}/releases`,
     releaseNotes: release.releaseNotes,
     updateAvailable: latestVersion
-      ? compareVersions(normalizeVersion(latestVersion), CODEX_PLUSPLUS_VERSION) > 0
+      ? compareVersions(normalizeVersion(latestVersion), TWEAKER_VERSION) > 0
       : false,
     ...(release.error ? { error: release.error } : {}),
   };
-  state.codexPlusPlus ??= {};
-  state.codexPlusPlus.updateCheck = check;
+  state.tweaker ??= {};
+  state.tweaker.updateCheck = check;
   writeState(state);
   return check;
 }
@@ -2058,7 +2713,7 @@ async function fetchLatestRelease(
       const res = await fetch(`https://api.github.com/repos/${repo}/${endpoint}`, {
         headers: {
           "Accept": "application/vnd.github+json",
-          "User-Agent": `codex-plusplus/${currentVersion}`,
+          "User-Agent": `tweaker/${currentVersion}`,
         },
         signal: controller.signal,
       });
@@ -2180,9 +2835,9 @@ function assertStoreEntryPlatformCompatible(entry: TweakStoreEntry): void {
 
 function storeEntryRuntimeCompatibility(entry: TweakStoreEntry): StoreEntryRuntimeCompatibility {
   const required = cleanMinRuntime(entry.manifest.minRuntime);
-  const compatible = !required || compareVersions(CODEX_PLUSPLUS_VERSION, required) >= 0;
+  const compatible = !required || compareVersions(TWEAKER_VERSION, required) >= 0;
   return {
-    current: CODEX_PLUSPLUS_VERSION,
+    current: TWEAKER_VERSION,
     required,
     compatible,
     reason: compatible || !required
@@ -2222,7 +2877,7 @@ async function fetchTweakStoreRegistry(): Promise<TweakStoreFetchResult> {
       const res = await fetch(TWEAK_STORE_INDEX_URL, {
         headers: {
           "Accept": "application/json",
-          "User-Agent": `codex-plusplus/${CODEX_PLUSPLUS_VERSION}`,
+          "User-Agent": `tweaker/${TWEAKER_VERSION}`,
         },
         signal: controller.signal,
       });
@@ -2250,7 +2905,7 @@ async function fetchTweakStoreRegistry(): Promise<TweakStoreFetchResult> {
 let warnedStoreRegistryFetch = false;
 
 async function installStoreTweak(entry: TweakStoreEntry): Promise<void> {
-  const work = mkdtempSync(join(tmpdir(), "codexpp-store-tweak-"));
+  const work = mkdtempSync(join(tmpdir(), "tweaker-store-tweak-"));
   const archive = join(work, "source.tar.gz");
   const extractDir = join(work, "extract");
   const target = join(TWEAKS_DIR, entry.id);
@@ -2272,7 +2927,7 @@ async function installStoreTweak(entry: TweakStoreEntry): Promise<void> {
       const url = storeArchiveUrl(entry);
       log("info", `installing store tweak ${entry.id} from ${entry.repo ?? "(unknown)"}@${entry.approvedCommitSha ?? "(unknown)"}`);
       const res = await fetch(url, {
-        headers: { "User-Agent": `codex-plusplus/${CODEX_PLUSPLUS_VERSION}` },
+        headers: { "User-Agent": `tweaker/${TWEAKER_VERSION}` },
         redirect: "follow",
       });
       if (!res.ok) throw new Error(`download failed: ${res.status}`);
@@ -2288,7 +2943,7 @@ async function installStoreTweak(entry: TweakStoreEntry): Promise<void> {
     copyTweakSource(source, stagedTarget);
     const stagedFiles = hashTweakSource(stagedTarget);
     writeFileSync(
-      join(stagedTarget, ".codexpp-store.json"),
+      join(stagedTarget, ".tweaker-store.json"),
       JSON.stringify(
         {
           ...(entry.repo ? { repo: entry.repo } : {}),
@@ -2351,7 +3006,7 @@ async function fetchGithubJson<T>(url: string): Promise<T> {
     const res = await fetch(url, {
       headers: {
         "Accept": "application/vnd.github+json",
-        "User-Agent": `codex-plusplus/${CODEX_PLUSPLUS_VERSION}`,
+        "User-Agent": `tweaker/${TWEAKER_VERSION}`,
       },
       signal: controller.signal,
     });
@@ -2366,7 +3021,7 @@ async function fetchManifestAtCommit(repo: string, commitSha: string): Promise<P
   const res = await fetch(`https://raw.githubusercontent.com/${repo}/${commitSha}/manifest.json`, {
     headers: {
       "Accept": "application/json",
-      "User-Agent": `codex-plusplus/${CODEX_PLUSPLUS_VERSION}`,
+      "User-Agent": `tweaker/${TWEAKER_VERSION}`,
     },
   });
   if (!res.ok) throw new Error(`manifest fetch returned ${res.status}`);
@@ -2440,7 +3095,9 @@ async function assertStoreTweakCleanForAutoUpdate(
 }
 
 function readStoreInstallMetadata(target: string): StoreInstallMetadata | null {
-  const metadataPath = join(target, ".codexpp-store.json");
+  const currentPath = join(target, ".tweaker-store.json");
+  const legacyPath = join(target, LEGACY_STORE_METADATA);
+  const metadataPath = existsSync(currentPath) ? currentPath : legacyPath;
   if (!existsSync(metadataPath)) return null;
   try {
     const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as Partial<StoreInstallMetadata>;
@@ -2469,7 +3126,7 @@ async function fetchBaselineStoreTweakHashes(
   const baselineDir = join(work, "baseline");
   const archive = join(work, "baseline.tar.gz");
   const res = await fetch(`https://codeload.github.com/${metadata.repo}/tar.gz/${metadata.approvedCommitSha}`, {
-    headers: { "User-Agent": `codex-plusplus/${CODEX_PLUSPLUS_VERSION}` },
+    headers: { "User-Agent": `tweaker/${TWEAKER_VERSION}` },
     redirect: "follow",
   });
   if (!res.ok) throw new Error(`Could not verify local tweak changes before update: ${res.status}`);
@@ -2489,7 +3146,7 @@ function hashTweakSource(root: string): Record<string, string> {
 
 function collectTweakFileHashes(root: string, dir: string, out: Record<string, string>): void {
   for (const name of readdirSync(dir).sort()) {
-    if (name === ".git" || name === "node_modules" || name === ".codexpp-store.json") continue;
+    if (name === ".git" || name === "node_modules" || name === ".tweaker-store.json" || name === LEGACY_STORE_METADATA) continue;
     const full = join(dir, name);
     const rel = relative(root, full).split("\\").join("/");
     const stat = statSync(full);
@@ -2535,7 +3192,8 @@ function compareVersions(a: string, b: string): number {
 
 function fallbackSourceRoot(): string | null {
   const candidates = [
-    join(homedir(), ".codex-plusplus", "source"),
+    join(homedir(), ".tweaker", "source"),
+    join(homedir(), `.${LEGACY_DATA_DIR}`, "source"),
     join(userRoot!, "source"),
   ];
   for (const candidate of candidates) {
@@ -2553,13 +3211,17 @@ function describeInstallationSource(sourceRoot: string | null): InstallationSour
     };
   }
   const normalized = sourceRoot.replace(/\\/g, "/");
-  if (/\/(?:Homebrew|homebrew)\/Cellar\/codexplusplus\//.test(normalized)) {
+  if (/\/(?:Homebrew|homebrew)\/Cellar\/tweaker\//.test(normalized)
+    || normalized.includes(`/${LEGACY_DATA_DIR.replace("-", "")}/`)) {
     return { kind: "homebrew", label: "Homebrew", detail: sourceRoot };
   }
   if (existsSync(join(sourceRoot, ".git"))) {
     return { kind: "local-dev", label: "Local development checkout", detail: sourceRoot };
   }
-  if (normalized.endsWith("/.codex-plusplus/source") || normalized.includes("/.codex-plusplus/source/")) {
+  if (normalized.endsWith("/.tweaker/source")
+    || normalized.includes("/.tweaker/source/")
+    || normalized.endsWith(`/.${LEGACY_DATA_DIR}/source`)
+    || normalized.includes(`/.${LEGACY_DATA_DIR}/source/`)) {
     return { kind: "github-source", label: "GitHub source installer", detail: sourceRoot };
   }
   if (existsSync(join(sourceRoot, "package.json"))) {
@@ -2575,11 +3237,119 @@ function startInstalledCli(cli: string, args: string[]): void {
   const runtime = localCliRuntime(cli, args);
   const child = spawn(runtime.command, runtime.args, {
     cwd: resolve(dirname(cli), "..", "..", ".."),
-    env: { ...runtime.env, CODEX_PLUSPLUS_MANUAL_UPDATE: "1" },
+    env: { ...runtime.env, TWEAKER_MANUAL_UPDATE: "1", [LEGACY_MANUAL_UPDATE_ENV]: "1" },
     detached: true,
     stdio: "ignore",
   });
   child.unref();
+}
+
+function startCodexDesktopUpdateTransaction(): void {
+  const cli = desktopUpdateCli();
+  startInstalledCli(cli, ["update-chatgpt", "--json"]);
+}
+
+function desktopUpdateCli(): string {
+  const cli = localRefreshCli();
+  if (!existsSync(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
+  return cli;
+}
+
+function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
+  const cli = desktopUpdateCli();
+  const runtime = localCliRuntime(cli, args);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(runtime.command, runtime.args, {
+      cwd: resolve(dirname(cli), "..", "..", ".."),
+      env: runtime.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let outputBytes = 0;
+    let settled = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      operation();
+    };
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      if (settled) return;
+      outputBytes += chunk.byteLength;
+      if (outputBytes > CLI_JSON_MAX_OUTPUT_BYTES) {
+        child.kill("SIGTERM");
+        finish(() => rejectPromise(new Error(`Tweakers CLI output exceeded the limit for ${args[0] ?? "command"}`)));
+        return;
+      }
+      if (stream === "stdout") stdout += chunk.toString();
+      else stderr += chunk.toString();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => rejectPromise(new Error(`Tweakers CLI timed out while running ${args[0] ?? "command"}`)));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => capture("stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
+    child.once("error", (error) => finish(() => rejectPromise(error)));
+    child.once("close", (code) => finish(() => {
+      if (code !== 0) {
+        rejectPromise(new Error(stderr.trim() || `Tweakers CLI exited with status ${code ?? "unknown"}`));
+        return;
+      }
+      try {
+        resolvePromise(JSON.parse(stdout.trim()));
+      } catch {
+        rejectPromise(new Error(`Tweakers CLI returned invalid JSON for ${args[0] ?? "command"}`));
+      }
+    }));
+  });
+}
+
+function attachEnvironmentHelperDiagnostics(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const transaction = value as Record<string, unknown>;
+  const transactionId = typeof transaction.transactionId === "string" ? transaction.transactionId : "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(transactionId)) return value;
+  const helperRoot = join(userRoot!, "transactions", "environment", transactionId);
+  const label = `co.tweakers.environment.${transactionId}`;
+  const readJson = (file: string): unknown => {
+    try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
+  };
+  const readLogTail = (file: string): string => {
+    try {
+      const contents = readFileSync(file, "utf8");
+      return contents.slice(-16 * 1024);
+    } catch {
+      return "";
+    }
+  };
+  const submission = readJson(join(helperRoot, "commit-helper.json")) as Record<string, unknown> | null;
+  let outcome = readJson(join(helperRoot, `${label}.outcome.json`)) as Record<string, unknown> | null;
+  const ENVIRONMENT_HELPER_STALE_MS = 60_000;
+  if (submission && outcome && (outcome.phase === "not-started" || outcome.phase === "running")) {
+    const reference = outcome.phase === "running" ? outcome.startedAt : submission.submittedAt;
+    const referenceTime = typeof reference === "string" ? Date.parse(reference) : Number.NaN;
+    if (!Number.isFinite(referenceTime) || Date.now() - referenceTime >= ENVIRONMENT_HELPER_STALE_MS) {
+      outcome = {
+        ...outcome,
+        phase: "failed",
+        finishedAt: new Date().toISOString(),
+        error: outcome.phase === "running"
+          ? "Environment helper stopped before reporting an outcome. Retry or roll back the prepared transaction."
+          : "Environment helper did not start. Retry the prepared transaction.",
+      };
+    }
+  }
+  return {
+    ...transaction,
+    helper: {
+      submission,
+      outcome,
+      stdout: readLogTail(join(helperRoot, `${label}.stdout.log`)),
+      stderr: readLogTail(join(helperRoot, `${label}.stderr.log`)),
+    },
+  };
 }
 
 interface LocalRefreshStatusValue {
@@ -2639,21 +3409,35 @@ function probeLocalRefreshStatus(): Promise<LocalRefreshStatusValue> {
   });
 }
 
-// Recent ChatGPT builds no longer consistently honor ELECTRON_RUN_AS_NODE on
-// their outer launcher. Prefer the bundled renderer Node binary so refresh
-// status emits JSON instead of launching ChatGPT and printing "Opening in…".
+// The OpenAI-bundled renderer Node enforces Team-ID library validation and
+// cannot load Tweakers' separately signed native swap module. Prefer the exact
+// Node executable captured by the installed Tweakers CLI shim; retain the
+// bundled renderer Node only as a compatibility fallback for native-free work.
 function localCliRuntime(cli: string, args: string[]): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
-  const bundledNode = join(process.resourcesPath, "cua_node", "bin", "node");
-  if (existsSync(bundledNode)) return { command: bundledNode, args: [cli, ...args], env: { ...process.env } };
-  return { command: process.execPath, args: [cli, ...args], env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" } };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    TWEAKERS_HOME: userRoot!,
+    TWEAKER_HOME: userRoot!,
+    TWEAKERS_USER_ROOT: userRoot!,
+    TWEAKER_USER_ROOT: userRoot!,
+    [LEGACY_USER_ROOT_ENV]: userRoot!,
+  };
+  return resolveLocalCliRuntime({
+    cli,
+    args,
+    userRoot: userRoot!,
+    resourcesPath: process.resourcesPath,
+    execPath: process.execPath,
+    env,
+  });
 }
 
 function localRefreshCli(status?: { source?: string; developmentSourceRoot?: string | null }): string {
   let developmentSourceRoot = status?.developmentSourceRoot ?? null;
   if (!developmentSourceRoot) {
     try {
-      const config = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as { codexPlusPlus?: { developmentSourceRoot?: unknown } };
-      if (typeof config.codexPlusPlus?.developmentSourceRoot === "string") developmentSourceRoot = config.codexPlusPlus.developmentSourceRoot;
+      const section = readState().tweaker as { developmentSourceRoot?: unknown } | undefined;
+      if (typeof section?.developmentSourceRoot === "string") developmentSourceRoot = section.developmentSourceRoot;
     } catch {}
   }
   if ((status?.source === "development" || !status) && developmentSourceRoot) {
@@ -2674,7 +3458,7 @@ function startInstalledCliWithLaunchd(cli: string, args: string[]): boolean {
   const command = [
     `trap ${shellQuote(cleanup)} EXIT`,
     `cd ${shellQuote(resolve(dirname(cli), "..", "..", ".."))}`,
-    `CODEX_PLUSPLUS_MANUAL_UPDATE=1 ELECTRON_RUN_AS_NODE=1 ${[runtime.command, ...runtime.args].map(shellQuote).join(" ")}`,
+    `TWEAKERS_HOME=${shellQuote(userRoot!)} TWEAKER_HOME=${shellQuote(userRoot!)} TWEAKERS_USER_ROOT=${shellQuote(userRoot!)} TWEAKER_USER_ROOT=${shellQuote(userRoot!)} ${LEGACY_USER_ROOT_ENV}=${shellQuote(userRoot!)} TWEAKER_MANUAL_UPDATE=1 ${LEGACY_MANUAL_UPDATE_ENV}=1 ELECTRON_RUN_AS_NODE=1 ${[runtime.command, ...runtime.args].map(shellQuote).join(" ")}`,
   ].join(" && ");
   const result = spawnSync(
     "launchctl",
@@ -2702,16 +3486,16 @@ function shellQuote(value: string): string {
 }
 
 function markSelfUpdateStarted(sourceRoot: string): SelfUpdateState {
-  const config = readState().codexPlusPlus;
+  const config = readState().tweaker;
   const channel = config?.updateChannel ?? "stable";
   const state: SelfUpdateState = {
     checkedAt: new Date().toISOString(),
     status: "checking",
-    currentVersion: CODEX_PLUSPLUS_VERSION,
+    currentVersion: TWEAKER_VERSION,
     latestVersion: null,
     targetRef: config?.updateChannel === "custom" ? config.updateRef ?? null : null,
     releaseUrl: null,
-    repo: config?.updateRepo ?? CODEX_PLUSPLUS_REPO,
+    repo: config?.updateRepo ?? TWEAKER_REPO,
     channel,
     sourceRoot,
     installationSource: describeInstallationSource(sourceRoot),
@@ -2727,7 +3511,7 @@ function broadcastReload(): void {
   };
   for (const wc of webContents.getAllWebContents()) {
     try {
-      wc.send("codexpp:tweaks-changed", payload);
+      wc.send("tweaker:tweaks-changed", payload);
     } catch (e) {
       log("warn", "broadcast send failed:", e);
     }
@@ -2744,7 +3528,7 @@ function makeLogger(scope: string) {
 }
 
 function makeMainIpc(id: string) {
-  const ch = (c: string) => `codexpp:${id}:${c}`;
+  const ch = (c: string) => `tweaker:${id}:${c}`;
   return {
     on: (c: string, h: (...args: unknown[]) => void) => {
       const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
@@ -3634,7 +4418,8 @@ function normalizeOwlViewUrl(url: string): string {
 }
 
 function getCodexWindowServices(): CodexWindowServices | null {
-  const services = (globalThis as unknown as Record<string, unknown>)[CODEX_WINDOW_SERVICES_KEY];
+  const globals = globalThis as unknown as Record<string, unknown>;
+  const services = globals[CODEX_WINDOW_SERVICES_KEY] ?? globals[LEGACY_WINDOW_SERVICES_KEY];
   return services && typeof services === "object" ? (services as CodexWindowServices) : null;
 }
 

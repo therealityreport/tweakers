@@ -1,8 +1,8 @@
 "use strict";
 
 const OWNER = "co.tweakers.thread-summary-profiles";
-const STYLE_ID = "codexpp-thread-summary-profiles-style";
-const MOUNT_ATTR = "data-codexpp-thread-summary-profiles";
+const STYLE_ID = "tweaker-thread-summary-profiles-style";
+const MOUNT_ATTR = "data-tweaker-thread-summary-profiles";
 const states = new WeakMap();
 
 const helpers = { normalizeProfilesProjection, renderProfilesState, profileSignature, panelContextSignature, findSummaryPanels, resolveProjectContext, normalizeRow };
@@ -18,7 +18,7 @@ module.exports = {
       for (const mount of state.mounts) mount.removeAttribute?.("data-profiles-context");
       schedule(state);
     };
-    for (const type of ["popstate", "hashchange", "codexpp:projects-revision"]) {
+    for (const type of ["popstate", "hashchange", "tweaker:projects-revision"]) {
       window.addEventListener?.(type, refresh);
       state.listeners.push(() => window.removeEventListener?.(type, refresh));
     }
@@ -169,7 +169,7 @@ function scan(state) {
     if (!mount) {
       mount = document.createElement("section");
       mount.setAttribute(MOUNT_ATTR, OWNER);
-      mount.className = "codexpp-thread-summary-profiles flex flex-col gap-2 pt-3";
+      mount.className = "tweaker-thread-summary-profiles flex flex-col gap-2 pt-3";
       panel.appendChild(mount);
       state.mounts.add(mount);
     }

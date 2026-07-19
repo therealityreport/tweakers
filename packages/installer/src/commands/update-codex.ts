@@ -1,13 +1,20 @@
 import kleur from "kleur";
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { ensureUserPaths } from "../paths.js";
-import { locateCodex } from "../platform.js";
-import { readState, resolveMode } from "../state.js";
-import { hasCodexPlusPlusAsarMarker } from "./install.js";
+import {
+  createDesktopUpdateTransaction,
+  type DesktopUpdateReceipt,
+  type DesktopUpdateTransaction,
+} from "../desktop-update-transaction.js";
 
-interface Opts {
+export interface UpdateCodexOptions {
   app?: string;
+  json?: boolean;
+}
+
+export interface UpdateCodexCommandDeps {
+  createTransaction(options: UpdateCodexOptions): DesktopUpdateTransaction;
+  print(line: string): void;
 }
 
 const PARKED_PATCHED_RE = /^Codex\.app\.patched-/;
@@ -31,32 +38,63 @@ export function pruneParkedPatchedApps(
   return removed;
 }
 
-/**
- * The legacy restore-then-let-Sparkle-run flow is superseded by the mode
- * toggle: its `Codex.app.patched-<ts>` parking is replaced by the payload
- * store under `<root>/mode/patched-payload`. In ChatGPT mode the official
- * Sparkle updater already runs natively (nothing to do); in Tweakers mode the
- * supported path is `tweakers mode chatgpt`.
- */
-export async function updateCodex(opts: Opts = {}): Promise<void> {
-  const paths = ensureUserPaths();
-  const state = readState(paths.stateFile);
-  const codex = locateCodex(opts.app ?? state?.appRoot);
-  if (codex.platform !== "darwin") {
-    throw new Error("codex-plusplus update-codex is only needed on macOS/Sparkle installs.");
-  }
+const DEFAULT_DEPS: UpdateCodexCommandDeps = {
+  createTransaction: (options) => createDesktopUpdateTransaction({ appPath: options.app }),
+  print: (line) => console.log(line),
+};
 
-  if (resolveMode(state, hasCodexPlusPlusAsarMarker(codex.asarPath)) === "chatgpt") {
-    console.log(kleur.green("ChatGPT mode is active; the official updater manages updates natively."));
-    console.log(kleur.dim("Nothing to restore — the live app is already the pristine official app."));
+/** Start the durable official-update continuation shared by Config and Menu Bar. */
+export async function updateCodex(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): Promise<DesktopUpdateReceipt> {
+  const receipt = await deps.createTransaction(opts).start();
+  printReceipt(receipt, opts, deps);
+  return receipt;
+}
+
+export function codexUpdateStatus(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): DesktopUpdateReceipt | null {
+  const receipt = deps.createTransaction(opts).status();
+  if (receipt) printReceipt(receipt, opts, deps);
+  else if (opts.json) deps.print(JSON.stringify({ schemaVersion: 1, kind: "desktop-update", transactionId: null, phase: "idle" }));
+  else deps.print(kleur.dim("No desktop Update and Reload transaction has started."));
+  return receipt;
+}
+
+export async function resumeCodexUpdate(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): Promise<DesktopUpdateReceipt> {
+  const receipt = await deps.createTransaction(opts).resume();
+  printReceipt(receipt, opts, deps);
+  return receipt;
+}
+
+export async function cancelCodexUpdate(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): Promise<DesktopUpdateReceipt> {
+  const receipt = await deps.createTransaction(opts).cancel();
+  printReceipt(receipt, opts, deps);
+  return receipt;
+}
+
+function printReceipt(
+  receipt: DesktopUpdateReceipt,
+  opts: UpdateCodexOptions,
+  deps: UpdateCodexCommandDeps,
+): void {
+  if (opts.json) {
+    deps.print(JSON.stringify(receipt));
     return;
   }
-
-  throw new Error(
-    "Refusing to run update-chatgpt in Tweakers mode.\n" +
-      "This flow is superseded by the mode toggle:\n" +
-      `  1. Run ${kleur.cyan("tweakers mode chatgpt")} (parks the patched payload, restores the official app).\n` +
-      "  2. Let the official ChatGPT updater run.\n" +
-      `  3. Run ${kleur.cyan("tweakers mode tweakers")} to come back.`,
-  );
+  const tone = receipt.phase === "completed" ? kleur.green
+    : receipt.phase === "failed" || receipt.phase === "rolled_back" ? kleur.yellow
+    : kleur.cyan;
+  deps.print(tone(`Desktop Update and Reload: ${receipt.phase}`));
+  deps.print(kleur.dim(`Transaction ${receipt.transactionId}`));
+  if (receipt.error) deps.print(kleur.yellow(receipt.error));
 }

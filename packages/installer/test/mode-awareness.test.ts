@@ -7,7 +7,13 @@ import { repair } from "../src/commands/repair";
 import { finalizePromotedModeState, install, refreshLivePartialBackups, type AsarMarker } from "../src/commands/install";
 import { refreshLocal } from "../src/commands/refresh-local";
 import { cleanupModeArtifacts, shouldSkipRestoreForChatgptMode } from "../src/commands/uninstall";
-import { updateCodex } from "../src/commands/update-codex";
+import {
+  cancelCodexUpdate,
+  codexUpdateStatus,
+  resumeCodexUpdate,
+  updateCodex,
+} from "../src/commands/update-codex";
+import type { DesktopUpdateReceipt, DesktopUpdateTransaction } from "../src/desktop-update-transaction";
 import { describeChatgptModeAsar } from "../src/commands/status";
 import { runHeldPromotion, type HeldPromotionDeps } from "../src/watcher-held";
 import { readState, writeState, type InstallerState } from "../src/state";
@@ -95,6 +101,7 @@ function repairDeps(counters: RepairCounters, overrides: Record<string, unknown>
       counters.settles += 1;
     },
     signingAvailable: () => true,
+    reconcileCliShims: () => {},
     install: async () => {
       counters.installs += 1;
     },
@@ -182,6 +189,50 @@ test("repair proceeds normally in Tweakers mode and when inference says tweakers
   }
 });
 
+test("manual repair restores CLI shims before the patch-already-intact fast path", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedState(root, fixture, { mode: "tweakers" });
+    const counters: RepairCounters = { stats: 0, headers: 0, settles: 0, installs: 0 };
+    let shimReconciliations = 0;
+
+    await repair(
+      { quiet: true },
+      repairDeps(counters, {
+        readAsarMarker: (): AsarMarker => "present",
+        readHeaderHash: () => ({ headerHash: "patched", header: {} }),
+        runtimeAssetsMatch: () => true,
+        listProcesses: () => [],
+        reconcileCliShims: () => { shimReconciliations += 1; },
+      }),
+    );
+
+    assert.equal(shimReconciliations, 1);
+    assert.equal(counters.installs, 0);
+  });
+});
+
+test("legacy patch schema forces a full repair instead of a runtime-only fast path", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedState(root, fixture, { mode: "tweakers" });
+    const counters: RepairCounters = { stats: 0, headers: 0, settles: 0, installs: 0 };
+
+    await repair(
+      { quiet: true },
+      repairDeps(counters, {
+        readAsarMarker: (): AsarMarker => "present",
+        readAsarPatchSchema: () => "legacy",
+        readHeaderHash: () => ({ headerHash: "patched", header: {} }),
+        runtimeAssetsMatch: () => false,
+        listProcesses: () => [],
+      }),
+    );
+
+    assert.equal(counters.installs, 1);
+  });
+});
+
 test("repair stands down via bootstrap inference: missing mode + unpatched app", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
@@ -236,7 +287,7 @@ test("repair warns loudly on a mode/marker mismatch without a journal and does n
 
     assert.equal(counters.installs, 0);
     assert.ok(warnings.some((line) => /patch marker/.test(line)));
-    assert.ok(warnings.some((line) => /tweakers mode status/.test(line)));
+    assert.ok(warnings.some((line) => /tweaker mode status/.test(line)));
   });
 });
 
@@ -287,7 +338,7 @@ test("install refuses in ChatGPT mode without the modeTransition flag", async ()
     });
 
     await assert.rejects(() => install({}), /Refusing to install while ChatGPT mode is active/);
-    await assert.rejects(() => install({}), /tweakers mode tweakers/);
+    await assert.rejects(() => install({}), /tweaker mode tweakers/);
   });
 });
 
@@ -462,22 +513,40 @@ test("uninstall wires the mode cleanup and switcher removal", () => {
 /* update-chatgpt guards                                                     */
 /* ------------------------------------------------------------------------- */
 
-test("update-chatgpt is a no-op in ChatGPT mode and refuses in Tweakers mode", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    seedState(root, fixture, { mode: "chatgpt" });
+test("update-chatgpt start/status/resume/cancel delegate to one durable transaction contract", async () => {
+  const calls: string[] = [];
+  const receipt = {
+    schemaVersion: 1,
+    kind: "desktop-update",
+    transactionId: "desktop-1",
+    phase: "awaiting_native_update",
+  } as DesktopUpdateReceipt;
+  const transaction: DesktopUpdateTransaction = {
+    start: async () => { calls.push("start"); return receipt; },
+    status: () => { calls.push("status"); return receipt; },
+    resume: async () => { calls.push("resume"); return { ...receipt, phase: "completed" }; },
+    cancel: async () => { calls.push("cancel"); return { ...receipt, phase: "failed" }; },
+  };
+  const output: string[] = [];
+  const deps = {
+    createTransaction: () => transaction,
+    print: (line: string) => { output.push(line); },
+  };
 
-    // ChatGPT mode: Sparkle updates natively — nothing to restore, no throw.
-    await updateCodex({ app: fixture.appRoot });
-    assert.equal(readFileSync(fixture.asarPath, "utf8"), "test asar");
+  assert.equal((await updateCodex({ json: true }, deps)).transactionId, "desktop-1");
+  assert.equal(codexUpdateStatus({ json: true }, deps)?.phase, "awaiting_native_update");
+  assert.equal((await resumeCodexUpdate({ json: true }, deps)).phase, "completed");
+  assert.equal((await cancelCodexUpdate({ json: true }, deps)).phase, "failed");
+  assert.deepEqual(calls, ["start", "status", "resume", "cancel"]);
+  assert.deepEqual(output.map((line) => JSON.parse(line).schemaVersion), [1, 1, 1, 1]);
+});
 
-    seedState(root, fixture, { mode: "tweakers" });
-    await assert.rejects(
-      () => updateCodex({ app: fixture.appRoot }),
-      /Refusing to run update-chatgpt in Tweakers mode/,
-    );
-    await assert.rejects(() => updateCodex({ app: fixture.appRoot }), /tweakers mode chatgpt/);
-  });
+test("update-chatgpt threads the exact --app option into its default transaction factory", () => {
+  const source = readFileSync(new URL("../src/commands/update-codex.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /createDesktopUpdateTransaction\(\{ appPath: options\.app \}\)/,
+  );
 });
 
 /* ------------------------------------------------------------------------- */
@@ -517,7 +586,7 @@ test("status/doctor flag a patched live app in ChatGPT mode and reserve drift fo
     payloadPatchedAsarHash: "patched",
   });
   assert.equal(patched.tone, "red");
-  assert.match(patched.label, /tweakers mode status/);
+  assert.match(patched.label, /tweaker mode status/);
 
   // An official update in ChatGPT mode matches neither payload but is NOT drift.
   const updated = describeChatgptModeAsar({
@@ -541,7 +610,7 @@ test("pruneRetiredTweaks removes staged retired tweaks and scrubs the dev-snapsh
     writeFileSync(join(tweaksDir, "mode-switcher", "index.js"), "// retired\n");
     mkdirSync(join(tweaksDir, "user-questions"), { recursive: true });
     writeFileSync(
-      join(tweaksDir, ".codexpp-dev-snapshot.json"),
+      join(tweaksDir, ".tweaker-dev-snapshot.json"),
       `${JSON.stringify({ folders: ["mode-switcher", "user-questions"] })}\n`,
     );
 
@@ -549,7 +618,7 @@ test("pruneRetiredTweaks removes staged retired tweaks and scrubs the dev-snapsh
 
     assert.equal(existsSync(join(tweaksDir, "mode-switcher")), false, "retired staged copy is pruned");
     assert.equal(existsSync(join(tweaksDir, "user-questions")), true, "active tweaks stay");
-    const snapshot = JSON.parse(readFileSync(join(tweaksDir, ".codexpp-dev-snapshot.json"), "utf8")) as {
+    const snapshot = JSON.parse(readFileSync(join(tweaksDir, ".tweaker-dev-snapshot.json"), "utf8")) as {
       folders: string[];
     };
     assert.deepEqual(snapshot.folders, ["user-questions"], "snapshot record no longer names the retired folder");

@@ -1,6 +1,6 @@
 # Getting Started
 
-A tweak is a JavaScript package loaded from the Codex++ tweaks directory. Tweaks
+A tweak is a JavaScript package loaded from the Tweaker tweaks directory. Tweaks
 can add settings UI, adjust Codex's renderer DOM, run Electron main-process
 code, communicate between renderer and main, store data, expose MCP servers, and
 open Codex-native windows.
@@ -9,17 +9,17 @@ open Codex-native windows.
 
 | Platform | Directory |
 |---|---|
-| macOS | `~/Library/Application Support/codex-plusplus/tweaks/` |
-| Linux | `~/.local/share/codex-plusplus/tweaks/` |
-| Windows | `%APPDATA%/codex-plusplus/tweaks/` |
+| macOS | `~/Library/Application Support/tweaker/tweaks/` |
+| Linux | `~/.local/share/tweaker/tweaks/` |
+| Windows | `%APPDATA%/tweaker/tweaks/` |
 
-Codex++ watches this directory and hot-reloads when files change. You can also
+Tweaker watches this directory and hot-reloads when files change. You can also
 reload from Settings -> Tweaks or restart Codex.
 
 ## Create a Tweak
 
 ```sh
-codexplusplus create-tweak ./my-tweak \
+tweaker create-tweak ./my-tweak \
   --id com.you.my-tweak \
   --name "My Tweak" \
   --repo you/my-tweak
@@ -38,22 +38,22 @@ my-tweak/
 Validate it:
 
 ```sh
-codexplusplus validate-tweak ./my-tweak
+tweaker validate-tweak ./my-tweak
 ```
 
 Link it into your live tweaks directory:
 
 ```sh
-codexplusplus dev ./my-tweak
+tweaker dev ./my-tweak
 ```
 
-`codexplusplus dev` validates the manifest, creates a symlink, touches a reload
+`tweaker dev` validates the manifest, creates a symlink, touches a reload
 marker, and watches for local changes. Pass `--replace` if a symlink with that
 name already points somewhere else.
 
 ## Entry File Resolution
 
-Codex++ resolves the entry file in this order:
+Tweaker resolves the entry file in this order:
 
 1. `manifest.main`, if present
 2. `index.js`
@@ -93,7 +93,7 @@ module.exports = {
         root.innerHTML = "";
         const p = document.createElement("p");
         p.className = "text-sm text-token-text-secondary";
-        p.textContent = "Hello from Codex++.";
+        p.textContent = "Hello from Tweaker.";
         root.append(p);
       },
     });

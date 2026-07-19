@@ -86,15 +86,15 @@ test("native project menu receives one working Project color item before Remove"
   _test.injectProjectColorMenu(document, menu, context, (choice) => selections.push(choice));
   _test.injectProjectColorMenu(document, menu, context, (choice) => selections.push(choice));
 
-  assert.equal(menu.querySelectorAll('[data-codexpp-project-color-menu="trigger"]').length, 1);
-  const trigger = menu.querySelector('[data-codexpp-project-color-menu="trigger"]');
+  assert.equal(menu.querySelectorAll('[data-tweaker-project-color-menu="trigger"]').length, 1);
+  const trigger = menu.querySelector('[data-tweaker-project-color-menu="trigger"]');
   trigger.rect = { left: 260, top: 700, right: 300, bottom: 730, width: 40, height: 30 };
   assert.equal(menu.children.indexOf(trigger) < menu.children.indexOf(remove), true);
   trigger.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {}, stopPropagation() {} });
   assert.equal(document.listenerCount(), 2);
   trigger.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  assert.equal(document.body.querySelectorAll('[data-codexpp-project-color-menu="submenu"]').length, 1);
-  const submenu = document.body.querySelector('[data-codexpp-project-color-menu="submenu"]');
+  assert.equal(document.body.querySelectorAll('[data-tweaker-project-color-menu="submenu"]').length, 1);
+  const submenu = document.body.querySelector('[data-tweaker-project-color-menu="submenu"]');
   assert.equal(submenu.style.values.get("overflow-y"), "auto");
   assert.equal(submenu.style.values.get("overscroll-behavior"), "contain");
   assert.equal(submenu.style.values.get("scrollbar-gutter"), "stable");
@@ -144,6 +144,73 @@ test("project overflow resolves from the live project row when semantic hosts ar
   assert.equal(context.source, "live-row");
 });
 
+test("renamed native projects retain their saved color and menu identity by workspace path", (t) => {
+  const previousDocument = global.document;
+  const previousElement = global.Element;
+  const previousHTMLElement = global.HTMLElement;
+  const document = new FakeDocument();
+  global.document = document;
+  global.Element = FakeElement;
+  global.HTMLElement = FakeElement;
+  t.after(() => {
+    global.document = previousDocument;
+    global.Element = previousElement;
+    global.HTMLElement = previousHTMLElement;
+  });
+
+  const nativeProjects = _test.normalizeNativeLocalProjects({
+    "local-projects": {
+      "local-project-manager": {
+        id: "local-project-manager",
+        name: "PROJECT MANAGER",
+        rootPaths: ["/Users/example/Projects/SKILLS MANAGER"],
+      },
+    },
+  });
+  const savedState = {
+    schemaVersion: 1,
+    nodes: [{
+      id: "project-skills-manager",
+      type: "project",
+      parentId: null,
+      name: "SKILLS MANAGER",
+      icon: { kind: "emoji", value: "📁" },
+      color: "#6d28d9",
+      colorMode: "manual",
+      overlayIntensity: "strong",
+      projectPath: "/Users/example/Projects/SKILLS MANAGER",
+      connections: {},
+    }],
+  };
+  const runtimeState = _test.bindNativeProjectIdentities(savedState, nativeProjects);
+  assert.deepEqual(runtimeState.nodes[0].nativeProjectIds, ["local-project-manager"]);
+  assert.deepEqual(runtimeState.nodes[0].nativeProjectNames, ["PROJECT MANAGER"]);
+  assert.equal(_test.normalizeState(runtimeState).nodes[0].name, "SKILLS MANAGER", "runtime aliases never replace saved project data");
+  assert.equal(_test.normalizeState(runtimeState).nodes[0].nativeProjectIds, undefined);
+
+  const container = document.createElement("div");
+  container.setAttribute("role", "listitem");
+  const row = document.createElement("button");
+  row.setAttribute("data-app-action-sidebar-project-id", "local-project-manager");
+  row.setAttribute("aria-label", "PROJECT MANAGER");
+  const icon = document.createElement("svg");
+  const title = document.createElement("span");
+  title.textContent = "PROJECT MANAGER";
+  row.append(icon, title);
+  container.appendChild(row);
+  document.body.appendChild(container);
+  const api = { react: { host: { query: () => [{ element: row, label: "PROJECT MANAGER" }] } } };
+
+  const context = _test.resolveProjectContext(api, runtimeState, icon);
+  assert.equal(context.project.id, "project-skills-manager");
+  assert.equal(context.project.color, "#6d28d9");
+
+  _test.applyNativeProjectColors(api, runtimeState);
+  assert.equal(row.getAttribute("data-tweaker-project-color-row"), "true");
+  assert.equal(row.style.values.get("--tweaker-project-color"), "#6d28d9");
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
+});
+
 test("native menu targeting chooses the nearest visible open project menu", () => {
   const document = new FakeDocument();
   const makeMenu = ({ state, left, top, width = 220, height = 320 }) => {
@@ -189,20 +256,20 @@ test("project tint rerenders immediately and teardown stays inside the semantic 
   const api = { react: { host: { query: () => [{ element: row }] } } };
 
   _test.applyNativeProjectColors(api, { nodes: [{ type: "project", name: "Alpha", color: "#1d4ed8", overlayIntensity: "medium" }] });
-  assert.equal(row.getAttribute("data-codexpp-project-color-row"), "true");
-  assert.equal(row.style.values.get("--codexpp-project-color"), "#1d4ed8");
-  assert.equal(icon.getAttribute("data-codexpp-project-color-icon"), "true");
-  assert.equal(title.getAttribute("data-codexpp-project-color-title"), "true");
-  assert.equal(unrelated.getAttribute("data-codexpp-project-color-child"), null);
+  assert.equal(row.getAttribute("data-tweaker-project-color-row"), "true");
+  assert.equal(row.style.values.get("--tweaker-project-color"), "#1d4ed8");
+  assert.equal(icon.getAttribute("data-tweaker-project-color-icon"), "true");
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
+  assert.equal(unrelated.getAttribute("data-tweaker-project-color-child"), null);
 
   _test.applyNativeProjectColors(api, { nodes: [{ type: "project", name: "Alpha", color: "#15803d", overlayIntensity: "strong" }] });
-  assert.equal(row.style.values.get("--codexpp-project-color"), "#15803d");
-  assert.equal(row.getAttribute("data-codexpp-project-overlay"), "strong");
+  assert.equal(row.style.values.get("--tweaker-project-color"), "#15803d");
+  assert.equal(row.getAttribute("data-tweaker-project-overlay"), "strong");
   _test.removeProjectColorArtifacts();
-  assert.equal(row.getAttribute("data-codexpp-project-color-row"), null);
-  assert.equal(icon.getAttribute("data-codexpp-project-color-icon"), null);
-  assert.equal(title.getAttribute("data-codexpp-project-color-title"), null);
-  assert.equal(document.getElementById("codexpp-project-colors"), null);
+  assert.equal(row.getAttribute("data-tweaker-project-color-row"), null);
+  assert.equal(icon.getAttribute("data-tweaker-project-color-icon"), null);
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), null);
+  assert.equal(document.getElementById("tweaker-project-colors"), null);
 });
 
 test("live group/cwd project rows paint when the semantic host query is empty", (t) => {
@@ -241,14 +308,14 @@ test("live group/cwd project rows paint when the semantic host query is empty", 
 
   _test.applyNativeProjectColors(api, { nodes: [{ id: "project-tweakers", type: "project", name: "tweakers", projectPath: "/Users/example/tweakers", color: "#334155", overlayIntensity: "medium" }] });
 
-  assert.equal(group.getAttribute("data-codexpp-project-color-group"), "true");
-  assert.equal(header.getAttribute("data-codexpp-project-color-row"), "true");
-  assert.equal(icon.getAttribute("data-codexpp-project-color-icon"), "true");
-  assert.equal(title.getAttribute("data-codexpp-project-color-title"), "true");
-  assert.equal(task.getAttribute("data-codexpp-project-color-task"), "true");
-  assert.equal(task.getAttribute("data-codexpp-project-selected"), "true");
-  assert.equal(showMore.getAttribute("data-codexpp-project-show-more"), "true");
-  assert.equal(unrelated.getAttribute("data-codexpp-project-color-task"), null);
+  assert.equal(group.getAttribute("data-tweaker-project-color-group"), "true");
+  assert.equal(header.getAttribute("data-tweaker-project-color-row"), "true");
+  assert.equal(icon.getAttribute("data-tweaker-project-color-icon"), "true");
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
+  assert.equal(task.getAttribute("data-tweaker-project-color-task"), "true");
+  assert.equal(task.getAttribute("data-tweaker-project-selected"), "true");
+  assert.equal(showMore.getAttribute("data-tweaker-project-show-more"), "true");
+  assert.equal(unrelated.getAttribute("data-tweaker-project-color-task"), null);
 });
 
 test("project hierarchy uses bold full-color headers and contrast-safe selected rows", (t) => {
@@ -304,60 +371,60 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
 
   _test.applyNativeProjectColors(api, state);
 
-  assert.equal(project.getAttribute("data-codexpp-project-color-group"), "true");
-  assert.equal(header.getAttribute("data-codexpp-project-color-row"), "true");
-  assert.equal(header.getAttribute("data-codexpp-project-selected"), "true");
-  assert.equal(projectIcon.getAttribute("data-codexpp-project-color-icon"), "true");
-  assert.equal(overflowIcon.getAttribute("data-codexpp-project-color-icon"), "true");
-  assert.equal(title.getAttribute("data-codexpp-project-color-title"), "true");
+  assert.equal(project.getAttribute("data-tweaker-project-color-group"), "true");
+  assert.equal(header.getAttribute("data-tweaker-project-color-row"), "true");
+  assert.equal(header.getAttribute("data-tweaker-project-selected"), "true");
+  assert.equal(projectIcon.getAttribute("data-tweaker-project-color-icon"), "true");
+  assert.equal(overflowIcon.getAttribute("data-tweaker-project-color-icon"), "true");
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
   assert.equal(title.textContent, "TRR", "saved casing is preserved");
-  assert.equal(task.getAttribute("data-codexpp-project-color-task"), "true");
-  assert.equal(taskAction.getAttribute("data-codexpp-project-task-label"), "true");
-  assert.equal(task.getAttribute("data-codexpp-project-selected"), null);
-  assert.equal(selectedTask.getAttribute("data-codexpp-project-color-task"), "true");
-  assert.equal(selectedTaskAction.getAttribute("data-codexpp-project-task-label"), "true");
-  assert.equal(selectedTask.getAttribute("data-codexpp-project-selected"), "true");
-  assert.equal(showMore.getAttribute("data-codexpp-project-show-more"), "true");
-  assert.equal(unrelated.getAttribute("data-codexpp-project-color-task"), null);
-  assert.equal(header.style.values.get("--codexpp-project-foreground"), "var(--gray-0)");
-  assert.equal(selectedTask.style.values.get("--codexpp-project-foreground"), "var(--gray-0)");
+  assert.equal(task.getAttribute("data-tweaker-project-color-task"), "true");
+  assert.equal(taskAction.getAttribute("data-tweaker-project-task-label"), "true");
+  assert.equal(task.getAttribute("data-tweaker-project-selected"), null);
+  assert.equal(selectedTask.getAttribute("data-tweaker-project-color-task"), "true");
+  assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-label"), "true");
+  assert.equal(selectedTask.getAttribute("data-tweaker-project-selected"), "true");
+  assert.equal(showMore.getAttribute("data-tweaker-project-show-more"), "true");
+  assert.equal(unrelated.getAttribute("data-tweaker-project-color-task"), null);
+  assert.equal(header.style.values.get("--tweaker-project-foreground"), "var(--gray-0)");
+  assert.equal(selectedTask.style.values.get("--tweaker-project-foreground"), "var(--gray-0)");
 
-  const css = document.getElementById("codexpp-project-colors").textContent;
-  assert.match(css, /data-codexpp-project-color-row[^}]*background-color:\s*var\(--codexpp-project-color\)/s);
-  assert.match(css, /data-codexpp-project-color-title[^}]*font-weight:\s*700/s);
-  assert.match(css, /data-codexpp-project-color-title[^}]*text-transform:\s*uppercase/s);
-  assert.match(css, /data-codexpp-project-color-row\]\[data-codexpp-project-selected="true"\][^}]*background-color:\s*var\(--gray-1000\)/s);
-  assert.match(css, /data-codexpp-project-color-row\]\[data-codexpp-project-selected="true"\][^}]*color:\s*var\(--gray-0\)/s);
-  assert.match(css, /data-codexpp-project-color-row\]\[data-codexpp-project-selected="true"\]\s+\*[^}]*color:\s*var\(--gray-0\)/s);
-  assert.match(css, /data-codexpp-project-task-label[^}]*font-weight:\s*400/s);
-  assert.match(css, /data-codexpp-project-color-task.*data-codexpp-project-selected[^}]*data-codexpp-project-task-label[^}]*color:\s*var\(--codexpp-project-foreground\)/s);
-  assert.match(css, /data-codexpp-project-color-task.*data-codexpp-project-selected[^}]*svg[^}]*color:\s*var\(--codexpp-project-foreground\)/s);
-  assert.match(css, /data-codexpp-project-color-row.*data-codexpp-project-selected[^}]*data-codexpp-project-color-icon[^}]*color:\s*var\(--gray-0\)/s);
-  assert.match(css, /\[data-codexpp-project-color-row\]\[data-codexpp-project-selected="true"\]::after/);
-  assert.doesNotMatch(css, /\[data-codexpp-project-color-row\]\[data-codexpp-project-selected="true"\][^}]*box-shadow/s);
-  assert.doesNotMatch(css, /data-codexpp-project-color-task\]\s+:is/);
-  assert.match(css, /electron-dark[^}]*--codexpp-project-task-foreground/s);
+  const css = document.getElementById("tweaker-project-colors").textContent;
+  assert.match(css, /data-tweaker-project-color-row[^}]*background-color:\s*var\(--tweaker-project-color\)/s);
+  assert.match(css, /data-tweaker-project-color-title[^}]*font-weight:\s*700/s);
+  assert.match(css, /data-tweaker-project-color-title[^}]*text-transform:\s*uppercase/s);
+  assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*background-color:\s*var\(--gray-1000\)/s);
+  assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*color:\s*var\(--gray-0\)/s);
+  assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\]\s+\*[^}]*color:\s*var\(--gray-0\)/s);
+  assert.match(css, /data-tweaker-project-task-label[^}]*font-weight:\s*400/s);
+  assert.match(css, /data-tweaker-project-color-task.*data-tweaker-project-selected[^}]*data-tweaker-project-task-label[^}]*color:\s*var\(--tweaker-project-foreground\)/s);
+  assert.match(css, /data-tweaker-project-color-task.*data-tweaker-project-selected[^}]*svg[^}]*color:\s*var\(--tweaker-project-foreground\)/s);
+  assert.match(css, /data-tweaker-project-color-row.*data-tweaker-project-selected[^}]*data-tweaker-project-color-icon[^}]*color:\s*var\(--gray-0\)/s);
+  assert.match(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\]::after/);
+  assert.doesNotMatch(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*box-shadow/s);
+  assert.doesNotMatch(css, /data-tweaker-project-color-task\]\s+:is/);
+  assert.match(css, /electron-dark[^}]*--tweaker-project-task-foreground/s);
 
   _test.applyNativeProjectColors(api, state);
-  assert.equal(project.querySelectorAll("[data-codexpp-project-color-row]").length, 1);
-  assert.equal(project.querySelectorAll("[data-codexpp-project-color-task]").length, 2);
+  assert.equal(project.querySelectorAll("[data-tweaker-project-color-row]").length, 1);
+  assert.equal(project.querySelectorAll("[data-tweaker-project-color-task]").length, 2);
 
   _test.removeProjectColorArtifacts();
-  assert.equal(project.getAttribute("data-codexpp-project-color-group"), null);
-  assert.equal(header.getAttribute("data-codexpp-project-color-row"), null);
-  assert.equal(header.getAttribute("data-codexpp-project-selected"), null);
-  assert.equal(projectIcon.getAttribute("data-codexpp-project-color-icon"), null);
-  assert.equal(overflowIcon.getAttribute("data-codexpp-project-color-icon"), null);
-  assert.equal(title.getAttribute("data-codexpp-project-color-title"), null);
-  assert.equal(task.getAttribute("data-codexpp-project-color-task"), null);
-  assert.equal(taskAction.getAttribute("data-codexpp-project-task-label"), null);
-  assert.equal(selectedTask.getAttribute("data-codexpp-project-color-task"), null);
-  assert.equal(selectedTaskAction.getAttribute("data-codexpp-project-task-label"), null);
-  assert.equal(header.style.values.has("--codexpp-project-foreground"), false);
-  assert.equal(selectedTask.style.values.has("--codexpp-project-foreground"), false);
-  assert.equal(selectedTask.getAttribute("data-codexpp-project-selected"), null);
-  assert.equal(showMore.getAttribute("data-codexpp-project-show-more"), null);
-  assert.equal(document.getElementById("codexpp-project-colors"), null);
+  assert.equal(project.getAttribute("data-tweaker-project-color-group"), null);
+  assert.equal(header.getAttribute("data-tweaker-project-color-row"), null);
+  assert.equal(header.getAttribute("data-tweaker-project-selected"), null);
+  assert.equal(projectIcon.getAttribute("data-tweaker-project-color-icon"), null);
+  assert.equal(overflowIcon.getAttribute("data-tweaker-project-color-icon"), null);
+  assert.equal(title.getAttribute("data-tweaker-project-color-title"), null);
+  assert.equal(task.getAttribute("data-tweaker-project-color-task"), null);
+  assert.equal(taskAction.getAttribute("data-tweaker-project-task-label"), null);
+  assert.equal(selectedTask.getAttribute("data-tweaker-project-color-task"), null);
+  assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-label"), null);
+  assert.equal(header.style.values.has("--tweaker-project-foreground"), false);
+  assert.equal(selectedTask.style.values.has("--tweaker-project-foreground"), false);
+  assert.equal(selectedTask.getAttribute("data-tweaker-project-selected"), null);
+  assert.equal(showMore.getAttribute("data-tweaker-project-show-more"), null);
+  assert.equal(document.getElementById("tweaker-project-colors"), null);
 });
 
 test("task selection promotes the parent project header to active black", (t) => {
@@ -396,9 +463,9 @@ test("task selection promotes the parent project header to active black", (t) =>
 
   _test.applyNativeProjectColors(api, { nodes: [{ id: "mixed", type: "project", name: "Mixed Case", projectPath: "/Users/example/Mixed Case", color: "#0369a1", overlayIntensity: "subtle" }] });
 
-  assert.equal(header.getAttribute("data-codexpp-project-selected"), "true");
+  assert.equal(header.getAttribute("data-tweaker-project-selected"), "true");
   assert.equal(title.textContent, "Mixed Case", "uppercase remains a visual treatment only");
-  for (const task of tasks) assert.equal(task.getAttribute("data-codexpp-project-selected"), "true");
+  for (const task of tasks) assert.equal(task.getAttribute("data-tweaker-project-selected"), "true");
 });
 
 test("all task tint levels bind to semantic descendants in light and dark themes", (t) => {
@@ -441,12 +508,12 @@ test("all task tint levels bind to semantic descendants in light and dark themes
     else document.body.classList.remove("electron-dark");
     for (const [overlayIntensity, percentage] of Object.entries(levels)) {
       _test.applyNativeProjectColors(api, { nodes: [{ id: "alpha", type: "project", name: "Alpha", color: "#1d4ed8", overlayIntensity }] });
-      assert.equal(project.getAttribute("data-codexpp-project-overlay"), overlayIntensity);
-      assert.equal(header.getAttribute("data-codexpp-project-color-row"), "true");
-      assert.equal(task.getAttribute("data-codexpp-project-color-task"), "true");
-      assert.equal(taskLabel.getAttribute("data-codexpp-project-task-label"), "true");
-      assert.equal(taskStatus.getAttribute("data-codexpp-project-task-label"), null);
-      const css = document.getElementById("codexpp-project-colors").textContent;
+      assert.equal(project.getAttribute("data-tweaker-project-overlay"), overlayIntensity);
+      assert.equal(header.getAttribute("data-tweaker-project-color-row"), "true");
+      assert.equal(task.getAttribute("data-tweaker-project-color-task"), "true");
+      assert.equal(taskLabel.getAttribute("data-tweaker-project-task-label"), "true");
+      assert.equal(taskStatus.getAttribute("data-tweaker-project-task-label"), null);
+      const css = document.getElementById("tweaker-project-colors").textContent;
       if (theme === "dark" && overlayIntensity !== "off") {
         assert.match(css, new RegExp(`electron-dark[^}]*project-overlay="${overlayIntensity}"[^}]*project-task-tint:\\s*${percentage}%`, "s"));
       } else {
@@ -719,9 +786,9 @@ test("renderer owns bounded native project menu integration and reversible tint 
   assert.match(source, /window\.setTimeout\(\(\) => \{[\s\S]*?\}, 1500\)/);
   assert.doesNotMatch(source, /for \(const delay of \[0, 50, 150, 350\]\)/);
   assert.match(source, /PROJECT_COLOR_STYLE_ID/);
-  assert.match(source, /data-codexpp-project-color-group/);
-  assert.match(source, /data-codexpp-project-color-task/);
-  assert.match(source, /data-codexpp-project-show-more/);
+  assert.match(source, /data-tweaker-project-color-group/);
+  assert.match(source, /data-tweaker-project-color-task/);
+  assert.match(source, /data-tweaker-project-show-more/);
   assert.match(source, /removeProjectColorArtifacts/);
 });
 
@@ -736,7 +803,7 @@ test("Projects Settings exposes synchronized Auto, named palette, tint, and cust
 });
 
 test("task tint variables remain available while headers use their full project color", () => {
-  assert.match(source, /--codexpp-project-header-tint:\s*16%/);
+  assert.match(source, /--tweaker-project-header-tint:\s*16%/);
   assert.match(source, /project-overlay="off"[^}]*project-task-tint:\s*0%/s);
   assert.match(source, /project-overlay="subtle"[^}]*project-task-tint:\s*6%/s);
   assert.match(source, /project-overlay="medium"[^}]*project-task-tint:\s*10%/s);
@@ -744,7 +811,7 @@ test("task tint variables remain available while headers use their full project 
   assert.match(source, /electron-dark[\s\S]*project-overlay="subtle"[^}]*project-task-tint:\s*11%/s);
   assert.match(source, /electron-dark[\s\S]*project-overlay="medium"[^}]*project-task-tint:\s*18%/s);
   assert.match(source, /electron-dark[\s\S]*project-overlay="strong"[^}]*project-task-tint:\s*24%/s);
-  assert.match(source, /data-codexpp-project-color-row[^}]*background-color:\s*var\(--codexpp-project-color\)/s);
+  assert.match(source, /data-tweaker-project-color-row[^}]*background-color:\s*var\(--tweaker-project-color\)/s);
 });
 
 class FakeDocument {

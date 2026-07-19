@@ -5,8 +5,8 @@
 │                                Codex.app                                │
 │  Contents/Resources/                                                    │
 │  ├─ app.asar                                                            │
-│  │   ├─ package.json   (main: codex-plusplus-loader.cjs)  ◄─ patched   │
-│  │   ├─ codex-plusplus-loader.cjs                          ◄─ injected │
+│  │   ├─ package.json   (main: tweaker-loader.cjs)  ◄─ patched   │
+│  │   ├─ tweaker-loader.cjs                          ◄─ injected │
 │  │   └─ <original Codex code …>                                         │
 │  ├─ Frameworks/Codex Framework.framework/.../Codex Framework (Owl)      │
 │  │      or Electron Framework.framework on older builds                 │
@@ -18,7 +18,7 @@
                   loader.cjs requires runtime/main.js
                                  ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│  <user-data-dir>/codex-plusplus/                                        │
+│  <user-data-dir>/tweaker/                                        │
 │  ├─ runtime/                                                            │
 │  │   ├─ main.js          — main process; hooks BrowserWindow            │
 │  │   ├─ preload.js       — bundled preload (renderer side)              │
@@ -49,12 +49,12 @@ The renderer only receives cached metadata (`latestVersion`, `releaseUrl`, `upda
    - The hash now matches the patched asar, so this passes.
    - On older Electron-style bundles, the `EnableEmbeddedAsarIntegrityValidation`
      fuse may also be off as a belt-and-suspenders measure.
-4. Electron loads the asar's `package.json#main`, which now points to `codex-plusplus-loader.cjs`.
+4. Electron loads the asar's `package.json#main`, which now points to `tweaker-loader.cjs`.
 5. The loader (in the asar):
-   - Reads `__codexpp.userRoot` from package.json.
-   - Sets `CODEX_PLUSPLUS_USER_ROOT` and `CODEX_PLUSPLUS_RUNTIME` envs.
+   - Reads `__tweaker.userRoot` from package.json.
+   - Sets `TWEAKER_USER_ROOT` and `TWEAKER_RUNTIME` envs.
    - `require()`s `<userRoot>/runtime/main.js`.
-   - `require()`s the original `__codexpp.originalMain` (Codex's real entry).
+   - `require()`s the original `__tweaker.originalMain` (Codex's real entry).
 6. Runtime's `main.js`:
    - Registers our preload via Electron-compatible session APIs (additive —
      Codex's own preload still runs).
@@ -81,7 +81,7 @@ The fuse alone would let us swap in a new asar, but Codex's asar is large (~115 
 
 ### Why local re-signing instead of disabling SIP?
 
-Re-signing is local-only, reversible, and doesn't compromise system security. On macOS, Codex++ creates and reuses a per-machine "Codex++ Local Signing" identity so privacy grants have a stable signer across repair runs. Users can still opt into ad-hoc signing with `--no-local-signing`. We never touch SIP, hardened runtime, or kernel-level protections.
+Re-signing is local-only, reversible, and doesn't compromise system security. On macOS, Tweaker creates and reuses a per-machine "Tweaker Local Signing" identity so privacy grants have a stable signer across repair runs. Users can still opt into ad-hoc signing with `--no-local-signing`. We never touch SIP, hardened runtime, or kernel-level protections.
 
 ### Why a preload, not source-patching the React tree?
 
@@ -94,7 +94,7 @@ So you can iterate on tweaks (and even on the runtime itself) without re-running
 ### What about Owl?
 
 Current Codex builds use Owl: a native Codex shell with a Chromium framework and
-an Electron-compatible JavaScript runtime. Codex++ still patches `app.asar` and
+an Electron-compatible JavaScript runtime. Tweaker still patches `app.asar` and
 still uses Electron-compatible APIs such as `app`, `BrowserWindow`, `session`,
 `ipcMain`, and `ipcRenderer`, but there is no `Electron Framework.framework` in
 the current macOS bundle. See [Owl runtime surface](./OWL-RUNTIME.md) for the
@@ -122,9 +122,9 @@ swapping the entire payload at that path:
 
 Both payloads keep the same bundle id and `productName`, so profile/login
 state is shared across modes. Switching is owned by the installer CLI —
-`tweakers mode <chatgpt|tweakers|status>` — which confirms (unless `--yes`),
+`tweaker mode <chatgpt|tweakers|status>` — which confirms (unless `--yes`),
 quits the app, swaps bundles transactionally (the app path is never empty),
-and relaunches. The in-app App Mode control (Settings → Config, tweakers mode
+and relaunches. The in-app App Mode control (Settings → Config, tweaker mode
 only) confirms in the renderer and then hands the same CLI off via a launchd
 job so the helper survives the app quitting and the bundle swap.
 
@@ -139,7 +139,7 @@ previous working payload.
 Mode discipline:
 
 - In chatgpt mode the watcher, `repair`, `install`, and `refresh-local` all
-  stand down — the `tweakers mode` command is the **only** sanctioned way the
+  stand down — the `tweaker mode` command is the **only** sanctioned way the
   official app path is ever patched, and chatgpt mode is always a
   byte-identical DevID restore away.
 - Alternating signers on one bundle id means some macOS TCC permissions
@@ -157,16 +157,16 @@ When Codex auto-updates via Sparkle:
 1. Sparkle downloads a new Codex.app and replaces ours on disk.
 2. Our patch is gone; the new app launches normally.
 3. Our launchd / systemd / scheduled-task watcher fires (macOS and Linux watch `app.asar`; Windows runs at logon).
-4. The watcher runs `codex-plusplus repair --quiet`.
+4. The watcher runs `tweaker repair --quiet`.
 5. `repair` is idempotent: if the current asar hash still matches `patchedAsarHash`, it exits without touching the app; if the hash drifted after an update, it re-runs the install patch against the new app bundle.
 
-## Codex++ self-updates
+## Tweaker self-updates
 
-The watcher also runs hourly using the GitHub-installed local CLI at `~/.codex-plusplus/source/packages/installer/dist/cli.js`. It checks the latest Codex++ GitHub Release, downloads and rebuilds a newer release when available, then runs `repair`. When the app patch is intact but the installed Codex++ version in `state.json` is older than the running CLI, `repair` refreshes `<user-data-dir>/runtime/` and updates state. It does not modify user tweak folders.
+The watcher also runs hourly using the GitHub-installed local CLI at `~/.tweaker/source/packages/installer/dist/cli.js`. It checks the latest Tweaker GitHub Release, downloads and rebuilds a newer release when available, then runs `repair`. When the app patch is intact but the installed Tweaker version in `state.json` is older than the running CLI, `repair` refreshes `<user-data-dir>/runtime/` and updates state. It does not modify user tweak folders.
 
-Users can disable Codex++ runtime auto-updates from Settings → Codex Plus Plus → Config. The setting is stored in `<user-data-dir>/config.json`; app-update repair still works, but intact-app runtime refreshes are skipped while auto-update is disabled.
+Users can disable Tweaker runtime auto-updates from Settings → Tweaker → Config. The setting is stored in `<user-data-dir>/config.json`; app-update repair still works, but intact-app runtime refreshes are skipped while auto-update is disabled.
 
-The Config page can also check for Codex++ updates manually. It reads GitHub release metadata and opens GitHub release pages for review.
+The Config page can also check for Tweaker updates manually. It reads GitHub release metadata and opens GitHub release pages for review.
 
 ## What's not protected against
 

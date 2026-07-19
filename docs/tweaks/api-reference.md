@@ -1,6 +1,6 @@
 # SDK and API Reference
 
-This is the full public API surface exported by `@codex-plusplus/sdk`.
+This is the full public API surface exported by `@therealityreport/tweakers-sdk`.
 
 Use it for types:
 
@@ -11,7 +11,7 @@ import {
   type Tweak,
   type TweakApi,
   type TweakManifest,
-} from "@codex-plusplus/sdk";
+} from "@therealityreport/tweakers-sdk";
 ```
 
 Runtime note: TypeScript and ESM must be bundled to runtime-loadable JavaScript
@@ -85,7 +85,7 @@ function defineTweak(tweak: Tweak): Tweak
 `defineTweak` is an identity helper for type inference.
 
 ```ts
-import { defineTweak } from "@codex-plusplus/sdk";
+import { defineTweak } from "@therealityreport/tweakers-sdk";
 
 export default defineTweak({
   start(api) {
@@ -104,7 +104,7 @@ Validates the manifest shape. It checks required string fields, id characters,
 GitHub repo format, scope, optional strings, author object, tags, permissions,
 and MCP shape.
 
-It does not check that the entry file exists; `codexplusplus validate-tweak`
+It does not check that the entry file exists; `tweaker validate-tweak`
 adds that filesystem check.
 
 ```ts
@@ -276,7 +276,7 @@ interface TweakMcpServer {
 }
 ```
 
-Declares an MCP server managed by Codex++. See [MCP servers](./mcp.md).
+Declares an MCP server managed by Tweaker. See [MCP servers](./mcp.md).
 
 ## `TweakManifestIssue`
 
@@ -317,7 +317,7 @@ Per-tweak key/value storage.
 Renderer backing store:
 
 ```text
-localStorage["codexpp:storage:<tweak-id>"]
+localStorage["tweaker:storage:<tweak-id>"]
 ```
 
 Main backing store:
@@ -459,7 +459,7 @@ interface TweakIpc {
 Channels are prefixed as:
 
 ```text
-codexpp:<tweak-id>:<channel>
+tweaker:<tweak-id>:<channel>
 ```
 
 Renderer supports `on`, `send`, and `invoke`.
@@ -507,7 +507,7 @@ where required.
 
 These APIs depend on Codex window services exposed by the patch. They may need
 runtime updates when upstream Codex changes its Owl/Electron internals. See
-[Owl runtime surface](../OWL-RUNTIME.md) for the private upstream APIs Codex++
+[Owl runtime surface](../OWL-RUNTIME.md) for the private upstream APIs Tweaker
 currently observes.
 
 `createWindow()` and `createBrowserView()` are kept for backwards
@@ -609,7 +609,7 @@ interface CodexViewCreateOptions {
 ```
 
 Creates an Owl `BrowserView` / `WebContentsView` child inside a Codex window.
-When `route` is provided, Codex++ loads the Codex app route through
+When `route` is provided, Tweaker loads the Codex app route through
 `app://-/index.html` and registers the view with Codex's host context unless
 `registerWithCodex` is `false`. When `url` is provided, it loads that URL.
 
@@ -633,7 +633,7 @@ interface CodexViewRef {
 ```
 
 The ref is serializable and works from renderer or main tweaks. Internally,
-Codex++ prefers Owl's private `contentView.addChildView(view.webContentsView)`
+Tweaker prefers Owl's private `contentView.addChildView(view.webContentsView)`
 path and falls back to `BrowserWindow.addBrowserView(view)`.
 
 ## `CodexViewsApi`
@@ -655,7 +655,7 @@ interface CodexCdpStatus {
 }
 ```
 
-CDP is opt-in. Codex++ reports status but does not silently enable it.
+CDP is opt-in. Tweaker reports status but does not silently enable it.
 
 ## `CodexCdpTarget`
 
@@ -700,7 +700,7 @@ interface NativeModuleLoadOptions {
 }
 ```
 
-`path` is resolved inside the tweak directory. The file must exist, and Codex++
+`path` is resolved inside the tweak directory. The file must exist, and Tweaker
 checks the real path so traversal and symlink escapes outside that directory
 are rejected.
 
@@ -715,7 +715,7 @@ interface NativeModuleRef {
 }
 ```
 
-For `.node` modules, Codex++ calls `module.request(method, payload)` when
+For `.node` modules, Tweaker calls `module.request(method, payload)` when
 present, otherwise it calls an exported function matching `method`.
 The tweak manifest must declare `native-module`.
 
@@ -733,10 +733,10 @@ interface NativePanelCreateOptions {
 ```
 
 Calls a factory exported by a loaded native module. When `moduleId` is omitted,
-Codex++ uses its built-in native host and defaults `factory` to `createPanel`.
+Tweaker uses its built-in native host and defaults `factory` to `createPanel`.
 The runtime supplies the parent native window handle to the module when
 available. After creation,
-Codex++ forwards parent window bounds, focus, visibility, fullscreen, minimize,
+Tweaker forwards parent window bounds, focus, visibility, fullscreen, minimize,
 and close events to optional native methods such as `syncParent(state)`,
 `parentChanged(state)`, `setParentBounds(bounds, state)`, and
 `parentBoundsChanged(bounds, state)`. The tweak manifest must declare
@@ -767,7 +767,7 @@ interface NativeViewAttachOptions {
 }
 ```
 
-When `moduleId` is omitted, Codex++ uses its built-in native host and defaults
+When `moduleId` is omitted, Tweaker uses its built-in native host and defaults
 `factory` to `attachView`. The 1.0.0 built-in host uses a child-window overlay
 with an `MTKView`; direct child `NSView` insertion is reported separately by
 `capabilities.native.directViewAttach`.
@@ -824,7 +824,7 @@ interface CodexNativeApi {
 }
 ```
 
-Native APIs are main-process backed. Renderer tweaks call them through Codex++
+Native APIs are main-process backed. Renderer tweaks call them through Tweaker
 IPC. Local/dev tweaks may load unsigned native code from their own directory;
 store-distributed native tweaks require stricter review. Native module, view,
 and helper permissions are enforced at runtime.

@@ -10,18 +10,18 @@ import { ipcRenderer } from "electron";
 import { registerSection } from "./settings-injector";
 
 export async function mountManager(): Promise<void> {
-  const tweaks = (await ipcRenderer.invoke("codexpp:list-tweaks")) as Array<{
+  const tweaks = (await ipcRenderer.invoke("tweaker:list-tweaks")) as Array<{
     manifest: { id: string; name: string; version: string; description?: string };
     entryExists: boolean;
   }>;
-  const paths = (await ipcRenderer.invoke("codexpp:user-paths")) as {
+  const paths = (await ipcRenderer.invoke("tweaker:user-paths")) as {
     userRoot: string;
     tweaksDir: string;
     logDir: string;
   };
 
   registerSection({
-    id: "codex-plusplus:manager",
+    id: "tweaker:manager",
     title: "Tweak Manager",
     description: `${tweaks.length} tweak(s) installed. User dir: ${paths.userRoot}`,
     render(root) {
@@ -31,12 +31,12 @@ export async function mountManager(): Promise<void> {
       actions.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
       actions.appendChild(
         button("Open tweaks folder", () =>
-          ipcRenderer.invoke("codexpp:reveal", paths.tweaksDir).catch(() => {}),
+          ipcRenderer.invoke("tweaker:reveal", paths.tweaksDir).catch(() => {}),
         ),
       );
       actions.appendChild(
         button("Open logs", () =>
-          ipcRenderer.invoke("codexpp:reveal", paths.logDir).catch(() => {}),
+          ipcRenderer.invoke("tweaker:reveal", paths.logDir).catch(() => {}),
         ),
       );
       actions.appendChild(

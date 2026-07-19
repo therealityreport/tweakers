@@ -3,6 +3,7 @@
 
 const crypto = require("node:crypto");
 const { validateAnswers, validateAskInput } = require("./core");
+const { version: SERVER_VERSION } = require("./manifest.json");
 
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
 const LEGACY_PROTOCOL_VERSION = "2025-06-18";
@@ -68,7 +69,7 @@ async function handleMessage(line) {
       return reply(message.id, {
         protocolVersion: negotiatedProtocolVersion,
         capabilities: { tools: {} },
-        serverInfo: { name: "user-questions", version: "0.4.7" },
+        serverInfo: { name: "user-questions", version: SERVER_VERSION },
       });
     }
     if (message.method === "ping") return reply(message.id, {});

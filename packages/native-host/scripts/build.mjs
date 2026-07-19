@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
-const src = resolve(root, "src", "codexpp_native_host.mm");
+const src = resolve(root, "src", "tweaker_native_host.mm");
 const outDir = resolve(root, "dist");
-const out = resolve(outDir, "codexpp_native_host.node");
+const out = resolve(outDir, "tweaker_native_host.node");
 
 mkdirSync(outDir, { recursive: true });
 

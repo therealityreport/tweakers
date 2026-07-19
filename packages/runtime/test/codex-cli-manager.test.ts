@@ -24,10 +24,15 @@ const RELEASE: CodexCliRelease = {
 
 test("derives every managed path under the Tweakers-owned root", () => {
   const paths = deriveCodexCliPaths("/Users/example");
-  assert.equal(paths.root, "/Users/example/Library/Application Support/codex-plusplus/codex-cli");
+  assert.equal(paths.root, "/Users/example/Library/Application Support/Tweakers/codex-cli");
   assert.equal(paths.state, join(paths.root, "state.json"));
   assert.equal(paths.releases, join(paths.root, "releases"));
   assert.equal(paths.staging, join(paths.root, "staging"));
+});
+
+test("managed Codex CLI follows the selected existing user root", () => {
+  const activeRoot = "/Users/example/Library/Application Support/legacy-install";
+  assert.equal(deriveCodexCliPaths("/Users/example", activeRoot).root, join(activeRoot, "codex-cli"));
 });
 
 test("archive validation rejects traversal, absolute paths, devices, and links", () => {
@@ -215,6 +220,19 @@ test("rollback swaps only after previous is revalidated", async () => {
   });
 });
 
+test("committed managed receipt rejects binary-byte tampering", async () => {
+  await withFixture(async ({ home, deps }) => {
+    const manager = createCodexCliManager({ home, deps });
+    await manager.installBeta();
+    const binary = manager.getSelectedBinary();
+    assert.ok(binary);
+    writeFileSync(binary, "tampered", { flag: "a" });
+    const validation = await manager.validateCurrent();
+    assert.equal(validation.valid, false);
+    assert.match(validation.error ?? "", /binary digest/i);
+  });
+});
+
 test("bootstrap preserves unmanaged override, clears bundled, applies validated beta, and falls back safely", async () => {
   await withFixture(async ({ home, deps }) => {
     const emptyEnv: NodeJS.ProcessEnv = {};
@@ -227,6 +245,36 @@ test("bootstrap preserves unmanaged override, clears bundled, applies validated 
     assert.equal(present.effectiveLane, "beta");
     assert.equal(env.CODEX_CLI_PATH, "/user/override");
     assert.equal(applyManagedCodexCliLaneAtBootstrap({ lane: "bundled", home, env }).effectiveLane, "bundled");
+    assert.equal(env.CODEX_CLI_PATH, undefined);
+
+    const isolated = "/tmp/tweaker-environments/alpha/backend/codex";
+    const explicit = applyManagedCodexCliLaneAtBootstrap({
+      lane: "beta",
+      home,
+      env,
+      selectedManagedCli: {
+        binaryPath: isolated,
+        version: "0.145.0-alpha.3",
+        fingerprint: "b".repeat(64),
+      },
+      validateSelectedManagedBinary: () => ({ valid: true }),
+    });
+    assert.equal(explicit.effectiveLane, "beta");
+    assert.equal(explicit.binary, isolated);
+    assert.equal(env.CODEX_CLI_PATH, isolated);
+
+    const rejectedExplicit = applyManagedCodexCliLaneAtBootstrap({
+      lane: "beta",
+      home,
+      env,
+      selectedManagedCli: {
+        binaryPath: isolated,
+        version: "0.145.0-alpha.3",
+        fingerprint: "b".repeat(64),
+      },
+      validateSelectedManagedBinary: () => ({ valid: false, error: "fingerprint mismatch" }),
+    });
+    assert.equal(rejectedExplicit.effectiveLane, "bundled");
     assert.equal(env.CODEX_CLI_PATH, undefined);
 
     const manager = createCodexCliManager({ home, deps });

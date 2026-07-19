@@ -54,6 +54,18 @@ export interface SparkleAppcastMetadata {
   error: string | null;
 }
 
+export interface SparkleFeedCapture {
+  feedUrl: string | null;
+  fallbackFeedUrl: string | null;
+}
+
+export interface SparkleProfileFeed {
+  /** Stable key derived from the verified application identity/profile. */
+  identityKey: string;
+  feedUrl: string;
+  fallbackFeedUrl?: string | null;
+}
+
 export interface SparkleFetchResponse {
   url: string;
   status: number;
@@ -68,6 +80,12 @@ export type SparkleFetch = (
 ) => Promise<SparkleFetchResponse>;
 
 export interface CodexSparkleBridgeOptions {
+  /** Runs the bounded Tweakers-owned manual update check without invoking raw Sparkle/XPC. */
+  requestManualCheck?: () => void | Promise<void>;
+  /** Runs the bounded metadata-only check used by OpenAI's startup/interval timer. */
+  requestBackgroundCheck?: () => void | Promise<void>;
+  /** Starts Tweakers' durable desktop-update transaction from OpenAI's native Update control. */
+  requestInstall?: () => void | Promise<void>;
   /** Restores the verified pristine app and enters update mode immediately before Sparkle installs. */
   prepareForInstall?: () => void | boolean;
   /** Rechecks signed-backup continuity without mutating the live app. */
@@ -78,6 +96,9 @@ export interface CodexSparkleBridgeOptions {
   appcastTimeoutMs?: number;
   maxAppcastBytes?: number;
   maxAppcastRedirects?: number;
+  onNativeControlActivityChanged?: (active: boolean) => void;
+  /** Receives only redacted HTTPS URLs after OpenAI's native init succeeds. */
+  onFeedCaptured?: (capture: SparkleFeedCapture) => void;
 }
 
 const SAFE_LIFECYCLE = new Set<SparkleLifecycleState>([
@@ -88,6 +109,15 @@ const SAFE_LIFECYCLE = new Set<SparkleLifecycleState>([
   "installing",
   "failed",
 ]);
+
+export const CODEX_PUBLIC_PRODUCTION_APPCAST = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
+
+interface AppcastFeedCandidate {
+  label: string;
+  url: string;
+  metadataUrl?: string;
+  headers: unknown;
+}
 
 /**
  * A narrow observer/action seam around OpenAI's native Sparkle addon.
@@ -101,9 +131,14 @@ export class CodexSparkleBridge {
   private readonly wrapped = new WeakSet<object>();
   private native: SparkleNativeExports | null = null;
   private headers: unknown = undefined;
-  private lastAppcast: SparkleAppcastMetadata | null = null;
+  private readonly lastAppcasts = new Map<string, SparkleAppcastMetadata>();
   private nativeChecksSuppressed = false;
   private nativeSchedulerDisabled = false;
+  private safeUpdateAvailable = false;
+  private readonly downstreamSinks: Partial<Record<
+    "setUpdateLifecycleStateSink" | "setDownloadProgressSink" | "setInstallProgressSink" | "setUpdateReadySink",
+    (...args: unknown[]) => void
+  >> = {};
   private state: SparkleBridgeSnapshot = {
     available: false,
     lifecycle: "idle",
@@ -166,6 +201,30 @@ export class CodexSparkleBridge {
     return { ...this.state };
   }
 
+  nativeUpdateControlActive(): boolean {
+    return this.safeUpdateAvailable && typeof this.downstreamSinks.setUpdateReadySink === "function";
+  }
+
+  /**
+   * Reuses OpenAI's own animated update control for a release discovered by
+   * Tweakers' metadata-only checker. Its install action is redirected to the
+   * durable environment transaction, never to raw Sparkle in the patched app.
+   */
+  setSafeUpdateAvailable(available: boolean): void {
+    this.safeUpdateAvailable = available;
+    this.state.ready = available;
+    if (available) {
+      this.state.lifecycle = "ready";
+      this.emitDownstream("setUpdateReadySink", true);
+      this.emitDownstream("setUpdateLifecycleStateSink", "ready");
+    } else {
+      if (this.state.lifecycle === "ready") this.state.lifecycle = "idle";
+      this.emitDownstream("setUpdateReadySink", false);
+      this.emitDownstream("setUpdateLifecycleStateSink", this.state.lifecycle);
+    }
+    this.refreshActionability();
+  }
+
   async installUpdate(): Promise<boolean> {
     this.refreshActionability();
     if (!this.state.canInstall || !this.native) return false;
@@ -186,12 +245,60 @@ export class CodexSparkleBridge {
    * Sparkle. Authorization headers never leave this method or enter its result.
    */
   async fetchAppcastMetadata(): Promise<SparkleAppcastMetadata> {
-    const feeds = [
-      this.state.feedUrl ? { url: this.state.feedUrl, headers: this.headers } : null,
+    const candidates = [
+      this.state.feedUrl ? { label: "captured feed", url: this.state.feedUrl, headers: this.headers } : null,
       this.state.fallbackFeedUrl && this.state.fallbackFeedUrl !== this.state.feedUrl
-        ? { url: this.state.fallbackFeedUrl, headers: undefined }
+        ? { label: "captured fallback feed", url: this.state.fallbackFeedUrl, headers: undefined }
         : null,
-    ].filter((entry): entry is { url: string; headers: unknown } => entry !== null);
+      { label: "public production feed", url: CODEX_PUBLIC_PRODUCTION_APPCAST, headers: undefined },
+    ].filter((entry): entry is { label: string; url: string; headers: unknown } => entry !== null);
+    const feeds = candidates.filter((feed, index) => (
+      candidates.findIndex((candidate) => candidate?.url === feed.url) === index
+    ));
+    return this.fetchAppcastCandidates("stable", feeds, CODEX_PUBLIC_PRODUCTION_APPCAST);
+  }
+
+  /**
+   * Fetch metadata only from a feed captured for one verified app identity.
+   * There is deliberately no production fallback here: Alpha must never read
+   * Stable metadata, even when its captured feed is unavailable.
+   */
+  async fetchProfileAppcastMetadata(profileFeed: SparkleProfileFeed): Promise<SparkleAppcastMetadata> {
+    const feedUrl = requirePersistableHttpsUrl(profileFeed.feedUrl);
+    const fallbackFeedUrl = profileFeed.fallbackFeedUrl
+      ? requirePersistableHttpsUrl(profileFeed.fallbackFeedUrl)
+      : null;
+    const livePrimary = this.state.feedUrl
+      && persistableHttpsUrl(this.state.feedUrl) === feedUrl
+      ? this.state.feedUrl
+      : feedUrl;
+    const liveFallback = fallbackFeedUrl && this.state.fallbackFeedUrl
+      && persistableHttpsUrl(this.state.fallbackFeedUrl) === fallbackFeedUrl
+      ? this.state.fallbackFeedUrl
+      : fallbackFeedUrl;
+    const candidates: AppcastFeedCandidate[] = [{
+      label: "captured profile feed",
+      url: livePrimary,
+      metadataUrl: feedUrl,
+      headers: livePrimary === this.state.feedUrl ? this.headers : undefined,
+    }];
+    if (liveFallback && liveFallback !== livePrimary) {
+      candidates.push({
+        label: "captured profile fallback feed",
+        url: liveFallback,
+        metadataUrl: fallbackFeedUrl!,
+        headers: undefined,
+      });
+    }
+    return this.fetchAppcastCandidates(`profile:${profileFeed.identityKey}`, candidates, feedUrl);
+  }
+
+  private async fetchAppcastCandidates(
+    cacheKey: string,
+    feeds: AppcastFeedCandidate[],
+    unavailableFeedUrl: string,
+  ): Promise<SparkleAppcastMetadata> {
+    const failures: string[] = [];
 
     for (const feed of feeds) {
       try {
@@ -199,29 +306,34 @@ export class CodexSparkleBridge {
         const parsed = parseAppcast(xml);
         const metadata: SparkleAppcastMetadata = {
           ...parsed,
-          feedUrl: feed.url,
+          feedUrl: feed.metadataUrl ?? feed.url,
           checkedAt: (this.options.now?.() ?? new Date()).toISOString(),
           stale: false,
           error: null,
         };
-        this.lastAppcast = metadata;
+        this.lastAppcasts.set(cacheKey, metadata);
+        this.state.lastError = null;
         return { ...metadata };
-      } catch {
-        // Try OpenAI's public fallback. Errors remain intentionally redacted.
+      } catch (error) {
+        failures.push(`${feed.label}: ${redactedAppcastFailure(error)}`);
       }
     }
 
-    if (this.lastAppcast) {
-      return { ...this.lastAppcast, stale: true, error: "Appcast metadata is unavailable." };
+    const failure = `Appcast metadata is unavailable (${failures.join("; ")}).`;
+    this.fail(failure);
+
+    const lastAppcast = this.lastAppcasts.get(cacheKey);
+    if (lastAppcast) {
+      return { ...lastAppcast, stale: true, error: failure };
     }
     return {
       marketingVersion: "Unavailable",
       build: "Unavailable",
       releaseUrl: null,
-      feedUrl: this.state.fallbackFeedUrl ?? this.state.feedUrl ?? "Unavailable",
+      feedUrl: unavailableFeedUrl,
       checkedAt: (this.options.now?.() ?? new Date()).toISOString(),
       stale: false,
-      error: "Appcast metadata is unavailable.",
+      error: failure,
     };
   }
 
@@ -229,13 +341,22 @@ export class CodexSparkleBridge {
     const original = addon.init;
     if (typeof original !== "function") return;
     const bridge = this;
-    addon.init = function codexPlusPlusSparkleInit(this: unknown, ...args: unknown[]) {
+    addon.init = function tweakerSparkleInit(this: unknown, ...args: unknown[]) {
       bridge.captureInit(args);
       try {
         const result = Reflect.apply(original, this, args);
         bridge.state.available = true;
         bridge.state.lastError = null;
         bridge.refreshActionability();
+        const capture = bridge.capturedFeedForPersistence();
+        if (capture.feedUrl) {
+          try {
+            bridge.options.onFeedCaptured?.(capture);
+          } catch {
+            // Persistence is observational and must never break OpenAI's
+            // successful native updater initialization.
+          }
+        }
         return result;
       } catch (error) {
         bridge.state.available = false;
@@ -248,15 +369,44 @@ export class CodexSparkleBridge {
 
   /**
    * Sparkle's XPC bootstrap assumes the outer app still has OpenAI's signing
-   * identity. In a locally signed Tweakers app, both manual and scheduled
-   * checks relaunch the foreground ChatGPT executable while looking for that
-   * service. Keep native checks inert and use the bounded signed-appcast path
-   * for version discovery instead.
+   * identity. In a locally signed Tweakers app, raw checks relaunch the
+   * foreground ChatGPT executable while looking for that service. Redirect the
+   * visible manual command and OpenAI's background timer to Tweakers' bounded
+   * services while keeping raw native checks inert.
    */
   private suppressNativeChecks(addon: SparkleNativeExports): void {
-    for (const name of ["checkForUpdates", "checkForUpdatesInBackground"] as const) {
-      if (typeof addon[name] !== "function") continue;
-      addon[name] = function codexPlusPlusSuppressedSparkleCheck() { return false; };
+    if (typeof addon.checkForUpdates === "function") {
+      const bridge = this;
+      addon.checkForUpdates = function tweakerManualUpdateCheck() {
+        try {
+          const result = bridge.options.requestManualCheck?.();
+          if (result && typeof (result as PromiseLike<void>).then === "function") {
+            void Promise.resolve(result).catch(() => {
+              bridge.fail("Manual desktop update check failed.");
+            });
+          }
+        } catch {
+          bridge.fail("Manual desktop update check failed.");
+        }
+        return false;
+      };
+      this.nativeChecksSuppressed = true;
+    }
+    if (typeof addon.checkForUpdatesInBackground === "function") {
+      const bridge = this;
+      addon.checkForUpdatesInBackground = function tweakerBackgroundUpdateCheck() {
+        try {
+          const result = bridge.options.requestBackgroundCheck?.();
+          if (result && typeof (result as PromiseLike<void>).then === "function") {
+            void Promise.resolve(result).catch(() => {
+              bridge.fail("Background desktop update check failed.");
+            });
+          }
+        } catch {
+          bridge.fail("Background desktop update check failed.");
+        }
+        return false;
+      };
       this.nativeChecksSuppressed = true;
     }
   }
@@ -294,7 +444,7 @@ export class CodexSparkleBridge {
     for (const name of ["scheduleNextUpdateCheck", "resetUpdateCycle"] as const) {
       try {
         if (typeof addon[name] !== "function") continue;
-        addon[name] = function codexPlusPlusSuppressedSparkleSchedule() { return undefined; };
+        addon[name] = function tweakerSuppressedSparkleSchedule() { return undefined; };
         acted = true;
       } catch {
         // Optional native scheduler seams are best-effort across app versions.
@@ -311,12 +461,22 @@ export class CodexSparkleBridge {
   ): void {
     const original = addon[name];
     if (typeof original !== "function") return;
-    addon[name] = function codexPlusPlusSparkleSinkSetter(this: unknown, sink: (...args: unknown[]) => void) {
+    const bridge = this;
+    addon[name] = function tweakerSparkleSinkSetter(this: unknown, sink: unknown) {
+      const wasActive = bridge.nativeUpdateControlActive();
+      if (typeof sink === "function") bridge.downstreamSinks[name] = sink as (...args: unknown[]) => void;
+      else delete bridge.downstreamSinks[name];
       const tee = (...args: unknown[]) => {
         observe(args[0]);
         if (typeof sink === "function") Reflect.apply(sink, undefined, args);
       };
-      return Reflect.apply(original, this, [tee]);
+      const result = Reflect.apply(original, this, [tee]);
+      if (bridge.safeUpdateAvailable) bridge.replaySafeUpdateToSink(name);
+      if (name === "setUpdateReadySink") {
+        const isActive = bridge.nativeUpdateControlActive();
+        if (isActive !== wasActive) bridge.options.onNativeControlActivityChanged?.(isActive);
+      }
+      return result;
     };
   }
 
@@ -327,11 +487,29 @@ export class CodexSparkleBridge {
     const original = addon[name];
     if (typeof original !== "function") return;
     const bridge = this;
-    addon[name] = function codexPlusPlusSparkleInstall(this: unknown, ...args: unknown[]) {
+    addon[name] = function tweakerSparkleInstall(this: unknown, ...args: unknown[]) {
       const prerequisite = bridge.installPrerequisite();
       if (!prerequisite.ok) {
         bridge.refreshActionability();
         return false;
+      }
+      if (bridge.safeUpdateAvailable && bridge.options.requestInstall) {
+        bridge.safeUpdateAvailable = false;
+        bridge.state.lifecycle = "installing";
+        bridge.state.ready = false;
+        bridge.state.lastError = null;
+        bridge.emitDownstream("setUpdateReadySink", false);
+        bridge.emitDownstream("setUpdateLifecycleStateSink", "installing");
+        try {
+          const requested = bridge.options.requestInstall();
+          if (requested && typeof (requested as PromiseLike<void>).then === "function") {
+            void Promise.resolve(requested).catch(() => bridge.restoreSafeUpdateAfterInstallFailure());
+          }
+          return true;
+        } catch {
+          bridge.restoreSafeUpdateAfterInstallFailure();
+          return false;
+        }
       }
       try {
         if (bridge.options.prepareForInstall?.() === false) {
@@ -349,10 +527,43 @@ export class CodexSparkleBridge {
     };
   }
 
+  private replaySafeUpdateToSink(
+    name: "setUpdateLifecycleStateSink" | "setDownloadProgressSink" | "setInstallProgressSink" | "setUpdateReadySink",
+  ): void {
+    if (name === "setUpdateReadySink") this.emitDownstream(name, true);
+    if (name === "setUpdateLifecycleStateSink") this.emitDownstream(name, "ready");
+  }
+
+  private emitDownstream(
+    name: "setUpdateLifecycleStateSink" | "setDownloadProgressSink" | "setInstallProgressSink" | "setUpdateReadySink",
+    value: unknown,
+  ): void {
+    const sink = this.downstreamSinks[name];
+    if (typeof sink !== "function") return;
+    try {
+      Reflect.apply(sink, undefined, [value]);
+    } catch {
+      // OpenAI owns these display callbacks; a renderer teardown must not
+      // interfere with updater state or the durable transaction.
+    }
+  }
+
+  private restoreSafeUpdateAfterInstallFailure(): void {
+    this.state.lastError = "Desktop update handoff failed.";
+    this.setSafeUpdateAvailable(true);
+  }
+
   private captureInit(args: unknown[]): void {
     this.state.feedUrl = safeHttpsUrl(args[0]);
     this.headers = args.length >= 2 ? args[1] : undefined;
     this.state.fallbackFeedUrl = safeHttpsUrl(args[2]);
+  }
+
+  private capturedFeedForPersistence(): SparkleFeedCapture {
+    return {
+      feedUrl: persistableHttpsUrl(this.state.feedUrl),
+      fallbackFeedUrl: persistableHttpsUrl(this.state.fallbackFeedUrl),
+    };
   }
 
   private async fetchBoundedAppcast(initialUrl: string, headers: unknown): Promise<string> {
@@ -370,9 +581,10 @@ export class CodexSparkleBridge {
     });
     try {
       let url = requireHttpsUrl(initialUrl);
+      let requestHeaders = headers;
       for (let redirects = 0; ; redirects += 1) {
         const response = await Promise.race([
-          fetcher(url, { headers, signal: controller.signal, redirect: "manual" }),
+          fetcher(url, { headers: requestHeaders, signal: controller.signal, redirect: "manual" }),
           deadline,
         ]);
         requireHttpsUrl(response.url || url);
@@ -380,7 +592,9 @@ export class CodexSparkleBridge {
           if (redirects >= maxRedirects) throw new Error("too many redirects");
           const location = response.headers.get("location");
           if (!location) throw new Error("redirect missing location");
-          url = requireHttpsUrl(new URL(location, url).toString());
+          const nextUrl = requireHttpsUrl(new URL(location, url).toString());
+          if (new URL(nextUrl).origin !== new URL(url).origin) requestHeaders = undefined;
+          url = nextUrl;
           continue;
         }
         if (!response.ok) throw new Error("appcast request failed");
@@ -427,6 +641,9 @@ export class CodexSparkleBridge {
     } else if (!prerequisite.ok) {
       this.state.canInstall = false;
       this.state.installPrerequisiteFailure = prerequisite.reason ?? "Signed Codex.app backup is unavailable.";
+    } else if (this.safeUpdateAvailable && typeof this.options.requestInstall === "function") {
+      this.state.canInstall = true;
+      this.state.installPrerequisiteFailure = null;
     } else if (this.nativeChecksSuppressed) {
       this.state.canInstall = false;
       this.state.installPrerequisiteFailure = "Native desktop updates are paused while Tweakers is active; use the signed-app refresh flow.";
@@ -477,6 +694,23 @@ function safeHttpsUrl(value: unknown): string | null {
   }
 }
 
+function persistableHttpsUrl(value: unknown): string | null {
+  const safe = safeHttpsUrl(value);
+  if (!safe) return null;
+  const url = new URL(safe);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function requirePersistableHttpsUrl(value: unknown): string {
+  const safe = persistableHttpsUrl(value);
+  if (!safe || safe !== value) throw new Error("Captured profile appcast URL is invalid");
+  return safe;
+}
+
 async function defaultSparkleFetch(
   url: string,
   init: { headers?: unknown; signal: AbortSignal; redirect: "manual" },
@@ -500,7 +734,15 @@ function parseAppcast(xml: string): Pick<SparkleAppcastMetadata, "marketingVersi
     const marketingVersion = readXmlAttribute(enclosure, "shortVersionString")
       ?? readXmlElement(item, "shortVersionString");
     const build = readXmlAttribute(enclosure, "version") ?? readXmlElement(item, "version");
-    if (!marketingVersion || !build || marketingVersion.length > 80 || build.length > 80) return [];
+    const archiveUrl = readXmlAttribute(enclosure, "url");
+    const archiveSignature = readXmlAttribute(enclosure, "edSignature");
+    // Metadata is authenticated by the trusted HTTPS feed. Requiring a valid
+    // Ed25519-shaped Sparkle enclosure signature additionally ensures we never
+    // advertise an item the native OpenAI updater could not verify at install.
+    // The signature covers the archive bytes, not the surrounding XML fields.
+    if (!marketingVersion || !build || marketingVersion.length > 80 || build.length > 80
+      || !archiveUrl || safeHttpsUrl(archiveUrl) === null
+      || !isSparkleEd25519Signature(archiveSignature)) return [];
     const releaseCandidate = readXmlElement(item, "releaseNotesLink") ?? readXmlElement(item, "link");
     return [{
       marketingVersion,
@@ -511,6 +753,16 @@ function parseAppcast(xml: string): Pick<SparkleAppcastMetadata, "marketingVersi
   if (releases.length === 0) throw new Error("appcast has no release");
   releases.sort((left, right) => compareAppcastRelease(right, left));
   return releases[0]!;
+}
+
+function isSparkleEd25519Signature(value: string | null): boolean {
+  if (!value || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  try {
+    const bytes = Buffer.from(value, "base64");
+    return bytes.byteLength === 64 && bytes.toString("base64") === value;
+  } catch {
+    return false;
+  }
 }
 
 function readXmlAttribute(element: string, localName: string): string | null {
@@ -559,4 +811,16 @@ function boundedInteger(value: number | undefined, fallback: number, min: number
   return typeof value === "number" && Number.isInteger(value)
     ? Math.max(min, Math.min(max, value))
     : fallback;
+}
+
+function redactedAppcastFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (/timeout/i.test(message)) return "timed out";
+  if (/too many redirects/i.test(message)) return "too many redirects";
+  if (/redirect missing location/i.test(message)) return "redirect missing location";
+  if (/transport must be HTTPS/i.test(message)) return "insecure redirect rejected";
+  if (/too large/i.test(message)) return "response too large";
+  if (/invalid appcast|no release/i.test(message)) return "invalid signed appcast";
+  if (/request failed/i.test(message)) return "request failed";
+  return "request failed";
 }

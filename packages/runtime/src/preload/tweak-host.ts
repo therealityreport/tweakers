@@ -39,6 +39,7 @@ import type {
   ReactFiberNode,
   Tweak,
 } from "@therealityreport/tweakers-sdk";
+import { createRendererStorage } from "../renderer-storage";
 
 interface ListedTweak {
   manifest: TweakManifest;
@@ -78,15 +79,15 @@ const loaded = new Map<string, { stop?: () => void }>();
 let cachedPaths: UserPaths | null = null;
 
 export async function startTweakHost(): Promise<void> {
-  const tweaks = (await ipcRenderer.invoke("codexpp:list-tweaks")) as ListedTweak[];
-  const paths = (await ipcRenderer.invoke("codexpp:user-paths")) as UserPaths;
+  const tweaks = (await ipcRenderer.invoke("tweaker:list-tweaks")) as ListedTweak[];
+  const paths = (await ipcRenderer.invoke("tweaker:user-paths")) as UserPaths;
   cachedPaths = paths;
   // Push the list to the settings injector so the Tweaks page can render
   // cards even before any tweak's start() runs (and for disabled tweaks
   // that we never load).
   setListedTweaks(tweaks);
   // Stash for the settings injector's empty-state message.
-  (window as unknown as { __codexpp_tweaks_dir__?: string }).__codexpp_tweaks_dir__ =
+  (window as unknown as { __tweaker_tweaks_dir__?: string }).__tweaker_tweaks_dir__ =
     paths.tweaksDir;
 
   for (const t of tweaks) {
@@ -110,16 +111,16 @@ export async function startTweakHost(): Promise<void> {
       );
       if (result.status === "timed_out") {
         sendLifecycle(t.manifest.id, "timed_out", `startup exceeded ${DEFAULT_TWEAK_STARTUP_TIMEOUT_MS}ms`);
-        console.error("[codex-plus-plus] tweak startup timed out:", t.manifest.id);
+        console.error("[tweaker] tweak startup timed out:", t.manifest.id);
       } else {
         sendLifecycle(t.manifest.id, "ready");
       }
     } catch (e) {
       sendLifecycle(t.manifest.id, "failed", e);
-      console.error("[codex-plus-plus] tweak load failed:", t.manifest.id, e);
+      console.error("[tweaker] tweak load failed:", t.manifest.id, e);
       try {
         ipcRenderer.send(
-          "codexpp:preload-log",
+          "tweaker:preload-log",
           "error",
           "tweak load failed: " + t.manifest.id + ": " + String((e as Error)?.stack ?? e),
         );
@@ -128,11 +129,11 @@ export async function startTweakHost(): Promise<void> {
   }
 
   console.info(
-    `[codex-plusplus] renderer host loaded ${loaded.size} tweak(s):`,
+    `[tweaker] renderer host loaded ${loaded.size} tweak(s):`,
     [...loaded.keys()].join(", ") || "(none)",
   );
   ipcRenderer.send(
-    "codexpp:preload-log",
+    "tweaker:preload-log",
     "info",
     `renderer host loaded ${loaded.size} tweak(s): ${[...loaded.keys()].join(", ") || "(none)"}`,
   );
@@ -151,7 +152,7 @@ function sendLifecycle(
     : "enabled";
   updateListedTweakLifecycle(id, rendererLifecycle, error === undefined ? undefined : error instanceof Error ? error.message : String(error));
   try {
-    ipcRenderer.send("codexpp:tweak-lifecycle", {
+    ipcRenderer.send("tweaker:tweak-lifecycle", {
       id,
       process: "renderer",
       status,
@@ -172,10 +173,10 @@ export function teardownTweakHost(): void {
     try {
       t.stop?.();
     } catch (e) {
-      console.warn("[codex-plusplus] tweak stop failed:", id, e);
+      console.warn("[tweaker] tweak stop failed:", id, e);
     } finally {
-      void ipcRenderer.invoke("codexpp:codex-view-dispose-tweak", id).catch(() => {});
-      void ipcRenderer.invoke("codexpp:native-dispose-tweak", id).catch(() => {});
+      void ipcRenderer.invoke("tweaker:codex-view-dispose-tweak", id).catch(() => {});
+      void ipcRenderer.invoke("tweaker:native-dispose-tweak", id).catch(() => {});
     }
   }
   loaded.clear();
@@ -184,7 +185,7 @@ export function teardownTweakHost(): void {
 
 async function loadTweak(t: ListedTweak, paths: UserPaths): Promise<void> {
   const source = (await ipcRenderer.invoke(
-    "codexpp:read-tweak-source",
+    "tweaker:read-tweak-source",
     t.entry,
   )) as string;
 
@@ -198,7 +199,7 @@ async function loadTweak(t: ListedTweak, paths: UserPaths): Promise<void> {
     "module",
     "exports",
     "console",
-    `${source}\n//# sourceURL=codexpp-tweak://${encodeURIComponent(t.manifest.id)}/${encodeURIComponent(t.entry)}`,
+    `${source}\n//# sourceURL=tweaker-tweak://${encodeURIComponent(t.manifest.id)}/${encodeURIComponent(t.entry)}`,
   );
   fn(module, exports, console);
   const mod = module.exports as { default?: Tweak } & Tweak;
@@ -219,7 +220,7 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
       : level === "warn" ? console.warn
       : level === "error" ? console.error
       : console.log;
-    consoleFn(`[codex-plusplus][${id}]`, ...a);
+    consoleFn(`[tweaker][${id}]`, ...a);
     // Also mirror to main's log file so we can diagnose tweak behavior
     // without attaching DevTools. Stringify each arg defensively.
     try {
@@ -229,7 +230,7 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
         try { return JSON.stringify(v); } catch { return String(v); }
       });
       ipcRenderer.send(
-        "codexpp:preload-log",
+        "tweaker:preload-log",
         level,
         `[tweak ${id}] ${parts.join(" ")}`,
       );
@@ -286,14 +287,14 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
     ipc: {
       on: (c, h) => {
         const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
-        ipcRenderer.on(`codexpp:${id}:${c}`, wrapped);
-        return () => ipcRenderer.removeListener(`codexpp:${id}:${c}`, wrapped);
+        ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
+        return () => ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
       },
-      send: (c, ...args) => ipcRenderer.send(`codexpp:${id}:${c}`, ...args),
+      send: (c, ...args) => ipcRenderer.send(`tweaker:${id}:${c}`, ...args),
       invoke: <T>(c: string, ...args: unknown[]) => {
         if (id === "co.tweakers.thread-summary-profiles" && c === "profiles.read") {
           return ipcRenderer.invoke(
-            "codexpp:cross-tweak-read",
+            "tweaker:cross-tweak-read",
             id,
             "co.tweakers.projects",
             "profiles.read",
@@ -302,14 +303,14 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
         }
         if (id === "co.tweakers.followup" && c === "policy") {
           return ipcRenderer.invoke(
-            "codexpp:cross-tweak-read",
+            "tweaker:cross-tweak-read",
             id,
             "co.tweakers.projects",
             "followup.policy.read",
             args[0],
           ) as Promise<T>;
         }
-        return ipcRenderer.invoke(`codexpp:${id}:${c}`, ...args) as Promise<T>;
+        return ipcRenderer.invoke(`tweaker:${id}:${c}`, ...args) as Promise<T>;
       },
     },
     fs: rendererFs(id, paths),
@@ -321,7 +322,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
   return {
     runtime: {
       getInfo: async () => {
-        const info = await ipcRenderer.invoke("codexpp:codex-runtime-info") as CodexRuntimeInfo;
+        const info = await ipcRenderer.invoke("tweaker:codex-runtime-info") as CodexRuntimeInfo;
         const bridge = rendererElectronBridge();
         return {
           ...info,
@@ -330,22 +331,22 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
         };
       },
       getCapabilities: () =>
-        ipcRenderer.invoke("codexpp:codex-runtime-capabilities") as Promise<CodexRuntimeCapabilities>,
+        ipcRenderer.invoke("tweaker:codex-runtime-capabilities") as Promise<CodexRuntimeCapabilities>,
     },
     windows: {
       create: (options) =>
-        ipcRenderer.invoke("codexpp:codex-window-create", options) as Promise<CodexWindowRef>,
+        ipcRenderer.invoke("tweaker:codex-window-create", options) as Promise<CodexWindowRef>,
       getPrimary: () =>
-        ipcRenderer.invoke("codexpp:codex-window-primary") as Promise<CodexWindowRef | null>,
+        ipcRenderer.invoke("tweaker:codex-window-primary") as Promise<CodexWindowRef | null>,
       focus: (windowId) =>
-        ipcRenderer.invoke("codexpp:codex-window-focus", windowId) as Promise<boolean>,
+        ipcRenderer.invoke("tweaker:codex-window-focus", windowId) as Promise<boolean>,
       show: (windowId) =>
-        ipcRenderer.invoke("codexpp:codex-window-show", windowId) as Promise<boolean>,
+        ipcRenderer.invoke("tweaker:codex-window-show", windowId) as Promise<boolean>,
     },
     views: {
       create: async (options) => {
         const ref = await ipcRenderer.invoke(
-          "codexpp:codex-view-create",
+          "tweaker:codex-view-create",
           tweakId,
           options,
         ) as { id: string; webContentsId: number; parentWindowId: number | null };
@@ -354,14 +355,14 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
     },
     cdp: {
       getStatus: () =>
-        ipcRenderer.invoke("codexpp:codex-cdp-status") as Promise<CodexCdpStatus>,
+        ipcRenderer.invoke("tweaker:codex-cdp-status") as Promise<CodexCdpStatus>,
       listTargets: () =>
-        ipcRenderer.invoke("codexpp:codex-cdp-targets") as Promise<CodexCdpTarget[]>,
+        ipcRenderer.invoke("tweaker:codex-cdp-targets") as Promise<CodexCdpTarget[]>,
     },
     native: {
       loadModule: async (options) => {
         const ref = await ipcRenderer.invoke(
-          "codexpp:native-load-module",
+          "tweaker:native-load-module",
           tweakId,
           options,
         ) as { id: string; kind: NativeModuleKind };
@@ -369,7 +370,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       },
       createPanel: async (options) => {
         const ref = await ipcRenderer.invoke(
-          "codexpp:native-create-panel",
+          "tweaker:native-create-panel",
           tweakId,
           options,
         ) as { id: string; windowId: number | null };
@@ -377,7 +378,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       },
       attachView: async (options) => {
         const ref = await ipcRenderer.invoke(
-          "codexpp:native-attach-view",
+          "tweaker:native-attach-view",
           tweakId,
           options,
         ) as { id: string };
@@ -385,7 +386,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       },
       launchHelper: async (options) => {
         const ref = await ipcRenderer.invoke(
-          "codexpp:native-launch-helper",
+          "tweaker:native-launch-helper",
           tweakId,
           options,
         ) as { id: string; pid: number };
@@ -393,12 +394,12 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       },
     },
     refresh: {
-      getStatus: () => ipcRenderer.invoke("codexpp:get-refresh-status"),
-      start: (source = "smart") => ipcRenderer.invoke("codexpp:start-local-refresh", source),
+      getStatus: () => ipcRenderer.invoke("tweaker:get-refresh-status"),
+      start: (source = "smart") => ipcRenderer.invoke("tweaker:start-local-refresh", source),
       onStatusChanged: (listener) => {
-        const handler = () => { void ipcRenderer.invoke("codexpp:get-refresh-status").then(listener); };
-        ipcRenderer.on("codexpp:refresh-status-changed", handler);
-        return () => ipcRenderer.removeListener("codexpp:refresh-status-changed", handler);
+        const handler = () => { void ipcRenderer.invoke("tweaker:get-refresh-status").then(listener); };
+        ipcRenderer.on("tweaker:refresh-status-changed", handler);
+        return () => ipcRenderer.removeListener("tweaker:refresh-status-changed", handler);
       },
     },
     capture: {
@@ -424,7 +425,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       throw new Error("api.codex.createBrowserView is main-only; use a main-scoped tweak");
     },
     createWindow: (options) =>
-      ipcRenderer.invoke("codexpp:codex-window-create", options) as Promise<CodexWindowRef>,
+      ipcRenderer.invoke("tweaker:codex-window-create", options) as Promise<CodexWindowRef>,
   };
 }
 
@@ -439,17 +440,17 @@ function rendererCodexViewRef(
     webContentsId,
     parentWindowId,
     setBounds: (bounds) =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "setBounds", bounds) as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "setBounds", bounds) as Promise<void>,
     setVisible: (visible) =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "setVisible", visible) as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "setVisible", visible) as Promise<void>,
     bringToFront: () =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "bringToFront") as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "bringToFront") as Promise<void>,
     loadRoute: (route, hostId) =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "loadRoute", route, hostId) as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "loadRoute", route, hostId) as Promise<void>,
     loadUrl: (url) =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "loadUrl", url) as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "loadUrl", url) as Promise<void>,
     dispose: () =>
-      ipcRenderer.invoke("codexpp:codex-view-call", tweakId, id, "dispose") as Promise<void>,
+      ipcRenderer.invoke("tweaker:codex-view-call", tweakId, id, "dispose") as Promise<void>,
   };
 }
 
@@ -463,7 +464,7 @@ function rendererNativeModuleRef(
     kind,
     request: (method, payload, timeoutMs) =>
       ipcRenderer.invoke(
-        "codexpp:native-module-request",
+        "tweaker:native-module-request",
         tweakId,
         id,
         method,
@@ -471,7 +472,7 @@ function rendererNativeModuleRef(
         timeoutMs,
       ),
     dispose: () =>
-      ipcRenderer.invoke("codexpp:native-module-dispose", tweakId, id) as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-module-dispose", tweakId, id) as Promise<void>,
   };
 }
 
@@ -480,13 +481,13 @@ function rendererNativePanelRef(tweakId: string, id: string, windowId: number | 
     id,
     windowId,
     setBounds: (bounds) =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "panel", id, "setBounds", bounds) as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "panel", id, "setBounds", bounds) as Promise<void>,
     show: () =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "panel", id, "show") as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "panel", id, "show") as Promise<void>,
     hide: () =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "panel", id, "hide") as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "panel", id, "hide") as Promise<void>,
     dispose: () =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "panel", id, "dispose") as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "panel", id, "dispose") as Promise<void>,
   };
 }
 
@@ -494,11 +495,11 @@ function rendererNativeViewRef(tweakId: string, id: string): NativeViewRef {
   return {
     id,
     setBounds: (bounds) =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "view", id, "setBounds", bounds) as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "view", id, "setBounds", bounds) as Promise<void>,
     setVisible: (visible) =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "view", id, "setVisible", visible) as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "view", id, "setVisible", visible) as Promise<void>,
     dispose: () =>
-      ipcRenderer.invoke("codexpp:native-instance-call", tweakId, "view", id, "dispose") as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-instance-call", tweakId, "view", id, "dispose") as Promise<void>,
   };
 }
 
@@ -507,10 +508,10 @@ function rendererNativeHelperRef(tweakId: string, id: string, pid: number): Nati
     id,
     pid,
     send: (message) =>
-      ipcRenderer.invoke("codexpp:native-helper-call", tweakId, id, "send", message) as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-helper-call", tweakId, id, "send", message) as Promise<void>,
     request: (message, timeoutMs) =>
       ipcRenderer.invoke(
-        "codexpp:native-helper-call",
+        "tweaker:native-helper-call",
         tweakId,
         id,
         "request",
@@ -518,7 +519,7 @@ function rendererNativeHelperRef(tweakId: string, id: string, pid: number): Nati
         timeoutMs,
       ),
     stop: () =>
-      ipcRenderer.invoke("codexpp:native-helper-call", tweakId, id, "stop") as Promise<void>,
+      ipcRenderer.invoke("tweaker:native-helper-call", tweakId, id, "stop") as Promise<void>,
   };
 }
 
@@ -527,42 +528,17 @@ function rendererElectronBridge(): ElectronBridge | null {
   return value && typeof value === "object" ? value as ElectronBridge : null;
 }
 
-function rendererStorage(id: string) {
-  const key = `codexpp:storage:${id}`;
-  const read = (): Record<string, unknown> => {
-    try {
-      return JSON.parse(localStorage.getItem(key) ?? "{}");
-    } catch {
-      return {};
-    }
-  };
-  const write = (v: Record<string, unknown>) =>
-    localStorage.setItem(key, JSON.stringify(v));
-  return {
-    get: <T>(k: string, d?: T) => (k in read() ? (read()[k] as T) : (d as T)),
-    set: (k: string, v: unknown) => {
-      const o = read();
-      o[k] = v;
-      write(o);
-    },
-    delete: (k: string) => {
-      const o = read();
-      delete o[k];
-      write(o);
-    },
-    all: () => read(),
-  };
-}
+export const rendererStorage = (id: string, storage: Storage = localStorage) => createRendererStorage(id, storage);
 
 function rendererFs(id: string, _paths: UserPaths) {
   // Sandboxed renderer can't use Node fs directly — proxy through main IPC.
   return {
     dataDir: `<remote>/tweak-data/${id}`,
     read: (p: string) =>
-      ipcRenderer.invoke("codexpp:tweak-fs", "read", id, p) as Promise<string>,
+      ipcRenderer.invoke("tweaker:tweak-fs", "read", id, p) as Promise<string>,
     write: (p: string, c: string) =>
-      ipcRenderer.invoke("codexpp:tweak-fs", "write", id, p, c) as Promise<void>,
+      ipcRenderer.invoke("tweaker:tweak-fs", "write", id, p, c) as Promise<void>,
     exists: (p: string) =>
-      ipcRenderer.invoke("codexpp:tweak-fs", "exists", id, p) as Promise<boolean>,
+      ipcRenderer.invoke("tweaker:tweak-fs", "exists", id, p) as Promise<boolean>,
   };
 }

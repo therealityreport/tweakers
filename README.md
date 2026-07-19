@@ -1,17 +1,17 @@
-# Codex++
+# Tweaker
 
-Codex++ lets you install local tweaks into the OpenAI Codex desktop app. Tweaks
+Tweaker lets you install local tweaks into the OpenAI Codex desktop app. Tweaks
 can change UI, add settings pages, run main-process code, and use native
-OS-level features through the Codex++ bridge.
+OS-level features through the Tweaker bridge.
 [Join the Discord community](https://discord.gg/6bY6gGX36H).
 
-<img width="1413" height="1016" alt="Codex++ settings screenshot" src="https://github.com/user-attachments/assets/ea0b2ffc-c30d-4f68-ae12-dd8d6a997b2f" />
+<img width="1413" height="1016" alt="Tweaker settings screenshot" src="https://github.com/user-attachments/assets/ea0b2ffc-c30d-4f68-ae12-dd8d6a997b2f" />
 
 > Unofficial project. Not affiliated with OpenAI. Use at your own risk.
 
 ## TL;DR
 
-Codex++ patches your local Codex app so Codex loads a small Codex++ runtime on
+Tweaker patches your local Codex app so Codex loads a small Tweaker runtime on
 startup.
 
 That runtime lives in your user data directory, not inside Codex. It finds
@@ -20,7 +20,7 @@ tweaks in a local `tweaks/` folder and loads them when Codex opens.
 The app patch is tiny. Your tweaks, config, logs, backups, and runtime files
 stay outside the app bundle, so you can edit tweaks without rebuilding Codex.
 
-When Codex updates, the patch is usually removed. Codex++ installs a watcher
+When Codex updates, the patch is usually removed. Tweaker installs a watcher
 that notices this and re-applies the patch.
 
 1.0.0 adds cleaner patching, better debug output, Owl runtime detection,
@@ -30,7 +30,7 @@ processes, and tweak-owned native modules.
 ## Table Of Contents
 
 - [Install](#install)
-- [What Codex++ Is](#what-codex-is)
+- [What Tweaker Is](#what-tweaker-is)
 - [How It Works](#how-it-works)
 - [Common Commands](#common-commands)
 - [Where Files Live](#where-files-live)
@@ -70,23 +70,23 @@ Bun:
 
 ```sh
 bun install -g github:therealityreport/tweakers
-codexplusplus install
+tweaker install
 ```
 
-After install, launch Codex normally. Open Settings and look for the Codex++
+After install, launch Codex normally. Open Settings and look for the Tweaker
 section.
 
-## What Codex++ Is
+## What Tweaker Is
 
-Codex++ is a tweak loader for Codex Desktop.
+Tweaker is a tweak loader for Codex Desktop.
 
 It gives you:
 
 - A local `tweaks/` folder.
 - A runtime that loads renderer and main-process tweaks.
-- A Codex++ Settings section inside Codex.
+- A Tweaker Settings section inside Codex.
 - CLI tools for install, repair, update, debug, and tweak development.
-- A watcher that repairs Codex++ after Codex updates.
+- A watcher that repairs Tweaker after Codex updates.
 - A public SDK for tweak authors.
 - Native bridge APIs for advanced macOS tweaks.
 
@@ -97,49 +97,50 @@ It modifies your installed app so it can load local code.
 
 Install flow:
 
-1. Codex++ finds your Codex app.
+1. Tweaker finds your Codex app.
 2. It backs up the unpatched app files.
-3. It patches Codex `app.asar` so a Codex++ loader runs first.
-4. It stages the Codex++ runtime in your user data directory.
+3. It patches Codex `app.asar` so a Tweaker loader runs first.
+4. It stages the Tweaker runtime in your user data directory.
 5. It re-signs the app when needed.
 6. It installs a watcher for future Codex updates.
 
 Runtime flow:
 
 1. You launch Codex.
-2. The Codex++ loader starts.
-3. The loader starts the Codex++ runtime from disk.
+2. The Tweaker loader starts.
+3. The loader starts the Tweaker runtime from disk.
 4. Codex starts normally.
-5. Codex++ discovers enabled tweaks.
+5. Tweaker discovers enabled tweaks.
 6. Renderer tweaks run in Codex windows.
 7. Main-process tweaks run in the Codex main process.
-8. The Settings UI shows Codex++ pages and tweak controls.
+8. The Settings UI shows Tweaker pages and tweak controls.
 
 ## Common Commands
 
 | Command | What it does |
 |---|---|
-| `codexplusplus install` | Patch Codex and install the runtime. |
-| `codexplusplus status` | Show installed version and patch state. |
-| `codexplusplus debug` | Show app path, runtime type, paths, open state, and bridge status. |
-| `codexplusplus repair` | Re-apply the patch after an app update or broken install. |
-| `codexplusplus update` | Update Codex++ from the latest GitHub release. |
-| `codexplusplus update-codex` | Prepare Codex for its official updater, then re-patch after restart. |
-| `codexplusplus doctor` | Diagnose signatures, integrity, permissions, and common failures. |
-| `codexplusplus safe-mode` | Disable all tweaks without deleting them. |
-| `codexplusplus safe-mode --off` | Leave safe mode. |
-| `codexplusplus uninstall` | Remove Codex++ and restore the app when safe. |
-| `codexplusplus uninstall --purge` | Also delete tweaks, config, logs, backups, and Codex++ user data. |
+| `tweaker install` | Patch Codex and install the runtime. |
+| `tweaker status` | Show installed version and patch state. |
+| `tweaker debug` | Show app path, runtime type, paths, open state, and bridge status. |
+| `tweaker repair` | Re-apply the patch after an app update or broken install. |
+| `tweaker update` | Install the latest published Tweakers release; keep the managed runtime unchanged when no release exists. |
+| `tweaker update-chatgpt` | Confirm official updates in ChatGPT mode, or show the required mode-switch steps in Tweakers mode. |
+| `tweaker update-codex` | Compatibility alias for `update-chatgpt`. |
+| `tweaker doctor` | Diagnose signatures, integrity, permissions, and common failures. |
+| `tweaker safe-mode` | Disable all tweaks without deleting them. |
+| `tweaker safe-mode --off` | Leave safe mode. |
+| `tweaker uninstall` | Remove Tweaker and restore the app when safe. |
+| `tweaker uninstall --purge` | Also delete tweaks, config, logs, backups, and Tweaker user data. |
 
 Tweak development commands:
 
 | Command | What it does |
 |---|---|
-| `codexplusplus create-tweak ./my-tweak` | Create a new tweak folder. |
-| `codexplusplus validate-tweak ./my-tweak` | Validate a tweak manifest and entry file. |
-| `codexplusplus dev ./my-tweak` | Link a local tweak into Codex++ for development. |
-| `tweakers dev-sync` | Validate, build, and publish one safe development snapshot. |
-| `tweakers dev-sync --watch` | Watch the checkout and publish only successful validated builds. |
+| `tweaker create-tweak ./my-tweak` | Create a new tweak folder. |
+| `tweaker validate-tweak ./my-tweak` | Validate a tweak manifest and entry file. |
+| `tweaker dev ./my-tweak` | Link a local tweak into Tweaker for development. |
+| `tweaker dev-sync` | Validate, build, and publish one safe development snapshot. |
+| `tweaker dev-sync --watch` | Watch the checkout and publish only successful validated builds. |
 
 `dev-sync` never fetches, merges, or changes Git branches. It stages the complete
 built tweak set before changing the live snapshot, pauses runtime reloads during
@@ -157,7 +158,7 @@ node packages/installer/dist/cli.js debug
 
 ## Where Files Live
 
-Codex++ keeps almost everything outside Codex.
+Tweaker keeps almost everything outside Codex.
 
 | Item | Location |
 |---|---|
@@ -175,12 +176,12 @@ Default user data paths:
 
 | OS | Path |
 |---|---|
-| macOS | `~/Library/Application Support/codex-plusplus/` |
-| Windows | `%APPDATA%/codex-plusplus/` |
-| Linux | `$XDG_DATA_HOME/codex-plusplus/` or `~/.local/share/codex-plusplus/` |
+| macOS | `~/Library/Application Support/Tweakers/` |
+| Windows | `%APPDATA%/Tweakers/` |
+| Linux | `$XDG_DATA_HOME/Tweakers/` or `~/.local/share/Tweakers/` |
 
-On Windows Store installs, Codex++ also creates a writable managed app copy
-under `%LOCALAPPDATA%/codex-plusplus/store-apps/`. Use the Codex++ shortcut for
+On Windows Store installs, Tweaker also creates a writable managed app copy
+under `%LOCALAPPDATA%/Tweakers/store-apps/`. Use the Tweaker shortcut for
 that copy.
 
 The repair watcher runs the managed updater CLI, not a development checkout.
@@ -207,7 +208,7 @@ Minimal `manifest.json`:
   "name": "My Tweak",
   "version": "0.1.0",
   "githubRepo": "you/my-tweak",
-  "description": "Adds a Codex++ settings page.",
+  "description": "Adds a Tweaker settings page.",
   "scope": "renderer",
   "main": "index.js"
 }
@@ -222,7 +223,7 @@ module.exports = {
       id: "main",
       title: api.manifest.name,
       render(root) {
-        root.textContent = "Hello from Codex++.";
+        root.textContent = "Hello from Tweaker.";
       },
     });
   },
@@ -233,9 +234,9 @@ module.exports = {
 Local dev loop:
 
 ```sh
-codexplusplus create-tweak ./my-tweak --id com.you.my-tweak --name "My Tweak"
-codexplusplus validate-tweak ./my-tweak
-codexplusplus dev ./my-tweak
+tweaker create-tweak ./my-tweak --id com.you.my-tweak --name "My Tweak"
+tweaker validate-tweak ./my-tweak
+tweaker dev ./my-tweak
 ```
 
 Full docs are in [Writing Tweaks](./docs/WRITING-TWEAKS.md).
@@ -254,13 +255,13 @@ rather than reusing `co.tweakers`.
 Current macOS Codex builds use Owl: a native app shell with Chromium and an
 Electron-compatible JavaScript runtime.
 
-Codex++ 1.0.0 detects Owl and reports capability status through:
+Tweaker 1.0.0 detects Owl and reports capability status through:
 
 ```sh
-codexplusplus debug
+tweaker debug
 ```
 
-Tweak authors should use the Codex++ SDK, not raw Owl internals:
+Tweak authors should use the Tweaker SDK, not raw Owl internals:
 
 - `api.codex.runtime.getInfo()`
 - `api.codex.runtime.getCapabilities()`
@@ -284,7 +285,7 @@ Browser host mode opens the Codex React UI in a normal browser tab while a
 hidden Codex window provides the private app bridge:
 
 ```sh
-codexplusplus browser --port 8765
+tweaker browser --port 8765
 ```
 
 Then open:
@@ -299,60 +300,68 @@ embedding.
 
 ## Updates And Recovery
 
-Update Codex++:
+Update Tweaker:
 
 ```sh
-codexplusplus update
+tweaker update
 ```
 
-Run the official Codex updater on macOS:
+There is currently no published GitHub release. Until one exists, `update`
+reports that state and keeps the installed managed runtime unchanged.
+
+Check the official ChatGPT updater state on macOS:
 
 ```sh
-codexplusplus update-codex
+tweaker update-chatgpt
 ```
 
-Repair Codex++:
+In ChatGPT mode this is intentionally a no-op because the official updater
+already owns updates. In Tweakers mode it refuses and directs you through
+`tweaker mode chatgpt`, the official update, and `tweaker mode tweakers`.
+`update-codex` remains a compatibility alias.
+
+Repair Tweaker:
 
 ```sh
-codexplusplus repair --force
+tweaker repair --force
 ```
 
 Disable tweaks temporarily:
 
 ```sh
-codexplusplus safe-mode
+tweaker safe-mode
 ```
 
 Re-enable normal tweak loading:
 
 ```sh
-codexplusplus safe-mode --off
+tweaker safe-mode --off
 ```
 
 Uninstall:
 
 ```sh
-codexplusplus uninstall
+tweaker uninstall
 ```
 
 Clean uninstall, including tweaks/config/logs/backups:
 
 ```sh
-codexplusplus uninstall --purge
+tweaker uninstall --purge
 ```
 
 ## Security
 
-Codex++ runs local code inside your Codex desktop app. Install tweaks only from
+Tweaker runs local code inside your Codex desktop app. Install tweaks only from
 sources you trust.
 
 Important details:
 
-- Codex++ does not silently update tweak files.
+- Tweaker does not silently update tweak files.
 - Tweak update checks link to GitHub Releases for review.
 - Native tweaks can run native code and need extra review.
 - Native bridge paths are restricted to files inside the tweak directory.
-- Tweak data APIs default to Codex++'s user data directory.
+- Tweak data APIs default to Tweaker's user data directory.
 
 See [Security](./SECURITY.md).
 

@@ -1,8 +1,8 @@
 "use strict";
 
-const PANEL_ATTR = "data-codexpp-followup-panel";
-const SOURCE_ATTR = "data-codexpp-followup-source";
-const STYLE_ID = "codexpp-followup-style";
+const PANEL_ATTR = "data-tweaker-followup-panel";
+const SOURCE_ATTR = "data-tweaker-followup-source";
+const STYLE_ID = "tweaker-followup-style";
 const MAX_ITEMS = 5;
 const MESSAGE_SELECTOR = [
   '[data-message-author-role="assistant"]',
@@ -304,7 +304,7 @@ function reconcileMessage(state, message) {
 function renderPanel(payload, api) {
   const panel = document.createElement("section");
   panel.setAttribute(PANEL_ATTR, "true");
-  panel.className = "codexpp-followup-panel flex flex-col gap-2 pt-3";
+  panel.className = "tweaker-followup-panel flex flex-col gap-2 pt-3";
   const heading = document.createElement("div");
   heading.className = "text-sm font-medium text-token-text-secondary";
   heading.textContent = payload.title;
@@ -314,7 +314,7 @@ function renderPanel(payload, api) {
   for (const item of payload.items) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "codexpp-followup-row border-token-border text-token-text-primary hover:bg-token-foreground/5 rounded-md border px-3 py-2 text-left text-sm";
+    button.className = "tweaker-followup-row border-token-border text-token-text-primary hover:bg-token-foreground/5 rounded-md border px-3 py-2 text-left text-sm";
     button.setAttribute("data-followup-prompt", item.prompt);
     button.textContent = item.prompt;
     button.addEventListener("click", () => insertPrompt(item.prompt, api));

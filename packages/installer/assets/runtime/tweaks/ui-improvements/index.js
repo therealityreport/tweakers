@@ -165,47 +165,47 @@ const BEHAVIORS = Object.freeze({
 function applySidebarLayout(state) {
   const sidebars = [...new Set((state.api?.react?.host?.query?.("projects") || []).map((match) => match.element?.closest?.("aside, nav")).filter(Boolean))];
   for (const sidebar of sidebars) {
-    if (sidebar.hasAttribute("data-codexpp-sidebar-layout")) continue;
-    sidebar.setAttribute("data-codexpp-sidebar-layout", "true");
-    sidebar.setAttribute("data-codexpp-sidebar-density", state.layout.density);
-    sidebar.style.setProperty("--codexpp-sidebar-width", `${state.layout.width}px`);
-    ownMount(state, "sidebar-layout", () => { sidebar.removeAttribute("data-codexpp-sidebar-layout"); sidebar.removeAttribute("data-codexpp-sidebar-density"); sidebar.style.removeProperty("--codexpp-sidebar-width"); }, sidebar);
+    if (sidebar.hasAttribute("data-tweaker-sidebar-layout")) continue;
+    sidebar.setAttribute("data-tweaker-sidebar-layout", "true");
+    sidebar.setAttribute("data-tweaker-sidebar-density", state.layout.density);
+    sidebar.style.setProperty("--tweaker-sidebar-width", `${state.layout.width}px`);
+    ownMount(state, "sidebar-layout", () => { sidebar.removeAttribute("data-tweaker-sidebar-layout"); sidebar.removeAttribute("data-tweaker-sidebar-density"); sidebar.style.removeProperty("--tweaker-sidebar-width"); }, sidebar);
   }
 }
 
 function applyChatMultiSelect(state) {
   const matches = state.api?.react?.host?.query?.("assistant-turns") || [];
   for (const message of matches.map((match) => match.element)) {
-    if (message.hasAttribute("data-codexpp-multiselect-ready")) continue;
-    message.setAttribute("data-codexpp-multiselect-ready", "true");
+    if (message.hasAttribute("data-tweaker-multiselect-ready")) continue;
+    message.setAttribute("data-tweaker-multiselect-ready", "true");
     const onClick = (event) => {
       if (!event.metaKey && !event.ctrlKey) return;
       event.preventDefault();
-      message.toggleAttribute("data-codexpp-message-selected");
+      message.toggleAttribute("data-tweaker-message-selected");
       renderSelectionToolbar(state);
     };
     message.addEventListener("click", onClick);
     state.listeners.push({ id: "chat-multi-select", target: message, type: "click", listener: onClick });
     ownMount(state, "chat-multi-select", () => {
-      message.removeAttribute("data-codexpp-multiselect-ready");
-      message.removeAttribute("data-codexpp-message-selected");
+      message.removeAttribute("data-tweaker-multiselect-ready");
+      message.removeAttribute("data-tweaker-message-selected");
     }, message);
   }
 }
 
 function renderSelectionToolbar(state) {
-  document.querySelector("[data-codexpp-selection-toolbar]")?.remove();
-  const selected = [...document.querySelectorAll("[data-codexpp-message-selected]")];
+  document.querySelector("[data-tweaker-selection-toolbar]")?.remove();
+  const selected = [...document.querySelectorAll("[data-tweaker-message-selected]")];
   if (!selected.length) return;
   const toolbar = document.createElement("div");
-  toolbar.setAttribute("data-codexpp-selection-toolbar", "true");
+  toolbar.setAttribute("data-tweaker-selection-toolbar", "true");
   toolbar.className = "fixed bottom-6 left-1/2 z-[9999] flex -translate-x-1/2 gap-2 rounded-lg border border-token-border bg-token-main-surface-primary p-2 shadow-lg";
   const copy = document.createElement("button");
   copy.type = "button"; copy.className = "rounded-md bg-token-foreground/5 px-3 py-1.5 text-sm text-token-text-primary"; copy.textContent = `Copy ${selected.length}`;
   copy.addEventListener("click", () => void navigator.clipboard?.writeText(selected.map((node) => node.textContent || "").join("\n\n")));
   const clear = document.createElement("button");
   clear.type = "button"; clear.className = copy.className; clear.textContent = "Clear";
-  clear.addEventListener("click", () => { for (const node of selected) node.removeAttribute("data-codexpp-message-selected"); toolbar.remove(); });
+  clear.addEventListener("click", () => { for (const node of selected) node.removeAttribute("data-tweaker-message-selected"); toolbar.remove(); });
   toolbar.append(copy, clear); document.body.appendChild(toolbar);
   ownMount(state, "chat-multi-select", () => toolbar.remove(), toolbar);
 }
@@ -213,8 +213,8 @@ function renderSelectionToolbar(state) {
 function applySlashMenuImprovements(state) {
   const matches = state.api?.react?.host?.query?.("command-menu") || [];
   for (const menu of matches.map((match) => match.element)) {
-    if (menu.hasAttribute("data-codexpp-slash-navigation")) continue;
-    menu.setAttribute("data-codexpp-slash-navigation", "true");
+    if (menu.hasAttribute("data-tweaker-slash-navigation")) continue;
+    menu.setAttribute("data-tweaker-slash-navigation", "true");
     const onKeydown = (event) => {
       if (event.key !== "Home" && event.key !== "End") return;
       const options = menu.querySelectorAll("[role='option'], [data-command-item]");
@@ -224,18 +224,18 @@ function applySlashMenuImprovements(state) {
     };
     menu.addEventListener("keydown", onKeydown);
     state.listeners.push({ id: "slash-menu-improvements", target: menu, type: "keydown", listener: onKeydown });
-    ownMount(state, "slash-menu-improvements", () => menu.removeAttribute("data-codexpp-slash-navigation"), menu);
+    ownMount(state, "slash-menu-improvements", () => menu.removeAttribute("data-tweaker-slash-navigation"), menu);
   }
 }
 
 function applyMessageMetrics(state) {
   const matches = state.api?.react?.host?.query?.("assistant-turns") || [];
   for (const message of matches.map((match) => match.element)) {
-    if (message.querySelector("[data-codexpp-message-metrics]")) continue;
+    if (message.querySelector("[data-tweaker-message-metrics]")) continue;
     const words = countMessageWords(message);
     if (!words) continue;
     const metrics = document.createElement("span");
-    metrics.setAttribute("data-codexpp-message-metrics", "true");
+    metrics.setAttribute("data-tweaker-message-metrics", "true");
     metrics.className = "text-token-text-secondary text-xs";
     metrics.textContent = `${words} word${words === 1 ? "" : "s"}`;
     message.appendChild(metrics);
@@ -251,7 +251,7 @@ function countMessageWords(message) {
     const raw = String(message.textContent || "").trim();
     return raw ? raw.split(/\s+/).length : 0;
   }
-  for (const injected of clone.querySelectorAll?.("[data-codexpp-message-metrics]") || []) {
+  for (const injected of clone.querySelectorAll?.("[data-tweaker-message-metrics]") || []) {
     injected.remove();
   }
   const text = String(clone.textContent || "").trim();
@@ -261,8 +261,8 @@ function countMessageWords(message) {
 function ownMount(state, id, remove, node) { state.mounts.push({ id, remove, node }); }
 
 const STYLE_CSS = Object.freeze({
-  "chat-multi-select": "[data-codexpp-message-selected] { outline: 2px solid var(--color-token-focus-border, #3b82f6); outline-offset: 2px; }",
-  "sidebar-layout": "[data-codexpp-sidebar-layout] { min-width: var(--codexpp-sidebar-width, 18rem); } [data-codexpp-sidebar-layout][data-codexpp-sidebar-density='compact'] [data-app-action-sidebar-project-id] { padding-block: .25rem; }",
+  "chat-multi-select": "[data-tweaker-message-selected] { outline: 2px solid var(--color-token-focus-border, #3b82f6); outline-offset: 2px; }",
+  "sidebar-layout": "[data-tweaker-sidebar-layout] { min-width: var(--tweaker-sidebar-width, 18rem); } [data-tweaker-sidebar-layout][data-tweaker-sidebar-density='compact'] [data-app-action-sidebar-project-id] { padding-block: .25rem; }",
 });
 
 function installStyle(state, id) {
@@ -270,7 +270,7 @@ function installStyle(state, id) {
   if (!css) return; // most toggles need no CSS; don't inject empty <style> nodes
   if (state.styles.some((entry) => entry.id === id)) return; // idempotent
   const style = document.createElement("style");
-  style.setAttribute("data-codexpp-ui-improvement-style", id);
+  style.setAttribute("data-tweaker-ui-improvement-style", id);
   style.textContent = css;
   (document.head || document.documentElement).appendChild(style);
   state.styles.push({ id, node: style });
@@ -353,8 +353,8 @@ function renderSettings(root, state) {
 function updateSidebarLayout(state, patch) {
   Object.assign(state.layout, patch);
   state.api?.storage?.set?.(LAYOUT_KEY, state.layout);
-  for (const sidebar of document.querySelectorAll("[data-codexpp-sidebar-layout]")) {
-    sidebar.style.setProperty("--codexpp-sidebar-width", `${state.layout.width}px`);
-    sidebar.setAttribute("data-codexpp-sidebar-density", state.layout.density);
+  for (const sidebar of document.querySelectorAll("[data-tweaker-sidebar-layout]")) {
+    sidebar.style.setProperty("--tweaker-sidebar-width", `${state.layout.width}px`);
+    sidebar.setAttribute("data-tweaker-sidebar-density", state.layout.density);
   }
 }

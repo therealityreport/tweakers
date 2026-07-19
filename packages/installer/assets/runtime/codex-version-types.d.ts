@@ -1,5 +1,7 @@
 export type CodexCliLane = "bundled" | "beta";
 export type CodexReleaseChannel = "stable" | "prerelease";
+/** Semantic channel measured from an installed CLI version string. */
+export type CodexVersionChannel = CodexReleaseChannel | "unknown";
 export interface CodexSemanticVersion {
     major: bigint;
     minor: bigint;
@@ -85,10 +87,20 @@ export interface CodexInstalledDesktopVersion {
 export interface CodexCliVersionState {
     path: string | null;
     version: string | null;
+    versionChannel: CodexVersionChannel;
     available: boolean;
     release: CodexReleaseInfo | null;
     managedCurrentVersion: string | null;
     managedPreviousVersion: string | null;
+    error: string | null;
+}
+export interface CodexActiveCliVersionState {
+    path: string;
+    version: string | null;
+    versionChannel: CodexVersionChannel;
+    available: boolean;
+    lane: CodexCliLane;
+    source: "bundled" | "managed-alpha" | "override";
     error: string | null;
 }
 export interface CodexVersionsSnapshot {
@@ -97,6 +109,7 @@ export interface CodexVersionsSnapshot {
     fromCache: boolean;
     stale: boolean;
     desktop: CodexDesktopVersionState;
+    activeCli: CodexActiveCliVersionState;
     cli: Record<CodexCliLane, CodexCliVersionState>;
     requestedLane: CodexCliLane | null;
     effectiveLane: CodexCliLane;

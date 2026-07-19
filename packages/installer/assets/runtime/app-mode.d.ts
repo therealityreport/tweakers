@@ -5,7 +5,7 @@
  * OpenAI Developer-ID bundle ("chatgpt" mode) and the patched,
  * contained-signed bundle ("tweakers" mode). The switch itself — quitting the
  * app, swapping bundles, relaunching — is owned entirely by the installer CLI
- * (`tweakers mode <target> --yes`). The runtime's only job is to validate the
+ * (`tweaker mode <target> --yes`). The runtime's only job is to validate the
  * renderer's request and hand off to that CLI.
  *
  * Two invariants callers must uphold:
@@ -28,7 +28,7 @@ export interface SwitchAppModeDeps {
      * bundle — but the seam keeps the target validation honest and testable.
      */
     currentMode: AppModeTarget;
-    /** Installer CLI path (same resolution as `codexpp:start-local-refresh`). */
+    /** Installer CLI path (same resolution as `tweaker:start-local-refresh`). */
     resolveCli: () => string;
     cliExists: (cli: string) => boolean;
     /**

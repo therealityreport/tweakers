@@ -40,6 +40,7 @@ export interface ManagedCodexCliReceipt {
   version: string;
   releaseTag: string;
   digest: string;
+  binaryDigest: string;
   architecture: string;
   relativeDirectory: string;
   binaryRelativePath: string;
@@ -97,8 +98,8 @@ const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const RECEIPT_FILE = "receipt.json";
 const ALLOWED_ASSET = "codex-package-aarch64-apple-darwin.tar.gz";
 
-export function deriveCodexCliPaths(home: string): CodexCliPaths {
-  const root = join(resolve(home), "Library", "Application Support", "codex-plusplus", "codex-cli");
+export function deriveCodexCliPaths(home: string, activeUserRoot?: string): CodexCliPaths {
+  const root = join(activeUserRoot ?? join(resolve(home), "Library", "Application Support", "Tweakers"), "codex-cli");
   return { root, releases: join(root, "releases"), staging: join(root, "staging"), state: join(root, "state.json"), lock: join(root, "operation.lock") };
 }
 
@@ -115,8 +116,8 @@ export function validateArchiveEntries(entries: ArchiveEntry[]): void {
   }
 }
 
-export function createCodexCliManager(input: { home: string; deps: CodexCliManagerDependencies }): CodexCliManager {
-  const paths = deriveCodexCliPaths(input.home);
+export function createCodexCliManager(input: { home: string; userRoot?: string; deps: CodexCliManagerDependencies }): CodexCliManager {
+  const paths = deriveCodexCliPaths(input.home, input.userRoot);
   const deps = input.deps;
   let busy = false;
   let state = readState(paths.state);
@@ -172,6 +173,7 @@ export function createCodexCliManager(input: { home: string; deps: CodexCliManag
             version: release.version,
             releaseTag: release.tag,
             digest: release.digest.toLowerCase(),
+            binaryDigest: createHash("sha256").update(readFileSync(binary)).digest("hex"),
             architecture: release.architecture,
             relativeDirectory: directoryName,
             binaryRelativePath,
@@ -285,10 +287,19 @@ export interface BootstrapLaneResult {
   error: string | null;
 }
 
+export interface SelectedManagedCodexCli {
+  binaryPath: string;
+  version: string;
+  fingerprint: string;
+}
+
 export function applyManagedCodexCliLaneAtBootstrap(input: {
   lane?: CodexCliLane | null;
   home: string;
+  userRoot?: string;
   env?: NodeJS.ProcessEnv;
+  selectedManagedCli?: SelectedManagedCodexCli | null;
+  validateSelectedManagedBinary?: (selected: SelectedManagedCodexCli) => { valid: boolean; error?: string };
   validateManagedBinary?: (binary: string, receipt: ManagedCodexCliReceipt) => { valid: boolean; error?: string };
   persistFailure?: (safeMessage: string) => void;
 }): BootstrapLaneResult {
@@ -301,7 +312,33 @@ export function applyManagedCodexCliLaneAtBootstrap(input: {
     delete env.CODEX_CLI_PATH;
     return { requestedLane: "bundled", effectiveLane: "bundled", binary: null, userOverridePreserved: false, fallback: false, error: null };
   }
-  const paths = deriveCodexCliPaths(input.home);
+  if (input.selectedManagedCli) {
+    const selected = input.selectedManagedCli;
+    const validation = (input.validateSelectedManagedBinary ?? validateSelectedManagedBinarySync)(selected);
+    if (validation.valid) {
+      env.CODEX_CLI_PATH = selected.binaryPath;
+      return {
+        requestedLane: "beta",
+        effectiveLane: "beta",
+        binary: selected.binaryPath,
+        userOverridePreserved: false,
+        fallback: false,
+        error: null,
+      };
+    }
+    delete env.CODEX_CLI_PATH;
+    const error = safeError(validation.error ?? "Selected managed Alpha validation failed");
+    input.persistFailure?.(error);
+    return {
+      requestedLane: "beta",
+      effectiveLane: "bundled",
+      binary: null,
+      userOverridePreserved: false,
+      fallback: true,
+      error,
+    };
+  }
+  const paths = deriveCodexCliPaths(input.home, input.userRoot);
   const state = readState(paths.state);
   const receipt = state.current;
   const binary = receipt ? binaryForReceipt(paths, receipt) : "";
@@ -316,6 +353,57 @@ export function applyManagedCodexCliLaneAtBootstrap(input: {
   const error = safeError(validation.error ?? "Managed Beta validation failed");
   input.persistFailure?.(error);
   return { requestedLane: "beta", effectiveLane: "bundled", binary: null, userOverridePreserved: false, fallback: true, error };
+}
+
+function validateSelectedManagedBinarySync(
+  selected: SelectedManagedCodexCli,
+): { valid: boolean; error?: string } {
+  try {
+    if (!isAbsolute(selected.binaryPath) || resolve(selected.binaryPath) !== selected.binaryPath) {
+      throw new Error("Selected managed Alpha path is not exact and absolute");
+    }
+    if (!/^\d+\.\d+\.\d+-alpha\.\d+$/.test(selected.version)) {
+      throw new Error("Selected managed Alpha version is invalid");
+    }
+    if (!/^[a-f0-9]{64}$/i.test(selected.fingerprint)) {
+      throw new Error("Selected managed Alpha fingerprint is invalid");
+    }
+    const info = lstatSync(selected.binaryPath);
+    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o111) === 0) {
+      throw new Error("Selected managed Alpha binary is not a regular executable file");
+    }
+    const actualFingerprint = createHash("sha256").update(readFileSync(selected.binaryPath)).digest("hex");
+    if (actualFingerprint !== selected.fingerprint.toLowerCase()) {
+      throw new Error("Selected managed Alpha fingerprint does not match");
+    }
+    if (process.platform === "darwin") {
+      execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", selected.binaryPath], {
+        stdio: "pipe",
+        timeout: 5_000,
+      });
+      execFileSync("/usr/bin/codesign", [
+        "-R=identifier \"codex\" and anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "--verify",
+        selected.binaryPath,
+      ], { stdio: "pipe", timeout: 5_000 });
+      const architecture = execFileSync("/usr/bin/file", ["-b", selected.binaryPath], {
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      if (!/arm64|aarch64/i.test(architecture)) throw new Error("Selected managed Alpha architecture is invalid");
+    }
+    const version = execFileSync(selected.binaryPath, ["--version"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+    });
+    if (normalizeVersion(version) !== selected.version) {
+      throw new Error("Selected managed Alpha version does not match");
+    }
+    return { valid: true };
+  } catch (error) {
+    return { valid: false, error: safeError(error) };
+  }
 }
 
 export interface CodexFeatureInventoryEntry extends ParsedCodexFeature { stage: CodexFeatureStage }
@@ -395,9 +483,18 @@ function validateReceiptFiles(paths: CodexCliPaths, receipt: ManagedCodexCliRece
   const releaseDir = safeChild(paths.releases, receipt.relativeDirectory);
   if (!isContained(releaseDir, binary)) throw new Error("Managed Beta binary escapes its release directory");
   const diskReceipt = readReceipt(releaseDir);
-  if (!diskReceipt || diskReceipt.version !== receipt.version || diskReceipt.digest !== receipt.digest || diskReceipt.relativeDirectory !== receipt.relativeDirectory || diskReceipt.binaryRelativePath !== receipt.binaryRelativePath) throw new Error("Managed Beta receipt or digest does not agree with state");
+    if (!diskReceipt
+      || diskReceipt.version !== receipt.version
+      || diskReceipt.digest !== receipt.digest
+      || diskReceipt.binaryDigest !== receipt.binaryDigest
+      || diskReceipt.relativeDirectory !== receipt.relativeDirectory
+      || diskReceipt.binaryRelativePath !== receipt.binaryRelativePath) {
+      throw new Error("Managed Beta receipt or digest does not agree with state");
+    }
   const info = lstatSync(binary);
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o111) === 0) throw new Error("Managed Beta binary is not a regular executable file");
+  const binaryDigest = createHash("sha256").update(readFileSync(binary)).digest("hex");
+  if (binaryDigest !== receipt.binaryDigest) throw new Error("Managed Beta binary digest does not agree with its receipt");
 }
 
 function reconcileStateSync(paths: CodexCliPaths, value: ManagedCodexCliState): ManagedCodexCliState {
@@ -430,7 +527,7 @@ function readReceipt(directory: string): ManagedCodexCliReceipt | null {
 function validReceipt(value: unknown): value is ManagedCodexCliReceipt {
   if (!value || typeof value !== "object") return false;
   const receipt = value as Partial<ManagedCodexCliReceipt>;
-  return receipt.schemaVersion === 1 && typeof receipt.version === "string" && typeof receipt.releaseTag === "string" && /^[a-f0-9]{64}$/i.test(receipt.digest ?? "") && receipt.architecture === "aarch64-apple-darwin" && typeof receipt.relativeDirectory === "string" && basename(receipt.relativeDirectory) === receipt.relativeDirectory && typeof receipt.binaryRelativePath === "string" && !isAbsolute(receipt.binaryRelativePath) && !receipt.binaryRelativePath.split(/[\\/]/).includes("..") && typeof receipt.verifiedAt === "string";
+  return receipt.schemaVersion === 1 && typeof receipt.version === "string" && typeof receipt.releaseTag === "string" && /^[a-f0-9]{64}$/i.test(receipt.digest ?? "") && /^[a-f0-9]{64}$/i.test(receipt.binaryDigest ?? "") && receipt.architecture === "aarch64-apple-darwin" && typeof receipt.relativeDirectory === "string" && basename(receipt.relativeDirectory) === receipt.relativeDirectory && typeof receipt.binaryRelativePath === "string" && !isAbsolute(receipt.binaryRelativePath) && !receipt.binaryRelativePath.split(/[\\/]/).includes("..") && typeof receipt.verifiedAt === "string";
 }
 
 function binaryForReceipt(paths: CodexCliPaths, receipt: ManagedCodexCliReceipt): string {

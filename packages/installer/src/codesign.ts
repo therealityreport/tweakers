@@ -219,6 +219,10 @@ export function codeSigningWalkRoots(appRoot: string): string[] {
   return [
     join(appRoot, "Contents", "Frameworks"),
     join(resources, "app.asar.unpacked"),
+    // The Tweakers native host is a loose Mach-O staged outside Electron's
+    // normal nested-code locations. `codesign --deep` does not reliably find
+    // it, so include its directory in the explicit inside-out signing walk.
+    join(resources, "tweakers", "native"),
   ];
 }
 
@@ -407,7 +411,7 @@ function findCodeSigningIdentity(identityName: string): Omit<PreparedSigningIden
 }
 
 function createLocalSigningIdentity(identityName: string, posture: SigningPosture): PreparedSigningIdentity {
-  const dir = mkdtempSync(join(tmpdir(), "codex-plusplus-signing-"));
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-signing-"));
   try {
     const configPath = join(dir, "openssl.cnf");
     const keyPath = join(dir, "identity.key");

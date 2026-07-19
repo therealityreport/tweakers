@@ -1,10 +1,10 @@
 {
   "id": "co.tweakers.usage-limit-resets-tracker",
   "name": "Usage Limit Resets Tracker",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "githubRepo": "therealityreport/tweakers",
   "description": "Track observed usage-limit resets and clearly label observed versus estimated times.",
-  "author": "The Reality Report",
+  "author": "hulibrands",
   "tags": ["usage", "history", "limits"],
   "scope": "renderer",
   "permissions": ["settings"]

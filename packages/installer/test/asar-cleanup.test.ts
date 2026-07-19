@@ -7,7 +7,7 @@ import test from "node:test";
 import { cleanupTempTree, collectUnpackOptions } from "../src/asar";
 
 test("asar temp cleanup removes extracted work trees", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-asar-cleanup-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-asar-cleanup-"));
   mkdirSync(join(root, "src", "nested"), { recursive: true });
   writeFileSync(join(root, "src", "nested", "file.txt"), "ok");
 
@@ -17,7 +17,7 @@ test("asar temp cleanup removes extracted work trees", async () => {
 });
 
 test("collectUnpackOptions compacts fully unpacked directories", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-asar-unpack-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-asar-unpack-"));
   const src = join(root, "src");
   const archive = join(root, "app.asar");
   mkdirSync(join(src, "native"), { recursive: true });

@@ -3,13 +3,13 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { generateProductionHealthReceipt, probeNativeHealth, readProductionHealthReceipt, readTransactionState, runInstallTransaction, transactionLockFile, TransactionLockHeldError } from "../src/transaction";
+import { archiveTransactionState, generateProductionHealthReceipt, probeNativeHealth, readProductionHealthReceipt, readTransactionState, runInstallTransaction, transactionLockFile, TransactionLockHeldError } from "../src/transaction";
 import { createSignedBackupTransactionWiring, formatInvalidatedInstallError } from "../src/commands/install";
 
 type Health = { host: "pass" | "fail" | "unknown"; session: "pass" | "fail" | "unknown"; permissions: Record<string, "pass" | "fail" | "unknown"> };
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-transaction-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-transaction-"));
   const appRoot = join(root, "app");
   const runtimeRoot = join(root, "runtime");
   const workRoot = join(root, "work");
@@ -848,6 +848,31 @@ test("a degraded record for a DIFFERENT source is archived and a fresh transacti
     assert.equal(result.status, "promoted");
     assert.ok(calls.includes("promoteCandidate"));
   } finally {
+    clean(f.root);
+  }
+});
+
+test("archive failure preserves the legacy install journal as source evidence", () => {
+  const f = fixture();
+  const realDate = globalThis.Date;
+  const fixedMilliseconds = realDate.parse("2026-07-17T03:04:05.678Z");
+  const fixedStamp = new realDate(fixedMilliseconds).toISOString().replace(/[:.]/g, "-");
+  const archived = `${f.stateFile.replace(/\.json$/, "")}.${fixedStamp}.promoting.json`;
+  const sourceBytes = '{"legacy":"evidence"}\n';
+  try {
+    writeFileSync(f.stateFile, sourceBytes);
+    mkdirSync(archived);
+    globalThis.Date = class extends realDate {
+      constructor(value?: string | number | Date) {
+        super(value === undefined ? fixedMilliseconds : value instanceof realDate ? value.getTime() : value);
+      }
+      static now(): number { return fixedMilliseconds; }
+    } as DateConstructor;
+
+    archiveTransactionState(f.stateFile, interruptedState(f) as Parameters<typeof archiveTransactionState>[1]);
+    assert.equal(readFileSync(f.stateFile, "utf8"), sourceBytes);
+  } finally {
+    globalThis.Date = realDate;
     clean(f.root);
   }
 });

@@ -83,7 +83,7 @@ function ensureObserver(): void {
 
 function safelyNotify(entry: { listener: (snapshots: HostSurfaceSnapshot[]) => void }, snapshots: HostSurfaceSnapshot[]): void {
   try { entry.listener(snapshots); }
-  catch (error) { console.warn("[codex-plusplus] host surface observer failed", error); }
+  catch (error) { console.warn("[tweaker] host surface observer failed", error); }
 }
 
 function projectRows(): HostSurfaceMatch[] {

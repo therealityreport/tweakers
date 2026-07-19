@@ -82,7 +82,7 @@ function safelyNotify(entry, snapshots) {
         entry.listener(snapshots);
     }
     catch (error) {
-        console.warn("[codex-plusplus] host surface observer failed", error);
+        console.warn("[tweaker] host surface observer failed", error);
     }
 }
 function projectRows() {

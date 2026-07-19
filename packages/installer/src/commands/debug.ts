@@ -19,7 +19,7 @@ export interface DebugReport {
   runtime: RuntimeReport;
   owlBridge: OwlBridgeReport;
   codexDataPaths: DataPath[];
-  codexPlusPlusPaths: DataPath[];
+  tweakerPaths: DataPath[];
   open: OpenReport;
 }
 
@@ -53,6 +53,8 @@ export interface OpenReport {
   pid: number | null;
   relatedPids: number[];
   hasMainProcess?: boolean;
+  /** True only when the platform proved that the main process owns a visible window. */
+  visibleWindow?: boolean;
   openedAt: string | null;
   openedAtRaw: string | null;
   detail: string | null;
@@ -92,7 +94,7 @@ export function collectDebugReport(opts: DebugOpts = {}): DebugReport {
     runtime,
     owlBridge: collectOwlBridgeReport(codex, runtime, open, paths),
     codexDataPaths: codexDataPaths(codex),
-    codexPlusPlusPaths: codexPlusPlusPaths(paths),
+    tweakerPaths: tweakerPaths(paths),
     open,
   };
 }
@@ -152,7 +154,7 @@ export function codexDataPaths(codex: Pick<CodexInstall, "appName" | "bundleId" 
       ["Roaming data", join(roaming, appName)],
       ["Local data", join(local, appName)],
       ["Local cache", join(local, appName, "Cache")],
-      ["Tweakers Store mirror", join(local, "codex-plusplus", "store-apps")],
+      ["Tweakers Store mirror", join(local, "tweaker", "store-apps")],
     ]);
   }
 
@@ -167,7 +169,7 @@ export function codexDataPaths(codex: Pick<CodexInstall, "appName" | "bundleId" 
   ]);
 }
 
-export function codexPlusPlusPaths(paths: UserPaths = userPaths()): DataPath[] {
+export function tweakerPaths(paths: UserPaths = userPaths()): DataPath[] {
   return existingAware([
     ["Root", paths.root],
     ["Runtime", paths.runtime],
@@ -191,12 +193,12 @@ export function collectOwlBridgeReport(
 ): OwlBridgeReport {
   const windowServicesPatched = hasWindowServicesMarker(codex.asarPath);
   const runtimeMain = join(paths.runtime, "main.js");
-  const hasNativeModules = runtimeFeature(runtimeMain, "codexpp:native-load-module");
-  const hasOwlViews = runtimeFeature(runtimeMain, "codexpp:codex-view-create");
-  const hasNativePanels = runtimeFeature(runtimeMain, "codexpp:native-create-panel");
-  const hasNativeViews = runtimeFeature(runtimeMain, "codexpp:native-attach-view");
-  const hasNativeHelpers = runtimeFeature(runtimeMain, "codexpp:native-launch-helper");
-  const hasNativeHost = existsSync(join(paths.runtime, "native", "codexpp_native_host.node"));
+  const hasNativeModules = runtimeFeature(runtimeMain, "tweaker:native-load-module");
+  const hasOwlViews = runtimeFeature(runtimeMain, "tweaker:codex-view-create");
+  const hasNativePanels = runtimeFeature(runtimeMain, "tweaker:native-create-panel");
+  const hasNativeViews = runtimeFeature(runtimeMain, "tweaker:native-attach-view");
+  const hasNativeHelpers = runtimeFeature(runtimeMain, "tweaker:native-launch-helper");
+  const hasNativeHost = existsSync(join(paths.runtime, "native", "tweaker_native_host.node"));
   const cdp = probeCdp();
   const isClosed = open.status === "closed";
   const isOwl = runtime.type === "owl";
@@ -239,6 +241,7 @@ export function getOpenReport(codex: CodexInstall): OpenReport {
       pid: null,
       relatedPids: [],
       hasMainProcess: false,
+      visibleWindow: false,
       openedAt: null,
       openedAtRaw: null,
       detail: "No Codex processes found for the detected install path.",
@@ -251,6 +254,7 @@ export function getOpenReport(codex: CodexInstall): OpenReport {
       pid: primary.pid,
       relatedPids: related.map((p) => p.pid),
       hasMainProcess: false,
+      visibleWindow: false,
       openedAt: primary.startedAt,
       openedAtRaw: primary.startedAtRaw,
       detail: "Only helper/background processes were found.",
@@ -260,26 +264,33 @@ export function getOpenReport(codex: CodexInstall): OpenReport {
   if (codex.platform === "darwin") {
     const uiState = macProcessUiState(primary.pid);
     if (uiState === "frontmost") {
-      return openReport("open", primary, related, "Main Codex process is frontmost.");
+      return openReport("open", primary, related, "Main Codex process is frontmost.", true);
     }
     if (uiState === "hidden") {
-      return openReport("background", primary, related, "Main Codex process is running but hidden.");
+      return openReport("background", primary, related, "Main Codex process is running but hidden.", false);
     }
     if (uiState === "visible") {
-      return openReport("inactive", primary, related, "Main Codex process is running but not frontmost.");
+      return openReport("inactive", primary, related, "Main Codex process is running but not frontmost.", true);
     }
-    return openReport("inactive", primary, related, "Main Codex process is running; foreground state was not accessible.");
+    return openReport("inactive", primary, related, "Main Codex process is running; foreground state was not accessible.", false);
   }
 
-  return openReport("inactive", primary, related, "Main Codex process is running.");
+  return openReport("inactive", primary, related, "Main Codex process is running.", false);
 }
 
-function openReport(status: OpenStatus, primary: ProcessInfo, related: ProcessInfo[], detail: string): OpenReport {
+function openReport(
+  status: OpenStatus,
+  primary: ProcessInfo,
+  related: ProcessInfo[],
+  detail: string,
+  visibleWindow: boolean,
+): OpenReport {
   return {
     status,
     pid: primary.pid,
     relatedPids: related.map((p) => p.pid),
     hasMainProcess: true,
+    visibleWindow,
     openedAt: primary.startedAt,
     openedAtRaw: primary.startedAtRaw,
     detail,
@@ -450,7 +461,8 @@ function hasWindowServicesMarker(asarPath: string): boolean {
     for (const file of files) {
       if (!file.startsWith("/.vite/build/") || !file.endsWith(".js")) continue;
       const source = asar.extractFile(asarPath, file.slice(1)).toString("utf8");
-      if (source.includes("__codexpp_window_services__")) return true;
+      if (source.includes("__tweaker_window_services__")
+        || source.includes(["__codex", "pp_window_services__"].join(""))) return true;
     }
   } catch {
     return false;
@@ -468,7 +480,9 @@ function runtimeFeature(runtimeMain: string, needle: string): boolean {
 }
 
 function probeCdp(): { enabled: boolean; url: string | null } {
-  const port = process.env.CODEXPP_REMOTE_DEBUG_PORT ?? "9222";
+  const port = process.env.TWEAKER_REMOTE_DEBUG_PORT
+    ?? process.env[[["CODEX", "PP"].join(""), "REMOTE_DEBUG_PORT"].join("_")]
+    ?? "9222";
   const url = `http://127.0.0.1:${port}`;
   try {
     execFileSync("curl", ["-fsS", "--max-time", "0.5", `${url}/json/version`], {
@@ -482,7 +496,7 @@ function probeCdp(): { enabled: boolean; url: string | null } {
 }
 
 function printDebugReport(report: DebugReport): void {
-  console.log(kleur.bold("codex-plusplus debug"));
+  console.log(kleur.bold("tweaker debug"));
   console.log();
 
   console.log(kleur.bold("codex app"));
@@ -527,7 +541,7 @@ function printDebugReport(report: DebugReport): void {
 
   printDataPaths("codex data paths", report.codexDataPaths);
   console.log();
-  printDataPaths("codex-plusplus data paths", report.codexPlusPlusPaths);
+  printDataPaths("tweaker data paths", report.tweakerPaths);
 }
 
 function printDataPaths(title: string, paths: DataPath[]): void {

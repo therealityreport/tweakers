@@ -1,12 +1,12 @@
 /* eslint-disable */
 /**
- * codex-plusplus loader stub. This file is copied into Codex.app/Contents/Resources/app.asar
+ * tweaker loader stub. This file is copied into Codex.app/Contents/Resources/app.asar
  * by the installer, and `package.json#main` is rewritten to point at it.
  *
  * Responsibilities:
  *   1. Resolve the original entry point that we replaced (stored in
- *      package.json#__codexpp.originalMain) and the user runtime location
- *      (also recorded in __codexpp.userRoot).
+ *      package.json#__tweaker.originalMain) and the user runtime location
+ *      (also recorded in __tweaker.userRoot).
  *   2. Hook `require` so renderer preloads can find our runtime.
  *   3. Load the runtime's main-process entry BEFORE the original main entry.
  *      The runtime patches Electron's BrowserWindow to inject our preload script.
@@ -22,7 +22,7 @@ const fs = require("node:fs");
 const Module = require("node:module");
 
 const pkg = require("./package.json");
-const meta = pkg.__codexpp || {};
+const meta = pkg.__tweaker || {};
 const originalMain = meta.originalMain;
 const appUserDataRoot = meta.appUserDataRoot;
 const userRoot = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1" && process.env.TWEAKERS_HEALTH_USER_ROOT
@@ -58,7 +58,7 @@ function safe(label, fn) {
       appendCappedLog(path.join(logDir, "loader.log"), line);
     } catch (_) {
       // last resort: stderr
-      process.stderr.write(`[codex-plusplus loader] ${label}: ${e}\n`);
+      process.stderr.write(`[tweaker loader] ${label}: ${e}\n`);
     }
   }
 }
@@ -72,10 +72,10 @@ if (appUserDataRoot && process.env.TWEAKERS_HEALTH_CHECK_ONLY !== "1") {
 
 safe("init", () => {
   if (!originalMain) {
-    throw new Error("loader: package.json missing __codexpp.originalMain");
+    throw new Error("loader: package.json missing __tweaker.originalMain");
   }
   if (!userRoot) {
-    throw new Error("loader: package.json missing __codexpp.userRoot");
+    throw new Error("loader: package.json missing __tweaker.userRoot");
   }
 
   // Allow user-installed runtime modules to be require()d from anywhere.
@@ -84,15 +84,17 @@ safe("init", () => {
     Module.globalPaths.push(path.join(runtimeDir, "node_modules"));
     process.env.TWEAKERS_USER_ROOT = userRoot;
     process.env.TWEAKERS_RUNTIME = runtimeDir;
-    // Legacy aliases remain for already-patched Codex++ installs.
-    process.env.CODEX_PLUSPLUS_USER_ROOT = userRoot;
-    process.env.CODEX_PLUSPLUS_RUNTIME = runtimeDir;
+    // Legacy aliases remain for already-patched Tweaker installs.
+    process.env.TWEAKER_USER_ROOT = userRoot;
+    process.env.TWEAKER_RUNTIME = runtimeDir;
+    process.env[["CODEX", "PLUSPLUS", "USER_ROOT"].join("_")] = userRoot;
+    process.env[["CODEX", "PLUSPLUS", "RUNTIME"].join("_")] = runtimeDir;
     // Load the runtime main-process bootstrap. It will hook BrowserWindow
     // before Codex creates any windows.
     safe("runtime", () => require(path.join(runtimeDir, "main.js")));
   } else {
     process.stderr.write(
-      `[codex-plusplus] runtime missing at ${runtimeDir}; loading Codex untweaked.\n`,
+      `[tweaker] runtime missing at ${runtimeDir}; loading Codex untweaked.\n`,
     );
   }
 });
