@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { migrateLegacyConfigSection } from "./legacy-compat.js";
 
 /**
  * Shared config.json access. The file is co-owned by the runtime (tweak
@@ -33,7 +34,9 @@ export function readConfigFile(configFile: string): ConfigFile {
   if (!configFileIsTrusted(configFile)) return {};
   try {
     const parsed = JSON.parse(readFileSync(configFile, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as ConfigFile) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? migrateLegacyConfigSection(parsed as ConfigFile)
+      : {};
   } catch {
     return {};
   }
@@ -55,7 +58,7 @@ export function updateConfigFile(configFile: string, mutate: (config: ConfigFile
 /** Dev-mode source root (the checkout's tweaks/ dir) or null when dev mode is off. */
 export function readDevTweaksRoot(configFile: string): string | null {
   const config = readConfigFile(configFile);
-  const section = config.codexPlusPlus;
+  const section = config.tweaker;
   if (!section || typeof section !== "object") return null;
   const value = (section as Record<string, unknown>).devTweaksRoot;
   return typeof value === "string" && value.length > 0 ? value : null;

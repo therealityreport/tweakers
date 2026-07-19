@@ -25,6 +25,7 @@ import { findSourceRoot } from "../source-root.js";
 import { readValidManifest } from "./dev-tweak.js";
 import { registerDevelopmentCheckout } from "./refresh-local.js";
 import { stageBundledTweaks } from "./install.js";
+import { LEGACY_DEV_SNAPSHOT_FILE } from "../legacy-compat.js";
 
 export interface DevSyncResult {
   linked: string[];
@@ -49,20 +50,21 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
   if (platform() !== "darwin") {
-    throw new Error("tweakers dev-sync is only supported on macOS.");
+    throw new Error("tweaker dev-sync is only supported on macOS.");
   }
   const paths = ensureUserPaths();
 
   if (opts.off === true) {
     const previousRoot = readDevTweaksRoot(paths.configFile);
     updateConfigFile(paths.configFile, (config) => {
-      const section = config.codexPlusPlus;
+      const section = config.tweaker;
       if (section && typeof section === "object") {
         delete (section as Record<string, unknown>).devTweaksRoot;
       }
     });
     if (previousRoot) removeDevSymlinks(paths.tweaks, previousRoot);
-    rmSync(join(paths.tweaks, ".codexpp-dev-snapshot.json"), { force: true });
+    rmSync(join(paths.tweaks, ".tweaker-dev-snapshot.json"), { force: true });
+    rmSync(join(paths.tweaks, LEGACY_DEV_SNAPSHOT_FILE), { force: true });
     stageBundledTweaks(paths.tweaks, paths.runtime);
     touchDevReloadMarker(paths.tweaks);
     if (!opts.quiet) {
@@ -94,8 +96,8 @@ export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
 
 export function resolveDevSyncSourceRoot(configFile: string, invokedSourceRoot: string): string {
   const config = readConfigFile(configFile);
-  const section = config.codexPlusPlus && typeof config.codexPlusPlus === "object"
-    ? config.codexPlusPlus as Record<string, unknown>
+  const section = config.tweaker && typeof config.tweaker === "object"
+    ? config.tweaker as Record<string, unknown>
     : {};
   const registered = typeof section.developmentSourceRoot === "string"
     ? resolve(section.developmentSourceRoot)
@@ -130,7 +132,7 @@ export async function runDevSyncCycle(options: DevSyncCycleOptions): Promise<voi
 export function clearLegacyDevMode(configFile: string, liveTweaks: string): void {
   const previousRoot = readDevTweaksRoot(configFile);
   updateConfigFile(configFile, (config) => {
-    const section = config.codexPlusPlus;
+    const section = config.tweaker;
     if (section && typeof section === "object") delete (section as Record<string, unknown>).devTweaksRoot;
   });
   if (previousRoot) removeDevSymlinks(liveTweaks, previousRoot);
@@ -149,10 +151,14 @@ function publishBuiltTweaks(builtTweaks: string, liveTweaks: string): void {
   mkdirSync(liveTweaks, { recursive: true });
   const nextRoot = join(liveTweaks, `.dev-sync-next-${process.pid}`);
   const previousRoot = join(liveTweaks, `.dev-sync-previous-${process.pid}`);
-  const manifestPath = join(liveTweaks, ".codexpp-dev-snapshot.json");
-  const publishLock = join(liveTweaks, ".codexpp-dev-publishing");
+  const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
+  const legacyManifestPath = join(liveTweaks, LEGACY_DEV_SNAPSHOT_FILE);
+  const publishLock = join(liveTweaks, ".tweaker-dev-publishing");
   const nextFolders = listDirectories(builtTweaks);
-  const priorFolders = readSnapshotFolders(manifestPath);
+  const priorFolders = [...new Set([
+    ...readSnapshotFolders(manifestPath),
+    ...readSnapshotFolders(legacyManifestPath),
+  ])];
   const affected = [...new Set([...priorFolders, ...nextFolders])].sort();
   rmSync(nextRoot, { recursive: true, force: true });
   rmSync(previousRoot, { recursive: true, force: true });
@@ -177,6 +183,7 @@ function publishBuiltTweaks(builtTweaks: string, liveTweaks: string): void {
       promoted.push(folder);
     }
     writeFileSync(manifestPath, JSON.stringify({ folders: nextFolders }, null, 2) + "\n", "utf8");
+    rmSync(legacyManifestPath, { force: true });
   } catch (error) {
     for (const folder of promoted) rmSync(join(liveTweaks, folder), { recursive: true, force: true });
     for (const folder of moved) renameSync(join(previousRoot, folder), join(liveTweaks, folder));
@@ -271,7 +278,7 @@ export function reconcileDevTweaks(
       result.linked.push(folder);
       result.changed = true;
     }
-    // A prior `tweakers dev` may have linked the same source under its
+    // A prior `tweaker dev` may have linked the same source under its
     // manifest id; discovery is a directory scan, so both would load.
     if (id !== folder) {
       const dupePath = join(tweaksDir, id);
@@ -306,7 +313,7 @@ export function touchDevReloadMarker(tweaksDir: string): void {
   // block the watcher's clean-tree self-update.
   try {
     mkdirSync(tweaksDir, { recursive: true });
-    writeFileSync(join(tweaksDir, ".codexpp-dev-reload"), String(Date.now()), "utf8");
+    writeFileSync(join(tweaksDir, ".tweaker-dev-reload"), String(Date.now()), "utf8");
   } catch {
     // Best effort: link churn itself also wakes the runtime watcher.
   }

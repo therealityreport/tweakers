@@ -15,7 +15,7 @@ function installReactHook() {
             const id = nextId++;
             renderers.set(id, renderer);
             // eslint-disable-next-line no-console
-            console.debug("[codex-plusplus] React renderer attached:", renderer.rendererPackageName, renderer.version);
+            console.debug("[tweaker] React renderer attached:", renderer.rendererPackageName, renderer.version);
             return id;
         },
         on(event, fn) {
@@ -41,11 +41,11 @@ function installReactHook() {
         writable: true, // allow real DevTools to overwrite if user installs it
         value: hook,
     });
-    window.__codexpp__ = { hook, renderers };
+    window.__tweaker__ = { hook, renderers };
 }
 /** Resolve the React fiber for a DOM node, if any renderer has one. */
 function fiberForNode(node) {
-    const renderers = window.__codexpp__?.renderers;
+    const renderers = window.__tweaker__?.renderers;
     if (renderers) {
         for (const r of renderers.values()) {
             const f = r.findFiberByHostInstance?.(node);

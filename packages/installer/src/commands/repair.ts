@@ -2,20 +2,20 @@ import kleur from "kleur";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { install, readAsarMarker, readCodexVersion, runtimeAssetsMatch, stageAssets, stageBundledTweaks, type AsarMarker } from "./install.js";
-import { ensureUserPaths } from "../paths.js";
+import { install, readAsarMarker, readAsarPatchSchema, readCodexVersion, runtimeAssetsMatch, stageAssets, stageBundledTweaks, type AsarMarker, type AsarPatchSchema } from "./install.js";
+import { ensureUserPaths, userPaths } from "../paths.js";
 import { readState, resolveMode, writeState, type InstallerState } from "../state.js";
 import { reconcileModeTransition } from "../mode-transition.js";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { signatureInfo, signingAvailable, verifySignature } from "../codesign.js";
 import { listProcesses, type ProcessInfo } from "./debug.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
-import { readDevTweaksRoot } from "../config.js";
+import { readConfigFile, readDevTweaksRoot } from "../config.js";
 import { reconcileDevTweaks } from "./dev-sync.js";
 import { readHeaderHash } from "../asar.js";
-import { CODEX_PLUSPLUS_VERSION, compareSemver } from "../version.js";
+import { TWEAKER_VERSION, compareSemver } from "../version.js";
 import { installWatcher } from "../watcher.js";
 import { clearUpdateMode, isUpdateModeFresh, readUpdateMode, writeUpdateMode } from "../update-mode.js";
 import { findSourceRoot } from "../source-root.js";
@@ -33,6 +33,18 @@ import {
 import { fileURLToPath } from "node:url";
 import { clearDeferredRepair, readDeferredRepair, writeDeferredRepair } from "../deferred-repair.js";
 import { isLockHeldByLiveOwner } from "../process-lock.js";
+import {
+  assertLifecycleReceiptsIdle,
+  isLifecycleLockHeld,
+  lifecycleLockFile,
+  withLifecycleLock,
+} from "../lifecycle-lock.js";
+import { formatCliShimResult, type CliShimResult } from "../cli-shim.js";
+import { reconcileManagedCliShims } from "../managed-runtime.js";
+import { LEGACY_WATCHER_ENV } from "../legacy-compat.js";
+import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import { decideRuntimeFingerprintRepair, readRuntimeFingerprint } from "../runtime-fingerprint.js";
+import { updateAutoRepairState, type RuntimeRepairState } from "../auto-repair-state.js";
 
 interface Opts {
   app?: string;
@@ -54,7 +66,20 @@ export interface RepairDependencies {
   waitForSettle?: (appRoot: string | undefined, opts: SettleOptions) => Promise<void>;
   /** Mode-guard seam: how the live patch marker is observed. */
   readAsarMarker?: typeof readAsarMarker;
+  readAsarPatchSchema?: (asarPath: string) => AsarPatchSchema;
+  /** Manual-only shim reconciliation seam; watcher repair never invokes it. */
+  reconcileCliShims?: () => CliShimResult | void;
+  readExpectedRuntimeFingerprint?: () => string | null;
+  readActiveRuntimeFingerprint?: (runtimeRoot: string) => string | null;
+  isAppRunning?: (appRoot: string) => boolean;
+  stageAssets?: typeof stageAssets;
+  stageBundledTweaks?: typeof stageBundledTweaks;
+  now?: () => Date;
 }
+
+export type RepairOutcome =
+  | { status: "completed" }
+  | { status: "deferred" | "skipped"; reason: string };
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sourceRoot = findSourceRoot(here);
@@ -74,29 +99,66 @@ const STAT_GUARD_HYGIENE_EVERY_N = 6;
  * overwrite state.
  */
 export async function repair(opts: Opts = {}, dependencies: RepairDependencies = {}): Promise<void> {
+  await repairWithOutcome(opts, dependencies);
+}
+
+export async function repairWithOutcome(
+  opts: Opts = {},
+  dependencies: RepairDependencies = {},
+): Promise<RepairOutcome> {
+  const preliminaryPaths = userPaths();
+  const watcherRepair = isWatcherRepair(opts);
+  if (watcherRepair && isRepairBlockedByActiveTransaction(
+    preliminaryPaths.root,
+    preliminaryPaths.transactionStateFile,
+  )) {
+    if (!opts.quiet) {
+      console.log(kleur.yellow("Another Tweakers lifecycle operation is active; skipping this repair pass."));
+    }
+    return { status: "deferred", reason: "active-transaction" };
+  }
+
+  try {
+    return await withLifecycleLock(
+      lifecycleLockFile(preliminaryPaths.root),
+      "repair",
+      async () => {
+        assertLifecycleReceiptsIdle(preliminaryPaths.root);
+        return repairWithLifecycle(opts, dependencies);
+      },
+    );
+  } catch (error) {
+    // A watcher may lose the race between its read-only preflight and lock
+    // acquisition. Treat only lifecycle contention as a deferred pass; real
+    // repair failures must remain visible.
+    if (watcherRepair && isLifecycleContentionError(error)) {
+      if (!opts.quiet) {
+        console.log(kleur.yellow("Another Tweakers lifecycle operation is active; skipping this repair pass."));
+      }
+      return { status: "deferred", reason: "active-transaction" };
+    }
+    throw error;
+  }
+}
+
+async function repairWithLifecycle(
+  opts: Opts,
+  dependencies: RepairDependencies,
+): Promise<RepairOutcome> {
   // ChatGPT-mode guard — deliberately the FIRST statement, before the
   // transaction-block check, the stat guard, and update-mode handling, and it
   // applies to --force repairs too: while ChatGPT mode is active the official
   // app stays pristine, so every repair path (including a straggling
   // refresh-local promote) must no-op loudly instead of re-patching.
-  if (repairStandsDownInChatgptMode(opts, dependencies)) return;
+  if (repairStandsDownInChatgptMode(opts, dependencies)) {
+    return { status: "skipped", reason: "chatgpt-mode" };
+  }
   const paths = ensureUserPaths();
   const deferredRepairFile = paths.deferredRepairFile ?? join(paths.root, "deferred-repair.json");
   const watcherRepair = isWatcherRepair(opts);
+  const appIsRunning = dependencies.isAppRunning ?? isCodexRunning;
   const deferredRepair = watcherRepair ? null : readDeferredRepair(deferredRepairFile);
   const waitForSettle = dependencies.waitForSettle ?? waitForMacAppUpdateToSettle;
-
-  // Never race an in-flight install/refresh transaction: a watcher pass fired
-  // by WatchPaths mid-promotion must yield, not "recover" a live promotion.
-  // Only watcher passes skip silently — a coordinated refresh legitimately
-  // spawns `repair --force` as a child while holding the refresh lock, and a
-  // manual repair should surface the lock error from install() instead.
-  if (watcherRepair && isRepairBlockedByActiveTransaction(paths.root, paths.transactionStateFile)) {
-    if (!opts.quiet) {
-      console.log(kleur.yellow("Another Tweakers install/refresh is running; skipping this repair pass."));
-    }
-    return;
-  }
 
   if (opts.force) {
     // `repair --force` is the documented recovery from a degraded promotion;
@@ -117,6 +179,17 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
         console.log(kleur.yellow(`Cleared ${transaction.phase} install transaction (archived for inspection).`));
       }
     }
+  }
+
+  // Manual repair is also the recovery command for a healthy install whose
+  // public CLI shims are missing. Reconcile before every manual fast path so
+  // "Patch already intact" still repairs the command, but never do this from
+  // the periodic watcher (or from the candidate install it delegates to).
+  if (!watcherRepair) {
+    const reconcileCliShims = dependencies.reconcileCliShims
+      ?? (() => reconcileManagedCliShims(sourceRoot, paths.root, paths.binDir));
+    const cliShims = reconcileCliShims();
+    if (cliShims && !opts.quiet) console.log(formatCliShimResult(cliShims));
   }
 
   const state = readState(paths.stateFile);
@@ -144,7 +217,34 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
       current.mtimeMs === state.patchedAsarStat.mtimeMs
     ) {
       const passes = (state.watcherStatGuardPasses ?? 0) + 1;
-      if (passes % STAT_GUARD_HYGIENE_EVERY_N === 0) {
+      const expectedFingerprint = (dependencies.readExpectedRuntimeFingerprint
+        ?? (() => readRuntimeFingerprint(packagedRuntimeRoot()))
+      )();
+      const activeFingerprint = (dependencies.readActiveRuntimeFingerprint ?? readRuntimeFingerprint)(paths.runtime);
+      const fingerprintDecision = decideRuntimeFingerprintRepair({
+        expected: expectedFingerprint,
+        active: activeFingerprint,
+        appRunning: appIsRunning(appRoot),
+      });
+      recordRuntimeRepairState(paths.root, {
+        status: fingerprintDecision.action === "repair"
+          ? "repairing"
+          : fingerprintDecision.action,
+        expectedFingerprint,
+        activeFingerprint,
+        checkedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
+        error: null,
+      });
+
+      if (fingerprintDecision.action === "pending") {
+        if (!opts.quiet) console.log(kleur.yellow("Runtime update held until a later cycle observes ChatGPT closed."));
+        return { status: "deferred", reason: "runtime-drift-app-running" };
+      }
+      const fullVerificationRequired = fingerprintDecision.action === "repair"
+        || (fingerprintDecision.action === "unknown" && passes % STAT_GUARD_HYGIENE_EVERY_N === 0);
+      if (fullVerificationRequired) {
+        if (!opts.quiet) console.log(kleur.yellow("Runtime fingerprint requires a full repair verification."));
+      } else if (passes % STAT_GUARD_HYGIENE_EVERY_N === 0) {
         const watcher = refreshWatcher(state.watcher, appRoot, opts.quiet);
         cleanupStaleHelperGeneration(appRoot, opts, dependencies);
         syncDevTweaks(paths.tweaks, paths.configFile, opts);
@@ -161,8 +261,10 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
           watcherStatGuardPasses: passes,
         });
       }
-      if (!opts.quiet) console.log(kleur.green("Patch intact (app.asar unchanged)."));
-      return;
+      if (!fullVerificationRequired) {
+        if (!opts.quiet) console.log(kleur.green("Patch intact (app.asar and runtime unchanged)."));
+        return { status: "completed" };
+      }
     }
   }
 
@@ -189,7 +291,7 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
         if (!opts.quiet) {
           console.log(kleur.yellow("Codex update mode is active; leaving signed app unpatched."));
         }
-        return;
+        return { status: "deferred", reason: "codex-update-mode" };
       }
       if (codexVersion === updateMode.codexVersion && !opts.quiet) {
         console.log(kleur.yellow("Codex update mode is stale; clearing it and repairing Tweakers."));
@@ -199,29 +301,77 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
     const readHeader = dependencies.readHeaderHash ?? readHeaderHash;
     const runtimeMatches = dependencies.runtimeAssetsMatch ?? runtimeAssetsMatch;
     const { headerHash } = readHeader(codex.asarPath);
-    if (headerHash === state.patchedAsarHash) {
+    const patchSchema = (dependencies.readAsarPatchSchema ?? readAsarPatchSchema)(codex.asarPath);
+    if (headerHash === state.patchedAsarHash && patchSchema !== "legacy") {
+      if (!appIsRunning(codex.appRoot)) {
+        migrateLegacyTweakNamespaces(paths.root, paths.configFile);
+      }
       const patchedAsarStat = statAsar(codex.asarPath) ?? state.patchedAsarStat;
       const watcher = refreshWatcher(state.watcher, codex.appRoot, opts.quiet);
       cleanupStaleHelperGeneration(codex.appRoot, opts, dependencies);
       syncDevTweaks(paths.tweaks, paths.configFile, opts);
-      if (compareSemver(CODEX_PLUSPLUS_VERSION, state.version) > 0 || !runtimeMatches(paths.runtime)) {
+      // Always complete the existing full-tree verification after the cheap
+      // fingerprint gate requests repair. Do not let a version comparison
+      // short-circuit the proof that active runtime bytes actually differ.
+      const runtimeIsCurrent = runtimeMatches(paths.runtime);
+      if (compareSemver(TWEAKER_VERSION, state.version) > 0 || !runtimeIsCurrent) {
         if (!isAutoUpdateEnabled(paths.configFile)) {
           if (!opts.quiet) console.log(kleur.yellow("Tweakers auto-update is disabled."));
-          return;
+          return { status: "skipped", reason: "auto-update-disabled" };
         }
-        if (isCodexRunning(codex.appRoot)) {
+        if (appIsRunning(codex.appRoot)) {
+          recordRuntimeRepairState(paths.root, {
+            status: "pending",
+            expectedFingerprint: (dependencies.readExpectedRuntimeFingerprint
+              ?? (() => readRuntimeFingerprint(packagedRuntimeRoot())))(),
+            activeFingerprint: (dependencies.readActiveRuntimeFingerprint ?? readRuntimeFingerprint)(paths.runtime),
+            checkedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
+            error: null,
+          });
           if (!opts.quiet) console.log(kleur.yellow("Runtime update held until a later cycle observes Codex closed."));
-          return;
+          return { status: "deferred", reason: "runtime-drift-app-running" };
         }
-        stageAssets(paths.runtime);
-        stageBundledTweaks(paths.tweaks, paths.runtime, {
-          devTweaksRoot: readDevTweaksRoot(paths.configFile),
-          log: opts.quiet ? undefined : (line) => console.log(kleur.dim(line)),
+        const expectedFingerprint = (dependencies.readExpectedRuntimeFingerprint
+          ?? (() => readRuntimeFingerprint(packagedRuntimeRoot())))();
+        try {
+          (dependencies.stageAssets ?? stageAssets)(paths.runtime);
+          (dependencies.stageBundledTweaks ?? stageBundledTweaks)(paths.tweaks, paths.runtime, {
+            devTweaksRoot: readDevTweaksRoot(paths.configFile),
+            log: opts.quiet ? undefined : (line) => console.log(kleur.dim(line)),
+          });
+        } catch (error) {
+          recordRuntimeRepairState(paths.root, {
+            status: "failed",
+            expectedFingerprint,
+            activeFingerprint: (dependencies.readActiveRuntimeFingerprint ?? readRuntimeFingerprint)(paths.runtime),
+            checkedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+        const stagedActiveFingerprint = (dependencies.readActiveRuntimeFingerprint ?? readRuntimeFingerprint)(paths.runtime);
+        if (expectedFingerprint !== null && stagedActiveFingerprint !== expectedFingerprint) {
+          const error = "Runtime fingerprint did not match the packaged runtime after staging";
+          recordRuntimeRepairState(paths.root, {
+            status: "failed",
+            expectedFingerprint,
+            activeFingerprint: stagedActiveFingerprint,
+            checkedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
+            error,
+          });
+          throw new Error(error);
+        }
+        recordRuntimeRepairState(paths.root, {
+          status: expectedFingerprint === null || stagedActiveFingerprint === null ? "unknown" : "current",
+          expectedFingerprint,
+          activeFingerprint: stagedActiveFingerprint,
+          checkedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
+          error: null,
         });
         writeState(paths.stateFile, {
           ...state,
           watcher,
-          version: CODEX_PLUSPLUS_VERSION,
+          version: TWEAKER_VERSION,
           sourceRoot,
           runtimeUpdatedAt: new Date().toISOString(),
           patchedAsarStat,
@@ -229,10 +379,10 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
         });
         if (!opts.quiet) {
           console.log(
-            kleur.green(`Updated Tweakers runtime ${state.version} → ${CODEX_PLUSPLUS_VERSION}.`),
+            kleur.green(`Updated Tweakers runtime ${state.version} → ${TWEAKER_VERSION}.`),
           );
         }
-        return;
+        return { status: "completed" };
       }
       writeState(paths.stateFile, {
         ...state,
@@ -242,7 +392,7 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
         watcherStatGuardPasses: 0,
       });
       if (!opts.quiet) console.log(kleur.green("Patch already intact."));
-      return;
+      return { status: "completed" };
     }
   }
 
@@ -264,7 +414,7 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
         force: opts.force === true,
         updateModeFile: paths.updateModeFile,
       });
-    if (isCodexRunning(codex.appRoot)) {
+    if (appIsRunning(codex.appRoot)) {
       if (!opts.quiet) {
         console.log(
           coordinatedQuit
@@ -289,13 +439,15 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
       });
       (dependencies.notifySigningUnavailable ?? showSigningUnavailableNotification)();
     }
-    return;
+    return { status: "deferred", reason: "signing-unavailable" };
   }
 
   // Re-read the mode IMMEDIATELY before mutating: the settle wait above can
-  // last up to 15 minutes, during which a `tweakers mode chatgpt` switch may
+  // last up to 15 minutes, during which a `tweaker mode chatgpt` switch may
   // have completed. This closes the in-flight-watcher race.
-  if (repairStandsDownInChatgptMode(opts, dependencies)) return;
+  if (repairStandsDownInChatgptMode(opts, dependencies)) {
+    return { status: "skipped", reason: "chatgpt-mode" };
+  }
 
   const runInstall = dependencies.install ?? install;
   await runInstall({
@@ -307,10 +459,12 @@ export async function repair(opts: Opts = {}, dependencies: RepairDependencies =
     watcherKind: state?.watcher,
     quiet: opts.quiet,
     coordinatedQuit,
+    reconcileCliShims: false,
   });
   syncDevTweaks(paths.tweaks, paths.configFile, opts);
   if (deferredRepair) clearDeferredRepair(deferredRepairFile);
   if (!opts.quiet) console.log(kleur.green("✓ Repair complete."));
+  return { status: "completed" };
 }
 
 /**
@@ -337,18 +491,17 @@ function repairStandsDownInChatgptMode(opts: Opts, dependencies: RepairDependenc
     // still decides below, and inference treats it as unpatched.
   }
 
-  try {
-    const reconciled = reconcileModeTransition(
-      { root: paths.root, stateFile: paths.stateFile },
-      { marker, appRoot },
-      { log: opts.quiet ? undefined : (line) => console.log(kleur.dim(line)) },
-    );
-    if (reconciled.action === "in-progress") {
-      console.log(kleur.yellow(`A Tweakers mode switch is in progress (PID ${reconciled.ownerPid}); skipping this repair.`));
-      return true;
-    }
-  } catch {
-    // Reconciliation is hygiene here; the mode resolution below still decides.
+  const reconciled = reconcileModeTransition(
+    { root: paths.root, stateFile: paths.stateFile },
+    { marker, appRoot },
+    { log: opts.quiet ? undefined : (line) => console.log(kleur.dim(line)) },
+  );
+  if (reconciled.action === "in-progress") {
+    console.log(kleur.yellow(`A Tweakers mode switch is in progress (PID ${reconciled.ownerPid}); skipping this repair.`));
+    return true;
+  }
+  if (reconciled.action === "blocked") {
+    throw new Error(`Interrupted Tweakers mode switch requires recovery: ${reconciled.reason}`);
   }
 
   const current = readState(paths.stateFile) ?? state;
@@ -357,11 +510,11 @@ function repairStandsDownInChatgptMode(opts: Opts, dependencies: RepairDependenc
     // Reality mismatch without a journal: something patched the app outside
     // the mode machinery. Never patch further and never stay silent.
     console.warn(kleur.yellow("State says ChatGPT mode but the live app carries the Tweakers patch marker."));
-    console.warn(kleur.yellow(`Run ${kleur.cyan("tweakers mode status")} and ${kleur.cyan("tweakers mode chatgpt")} to reconcile.`));
+    console.warn(kleur.yellow(`Run ${kleur.cyan("tweaker mode status")} and ${kleur.cyan("tweaker mode chatgpt")} to reconcile.`));
     return true;
   }
   console.log(kleur.yellow("ChatGPT mode is active; repair is standing down (the official app stays pristine)."));
-  console.log(kleur.yellow(`Run ${kleur.cyan("tweakers mode tweakers")} to switch back to the patched app.`));
+  console.log(kleur.yellow(`Run ${kleur.cyan("tweaker mode tweakers")} to switch back to the patched app.`));
   return true;
 }
 
@@ -371,7 +524,7 @@ function showSigningUnavailableNotification(): void {
       "osascript",
       [
         "-e",
-        'display notification "Codex updated — open Tweakers or run `tweakers repair` to re-enable your tweaks." with title "Tweakers repair deferred"',
+        'display notification "Codex updated — open Tweakers or run `tweaker repair` to re-enable your tweaks." with title "Tweakers repair deferred"',
       ],
       { detached: true, stdio: "ignore" },
     );
@@ -488,15 +641,8 @@ function notifyUpdateModePaused(updateModeFile: string, fallbackAppRoot: string)
 }
 
 function isAutoUpdateEnabled(configFile: string): boolean {
-  if (!existsSync(configFile)) return true;
-  try {
-    const config = JSON.parse(readFileSync(configFile, "utf8")) as {
-      codexPlusPlus?: { autoUpdate?: boolean };
-    };
-    return config.codexPlusPlus?.autoUpdate !== false;
-  } catch {
-    return true;
-  }
+  const config = readConfigFile(configFile) as { tweaker?: { autoUpdate?: boolean } };
+  return config.tweaker?.autoUpdate !== false;
 }
 
 export interface SettleOptions {
@@ -516,7 +662,9 @@ function settleOptions(opts: Opts, updateModeFile: string): SettleOptions {
 }
 
 function isWatcherRepair(opts: Opts): boolean {
-  return opts.watcher === true || process.env.CODEX_PLUSPLUS_WATCHER === "1";
+  return opts.watcher === true
+    || process.env.TWEAKER_WATCHER === "1"
+    || process.env[LEGACY_WATCHER_ENV] === "1";
 }
 
 /**
@@ -526,8 +674,23 @@ function isWatcherRepair(opts: Opts): boolean {
  */
 function isRepairBlockedByActiveTransaction(userRoot: string, transactionStateFile: string): boolean {
   const refreshLock = join(userRoot, "refresh-local.lock");
-  return isLockHeldByLiveOwner(refreshLock)
+  let receiptBlocked = false;
+  try {
+    assertLifecycleReceiptsIdle(userRoot, { contextOwned: false });
+  } catch {
+    receiptBlocked = true;
+  }
+  return receiptBlocked
+    || isLifecycleLockHeld(userRoot)
+    || isLockHeldByLiveOwner(refreshLock)
     || isTransactionLockHeld(transactionLockFile(transactionStateFile));
+}
+
+function isLifecycleContentionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Another Tweakers lifecycle operation is active/i.test(message)
+    || /Environment transaction .*finish or cancel/i.test(message)
+    || /Desktop update .*resume or cancel/i.test(message);
 }
 
 /**
@@ -649,6 +812,22 @@ function statAsarFile(asarPath: string): { size: number; mtimeMs: number } | nul
   } catch {
     return null;
   }
+}
+
+function packagedRuntimeRoot(): string {
+  const packaged = resolve(here, "..", "..", "assets", "runtime");
+  return existsSync(packaged)
+    ? packaged
+    : resolve(here, "..", "..", "..", "runtime", "dist");
+}
+
+function recordRuntimeRepairState(userRoot: string, runtime: RuntimeRepairState): void {
+  updateAutoRepairState(userRoot, (current) => ({
+    ...(current ?? {}),
+    schemaVersion: 1,
+    checkedAt: runtime.checkedAt,
+    runtime,
+  }));
 }
 
 function patchInputsReadable(appRoot: string): boolean {

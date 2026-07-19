@@ -6,7 +6,7 @@ import test from "node:test";
 const mainSource = readFileSync(resolve("packages/runtime/src/main.ts"), "utf8");
 
 test("launchd patch helpers use the unified namespace and self-remove", () => {
-  assert.doesNotMatch(mainSource, /com\.codexplusplus/);
+  assert.doesNotMatch(mainSource, /com\.tweaker/);
   assert.match(mainSource, /com\.therealityreport\.tweakers\.patch-helper\./);
 
   const helperBody = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");

@@ -8,8 +8,18 @@
  * back based on the OBSERVED bundle state (live patch marker + payload
  * presence) — before anything else runs.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { isDeveloperIdSignedBackup } from "./codesign.js";
 import { readPlist } from "./plist.js";
 import { processAlive } from "./process-lock.js";
@@ -66,14 +76,16 @@ export function payloadMetadataFile(userRoot: string): string {
 
 export function readModeTransition(file: string): ModeTransitionJournal | null {
   if (!existsSync(file)) return null;
+  let value: unknown;
   try {
-    const value = JSON.parse(readFileSync(file, "utf8")) as ModeTransitionJournal;
-    return value.schemaVersion === 1 && (value.target === "chatgpt" || value.target === "tweakers")
-      ? value
-      : null;
-  } catch {
-    return null;
+    value = JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Mode transition journal is unreadable at ${file}: ${errorMessage(error)}`);
   }
+  if (!isModeTransitionJournal(value) || !modeTransitionPathsAreSafe(file, value)) {
+    throw new Error(`Mode transition journal is invalid at ${file}`);
+  }
+  return value;
 }
 
 export function writeModeTransition(file: string, journal: ModeTransitionJournal): void {
@@ -82,7 +94,9 @@ export function writeModeTransition(file: string, journal: ModeTransitionJournal
 }
 
 export function clearModeTransition(file: string): void {
+  if (!existsSync(file)) return;
   rmSync(file, { force: true });
+  fsyncDirectory(dirname(file));
 }
 
 export function readPayloadMetadata(file: string): ParkedPayloadMetadata | null {
@@ -194,7 +208,7 @@ export function reconcileModeTransition(
   const observedMode: AppMode = observed.marker === "present" ? "tweakers" : "chatgpt";
   const completed = observedMode === journal.target;
   // Staging copies are disposable inputs — with one exception: a completed
-  // switch TO tweakers whose owner died during post-swap housekeeping leaves
+  // switch TO tweaker whose owner died during post-swap housekeeping leaves
   // the swapped-out pristine official Contents at the staged path. That copy
   // is the freshest Developer-ID payload (and can be the ONLY intact one), so
   // it is adopted into the backup, never destroyed.
@@ -290,6 +304,70 @@ function errorMessage(error: unknown): string {
 function writeJsonAtomically(file: string, value: object): void {
   mkdirSync(dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, file);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    fsyncFile(temporary);
+    renameSync(temporary, file);
+    fsyncDirectory(dirname(file));
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function isModeTransitionJournal(value: unknown): value is ModeTransitionJournal {
+  if (!value || typeof value !== "object") return false;
+  const journal = value as Record<string, unknown>;
+  return journal.schemaVersion === 1
+    && (journal.target === "chatgpt" || journal.target === "tweakers")
+    && (journal.phase === "preparing" || journal.phase === "swapping")
+    && Number.isInteger(journal.ownerPid)
+    && Number(journal.ownerPid) > 0
+    && (journal.stagedPath === null || typeof journal.stagedPath === "string")
+    && (journal.payloadPath === null || typeof journal.payloadPath === "string")
+    && typeof journal.startedAt === "string"
+    && Number.isFinite(Date.parse(journal.startedAt));
+}
+
+/**
+ * Recovery deletes or adopts the paths stored in the journal. Treat those
+ * values as untrusted durable input: only this Tweakers root's private mode
+ * directory may be named, and the parked payload must use its one canonical
+ * path. This keeps a corrupt or forged journal from turning recovery into an
+ * arbitrary recursive delete.
+ */
+function modeTransitionPathsAreSafe(file: string, journal: ModeTransitionJournal): boolean {
+  const userRoot = dirname(dirname(file));
+  const privateModeRoot = modeDirectory(userRoot);
+  const stagedSafe = journal.stagedPath === null
+    || isExactDescendant(privateModeRoot, journal.stagedPath);
+  const payloadSafe = journal.payloadPath === null
+    || journal.payloadPath === parkedPayloadApp(userRoot);
+  return stagedSafe && payloadSafe;
+}
+
+function isExactDescendant(parent: string, candidate: string): boolean {
+  if (!isAbsolute(candidate) || normalize(candidate) !== candidate || resolve(candidate) !== candidate) {
+    return false;
+  }
+  const child = relative(parent, candidate);
+  return child.length > 0 && child !== ".." && !child.startsWith(`..${sep}`)
+    && !isAbsolute(child);
+}
+
+function fsyncFile(file: string): void {
+  const descriptor = openSync(file, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function fsyncDirectory(directory: string): void {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }

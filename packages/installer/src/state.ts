@@ -63,14 +63,10 @@ export interface InstallerState {
 }
 
 /**
- * Resolve the effective app mode. An explicit state.mode always wins; when it
- * is absent (all pre-toggle installs) the live patch marker decides: a patched
- * app behaves as "tweakers", an unpatched app as "chatgpt" so the watcher and
- * repair stand down instead of re-patching a pristine official app.
- *
- * Guards must verify REALITY (state.mode AND the live marker together); a
- * mismatch between the two is reconciled through the mode-transition journal,
- * never silently ignored.
+ * Resolve repair intent. Explicit state remains authoritative here so an
+ * interrupted or externally replaced Tweakers payload enters the existing
+ * mismatch/recovery gates instead of being silently reclassified. Read-only
+ * status surfaces use live marker/signature evidence directly.
  */
 export function resolveMode(state: InstallerState | null, liveMarkerPresent: boolean): AppMode {
   if (state?.mode === "chatgpt" || state?.mode === "tweakers") return state.mode;

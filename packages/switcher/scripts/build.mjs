@@ -1,7 +1,7 @@
 // Builds the Tweakers menu-bar switcher: clang-compiles the single ObjC file,
 // assembles a minimal `Tweakers Switcher.app` bundle (LSUIElement, no Dock
 // icon), and ad-hoc signs it. The per-machine local-identity signature is
-// applied later, at `tweakers mode setup` time, because that identity only
+// applied later, at `tweaker mode setup` time, because that identity only
 // exists on the end user's machine.
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -35,6 +35,8 @@ run("xcrun", [
   "AppKit",
   "-framework",
   "Foundation",
+  "-framework",
+  "Security",
   src,
   "-o",
   binary,

@@ -65,14 +65,14 @@ test("renderer conditionally shows inline Other fields, squares checkboxes, and 
     },
     querySelectorAll(selector) {
       if (selector === "form") return forms;
-      if (selector === "[data-codexpp-user-questions-checkbox]") {
-        return controls.filter((control) => control.hasAttribute("data-codexpp-user-questions-checkbox"));
+      if (selector === "[data-tweaker-user-questions-checkbox]") {
+        return controls.filter((control) => control.hasAttribute("data-tweaker-user-questions-checkbox"));
       }
-      if (selector === "[data-codexpp-user-questions-other-field]") {
-        return fields.filter((field) => field.hasAttribute("data-codexpp-user-questions-other-field"));
+      if (selector === "[data-tweaker-user-questions-other-field]") {
+        return fields.filter((field) => field.hasAttribute("data-tweaker-user-questions-other-field"));
       }
-      if (selector === "[data-codexpp-user-questions-other-input]") {
-        return inputs.filter((input) => input.hasAttribute("data-codexpp-user-questions-other-input"));
+      if (selector === "[data-tweaker-user-questions-other-input]") {
+        return inputs.filter((input) => input.hasAttribute("data-tweaker-user-questions-other-input"));
       }
       return [];
     },
@@ -110,11 +110,11 @@ test("renderer conditionally shows inline Other fields, squares checkboxes, and 
   assert.ok(appendedStyle);
   assert.match(appendedStyle.textContent, /button\[role="checkbox"\]/);
   assert.match(appendedStyle.textContent, /border-radius: var\(--radius-xs, 0\.25rem\) !important/);
-  assert.match(appendedStyle.textContent, /data-codexpp-user-questions-other-field/);
-  assert.equal(regularCheckbox.hasAttribute("data-codexpp-user-questions-checkbox"), true);
-  assert.equal(otherCheckbox.hasAttribute("data-codexpp-user-questions-checkbox"), true);
-  assert.equal(regularRadio.hasAttribute("data-codexpp-user-questions-checkbox"), false);
-  assert.equal(unrelatedCheckbox.hasAttribute("data-codexpp-user-questions-checkbox"), false);
+  assert.match(appendedStyle.textContent, /data-tweaker-user-questions-other-field/);
+  assert.equal(regularCheckbox.hasAttribute("data-tweaker-user-questions-checkbox"), true);
+  assert.equal(otherCheckbox.hasAttribute("data-tweaker-user-questions-checkbox"), true);
+  assert.equal(regularRadio.hasAttribute("data-tweaker-user-questions-checkbox"), false);
+  assert.equal(unrelatedCheckbox.hasAttribute("data-tweaker-user-questions-checkbox"), false);
   assert.equal(singleOther.field.hidden, true);
   assert.equal(singleOther.input.required, false);
   assert.equal(multiOther.field.hidden, true);
@@ -177,10 +177,10 @@ test("renderer conditionally shows inline Other fields, squares checkboxes, and 
   assert.equal(unregisterCount, 1);
   assert.equal(observer.disconnected, true);
   assert.equal(styleRemoved, true);
-  assert.equal(regularCheckbox.hasAttribute("data-codexpp-user-questions-checkbox"), false);
-  assert.equal(otherCheckbox.hasAttribute("data-codexpp-user-questions-checkbox"), false);
+  assert.equal(regularCheckbox.hasAttribute("data-tweaker-user-questions-checkbox"), false);
+  assert.equal(otherCheckbox.hasAttribute("data-tweaker-user-questions-checkbox"), false);
   assert.equal(singleOther.field.hidden, false);
-  assert.equal(singleOther.field.hasAttribute("data-codexpp-user-questions-other-field"), false);
+  assert.equal(singleOther.field.hasAttribute("data-tweaker-user-questions-other-field"), false);
   assert.equal(multiOther.field.hidden, false);
   assert.equal(oldFirstField.field.hidden, false);
   assert.equal(oldSecondField.field.hidden, false);
@@ -188,7 +188,7 @@ test("renderer conditionally shows inline Other fields, squares checkboxes, and 
   assert.equal(multiOther.input.required, false);
   assert.equal(oldFirstField.input.required, false);
   assert.equal(oldSecondField.input.required, false);
-  assert.equal(singleOther.input.hasAttribute("data-codexpp-user-questions-other-input"), false);
+  assert.equal(singleOther.input.hasAttribute("data-tweaker-user-questions-other-input"), false);
 });
 
 function makeControl(textContent, role, checked, header = "") {

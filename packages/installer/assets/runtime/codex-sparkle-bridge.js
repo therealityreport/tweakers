@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.CodexSparkleBridge = void 0;
+exports.CodexSparkleBridge = exports.CODEX_PUBLIC_PRODUCTION_APPCAST = void 0;
 exports.getCodexSparkleBridge = getCodexSparkleBridge;
 exports.configureCodexSparkleBridge = configureCodexSparkleBridge;
 exports.resetCodexSparkleBridgeForTests = resetCodexSparkleBridgeForTests;
@@ -12,6 +12,7 @@ const SAFE_LIFECYCLE = new Set([
     "installing",
     "failed",
 ]);
+exports.CODEX_PUBLIC_PRODUCTION_APPCAST = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 /**
  * A narrow observer/action seam around OpenAI's native Sparkle addon.
  *
@@ -24,9 +25,11 @@ class CodexSparkleBridge {
     wrapped = new WeakSet();
     native = null;
     headers = undefined;
-    lastAppcast = null;
+    lastAppcasts = new Map();
     nativeChecksSuppressed = false;
     nativeSchedulerDisabled = false;
+    safeUpdateAvailable = false;
+    downstreamSinks = {};
     state = {
         available: false,
         lifecycle: "idle",
@@ -88,6 +91,30 @@ class CodexSparkleBridge {
         this.refreshActionability();
         return { ...this.state };
     }
+    nativeUpdateControlActive() {
+        return this.safeUpdateAvailable && typeof this.downstreamSinks.setUpdateReadySink === "function";
+    }
+    /**
+     * Reuses OpenAI's own animated update control for a release discovered by
+     * Tweakers' metadata-only checker. Its install action is redirected to the
+     * durable environment transaction, never to raw Sparkle in the patched app.
+     */
+    setSafeUpdateAvailable(available) {
+        this.safeUpdateAvailable = available;
+        this.state.ready = available;
+        if (available) {
+            this.state.lifecycle = "ready";
+            this.emitDownstream("setUpdateReadySink", true);
+            this.emitDownstream("setUpdateLifecycleStateSink", "ready");
+        }
+        else {
+            if (this.state.lifecycle === "ready")
+                this.state.lifecycle = "idle";
+            this.emitDownstream("setUpdateReadySink", false);
+            this.emitDownstream("setUpdateLifecycleStateSink", this.state.lifecycle);
+        }
+        this.refreshActionability();
+    }
     async installUpdate() {
         this.refreshActionability();
         if (!this.state.canInstall || !this.native)
@@ -110,41 +137,85 @@ class CodexSparkleBridge {
      * Sparkle. Authorization headers never leave this method or enter its result.
      */
     async fetchAppcastMetadata() {
-        const feeds = [
-            this.state.feedUrl ? { url: this.state.feedUrl, headers: this.headers } : null,
+        const candidates = [
+            this.state.feedUrl ? { label: "captured feed", url: this.state.feedUrl, headers: this.headers } : null,
             this.state.fallbackFeedUrl && this.state.fallbackFeedUrl !== this.state.feedUrl
-                ? { url: this.state.fallbackFeedUrl, headers: undefined }
+                ? { label: "captured fallback feed", url: this.state.fallbackFeedUrl, headers: undefined }
                 : null,
+            { label: "public production feed", url: exports.CODEX_PUBLIC_PRODUCTION_APPCAST, headers: undefined },
         ].filter((entry) => entry !== null);
+        const feeds = candidates.filter((feed, index) => (candidates.findIndex((candidate) => candidate?.url === feed.url) === index));
+        return this.fetchAppcastCandidates("stable", feeds, exports.CODEX_PUBLIC_PRODUCTION_APPCAST);
+    }
+    /**
+     * Fetch metadata only from a feed captured for one verified app identity.
+     * There is deliberately no production fallback here: Alpha must never read
+     * Stable metadata, even when its captured feed is unavailable.
+     */
+    async fetchProfileAppcastMetadata(profileFeed) {
+        const feedUrl = requirePersistableHttpsUrl(profileFeed.feedUrl);
+        const fallbackFeedUrl = profileFeed.fallbackFeedUrl
+            ? requirePersistableHttpsUrl(profileFeed.fallbackFeedUrl)
+            : null;
+        const livePrimary = this.state.feedUrl
+            && persistableHttpsUrl(this.state.feedUrl) === feedUrl
+            ? this.state.feedUrl
+            : feedUrl;
+        const liveFallback = fallbackFeedUrl && this.state.fallbackFeedUrl
+            && persistableHttpsUrl(this.state.fallbackFeedUrl) === fallbackFeedUrl
+            ? this.state.fallbackFeedUrl
+            : fallbackFeedUrl;
+        const candidates = [{
+                label: "captured profile feed",
+                url: livePrimary,
+                metadataUrl: feedUrl,
+                headers: livePrimary === this.state.feedUrl ? this.headers : undefined,
+            }];
+        if (liveFallback && liveFallback !== livePrimary) {
+            candidates.push({
+                label: "captured profile fallback feed",
+                url: liveFallback,
+                metadataUrl: fallbackFeedUrl,
+                headers: undefined,
+            });
+        }
+        return this.fetchAppcastCandidates(`profile:${profileFeed.identityKey}`, candidates, feedUrl);
+    }
+    async fetchAppcastCandidates(cacheKey, feeds, unavailableFeedUrl) {
+        const failures = [];
         for (const feed of feeds) {
             try {
                 const xml = await this.fetchBoundedAppcast(feed.url, feed.headers);
                 const parsed = parseAppcast(xml);
                 const metadata = {
                     ...parsed,
-                    feedUrl: feed.url,
+                    feedUrl: feed.metadataUrl ?? feed.url,
                     checkedAt: (this.options.now?.() ?? new Date()).toISOString(),
                     stale: false,
                     error: null,
                 };
-                this.lastAppcast = metadata;
+                this.lastAppcasts.set(cacheKey, metadata);
+                this.state.lastError = null;
                 return { ...metadata };
             }
-            catch {
-                // Try OpenAI's public fallback. Errors remain intentionally redacted.
+            catch (error) {
+                failures.push(`${feed.label}: ${redactedAppcastFailure(error)}`);
             }
         }
-        if (this.lastAppcast) {
-            return { ...this.lastAppcast, stale: true, error: "Appcast metadata is unavailable." };
+        const failure = `Appcast metadata is unavailable (${failures.join("; ")}).`;
+        this.fail(failure);
+        const lastAppcast = this.lastAppcasts.get(cacheKey);
+        if (lastAppcast) {
+            return { ...lastAppcast, stale: true, error: failure };
         }
         return {
             marketingVersion: "Unavailable",
             build: "Unavailable",
             releaseUrl: null,
-            feedUrl: this.state.fallbackFeedUrl ?? this.state.feedUrl ?? "Unavailable",
+            feedUrl: unavailableFeedUrl,
             checkedAt: (this.options.now?.() ?? new Date()).toISOString(),
             stale: false,
-            error: "Appcast metadata is unavailable.",
+            error: failure,
         };
     }
     wrapInit(addon) {
@@ -152,13 +223,23 @@ class CodexSparkleBridge {
         if (typeof original !== "function")
             return;
         const bridge = this;
-        addon.init = function codexPlusPlusSparkleInit(...args) {
+        addon.init = function tweakerSparkleInit(...args) {
             bridge.captureInit(args);
             try {
                 const result = Reflect.apply(original, this, args);
                 bridge.state.available = true;
                 bridge.state.lastError = null;
                 bridge.refreshActionability();
+                const capture = bridge.capturedFeedForPersistence();
+                if (capture.feedUrl) {
+                    try {
+                        bridge.options.onFeedCaptured?.(capture);
+                    }
+                    catch {
+                        // Persistence is observational and must never break OpenAI's
+                        // successful native updater initialization.
+                    }
+                }
                 return result;
             }
             catch (error) {
@@ -171,16 +252,46 @@ class CodexSparkleBridge {
     }
     /**
      * Sparkle's XPC bootstrap assumes the outer app still has OpenAI's signing
-     * identity. In a locally signed Tweakers app, both manual and scheduled
-     * checks relaunch the foreground ChatGPT executable while looking for that
-     * service. Keep native checks inert and use the bounded signed-appcast path
-     * for version discovery instead.
+     * identity. In a locally signed Tweakers app, raw checks relaunch the
+     * foreground ChatGPT executable while looking for that service. Redirect the
+     * visible manual command and OpenAI's background timer to Tweakers' bounded
+     * services while keeping raw native checks inert.
      */
     suppressNativeChecks(addon) {
-        for (const name of ["checkForUpdates", "checkForUpdatesInBackground"]) {
-            if (typeof addon[name] !== "function")
-                continue;
-            addon[name] = function codexPlusPlusSuppressedSparkleCheck() { return false; };
+        if (typeof addon.checkForUpdates === "function") {
+            const bridge = this;
+            addon.checkForUpdates = function tweakerManualUpdateCheck() {
+                try {
+                    const result = bridge.options.requestManualCheck?.();
+                    if (result && typeof result.then === "function") {
+                        void Promise.resolve(result).catch(() => {
+                            bridge.fail("Manual desktop update check failed.");
+                        });
+                    }
+                }
+                catch {
+                    bridge.fail("Manual desktop update check failed.");
+                }
+                return false;
+            };
+            this.nativeChecksSuppressed = true;
+        }
+        if (typeof addon.checkForUpdatesInBackground === "function") {
+            const bridge = this;
+            addon.checkForUpdatesInBackground = function tweakerBackgroundUpdateCheck() {
+                try {
+                    const result = bridge.options.requestBackgroundCheck?.();
+                    if (result && typeof result.then === "function") {
+                        void Promise.resolve(result).catch(() => {
+                            bridge.fail("Background desktop update check failed.");
+                        });
+                    }
+                }
+                catch {
+                    bridge.fail("Background desktop update check failed.");
+                }
+                return false;
+            };
             this.nativeChecksSuppressed = true;
         }
     }
@@ -217,7 +328,7 @@ class CodexSparkleBridge {
             try {
                 if (typeof addon[name] !== "function")
                     continue;
-                addon[name] = function codexPlusPlusSuppressedSparkleSchedule() { return undefined; };
+                addon[name] = function tweakerSuppressedSparkleSchedule() { return undefined; };
                 acted = true;
             }
             catch {
@@ -230,13 +341,27 @@ class CodexSparkleBridge {
         const original = addon[name];
         if (typeof original !== "function")
             return;
-        addon[name] = function codexPlusPlusSparkleSinkSetter(sink) {
+        const bridge = this;
+        addon[name] = function tweakerSparkleSinkSetter(sink) {
+            const wasActive = bridge.nativeUpdateControlActive();
+            if (typeof sink === "function")
+                bridge.downstreamSinks[name] = sink;
+            else
+                delete bridge.downstreamSinks[name];
             const tee = (...args) => {
                 observe(args[0]);
                 if (typeof sink === "function")
                     Reflect.apply(sink, undefined, args);
             };
-            return Reflect.apply(original, this, [tee]);
+            const result = Reflect.apply(original, this, [tee]);
+            if (bridge.safeUpdateAvailable)
+                bridge.replaySafeUpdateToSink(name);
+            if (name === "setUpdateReadySink") {
+                const isActive = bridge.nativeUpdateControlActive();
+                if (isActive !== wasActive)
+                    bridge.options.onNativeControlActivityChanged?.(isActive);
+            }
+            return result;
         };
     }
     wrapInstall(addon, name) {
@@ -244,11 +369,30 @@ class CodexSparkleBridge {
         if (typeof original !== "function")
             return;
         const bridge = this;
-        addon[name] = function codexPlusPlusSparkleInstall(...args) {
+        addon[name] = function tweakerSparkleInstall(...args) {
             const prerequisite = bridge.installPrerequisite();
             if (!prerequisite.ok) {
                 bridge.refreshActionability();
                 return false;
+            }
+            if (bridge.safeUpdateAvailable && bridge.options.requestInstall) {
+                bridge.safeUpdateAvailable = false;
+                bridge.state.lifecycle = "installing";
+                bridge.state.ready = false;
+                bridge.state.lastError = null;
+                bridge.emitDownstream("setUpdateReadySink", false);
+                bridge.emitDownstream("setUpdateLifecycleStateSink", "installing");
+                try {
+                    const requested = bridge.options.requestInstall();
+                    if (requested && typeof requested.then === "function") {
+                        void Promise.resolve(requested).catch(() => bridge.restoreSafeUpdateAfterInstallFailure());
+                    }
+                    return true;
+                }
+                catch {
+                    bridge.restoreSafeUpdateAfterInstallFailure();
+                    return false;
+                }
             }
             try {
                 if (bridge.options.prepareForInstall?.() === false) {
@@ -266,10 +410,38 @@ class CodexSparkleBridge {
             }
         };
     }
+    replaySafeUpdateToSink(name) {
+        if (name === "setUpdateReadySink")
+            this.emitDownstream(name, true);
+        if (name === "setUpdateLifecycleStateSink")
+            this.emitDownstream(name, "ready");
+    }
+    emitDownstream(name, value) {
+        const sink = this.downstreamSinks[name];
+        if (typeof sink !== "function")
+            return;
+        try {
+            Reflect.apply(sink, undefined, [value]);
+        }
+        catch {
+            // OpenAI owns these display callbacks; a renderer teardown must not
+            // interfere with updater state or the durable transaction.
+        }
+    }
+    restoreSafeUpdateAfterInstallFailure() {
+        this.state.lastError = "Desktop update handoff failed.";
+        this.setSafeUpdateAvailable(true);
+    }
     captureInit(args) {
         this.state.feedUrl = safeHttpsUrl(args[0]);
         this.headers = args.length >= 2 ? args[1] : undefined;
         this.state.fallbackFeedUrl = safeHttpsUrl(args[2]);
+    }
+    capturedFeedForPersistence() {
+        return {
+            feedUrl: persistableHttpsUrl(this.state.feedUrl),
+            fallbackFeedUrl: persistableHttpsUrl(this.state.fallbackFeedUrl),
+        };
     }
     async fetchBoundedAppcast(initialUrl, headers) {
         const fetcher = this.options.fetch ?? defaultSparkleFetch;
@@ -286,9 +458,10 @@ class CodexSparkleBridge {
         });
         try {
             let url = requireHttpsUrl(initialUrl);
+            let requestHeaders = headers;
             for (let redirects = 0;; redirects += 1) {
                 const response = await Promise.race([
-                    fetcher(url, { headers, signal: controller.signal, redirect: "manual" }),
+                    fetcher(url, { headers: requestHeaders, signal: controller.signal, redirect: "manual" }),
                     deadline,
                 ]);
                 requireHttpsUrl(response.url || url);
@@ -298,7 +471,10 @@ class CodexSparkleBridge {
                     const location = response.headers.get("location");
                     if (!location)
                         throw new Error("redirect missing location");
-                    url = requireHttpsUrl(new URL(location, url).toString());
+                    const nextUrl = requireHttpsUrl(new URL(location, url).toString());
+                    if (new URL(nextUrl).origin !== new URL(url).origin)
+                        requestHeaders = undefined;
+                    url = nextUrl;
                     continue;
                 }
                 if (!response.ok)
@@ -354,6 +530,10 @@ class CodexSparkleBridge {
             this.state.canInstall = false;
             this.state.installPrerequisiteFailure = prerequisite.reason ?? "Signed Codex.app backup is unavailable.";
         }
+        else if (this.safeUpdateAvailable && typeof this.options.requestInstall === "function") {
+            this.state.canInstall = true;
+            this.state.installPrerequisiteFailure = null;
+        }
         else if (this.nativeChecksSuppressed) {
             this.state.canInstall = false;
             this.state.installPrerequisiteFailure = "Native desktop updates are paused while Tweakers is active; use the signed-app refresh flow.";
@@ -401,6 +581,23 @@ function safeHttpsUrl(value) {
         return null;
     }
 }
+function persistableHttpsUrl(value) {
+    const safe = safeHttpsUrl(value);
+    if (!safe)
+        return null;
+    const url = new URL(safe);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+}
+function requirePersistableHttpsUrl(value) {
+    const safe = persistableHttpsUrl(value);
+    if (!safe || safe !== value)
+        throw new Error("Captured profile appcast URL is invalid");
+    return safe;
+}
 async function defaultSparkleFetch(url, init) {
     const response = await fetch(url, {
         headers: init.headers,
@@ -420,7 +617,15 @@ function parseAppcast(xml) {
         const marketingVersion = readXmlAttribute(enclosure, "shortVersionString")
             ?? readXmlElement(item, "shortVersionString");
         const build = readXmlAttribute(enclosure, "version") ?? readXmlElement(item, "version");
-        if (!marketingVersion || !build || marketingVersion.length > 80 || build.length > 80)
+        const archiveUrl = readXmlAttribute(enclosure, "url");
+        const archiveSignature = readXmlAttribute(enclosure, "edSignature");
+        // Metadata is authenticated by the trusted HTTPS feed. Requiring a valid
+        // Ed25519-shaped Sparkle enclosure signature additionally ensures we never
+        // advertise an item the native OpenAI updater could not verify at install.
+        // The signature covers the archive bytes, not the surrounding XML fields.
+        if (!marketingVersion || !build || marketingVersion.length > 80 || build.length > 80
+            || !archiveUrl || safeHttpsUrl(archiveUrl) === null
+            || !isSparkleEd25519Signature(archiveSignature))
             return [];
         const releaseCandidate = readXmlElement(item, "releaseNotesLink") ?? readXmlElement(item, "link");
         return [{
@@ -433,6 +638,17 @@ function parseAppcast(xml) {
         throw new Error("appcast has no release");
     releases.sort((left, right) => compareAppcastRelease(right, left));
     return releases[0];
+}
+function isSparkleEd25519Signature(value) {
+    if (!value || !/^[A-Za-z0-9+/]+={0,2}$/.test(value))
+        return false;
+    try {
+        const bytes = Buffer.from(value, "base64");
+        return bytes.byteLength === 64 && bytes.toString("base64") === value;
+    }
+    catch {
+        return false;
+    }
 }
 function readXmlAttribute(element, localName) {
     const escaped = localName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -477,5 +693,23 @@ function boundedInteger(value, fallback, min, max) {
     return typeof value === "number" && Number.isInteger(value)
         ? Math.max(min, Math.min(max, value))
         : fallback;
+}
+function redactedAppcastFailure(error) {
+    const message = error instanceof Error ? error.message : "";
+    if (/timeout/i.test(message))
+        return "timed out";
+    if (/too many redirects/i.test(message))
+        return "too many redirects";
+    if (/redirect missing location/i.test(message))
+        return "redirect missing location";
+    if (/transport must be HTTPS/i.test(message))
+        return "insecure redirect rejected";
+    if (/too large/i.test(message))
+        return "response too large";
+    if (/invalid appcast|no release/i.test(message))
+        return "invalid signed appcast";
+    if (/request failed/i.test(message))
+        return "request failed";
+    return "request failed";
 }
 //# sourceMappingURL=codex-sparkle-bridge.js.map

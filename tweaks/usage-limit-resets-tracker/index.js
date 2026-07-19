@@ -473,12 +473,12 @@ function annotateObservation(observation, estimate, instance) {
   for (const element of document.querySelectorAll("[data-usage-limit-key], [data-testid*='usage' i]")) {
     const candidate = observationFromElement(element);
     if (!candidate || candidate.key !== observation.key) continue;
-    let badge = [...(element.parentElement?.querySelectorAll?.("[data-codexpp-usage-reset]") || [])]
-      .find((item) => item.getAttribute("data-codexpp-usage-reset") === observation.key);
+    let badge = [...(element.parentElement?.querySelectorAll?.("[data-tweaker-usage-reset]") || [])]
+      .find((item) => item.getAttribute("data-tweaker-usage-reset") === observation.key);
     if (!badge) {
       badge = document.createElement("span");
-      badge.dataset.codexppUsageReset = observation.key;
-      badge.setAttribute("data-codexpp-usage-reset", observation.key);
+      badge.dataset.tweakerUsageReset = observation.key;
+      badge.setAttribute("data-tweaker-usage-reset", observation.key);
       badge.className = "ml-2 text-token-text-secondary text-xs";
       element.insertAdjacentElement("afterend", badge);
       instance.badges.add(badge);

@@ -21,16 +21,20 @@ const fullReloadSequence = [
   "broadcastReload",
 ];
 
-test("source toggle handler delegates enable changes to lifecycle helper", () => {
-  const body = extractHandlerBody(runtimeSource, "codexpp:set-tweak-enabled");
+test("source toggle handler returns the serialized lifecycle reload", () => {
+  const body = extractHandlerBody(runtimeSource, "tweaker:set-tweak-enabled");
 
-  assert.match(body, /return setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
+  assert.match(body, /setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
+  assert.doesNotMatch(body, /mcpReconciler\?\.request/);
+  assert.match(body, /return setTweakEnabledAndReload/);
 });
 
-test("bundled toggle handler delegates enable changes to lifecycle helper", () => {
-  const body = extractHandlerBody(bundledRuntime, "codexpp:set-tweak-enabled");
+test("bundled toggle handler returns the serialized lifecycle reload", () => {
+  const body = extractHandlerBody(bundledRuntime, "tweaker:set-tweak-enabled");
 
-  assert.match(body, /return setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
+  assert.match(body, /setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
+  assert.doesNotMatch(body, /mcpReconciler\?\.request/);
+  assert.match(body, /return setTweakEnabledAndReload/);
 });
 
 test("source lifecycle helper normalizes enabled value before persisting", () => {
@@ -53,24 +57,28 @@ test("source lifecycle helper returns only after reloading", () => {
   const body = extractFunctionBody(lifecycleSource, "setTweakEnabledAndReload");
 
   assertCallOrder(body, ["reloadTweaks", "return true"]);
+  assert.match(body, /await reloadTweaks/);
 });
 
 test("bundled lifecycle helper returns only after reloading", () => {
   const body = extractFunctionBody(bundledRuntime, "setTweakEnabledAndReload");
 
   assertCallOrder(body, ["reloadTweaks", "return true"]);
+  assert.match(body, /await reloadTweaks/);
 });
 
 test("source manual force reload delegates to lifecycle helper", () => {
-  const body = extractHandlerBody(runtimeSource, "codexpp:reload-tweaks");
+  const body = extractHandlerBody(runtimeSource, "tweaker:reload-tweaks");
 
   assertCallOrder(body, ["reloadTweaks", "return "]);
+  assert.match(body, /await reloadTweaks/);
 });
 
 test("bundled manual force reload delegates to lifecycle helper", () => {
-  const body = extractHandlerBody(bundledRuntime, "codexpp:reload-tweaks");
+  const body = extractHandlerBody(bundledRuntime, "tweaker:reload-tweaks");
 
   assertCallOrder(body, ["reloadTweaks", "return "]);
+  assert.match(body, /await reloadTweaks/);
 });
 
 test("source lifecycle reload helper uses the full main reload sequence", () => {
@@ -97,12 +105,12 @@ test("source filesystem watcher defers reload while a dev snapshot is publishing
 });
 
 test("source runtime exposes refresh status and starts the detached refresh CLI", () => {
-  assert.match(runtimeSource, /ipcMain\.handle\("codexpp:get-refresh-status"/);
-  assert.match(runtimeSource, /ipcMain\.handle\("codexpp:start-local-refresh"/);
+  assert.match(runtimeSource, /ipcMain\.handle\("tweaker:get-refresh-status"/);
+  assert.match(runtimeSource, /ipcMain\.handle\("tweaker:start-local-refresh"/);
   assert.match(runtimeSource, /startInstalledCli\(cli, \["refresh-local"/);
-  assert.match(runtimeSource, /codexpp:refresh-status-changed/);
+  assert.match(runtimeSource, /tweaker:refresh-status-changed/);
   assert.match(runtimeSource, /chokidar\.watch\(\[/);
-  assert.match(runtimeSource, /join\(process\.resourcesPath, "cua_node", "bin", "node"\)/);
+  assert.match(runtimeSource, /resolveLocalCliRuntime\(\{/);
   assert.match(runtimeSource, /localCliRuntime\(cli, \["refresh-status"\]\)/);
 });
 

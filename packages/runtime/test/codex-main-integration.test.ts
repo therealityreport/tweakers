@@ -5,6 +5,7 @@ import test from "node:test";
 
 const mainSource = readFileSync(resolve("packages/runtime/src/main.ts"), "utf8");
 const loaderSource = readFileSync(resolve("packages/loader/loader.cjs"), "utf8");
+const menuSource = readFileSync(resolve("packages/runtime/src/codex-desktop-update-menu.ts"), "utf8");
 
 test("managed Codex lane is applied while the runtime is evaluated before OpenAI main", () => {
   const installParent = mainSource.indexOf("installCodexAppServerParent();");
@@ -22,46 +23,164 @@ test("managed Codex lane is applied while the runtime is evaluated before OpenAI
 
 test("Codex IPC exposes only the approved narrow action channels", () => {
   for (const channel of [
-    "codexpp:get-codex-versions",
-    "codexpp:refresh-codex-versions",
-    "codexpp:set-codex-cli-lane",
-    "codexpp:install-codex-beta",
-    "codexpp:rollback-codex-beta",
-    "codexpp:set-codex-feature",
-    "codexpp:check-codex-desktop-update",
-    "codexpp:install-codex-desktop-update",
+    "tweaker:get-codex-versions",
+    "tweaker:refresh-codex-versions",
+    "tweaker:install-codex-beta",
+    "tweaker:rollback-codex-beta",
+    "tweaker:set-codex-feature",
+    "tweaker:check-codex-desktop-update",
+    "tweaker:get-codex-desktop-update",
+    "tweaker:start-codex-desktop-update",
+    "tweaker:get-codex-desktop-update-transaction",
+    "tweaker:resume-codex-desktop-update",
+    "tweaker:cancel-codex-desktop-update",
+    "tweaker:get-environment-status",
+    "tweaker:choose-alpha-environment",
+    "tweaker:get-environment-transaction",
+    "tweaker:prepare-environment",
+    "tweaker:commit-environment",
+    "tweaker:rollback-environment",
+    "tweaker:cancel-environment",
   ]) {
     assert.match(mainSource, new RegExp(`ipcMain\\.handle\\(\"${channel}\"`));
   }
-  assert.match(mainSource, /assertExactObjectKeys\(payload, \["lane", "confirmOverride"\]/);
   assert.match(mainSource, /assertExactObjectKeys\(payload, \["lane", "name", "enabled"\]/);
   assert.match(mainSource, /assertNoIpcArguments\(args, "install-codex-beta"\)/);
-  assert.match(mainSource, /assertNoIpcArguments\(args, "install-codex-desktop-update"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "get-codex-desktop-update"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "start-codex-desktop-update"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "get-codex-desktop-update-transaction"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "resume-codex-desktop-update"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "cancel-codex-desktop-update"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "get-environment-status"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "choose-alpha-environment"\)/);
+  assert.match(mainSource, /assertNoIpcArguments\(args, "get-environment-transaction"\)/);
+  assert.match(mainSource, /assertExactObjectKeys\(payload, \["appExperience", "releaseProfile"\]/);
+  assert.match(mainSource, /assertExactObjectKeys\(payload, \["transactionId"\]/);
+  assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:set-codex-cli-lane"/);
+  assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:install-codex-desktop-update"/);
 });
 
 test("renderer cannot supply a path, URL, tag, asset, or command to managed Codex actions", () => {
   for (const channel of [
-    "codexpp:install-codex-beta",
-    "codexpp:rollback-codex-beta",
-    "codexpp:check-codex-desktop-update",
-    "codexpp:install-codex-desktop-update",
+    "tweaker:install-codex-beta",
+    "tweaker:rollback-codex-beta",
+    "tweaker:check-codex-desktop-update",
+    "tweaker:get-codex-desktop-update",
+    "tweaker:start-codex-desktop-update",
+    "tweaker:get-codex-desktop-update-transaction",
+    "tweaker:resume-codex-desktop-update",
+    "tweaker:cancel-codex-desktop-update",
   ]) {
     const body = extractHandlerBody(mainSource, channel);
     assert.doesNotMatch(body, /payload|path|url|tag|asset|command/i, `${channel} accepts unsafe renderer input`);
   }
 });
 
-test("desktop install delegates only to the native Sparkle bridge", () => {
-  const body = extractHandlerBody(mainSource, "codexpp:install-codex-desktop-update");
-  assert.match(body, /getCodexSparkleBridge\(\)\.installUpdate\(\)/);
-  assert.doesNotMatch(body, /ditto|copy|rename|download|exec|spawn|shell/i);
+test("desktop Update and Reload delegates only to the durable installer transaction", () => {
+  const body = extractHandlerBody(mainSource, "tweaker:start-codex-desktop-update");
+  assert.match(body, /startCodexDesktopUpdateTransaction\(\)/);
+  assert.doesNotMatch(body, /checkForUpdates|installUpdate|ditto|copy|rename|download|exec|spawn|shell/i);
+  const starter = extractFunctionBody(mainSource, "startCodexDesktopUpdateTransaction");
+  assert.match(starter, /startInstalledCli\(cli, \["update-chatgpt", "--json"\]\)/);
   assert.match(mainSource, /getCodexSparkleBridge\(\)\.wrapExports\(loaded\)/);
 });
 
-test("desktop update checks refresh appcast metadata without calling raw native Sparkle", () => {
-  const body = extractHandlerBody(mainSource, "codexpp:check-codex-desktop-update");
-  assert.match(body, /getCodexVersionsSnapshot\(true\)/);
+test("environment IPC stages fixed selections and submits only a validated durable transaction", () => {
+  const status = extractHandlerBody(mainSource, "tweaker:get-environment-status");
+  assert.match(status, /\["environment", "status", "--observe", "--json"\]/);
+  const transaction = extractHandlerBody(mainSource, "tweaker:get-environment-transaction");
+  assert.match(transaction, /\["environment", "transaction", "--json"\]/);
+
+  const prepare = extractHandlerBody(mainSource, "tweaker:prepare-environment");
+  assert.match(prepare, /assertEnvironmentRequest\(payload\)/);
+  assert.match(prepare, /payload\.appExperience === "tweakers" && payload\.releaseProfile === "alpha"/);
+  assert.match(prepare, /ensureManagedAlphaEnvironmentBackend\(\)/);
+  assert.match(prepare, /"--app-experience",\s*payload\.appExperience/);
+  assert.match(prepare, /"--release-profile",\s*payload\.releaseProfile/);
+  assert.match(prepare, /ENVIRONMENT_PREPARE_TIMEOUT_MS/);
+
+  const commit = extractHandlerBody(mainSource, "tweaker:commit-environment");
+  assert.match(commit, /assertEnvironmentTransactionRequest\(payload\)/);
+  assert.match(commit, /"submit"/);
+  assert.match(commit, /"--transaction",\s*payload\.transactionId/);
+  const cancel = extractHandlerBody(mainSource, "tweaker:cancel-environment");
+  assert.match(cancel, /assertEnvironmentTransactionRequest\(payload\)/);
+  assert.match(cancel, /"cancel"/);
+
+  for (const body of [prepare, commit, cancel]) {
+    assert.doesNotMatch(body, /payload\.(?:path|url|tag|asset|command|cli|receipt)/i);
+  }
+  assert.match(mainSource, /await codexCliManager\.installBeta\(\)/);
+  assert.match(mainSource, /await codexCliManager\.validateCurrent\(\)/);
+});
+
+test("environment helper diagnostics stop treating a dead helper as in-flight forever", () => {
+  assert.match(mainSource, /ENVIRONMENT_HELPER_STALE_MS = 60_000/);
+  assert.match(mainSource, /Environment helper did not start/);
+  assert.match(mainSource, /Environment helper stopped before reporting an outcome/);
+});
+
+test("native Alpha chooser owns the path and invokes strict registration", () => {
+  const chooser = extractHandlerBody(mainSource, "tweaker:choose-alpha-environment");
+  assert.match(chooser, /dialog\.showOpenDialog/);
+  assert.match(chooser, /openDirectory/);
+  assert.match(chooser, /environment",\s*"register-alpha"/);
+  assert.match(chooser, /--app-path/);
+  assert.doesNotMatch(chooser, /payload/);
+});
+
+test("menu and Config use the same safe desktop update service without raw native Sparkle", () => {
+  const body = extractHandlerBody(mainSource, "tweaker:check-codex-desktop-update");
+  assert.match(body, /codexDesktopUpdateService\.checkAndPresent\(\)/);
   assert.doesNotMatch(body, /checkForUpdates|checkForUpdatesInBackground|installUpdate/);
+  assert.match(mainSource, /requestManualCheck: async \(\) =>/);
+  assert.match(mainSource, /requestCodexDesktopManualCheck\("native-sparkle"\)/);
+  assert.match(mainSource, /requestBackgroundCheck: runProactiveDesktopUpdateCheck/);
+  assert.match(mainSource, /requestInstall: startCodexDesktopUpdateTransaction/);
+  const retained = extractHandlerBody(mainSource, "tweaker:get-codex-desktop-update");
+  assert.match(retained, /getSnapshot\(\)/);
+  assert.doesNotMatch(retained, /publishCodexDesktopUpdateResult|checkSilently/);
+  assert.match(mainSource, /tweaker:codex-desktop-update-changed/);
+  assert.match(mainSource, /installCodexDesktopUpdateMenuReplay\(\)/);
+  assert.match(mainSource, /Menu\.setApplicationMenu = function tweakerSetApplicationMenu/);
+  assert.match(mainSource, /Menu\.buildFromTemplate\(template\)/);
+  assert.match(mainSource, /syncCodexDesktopUpdateMenuBeforeAttach[\s\S]*Reflect\.apply\(setApplicationMenu/);
+  assert.match(menuSource, /updateAvailable \? "Update Available…" : "Check for Updates…"/);
+});
+
+test("proactive desktop update checks are metadata-only, deduplicated, and excluded from health probes", () => {
+  const checker = extractFunctionBody(mainSource, "runProactiveDesktopUpdateCheck");
+  assert.match(checker, /codexDesktopUpdateService\.checkSilently\(\)/);
+  assert.match(checker, /result\.status !== "update-available"/);
+  assert.match(checker, /codexDesktopUpdateNotification/);
+  assert.match(checker, /Notification\.isSupported\(\)/);
+  assert.doesNotMatch(checker, /checkAndPresent|showMessageBox|startCodexDesktopUpdateTransaction/);
+
+  const readyStart = mainSource.indexOf("app.whenReady().then(() => {");
+  const readyEnd = mainSource.indexOf("app.on(\"will-quit\"", readyStart);
+  assert.ok(readyStart >= 0 && readyEnd > readyStart, "missing app-ready bootstrap block");
+  const ready = mainSource.slice(readyStart, readyEnd);
+  assert.match(ready, /if \(healthCheckOnly\)[\s\S]*?else \{[\s\S]*?scheduleProactiveDesktopUpdateChecks\(\)/);
+  assert.match(mainSource, /PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 \* 60 \* 60 \* 1_000/);
+});
+
+test("runtime owns one watched MCP reconciler with status and repair IPC", () => {
+  assert.match(mainSource, /const mcpReconciler = healthCheckOnly \? null : createMcpReconciler\(\{/);
+  assert.match(mainSource, /configPath: CODEX_CONFIG_FILE/);
+  assert.match(mainSource, /reconcileNow\(mcpTrigger\)/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:get-mcp-sync-state"/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:repair-mcp"/);
+  assert.match(mainSource, /mcpReconciler\?\.close\(\)/);
+  assert.match(mainSource, /receipt\.conflicts\.map/);
+  assert.match(mainSource, /conflict\.observedName.*conflict\.canonicalName.*conflict\.reason/s);
+  assert.doesNotMatch(mainSource, /syncManagedMcpServers\(/);
+});
+
+test("candidate health probes cannot watch, reconcile, or repair the real MCP config", () => {
+  assert.match(mainSource, /const mcpReconciler = healthCheckOnly \? null : createMcpReconciler\(\{/);
+  assert.match(mainSource, /if \(mcpReconciler\) \{[\s\S]*?await mcpReconciler\.reconcileNow\(mcpTrigger\)/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:set-tweak-enabled", async[\s\S]*?setTweakEnabledAndReload/);
+  assert.match(mainSource, /MCP repair is unavailable during a health-only probe/);
 });
 
 test("candidate health probes suppress Dock activation before app readiness", () => {
@@ -71,14 +190,53 @@ test("candidate health probes suppress Dock activation before app readiness", ()
   assert.match(mainSource, /app\.dock\?\.hide\(\)/);
 });
 
+test("candidate health probes cannot register preload, start browser UI, or load main tweaks", () => {
+  const readyStart = mainSource.indexOf("app.whenReady().then(() => {");
+  const readyEnd = mainSource.indexOf('app.on("will-quit"', readyStart);
+  assert.ok(readyStart >= 0 && readyEnd > readyStart, "missing app-ready bootstrap block");
+  const ready = mainSource.slice(readyStart, readyEnd);
+  assert.match(
+    ready,
+    /if \(!healthCheckOnly\) \{[\s\S]*?registerPreload\(session\.defaultSession[\s\S]*?maybeStartBrowserUiServer\(/,
+  );
+
+  assert.match(
+    mainSource,
+    /if \(!healthCheckOnly\) \{\s*app\.on\("session-created"[\s\S]*?registerPreload\(s, "session-created"\)/,
+  );
+  assert.match(
+    mainSource,
+    /if \(!healthCheckOnly\) \{\s*setImmediate\(\(\) => \{[\s\S]*?loadTweaksInitially\(tweakLifecycleDeps\)/,
+  );
+
+  const preload = extractFunctionBody(mainSource, "registerPreload");
+  assert.match(preload, /^\s*if \(healthCheckOnly\) return;/);
+  const mainTweaks = extractFunctionBody(mainSource, "loadAllMainTweaks");
+  assert.match(mainTweaks, /^\s*if \(healthCheckOnly\) return;/);
+});
+
 test("runtime CLI probes cannot launch a second Electron app instance", () => {
+  const localRuntimeStart = mainSource.indexOf("function localCliRuntime");
+  const localRuntimeEnd = mainSource.indexOf("function localRefreshCli", localRuntimeStart);
+  assert.ok(localRuntimeStart >= 0 && localRuntimeEnd > localRuntimeStart);
+  const localRuntime = mainSource.slice(localRuntimeStart, localRuntimeEnd);
   const launchdLaunch = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
-  assert.match(mainSource, /function localCliRuntime[\s\S]*?process\.resourcesPath, "cua_node"/);
-  assert.match(mainSource, /function localCliRuntime[\s\S]*?ELECTRON_RUN_AS_NODE: "1"/);
+  assert.match(mainSource, /function localCliRuntime[\s\S]*?resolveLocalCliRuntime\(\{/);
   assert.match(launchdLaunch, /localCliRuntime\(cli, args\)/);
   assert.match(launchdLaunch, /runtime\.command, \.\.\.runtime\.args/);
   assert.doesNotMatch(launchdLaunch, /process\.execPath, cli/);
   assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE=1/);
+  for (const exactRootVariable of [
+    "TWEAKERS_HOME",
+    "TWEAKER_HOME",
+    "TWEAKERS_USER_ROOT",
+    "TWEAKER_USER_ROOT",
+  ]) {
+    assert.match(localRuntime, new RegExp(`${exactRootVariable}: userRoot!`));
+    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}=\\$\\{shellQuote\\(userRoot!\\)\\}`));
+  }
+  assert.match(localRuntime, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
+  assert.match(launchdLaunch, /\$\{LEGACY_USER_ROOT_ENV\}=\$\{shellQuote\(userRoot!\)\}/);
 });
 
 test("Sparkle update mode is committed only after the signed app restore", () => {
@@ -108,8 +266,46 @@ test("failed appcast refresh keeps safe last-known-good metadata stale", () => {
   const body = extractFunctionBody(mainSource, "getCodexVersionsSnapshot");
   assert.match(body, /persistedAppcast/);
   assert.match(body, /!refreshedAppcast\.error && !refreshedAppcast\.stale/);
-  assert.match(body, /codexAppcastMetadata \?\? persistedAppcast/);
+  assert.match(body, /codexAppcastMetadataByIdentity\.get\(desktopAppcastMemoryKey\) \?\? persistedAppcast/);
   assert.match(body, /stale: true/);
+});
+
+test("desktop appcasts are isolated by verified release profile and Alpha never falls through to Stable", () => {
+  const target = extractFunctionBody(mainSource, "selectedCodexDesktopUpdateTarget");
+  assert.match(target, /verifiedCodexDesktopProfileIdentity\(registry, profile\)/);
+  assert.match(target, /readCapturedCodexDesktopProfileFeed/);
+  const refresh = extractFunctionBody(mainSource, "refreshCodexDesktopUpdateMetadata");
+  assert.match(refresh, /target\.profile === "alpha"/);
+  assert.match(refresh, /fetchProfileAppcastMetadata/);
+  assert.match(refresh, /fetchAppcastMetadata\(\)/);
+  assert.match(mainSource, /codexAppcastMetadataByIdentity/);
+  assert.match(mainSource, /codexDesktopAppcastMemoryKey/);
+  assert.match(mainSource, /onFeedCaptured: persistCapturedCodexDesktopProfileFeed/);
+});
+
+test("release-channel defaults remain Stable desktop, bundled CLI, and Stable Tweakers updates", () => {
+  const target = extractFunctionBody(mainSource, "selectedCodexDesktopUpdateTarget");
+  assert.match(target, /let profile: CodexDesktopUpdateTarget\["profile"\] = "stable"/);
+  const selectedLane = extractFunctionBody(mainSource, "selectedCodexLane");
+  assert.match(selectedLane, /codexCliBootstrap\.effectiveLane/);
+  assert.match(mainSource, /updateChannel: s\.tweaker\?\.updateChannel \?\? "stable"/);
+  const snapshot = extractFunctionBody(mainSource, "getCodexVersionsSnapshot");
+  assert.match(snapshot, /restartRequired: false/);
+  assert.doesNotMatch(mainSource, /codexLaneChangedThisProcess/);
+});
+
+test("Codex version snapshots report the exact measured active backend separately from lane releases", () => {
+  const body = extractFunctionBody(mainSource, "getCodexVersionsSnapshot");
+  assert.match(body, /activeCliPath = codexCliBootstrap\.binary \?\? bundledPath/);
+  assert.match(body, /probeCli\(activeCliPath\)/);
+  assert.match(body, /activeCli:\s*\{/);
+  assert.match(body, /path: activeCliProbe\.path/);
+  assert.match(body, /version: activeCliProbe\.version/);
+  assert.match(body, /versionChannel: codexVersionChannel\(activeCliProbe\.version\)/);
+  assert.match(body, /source: activeCliSource/);
+  assert.match(body, /Math\.min\(\.\.\.lookupCheckedAt\)/);
+  assert.match(body, /managedAlphaVersion = managerState\.current\?\.version \?\? betaProbe\?\.version/);
+  assert.match(body, /versionChannel: codexVersionChannel\(managedAlphaVersion\)/);
 });
 
 function extractHandlerBody(source: string, channel: string): string {

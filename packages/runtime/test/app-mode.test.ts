@@ -26,7 +26,7 @@ function deps(overrides: Partial<SwitchAppModeDeps> = {}): SwitchAppModeDeps & {
   };
 }
 
-test("switch-app-mode accepts only { target: chatgpt | tweakers }", () => {
+test("switch-app-mode accepts only { target: chatgpt | tweaker }", () => {
   assert.equal(parseSwitchAppModePayload({ target: "chatgpt" }), "chatgpt");
   assert.equal(parseSwitchAppModePayload({ target: "tweakers" }), "tweakers");
   for (const payload of [
@@ -99,15 +99,12 @@ const injectorSource = readFileSync(resolve("packages/runtime/src/preload/settin
 const hostSource = readFileSync(resolve("packages/runtime/src/preload/tweak-host.ts"), "utf8");
 const pageModelSource = readFileSync(resolve("packages/runtime/src/preload/settings-page-model.ts"), "utf8");
 
-test("main registers codexpp:switch-app-mode beside start-local-refresh on the launchd path", () => {
-  const refresh = mainSource.indexOf('ipcMain.handle("codexpp:start-local-refresh"');
-  const switchMode = mainSource.indexOf('ipcMain.handle("codexpp:switch-app-mode"');
-  assert.ok(refresh >= 0 && switchMode > refresh, "switch-app-mode is registered after start-local-refresh");
-  const body = extractHandlerBody(mainSource, "codexpp:switch-app-mode");
-  assert.match(body, /switchAppMode\(payload/);
-  assert.match(body, /startCliWithLaunchd: startInstalledCliWithLaunchd/);
-  assert.match(body, /localRefreshCli\(\)/);
-  assert.doesNotMatch(body, /startInstalledCli\(|spawn\(|confirm|dialog/i);
+test("main removes legacy mode/lane IPC and routes restarts through Environment", () => {
+  assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:switch-app-mode"/);
+  assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:set-codex-cli-lane"/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:prepare-environment"/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:commit-environment"/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:rollback-environment"/);
 });
 
 test("the runtime carries no soft vanilla mode or mode-switcher special cases", () => {
@@ -125,35 +122,31 @@ test("the runtime carries no soft vanilla mode or mode-switcher special cases", 
   assert.match(mainSource, /removeLegacyModeSwitcherState\(userRoot\)/);
 });
 
-test("the App Mode control confirms in the renderer, then invokes the switch IPC", () => {
-  const section = extractFunctionBody(injectorSource, "renderModeSection");
-  assert.match(section, /openModeSwitchModal\(target/);
-  const modal = extractFunctionBody(injectorSource, "openModeSwitchModal");
-  assert.doesNotMatch(modal, /window\.confirm/);
-  assert.match(injectorSource, /codexpp:switch-app-mode/);
-  assert.match(injectorSource, /ChatGPT will quit and restart as the official app\. Tweaks turn off; the Chrome-extension bridge turns on; some macOS permissions may need re-granting\./);
-  assert.match(injectorSource, /ChatGPT will quit and restart with Tweakers enabled\. Tweaks turn on; the Chrome-extension bridge turns off; some macOS permissions may need re-granting\./);
+test("the Environment control prepares one paired selection before one confirmation", () => {
+  const section = extractFunctionBody(injectorSource, "renderEnvironmentSection");
+  const modal = extractFunctionBody(injectorSource, "openEnvironmentConfirmModal");
+  assert.match(section, /tweaker:prepare-environment/);
+  assert.match(section, /openEnvironmentConfirmModal\(requested, receipt/);
+  assert.match(modal, /Apply & Restart/);
+  assert.doesNotMatch(injectorSource, /tweaker:switch-app-mode/);
+  assert.doesNotMatch(injectorSource, /tweaker:set-codex-cli-lane/);
 });
 
-test("the App Mode control never parks in Restarting… forever after a submitted switch", () => {
-  const section = extractFunctionBody(injectorSource, "renderModeSection");
-  // ok:true only means the launchd helper was submitted; a pre-quit CLI
-  // refusal is otherwise invisible (stdio discarded), so the control arms a
-  // timeout that re-enables it and points at the switcher / mode status.
-  assert.match(section, /MODE_SWITCH_START_TIMEOUT_MS/);
-  assert.match(section, /clearSwitchStartTimer/);
-  assert.match(section, /The switch did not start — check the Tweakers menu-bar switcher or run `tweakers mode status`\./);
-  assert.match(section, /pagehide/);
+test("the Environment control follows the durable receipt instead of parking on helper submission", () => {
+  const section = extractFunctionBody(injectorSource, "renderEnvironmentSection");
+  assert.match(section, /scheduleEnvironmentTransactionPoll/);
+  assert.match(section, /loadEnvironmentTransaction/);
+  assert.match(section, /normalizeEnvironmentHelperSubmission/);
+  assert.match(section, /environmentTransactionIsTerminal/);
 });
 
-test("the mode modal ignores backdrop clicks born from a double-click on the trigger", () => {
-  const modal = extractFunctionBody(injectorSource, "openModeSwitchModal");
-  // Dismissal requires the press to BEGIN on the backdrop and to fall outside
-  // the open grace period (a double-click's second click lands on the overlay
-  // that just appeared over the trigger button).
-  assert.match(modal, /pressBeganOnOverlay/);
-  assert.match(modal, /mousedown/);
-  assert.match(modal, /openedAt/);
+test("the Environment modal is accessible and traps keyboard focus", () => {
+  const modal = extractFunctionBody(injectorSource, "openEnvironmentConfirmModal");
+  assert.match(modal, /aria-modal/);
+  assert.match(modal, /aria-labelledby/);
+  assert.match(modal, /event\.key === "Escape"/);
+  assert.match(modal, /event\.key !== "Tab"/);
+  assert.match(modal, /confirm\.focus\(\)/);
 });
 
 function extractHandlerBody(source: string, channel: string): string {

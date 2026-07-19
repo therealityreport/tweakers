@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import test from "node:test";
 import {
   TWEAK_LIFECYCLE_STATUSES,
@@ -77,3 +78,47 @@ test("installer assets contain the same eleven canonical tweak folders", () => {
   assert.equal(sourceIds.length, 11);
   assert.deepEqual(packagedIds, sourceIds);
 });
+
+test("installer assets contain the MCP reconciler and a generated runtime fingerprint", () => {
+  const packagedRoot = resolve(root, "packages/installer/assets/runtime");
+  assert.equal(existsSync(resolve(packagedRoot, "mcp-reconciliation.js")), true);
+
+  const fingerprint = JSON.parse(
+    readFileSync(resolve(packagedRoot, "runtime-fingerprint.json"), "utf8"),
+  ) as { schemaVersion?: unknown; fingerprint?: unknown; fileCount?: unknown };
+  assert.equal(fingerprint.schemaVersion, 1);
+  assert.match(String(fingerprint.fingerprint), /^[0-9a-f]{64}$/);
+  assert.equal(Number.isInteger(fingerprint.fileCount) && Number(fingerprint.fileCount) > 0, true);
+  assert.deepEqual(runtimeFingerprint(packagedRoot), {
+    fingerprint: fingerprint.fingerprint,
+    fileCount: fingerprint.fileCount,
+  });
+
+  const main = readFileSync(resolve(packagedRoot, "main.js"), "utf8");
+  assert.match(main, /createMcpReconciler/);
+  assert.match(main, /tweaker:get-mcp-sync-state/);
+  assert.match(main, /tweaker:repair-mcp/);
+  assert.doesNotMatch(main, /syncManagedMcpServers\(\{\s*configPath:/);
+});
+
+function runtimeFingerprint(runtimeRoot: string): { fingerprint: string; fileCount: number } {
+  const hash = createHash("sha256");
+  let fileCount = 0;
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      const name = relative(runtimeRoot, path);
+      if (name === "runtime-fingerprint.json") continue;
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) {
+        fileCount += 1;
+        hash.update(name);
+        hash.update("\0");
+        hash.update(readFileSync(path));
+        hash.update("\0");
+      }
+    }
+  };
+  visit(runtimeRoot);
+  return { fingerprint: hash.digest("hex"), fileCount };
+}

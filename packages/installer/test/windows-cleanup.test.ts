@@ -15,11 +15,12 @@ test("Windows cleanup removes only Tweakers managed context menu entries", () =>
 
   assert.match(script, /OpenProjectInCodex/);
   assert.match(script, /GetValue\(''\)/);
-  assert.match(script, /\\codex-plusplus\\store-apps\\/);
+  assert.match(script, /\\tweaker\\store-apps\\/);
   assert.match(script, /Remove-Item -LiteralPath \$key -Recurse -Force/);
-  assert.match(script, /codex-plusplus-codex\.cmd/);
+  assert.match(script, /tweaker-codex\.cmd/);
   assert.match(script, /watcher\.cmd/);
-  assert.match(script, /Codex\+\+\.lnk/);
+  assert.match(script, /Tweakers\.lnk/);
+  assert.match(script, /Tweaker\.lnk/);
   assert.match(script, /store-apps/);
   assert.match(script, /Get-ScheduledTask -TaskName \$taskName/);
   assert.match(script, /Unregister-ScheduledTask -InputObject \$_ -Confirm:\$false/);

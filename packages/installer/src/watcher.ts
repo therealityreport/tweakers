@@ -5,11 +5,11 @@
  * we either auto-`repair` or surface a notification, depending on user prefs.
  *
  * Implementation per OS:
- *   macOS:   ~/Library/LaunchAgents/com.codexplusplus.watcher.plist (launchd)
- *   Linux:   ~/.config/systemd/user/codex-plusplus-watcher.service (systemd --user)
+ *   macOS:   ~/Library/LaunchAgents/com.tweaker.watcher.plist (launchd)
+ *   Linux:   ~/.config/systemd/user/tweaker-watcher.service (systemd --user)
  *   Windows: Task Scheduler entry via schtasks.exe
  *
- * The watcher itself is just `codex-plusplus repair --quiet` triggered on the
+ * The watcher itself is just `tweaker repair --quiet` triggered on the
  * relevant event (app launch / login). The simplest cross-platform approach
  * is "run at login" + "run when Codex.app is modified" (FSEvents/inotify on
  * unix, but launchd's WatchPaths handles it on mac).
@@ -21,6 +21,7 @@ import { join, dirname } from "node:path";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "./ownership.js";
 import { userPaths } from "./paths.js";
 import { managedCliPath } from "./managed-runtime.js";
+import { LEGACY_LAUNCHD_LABEL, LEGACY_WATCHER_ENV, LEGACY_WATCHER_STEM } from "./legacy-compat.js";
 
 export type WatcherKind = "launchd" | "login-item" | "scheduled-task" | "systemd" | "none";
 
@@ -55,17 +56,24 @@ const LABEL = "com.therealityreport.tweakers.watcher";
 // same value feeds the systemd timer (OnUnitActiveSec) and the schtasks /MO
 // interval below, so keep it in whole minutes.
 const WATCHER_INTERVAL_SECONDS = 60 * 60;
+export const WINDOWS_WATCHER_LOGON_TASK_NAME = "tweaker-watcher";
+export const WINDOWS_WATCHER_INTERVAL_TASK_NAME = "tweaker-watcher-interval";
+const WINDOWS_WATCHER_RETIRED_TASK_NAMES = [
+  "tweaker-watcher-hourly",
+  "tweaker-watcher-daily",
+];
 
 function launchdPath(): string {
   return join(targetUserHome(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
 
 function launchdLogPath(): string {
-  return join(targetUserHome(), "Library", "Logs", "codex-plusplus-watcher.log");
+  return join(targetUserHome(), "Library", "Logs", "tweaker-watcher.log");
 }
 
 function installLaunchd(appRoot: string): WatcherKind {
-  if (isRunningFromWatcher()) return "launchd";
+  const deferReload = isRunningFromWatcher();
+  if (!deferReload) removeLegacyLaunchdWatcher();
 
   const plPath = launchdPath();
   mkdirSync(dirname(plPath), { recursive: true });
@@ -107,6 +115,10 @@ function installLaunchd(appRoot: string): WatcherKind {
   writeFileSync(logPath, "", { flag: "a" });
   chownForTargetUser(plPath);
   chownForTargetUser(logPath);
+  // A running watcher may refresh its plist on disk, but must never boot out
+  // the service that owns the current cycle. The next non-watcher repair (or
+  // login) loads the new definition; health reports this transition as pending.
+  if (deferReload) return "launchd";
   if (!bootstrapLaunchd(plPath)) {
     try {
       execLaunchctlForTargetUser(["unload", plPath]);
@@ -117,10 +129,13 @@ function installLaunchd(appRoot: string): WatcherKind {
 }
 
 export function isRunningFromWatcher(): boolean {
-  return process.env.CODEX_PLUSPLUS_WATCHER === "1" || process.env.XPC_SERVICE_NAME === LABEL;
+  return process.env.TWEAKER_WATCHER === "1"
+    || process.env[LEGACY_WATCHER_ENV] === "1"
+    || process.env.XPC_SERVICE_NAME === LABEL;
 }
 
 function uninstallLaunchd(): void {
+  removeLegacyLaunchdWatcher();
   const plPath = launchdPath();
   if (!existsSync(plPath)) return;
   bootoutLaunchd(plPath);
@@ -128,6 +143,14 @@ function uninstallLaunchd(): void {
     execLaunchctlForTargetUser(["unload", plPath]);
   } catch {}
   rmSync(plPath, { force: true });
+}
+
+function removeLegacyLaunchdWatcher(): void {
+  const path = join(targetUserHome(), "Library", "LaunchAgents", `${LEGACY_LAUNCHD_LABEL}.plist`);
+  if (!existsSync(path)) return;
+  bootoutLaunchd(path);
+  try { execLaunchctlForTargetUser(["unload", path]); } catch {}
+  rmSync(path, { force: true });
 }
 
 function bootstrapLaunchd(plPath: string): boolean {
@@ -171,9 +194,10 @@ function execLaunchctlForTargetUser(args: string[]): void {
 function installSystemd(appRoot: string): WatcherKind {
   const dir = join(homedir(), ".config", "systemd", "user");
   mkdirSync(dir, { recursive: true });
+  removeSystemdWatcherUnits(dir, LEGACY_WATCHER_STEM);
   const repair = shellSingleQuote(watcherShellScript());
   const unit = `[Unit]
-Description=codex-plusplus repair watcher
+Description=tweaker repair watcher
 
 [Service]
 Type=oneshot
@@ -182,9 +206,9 @@ ExecStart=/bin/sh -c ${repair}
 [Install]
 WantedBy=default.target
 `;
-  writeFileSync(join(dir, "codex-plusplus-watcher.service"), unit);
-  writeFileSync(join(dir, "codex-plusplus-watcher.timer"), `[Unit]
-Description=codex-plusplus repair watcher interval
+  writeFileSync(join(dir, "tweaker-watcher.service"), unit);
+  writeFileSync(join(dir, "tweaker-watcher.timer"), `[Unit]
+Description=tweaker repair watcher interval
 
 [Timer]
 OnBootSec=5m
@@ -194,8 +218,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 `);
-  writeFileSync(join(dir, "codex-plusplus-watcher.path"), `[Unit]
-Description=codex-plusplus app.asar watcher
+  writeFileSync(join(dir, "tweaker-watcher.path"), `[Unit]
+Description=tweaker app.asar watcher
 
 [Path]
 PathChanged=${appRoot}/resources/app.asar
@@ -205,13 +229,13 @@ WantedBy=default.target
 `);
   try {
     execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
-    execFileSync("systemctl", ["--user", "enable", "codex-plusplus-watcher.service"], {
+    execFileSync("systemctl", ["--user", "enable", "tweaker-watcher.service"], {
       stdio: "ignore",
     });
-    execFileSync("systemctl", ["--user", "enable", "--now", "codex-plusplus-watcher.timer"], {
+    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.timer"], {
       stdio: "ignore",
     });
-    execFileSync("systemctl", ["--user", "enable", "--now", "codex-plusplus-watcher.path"], {
+    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.path"], {
       stdio: "ignore",
     });
   } catch {
@@ -221,45 +245,44 @@ WantedBy=default.target
 }
 
 function uninstallSystemd(): void {
-  const path = join(homedir(), ".config", "systemd", "user", "codex-plusplus-watcher.service");
-  if (!existsSync(path)) return;
+  const dir = join(homedir(), ".config", "systemd", "user");
+  removeSystemdWatcherUnits(dir, "tweaker-watcher");
+  removeSystemdWatcherUnits(dir, LEGACY_WATCHER_STEM);
+}
+
+function removeSystemdWatcherUnits(dir: string, stem: string): void {
   try {
-    execFileSync("systemctl", ["--user", "disable", "codex-plusplus-watcher.service"], {
+    execFileSync("systemctl", ["--user", "disable", `${stem}.service`], {
       stdio: "ignore",
     });
-    execFileSync("systemctl", ["--user", "disable", "--now", "codex-plusplus-watcher.path"], {
+    execFileSync("systemctl", ["--user", "disable", "--now", `${stem}.path`], {
       stdio: "ignore",
     });
-    execFileSync("systemctl", ["--user", "disable", "--now", "codex-plusplus-watcher.timer"], {
+    execFileSync("systemctl", ["--user", "disable", "--now", `${stem}.timer`], {
       stdio: "ignore",
     });
   } catch {}
-  rmSync(path, { force: true });
-  rmSync(join(homedir(), ".config", "systemd", "user", "codex-plusplus-watcher.path"), {
-    force: true,
-  });
-  rmSync(join(homedir(), ".config", "systemd", "user", "codex-plusplus-watcher.timer"), {
-    force: true,
-  });
+  for (const suffix of ["service", "path", "timer"]) {
+    rmSync(join(dir, `${stem}.${suffix}`), { force: true });
+  }
 }
 
 function installScheduledTask(_appRoot: string): WatcherKind {
   // schtasks.exe creates a logon-trigger task. We pass the watcher command via /TR.
   const repair = windowsWatcherTaskCommand();
   try {
-    deleteScheduledTask("codex-plusplus-watcher-daily");
+    for (const name of legacyWindowsWatcherTaskNames()) deleteScheduledTask(name);
     execFileSync("schtasks.exe", [
       "/Create",
       "/F",
       "/SC",
       "ONLOGON",
       "/TN",
-      "codex-plusplus-watcher",
+      WINDOWS_WATCHER_LOGON_TASK_NAME,
       "/TR",
       repair,
     ]);
-    deleteScheduledTask("codex-plusplus-watcher-hourly");
-    deleteScheduledTask("codex-plusplus-watcher-interval");
+    deleteScheduledTask(WINDOWS_WATCHER_INTERVAL_TASK_NAME);
     execFileSync("schtasks.exe", [
       "/Create",
       "/F",
@@ -268,7 +291,7 @@ function installScheduledTask(_appRoot: string): WatcherKind {
       "/MO",
       String(Math.round(WATCHER_INTERVAL_SECONDS / 60)),
       "/TN",
-      "codex-plusplus-watcher-interval",
+      WINDOWS_WATCHER_INTERVAL_TASK_NAME,
       "/TR",
       repair,
     ]);
@@ -280,7 +303,7 @@ function installScheduledTask(_appRoot: string): WatcherKind {
 
 function cliShellCommand(command: string, args: string[] = [], cli = managedCliPath(userPaths().root)): string {
   return [
-    "CODEX_PLUSPLUS_WATCHER=1",
+    "TWEAKER_WATCHER=1",
     shellQuote(process.execPath),
     ...nodeExecArgsForCli(cli).map(shellQuote),
     shellQuote(cli),
@@ -293,8 +316,7 @@ export function watcherShellScript(logPath?: string, cli = managedCliPath(userPa
   const commands = [
     "sleep 3",
     `printf '\\n[%s] Tweakers watcher start\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"`,
-    `${cliShellCommand("update", ["--watcher", "--quiet", "--no-repair"], cli)} || printf 'Tweakers runtime update failed; continuing with installed runtime\\n'`,
-    cliShellCommand("repair", ["--watcher", "--quiet"], cli),
+    cliShellCommand("watcher-run", [], cli),
   ];
   if (logPath) commands.unshift(`touch ${shellSingleQuote(logPath)}`);
   return commands.join("; ");
@@ -331,15 +353,14 @@ function nodeExecArgsForCli(cliPath: string): string[] {
 }
 
 function windowsWatcherTaskCommand(): string {
-  const scriptPath = join(windowsCodexPlusPlusDir(), "bin", "watcher.cmd");
+  const scriptPath = join(windowsTweakerDir(), "bin", "watcher.cmd");
   mkdirSync(dirname(scriptPath), { recursive: true });
   writeFileSync(
     scriptPath,
     [
       "@echo off",
-      "set CODEX_PLUSPLUS_WATCHER=1",
-      `${windowsCommand("update", ["--watcher", "--quiet", "--no-repair"])}`,
-      `${windowsCommand("repair", ["--watcher", "--quiet"])}`,
+      "set TWEAKER_WATCHER=1",
+      `${windowsCommand("watcher-run")}`,
       "exit /b 0",
       "",
     ].join("\r\n"),
@@ -351,15 +372,24 @@ function windowsQuote(value: string): string {
   return `"${value.replace(/"/g, `\\"`)}"`;
 }
 
-function windowsCodexPlusPlusDir(): string {
-  return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "codex-plusplus");
+function windowsTweakerDir(): string {
+  return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "tweaker");
 }
 
 function uninstallScheduledTask(): void {
-  deleteScheduledTask("codex-plusplus-watcher");
-  deleteScheduledTask("codex-plusplus-watcher-interval");
-  deleteScheduledTask("codex-plusplus-watcher-hourly");
-  deleteScheduledTask("codex-plusplus-watcher-daily");
+  for (const name of currentWindowsWatcherTaskNames()) deleteScheduledTask(name);
+  for (const name of legacyWindowsWatcherTaskNames()) deleteScheduledTask(name);
+}
+
+export function currentWindowsWatcherTaskNames(): string[] {
+  return [WINDOWS_WATCHER_LOGON_TASK_NAME, WINDOWS_WATCHER_INTERVAL_TASK_NAME];
+}
+
+export function legacyWindowsWatcherTaskNames(): string[] {
+  return [
+    ...WINDOWS_WATCHER_RETIRED_TASK_NAMES,
+    ...["", "-interval", "-hourly", "-daily"].map((suffix) => `${LEGACY_WATCHER_STEM}${suffix}`),
+  ];
 }
 
 function deleteScheduledTask(name: string): void {

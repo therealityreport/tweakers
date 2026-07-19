@@ -43,7 +43,7 @@ node --test diagnostics/codex-chat-ui/bounded-mount-contract.test.cjs
 Read-only inspection recorded that `/Applications/ChatGPT.app` version
 `26.707.41301` still contained the assistant-root class and a current hashed
 markdown class, but no installed `co.tweakers.codex-chat-ui/index.js` was
-found under the Codex++ Application Support directory. CDP was not exposed on
+found under the Tweaker Application Support directory. CDP was not exposed on
 the common local ports. Therefore the selector compatibility was observed in
 the packaged app, while deployment and live-renderer behavior remained
 unverified.

@@ -3,12 +3,12 @@
 The runtime loads JavaScript from tweak entry files. It does not transpile
 TypeScript, JSX, or raw ESM imports at runtime.
 
-Use `@codex-plusplus/sdk` for types, then bundle to CommonJS.
+Use `@therealityreport/tweakers-sdk` for types, then bundle to CommonJS.
 
 ## Install Dev Dependencies
 
 ```sh
-npm i -D @codex-plusplus/sdk typescript esbuild
+npm i -D @therealityreport/tweakers-sdk typescript esbuild
 ```
 
 ## TypeScript Source
@@ -16,7 +16,7 @@ npm i -D @codex-plusplus/sdk typescript esbuild
 `src/index.ts`:
 
 ```ts
-import { defineTweak } from "@codex-plusplus/sdk";
+import { defineTweak } from "@therealityreport/tweakers-sdk";
 
 export default defineTweak({
   start(api) {
@@ -55,7 +55,7 @@ Use `--platform=node` for main-process tweaks.
 For simple tweaks, one dependency-light entry can branch:
 
 ```ts
-import { defineTweak } from "@codex-plusplus/sdk";
+import { defineTweak } from "@therealityreport/tweakers-sdk";
 
 export default defineTweak({
   start(api) {
@@ -116,10 +116,10 @@ entry that branches on `api.process`.
 {
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=browser --format=cjs --outfile=index.js",
-    "validate": "codexplusplus validate-tweak ."
+    "validate": "tweaker validate-tweak ."
   },
   "devDependencies": {
-    "@codex-plusplus/sdk": "^1.0.0",
+    "@therealityreport/tweakers-sdk": "^1.0.0",
     "esbuild": "^0.28.0",
     "typescript": "^5.6.0"
   }
@@ -130,5 +130,5 @@ Run:
 
 ```sh
 npm run build
-codexplusplus validate-tweak .
+tweaker validate-tweak .
 ```

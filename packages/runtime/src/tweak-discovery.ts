@@ -24,7 +24,14 @@ export function discoverTweaks(tweaksDir: string): DiscoveredTweak[] {
   const out: DiscoveredTweak[] = [];
   for (const name of readdirSync(tweaksDir).sort((a, b) => a.localeCompare(b))) {
     const dir = join(tweaksDir, name);
-    if (!statSync(dir).isDirectory()) continue;
+    // A removed development target can leave a dangling top-level symlink.
+    // Treat one unreadable entry as invalid instead of taking every installed
+    // tweak offline.
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
     const manifestPath = join(dir, "manifest.json");
     if (!existsSync(manifestPath)) continue;
     let manifest: TweakManifest;

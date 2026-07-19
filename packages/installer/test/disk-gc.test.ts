@@ -16,7 +16,7 @@ type Health = {
 };
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-disk-gc-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-disk-gc-"));
   return {
     root,
     appRoot: join(root, "app"),

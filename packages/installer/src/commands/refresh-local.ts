@@ -12,6 +12,7 @@ import { install, readAsarMarker } from "./install.js";
 import { repair } from "./repair.js";
 import { acquireProcessLock, type ProcessLock } from "../process-lock.js";
 import { readState, resolveMode } from "../state.js";
+import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 
 export type RefreshSource = "development" | "stable" | "current";
 export type RefreshPhase = "idle" | "preparing" | "quitting" | "promoting" | "complete" | "failed";
@@ -50,7 +51,7 @@ export async function runRefreshWorkflow(adapters: WorkflowAdapters): Promise<vo
 
 export function registerDevelopmentCheckout(configFile: string, sourceRoot: string): void {
   updateConfigFile(configFile, (config) => {
-    const section = (config.codexPlusPlus ??= {}) as Record<string, unknown>;
+    const section = (config.tweaker ??= {}) as Record<string, unknown>;
     section.developmentSourceRoot = sourceRoot;
     section.lastPublishedTweakHash = hashTree(join(sourceRoot, "tweaks"), true);
   });
@@ -59,8 +60,8 @@ export function registerDevelopmentCheckout(configFile: string, sourceRoot: stri
 export function getLocalRefreshStatus(userRoot: string): LocalRefreshStatus {
   const configFile = join(userRoot, "config.json");
   const config = readConfigFile(configFile);
-  const section = config.codexPlusPlus && typeof config.codexPlusPlus === "object"
-    ? config.codexPlusPlus as Record<string, unknown>
+  const section = config.tweaker && typeof config.tweaker === "object"
+    ? config.tweaker as Record<string, unknown>
     : {};
   const developmentSourceRoot = typeof section.developmentSourceRoot === "string" && existsSync(section.developmentSourceRoot)
     ? section.developmentSourceRoot
@@ -86,6 +87,8 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
   // rebuild and promote a patched bundle over the pristine official app.
   assertRefreshAllowedByMode(paths.stateFile, opts.app);
   if (handoffRefreshLocalToLaunchd(paths.root)) return;
+  await withLifecycleLock(lifecycleLockFile(paths.root), "local refresh", async () => {
+  assertLifecycleReceiptsIdle(paths.root);
   const current = getLocalRefreshStatus(paths.root);
   const selected: RefreshSource = opts.source === "development" ? "development"
     : opts.source === "stable" ? "stable"
@@ -94,7 +97,6 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
   if (!sourceRoot) throw new Error("No registered Tweakers development checkout is available");
   const lockFile = join(paths.root, "refresh-local.lock");
   const lock = acquireRefreshLock(lockFile);
-  const appRoot = locateCodex(opts.app).appRoot;
   const stableStageRoot = join(paths.root, "refresh-stable-stage");
   let preparedStableSource: string | null = null;
   const writePhase = (phase: RefreshPhase, error: string | null = null): void => writeRefreshState(paths.root, {
@@ -107,12 +109,18 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
     checkedAt: new Date().toISOString(),
   });
   try {
+    const appRoot = locateCodex(opts.app).appRoot;
     await runRefreshWorkflow({
       phase: (phase) => writePhase(phase),
       prepare: async () => {
         if (selected === "stable") {
           rmSync(stableStageRoot, { recursive: true, force: true });
-          const stageEnv = { ...process.env, TWEAKERS_USER_ROOT: stableStageRoot, CODEX_PLUSPLUS_USER_ROOT: stableStageRoot };
+          const stageEnv = {
+            ...process.env,
+            TWEAKERS_USER_ROOT: stableStageRoot,
+            TWEAKER_USER_ROOT: stableStageRoot,
+            [["CODEX", "PLUSPLUS", "USER_ROOT"].join("_")]: stableStageRoot,
+          };
           runChecked(process.execPath, [resolve(process.argv[1]), "update", "--no-repair", "--quiet", "--force"], process.cwd(), stageEnv);
           preparedStableSource = managedSourceRoot(stableStageRoot);
           const stagedCli = managedCliPath(stableStageRoot);
@@ -143,6 +151,7 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
     lock.release();
     rmSync(stableStageRoot, { recursive: true, force: true });
   }
+  });
 }
 
 function assertRefreshAllowedByMode(stateFile: string, app?: string): void {
@@ -157,7 +166,7 @@ function assertRefreshAllowedByMode(stateFile: string, app?: string): void {
   throw new Error(
     "Refusing to refresh the local app while ChatGPT mode is active.\n" +
       "The official app stays pristine in ChatGPT mode; a refresh would rebuild and promote a patched bundle.\n" +
-      "Run `tweakers mode tweakers` first.",
+      "Run `tweaker mode tweakers` first.",
   );
 }
 

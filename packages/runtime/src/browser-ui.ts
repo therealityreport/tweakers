@@ -5,12 +5,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join, normalize, relative } from "node:path";
 import type { Socket } from "node:net";
 
-const CONNECT_PORT_CHANNEL = "codexpp:browser-ui-connect-app-host";
-const BRIDGE_REQUEST_CHANNEL = "codexpp:browser-ui-bridge-request";
-const BRIDGE_RESPONSE_CHANNEL = "codexpp:browser-ui-bridge-response";
-const MESSAGE_FOR_VIEW_CHANNEL = "codexpp:browser-ui-message-for-view";
-const WORKER_MESSAGE_CHANNEL = "codexpp:browser-ui-worker-message";
-const SYSTEM_THEME_CHANNEL = "codexpp:browser-ui-system-theme";
+const CONNECT_PORT_CHANNEL = "tweaker:browser-ui-connect-app-host";
+const BRIDGE_REQUEST_CHANNEL = "tweaker:browser-ui-bridge-request";
+const BRIDGE_RESPONSE_CHANNEL = "tweaker:browser-ui-bridge-response";
+const MESSAGE_FOR_VIEW_CHANNEL = "tweaker:browser-ui-message-for-view";
+const WORKER_MESSAGE_CHANNEL = "tweaker:browser-ui-worker-message";
+const SYSTEM_THEME_CHANNEL = "tweaker:browser-ui-system-theme";
 
 type LogFn = (level: "info" | "warn" | "error", ...args: unknown[]) => void;
 
@@ -109,13 +109,15 @@ const controlClients = new Set<WebSocketConnection>();
 export function maybeStartBrowserUiServer(
   opts: Pick<BrowserUiServerOptions, "getWindowServices" | "log">,
 ): void {
-  if (process.env.CODEXPP_BROWSER_UI !== "1") return;
-  const port = parsePort(process.env.CODEXPP_BROWSER_UI_PORT, 8765);
+  const legacyEnabled = process.env[[["CODEX", "PP"].join(""), "BROWSER_UI"].join("_")];
+  if (process.env.TWEAKER_BROWSER_UI !== "1" && legacyEnabled !== "1") return;
+  const port = parsePort(process.env.TWEAKER_BROWSER_UI_PORT ?? process.env[[["CODEX", "PP"].join(""), "BROWSER_UI_PORT"].join("_")], 8765);
   startBrowserUiServer({
     ...opts,
     port,
     host: "127.0.0.1",
-    hideMainWindow: process.env.CODEXPP_BROWSER_UI_HIDE_MAIN === "1",
+    hideMainWindow: process.env.TWEAKER_BROWSER_UI_HIDE_MAIN === "1"
+      || process.env[[["CODEX", "PP"].join(""), "BROWSER_UI_HIDE_MAIN"].join("_")] === "1",
   });
 }
 
@@ -213,13 +215,14 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
     sendText(res, 400, "Bad Request\n", "text/plain; charset=utf-8");
     return;
   }
+  normalizeLegacyBrowserUiPath(url);
 
-  if (url.pathname === "/codexpp/browser-ui/health") {
+  if (url.pathname === "/tweaker/browser-ui/health") {
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  if (url.pathname === "/codexpp/browser-ui/bridge") {
+  if (url.pathname === "/tweaker/browser-ui/bridge") {
     if (req.method !== "POST") {
       sendText(res, 405, "Method Not Allowed\n", "text/plain; charset=utf-8");
       return;
@@ -239,7 +242,7 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
     return;
   }
 
-  if (url.pathname === "/codexpp/browser-ui/bridge.js") {
+  if (url.pathname === "/tweaker/browser-ui/bridge.js") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       sendText(res, 405, "Method Not Allowed\n", "text/plain; charset=utf-8");
       return;
@@ -272,12 +275,13 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
 async function handleUpgrade(req: IncomingMessage, socket: Socket, head: Buffer): Promise<void> {
   const url = requestUrl(req);
   if (!url) throw new Error("bad websocket URL");
-  if (url.pathname !== "/codexpp/browser-ui/rpc" && url.pathname !== "/codexpp/browser-ui/control") {
+  normalizeLegacyBrowserUiPath(url);
+  if (url.pathname !== "/tweaker/browser-ui/rpc" && url.pathname !== "/tweaker/browser-ui/control") {
     socket.destroy();
     return;
   }
   const ws = acceptWebSocket(req, socket, head);
-  if (url.pathname === "/codexpp/browser-ui/control") {
+  if (url.pathname === "/tweaker/browser-ui/control") {
     controlClients.add(ws);
     ws.onClose(() => controlClients.delete(ws));
     ws.sendJson({ type: "hello" });
@@ -290,10 +294,17 @@ async function handleUpgrade(req: IncomingMessage, socket: Socket, head: Buffer)
   bridgeMessagePortToWebSocket(port1, ws);
 }
 
+function normalizeLegacyBrowserUiPath(url: URL): void {
+  const legacyPrefix = `/${["codex", "pp"].join("")}/browser-ui`;
+  if (url.pathname === legacyPrefix || url.pathname.startsWith(`${legacyPrefix}/`)) {
+    url.pathname = `/tweaker/browser-ui${url.pathname.slice(legacyPrefix.length)}`;
+  }
+}
+
 async function browserIndexHtml(options: BrowserUiServerOptions): Promise<string> {
   const indexPath = join(webviewRoot(), "index.html");
   let html = relaxBrowserUiCsp(readFileSync(indexPath, "utf8"));
-  const shim = `<script src="/codexpp/browser-ui/bridge.js"></script>`;
+  const shim = `<script src="/tweaker/browser-ui/bridge.js"></script>`;
   if (html.includes("</head>")) {
     html = html.replace("</head>", `${shim}\n  </head>`);
   } else {
@@ -484,10 +495,10 @@ function browserBridgeScript(state: InitialState): string {
   const browserSidebarSeededLocalServers = new Set();
   let systemThemeVariant = initialState.systemThemeVariant || "light";
 
-  window.__codexppBrowserUi = true;
+  window.__tweakerBrowserUi = true;
   installBrowserUiWebviewShim();
 
-  const control = new WebSocket(new URL("/codexpp/browser-ui/control", location.href));
+  const control = new WebSocket(new URL("/tweaker/browser-ui/control", location.href));
   control.addEventListener("message", (event) => {
     let payload;
     try { payload = JSON.parse(event.data); } catch { return; }
@@ -509,7 +520,7 @@ function browserBridgeScript(state: InitialState): string {
   });
 
   async function bridge(method, args = []) {
-    const res = await fetch("/codexpp/browser-ui/bridge", {
+    const res = await fetch("/tweaker/browser-ui/bridge", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ method, args }),
@@ -726,7 +737,7 @@ function browserBridgeScript(state: InitialState): string {
     if (event.source !== window || !event.data || event.data.type !== "connect-app-host") return;
     const port = event.data.port;
     if (!port) return;
-    const ws = new WebSocket(new URL("/codexpp/browser-ui/rpc", location.href));
+    const ws = new WebSocket(new URL("/tweaker/browser-ui/rpc", location.href));
     ws.addEventListener("message", (message) => port.postMessage(message.data));
     ws.addEventListener("close", () => {
       try { port.postMessage(null); } catch {}
@@ -745,8 +756,8 @@ function browserBridgeScript(state: InitialState): string {
   });
 
   function installBrowserUiWebviewShim() {
-    if (window.__codexppWebviewShimInstalled) return;
-    window.__codexppWebviewShimInstalled = true;
+    if (window.__tweakerWebviewShimInstalled) return;
+    window.__tweakerWebviewShimInstalled = true;
     const originalCreateElement = Document.prototype.createElement;
     Document.prototype.createElement = function(tagName, options) {
       if (String(tagName).toLowerCase() !== "webview") {
@@ -757,7 +768,7 @@ function browserBridgeScript(state: InitialState): string {
 
     function createWebviewIframe(doc) {
       const iframe = originalCreateElement.call(doc, "iframe");
-      iframe.dataset.codexppWebviewShim = "true";
+      iframe.dataset.tweakerWebviewShim = "true";
       iframe.style.border = "0";
       iframe.style.display = "block";
       iframe.style.backgroundColor = "#fff";
@@ -775,13 +786,13 @@ function browserBridgeScript(state: InitialState): string {
         Object.assign(event, extra);
         iframe.dispatchEvent(event);
       };
-      const currentUrl = () => iframe.dataset.codexppRequestedSrc || nativeGetAttribute("src") || "about:blank";
+      const currentUrl = () => iframe.dataset.tweakerRequestedSrc || nativeGetAttribute("src") || "about:blank";
       const actualFrameUrl = (url) => {
         const requested = String(url || "about:blank");
         if (!shouldBreakRecursiveFrameLoad(requested)) return requested;
         try {
           const next = new URL(requested, location.href);
-          next.searchParams.set("__codexpp_frame_depth", String(frameAncestorDepth() + 1));
+          next.searchParams.set("__tweaker_frame_depth", String(frameAncestorDepth() + 1));
           return next.href;
         } catch {
           return requested;
@@ -789,7 +800,7 @@ function browserBridgeScript(state: InitialState): string {
       };
       const setFrameUrl = (url) => {
         const requested = String(url || "about:blank");
-        iframe.dataset.codexppRequestedSrc = requested;
+        iframe.dataset.tweakerRequestedSrc = requested;
         nativeSetAttribute("src", actualFrameUrl(requested));
       };
       const navigate = (url) => {

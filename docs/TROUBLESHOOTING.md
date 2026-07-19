@@ -5,40 +5,40 @@
 The re-sign step failed or was skipped. Run:
 
 ```sh
-codex-plusplus doctor
+tweaker doctor
 ```
 
 If the signature check fails, manually re-sign:
 
 ```sh
-codex-plusplus repair --force
+tweaker repair --force
 xattr -dr com.apple.quarantine /Applications/Codex.app
 ```
 
-On macOS, Codex++ signs ad-hoc by default. `codex-plusplus install --local`
-or `codex-plusplus repair --local` opts into a local "Codex++ Local Signing"
+On macOS, Tweaker signs ad-hoc by default. `tweaker install --local`
+or `tweaker repair --local` opts into a local "Tweaker Local Signing"
 identity, but that can involve Keychain access prompts.
 
-## App launches but nothing about codex-plusplus appears
+## App launches but nothing about tweaker appears
 
-1. Open DevTools (View menu) and look for `[codex-plusplus]` lines.
-2. Check `~/Library/Application Support/codex-plusplus/log/loader.log`.
-3. If empty, the loader is not being executed → integrity check failed and the app silently fell back. Run `codex-plusplus repair`.
+1. Open DevTools (View menu) and look for `[tweaker]` lines.
+2. Check `~/Library/Application Support/tweaker/log/loader.log`.
+3. If empty, the loader is not being executed → integrity check failed and the app silently fell back. Run `tweaker repair`.
 
 ## Codex auto-updated and the patch is gone
 
 The watcher should normally re-apply the patch automatically. To force it immediately, run:
 
 ```sh
-codex-plusplus repair
+tweaker repair
 ```
 
 Check the watcher is installed:
 
 ```sh
-launchctl list | grep codexplusplus      # macOS
-systemctl --user status codex-plusplus-watcher  # Linux
-schtasks /Query /TN codex-plusplus-watcher       # Windows
+launchctl list | grep tweaker      # macOS
+systemctl --user status tweaker-watcher  # Linux
+schtasks /Query /TN tweaker-watcher       # Windows
 ```
 
 ## macOS keeps asking: ChatGPT wants to access key "Codex Storage Key"
@@ -76,7 +76,7 @@ Codex's Settings markup may have changed. The injector's heuristics need an upda
 Check the renderer console:
 
 ```
-[codex-plusplus] tweak load failed: <id> <error>
+[tweaker] tweak load failed: <id> <error>
 ```
 
 Common causes:
@@ -88,15 +88,15 @@ Common causes:
 
 ## Uninstall is incomplete
 
-The uninstaller only restores files we backed up at install time. If you've upgraded `codex-plusplus` and the original app version no longer matches, the restored backup may be stale. Either:
+The uninstaller only restores files we backed up at install time. If you've upgraded `tweaker` and the original app version no longer matches, the restored backup may be stale. Either:
 
 - Reinstall Codex from a fresh download
-- Or `codex-plusplus install` against the new Codex, then `uninstall`
+- Or `tweaker install` against the new Codex, then `uninstall`
 
 ## I want to start fresh
 
 ```sh
-codexplusplus uninstall --purge
+tweaker uninstall --purge
 ```
 
-This removes the runtime, watcher, tweaks, config, logs, backups, and Codex++ user data. Then reinstall Codex.app from the official download.
+This removes the runtime, watcher, tweaks, config, logs, backups, and Tweaker user data. Then reinstall Codex.app from the official download.

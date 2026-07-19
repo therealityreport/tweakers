@@ -17,7 +17,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
+    "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
     "lint": "eslint packages/*/src --ext .ts --no-error-on-unmatched-pattern",
     "check:tweak-catalog": "node scripts/check-tweak-catalog.mjs store/index.json",
     "sync:tweaks": "node scripts/sync-tweaks.mjs",
@@ -40,9 +40,10 @@
     "node": ">=20"
   },
   "bin": {
-    "tweakers": "bin/codexplusplus.js",
-    "codexplusplus": "bin/codexplusplus.js",
-    "codex-plusplus": "bin/codexplusplus.js"
+    "tweaker": "bin/tweaker.js",
+    "tweakers": "bin/tweaker.js",
+    "codexplusplus": "bin/tweaker.js",
+    "codex-plusplus": "bin/tweaker.js"
   },
   "dependencies": {
     "@electron/asar": "^3.4.0",

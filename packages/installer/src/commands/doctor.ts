@@ -8,7 +8,7 @@ import { verifySignature } from "../codesign.js";
 import { existsSync, accessSync, constants } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { inspectChromeBridge } from "../chrome-bridge-health.js";
-import { hasCodexPlusPlusAsarMarker, readCodexVersion } from "./install.js";
+import { readAsarMarker, readCodexVersion } from "./install.js";
 import { describeChatgptModeAsar } from "./status.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
 
@@ -33,7 +33,7 @@ export async function doctor(): Promise<void> {
     checks.push({
       name: "installed",
       ok: false,
-      detail: "no state file — run `tweakers install`",
+      detail: "no state file — run `tweaker install`",
     });
     print(checks);
     return;
@@ -55,8 +55,14 @@ export async function doctor(): Promise<void> {
 
   if (existsSync(codex.asarPath)) {
     const { headerHash } = readHeaderHash(codex.asarPath);
-    const markerPresent = hasCodexPlusPlusAsarMarker(codex.asarPath);
-    if (resolveMode(state, markerPresent) === "chatgpt") {
+    const marker = readAsarMarker(codex.asarPath);
+    const markerPresent = marker === "present";
+    const observedMode = marker === "present"
+      ? "tweakers"
+      : marker === "absent"
+        ? "chatgpt"
+        : resolveMode(state, false);
+    if (observedMode === "chatgpt") {
       const payloadMeta = readPayloadMetadata(payloadMetadataFile(paths.root));
       const report = describeChatgptModeAsar({
         headerHash,
@@ -79,7 +85,7 @@ export async function doctor(): Promise<void> {
           headerHash === state.patchedAsarHash
             ? "matches patched"
             : headerHash === state.originalAsarHash
-              ? "matches ORIGINAL — Codex updated; run `tweakers repair`"
+              ? "matches ORIGINAL — Codex updated; run `tweaker repair`"
               : "drift from both original and patched",
       });
     }
@@ -150,7 +156,7 @@ function tryWrite(p: string): boolean {
 }
 
 function print(checks: Check[]): void {
-  console.log(kleur.bold("codex-plusplus doctor\n"));
+  console.log(kleur.bold("tweaker doctor\n"));
   for (const c of checks) {
     const mark =
       c.ok === true

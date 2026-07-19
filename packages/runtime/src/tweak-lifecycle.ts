@@ -175,7 +175,7 @@ export interface ReloadTweaksDeps {
   logInfo(message: string): void;
   stopAllMainTweaks(): void;
   clearTweakModuleCache(): void;
-  loadAllMainTweaks(): void;
+  loadAllMainTweaks(): void | Promise<void>;
   broadcastReload(): void;
 }
 
@@ -187,22 +187,40 @@ export function isMainProcessTweakScope(scope: TweakScope | undefined): boolean 
   return scope !== "renderer";
 }
 
-export function reloadTweaks(reason: string, deps: ReloadTweaksDeps): void {
-  deps.logInfo(`reloading tweaks (${reason})`);
-  deps.stopAllMainTweaks();
-  deps.clearTweakModuleCache();
-  deps.loadAllMainTweaks();
-  deps.broadcastReload();
+let reloadSequence: Promise<void> = Promise.resolve();
+
+export function loadTweaksInitially(
+  deps: Pick<ReloadTweaksDeps, "loadAllMainTweaks">,
+): Promise<void> {
+  const run = async (): Promise<void> => {
+    await deps.loadAllMainTweaks();
+  };
+  const operation = reloadSequence.then(run, run);
+  reloadSequence = operation.catch(() => {});
+  return operation;
 }
 
-export function setTweakEnabledAndReload(
+export function reloadTweaks(reason: string, deps: ReloadTweaksDeps): Promise<void> {
+  const run = async (): Promise<void> => {
+    deps.logInfo(`reloading tweaks (${reason})`);
+    deps.stopAllMainTweaks();
+    deps.clearTweakModuleCache();
+    await deps.loadAllMainTweaks();
+    deps.broadcastReload();
+  };
+  const operation = reloadSequence.then(run, run);
+  reloadSequence = operation.catch(() => {});
+  return operation;
+}
+
+export async function setTweakEnabledAndReload(
   id: string,
   enabled: unknown,
   deps: SetTweakEnabledAndReloadDeps,
-): true {
+): Promise<true> {
   const normalizedEnabled = !!enabled;
   deps.setTweakEnabled(id, normalizedEnabled);
   deps.logInfo(`tweak ${id} enabled=${normalizedEnabled}`);
-  reloadTweaks("enabled-toggle", deps);
+  await reloadTweaks("enabled-toggle", deps);
   return true;
 }

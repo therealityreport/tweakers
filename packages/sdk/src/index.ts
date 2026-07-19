@@ -1,5 +1,5 @@
 /**
- * Public SDK for codex-plusplus tweak authors.
+ * Public SDK for tweaker tweak authors.
  *
  * A tweak is an ES module that default-exports an object satisfying `Tweak`.
  * The runtime calls `start(api)` after the app's settings UI is ready, and
@@ -282,7 +282,7 @@ export interface TweakApi {
   manifest: Readonly<TweakManifest>;
   /** Per-tweak persistent KV store, scoped to this tweak's id. */
   storage: TweakStorage;
-  /** Per-tweak logger; output goes to the codex-plusplus log file + devtools. */
+  /** Per-tweak logger; output goes to the tweaker log file + devtools. */
   log: TweakLogger;
   /** Process this tweak is running in. */
   process: "renderer" | "main";

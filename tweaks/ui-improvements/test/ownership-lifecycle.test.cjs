@@ -53,11 +53,11 @@ test("persisted toggle state defaults safely and preserves independent disables"
 });
 
 test("all four switches have concrete DOM behavior hooks", () => {
-  for (const marker of ["data-codexpp-sidebar-layout", "data-codexpp-multiselect-ready", "data-codexpp-slash-navigation", "data-codexpp-message-metrics"]) {
+  for (const marker of ["data-tweaker-sidebar-layout", "data-tweaker-multiselect-ready", "data-tweaker-slash-navigation", "data-tweaker-message-metrics"]) {
     assert.match(source, new RegExp(marker));
   }
-  assert.doesNotMatch(source, /data-codexpp-project-label/);
-  assert.doesNotMatch(source, /data-codexpp-settings-search|data-codexpp-tweak-mentions/);
+  assert.doesNotMatch(source, /data-tweaker-project-label/);
+  assert.doesNotMatch(source, /data-tweaker-settings-search|data-tweaker-tweak-mentions/);
   assert.match(source, /storage.*set|set.*STORAGE_KEY/is);
 });
 
@@ -101,7 +101,7 @@ test("sidebar layout never adds blanket padding to every task and navigation con
   const css = String(source.match(/"sidebar-layout":\s*"([^"]+)"/)?.[1] || "");
   assert.match(css, /data-app-action-sidebar-project-id/);
   assert.doesNotMatch(css, /:is\(a,button,\[role='button'\]\)/);
-  assert.doesNotMatch(css, /codexpp-sidebar-row-padding/);
+  assert.doesNotMatch(css, /tweaker-sidebar-row-padding/);
 });
 
 test("a single shared observer dispatches to behaviors (no per-toggle observers)", () => {

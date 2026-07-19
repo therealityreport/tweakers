@@ -56,7 +56,7 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     const common = {
       platform: "darwin" as const,
       env: { PATH: "/opt/custom node/bin:/usr/bin" },
-      argv: ["node", "/tmp/tweakers cli.js", "refresh-local", "--source", "development"],
+      argv: ["node", "/tmp/tweaker cli.js", "refresh-local", "--source", "development"],
       execPath: "/tmp/node binary",
       cwd: "/tmp/source root",
       now: () => 123,
@@ -70,7 +70,7 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     assert.match(calls[0]?.args.join(" ") ?? "", /com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123/);
     assert.match(calls[0]?.args.at(-1) ?? "", /TWEAKERS_REFRESH_LOCAL_DETACHED=1/);
     assert.match(calls[0]?.args.at(-1) ?? "", /PATH='\/opt\/custom node\/bin:\/usr\/bin'/);
-    assert.match(calls[0]?.args.at(-1) ?? "", /'\/tmp\/node binary' '\/tmp\/tweakers cli\.js'/);
+    assert.match(calls[0]?.args.at(-1) ?? "", /'\/tmp\/node binary' '\/tmp\/tweaker cli\.js'/);
     assert.match(
       calls[0]?.args.at(-1) ?? "",
       /; launchctl remove 'com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123'$/,

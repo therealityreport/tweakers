@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildCodexFeatureUnion,
   codexHeading,
+  codexVersionChannel,
   compareCodexVersions,
   computeCodexUpdateAvailable,
   createCodexVersionService,
@@ -79,6 +80,13 @@ test("Codex tags parse exactly and stable sorts above alphas of the same version
   );
 });
 
+test("installed CLI channel is measured from the version, not its source lane", () => {
+  assert.equal(codexVersionChannel("0.144.5"), "stable");
+  assert.equal(codexVersionChannel("0.145.0-alpha.18"), "prerelease");
+  assert.equal(codexVersionChannel("0.145.0-beta.1"), "unknown");
+  assert.equal(codexVersionChannel(null), "unknown");
+});
+
 test("desktop probing prefers live app marketing version and falls back through plist and state", () => {
   assert.deepEqual(probeCodexDesktopVersion({
     appVersion: " 1.2026.190 ",
@@ -122,6 +130,8 @@ test("release filters keep only semver releases belonging to the requested lane"
     release("rust-v0.144.3"),
     release("rust-v0.145.0-alpha.2"),
     release("rust-v0.145.0-alpha.10"),
+    release("rust-v0.145.0-alpha.18"),
+    release("rust-v0.145.0-alpha.22"),
     release("rust-v0.1.2025-beta", { prerelease: true }),
     release("rust-v9.0.0", { draft: true }),
     release("rust-v8.0.0", { prerelease: true }),
@@ -133,10 +143,15 @@ test("release filters keep only semver releases belonging to the requested lane"
   );
   assert.deepEqual(
     filterCodexReleases(releases, "beta").map((item) => item.tag_name),
-    ["rust-v0.145.0-alpha.2", "rust-v0.145.0-alpha.10"],
+    [
+      "rust-v0.145.0-alpha.2",
+      "rust-v0.145.0-alpha.10",
+      "rust-v0.145.0-alpha.18",
+      "rust-v0.145.0-alpha.22",
+    ],
   );
   assert.equal(selectLatestCodexRelease(releases, "bundled")?.tag_name, "rust-v0.144.3");
-  assert.equal(selectLatestCodexRelease(releases, "beta")?.tag_name, "rust-v0.145.0-alpha.10");
+  assert.equal(selectLatestCodexRelease(releases, "beta")?.tag_name, "rust-v0.145.0-alpha.22");
 });
 
 test("asset resolution accepts one allowlisted arm64 mac package with a SHA-256 digest", () => {
@@ -305,7 +320,7 @@ test("selected features are read-only when their inventory is not fresh", () => 
   assert.equal(union[0]?.effect, "none");
 });
 
-test("release service uses a matching 24-hour cache and refreshes after expiry", async () => {
+test("release service uses a matching one-hour cache and refreshes after expiry", async () => {
   let now = Date.parse("2026-07-13T12:00:00Z");
   let fetchCount = 0;
   let writtenLane: string | null = null;
@@ -314,7 +329,7 @@ test("release service uses a matching 24-hour cache and refreshes after expiry",
     schemaVersion: 1,
     currentVersion: "1.0.0",
     lane: "bundled",
-    checkedAt: new Date(now - 23 * 60 * 60 * 1000).toISOString(),
+    checkedAt: new Date(now - 59 * 60 * 1000).toISOString(),
     release: cachedRelease,
   };
   const service = createCodexVersionService({
@@ -335,7 +350,7 @@ test("release service uses a matching 24-hour cache and refreshes after expiry",
   assert.equal(fresh.stale, false);
   assert.equal(fetchCount, 0);
 
-  now += 2 * 60 * 60 * 1000;
+  now += 2 * 60 * 1000;
   const refreshed = await service.fetchLatestRelease("bundled");
   assert.equal(refreshed.release?.tag, "rust-v0.144.4");
   assert.equal(refreshed.fromCache, false);

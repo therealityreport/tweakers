@@ -1,10 +1,10 @@
 {
   "id": "co.tweakers.shadcn-codex-ui",
   "name": "Shadcn Codex UI",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "githubRepo": "therealityreport/tweakers",
   "description": "Render supported rich assistant blocks in an owned, native-safe message section.",
-  "author": "The Reality Report",
+  "author": "hulibrands",
   "tags": ["ui", "messages", "rich-blocks"],
   "scope": "renderer",
   "permissions": ["settings"],

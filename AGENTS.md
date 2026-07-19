@@ -58,7 +58,7 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - **Tweak-only:** follow `tweaks/AGENTS.md`; validate manifest, entry, lifecycle
   cleanup, permissions, and tests; apply a semantic-version bump; run
   `npm run sync:tweaks`; run focused tests, catalog check, build, and full suite;
-  then run one safe `tweakers dev-sync` snapshot and verify the live app.
+  then run one safe `tweaker dev-sync` snapshot and verify the live app.
 - **Runtime/installer:** run focused tests, typecheck/build, and full suite. Do
   not quit or replace the live app automatically; leave full promotion to the
   user-confirmed title-bar refresh flow.

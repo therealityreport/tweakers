@@ -1,7 +1,7 @@
 "use strict";
 
-const STYLE_ID = "codexpp-titlebar-controls-style";
-const ATTR = "data-codexpp-titlebar-controls";
+const STYLE_ID = "tweaker-titlebar-controls-style";
+const ATTR = "data-tweaker-titlebar-controls";
 const CONTROL_SELECTOR = [
   '[data-titlebar-control]',
   '[aria-label="Hide sidebar"]',

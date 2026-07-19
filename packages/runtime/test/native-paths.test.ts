@@ -6,7 +6,7 @@ import test from "node:test";
 import { resolveNativeTweakPath } from "../src/native-paths";
 
 test("resolveNativeTweakPath allows paths inside the tweak directory", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-native-paths-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-native-paths-"));
   try {
     mkdirSync(join(root, "native"), { recursive: true });
     writeFileSync(join(root, "native", "addon.node"), "");
@@ -20,8 +20,8 @@ test("resolveNativeTweakPath allows paths inside the tweak directory", () => {
 });
 
 test("resolveNativeTweakPath rejects traversal outside the tweak directory", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-native-paths-"));
-  const outside = mkdtempSync(join(tmpdir(), "codexpp-native-outside-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-native-paths-"));
+  const outside = mkdtempSync(join(tmpdir(), "tweaker-native-outside-"));
   try {
     writeFileSync(join(outside, "addon.node"), "");
     assert.throws(
@@ -35,8 +35,8 @@ test("resolveNativeTweakPath rejects traversal outside the tweak directory", () 
 });
 
 test("resolveNativeTweakPath rejects symlinks that escape the tweak directory", (t) => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-native-paths-"));
-  const outside = mkdtempSync(join(tmpdir(), "codexpp-native-outside-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-native-paths-"));
+  const outside = mkdtempSync(join(tmpdir(), "tweaker-native-outside-"));
   try {
     writeFileSync(join(outside, "addon.node"), "");
     try {
@@ -56,7 +56,7 @@ test("resolveNativeTweakPath rejects symlinks that escape the tweak directory", 
 });
 
 test("resolveNativeTweakPath rejects the tweak directory itself", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-native-paths-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-native-paths-"));
   try {
     assert.throws(
       () => resolveNativeTweakPath(root, "."),

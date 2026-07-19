@@ -60,7 +60,7 @@ export function createTweak(target: string, opts: CreateTweakOpts = {}): void {
     private: true,
     type: "commonjs",
     scripts: {
-      validate: "codexplusplus validate-tweak .",
+      validate: "tweaker validate-tweak .",
     },
     devDependencies: {
       "@therealityreport/tweakers-sdk": "^0.1.3",
@@ -74,7 +74,7 @@ export function createTweak(target: string, opts: CreateTweakOpts = {}): void {
   console.log();
   console.log("Next:");
   console.log(`  1. Edit ${kleur.cyan(resolve(dir, "manifest.json"))}`);
-  console.log(`  2. Run ${kleur.cyan(`codexplusplus validate-tweak ${dir}`)}`);
+  console.log(`  2. Run ${kleur.cyan(`tweaker validate-tweak ${dir}`)}`);
   console.log("  3. Copy or symlink this directory into your Tweakers tweaks directory");
 }
 
@@ -159,7 +159,7 @@ ${manifest.description}
 ## Development
 
 \`\`\`sh
-codexplusplus validate-tweak .
+tweaker validate-tweak .
 \`\`\`
 
 Install by copying or symlinking this directory into your Tweakers tweaks directory.

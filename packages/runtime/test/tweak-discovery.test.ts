@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -134,6 +135,18 @@ test("discoverTweaks skips top-level files", () => {
   });
 });
 
+test("discoverTweaks skips a dangling top-level symlink without hiding valid tweaks", () => {
+  withTempDir((root) => {
+    const valid = writeTweak(root, "valid", validManifest("com.example.valid"));
+    writeFileSync(join(valid, "index.js"), "module.exports = {};");
+    symlinkSync(join(root, "missing-development-target"), join(root, "dangling"));
+
+    const discovered = discoverTweaks(root);
+
+    assert.deepEqual(discovered.map((tweak) => tweak.manifest.id), ["com.example.valid"]);
+  });
+});
+
 test("discoverTweaks accepts renderer, main, both, and omitted scopes", () => {
   withTempDir((root) => {
     for (const [name, scope] of [
@@ -161,7 +174,7 @@ test("discoverTweaks accepts renderer, main, both, and omitted scopes", () => {
 });
 
 function withTempDir(fn: (root: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-discovery-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-discovery-"));
   try {
     fn(root);
   } finally {

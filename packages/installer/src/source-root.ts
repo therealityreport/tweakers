@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { LEGACY_DATA_DIR } from "./legacy-compat.js";
 
 export function findSourceRoot(start: string): string {
   let dir = resolve(start);
@@ -31,21 +32,27 @@ export function describeInstallationSource(sourceRoot: string | null | undefined
     return {
       kind: "unknown",
       label: "Unknown",
-      detail: "Tweakers source location is not recorded yet. Run tweakers install or repair.",
+      detail: "Tweakers source location is not recorded yet. Run tweaker install or repair.",
     };
   }
 
   const normalized = sourceRoot.replace(/\\/g, "/");
-  if (normalized.includes("/Tweakers/managed-runtime/current") || normalized.includes("/codex-plusplus/managed-runtime/current")) {
+  if (normalized.includes("/Tweakers/managed-runtime/current")
+    || normalized.includes("/tweaker/managed-runtime/current")
+    || normalized.includes(`/${LEGACY_DATA_DIR}/managed-runtime/current`)) {
     return { kind: "managed-runtime", label: "Managed stable runtime", detail: sourceRoot };
   }
-  if (/\/(?:Homebrew|homebrew)\/Cellar\/codexplusplus\//.test(normalized)) {
+  if (/\/(?:Homebrew|homebrew)\/Cellar\/tweaker\//.test(normalized)
+    || normalized.includes(`/${LEGACY_DATA_DIR.replace("-", "")}/`)) {
     return { kind: "homebrew", label: "Homebrew", detail: sourceRoot };
   }
   if (existsSync(join(sourceRoot, ".git"))) {
     return { kind: "local-dev", label: "Local development checkout", detail: sourceRoot };
   }
-  if (normalized.endsWith("/.codex-plusplus/source") || normalized.includes("/.codex-plusplus/source/")) {
+  if (normalized.endsWith("/.tweaker/source")
+    || normalized.includes("/.tweaker/source/")
+    || normalized.endsWith(`/.${LEGACY_DATA_DIR}/source`)
+    || normalized.includes(`/.${LEGACY_DATA_DIR}/source/`)) {
     return { kind: "github-source", label: "GitHub source installer", detail: sourceRoot };
   }
   if (existsSync(join(sourceRoot, "package.json"))) {

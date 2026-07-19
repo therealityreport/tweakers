@@ -4,7 +4,12 @@ import kleur from "kleur";
 import { install } from "./commands/install.js";
 import { uninstall } from "./commands/uninstall.js";
 import { repair } from "./commands/repair.js";
-import { updateCodex } from "./commands/update-codex.js";
+import {
+  cancelCodexUpdate,
+  codexUpdateStatus,
+  resumeCodexUpdate,
+  updateCodex,
+} from "./commands/update-codex.js";
 import { selfUpdate } from "./commands/self-update.js";
 import { status } from "./commands/status.js";
 import { debug } from "./commands/debug.js";
@@ -12,10 +17,17 @@ import { browserUi } from "./commands/browser-ui.js";
 import { doctor } from "./commands/doctor.js";
 import { safeMode } from "./commands/safe-mode.js";
 import { migrate } from "./commands/migrate.js";
-import { CODEX_PLUSPLUS_VERSION } from "./version.js";
+import { TWEAKER_VERSION } from "./version.js";
 import { buildCliFailureIssueUrl, showPatchFailedAlert } from "./alerts.js";
 import { capKnownLogFiles } from "./logging.js";
 import { createTweakersVariant } from "./commands/create-variant.js";
+import { runWatcherCycle } from "./watcher-cycle.js";
+import { ensureUserPaths } from "./paths.js";
+import {
+  assertEnvironmentCliSuccess,
+  environment,
+  type EnvironmentCommandOptions,
+} from "./commands/environment.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -121,6 +133,11 @@ async function runMode(target: string, opts: { json?: boolean; yes?: boolean; ap
   return mode(target, opts);
 }
 
+async function runEnvironment(action: string, opts: EnvironmentCommandOptions): Promise<void> {
+  const result = await environment(action, opts);
+  if (action === "commit") assertEnvironmentCliSuccess("commit", result);
+}
+
 async function runRefreshStatus(): Promise<void> {
   const { getLocalRefreshStatus } = await import("./commands/refresh-local.js");
   const { ensureUserPaths } = await import("./paths.js");
@@ -133,8 +150,8 @@ function maybeShowPatchFailedAlert(message: string): void {
   showPatchFailedAlert(message);
 }
 
-const prog = sade("tweakers")
-  .version(CODEX_PLUSPLUS_VERSION)
+const prog = sade("tweaker")
+  .version(TWEAKER_VERSION)
   .describe("Tweak system for the Codex desktop app");
 
 capKnownLogFiles();
@@ -183,20 +200,43 @@ prog
 
 prog
   .command("update-chatgpt")
-  .describe("Restore signed Codex.app so the official ChatGPT updater can run, then reapply Tweakers after restart")
+  .describe("Start the durable official ChatGPT Update and Reload transaction")
   .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the schema-v1 transaction receipt as JSON")
   .action(wrap(updateCodex));
 
-// Compatibility alias retained for existing codexplusplus installs.
+// Compatibility alias retained for existing tweaker installs.
 prog
   .command("update-codex")
   .describe("Alias for update-chatgpt")
   .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the schema-v1 transaction receipt as JSON")
   .action(wrap(updateCodex));
 
 prog
+  .command("update-chatgpt-status")
+  .describe("Print the durable desktop update transaction status")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the schema-v1 transaction receipt as JSON", true)
+  .action(wrap(codexUpdateStatus));
+
+prog
+  .command("update-chatgpt-resume")
+  .describe("Resume a timed-out desktop update while ChatGPT remains in official mode")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the schema-v1 transaction receipt as JSON")
+  .action(wrap(resumeCodexUpdate));
+
+prog
+  .command("update-chatgpt-cancel")
+  .describe("Cancel an active desktop update continuation")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the schema-v1 transaction receipt as JSON")
+  .action(wrap(cancelCodexUpdate));
+
+prog
   .command("update")
-  .describe("Update Tweakers from the latest GitHub release, rebuild, then repair the app patch")
+  .describe("Install the latest published Tweakers release; keep the managed runtime when no release exists")
   .option("--repo", "GitHub repo to download (default: therealityreport/tweakers)")
   .option("--ref", "Git ref to download (default: latest GitHub release)")
   .option("--repair", "Run repair after updating", true)
@@ -223,6 +263,20 @@ prog
   .option("--yes", "Skip the confirmation prompt")
   .option("--app", "Path to ChatGPT.app / install dir")
   .action(wrap(runMode));
+
+prog
+  .command("environment <action>")
+  .describe("Inspect, prepare, and complete a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
+  .option("--app-experience", "App experience: chatgpt or tweakers")
+  .option("--release-profile", "Release profile: stable or alpha")
+  .option("--transaction", "Durable environment transaction ID")
+  .option("--app-path", "Exact absolute path to a user-selected OpenAI Beta .app (register-alpha only)")
+  .option("--app", "Alias for --app-path")
+  .option("--observe", "Read persisted and observed environment state without taking the lifecycle lock")
+  .option("--dry-run", "Preview environment transaction artifacts eligible for garbage collection")
+  .option("--apply", "Delete only artifacts that remain eligible after locked revalidation")
+  .option("--json", "Print exactly one machine-readable JSON value")
+  .action(wrap(runEnvironment));
 
 prog
   .command("status")
@@ -297,11 +351,13 @@ prog.command("migrate")
   .option("--legacy-root", "Explicit legacy root (otherwise known roots are detected)")
   .option("--target-root", "Tweakers user root (defaults to the active user root)")
   .action(wrap(migrate));
-prog.command("watcher-run").describe("Run one internal watcher cycle").action(wrap(() => repair({ watcher: true, quiet: true })));
+prog.command("watcher-run").describe("Run one internal watcher cycle").action(wrap(() =>
+  runWatcherCycle({ userRoot: ensureUserPaths().root }).then(() => undefined)
+));
 
 prog
   .command("safe-mode")
-  .describe("Temporarily disable all tweaks without deleting them. Leave safe mode with: tweakers safe-mode --off")
+  .describe("Temporarily disable all tweaks without deleting them. Leave safe mode with: tweaker safe-mode --off")
   .option("--on", "Enable safe mode (default)")
   .option("--off", "Disable safe mode and return to normal tweak loading")
   .option("--status", "Print current safe mode status")

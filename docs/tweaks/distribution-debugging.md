@@ -2,7 +2,7 @@
 
 ## Release Checks
 
-Every tweak must declare `githubRepo` in `owner/repo` form. Codex++ checks
+Every tweak must declare `githubRepo` in `owner/repo` form. Tweaker checks
 GitHub Releases at most once per day per installed tweak:
 
 - Current version comes from `manifest.version`.
@@ -10,27 +10,27 @@ GitHub Releases at most once per day per installed tweak:
 - Tags are compared as semver with optional leading `v`.
 - If newer, Settings -> Tweaks shows update UI linking to the GitHub release.
 
-Codex++ does not auto-install arbitrary tweak releases.
+Tweaker does not auto-install arbitrary tweak releases.
 
 ## Tweak Store
 
 Store-approved tweaks are pinned to reviewed commit SHAs in `store/index.json`.
 Store installs validate the downloaded manifest against the approved entry and
-write `.codexpp-store.json` metadata into the installed tweak folder.
+write `.tweaker-store.json` metadata into the installed tweak folder.
 
-When updating a store tweak, Codex++ checks whether local files differ from the
+When updating a store tweak, Tweaker checks whether local files differ from the
 approved baseline. If they do, it refuses to auto-update and asks the user to
 resolve local changes.
 
 ## Useful Commands
 
 ```sh
-codexplusplus create-tweak ./my-tweak --id com.you.my-tweak --name "My Tweak" --repo you/my-tweak
-codexplusplus validate-tweak ./my-tweak
-codexplusplus dev ./my-tweak
-codexplusplus status
-codexplusplus doctor
-codexplusplus debug
+tweaker create-tweak ./my-tweak --id com.you.my-tweak --name "My Tweak" --repo you/my-tweak
+tweaker validate-tweak ./my-tweak
+tweaker dev ./my-tweak
+tweaker status
+tweaker doctor
+tweaker debug
 ```
 
 ## Logs
@@ -41,11 +41,11 @@ codexplusplus debug
 | `<userRoot>/log/preload.log` | renderer preload, renderer tweaks, settings injector. |
 | `<userRoot>/log/loader.log` | loader startup before runtime handoff. |
 
-Renderer logs also appear in DevTools with `[codex-plusplus]` prefixes.
+Renderer logs also appear in DevTools with `[tweaker]` prefixes.
 
 ## Debugging Renderer Tweaks
 
-- Filter DevTools console for `[codex-plusplus]`.
+- Filter DevTools console for `[tweaker]`.
 - Prefer `api.log.info()` for persistent logs.
 - Use `api.react.waitForElement(selector, timeoutMs)` instead of patching before
   Codex has rendered.

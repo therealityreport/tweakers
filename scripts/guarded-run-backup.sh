@@ -67,7 +67,7 @@ fi
 
 home=${HOME:?HOME must be set}
 app_path=${GUARDED_RUN_APP_PATH:-/Applications/ChatGPT.app}
-state_root=${GUARDED_RUN_STATE_ROOT:-$home/Library/Application\ Support/codex-plusplus}
+state_root=${GUARDED_RUN_STATE_ROOT:-$home/Library/Application\ Support/tweaker}
 watcher_plist=${GUARDED_RUN_WATCHER_PLIST:-$home/Library/LaunchAgents/com.therealityreport.tweakers.watcher.plist}
 backup_root=${GUARDED_RUN_BACKUP_ROOT:-$home/Library/Application\ Support/Tweakers/guarded-backups}
 

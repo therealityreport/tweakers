@@ -1,4 +1,4 @@
-import type { CodexCliLane, CodexDesktopVersionProbeInput, CodexFeatureEntry, CodexInstalledDesktopVersion, CodexReleaseAsset, CodexSemanticVersion, CodexUpdateAvailability, CodexVersionService, CodexVersionServiceDependencies, GitHubCodexRelease, ParsedCodexFeature } from "./codex-version-types.js";
+import type { CodexCliLane, CodexDesktopVersionProbeInput, CodexFeatureEntry, CodexInstalledDesktopVersion, CodexReleaseAsset, CodexSemanticVersion, CodexUpdateAvailability, CodexVersionChannel, CodexVersionService, CodexVersionServiceDependencies, GitHubCodexRelease, ParsedCodexFeature } from "./codex-version-types.js";
 export declare function probeCodexDesktopVersion(input: CodexDesktopVersionProbeInput): CodexInstalledDesktopVersion;
 /**
  * Compare OpenAI appcast metadata without invoking the native Sparkle addon.
@@ -12,6 +12,12 @@ export declare function filterCodexReleases(releases: readonly GitHubCodexReleas
 export declare function selectLatestCodexRelease(releases: readonly GitHubCodexRelease[], lane: CodexCliLane): GitHubCodexRelease | null;
 export declare function resolveCodexReleaseAsset(release: GitHubCodexRelease): CodexReleaseAsset;
 export declare function parseCodexCliVersion(output: string): string | null;
+/**
+ * Classify the semantic release channel of the exact installed CLI version.
+ * This is deliberately independent of where the binary came from: OpenAI's
+ * production desktop app can embed a prerelease Codex CLI.
+ */
+export declare function codexVersionChannel(version: string | null | undefined): CodexVersionChannel;
 export declare function parseCodexFeatureList(output: string): ParsedCodexFeature[];
 export declare function buildCodexFeatureUnion(bundled: readonly ParsedCodexFeature[] | null, beta: readonly ParsedCodexFeature[] | null, selectedLane: CodexCliLane, fresh?: Record<CodexCliLane, boolean>): CodexFeatureEntry[];
 export declare function computeCodexUpdateAvailable(availability: CodexUpdateAvailability): boolean;

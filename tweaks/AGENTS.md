@@ -1,7 +1,7 @@
-# AGENTS.md — Codex++ tweak authoring guide
+# AGENTS.md — Tweaker tweak authoring guide
 
 This file is read by AI coding agents (and humans) authoring tweaks for
-Codex++. **Follow it.**
+Tweaker. **Follow it.**
 
 The repository-level feature-routing, synchronization, testing, live-refresh,
 and release workflow is defined by `../AGENTS.md`; follow both files.
@@ -40,7 +40,7 @@ module.exports = {
 Or, with the SDK helper:
 
 ```js
-const { defineTweak } = require("@codex-plusplus/sdk");
+const { defineTweak } = require("@therealityreport/tweakers-sdk");
 module.exports = defineTweak({
   start(api) { api.log.info("hello"); },
 });
@@ -61,7 +61,7 @@ module.exports = defineTweak({
 | `tags`        | `string[]`                      | no       | e.g. `["ui", "shortcut"]`. |
 | `scope`       | `"renderer" \| "main" \| "both"` | no      | Current runtime behavior is effectively `"both"` when omitted. Set it explicitly. |
 | `main`        | `string`                        | no       | Custom entry path. Defaults to `index.js`/`index.mjs`/`index.cjs`. |
-| `minRuntime`  | `string` (semver range)         | no       | Codex++ runtime range required. |
+| `minRuntime`  | `string` (semver range)         | no       | Tweaker runtime range required. |
 
 Full manifest example:
 
@@ -73,8 +73,8 @@ Full manifest example:
   "githubRepo": "example/my-tweak",
   "description": "Minimal example tweak. Adds a section to the Tweaks tab.",
   "author": {
-    "name": "codex-plusplus",
-    "url": "https://github.com/anomalyco/codex-plusplus"
+    "name": "tweaker",
+    "url": "https://github.com/anomalyco/tweaker"
   },
   "homepage": "https://github.com/example/my-tweak",
   "tags": ["example", "demo"],
@@ -84,7 +84,7 @@ Full manifest example:
 
 ## The API (`api`)
 
-See `@codex-plusplus/sdk` for full types. The most-used pieces:
+See `@therealityreport/tweakers-sdk` for full types. The most-used pieces:
 
 - `api.log.{debug,info,warn,error}(…)` — goes to `preload.log` and DevTools.
 - `api.storage.{get,set,delete,all}` — per-tweak persistent KV.
@@ -93,7 +93,7 @@ See `@codex-plusplus/sdk` for full types. The most-used pieces:
 - `api.settings.registerPage({ id, title, description?, iconSvg?, render })` — register a dedicated settings page in the sidebar.
 - `api.react.waitForElement(selector, timeoutMs?)` — async DOM-ready wait.
 - `api.react.findOwnerByName(node, "Component")` — fiber walk.
-- `api.ipc.{on,send,invoke}` — channels are auto-prefixed with `codexpp:<id>:`.
+- `api.ipc.{on,send,invoke}` — channels are auto-prefixed with `tweaker:<id>:`.
 - `api.fs.{read,write,exists}` — sandboxed to your tweak's data dir.
 - `api.codex.runtime.{getInfo,getCapabilities}` — Owl/Electron runtime probes.
 - `api.codex.windows.{create,getPrimary,focus,show}` — stable native Codex window hooks.
@@ -256,8 +256,8 @@ btn.textContent = "Delete all data";
 ## Hot reload
 
 Do not link raw checkout files into the live app. After validation and tests,
-run `npm run sync:tweaks` and one `tweakers dev-sync` snapshot; use
-`tweakers dev-sync --watch` only for an explicitly requested development
+run `npm run sync:tweaks` and one `tweaker dev-sync` snapshot; use
+`tweaker dev-sync --watch` only for an explicitly requested development
 session. The sync workflow publishes complete validated builds, and `start()`
 may be invoked again after publication. Use `stop()` to undo every DOM
 mutation, IPC handler, observer, and event listener.
@@ -265,15 +265,15 @@ mutation, IPC handler, observer, and event listener.
 ## Inspecting the live DOM (Chrome DevTools Protocol)
 
 When you're authoring a tweak, you almost always need to know Codex's
-real markup — class names, structure, computed styles. The Codex++
+real markup — class names, structure, computed styles. The Tweaker
 runtime can expose Electron's renderer over CDP so you (or an AI agent)
 can probe and mutate it from the host shell without clicking around.
 
 **Enable it:**
 
 ```sh
-CODEXPP_REMOTE_DEBUG=1 open -a Codex
-# default port 9222 — override with CODEXPP_REMOTE_DEBUG_PORT=NNNN
+TWEAKER_REMOTE_DEBUG=1 open -a Codex
+# default port 9222 — override with TWEAKER_REMOTE_DEBUG_PORT=NNNN
 ```
 
 The switch is wired in at `packages/runtime/src/main.ts` and is **off by
@@ -335,7 +335,7 @@ make a change, rebuild + stage the runtime, `Page.reload`, re-probe.
 
 ## Reference
 
-- SDK types: `@codex-plusplus/sdk` → `TweakManifest`, `TweakApi`,
+- SDK types: `@therealityreport/tweakers-sdk` → `TweakManifest`, `TweakApi`,
   `SettingsSection`, etc.
 - Codex's Settings markup samples: `/tmp/codex_panels/*.txt` (when the
   runtime is in dev/dump mode).

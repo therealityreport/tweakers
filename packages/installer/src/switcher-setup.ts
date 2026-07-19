@@ -1,10 +1,11 @@
 /**
- * Menu-bar switcher install/removal.
+ * Menu Bar mode-coordinator metadata and legacy standalone cleanup.
  *
- * The switcher (packages/switcher) is a tiny NSStatusItem app that offers the
- * mode switch from BOTH modes — in ChatGPT mode the live app is pristine (no
- * injected UI), so this menu bar item is the only in-GUI way back to Tweakers
- * mode. Setup therefore has to leave four things in place, idempotently:
+ * Mode controls now live in the existing Menu Bar app. The historical
+ * `Tweakers Switcher.app` implementation remains below only as a temporary
+ * compatibility seam for old installs and hermetic migration tests; current
+ * production setup writes coordinator metadata and removes that second status
+ * item. The legacy app formerly required four things, idempotently:
  *
  *   1. App copy   — installer assets → `<root>/bin/Tweakers Switcher.app`.
  *   2. CLI config — `<root>/switcher.json` with the argv prefix the binary
@@ -18,11 +19,12 @@
  *                   KeepAlive={SuccessfulExit:false}: restart after a crash,
  *                   but a clean "Quit Switcher" (exit 0) stays quit.
  *
- * Every system side effect (codesign, launchctl) flows through injectable
- * deps so tests stay hermetic; file operations run against TWEAKERS_HOME.
+ * Every system side effect (codesign, launchctl, exact-app quit) flows through
+ * injectable deps so tests stay hermetic; file operations run against
+ * TWEAKERS_HOME.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +54,12 @@ export interface SwitcherStatusResult {
   reason?: string;
 }
 
+export interface ModeCoordinatorStatusResult {
+  configured: boolean;
+  source: "coordinator" | "switcher-compat" | "unavailable";
+  reason?: string;
+}
+
 /** Injectable system side effects (repo convention — tests stay hermetic). */
 export interface SwitcherSetupDeps {
   platform?: () => NodeJS.Platform;
@@ -69,6 +77,8 @@ export interface SwitcherSetupDeps {
   isAgentLoaded?: (label: string) => boolean;
   /** argv prefix the switcher binary uses for mode and refresh commands. */
   cliInvocation?: (userRoot: string) => string[];
+  /** Gracefully quits only the retired standalone app, never Menu Bar. */
+  quitApp?: (appRoot: string, binaryPath: string) => void;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -91,6 +101,11 @@ export function installedSwitcherBinary(userRoot: string): string {
 /** Sidecar config the binary reads: which CLI runtime to spawn. */
 export function switcherConfigFile(userRoot: string): string {
   return join(userRoot, "switcher.json");
+}
+
+/** Neutral metadata consumed by the existing Menu Bar Tweakers integration. */
+export function modeCoordinatorConfigFile(userRoot: string): string {
+  return join(userRoot, "coordinator.json");
 }
 
 export function switcherLaunchAgentPlist(launchAgentsDir: string): string {
@@ -122,12 +137,54 @@ export function resolveSwitcherCliInvocation(userRoot: string): string[] {
   return [process.execPath, ...nodeArgs, cli];
 }
 
-function writeSwitcherConfig(configFile: string, cli: string[]): void {
-  writeFileSync(
-    configFile,
-    `${JSON.stringify({ schemaVersion: 1, cli, updatedAt: new Date().toISOString() }, null, 2)}\n`,
-  );
+function writeCoordinatorConfig(configFile: string, value: object): void {
+  const temporary = `${configFile}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, configFile);
   chownForTargetUser(configFile);
+}
+
+/**
+ * Keep the restart coordinator independent of any status-item app. The
+ * neutral file is canonical; switcher.json remains a one-release compatibility
+ * alias for Menu Bar 1.8 installations already in the field.
+ */
+export async function ensureModeCoordinatorConfigured(
+  deps: Pick<SwitcherSetupDeps, "cliInvocation"> = {},
+): Promise<{ configured: boolean; reason?: string }> {
+  const paths = ensureUserPaths();
+  try {
+    const cli = (deps.cliInvocation ?? resolveSwitcherCliInvocation)(paths.root);
+    const value = { schemaVersion: 1, cli, updatedAt: new Date().toISOString() };
+    writeCoordinatorConfig(modeCoordinatorConfigFile(paths.root), value);
+    writeCoordinatorConfig(switcherConfigFile(paths.root), value);
+    return { configured: true };
+  } catch (error) {
+    return { configured: false, reason: `could not write restart coordinator metadata: ${errorMessage(error)}` };
+  }
+}
+
+export function modeCoordinatorStatus(userRoot = userPaths().root): ModeCoordinatorStatusResult {
+  for (const [file, source] of [
+    [modeCoordinatorConfigFile(userRoot), "coordinator"],
+    [switcherConfigFile(userRoot), "switcher-compat"],
+  ] as const) {
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as { schemaVersion?: unknown; cli?: unknown };
+      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.cli) || parsed.cli.length === 0
+        || !parsed.cli.every((entry) => typeof entry === "string" && entry.length > 0)
+        || !existsSync(parsed.cli[0]!)) continue;
+      return { configured: true, source };
+    } catch {
+      // Try the compatibility file before reporting unavailable.
+    }
+  }
+  return {
+    configured: false,
+    source: "unavailable",
+    reason: "restart coordinator metadata is missing or points to an unavailable Tweakers CLI",
+  };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -142,7 +199,7 @@ function writeSwitcherConfig(configFile: string, cli: string[]): void {
  * TWEAKERS_HOME is baked into the agent's environment: launchd spawns the
  * switcher (and the CLI the switcher spawns inherits that environment) with a
  * minimal environment that never carries the user's shell overrides, so an
- * override-root install (TWEAKERS_HOME / CODEX_PLUSPLUS_HOME) would otherwise
+ * override-root install (TWEAKERS_HOME / TWEAKER_HOME) would otherwise
  * resolve a different root than the installer that set it up. Harmless for
  * default installs — the resolved root is the default one.
  */
@@ -245,7 +302,9 @@ function defaultIsAgentLoaded(label: string): boolean {
 /* ------------------------------------------------------------------------- */
 
 /**
- * Ensure the menu-bar switcher app + LaunchAgent are installed and loaded.
+ * Legacy compatibility helper. Current production code must use
+ * ensureModeCoordinatorConfigured and removeStandaloneSwitcher instead.
+ * Ensure the historical menu-bar switcher app + LaunchAgent are installed and loaded.
  * Idempotent: re-running refreshes the app copy, CLI config, and plist, and
  * reloads the agent. Failures are reported as `{ installed: false, reason }` —
  * callers decide whether that is fatal (`mode chatgpt` refuses) or a warning
@@ -277,7 +336,9 @@ export async function ensureSwitcherInstalled(deps: SwitcherSetupDeps = {}): Pro
 
   try {
     const cli = (deps.cliInvocation ?? resolveSwitcherCliInvocation)(paths.root);
-    writeSwitcherConfig(switcherConfigFile(paths.root), cli);
+    const value = { schemaVersion: 1, cli, updatedAt: new Date().toISOString() };
+    writeCoordinatorConfig(modeCoordinatorConfigFile(paths.root), value);
+    writeCoordinatorConfig(switcherConfigFile(paths.root), value);
   } catch (error) {
     return { installed: false, reason: `could not write the switcher CLI config: ${errorMessage(error)}` };
   }
@@ -311,27 +372,47 @@ export async function ensureSwitcherInstalled(deps: SwitcherSetupDeps = {}): Pro
  * absent switcher reports `{ removed: false }` without touching launchd.
  */
 export async function removeSwitcher(deps: SwitcherSetupDeps = {}): Promise<SwitcherRemovalResult> {
+  const result = await removeStandaloneSwitcher(deps);
+  const paths = userPaths();
+  const coordinator = modeCoordinatorConfigFile(paths.root);
+  const compatibility = switcherConfigFile(paths.root);
+  const metadataExisted = existsSync(coordinator) || existsSync(compatibility);
+  rmSync(coordinator, { force: true });
+  rmSync(compatibility, { force: true });
+  return result.removed || metadataExisted ? { removed: true } : result;
+}
+
+/**
+ * Remove only the retired standalone status item. Coordinator metadata stays
+ * available to the existing Menu Bar app during the compatibility window.
+ */
+export async function removeStandaloneSwitcher(deps: SwitcherSetupDeps = {}): Promise<SwitcherRemovalResult> {
   if ((deps.platform ?? platform)() !== "darwin") {
     return { removed: false, reason: "the menu-bar switcher is only supported on macOS" };
   }
   const paths = userPaths();
   const plistPath = switcherLaunchAgentPlist(deps.launchAgentsDir ?? defaultLaunchAgentsDir());
   const installedApp = installedSwitcherApp(paths.root);
-  const configFile = switcherConfigFile(paths.root);
-  const existed = existsSync(plistPath) || existsSync(installedApp) || existsSync(configFile);
-  if (!existed) return { removed: false, reason: "the menu-bar switcher is not installed" };
+  const binaryPath = installedSwitcherBinary(paths.root);
+  const existed = existsSync(plistPath) || existsSync(installedApp);
+  if (!existed) return { removed: false, reason: "the standalone menu-bar switcher is not installed" };
 
   if (existsSync(plistPath)) {
     unloadSwitcherAgent(plistPath, deps.launchctl ?? defaultLaunchctl);
   }
+  try {
+    (deps.quitApp ?? defaultQuitStandaloneSwitcher)(installedApp, binaryPath);
+  } catch {
+    // Removal remains idempotent. The exact installed process is targeted
+    // again by the next migration cycle if graceful quit was unavailable.
+  }
   rmSync(plistPath, { force: true });
   rmSync(installedApp, { recursive: true, force: true });
-  rmSync(configFile, { force: true });
   return { removed: true };
 }
 
 /**
- * Read-only check for `tweakers mode status`: installed app copy + LaunchAgent
+ * Read-only check for `tweaker mode status`: installed app copy + LaunchAgent
  * plist + loaded agent. Never installs anything (unlike ensureSwitcherInstalled).
  */
 export async function switcherStatus(deps: SwitcherSetupDeps = {}): Promise<SwitcherStatusResult> {
@@ -340,14 +421,14 @@ export async function switcherStatus(deps: SwitcherSetupDeps = {}): Promise<Swit
   }
   const paths = userPaths();
   if (!existsSync(installedSwitcherBinary(paths.root))) {
-    return { installed: false, reason: "the switcher app is not installed (run `tweakers mode setup`)" };
+    return { installed: false, reason: "the switcher app is not installed (run `tweaker mode setup`)" };
   }
   const plistPath = switcherLaunchAgentPlist(deps.launchAgentsDir ?? defaultLaunchAgentsDir());
   if (!existsSync(plistPath)) {
-    return { installed: false, reason: "the switcher LaunchAgent is not installed (run `tweakers mode setup`)" };
+    return { installed: false, reason: "the switcher LaunchAgent is not installed (run `tweaker mode setup`)" };
   }
   if (!(deps.isAgentLoaded ?? defaultIsAgentLoaded)(SWITCHER_LABEL)) {
-    return { installed: false, reason: "the switcher LaunchAgent is not loaded (run `tweakers mode setup`)" };
+    return { installed: false, reason: "the switcher LaunchAgent is not loaded (run `tweaker mode setup`)" };
   }
   return { installed: true };
 }
@@ -370,6 +451,24 @@ function signWithLocalIdentity(appRoot: string): void {
   execFileSync("codesign", ["--force", "--deep", "--sign", identity?.hash ?? "-", appRoot], {
     stdio: ["ignore", "ignore", "pipe"],
   });
+}
+
+function defaultQuitStandaloneSwitcher(_appRoot: string, binaryPath: string): void {
+  const escaped = binaryPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const running = spawnSync("pgrep", ["-f", `^${escaped}$`], { encoding: "utf8" });
+  if (running.status !== 0) return;
+  try {
+    execFileSync("osascript", ["-e", `tell application id \"com.therealityreport.tweakers.switcher\" to quit`], {
+      stdio: "ignore",
+    });
+  } catch {
+    for (const raw of (running.stdout ?? "").split(/\s+/)) {
+      const pid = Number(raw);
+      if (Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, "SIGTERM"); } catch { /* already exited */ }
+      }
+    }
+  }
 }
 
 function xmlEscape(value: string): string {

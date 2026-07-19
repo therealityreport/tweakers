@@ -1,7 +1,7 @@
 {
   "name": "@therealityreport/tweakers-installer",
   "version": "1.0.0",
-  "description": "Installer CLI for codex-plusplus tweak system",
+  "description": "Installer CLI for tweaker tweak system",
   "type": "module",
   "repository": {
     "type": "git",
@@ -13,6 +13,7 @@
   },
   "homepage": "https://github.com/therealityreport/tweakers#readme",
   "bin": {
+    "tweaker": "dist/cli.js",
     "tweakers": "dist/cli.js",
     "codexplusplus": "dist/cli.js",
     "codex-plusplus": "dist/cli.js"

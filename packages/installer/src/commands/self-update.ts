@@ -18,7 +18,7 @@ import { pipeline } from "node:stream/promises";
 import { spawnSync } from "node:child_process";
 import { extract as extractTar } from "tar";
 import { ensureUserPaths } from "../paths.js";
-import { CODEX_PLUSPLUS_VERSION, compareSemver } from "../version.js";
+import { TWEAKER_VERSION, compareSemver } from "../version.js";
 import { describeInstallationSource, findSourceRoot } from "../source-root.js";
 import { ensureManagedRuntime, hasReleaseProvenance, managedSourceRoot, writeReleaseProvenance } from "../managed-runtime.js";
 import {
@@ -27,6 +27,8 @@ import {
   type SelfUpdateState,
   writeSelfUpdateState,
 } from "../self-update-state.js";
+import { readConfigFile } from "../config.js";
+import { LEGACY_REF_ENV, LEGACY_REPO_ENV } from "../legacy-compat.js";
 
 interface Opts {
   repo?: string;
@@ -45,8 +47,13 @@ interface GitHubRelease {
   prerelease?: boolean;
 }
 
+interface ParsedPrereleaseSemver {
+  core: readonly [bigint, bigint, bigint];
+  prerelease: string[];
+}
+
 interface RuntimeConfig {
-  codexPlusPlus?: {
+  tweaker?: {
     autoUpdate?: boolean;
     updateChannel?: SelfUpdateChannel;
     updateRepo?: string;
@@ -65,6 +72,8 @@ interface UpdateTarget {
 const here = dirname(fileURLToPath(import.meta.url));
 const WATCHER_SELF_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
 const COMMAND_OUTPUT_TAIL_CHARS = 8_000;
+const NO_PUBLISHED_STABLE_RELEASE_PREFIX = "No published GitHub release found for ";
+const NO_PUBLISHED_CHANNEL_RELEASE_PREFIX = "No published releases found for ";
 
 interface RunOptions {
   quiet?: boolean;
@@ -99,7 +108,7 @@ export function resolveUpdateRepo(
     return opts.repo;
   }
   if (opts.watcher) return DEFAULT_UPDATE_REPO;
-  const candidate = env.CODEX_PLUSPLUS_REPO ?? config.updateRepo;
+  const candidate = env.TWEAKER_REPO ?? env[LEGACY_REPO_ENV] ?? config.updateRepo;
   if (candidate && REPO_ALLOWLIST.test(candidate)) return candidate;
   return DEFAULT_UPDATE_REPO;
 }
@@ -112,7 +121,7 @@ export async function selfUpdate(opts: Opts = {}): Promise<void> {
   const sourceRoot = managedSourceRoot(paths.root);
   ensureManagedRuntime(developmentSourceRoot, paths.root);
   const parent = dirname(sourceRoot);
-  const work = mkdtempSync(join(tmpdir(), "codexpp-update-"));
+  const work = mkdtempSync(join(tmpdir(), "tweaker-update-"));
   const archive = join(work, "source.tar.gz");
   const next = join(work, "source");
   const previous = `${sourceRoot}.previous`;
@@ -160,7 +169,7 @@ export async function selfUpdate(opts: Opts = {}): Promise<void> {
         return;
       }
       const releaseAlreadyInstalled = hasReleaseProvenance(sourceRoot, target.ref);
-      if (!shouldDownloadSelfUpdate(CODEX_PLUSPLUS_VERSION, target.ref, opts.force === true || !releaseAlreadyInstalled)) {
+      if (!shouldDownloadSelfUpdate(TWEAKER_VERSION, target.ref, opts.force === true || !releaseAlreadyInstalled)) {
         writeSelfUpdateState(paths.selfUpdateStateFile, selfUpdateState({
           status: "up-to-date",
           repo,
@@ -168,7 +177,7 @@ export async function selfUpdate(opts: Opts = {}): Promise<void> {
           sourceRoot,
           target,
         }));
-        log(opts, `Tweakers is already up to date (${CODEX_PLUSPLUS_VERSION}).`);
+        log(opts, `Tweakers is already up to date (${TWEAKER_VERSION}).`);
         runRepairIfRequested(opts, sourceRoot, parent);
         return;
       }
@@ -206,7 +215,7 @@ export async function selfUpdate(opts: Opts = {}): Promise<void> {
         sourceRoot,
         target,
       }));
-      log(opts, kleur.green(`Updated codex-plusplus source at ${sourceRoot}`));
+      log(opts, kleur.green(`Updated tweaker source at ${sourceRoot}`));
 
       try {
         runRepairIfRequested(opts, sourceRoot, parent);
@@ -233,11 +242,11 @@ export async function selfUpdate(opts: Opts = {}): Promise<void> {
 async function resolveUpdateTarget(
   repo: string,
   opts: Opts,
-  config: NonNullable<RuntimeConfig["codexPlusPlus"]>,
+  config: NonNullable<RuntimeConfig["tweaker"]>,
 ): Promise<UpdateTarget> {
   const explicitRef = opts.watcher
     ? opts.ref
-    : (opts.ref ?? process.env.CODEX_PLUSPLUS_REF ?? (config.updateChannel === "custom" ? config.updateRef : undefined));
+    : (opts.ref ?? process.env.TWEAKER_REF ?? process.env[LEGACY_REF_ENV] ?? (config.updateChannel === "custom" ? config.updateRef : undefined));
   if (explicitRef) {
     return {
       ref: explicitRef,
@@ -266,7 +275,7 @@ async function fetchLatestRelease(repo: string): Promise<GitHubRelease> {
   const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
     headers: githubRequestHeaders(githubToken()),
   });
-  if (res.status === 404) throw new Error(`No published GitHub release found for ${repo}`);
+  if (res.status === 404) throw new Error(`${NO_PUBLISHED_STABLE_RELEASE_PREFIX}${repo}`);
   if (!res.ok) throw new Error(`Release check failed: ${res.status} ${res.statusText}`);
   return (await res.json()) as GitHubRelease;
 }
@@ -277,9 +286,65 @@ async function fetchLatestAnyRelease(repo: string): Promise<GitHubRelease> {
   });
   if (!res.ok) throw new Error(`Release check failed: ${res.status} ${res.statusText}`);
   const releases = (await res.json()) as GitHubRelease[];
-  const release = releases.find((r) => !r.draft);
-  if (!release) throw new Error(`No published releases found for ${repo}`);
+  const release = selectHighestPrereleaseRelease(releases);
+  if (!release) throw new Error(`${NO_PUBLISHED_CHANNEL_RELEASE_PREFIX}${repo}`);
   return release;
+}
+
+export function selectHighestPrereleaseRelease(
+  releases: readonly GitHubRelease[],
+): GitHubRelease | null {
+  let selected: GitHubRelease | null = null;
+  let selectedVersion: ParsedPrereleaseSemver | null = null;
+  for (const release of releases) {
+    if (release.draft || release.prerelease !== true || !release.tag_name) continue;
+    const version = parsePrereleaseSemver(release.tag_name);
+    if (!version) continue;
+    if (!selectedVersion || comparePrereleaseSemver(version, selectedVersion) > 0) {
+      selected = release;
+      selectedVersion = version;
+    }
+  }
+  return selected;
+}
+
+function parsePrereleaseSemver(tag: string): ParsedPrereleaseSemver | null {
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(tag);
+  if (!match) return null;
+  const prerelease = match[4]!.split(".");
+  if (prerelease.some((identifier) => /^\d+$/.test(identifier) && !/^(?:0|[1-9]\d*)$/.test(identifier))) {
+    return null;
+  }
+  return {
+    core: [BigInt(match[1]!), BigInt(match[2]!), BigInt(match[3]!)],
+    prerelease,
+  };
+}
+
+function comparePrereleaseSemver(
+  left: ParsedPrereleaseSemver,
+  right: ParsedPrereleaseSemver,
+): number {
+  for (let index = 0; index < left.core.length; index += 1) {
+    if (left.core[index]! > right.core[index]!) return 1;
+    if (left.core[index]! < right.core[index]!) return -1;
+  }
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = left.prerelease[index];
+    const rightIdentifier = right.prerelease[index];
+    if (leftIdentifier === undefined) return -1;
+    if (rightIdentifier === undefined) return 1;
+    if (leftIdentifier === rightIdentifier) continue;
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) {
+      return BigInt(leftIdentifier) > BigInt(rightIdentifier) ? 1 : -1;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftIdentifier > rightIdentifier ? 1 : -1;
+  }
+  return 0;
 }
 
 async function download(url: string, target: string): Promise<void> {
@@ -314,7 +379,9 @@ function githubToken(): string | null {
 }
 
 export function isNoPublishedReleaseError(error: unknown): boolean {
-  return /No published GitHub release found/.test(error instanceof Error ? error.message : String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith(NO_PUBLISHED_STABLE_RELEASE_PREFIX)
+    || message.startsWith(NO_PUBLISHED_CHANNEL_RELEASE_PREFIX);
 }
 
 export function shouldDownloadSelfUpdate(
@@ -389,14 +456,9 @@ function readPackageVersion(sourceDir: string): string | null {
   }
 }
 
-function readRuntimeConfig(configFile: string): NonNullable<RuntimeConfig["codexPlusPlus"]> {
-  if (!existsSync(configFile)) return {};
-  try {
-    const config = JSON.parse(readFileSync(configFile, "utf8")) as RuntimeConfig;
-    return config.codexPlusPlus ?? {};
-  } catch {
-    return {};
-  }
+function readRuntimeConfig(configFile: string): NonNullable<RuntimeConfig["tweaker"]> {
+  const config = readConfigFile(configFile) as RuntimeConfig;
+  return config.tweaker ?? {};
 }
 
 function selfUpdateState(opts: {
@@ -412,7 +474,7 @@ function selfUpdateState(opts: {
     checkedAt: now,
     completedAt: opts.status === "checking" ? undefined : now,
     status: opts.status,
-    currentVersion: CODEX_PLUSPLUS_VERSION,
+    currentVersion: TWEAKER_VERSION,
     latestVersion: opts.target?.version ?? null,
     targetRef: opts.target?.ref ?? null,
     releaseUrl: opts.target?.releaseUrl ?? null,
@@ -524,13 +586,8 @@ function rollbackSource(sourceRoot: string, previous: string): void {
 }
 
 function isAutoUpdateEnabled(configFile: string): boolean {
-  if (!existsSync(configFile)) return true;
-  try {
-    const config = JSON.parse(readFileSync(configFile, "utf8")) as RuntimeConfig;
-    return config.codexPlusPlus?.autoUpdate !== false;
-  } catch {
-    return true;
-  }
+  const config = readConfigFile(configFile) as RuntimeConfig;
+  return config.tweaker?.autoUpdate !== false;
 }
 
 function log(opts: Opts, message: string): void {

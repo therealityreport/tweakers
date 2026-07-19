@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 const require = createRequire(import.meta.url);
-const hostPath = join(process.cwd(), "packages/native-host/dist/codexpp_native_host.node");
+const hostPath = join(process.cwd(), "packages/native-host/dist/tweaker_native_host.node");
 
 test("native host reports AppKit and Metal capabilities", { skip: process.platform !== "darwin" }, () => {
   assert.equal(existsSync(hostPath), true, "native host must be built before tests");

@@ -11,7 +11,7 @@
 declare global {
   interface Window {
     __REACT_DEVTOOLS_GLOBAL_HOOK__?: ReactDevtoolsHook;
-    __codexpp__?: {
+    __tweaker__?: {
       hook: ReactDevtoolsHook;
       renderers: Map<number, RendererInternals>;
     };
@@ -52,7 +52,7 @@ export function installReactHook(): void {
       renderers.set(id, renderer);
       // eslint-disable-next-line no-console
       console.debug(
-        "[codex-plusplus] React renderer attached:",
+        "[tweaker] React renderer attached:",
         renderer.rendererPackageName,
         renderer.version,
       );
@@ -82,12 +82,12 @@ export function installReactHook(): void {
     value: hook,
   });
 
-  window.__codexpp__ = { hook, renderers };
+  window.__tweaker__ = { hook, renderers };
 }
 
 /** Resolve the React fiber for a DOM node, if any renderer has one. */
 export function fiberForNode(node: Node): unknown | null {
-  const renderers = window.__codexpp__?.renderers;
+  const renderers = window.__tweaker__?.renderers;
   if (renderers) {
     for (const r of renderers.values()) {
       const f = r.findFiberByHostInstance?.(node);

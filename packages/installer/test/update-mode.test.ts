@@ -38,7 +38,7 @@ test("update mode is fresh until the updater grace window expires", () => {
 });
 
 test("update mode survives notification metadata and reports stale status", () => {
-  const root = mkdtempSync(join(tmpdir(), "codexpp-update-mode-"));
+  const root = mkdtempSync(join(tmpdir(), "tweaker-update-mode-"));
   try {
     const file = join(root, "update-mode.json");
     writeUpdateMode(file, {

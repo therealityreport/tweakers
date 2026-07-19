@@ -1,6 +1,6 @@
 # Runtime and Lifecycle
 
-Codex++ loads a runtime from the user data directory. That runtime discovers
+Tweaker loads a runtime from the user data directory. That runtime discovers
 tweaks, starts main-process tweaks, injects a renderer preload into Codex
 windows, and starts renderer tweaks from that preload.
 
@@ -62,17 +62,17 @@ runtime:
 2. Clears cached tweak modules under the tweaks directory.
 3. Re-discovers tweak manifests and entries.
 4. Restarts main tweaks.
-5. Broadcasts `codexpp:tweaks-changed` to renderers.
+5. Broadcasts `tweaker:tweaks-changed` to renderers.
 6. Renderers stop loaded renderer tweaks and start them again from fresh source.
 
 Make all mutations idempotent. Codex can also re-render its own DOM without a
-Codex++ hot reload.
+Tweaker hot reload.
 
 ## Cleanup Checklist
 
 Clean these in `stop()`:
 
-- DOM nodes you inserted outside Codex++ settings pages.
+- DOM nodes you inserted outside Tweaker settings pages.
 - `<style>` tags you inserted.
 - Event listeners on `window`, `document`, or Codex DOM nodes.
 - `MutationObserver`, `ResizeObserver`, `IntersectionObserver`.
@@ -86,7 +86,7 @@ Clean these in `stop()`:
 
 | API | Process | Backing store |
 |---|---|---|
-| `api.storage` | renderer | `localStorage["codexpp:storage:<id>"]` |
+| `api.storage` | renderer | `localStorage["tweaker:storage:<id>"]` |
 | `api.storage` | main | `<userRoot>/storage/<id>.json` |
 | `api.fs` | renderer/main | `<userRoot>/tweak-data/<id>/` |
 
@@ -103,7 +103,7 @@ Use [TypeScript and bundling](./typescript-and-bundling.md) for build examples.
 
 ## Safe Mode and Enable Flags
 
-Codex++ stores enable flags in `<userRoot>/config.json`.
+Tweaker stores enable flags in `<userRoot>/config.json`.
 
 - Missing enable state means enabled.
 - Safe mode disables tweak loading.

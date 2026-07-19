@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { LEGACY_DATA_DIR, LEGACY_WATCHER_STEM } from "./legacy-compat.js";
 
 export const WINDOWS_CODEX_CONTEXT_MENU_KEYS = [
   "HKCU:\\Software\\Classes\\Directory\\shell\\OpenProjectInCodex",
@@ -9,10 +10,14 @@ export const WINDOWS_CODEX_CONTEXT_MENU_KEYS = [
 ];
 
 export const WINDOWS_WATCHER_TASK_NAMES = [
-  "codex-plusplus-watcher",
-  "codex-plusplus-watcher-interval",
-  "codex-plusplus-watcher-hourly",
-  "codex-plusplus-watcher-daily",
+  "tweaker-watcher",
+  "tweaker-watcher-interval",
+  "tweaker-watcher-hourly",
+  "tweaker-watcher-daily",
+  LEGACY_WATCHER_STEM,
+  `${LEGACY_WATCHER_STEM}-interval`,
+  `${LEGACY_WATCHER_STEM}-hourly`,
+  `${LEGACY_WATCHER_STEM}-daily`,
 ];
 
 export function cleanupWindowsManagedArtifacts(): void {
@@ -42,18 +47,22 @@ export function buildWindowsManagedCleanupScript(input: {
   home: string;
 }): string {
   const cleanupPaths = [
-    input.localAppData ? join(input.localAppData, "Microsoft", "WindowsApps", "codex-plusplus-codex.cmd") : null,
-    input.localAppData ? join(input.localAppData, "codex-plusplus", "store-apps") : null,
-    input.appData ? join(input.appData, "codex-plusplus", "bin", "watcher.cmd") : null,
+    input.localAppData ? join(input.localAppData, "Microsoft", "WindowsApps", "tweaker-codex.cmd") : null,
+    input.localAppData ? join(input.localAppData, "tweaker", "store-apps") : null,
+    input.localAppData ? join(input.localAppData, LEGACY_DATA_DIR, "store-apps") : null,
+    input.appData ? join(input.appData, "tweaker", "bin", "watcher.cmd") : null,
+    input.appData ? join(input.appData, LEGACY_DATA_DIR, "bin", "watcher.cmd") : null,
     input.appData ? join(input.appData, "Microsoft", "Windows", "Start Menu", "Programs", "Tweakers.lnk") : null,
     join(input.home, "Desktop", "Tweakers.lnk"),
-    // Legacy Codex++ shortcuts from installs made before the Tweakers rename.
-    input.appData ? join(input.appData, "Microsoft", "Windows", "Start Menu", "Programs", "Codex++.lnk") : null,
-    join(input.home, "Desktop", "Codex++.lnk"),
+    // Legacy Tweaker shortcuts from installs made before the Tweakers rename.
+    input.appData ? join(input.appData, "Microsoft", "Windows", "Start Menu", "Programs", "Tweaker.lnk") : null,
+    join(input.home, "Desktop", "Tweaker.lnk"),
+    input.localAppData ? join(input.localAppData, "Microsoft", "WindowsApps", `${LEGACY_DATA_DIR}-codex.cmd`) : null,
   ].filter((path): path is string => path !== null);
 
   const emptyDirs = [
-    input.appData ? join(input.appData, "codex-plusplus", "bin") : null,
+    input.appData ? join(input.appData, "tweaker", "bin") : null,
+    input.appData ? join(input.appData, LEGACY_DATA_DIR, "bin") : null,
   ].filter((path): path is string => path !== null);
 
   return [
@@ -71,14 +80,14 @@ export function buildWindowsManagedCleanupScript(input: {
     "$currentPid = $PID",
     "Get-CimInstance Win32_Process | Where-Object {",
     "  $_.ProcessId -ne $currentPid -and $_.CommandLine -and",
-    "  $_.CommandLine.ToString().ToLowerInvariant().Contains('codex-plusplus') -and",
+    `  ($_.CommandLine.ToString().ToLowerInvariant().Contains('tweaker') -or $_.CommandLine.ToString().ToLowerInvariant().Contains('${LEGACY_DATA_DIR}')) -and`,
     "  ($_.CommandLine.ToString().ToLowerInvariant().Contains('watcher.cmd') -or",
     "    $_.CommandLine.ToString().ToLowerInvariant().Contains('--watcher') -or",
-    "    $_.CommandLine.ToString().ToLowerInvariant().Contains('codex-plusplus-watcher'))",
+    "    $_.CommandLine.ToString().ToLowerInvariant().Contains('tweaker-watcher'))",
     "} | ForEach-Object {",
     "  try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}",
     "}",
-    "$managedPattern = '\\codex-plusplus\\store-apps\\'",
+    "$managedPatterns = @('\\tweaker\\store-apps\\', '\\" + LEGACY_DATA_DIR + "\\store-apps\\')",
     "$contextKeys = @(",
     ...WINDOWS_CODEX_CONTEXT_MENU_KEYS.map((key) => `  '${escapePowerShellSingleQuotedString(key)}'`),
     ")",
@@ -88,7 +97,7 @@ export function buildWindowsManagedCleanupScript(input: {
     "  if (Test-Path -LiteralPath $commandKey) {",
     "    try { $command = (Get-Item -LiteralPath $commandKey).GetValue('') } catch {}",
     "  }",
-    "  if ($command -and $command.ToString().ToLowerInvariant().Contains($managedPattern)) {",
+    "  if ($command -and ($managedPatterns | Where-Object { $command.ToString().ToLowerInvariant().Contains($_) } | Select-Object -First 1)) {",
     "    Remove-Item -LiteralPath $key -Recurse -Force",
     "  }",
     "}",

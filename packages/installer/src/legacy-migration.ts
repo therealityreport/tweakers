@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { LEGACY_DATA_DIR } from "./legacy-compat.js";
 
 export const CANONICAL_TWEAK_DIRS = Object.freeze([
   "co.tweakers.account-switcher",
@@ -123,7 +124,7 @@ export function migrateLegacyProjects(options: LegacyMigrationOptions): LegacyMi
 
 export function defaultLegacyMigrationRoots(home: string): string[] {
   return [
-    join(home, "Library", "Application Support", "codex-plusplus"),
+    join(home, "Library", "Application Support", LEGACY_DATA_DIR),
     join(home, "Library", "Application Support", "ShadGPT", "TweakerLibrary"),
   ];
 }

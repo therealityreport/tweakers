@@ -115,7 +115,7 @@ function resolveEntry(tweakDir: string, manifest: TweakManifest): string | null 
 
 function touchReloadMarker(linkPath: string): void {
   try {
-    writeFileSync(join(linkPath, ".codexpp-dev-reload"), String(Date.now()), "utf8");
+    writeFileSync(join(linkPath, ".tweaker-dev-reload"), String(Date.now()), "utf8");
   } catch {
     // Best effort only. Creating the symlink itself usually wakes the runtime watcher.
   }
@@ -142,7 +142,7 @@ function watchForChanges(sourceDir: string, linkPath: string): Promise<void> {
 
   const watcher = watch(sourceDir, { recursive: true }, (_event, filename) => {
     if (filename && String(filename).includes("node_modules")) return;
-    if (filename === ".codexpp-dev-reload") return;
+    if (filename === ".tweaker-dev-reload") return;
     rerun(filename ? join(sourceDir, String(filename)) : null);
   });
 

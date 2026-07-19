@@ -5,7 +5,7 @@
  *      reference when React mounts. We use this for fiber walking.
  *   2. After DOMContentLoaded, kick off settings-injection logic.
  *   3. Discover renderer-scoped tweaks (via IPC to main) and start them.
- *   4. Listen for `codexpp:tweaks-changed` from main (filesystem watcher) and
+ *   4. Listen for `tweaker:tweaks-changed` from main (filesystem watcher) and
  *      hot-reload tweaks without dropping the page.
  */
 
@@ -14,13 +14,14 @@ import { installReactHook } from "./react-hook";
 import { startSettingsInjector } from "./settings-injector";
 import { startTweakHost, teardownTweakHost } from "./tweak-host";
 import { mountManager } from "./manager";
+import { startDesktopUpdateIndicator } from "./desktop-update-indicator";
 
-const BROWSER_UI_CONNECT_PORT = "codexpp:browser-ui-connect-app-host";
-const BROWSER_UI_BRIDGE_REQUEST = "codexpp:browser-ui-bridge-request";
-const BROWSER_UI_BRIDGE_RESPONSE = "codexpp:browser-ui-bridge-response";
-const BROWSER_UI_MESSAGE_FOR_VIEW = "codexpp:browser-ui-message-for-view";
-const BROWSER_UI_WORKER_MESSAGE = "codexpp:browser-ui-worker-message";
-const BROWSER_UI_SYSTEM_THEME = "codexpp:browser-ui-system-theme";
+const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
+const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
+const BROWSER_UI_BRIDGE_RESPONSE = "tweaker:browser-ui-bridge-response";
+const BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
+const BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
+const BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 
 const DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 const DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
@@ -49,14 +50,14 @@ function desktopWorkerForViewChannel(workerId: string): string {
 // Codex's renderer is sandboxed (sandbox: true), so `require("node:fs")` is
 // unavailable. We forward log lines to main via IPC; main writes the file.
 function fileLog(stage: string, extra?: unknown): void {
-  const msg = `[codex-plusplus preload] ${stage}${
+  const msg = `[tweaker preload] ${stage}${
     extra === undefined ? "" : " " + safeStringify(extra)
   }`;
   try {
     console.error(msg);
   } catch {}
   try {
-    ipcRenderer.send("codexpp:preload-log", "info", msg);
+    ipcRenderer.send("tweaker:preload-log", "info", msg);
   } catch {}
 }
 function safeStringify(v: unknown): string {
@@ -95,6 +96,8 @@ queueMicrotask(() => {
 async function boot() {
   fileLog("boot start", { readyState: document.readyState });
   try {
+    startDesktopUpdateIndicator();
+    fileLog("desktop update indicator started");
     startSettingsInjector();
     fileLog("settings injector started");
     await startTweakHost();
@@ -105,7 +108,7 @@ async function boot() {
     fileLog("boot complete");
   } catch (e) {
     fileLog("boot FAILED", String((e as Error)?.stack ?? e));
-    console.error("[codex-plusplus] preload boot failed:", e);
+    console.error("[tweaker] preload boot failed:", e);
   }
 }
 
@@ -113,16 +116,16 @@ async function boot() {
 // doesn't reentrantly tear down the host mid-load.
 let reloading: Promise<void> | null = null;
 function subscribeReload(): void {
-  ipcRenderer.on("codexpp:tweaks-changed", () => {
+  ipcRenderer.on("tweaker:tweaks-changed", () => {
     if (reloading) return;
     reloading = (async () => {
       try {
-        console.info("[codex-plusplus] hot-reloading tweaks");
+        console.info("[tweaker] hot-reloading tweaks");
         teardownTweakHost();
         await startTweakHost();
         await mountManager();
       } catch (e) {
-        console.error("[codex-plusplus] hot reload failed:", e);
+        console.error("[tweaker] hot reload failed:", e);
       } finally {
         reloading = null;
       }

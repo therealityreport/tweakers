@@ -1,4 +1,5 @@
-export const CODEX_WINDOW_SERVICES_KEY = "__codexpp_window_services__";
+export const CODEX_WINDOW_SERVICES_KEY = "__tweaker_window_services__";
+export const LEGACY_CODEX_WINDOW_SERVICES_KEY = ["__codex", "pp_window_services__"].join("");
 
 export interface CodexWindowServicesPatch {
   source: string;
@@ -62,6 +63,9 @@ export function patchCodexWindowServicesSource(
     source:
       source.slice(0, statementEnd + 1) +
       `globalThis.${marker}=${assignment.serviceVar};` +
+      (marker === CODEX_WINDOW_SERVICES_KEY
+        ? `globalThis.${LEGACY_CODEX_WINDOW_SERVICES_KEY}=${assignment.serviceVar};`
+        : "") +
       source.slice(statementEnd + 1),
     changed: true,
     strategy: "service-factory-fingerprint",

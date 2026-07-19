@@ -11,7 +11,7 @@
 declare global {
     interface Window {
         __REACT_DEVTOOLS_GLOBAL_HOOK__?: ReactDevtoolsHook;
-        __codexpp__?: {
+        __tweaker__?: {
             hook: ReactDevtoolsHook;
             renderers: Map<number, RendererInternals>;
         };

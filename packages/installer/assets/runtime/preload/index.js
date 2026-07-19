@@ -6,7 +6,7 @@
  *      reference when React mounts. We use this for fiber walking.
  *   2. After DOMContentLoaded, kick off settings-injection logic.
  *   3. Discover renderer-scoped tweaks (via IPC to main) and start them.
- *   4. Listen for `codexpp:tweaks-changed` from main (filesystem watcher) and
+ *   4. Listen for `tweaker:tweaks-changed` from main (filesystem watcher) and
  *      hot-reload tweaks without dropping the page.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -15,12 +15,13 @@ const react_hook_1 = require("./react-hook");
 const settings_injector_1 = require("./settings-injector");
 const tweak_host_1 = require("./tweak-host");
 const manager_1 = require("./manager");
-const BROWSER_UI_CONNECT_PORT = "codexpp:browser-ui-connect-app-host";
-const BROWSER_UI_BRIDGE_REQUEST = "codexpp:browser-ui-bridge-request";
-const BROWSER_UI_BRIDGE_RESPONSE = "codexpp:browser-ui-bridge-response";
-const BROWSER_UI_MESSAGE_FOR_VIEW = "codexpp:browser-ui-message-for-view";
-const BROWSER_UI_WORKER_MESSAGE = "codexpp:browser-ui-worker-message";
-const BROWSER_UI_SYSTEM_THEME = "codexpp:browser-ui-system-theme";
+const desktop_update_indicator_1 = require("./desktop-update-indicator");
+const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
+const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
+const BROWSER_UI_BRIDGE_RESPONSE = "tweaker:browser-ui-bridge-response";
+const BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
+const BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
+const BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 const DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 const DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
 const DESKTOP_SHOW_CONTEXT_MENU = "codex_desktop:show-context-menu";
@@ -45,13 +46,13 @@ function desktopWorkerForViewChannel(workerId) {
 // Codex's renderer is sandboxed (sandbox: true), so `require("node:fs")` is
 // unavailable. We forward log lines to main via IPC; main writes the file.
 function fileLog(stage, extra) {
-    const msg = `[codex-plusplus preload] ${stage}${extra === undefined ? "" : " " + safeStringify(extra)}`;
+    const msg = `[tweaker preload] ${stage}${extra === undefined ? "" : " " + safeStringify(extra)}`;
     try {
         console.error(msg);
     }
     catch { }
     try {
-        electron_1.ipcRenderer.send("codexpp:preload-log", "info", msg);
+        electron_1.ipcRenderer.send("tweaker:preload-log", "info", msg);
     }
     catch { }
 }
@@ -90,6 +91,8 @@ queueMicrotask(() => {
 async function boot() {
     fileLog("boot start", { readyState: document.readyState });
     try {
+        (0, desktop_update_indicator_1.startDesktopUpdateIndicator)();
+        fileLog("desktop update indicator started");
         (0, settings_injector_1.startSettingsInjector)();
         fileLog("settings injector started");
         await (0, tweak_host_1.startTweakHost)();
@@ -101,25 +104,25 @@ async function boot() {
     }
     catch (e) {
         fileLog("boot FAILED", String(e?.stack ?? e));
-        console.error("[codex-plusplus] preload boot failed:", e);
+        console.error("[tweaker] preload boot failed:", e);
     }
 }
 // Hot reload: gated behind a small in-flight lock so a flurry of fs events
 // doesn't reentrantly tear down the host mid-load.
 let reloading = null;
 function subscribeReload() {
-    electron_1.ipcRenderer.on("codexpp:tweaks-changed", () => {
+    electron_1.ipcRenderer.on("tweaker:tweaks-changed", () => {
         if (reloading)
             return;
         reloading = (async () => {
             try {
-                console.info("[codex-plusplus] hot-reloading tweaks");
+                console.info("[tweaker] hot-reloading tweaks");
                 (0, tweak_host_1.teardownTweakHost)();
                 await (0, tweak_host_1.startTweakHost)();
                 await (0, manager_1.mountManager)();
             }
             catch (e) {
-                console.error("[codex-plusplus] hot reload failed:", e);
+                console.error("[tweaker] hot reload failed:", e);
             }
             finally {
                 reloading = null;

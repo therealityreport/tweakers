@@ -1,8 +1,8 @@
 "use strict";
 
 const OWNER = "co.tweakers.shadcn-codex-ui";
-const STYLE_ID = "codexpp-shadcn-codex-ui-style";
-const MOUNT_ATTR = "data-codexpp-rich-block-owner";
+const STYLE_ID = "tweaker-shadcn-codex-ui-style";
+const MOUNT_ATTR = "data-tweaker-rich-block-owner";
 const ENABLED_KEY = "enabled";
 const SUPPORTED_KINDS = Object.freeze(["heading", "text", "paragraph", "code", "list", "badge", "divider", "keyValue", "callout"]);
 const states = new WeakMap();
@@ -106,7 +106,7 @@ function renderSettings(root, state) {
   previewTitle.className = "pt-2 text-sm font-medium text-token-text-primary";
   previewTitle.textContent = "Block preview";
   const preview = document.createElement("div");
-  preview.className = "codexpp-rich-blocks flex flex-col gap-2 rounded-lg border border-token-border p-3";
+  preview.className = "tweaker-rich-blocks flex flex-col gap-2 rounded-lg border border-token-border p-3";
   renderBlocks(preview, [
     { kind: "heading", text: "Rich response" },
     { kind: "text", text: "Native message content remains intact." },
@@ -168,7 +168,7 @@ function reconcileRichBlock(message, rawPayload) {
     const host = document.createElement("section");
     host.setAttribute(MOUNT_ATTR, OWNER);
     host.setAttribute("data-message-id", String(message.id || message.getAttribute?.("data-message-id") || ""));
-    host.className = "codexpp-rich-blocks flex flex-col gap-2 pt-3";
+    host.className = "tweaker-rich-blocks flex flex-col gap-2 pt-3";
     renderBlocks(host, payload.blocks);
     const content = message.querySelector?.("[data-message-content], [data-testid*=message-content], .markdown, [class*=markdown]") || message;
     content.appendChild(host);

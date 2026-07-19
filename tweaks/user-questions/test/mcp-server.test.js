@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
+const manifest = require("../manifest.json");
 
 const MODERN_PROTOCOL_VERSION = "2025-11-25";
 const LEGACY_PROTOCOL_VERSION = "2025-06-18";
@@ -11,7 +12,7 @@ test("MCP tool preserves its contract, returns one accepted answer, and stays co
   const { child, messages, initialized } = await startServer(t);
   assert.equal(initialized.id, 1);
   assert.equal(initialized.result.protocolVersion, MODERN_PROTOCOL_VERSION);
-  assert.equal(initialized.result.serverInfo.version, "0.4.7");
+  assert.equal(initialized.result.serverInfo.version, manifest.version);
 
   send(child, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   const tool = (await messages.next()).value.result.tools[0];

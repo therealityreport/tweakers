@@ -43,6 +43,6 @@ test("root AGENTS policy contains all feature routes and live synchronization ga
   const policy = readFileSync(new URL("../AGENTS.md", import.meta.url), "utf8");
   for (const route of ["Add to an existing tweak", "Revise an existing tweak", "Create a new tweak"]) assert.match(policy, new RegExp(route));
   assert.match(policy, /npm run sync:tweaks/);
-  assert.match(policy, /tweakers dev-sync/);
+  assert.match(policy, /tweaker dev-sync/);
   assert.match(policy, /Never push a tag or publish/);
 });

@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v codexplusplus >/dev/null 2>&1; then
-  exec codexplusplus update "$@"
-fi
+for command_name in tweaker tweakers codexplusplus codex-plusplus; do
+  if command -v "$command_name" >/dev/null 2>&1; then
+    exec "$command_name" update "$@"
+  fi
+done
 
-if command -v codex-plusplus >/dev/null 2>&1; then
-  exec codex-plusplus update "$@"
-fi
-
-echo "[!] codexplusplus is not installed in PATH; running the installer instead." >&2
+echo "[!] tweaker is not installed in PATH; running the installer instead." >&2
 exec bash -c "$(curl -fsSL https://raw.githubusercontent.com/therealityreport/tweakers/main/install.sh)"

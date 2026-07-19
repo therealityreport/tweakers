@@ -46,8 +46,10 @@ function getRuntimeCapabilities(opts) {
     };
 }
 function getCdpStatus() {
-    const enabled = process.env.CODEXPP_REMOTE_DEBUG === "1";
-    const port = parseCdpPort(process.env.CODEXPP_REMOTE_DEBUG_PORT);
+    const legacyEnabled = process.env[[["CODEX", "PP"].join(""), "REMOTE_DEBUG"].join("_")];
+    const legacyPort = process.env[[["CODEX", "PP"].join(""), "REMOTE_DEBUG_PORT"].join("_")];
+    const enabled = process.env.TWEAKER_REMOTE_DEBUG === "1" || legacyEnabled === "1";
+    const port = parseCdpPort(process.env.TWEAKER_REMOTE_DEBUG_PORT ?? legacyPort);
     return {
         supported: true,
         enabled,

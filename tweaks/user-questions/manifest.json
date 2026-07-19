@@ -1,10 +1,10 @@
 {
   "id": "co.tweakers.user-questions",
   "name": "User Questions",
-  "version": "0.4.8",
+  "version": "0.4.10",
   "githubRepo": "therealityreport/tweakers",
   "description": "Native task-scoped questions shown one at a time, with conditional inline Other input and rounded-square multi-select controls.",
-  "author": "The Reality Report",
+  "author": "hulibrands",
   "tags": ["questions", "productivity", "forms"],
   "scope": "both",
   "permissions": ["settings", "filesystem"],

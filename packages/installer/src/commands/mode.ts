@@ -1,5 +1,5 @@
 /**
- * `tweakers mode <chatgpt|tweakers|status|setup> [--json] [--yes]`
+ * `tweaker mode <chatgpt|tweakers|status|setup> [--json] [--yes]`
  *
  * /Applications/ChatGPT.app alternates between the pristine OpenAI
  * Developer-ID payload ("chatgpt" mode) and the patched contained-signed
@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { ensureUserPaths, type UserPaths } from "../paths.js";
-import { readState, resolveMode, writeState, type AppMode } from "../state.js";
+import { readState, writeState, type AppMode } from "../state.js";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import {
   install,
@@ -48,6 +48,7 @@ import {
   type TransactionPhase,
 } from "../transaction.js";
 import { isUpdateModeFresh, readUpdateMode } from "../update-mode.js";
+import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import {
   clearModeTransition,
   modeDirectory,
@@ -64,8 +65,20 @@ import {
   writePayloadMetadata,
   type ModeTransitionJournal,
 } from "../mode-transition.js";
-import { ensureSwitcherInstalled, switcherStatus } from "../switcher-setup.js";
+import {
+  ensureModeCoordinatorConfigured,
+  ensureSwitcherInstalled,
+  modeCoordinatorStatus,
+  removeStandaloneSwitcher,
+  switcherStatus,
+} from "../switcher-setup.js";
 import { readPlist } from "../plist.js";
+import {
+  environment,
+  type EnvironmentCommandResult,
+  type EnvironmentStatusResult,
+} from "./environment.js";
+import type { EnvironmentTransactionReceipt } from "../environment-transaction.js";
 
 export interface ModeCommandOptions {
   json?: boolean;
@@ -96,7 +109,13 @@ export interface ModeCommandDeps {
   spawnHealthProbe?: (executable: string, userRoot: string) => void;
   ensureSwitcher?: typeof ensureSwitcherInstalled;
   switcherStatus?: typeof switcherStatus;
+  ensureCoordinator?: typeof ensureModeCoordinatorConfigured;
+  coordinatorStatus?: typeof modeCoordinatorStatus;
+  removeStandaloneSwitcher?: typeof removeStandaloneSwitcher;
   installApp?: typeof install;
+  environmentCommand?: typeof environment;
+  /** @internal Keeps legacy bundle-swap unit fixtures reachable, never production CLI flow. */
+  legacyModeEngineForTests?: boolean;
 }
 
 export async function mode(
@@ -117,7 +136,7 @@ export async function mode(
       return runNotifiedSwitch(target, opts, deps);
     default:
       throw new Error(
-        `Unknown mode target "${target ?? ""}".\nUse: tweakers mode <chatgpt|tweakers|status|setup>`,
+        `Unknown mode target "${target ?? ""}".\nUse: tweaker mode <chatgpt|tweakers|status|setup>`,
       );
   }
 }
@@ -143,8 +162,15 @@ async function runNotifiedSwitch(
   };
   const wrapped: ModeCommandDeps = { ...deps, notify: notifyOnce };
   try {
-    if (target === "chatgpt") await switchToChatgpt(opts, wrapped);
-    else await switchToTweakers(opts, wrapped);
+    if (deps.legacyModeEngineForTests === true) {
+      await withLifecycleLock(lifecycleLockFile(ensureUserPaths().root), `legacy mode switch to ${target}`, async () => {
+        assertLifecycleReceiptsIdle(ensureUserPaths().root);
+        if (target === "chatgpt") await switchToChatgpt(opts, wrapped);
+        else await switchToTweakers(opts, wrapped);
+      });
+    } else {
+      await switchEnvironmentExperience(target, opts, wrapped);
+    }
   } catch (error) {
     if (!notified) {
       notifyOnce("Tweakers mode switch refused", errorMessage(error).split("\n")[0]);
@@ -153,13 +179,123 @@ async function runNotifiedSwitch(
   }
 }
 
+/**
+ * Compatibility adapter for `tweaker mode <target>`. Production mode changes
+ * use the same durable Environment coordinator as Config: prepare every
+ * prerequisite first, ask once, then prove a different PID and activated
+ * visible window before reporting success. The old bundle-swap engine remains
+ * reachable only through the explicit test seam above.
+ */
+async function switchEnvironmentExperience(
+  target: "chatgpt" | "tweakers",
+  opts: ModeCommandOptions,
+  deps: ModeCommandDeps,
+): Promise<void> {
+  const runEnvironment = deps.environmentCommand ?? environment;
+  const status = await runEnvironment("status", { observe: true, quiet: true });
+  if (!isEnvironmentStatusResult(status)) {
+    throw new Error("Environment status returned an invalid compatibility result");
+  }
+  if (status.observation?.transitionJournalPresent === true) {
+    const paths = ensureUserPaths();
+    const codex = (deps.locate ?? locateCodex)(status.selected.selectedDesktopPath);
+    const readMarker = deps.readMarker ?? readAsarMarker;
+    await withLifecycleLock(lifecycleLockFile(paths.root), "legacy mode transition reconciliation", async () => {
+      reconcileAtEntry(paths, codex, readMarker(codex.asarPath), deps);
+    });
+  }
+  if (opts.app !== undefined && opts.app !== status.selected.selectedDesktopPath) {
+    throw new Error(
+      `The requested app path ${opts.app} does not match the selected ${status.selected.releaseProfile} environment at ${status.selected.selectedDesktopPath}`,
+    );
+  }
+  const observedExperience = status.observation?.appExperience ?? null;
+  if (observedExperience === null) {
+    throw new Error(
+      `Cannot verify the live app experience at ${status.selected.selectedDesktopPath}; run tweaker repair before switching modes`,
+    );
+  }
+  if (observedExperience !== status.selected.appExperience) {
+    throw new Error(
+      `Environment selection says ${status.selected.appExperience}, but the live app proves ${observedExperience}; run tweaker repair before switching modes`,
+    );
+  }
+  if (status.selected.appExperience === target) {
+    console.log(kleur.green(`Already in ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
+    return;
+  }
+
+  const prepared = await runEnvironment("prepare", {
+    appExperience: target,
+    releaseProfile: status.selected.releaseProfile,
+    quiet: true,
+  });
+  const receipt = requirePreparedEnvironmentReceipt(prepared);
+  const confirmed = opts.yes === true
+    || (deps.confirm ?? confirmModeSwitch)({
+      target,
+      appRoot: receipt.requested.selectedDesktopPath,
+    });
+  if (!confirmed) {
+    await runEnvironment("cancel", { transaction: receipt.transactionId, quiet: true });
+    console.log(kleur.yellow("Mode switch cancelled."));
+    return;
+  }
+
+  const committed = await runEnvironment("commit", {
+    transaction: receipt.transactionId,
+    quiet: true,
+  });
+  if (!isEnvironmentTransactionReceipt(committed) || committed.phase !== "committed") {
+    const phase = isEnvironmentTransactionReceipt(committed) ? committed.phase : "invalid";
+    const detail = isEnvironmentTransactionReceipt(committed) && committed.error
+      ? `: ${committed.error}`
+      : "";
+    throw new Error(`Environment mode switch did not commit (phase ${phase})${detail}`);
+  }
+  console.log(kleur.green().bold(`✓ Switched to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
+  console.log(
+    kleur.dim(
+      `  Restart verified: PID ${committed.oldMainPid} → ${committed.newMainPid}; activated window at ${committed.requested.selectedDesktopPath}`,
+    ),
+  );
+}
+
+function isEnvironmentStatusResult(value: EnvironmentCommandResult): value is EnvironmentStatusResult {
+  return "selected" in value
+    && value.schemaVersion === 1
+    && value.selected !== null
+    && (value.selected.releaseProfile === "stable" || value.selected.releaseProfile === "alpha")
+    && (value.selected.appExperience === "chatgpt" || value.selected.appExperience === "tweakers");
+}
+
+function isEnvironmentTransactionReceipt(
+  value: EnvironmentCommandResult,
+): value is EnvironmentTransactionReceipt {
+  return "kind" in value
+    && value.kind === "environment"
+    && "transactionId" in value
+    && typeof value.transactionId === "string"
+    && value.transactionId.length > 0;
+}
+
+function requirePreparedEnvironmentReceipt(
+  value: EnvironmentCommandResult,
+): EnvironmentTransactionReceipt {
+  if (!isEnvironmentTransactionReceipt(value) || value.phase !== "prepared") {
+    const phase = isEnvironmentTransactionReceipt(value) ? value.phase : "invalid";
+    throw new Error(`Environment mode switch preparation did not complete (phase ${phase})`);
+  }
+  return value;
+}
+
 /* ------------------------------------------------------------------------- */
 /* status / setup                                                            */
 /* ------------------------------------------------------------------------- */
 
 interface ModeStatusReport {
   mode: AppMode;
-  modeSource: "state" | "inferred";
+  modeSource: "live-marker" | "state-fallback" | "unverified";
   liveMarker: AsarMarker;
   parkedPayload: { present: boolean; baseVersion: string | null; parkedAt: string | null };
   backup: { present: boolean; developerIdValid: boolean; version: string | null };
@@ -181,33 +317,34 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
   let marker: AsarMarker = "unreadable";
   if (codex) marker = readMarker(codex.asarPath);
 
-  // A stale interrupted transition is reconciled on every mode entry —
-  // including status — so the report reflects reality, never a dead switch.
-  if (codex) {
-    reconcileModeTransition(
-      { root: paths.root, stateFile: paths.stateFile },
-      { marker, appRoot: codex.appRoot },
-      {
-        log: opts.json ? undefined : (line) => console.log(kleur.dim(line)),
-        isDeveloperIdBackup: deps.isDeveloperIdBackup,
-      },
-    );
-  }
-
-  const current = readState(paths.stateFile);
+  // Status is observation only. Interrupted-transition reconciliation mutates
+  // app metadata, state, and parked payloads, so it runs only from a
+  // lifecycle-locked switch or repair command.
+  const current = state;
   const parkedApp = parkedPayloadApp(paths.root);
   const payloadMeta = readPayloadMetadata(payloadMetadataFile(paths.root));
   const parkedPresent = existsSync(join(parkedApp, "Contents"));
   const backup = join(paths.backup, "Codex.app");
   const backupPresent = existsSync(backup);
   const verifyBackup = deps.isDeveloperIdBackup ?? isDeveloperIdSignedBackup;
-  // Status is read-only by design: it must never install the switcher as a
-  // side effect of being asked how things look.
-  const switcher = await (deps.switcherStatus ?? switcherStatus)();
+  // Compatibility JSON keeps the historical `switcher` key for Menu Bar 1.8,
+  // but it now reports the shared restart coordinator rather than a second
+  // status-item app.
+  const coordinator = (deps.coordinatorStatus ?? modeCoordinatorStatus)();
   const journal = readModeTransition(modeTransitionFile(paths.root));
+  const stateMode = current?.mode === "chatgpt" || current?.mode === "tweakers"
+    ? current.mode
+    : null;
+  const observedMode = marker === "present"
+    ? "tweakers"
+    : marker === "absent"
+      ? "chatgpt"
+      : stateMode ?? "chatgpt";
   const report: ModeStatusReport = {
-    mode: resolveMode(current, marker === "present"),
-    modeSource: current?.mode ? "state" : "inferred",
+    mode: observedMode,
+    modeSource: marker === "unreadable"
+      ? stateMode === null ? "unverified" : "state-fallback"
+      : "live-marker",
     liveMarker: marker,
     parkedPayload: {
       present: parkedPresent,
@@ -221,7 +358,10 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
       developerIdValid: backupPresent && verifyBackup(backup),
       version: backupPresent ? readCodexVersion(join(backup, "Contents", "Info.plist")) : null,
     },
-    switcher: { installed: switcher.installed, ...(switcher.reason ? { reason: switcher.reason } : {}) },
+    switcher: {
+      installed: coordinator.configured,
+      ...(coordinator.reason ? { reason: coordinator.reason } : {}),
+    },
     transition: journal ? { target: journal.target, phase: journal.phase, ownerPid: journal.ownerPid } : null,
   };
 
@@ -230,28 +370,29 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
     return;
   }
 
-  console.log(kleur.bold("tweakers mode"));
-  console.log(`  mode:          ${report.mode === "chatgpt" ? kleur.cyan("chatgpt") : kleur.green("tweakers")}${report.modeSource === "inferred" ? kleur.dim(" (inferred)") : ""}`);
+  console.log(kleur.bold("tweaker mode"));
+  console.log(`  mode:          ${report.mode === "chatgpt" ? kleur.cyan("chatgpt") : kleur.green("tweakers")}${report.modeSource === "live-marker" ? "" : kleur.dim(` (${report.modeSource})`)}`);
   console.log(`  live marker:   ${report.liveMarker}`);
   console.log(`  parked payload: ${report.parkedPayload.present ? kleur.green(`present${report.parkedPayload.baseVersion ? ` (${report.parkedPayload.baseVersion})` : ""}`) : kleur.dim("none")}`);
   console.log(`  pristine backup: ${report.backup.present ? `${report.backup.developerIdValid ? kleur.green("Developer ID valid") : kleur.red("NOT Developer ID signed")}${report.backup.version ? ` (${report.backup.version})` : ""}` : kleur.red("missing")}`);
-  console.log(`  switcher:      ${report.switcher.installed ? kleur.green("installed") : kleur.yellow(`not installed${report.switcher.reason ? ` — ${report.switcher.reason}` : ""}`)}`);
+  console.log(`  mode controls: ${report.switcher.installed ? kleur.green("Menu Bar coordinator ready") : kleur.yellow(`unavailable${report.switcher.reason ? ` — ${report.switcher.reason}` : ""}`)}`);
   if (report.transition) {
     console.log(kleur.yellow(`  transition:    switch to ${report.transition.target} in progress (phase ${report.transition.phase}, PID ${report.transition.ownerPid})`));
   }
 }
 
 async function modeSetup(deps: ModeCommandDeps): Promise<void> {
-  const result = await (deps.ensureSwitcher ?? ensureSwitcherInstalled)();
-  if (!result.installed) {
-    throw new Error(`Menu-bar switcher setup failed${result.reason ? `: ${result.reason}` : ""}.`);
+  const coordinator = await (deps.ensureCoordinator ?? ensureModeCoordinatorConfigured)();
+  if (!coordinator.configured) {
+    throw new Error(`Menu Bar restart coordinator setup failed${coordinator.reason ? `: ${coordinator.reason}` : ""}.`);
   }
-  console.log(kleur.green("Menu-bar switcher installed and loaded."));
-  console.log(kleur.dim("  Look for the Tweakers icon in the macOS menu bar to switch modes."));
+  await (deps.removeStandaloneSwitcher ?? removeStandaloneSwitcher)();
+  console.log(kleur.green("Menu Bar restart coordinator configured."));
+  console.log(kleur.dim("  Use the Tweakers tab in the existing Menu Bar app to switch modes."));
 }
 
 /* ------------------------------------------------------------------------- */
-/* tweakers → chatgpt                                                        */
+/* tweaker → chatgpt                                                        */
 /* ------------------------------------------------------------------------- */
 
 async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps): Promise<void> {
@@ -267,7 +408,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
     const state = readState(paths.stateFile);
     const marker = readMarker(codex.asarPath);
     if (marker === "unreadable") {
-      throw new Error("Refusing to switch modes: the live app.asar is unreadable. Run `tweakers doctor` first.");
+      throw new Error("Refusing to switch modes: the live app.asar is unreadable. Run `tweaker doctor` first.");
     }
     if (marker === "absent") {
       if (state && state.mode !== "chatgpt") writeState(paths.stateFile, { ...state, mode: "chatgpt" });
@@ -281,7 +422,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
       throw new Error(
         "Refusing to switch to ChatGPT mode: the installer state file is missing or unreadable.\n" +
           "Without it the switch cannot record its outcome and the auto-repair watcher would re-patch the pristine app.\n" +
-          "Run `tweakers doctor` first.",
+          "Run `tweaker doctor` first.",
       );
     }
 
@@ -291,7 +432,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
     if (!verifyBackup(backup)) {
       throw new Error(
         `Refusing to switch to ChatGPT mode: the pristine backup at ${backup} is missing or not Developer ID signed.\n` +
-          "Run `tweakers repair` first so a fresh official update refreshes the backup.",
+          "Run `tweaker repair` first so a fresh official update refreshes the backup.",
       );
     }
     const backupVersion = readCodexVersion(join(backup, "Contents", "Info.plist"));
@@ -314,18 +455,6 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
       (deps.notify ?? showModeNotification)("Tweakers mode switch refused", `Refusing to switch: ${message}.`);
       throw new Error(`Refusing to switch to ChatGPT mode: ${message}.`);
     }
-    // The switcher is the only in-GUI way back from a pristine app, so setup
-    // auto-runs here (it is an idempotent refresh when already installed) and
-    // a setup failure refuses the switch — never strand the user.
-    const switcher = await (deps.ensureSwitcher ?? ensureSwitcherInstalled)();
-    if (!switcher.installed) {
-      throw new Error(
-        `Refusing to switch to ChatGPT mode: the menu-bar switcher could not be installed${switcher.reason ? ` (${switcher.reason})` : ""}.\n` +
-          "Without it a pristine app leaves no in-GUI way back to Tweakers mode.\n" +
-          "Fix the issue, run `tweakers mode setup`, then retry.",
-      );
-    }
-
     if (opts.yes !== true && !(deps.confirm ?? confirmModeSwitch)({ target: "chatgpt", appRoot: codex.appRoot })) {
       console.log(kleur.yellow("Mode switch cancelled."));
       return;
@@ -363,7 +492,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
       const readSignature = deps.signature ?? signatureInfo;
       const settledVersion = readCodexVersion(codex.metaPath);
       const settledBuild = readBundleBuild(codex.appRoot);
-      const backupBuild = readBundleBuild(backup);
+      const settledBackupBuild = readBundleBuild(backup);
       const verifyOfficialPristine = (appRoot: string): boolean => {
         const signature = readSignature(appRoot);
         return safeReadMarker(readMarker, join(appRoot, "Contents", "Resources", "app.asar")) === "absent"
@@ -376,7 +505,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
         verifyOfficialPristine(codex.appRoot)
         && isNewerBundle(
           { version: settledVersion, build: settledBuild },
-          { versions: [backupVersion, state.codexVersion], build: backupBuild },
+          { versions: [backupVersion, state.codexVersion], build: settledBackupBuild },
         )
       ) {
         refreshPristineBackupStaged(codex.appRoot, backup, {
@@ -471,9 +600,9 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
         // remnants; clearing it here would destroy exactly that record.
         (deps.notify ?? showModeNotification)(
           "Tweakers mode switch failed",
-          "The switch to ChatGPT mode failed and the app could not be verified. Run `tweakers doctor` before switching again.",
+          "The switch to ChatGPT mode failed and the app could not be verified. Run `tweaker doctor` before switching again.",
         );
-        console.error(kleur.red("Run `tweakers doctor` before switching modes again."));
+        console.error(kleur.red("Run `tweaker doctor` before switching modes again."));
         throw error;
       }
       clearModeTransition(modeTransitionFile(paths.root));
@@ -500,7 +629,7 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
 }
 
 /* ------------------------------------------------------------------------- */
-/* chatgpt → tweakers                                                        */
+/* chatgpt → tweakers                                                       */
 /* ------------------------------------------------------------------------- */
 
 async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps): Promise<void> {
@@ -516,7 +645,7 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
     const state = readState(paths.stateFile);
     const marker = readMarker(codex.asarPath);
     if (marker === "unreadable") {
-      throw new Error("Refusing to switch modes: the live app.asar is unreadable. Run `tweakers doctor` first.");
+      throw new Error("Refusing to switch modes: the live app.asar is unreadable. Run `tweaker doctor` first.");
     }
     if (marker === "present") {
       if (state && state.mode !== "tweakers") writeState(paths.stateFile, { ...state, mode: "tweakers" });
@@ -643,10 +772,9 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
 
     if (observed === "present" && flowError === null) {
       clearModeTransition(modeTransitionFile(paths.root));
-      // Keep the switcher fresh as part of the normal flow. The slow path
-      // already refreshed it inside install()'s promotion bookkeeping; a
-      // menu-bar helper failure must never fail the app switch itself.
-      if (usedFastPath) await refreshSwitcherNonfatal(deps);
+      // Keep the existing Menu Bar coordinator metadata fresh. A control-
+      // surface migration failure must never fail an otherwise valid switch.
+      if (usedFastPath) await refreshModeControlsNonfatal(deps);
       (deps.openApp ?? defaultOpenApp)(codex.appRoot);
       console.log(kleur.green().bold("✓ Switched to Tweakers mode."));
       console.log(`  ${usedFastPath ? "Fast path: parked payload swapped in." : "Slow path: rebuilt and promoted a fresh patched payload."}`);
@@ -661,12 +789,12 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
       // remnants; clearing it here would destroy exactly that record.
       (deps.notify ?? showModeNotification)(
         "Tweakers mode switch failed",
-        "The switch to Tweakers mode failed and the app could not be verified. Run `tweakers doctor` before switching again.",
+        "The switch to Tweakers mode failed and the app could not be verified. Run `tweaker doctor` before switching again.",
       );
-      console.error(kleur.red("Run `tweakers doctor` before switching modes again."));
+      console.error(kleur.red("Run `tweaker doctor` before switching modes again."));
       if (flowError !== null) throw flowError;
       throw new Error(
-        "The switch to Tweakers mode could not be verified: the live app.asar is unreadable. Run `tweakers doctor`.",
+        "The switch to Tweakers mode could not be verified: the live app.asar is unreadable. Run `tweaker doctor`.",
       );
     }
 
@@ -689,7 +817,7 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
     if (flowError !== null) throw flowError;
     throw new Error(
       "The switch to Tweakers mode did not complete: the live app has no patch marker.\n" +
-        "The pristine app was relaunched and the mode stays \"chatgpt\". Check `tweakers status`, then retry `tweakers mode tweakers`.",
+        "The pristine app was relaunched and the mode stays \"chatgpt\". Check `tweaker status`, then retry `tweaker mode tweakers`.",
     );
   } finally {
     lock.release();
@@ -705,8 +833,8 @@ function acquireModeLock(paths: UserPaths): { release(): void } {
     onContended: (owner) =>
       new Error(
         owner === null
-          ? "Another `tweakers mode` command is already running."
-          : `Another \`tweakers mode\` command is already running (PID ${owner}).`,
+          ? "Another `tweaker mode` command is already running."
+          : `Another \`tweaker mode\` command is already running (PID ${owner}).`,
       ),
   });
 }
@@ -759,7 +887,7 @@ function reconcileAtEntry(paths: UserPaths, codex: CodexInstall, marker: AsarMar
   if (result.action === "blocked") {
     throw new Error(
       `A previous mode switch could not be reconciled: ${result.reason}.\n` +
-        "Run `tweakers doctor` and repair the app before switching modes.",
+        "Run `tweaker doctor` and repair the app before switching modes.",
     );
   }
   if (result.action === "completed" || result.action === "rolled-back") {
@@ -767,14 +895,15 @@ function reconcileAtEntry(paths: UserPaths, codex: CodexInstall, marker: AsarMar
   }
 }
 
-async function refreshSwitcherNonfatal(deps: ModeCommandDeps): Promise<void> {
+async function refreshModeControlsNonfatal(deps: ModeCommandDeps): Promise<void> {
   try {
-    const result = await (deps.ensureSwitcher ?? ensureSwitcherInstalled)();
-    if (!result.installed) {
-      console.warn(kleur.yellow(`Menu-bar switcher refresh failed${result.reason ? `: ${result.reason}` : ""}.`));
+    const result = await (deps.ensureCoordinator ?? ensureModeCoordinatorConfigured)();
+    if (!result.configured) {
+      console.warn(kleur.yellow(`Menu Bar coordinator refresh failed${result.reason ? `: ${result.reason}` : ""}.`));
     }
+    await (deps.removeStandaloneSwitcher ?? removeStandaloneSwitcher)();
   } catch (error) {
-    console.warn(kleur.yellow(`Menu-bar switcher refresh failed: ${errorMessage(error)}`));
+    console.warn(kleur.yellow(`Menu Bar coordinator refresh failed: ${errorMessage(error)}`));
   }
 }
 

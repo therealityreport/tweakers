@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { appendCappedLog } from "../src/logging";
 
 test("appendCappedLog rotates at cap writing O(line) bytes, not the whole file", () => {
-  const dir = mkdtempSync(join(tmpdir(), "codexpp-log-"));
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-log-"));
   try {
     const file = join(dir, "main.log");
     const prior = "a".repeat(95);
@@ -26,7 +26,7 @@ test("appendCappedLog rotates at cap writing O(line) bytes, not the whole file",
 });
 
 test("appendCappedLog retains the pre-rotation content in .1", () => {
-  const dir = mkdtempSync(join(tmpdir(), "codexpp-log-"));
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-log-"));
   try {
     const file = join(dir, "retention.log");
     writeFileSync(file, "a".repeat(8));
@@ -42,7 +42,7 @@ test("appendCappedLog retains the pre-rotation content in .1", () => {
 });
 
 test("appendCappedLog truncates oversized entries to the byte cap", () => {
-  const dir = mkdtempSync(join(tmpdir(), "codexpp-log-"));
+  const dir = mkdtempSync(join(tmpdir(), "tweaker-log-"));
   try {
     const file = join(dir, "preload.log");
     appendCappedLog(file, "abcdef", 4);

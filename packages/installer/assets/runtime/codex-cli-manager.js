@@ -14,8 +14,8 @@ const EMPTY_STATE = { schemaVersion: 1, current: null, previous: null, updatedAt
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const RECEIPT_FILE = "receipt.json";
 const ALLOWED_ASSET = "codex-package-aarch64-apple-darwin.tar.gz";
-function deriveCodexCliPaths(home) {
-    const root = (0, node_path_1.join)((0, node_path_1.resolve)(home), "Library", "Application Support", "codex-plusplus", "codex-cli");
+function deriveCodexCliPaths(home, activeUserRoot) {
+    const root = (0, node_path_1.join)(activeUserRoot ?? (0, node_path_1.join)((0, node_path_1.resolve)(home), "Library", "Application Support", "Tweakers"), "codex-cli");
     return { root, releases: (0, node_path_1.join)(root, "releases"), staging: (0, node_path_1.join)(root, "staging"), state: (0, node_path_1.join)(root, "state.json"), lock: (0, node_path_1.join)(root, "operation.lock") };
 }
 function validateArchiveEntries(entries) {
@@ -34,7 +34,7 @@ function validateArchiveEntries(entries) {
     }
 }
 function createCodexCliManager(input) {
-    const paths = deriveCodexCliPaths(input.home);
+    const paths = deriveCodexCliPaths(input.home, input.userRoot);
     const deps = input.deps;
     let busy = false;
     let state = readState(paths.state);
@@ -94,6 +94,7 @@ function createCodexCliManager(input) {
                         version: release.version,
                         releaseTag: release.tag,
                         digest: release.digest.toLowerCase(),
+                        binaryDigest: (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(binary)).digest("hex"),
                         architecture: release.architecture,
                         relativeDirectory: directoryName,
                         binaryRelativePath,
@@ -214,7 +215,33 @@ function applyManagedCodexCliLaneAtBootstrap(input) {
         delete env.CODEX_CLI_PATH;
         return { requestedLane: "bundled", effectiveLane: "bundled", binary: null, userOverridePreserved: false, fallback: false, error: null };
     }
-    const paths = deriveCodexCliPaths(input.home);
+    if (input.selectedManagedCli) {
+        const selected = input.selectedManagedCli;
+        const validation = (input.validateSelectedManagedBinary ?? validateSelectedManagedBinarySync)(selected);
+        if (validation.valid) {
+            env.CODEX_CLI_PATH = selected.binaryPath;
+            return {
+                requestedLane: "beta",
+                effectiveLane: "beta",
+                binary: selected.binaryPath,
+                userOverridePreserved: false,
+                fallback: false,
+                error: null,
+            };
+        }
+        delete env.CODEX_CLI_PATH;
+        const error = safeError(validation.error ?? "Selected managed Alpha validation failed");
+        input.persistFailure?.(error);
+        return {
+            requestedLane: "beta",
+            effectiveLane: "bundled",
+            binary: null,
+            userOverridePreserved: false,
+            fallback: true,
+            error,
+        };
+    }
+    const paths = deriveCodexCliPaths(input.home, input.userRoot);
     const state = readState(paths.state);
     const receipt = state.current;
     const binary = receipt ? binaryForReceipt(paths, receipt) : "";
@@ -229,6 +256,56 @@ function applyManagedCodexCliLaneAtBootstrap(input) {
     const error = safeError(validation.error ?? "Managed Beta validation failed");
     input.persistFailure?.(error);
     return { requestedLane: "beta", effectiveLane: "bundled", binary: null, userOverridePreserved: false, fallback: true, error };
+}
+function validateSelectedManagedBinarySync(selected) {
+    try {
+        if (!(0, node_path_1.isAbsolute)(selected.binaryPath) || (0, node_path_1.resolve)(selected.binaryPath) !== selected.binaryPath) {
+            throw new Error("Selected managed Alpha path is not exact and absolute");
+        }
+        if (!/^\d+\.\d+\.\d+-alpha\.\d+$/.test(selected.version)) {
+            throw new Error("Selected managed Alpha version is invalid");
+        }
+        if (!/^[a-f0-9]{64}$/i.test(selected.fingerprint)) {
+            throw new Error("Selected managed Alpha fingerprint is invalid");
+        }
+        const info = (0, node_fs_1.lstatSync)(selected.binaryPath);
+        if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o111) === 0) {
+            throw new Error("Selected managed Alpha binary is not a regular executable file");
+        }
+        const actualFingerprint = (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(selected.binaryPath)).digest("hex");
+        if (actualFingerprint !== selected.fingerprint.toLowerCase()) {
+            throw new Error("Selected managed Alpha fingerprint does not match");
+        }
+        if (process.platform === "darwin") {
+            (0, node_child_process_1.execFileSync)("/usr/bin/codesign", ["--verify", "--deep", "--strict", selected.binaryPath], {
+                stdio: "pipe",
+                timeout: 5_000,
+            });
+            (0, node_child_process_1.execFileSync)("/usr/bin/codesign", [
+                "-R=identifier \"codex\" and anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+                "--verify",
+                selected.binaryPath,
+            ], { stdio: "pipe", timeout: 5_000 });
+            const architecture = (0, node_child_process_1.execFileSync)("/usr/bin/file", ["-b", selected.binaryPath], {
+                encoding: "utf8",
+                timeout: 5_000,
+            });
+            if (!/arm64|aarch64/i.test(architecture))
+                throw new Error("Selected managed Alpha architecture is invalid");
+        }
+        const version = (0, node_child_process_1.execFileSync)(selected.binaryPath, ["--version"], {
+            encoding: "utf8",
+            timeout: 5_000,
+            maxBuffer: 64 * 1024,
+        });
+        if (normalizeVersion(version) !== selected.version) {
+            throw new Error("Selected managed Alpha version does not match");
+        }
+        return { valid: true };
+    }
+    catch (error) {
+        return { valid: false, error: safeError(error) };
+    }
 }
 async function mutateCodexFeature(input, deps) {
     if ((input.lane !== "bundled" && input.lane !== "beta") || typeof input.enabled !== "boolean" || !/^[A-Za-z0-9_-]+$/.test(input.name))
@@ -319,11 +396,20 @@ function validateReceiptFiles(paths, receipt, binary) {
     if (!isContained(releaseDir, binary))
         throw new Error("Managed Beta binary escapes its release directory");
     const diskReceipt = readReceipt(releaseDir);
-    if (!diskReceipt || diskReceipt.version !== receipt.version || diskReceipt.digest !== receipt.digest || diskReceipt.relativeDirectory !== receipt.relativeDirectory || diskReceipt.binaryRelativePath !== receipt.binaryRelativePath)
+    if (!diskReceipt
+        || diskReceipt.version !== receipt.version
+        || diskReceipt.digest !== receipt.digest
+        || diskReceipt.binaryDigest !== receipt.binaryDigest
+        || diskReceipt.relativeDirectory !== receipt.relativeDirectory
+        || diskReceipt.binaryRelativePath !== receipt.binaryRelativePath) {
         throw new Error("Managed Beta receipt or digest does not agree with state");
+    }
     const info = (0, node_fs_1.lstatSync)(binary);
     if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o111) === 0)
         throw new Error("Managed Beta binary is not a regular executable file");
+    const binaryDigest = (0, node_crypto_1.createHash)("sha256").update((0, node_fs_1.readFileSync)(binary)).digest("hex");
+    if (binaryDigest !== receipt.binaryDigest)
+        throw new Error("Managed Beta binary digest does not agree with its receipt");
 }
 function reconcileStateSync(paths, value) {
     const valid = (receipt) => {
@@ -368,7 +454,7 @@ function validReceipt(value) {
     if (!value || typeof value !== "object")
         return false;
     const receipt = value;
-    return receipt.schemaVersion === 1 && typeof receipt.version === "string" && typeof receipt.releaseTag === "string" && /^[a-f0-9]{64}$/i.test(receipt.digest ?? "") && receipt.architecture === "aarch64-apple-darwin" && typeof receipt.relativeDirectory === "string" && (0, node_path_1.basename)(receipt.relativeDirectory) === receipt.relativeDirectory && typeof receipt.binaryRelativePath === "string" && !(0, node_path_1.isAbsolute)(receipt.binaryRelativePath) && !receipt.binaryRelativePath.split(/[\\/]/).includes("..") && typeof receipt.verifiedAt === "string";
+    return receipt.schemaVersion === 1 && typeof receipt.version === "string" && typeof receipt.releaseTag === "string" && /^[a-f0-9]{64}$/i.test(receipt.digest ?? "") && /^[a-f0-9]{64}$/i.test(receipt.binaryDigest ?? "") && receipt.architecture === "aarch64-apple-darwin" && typeof receipt.relativeDirectory === "string" && (0, node_path_1.basename)(receipt.relativeDirectory) === receipt.relativeDirectory && typeof receipt.binaryRelativePath === "string" && !(0, node_path_1.isAbsolute)(receipt.binaryRelativePath) && !receipt.binaryRelativePath.split(/[\\/]/).includes("..") && typeof receipt.verifiedAt === "string";
 }
 function binaryForReceipt(paths, receipt) {
     return safeChild(safeChild(paths.releases, receipt.relativeDirectory), receipt.binaryRelativePath);
