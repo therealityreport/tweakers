@@ -6,6 +6,10 @@ import { homedir, platform } from "node:os";
 import { join, sep } from "node:path";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { userPaths, type UserPaths } from "../paths.js";
+import {
+  collectDesktopUpdateDiagnostics,
+  type DesktopUpdateDiagnostics,
+} from "../desktop-update-diagnostics.js";
 
 export interface DebugOpts {
   app?: string;
@@ -21,6 +25,7 @@ export interface DebugReport {
   codexDataPaths: DataPath[];
   tweakerPaths: DataPath[];
   open: OpenReport;
+  desktopUpdate: DesktopUpdateDiagnostics;
 }
 
 export interface RuntimeReport {
@@ -96,6 +101,7 @@ export function collectDebugReport(opts: DebugOpts = {}): DebugReport {
     codexDataPaths: codexDataPaths(codex),
     tweakerPaths: tweakerPaths(paths),
     open,
+    desktopUpdate: collectDesktopUpdateDiagnostics(paths),
   };
 }
 
@@ -179,6 +185,14 @@ export function tweakerPaths(paths: UserPaths = userPaths()): DataPath[] {
     ["State", paths.stateFile],
     ["Update mode", paths.updateModeFile],
     ["Self-update state", paths.selfUpdateStateFile],
+    ["Desktop update receipt", paths.desktopUpdateReceiptFile
+      ?? join(paths.root, "transactions", "desktop-update.json")],
+    ["Desktop update archive", paths.desktopUpdateArchiveRoot
+      ?? join(paths.root, "transactions", "desktop-update")],
+    ["Desktop update heartbeat", paths.desktopUpdateHeartbeatFile
+      ?? join(paths.root, "transactions", "desktop-update.heartbeat.json")],
+    ["Desktop update log", paths.desktopUpdateLogFile
+      ?? join(paths.root, "log", "desktop-update.log")],
     ["Backup", paths.backup],
     ["Log", paths.logDir],
     ["Bin", paths.binDir],
@@ -542,6 +556,26 @@ function printDebugReport(report: DebugReport): void {
   printDataPaths("codex data paths", report.codexDataPaths);
   console.log();
   printDataPaths("tweaker data paths", report.tweakerPaths);
+  console.log();
+
+  console.log(kleur.bold("desktop update"));
+  console.log(`  receipt:      ${report.desktopUpdate.receiptPath}`);
+  console.log(`  archive:      ${report.desktopUpdate.archiveRoot}`);
+  console.log(`  heartbeat:    ${report.desktopUpdate.heartbeatPath}`);
+  console.log(`  log:          ${report.desktopUpdate.logPath}`);
+  console.log(`  phase:        ${report.desktopUpdate.receipt?.phase ?? "idle"}`);
+  console.log(`  blocking:     ${report.desktopUpdate.blocking}`);
+  console.log(`  stale:        ${report.desktopUpdate.stale}`);
+  console.log(`  unsafe:       ${report.desktopUpdate.unsafe}`);
+  if (report.desktopUpdate.receiptError !== null) {
+    console.log(`  receipt error:${bridgePad(report.desktopUpdate.receiptError)}`);
+  }
+  if (report.desktopUpdate.receipt !== null) {
+    console.log(`  receipt json: ${JSON.stringify(report.desktopUpdate.receipt)}`);
+  }
+  for (const line of report.desktopUpdate.logTail) {
+    console.log(`  log tail:     ${line}`);
+  }
 }
 
 function printDataPaths(title: string, paths: DataPath[]): void {

@@ -20,7 +20,7 @@ export function capLogFile(path: string, maxBytes = MAX_LOG_BYTES): void {
 
 export function capKnownLogFiles(): void {
   const paths = userPaths();
-  for (const file of ["main.log", "preload.log", "loader.log"]) {
+  for (const file of ["main.log", "preload.log", "loader.log", "desktop-update.log"]) {
     capLogFile(join(paths.logDir, file));
   }
   if (platform() === "darwin") {

@@ -152,6 +152,12 @@ interface PsSnapshot {
   command: string;
 }
 
+/** Stable process-identity token used to reject PID reuse across transactions. */
+export function readProcessStartToken(pid: number): string | null {
+  const snapshot = readProcessSnapshot(pid);
+  return snapshot?.startedAtRaw ?? null;
+}
+
 /** Re-read one PID via ps. Returns null when the process is gone. */
 function readProcessSnapshot(pid: number): PsSnapshot | null {
   let output: string;

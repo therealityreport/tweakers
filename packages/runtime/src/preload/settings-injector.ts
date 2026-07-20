@@ -49,8 +49,11 @@ import {
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
+  desktopUpdatePresentation,
   desktopUpdateStatusPresentation,
+  humanizeCodexPhase,
   restoreEnvironmentFocus,
+  type DesktopUpdatePresentation,
   type EnvironmentConfirmationDecision,
 } from "./environment-config-controller";
 import type {
@@ -265,8 +268,10 @@ interface DesktopUpdateTransactionState {
   resumable?: boolean;
   nativeUpdateHandoffAt?: string | null;
   refreshSource?: "development" | "stable" | null;
+  environmentTransactionId?: string | null;
   error?: string | null;
   updatedAt?: string;
+  blocksLifecycle?: boolean;
 }
 
 type CodexUiReload = (mode?: "operation-start" | "operation-stop") => void;
@@ -2388,6 +2393,11 @@ function renderDesktopUpdateSection(
     const installed = result?.installed?.marketingVersion ?? "Unavailable";
     const latest = result?.latest?.marketingVersion ?? "Unavailable";
     const status = desktopUpdateStatusPresentation(result?.status);
+    const presentation = desktopUpdatePresentation({
+      busy,
+      status: result?.status,
+      transaction,
+    });
     const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
     const left = row.firstElementChild as HTMLElement | null;
     left?.prepend(statusBadge(status.tone, status.label));
@@ -2424,10 +2434,7 @@ function renderDesktopUpdateSection(
         .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
         .finally(() => { busy = false; draw(); });
     });
-    update.disabled = busy
-      || result?.status !== "update-available"
-      || transactionIsActive()
-      || transaction?.resumable === true;
+    update.disabled = presentation.updateDisabled;
     actions?.appendChild(update);
     card.appendChild(row);
     if (result?.setupRequired) {
@@ -2440,7 +2447,7 @@ function renderDesktopUpdateSection(
       ));
     }
     if (result?.checkedAt) card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
-    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, {
+    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, presentation, {
       busy,
       onResume: () => {
         if (busy) return;
@@ -2526,9 +2533,9 @@ function normalizeDesktopUpdateTransaction(value: unknown): DesktopUpdateTransac
 
 function desktopUpdateTransactionRow(
   transaction: DesktopUpdateTransactionState,
+  presentation: DesktopUpdatePresentation,
   actions: { busy: boolean; onResume: () => void; onCancel: () => void },
 ): HTMLElement {
-  const phase = humanizeCodexPhase(transaction.phase);
   const detail = [
     transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
     transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
@@ -2539,26 +2546,15 @@ function desktopUpdateTransactionRow(
   row.setAttribute("role", "status");
   row.setAttribute("aria-live", "polite");
   const left = row.firstElementChild as HTMLElement | null;
-  const tone = transaction.phase === "completed"
-    ? "ok"
-    : transaction.phase === "failed" && !transaction.resumable
-      ? "error"
-      : "warn";
-  left?.prepend(statusBadge(tone, phase));
-  const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
-  const canResume = transaction.resumable === true
-    && (transaction.phase === "failed" || transaction.phase === "rolled_back");
-  const canCancel = transaction.phase === "awaiting_native_update"
-    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase));
-  if (canResume) {
-    const resume = compactButton("Resume", actions.onResume);
-    resume.disabled = actions.busy;
-    controls?.appendChild(resume);
+  if (presentation.tone && presentation.phaseLabel) {
+    left?.prepend(statusBadge(presentation.tone, presentation.phaseLabel));
   }
-  if (canCancel) {
-    const cancel = compactButton("Cancel", actions.onCancel);
-    cancel.disabled = actions.busy;
-    controls?.appendChild(cancel);
+  const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  for (const action of presentation.actions) {
+    const handler = action.kind === "resume" ? actions.onResume : actions.onCancel;
+    const button = compactButton(action.label, handler);
+    button.disabled = action.disabled;
+    controls?.appendChild(button);
   }
   return row;
 }
@@ -2883,6 +2879,7 @@ function renderCodexVersionsCard(
     ));
   }
 
+  card.appendChild(codexVersionSurfaceOverview(snapshot));
   card.appendChild(codexActiveCliRow(snapshot));
   card.appendChild(codexEmbeddedCliRow(bundled, snapshot));
   card.appendChild(codexLatestStableReleaseRow(bundled));
@@ -2906,6 +2903,56 @@ function renderCodexVersionsCard(
   const stateMessage = codexRuntimeMessage(snapshot);
   if (stateMessage) card.appendChild(rowSimple("Runtime status", stateMessage));
   card.appendChild(codexFeatureBrowser(snapshot, busy, reload));
+}
+
+function codexVersionSurfaceOverview(snapshot: CodexVersionsSnapshot): HTMLElement {
+  const stable = snapshot.cli.bundled.release?.version ?? "Not checked";
+  const prerelease = snapshot.cli.beta.release?.version ?? "Not checked";
+  const desktopPrerelease = snapshot.cli.bundled.versionChannel === "prerelease"
+    ? snapshot.cli.bundled.version ?? "Not checked"
+    : "Not included in this desktop release";
+  const overview = document.createElement("div");
+  overview.className = "grid grid-cols-1 gap-3 p-3 md:grid-cols-2";
+  overview.dataset.tweakerCodexVersionOverview = "true";
+  overview.append(
+    codexVersionSurfaceSummary("Terminal", [
+      ["Latest Release", stable],
+      ["Latest Pre-Release", prerelease],
+      ["Current", snapshot.terminalCli.version ?? "Not installed"],
+    ]),
+    codexVersionSurfaceSummary("Desktop macOS", [
+      ["Latest Release", stable],
+      ["Latest Pre-Release", desktopPrerelease],
+      ["Current", snapshot.activeCli.version ?? "Unavailable"],
+    ]),
+  );
+  return overview;
+}
+
+function codexVersionSurfaceSummary(
+  titleText: string,
+  metrics: ReadonlyArray<readonly [label: string, value: string]>,
+): HTMLElement {
+  const surface = document.createElement("div");
+  surface.className = "border-token-border flex min-w-0 flex-col gap-2 rounded-lg border p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm font-semibold text-token-text-primary";
+  title.textContent = titleText;
+  surface.appendChild(title);
+  for (const [label, value] of metrics) {
+    const metric = document.createElement("div");
+    metric.className = "flex min-w-0 items-baseline justify-between gap-3";
+    const key = document.createElement("span");
+    key.className = "text-token-text-secondary text-xs";
+    key.textContent = label;
+    const version = document.createElement("span");
+    version.className = "min-w-0 truncate text-right font-mono text-sm text-token-text-primary";
+    version.textContent = value;
+    version.title = value;
+    metric.append(key, version);
+    surface.appendChild(metric);
+  }
+  return surface;
 }
 
 function codexActiveCliRow(snapshot: CodexVersionsSnapshot): HTMLElement {
@@ -3258,10 +3305,6 @@ function runCodexAction(
 
 function safeUiError(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "Unknown error");
-}
-
-function humanizeCodexPhase(value: string): string {
-  return value.replace(/-/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatBytes(value: number): string {

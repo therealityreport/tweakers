@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { join } from "node:path";
 import { readDesktopUpdateReceipt } from "./desktop-update-transaction.js";
+import { desktopReceiptBlocksLifecycle } from "./desktop-update-state.js";
 import { readEnvironmentTransactionReceipt } from "./environment-transaction.js";
 import {
   acquireProcessLock,
@@ -63,16 +64,11 @@ export function assertLifecycleReceiptsIdle(
 
   const desktop = readDesktopUpdateReceipt(join(userRoot, "transactions", "desktop-update.json"));
   if (desktop) {
-    // A failed desktop receipt is only safely terminal when official mode was
-    // explicitly proven, no continuation remains, and rollback itself did not
-    // fail. Missing safety evidence is treated as unsafe for older/corrupt
-    // receipts instead of silently opening the lifecycle gate.
     const desktopRollbackFailed = desktop.phase === "failed"
       && /\brollback failed\b/i.test(desktop.error ?? "");
     const unsafeDesktopFailure = desktop.phase === "failed"
       && (desktop.safeOfficialMode !== true || desktopRollbackFailed);
-    const active = !["completed", "rolled_back", "failed"].includes(desktop.phase)
-      || (desktop.phase === "failed" && (desktop.resumable === true || unsafeDesktopFailure));
+    const active = desktopReceiptBlocksLifecycle(desktop);
     const contextOwns = context?.startsWith("desktop update") === true;
     if (active && desktop.transactionId !== allowance.desktopTransactionId && !contextOwns) {
       const detail = desktopRollbackFailed

@@ -90,9 +90,12 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
   await withLifecycleLock(lifecycleLockFile(paths.root), "local refresh", async () => {
   assertLifecycleReceiptsIdle(paths.root);
   const current = getLocalRefreshStatus(paths.root);
+  // Smart selection prefers a registered development checkout even when it is
+  // hash-current: the stable path depends on a published release that may not
+  // exist or may lag the installed desktop. `--source stable` still forces it.
   const selected: RefreshSource = opts.source === "development" ? "development"
     : opts.source === "stable" ? "stable"
-    : current.source === "development" ? "development" : "stable";
+    : current.source === "development" || current.developmentSourceRoot !== null ? "development" : "stable";
   const sourceRoot = selected === "development" ? current.developmentSourceRoot : managedSourceRoot(paths.root);
   if (!sourceRoot) throw new Error("No registered Tweakers development checkout is available");
   const lockFile = join(paths.root, "refresh-local.lock");
@@ -207,11 +210,31 @@ function readJson<T>(path: string): T | null {
 }
 
 function runChecked(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv = process.env): void {
-  const result = spawnSync(command, args, { cwd, env, stdio: "inherit" });
+  // Capture instead of inheriting stdio: refresh usually runs detached (launchd
+  // or a desktop-update owner), so inherited child output is lost and failures
+  // land in refresh-state/desktop-update logs with no cause. Echo the captured
+  // output so interactive runs stay as informative as before.
+  const result = spawnSync(command, args, {
+    cwd,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
   if (result.status !== 0) {
     const detail = result.error?.message
       ?? (result.signal ? `signal ${result.signal}` : `status ${result.status ?? "unknown"}`);
-    throw new Error(`${command} ${args.join(" ")} failed with ${detail}`);
+    const tail = [result.stdout, result.stderr]
+      .filter((chunk): chunk is string => typeof chunk === "string" && chunk.trim() !== "")
+      .join("\n")
+      .trim()
+      .split("\n")
+      .slice(-8)
+      .join("\n")
+      .slice(-800);
+    throw new Error(`${command} ${args.join(" ")} failed with ${detail}${tail ? `: ${tail}` : ""}`);
   }
 }
 
@@ -264,9 +287,9 @@ export function handoffRefreshLocalToLaunchd(
     ].join(" "),
   ].join(" && ");
   // launchctl-submitted jobs are relaunched by launchd every time they exit,
-  // even on exit code 0 — the job must unregister itself or the refresh (and
-  // the app restart it triggers) repeats forever.
-  const command = `${refreshCommand}; launchctl remove ${shellQuote(label)}`;
+  // even on exit code 0. The EXIT/signal traps unregister the job while
+  // preserving the refresh command's real status for launchd diagnostics.
+  const command = `${buildTransientLaunchdExitTrap(label)}\n${refreshCommand}`;
   const result = adapters.submit("launchctl", ["submit", "-l", label, "--", "/bin/sh", "-c", command]);
   if (result.status === 0) return true;
   return false;
@@ -284,4 +307,20 @@ export function acquireRefreshLock(lockFile: string): ProcessLock {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildTransientLaunchdExitTrap(label: string): string {
+  const quotedLabel = shellQuote(label);
+  return [
+    "cleanup_transient_launchd_job() {",
+    "  status=$?",
+    "  trap - EXIT HUP INT TERM",
+    `  launchctl remove ${quotedLabel} >/dev/null 2>&1 || launchctl bootout gui/$(id -u)/${quotedLabel} >/dev/null 2>&1`,
+    '  exit "$status"',
+    "}",
+    "trap cleanup_transient_launchd_job EXIT",
+    "trap 'exit 129' HUP",
+    "trap 'exit 130' INT",
+    "trap 'exit 143' TERM",
+  ].join("\n");
 }

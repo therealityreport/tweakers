@@ -5,6 +5,8 @@ import test from "node:test";
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
+  desktopUpdatePresentation,
+  humanizeCodexPhase,
   desktopUpdateStatusPresentation,
   restoreEnvironmentFocus,
   type EnvironmentConfigEffects,
@@ -51,6 +53,152 @@ test("Desktop Update never presents stale, unavailable, or unchecked state as he
   assert.deepEqual(desktopUpdateStatusPresentation("unavailable"), { label: "Unavailable", tone: "warn" });
   assert.deepEqual(desktopUpdateStatusPresentation("error"), { label: "Error", tone: "error" });
   assert.deepEqual(desktopUpdateStatusPresentation("current"), { label: "Up to date", tone: "ok" });
+});
+
+test("Desktop Update phase labels humanize both receipt separators", () => {
+  assert.equal(humanizeCodexPhase("rolled_back"), "Rolled Back");
+  assert.equal(humanizeCodexPhase("awaiting_native_update"), "Awaiting Native Update");
+  assert.equal(humanizeCodexPhase("rolled-back"), "Rolled Back");
+});
+
+test("Desktop Update presents awaiting and resumable rollback receipts with their intended actions", () => {
+  assert.deepEqual(desktopUpdatePresentation({
+    busy: false,
+    status: "update-available",
+    transaction: {
+      phase: "awaiting_native_update",
+      resumable: false,
+      safeOfficialMode: true,
+    },
+  }), {
+    phaseLabel: "Awaiting Native Update",
+    tone: "warn",
+    actions: [{ kind: "cancel", label: "Cancel", disabled: false }],
+    updateDisabled: true,
+  });
+
+  assert.deepEqual(desktopUpdatePresentation({
+    busy: false,
+    status: "update-available",
+    transaction: {
+      phase: "rolled_back",
+      resumable: true,
+      safeOfficialMode: true,
+    },
+  }), {
+    phaseLabel: "Rolled Back",
+    tone: "warn",
+    actions: [
+      { kind: "resume", label: "Resume", disabled: false },
+      { kind: "cancel", label: "Cancel", disabled: false },
+    ],
+    updateDisabled: true,
+  });
+});
+
+test("Desktop Update actions cover every reconciliation result without opening a blocked retry", () => {
+  const cases = [
+    {
+      name: "explicit idle result",
+      transaction: { phase: "idle", resumable: false, safeOfficialMode: false },
+      actions: [],
+      updateDisabled: false,
+    },
+    {
+      name: "live preparation",
+      transaction: { phase: "preparing", resumable: false, safeOfficialMode: false },
+      actions: [],
+      updateDisabled: true,
+    },
+    {
+      name: "native updater wait",
+      transaction: { phase: "awaiting_native_update", resumable: false, safeOfficialMode: true },
+      actions: ["cancel"],
+      updateDisabled: true,
+    },
+    {
+      name: "recovered before native advancement",
+      transaction: { phase: "failed", resumable: false, safeOfficialMode: true },
+      actions: [],
+      updateDisabled: false,
+    },
+    {
+      name: "recovered after native advancement",
+      transaction: { phase: "failed", resumable: true, safeOfficialMode: true },
+      actions: ["resume", "cancel"],
+      updateDisabled: true,
+    },
+    {
+      name: "rolled back with continuation",
+      transaction: { phase: "rolled_back", resumable: true, safeOfficialMode: true },
+      actions: ["resume", "cancel"],
+      updateDisabled: true,
+    },
+    {
+      name: "rolled back safely",
+      transaction: { phase: "rolled_back", resumable: false, safeOfficialMode: false },
+      actions: [],
+      updateDisabled: false,
+    },
+    {
+      name: "completed",
+      transaction: { phase: "completed", resumable: false, safeOfficialMode: false },
+      actions: [],
+      updateDisabled: false,
+    },
+    {
+      name: "unsafe recovery can be retried",
+      transaction: {
+        phase: "failed",
+        resumable: false,
+        safeOfficialMode: false,
+        environmentTransactionId: "environment-1",
+      },
+      actions: ["cancel"],
+      updateDisabled: true,
+    },
+    {
+      name: "unsafe failure without recovery evidence stays blocked",
+      transaction: {
+        phase: "failed",
+        resumable: false,
+        safeOfficialMode: false,
+        environmentTransactionId: null,
+      },
+      actions: [],
+      updateDisabled: true,
+    },
+    {
+      name: "canonical rollback-failure blocker stays closed",
+      transaction: {
+        phase: "failed",
+        resumable: false,
+        safeOfficialMode: true,
+        error: "return failed; rollback failed: disk error",
+        blocksLifecycle: true,
+      },
+      actions: [],
+      updateDisabled: true,
+    },
+  ] as const;
+
+  for (const scenario of cases) {
+    const presentation = desktopUpdatePresentation({
+      busy: false,
+      status: "update-available",
+      transaction: scenario.transaction,
+    });
+    assert.deepEqual(
+      presentation.actions.map((action) => action.kind),
+      scenario.actions,
+      `${scenario.name} actions`,
+    );
+    assert.equal(
+      presentation.updateDisabled,
+      scenario.updateDisabled,
+      `${scenario.name} update availability`,
+    );
+  }
 });
 
 test("Environment stages app experience and release profile independently", () => {
@@ -381,6 +529,13 @@ test("Runtime Versions keeps active, stable, and alpha backend truth visible", (
   assert.match(source, /Desktop-Embedded Codex CLI/);
   assert.match(source, /Latest Stable CLI Release/);
   assert.match(source, /Managed Alpha CLI \(Pre-release\)/);
+  assert.match(source, /codexVersionSurfaceOverview\(snapshot\)/);
+  assert.match(source, /codexVersionSurfaceSummary\("Terminal"/);
+  assert.match(source, /codexVersionSurfaceSummary\("Desktop macOS"/);
+  assert.match(source, /\["Latest Release", stable\]/);
+  assert.match(source, /\["Latest Pre-Release", prerelease\]/);
+  assert.match(source, /\["Current", snapshot\.terminalCli\.version/);
+  assert.match(source, /\["Current", snapshot\.activeCli\.version/);
   assert.match(source, /Desktop profile and CLI release channel are reported separately/);
   assert.doesNotMatch(source, /Stable CLI \(Bundled\)/);
   assert.doesNotMatch(source, /CODEX \(UPDATE AVAILABLE\)/);

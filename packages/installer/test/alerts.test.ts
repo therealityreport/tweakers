@@ -236,9 +236,23 @@ test("native-update handoff names OpenAI ownership and gives the manual menu fal
   }
 });
 
-test("native-update handoff clicks the updater menu on the exact committed process", { skip: process.platform !== "darwin" }, () => {
+/** Fake clock: each nowMs() call advances 1s, so a small deadlineMs bounds the
+ * retry loop deterministically without real waiting. */
+function fakeClock(): { nowMs: () => number; sleeps: number[]; sleep: (ms: number) => Promise<void> } {
+  let t = 0;
+  const sleeps: number[] = [];
+  return {
+    nowMs: () => (t += 1_000),
+    sleeps,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+    },
+  };
+}
+
+test("native-update handoff clicks the updater menu on the exact committed process", { skip: process.platform !== "darwin" }, async () => {
   const calls: RecordedExecCall[] = [];
-  const requested = requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+  const requested = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 91, visibleWindow: true }),
     exec: ((command: string, args: readonly string[], options: unknown) => {
       calls.push({ command, args, options });
@@ -255,14 +269,18 @@ test("native-update handoff clicks the updater menu on the exact committed proce
   assert.match(script, /click updateItem/);
 });
 
-test("native-update handoff refuses a process that is not the exact committed app", { skip: process.platform !== "darwin" }, () => {
+test("native-update handoff refuses a process that is not the exact committed app", { skip: process.platform !== "darwin" }, async () => {
+  const clock = fakeClock();
   let executed = false;
-  const requested = requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+  const requested = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 92, visibleWindow: true }),
     exec: (() => {
       executed = true;
       return "";
     }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 1,
   });
 
   assert.equal(requested.ok, false);
@@ -270,9 +288,9 @@ test("native-update handoff refuses a process that is not the exact committed ap
   assert.equal(executed, false);
 });
 
-test("native-update handoff includes localized labels and a structural app-menu fallback", { skip: process.platform !== "darwin" }, () => {
+test("native-update handoff includes localized labels and a structural app-menu fallback", { skip: process.platform !== "darwin" }, async () => {
   const calls: RecordedExecCall[] = [];
-  const result = requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 91, visibleWindow: true }),
     locale: () => "fr-FR",
     readLocaleMessages: () => ({
@@ -288,19 +306,27 @@ test("native-update handoff includes localized labels and a structural app-menu 
   const script = scriptFrom(calls[0]);
   assert.match(script, /"Mettre à jour"/);
   assert.match(script, /menu item 4 of appMenu/);
+  assert.match(script, /name of beforeItem is missing value/);
   assert.match(script, /AXSeparator/);
   assert.match(script, /"Check for Updates…"/);
 });
 
-test("native-update handoff reports Automation denial with exact System Settings guidance", { skip: process.platform !== "darwin" }, () => {
+test("native-update handoff reports Automation denial with exact System Settings guidance", { skip: process.platform !== "darwin" }, async () => {
   const denied = Object.assign(new Error("osascript failed"), {
     stderr: "System Events got an error: Not authorized to send Apple events. (-1743)",
     status: 1,
   });
-  const result = requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+  const clock = fakeClock();
+  let execCalls = 0;
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 91, visibleWindow: true }),
     readLocaleMessages: () => null,
-    exec: (() => { throw denied; }) as typeof execFileSync,
+    exec: (() => {
+      execCalls += 1;
+      throw denied;
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
   });
 
   assert.equal(result.ok, false);
@@ -309,21 +335,113 @@ test("native-update handoff reports Automation denial with exact System Settings
   assert.match(result.message, /denied Automation access/i);
   assert.match(result.permissionGuidance ?? "", /System Settings > Privacy & Security > Automation/);
   assert.match(result.permissionGuidance ?? "", /control System Events/);
+  assert.equal(execCalls, 1);
+  assert.equal(clock.sleeps.length, 0);
 });
 
-test("native-update handoff reports a missing updater menu instead of swallowing it", { skip: process.platform !== "darwin" }, () => {
+test("native-update handoff reports a missing updater menu instead of swallowing it", { skip: process.platform !== "darwin" }, async () => {
   const missing = Object.assign(new Error("osascript failed"), {
     stderr: "execution error: TWEAKERS_MENU_NOT_FOUND (1708)",
     status: 1,
   });
-  const result = requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+  const clock = fakeClock();
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
     observe: () => ({ pid: 91, visibleWindow: true }),
     readLocaleMessages: () => null,
     exec: (() => { throw missing; }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 1,
   });
 
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.kind, "menu_item_not_found");
+});
+
+test("native-update handoff retries until the menu appears after app launch", { skip: process.platform !== "darwin" }, async () => {
+  const missing = Object.assign(new Error("osascript failed"), {
+    stderr: "execution error: TWEAKERS_MENU_NOT_FOUND (1708)",
+    status: 1,
+  });
+  const clock = fakeClock();
+  let execCalls = 0;
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: (() => {
+      execCalls += 1;
+      if (execCalls < 3) throw missing;
+      return "";
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 60_000,
+    pollIntervalMs: 500,
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(execCalls, 3);
+  assert.deepEqual(clock.sleeps, [500, 500]);
+});
+
+test("native-update handoff stops retrying at the deadline and records the observed menu", { skip: process.platform !== "darwin" }, async () => {
+  const missing = Object.assign(new Error("osascript failed"), {
+    stderr: "execution error: TWEAKERS_MENU_NOT_FOUND (1708)",
+    status: 1,
+  });
+  const clock = fakeClock();
+  const attemptScripts: string[] = [];
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: ((command: string, args: readonly string[]) => {
+      const script = String(args[1]);
+      if (script.includes("click updateItem")) {
+        attemptScripts.push(script);
+        throw missing;
+      }
+      return "|About ChatGPT| |Settings…|Log Out";
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    // deadline = first nowMs (1000) + 5000; each nowMs call advances 1s, so
+    // the loop runs attempts at t=1s..5s and exits at t=6s: 5 attempts.
+    deadlineMs: 5_000,
+    pollIntervalMs: 2_000,
+  });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.kind, "menu_item_not_found");
+  assert.equal(attemptScripts.length, 5);
+  assert.equal(clock.sleeps.length, 4);
+  assert.match(result.message, /ChatGPT's native update menu item could not be found\./);
+  assert.match(result.message, /Observed app menu items: \|About ChatGPT\| \|Settings…\|Log Out/);
+});
+
+test("native-update handoff re-observes a hidden window on each retry", { skip: process.platform !== "darwin" }, async () => {
+  const clock = fakeClock();
+  let observations = 0;
+  let executed = 0;
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => {
+      observations += 1;
+      return { pid: 91, visibleWindow: observations > 1 };
+    },
+    readLocaleMessages: () => null,
+    exec: (() => {
+      executed += 1;
+      return "";
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 60_000,
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(observations, 2);
+  assert.equal(executed, 1);
+  assert.equal(clock.sleeps.length, 1);
 });
 
 test(
@@ -380,6 +498,30 @@ test(
       assert.notEqual(reconcileIndex, -1);
       assert.notEqual(openIndex, -1);
       assert.ok(reconcileIndex < openIndex);
+    } finally {
+      restore();
+    }
+  },
+);
+
+test(
+  "watcher-driven reopen launches in the background without activating",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const { calls, restore } = installExecSpy();
+    const appRoot = "/tmp/Codex.app";
+    try {
+      withEnv({ TWEAKER_WATCHER: "1" }, () => {
+        openCodex(appRoot);
+      });
+
+      const launchCalls = calls.filter((call) => call.command === "open");
+      assert.equal(launchCalls.length, 1);
+      assert.deepEqual(launchCalls[0]?.args, ["-g", appRoot]);
+      assert.equal(
+        calls.some((call) => call.command === "osascript" && call.args.some((arg) => arg.includes("to activate"))),
+        false,
+      );
     } finally {
       restore();
     }

@@ -104,7 +104,7 @@ function installLaunchd(appRoot: string): WatcherKind {
     <string>${appRoot}/Contents/Resources/app.asar</string>
   </array>
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>120</integer>
   <key>StandardOutPath</key>
   <string>${logPath}</string>
   <key>StandardErrorPath</key>

@@ -6,6 +6,7 @@ import {
   type DesktopUpdateReceipt,
   type DesktopUpdateTransaction,
 } from "../desktop-update-transaction.js";
+import { desktopReceiptBlocksLifecycle } from "../desktop-update-state.js";
 
 export interface UpdateCodexOptions {
   app?: string;
@@ -73,6 +74,16 @@ export async function resumeCodexUpdate(
   return receipt;
 }
 
+export async function reconcileCodexUpdate(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): Promise<DesktopUpdateReceipt | null> {
+  const receipt = await deps.createTransaction(opts).reconcile();
+  if (receipt) printReceipt(receipt, opts, deps);
+  else if (opts.json) deps.print(JSON.stringify({ transactionId: null, phase: "idle" }));
+  return receipt;
+}
+
 export async function cancelCodexUpdate(
   opts: UpdateCodexOptions = {},
   deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
@@ -88,7 +99,10 @@ function printReceipt(
   deps: UpdateCodexCommandDeps,
 ): void {
   if (opts.json) {
-    deps.print(JSON.stringify(receipt));
+    deps.print(JSON.stringify({
+      ...receipt,
+      blocksLifecycle: desktopReceiptBlocksLifecycle(receipt),
+    }));
     return;
   }
   const tone = receipt.phase === "completed" ? kleur.green

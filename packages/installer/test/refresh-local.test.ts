@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,7 +30,21 @@ test("smart refresh selects a changed registered development checkout", () => {
     const current = getLocalRefreshStatus(user);
     assert.equal(current.available, false);
     assert.equal(current.source, "current");
+    // Smart source selection needs the registered checkout even when
+    // hash-current, so it must survive into the "current" status.
+    assert.equal(current.developmentSourceRoot, source);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("smart refresh prefers a registered development checkout over the stable stage", () => {
+  const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
+  assert.match(source, /current\.source === "development" \|\| current\.developmentSourceRoot !== null \? "development" : "stable"/);
+});
+
+test("refresh child failures capture output for the refresh-state and receipt error", () => {
+  const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
+  assert.match(source, /stdio: \["ignore", "pipe", "pipe"\]/);
+  assert.match(source, /failed with \$\{detail\}\$\{tail \? `: \$\{tail\}` : ""\}/);
 });
 
 test("stable refresh stages a release separately and holds a promotable candidate", () => {
@@ -71,11 +86,12 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     assert.match(calls[0]?.args.at(-1) ?? "", /TWEAKERS_REFRESH_LOCAL_DETACHED=1/);
     assert.match(calls[0]?.args.at(-1) ?? "", /PATH='\/opt\/custom node\/bin:\/usr\/bin'/);
     assert.match(calls[0]?.args.at(-1) ?? "", /'\/tmp\/node binary' '\/tmp\/tweaker cli\.js'/);
-    assert.match(
-      calls[0]?.args.at(-1) ?? "",
-      /; launchctl remove 'com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123'$/,
-      "submitted job must unregister itself or launchd relaunches it forever",
-    );
+    const shell = calls[0]?.args.at(-1) ?? "";
+    assert.match(shell, /trap cleanup_transient_launchd_job EXIT/);
+    assert.match(shell, /launchctl remove 'com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123'/);
+    assert.match(shell, /launchctl bootout gui\/\$\(id -u\)\/'com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123'/);
+    assert.match(shell, /trap 'exit 143' TERM/);
+    assert.doesNotMatch(shell, /\|\|\s*true/);
 
     assert.equal(handoffRefreshLocalToLaunchd(root, {
       ...common,
@@ -89,6 +105,82 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
       submit: () => { recursiveSubmitCalled = true; return { status: 0 }; },
     }), false);
     assert.equal(recursiveSubmitCalled, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("refresh launchd shell cleans its label and preserves a non-zero refresh exit", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-shell-"));
+  try {
+    const cleanupCalls = join(root, "cleanup.log");
+    const launchctl = join(root, "launchctl");
+    const worker = join(root, "worker");
+    const cli = join(root, "cli.js");
+    writeFileSync(
+      launchctl,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "$CLEANUP_CALLS"\n[ "$1" = remove ] && exit 1\nexit 0\n`,
+    );
+    writeFileSync(worker, "#!/bin/sh\nexit 23\n");
+    writeFileSync(cli, "// fixture\n");
+    chmodSync(launchctl, 0o755);
+    chmodSync(worker, 0o755);
+
+    let shell = "";
+    assert.equal(handoffRefreshLocalToLaunchd(root, {
+      platform: "darwin",
+      env: { PATH: `${root}:/usr/bin:/bin` },
+      argv: ["node", cli, "refresh-local"],
+      execPath: worker,
+      cwd: root,
+      now: () => 456,
+      submit: (_command, args) => {
+        shell = args.at(-1) ?? "";
+        return { status: 0 };
+      },
+    }), true);
+
+    const result = spawnSync("/bin/sh", ["-c", shell], {
+      env: {
+        ...process.env,
+        PATH: `${root}:/usr/bin:/bin`,
+        CLEANUP_CALLS: cleanupCalls,
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 23);
+    assert.deepEqual(readFileSync(cleanupCalls, "utf8").trim().split("\n"), [
+      `remove com.therealityreport.tweakers.refresh-local.${process.pid}.456`,
+      `bootout gui/${process.getuid?.() ?? 501}/com.therealityreport.tweakers.refresh-local.${process.pid}.456`,
+    ]);
+
+    writeFileSync(worker, "#!/bin/sh\nkill -TERM \"$PPID\"\nsleep 0.1\nexit 0\n");
+    shell = "";
+    assert.equal(handoffRefreshLocalToLaunchd(root, {
+      platform: "darwin",
+      env: { PATH: `${root}:/usr/bin:/bin` },
+      argv: ["node", cli, "refresh-local"],
+      execPath: worker,
+      cwd: root,
+      now: () => 457,
+      submit: (_command, args) => {
+        shell = args.at(-1) ?? "";
+        return { status: 0 };
+      },
+    }), true);
+    const interrupted = spawnSync("/bin/sh", ["-c", shell], {
+      env: {
+        ...process.env,
+        PATH: `${root}:/usr/bin:/bin`,
+        CLEANUP_CALLS: cleanupCalls,
+      },
+      encoding: "utf8",
+    });
+    assert.equal(interrupted.status, 143);
+    assert.match(
+      readFileSync(cleanupCalls, "utf8"),
+      new RegExp(`remove com\\.therealityreport\\.tweakers\\.refresh-local\\.${process.pid}\\.457`),
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

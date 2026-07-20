@@ -48,6 +48,32 @@ export interface EnvironmentConfigControllerOptions {
 }
 export declare function createEnvironmentConfigController<Receipt>(selected: EnvironmentSelectionPair, effects: EnvironmentConfigEffects<Receipt>, options?: EnvironmentConfigControllerOptions): EnvironmentConfigController<Receipt>;
 export type DesktopUpdateStatus = "update-available" | "current" | "stale" | "unavailable" | "error";
+export declare function humanizeCodexPhase(value: string): string;
+export interface DesktopUpdatePresentationTransaction {
+    phase: string;
+    safeOfficialMode?: boolean;
+    resumable?: boolean;
+    environmentTransactionId?: string | null;
+    error?: string | null;
+    blocksLifecycle?: boolean;
+}
+export interface DesktopUpdatePresentationInput {
+    busy: boolean;
+    status: DesktopUpdateStatus | undefined;
+    transaction: DesktopUpdatePresentationTransaction | null;
+}
+export interface DesktopUpdatePresentationAction {
+    kind: "resume" | "cancel";
+    label: "Resume" | "Cancel";
+    disabled: boolean;
+}
+export interface DesktopUpdatePresentation {
+    phaseLabel: string | null;
+    tone: "ok" | "warn" | "error" | null;
+    actions: DesktopUpdatePresentationAction[];
+    updateDisabled: boolean;
+}
+export declare function desktopUpdatePresentation(input: DesktopUpdatePresentationInput): DesktopUpdatePresentation;
 export declare function desktopUpdateStatusPresentation(status: DesktopUpdateStatus | undefined): {
     label: string;
     tone: "ok" | "warn" | "error";

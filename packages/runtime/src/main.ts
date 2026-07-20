@@ -80,6 +80,13 @@ import {
 } from "./tweak-store";
 import { maybeStartBrowserUiServer } from "./browser-ui";
 import { resolveLocalCliRuntime } from "./local-cli-runtime";
+import { resolveTerminalCodexBinary } from "./codex-terminal-cli";
+import {
+  classifyInstalledCliCommand,
+  submitInstalledCliWithLaunchd,
+  type LaunchdSubmitOptions,
+} from "./installed-cli-launch";
+import { createDesktopUpdateStartupReconciler } from "./desktop-update-startup";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import { answerPromotionHealthRequest, hasAuthenticatedSessionCookie, hasAuthenticatedCodexToken, readCodexAuth } from "./promotion-health";
 import {
@@ -1329,6 +1336,24 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
+  windowReady: () => BrowserWindow.getAllWindows().some((window) => (
+    !window.isDestroyed() && window.isVisible()
+  )),
+  launch: () => {
+    const cli = desktopUpdateCli();
+    startInstalledCli(cli, ["update-chatgpt-reconcile", "--json"]);
+  },
+  setTimer: (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  onEvent: (event) => {
+    log(event.result === "submitted" ? "info" : "warn", event.event, event);
+  },
+});
+
 app.whenReady().then(() => {
   log("info", "app ready fired");
   // A disposable health probe launches Codex's main process only far enough to
@@ -1346,6 +1371,7 @@ app.whenReady().then(() => {
     // Raw Sparkle scheduling stays disabled in the locally signed app. This
     // bounded metadata-only loop restores proactive update notification safely.
     scheduleProactiveDesktopUpdateChecks();
+    if (process.platform === "darwin") desktopUpdateStartupReconciler.schedule();
   }
   void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
@@ -1754,6 +1780,19 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
   const bundledPath = bundledCodexBinary();
   const betaPath = codexCliManager.getSelectedBinary();
   const activeCliPath = codexCliBootstrap.binary ?? bundledPath;
+  const terminalPath = resolveTerminalCodexBinary({
+    home: homedir(),
+    pathValue: process.env.PATH,
+    preferredPath: process.env.CODEX_TERMINAL_CLI_PATH,
+    excludedPaths: [bundledPath, betaPath].filter((value): value is string => !!value),
+    isExecutable: (path) => {
+      try {
+        return existsSync(path) && statSync(path).isFile();
+      } catch {
+        return false;
+      }
+    },
+  });
   const installedDesktop = installedCodexDesktopVersion();
   const desktopCacheKey = installedDesktop.installedMarketingVersion
     ? `${installedDesktop.installedMarketingVersion}:${installedDesktop.installedBuild ?? ""}`
@@ -1767,9 +1806,10 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
   if (!codexAppcastMetadataByIdentity.has(desktopAppcastMemoryKey) && persistedAppcast) {
     codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, persistedAppcast);
   }
-  const [bundledProbe, betaProbe, activeCliProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
+  const [bundledProbe, betaProbe, terminalProbe, activeCliProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
     codexVersionService.probeCli(bundledPath),
     betaPath ? codexVersionService.probeCli(betaPath) : Promise.resolve(null),
+    terminalPath ? codexVersionService.probeCli(terminalPath) : Promise.resolve(null),
     codexVersionService.probeCli(activeCliPath),
     force
       ? codexVersionService.fetchLatestRelease("bundled", { force: true })
@@ -1865,6 +1905,16 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
       nativeUpdateActionable: sparkle.canInstall,
       nativeUpdatePrerequisiteError: sparkle.installPrerequisiteFailure,
       updateAvailable: desktopUpdate,
+    },
+    terminalCli: {
+      path: terminalProbe?.path ?? terminalPath,
+      version: terminalProbe?.version ?? null,
+      versionChannel: codexVersionChannel(terminalProbe?.version),
+      available: terminalProbe?.available ?? false,
+      release: bundledRelease?.release ?? null,
+      error: terminalProbe?.error ?? (terminalPath ? null : "Terminal Codex CLI was not found"),
+      managedCurrentVersion: null,
+      managedPreviousVersion: null,
     },
     activeCli: {
       path: activeCliProbe.path,
@@ -3453,36 +3503,43 @@ function localRefreshCli(status?: { source?: string; developmentSourceRoot?: str
 // EXIT trap's launchctl remove/bootout make the transient job self-remove.
 function startInstalledCliWithLaunchd(cli: string, args: string[]): boolean {
   const label = `com.therealityreport.tweakers.patch-helper.${process.pid}.${Date.now()}`;
-  const cleanup = `launchctl remove ${label} >/dev/null 2>&1 || launchctl bootout gui/$(id -u)/${label} >/dev/null 2>&1 || true`;
   const runtime = localCliRuntime(cli, args);
-  const command = [
-    `trap ${shellQuote(cleanup)} EXIT`,
-    `cd ${shellQuote(resolve(dirname(cli), "..", "..", ".."))}`,
-    `TWEAKERS_HOME=${shellQuote(userRoot!)} TWEAKER_HOME=${shellQuote(userRoot!)} TWEAKERS_USER_ROOT=${shellQuote(userRoot!)} TWEAKER_USER_ROOT=${shellQuote(userRoot!)} ${LEGACY_USER_ROOT_ENV}=${shellQuote(userRoot!)} TWEAKER_MANUAL_UPDATE=1 ${LEGACY_MANUAL_UPDATE_ENV}=1 ELECTRON_RUN_AS_NODE=1 ${[runtime.command, ...runtime.args].map(shellQuote).join(" ")}`,
-  ].join(" && ");
-  const result = spawnSync(
-    "launchctl",
-    [
-      "submit",
-      "-l",
-      label,
-      "--",
-      "/bin/sh",
-      "-c",
-      `${command} || true`,
-    ],
-    {
-      encoding: "utf8",
-      stdio: "ignore",
+  return submitInstalledCliWithLaunchd({
+    classification: classifyInstalledCliCommand(args),
+    label,
+    cwd: resolve(dirname(cli), "..", "..", ".."),
+    command: runtime.command,
+    args: runtime.args,
+    environment: {
+      TWEAKERS_HOME: userRoot!,
+      TWEAKER_HOME: userRoot!,
+      TWEAKERS_USER_ROOT: userRoot!,
+      TWEAKER_USER_ROOT: userRoot!,
+      [LEGACY_USER_ROOT_ENV]: userRoot!,
+      TWEAKER_MANUAL_UPDATE: "1",
+      [LEGACY_MANUAL_UPDATE_ENV]: "1",
+      ELECTRON_RUN_AS_NODE: "1",
+      TWEAKERS_DESKTOP_UPDATE_JOB_LABEL: label,
     },
-  );
-  if (result.status === 0) return true;
-  log("warn", `launchctl submit failed for Tweakers patch helper: ${result.error?.message ?? result.status}`);
-  return false;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+  }, {
+    submit: (command, submitArgs, options: LaunchdSubmitOptions) => {
+      const result = spawnSync(command, [...submitArgs], options);
+      return {
+        status: result.status,
+        signal: result.signal,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error,
+      };
+    },
+    onEvent: (event) => {
+      log(
+        event.submitResult === "submitted" ? "info" : "warn",
+        "desktop-update-launch",
+        event,
+      );
+    },
+  });
 }
 
 function markSelfUpdateStarted(sourceRoot: string): SelfUpdateState {

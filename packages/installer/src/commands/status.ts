@@ -11,6 +11,7 @@ import { readAsarMarker, readCodexVersion } from "./install.js";
 import { describeUpdateMode, readUpdateMode } from "../update-mode.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
 import { readConfigFile } from "../config.js";
+import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
@@ -21,6 +22,17 @@ export async function status(): Promise<void> {
   console.log(`  tweaks dir:   ${paths.tweaks}`);
   console.log(`  log dir:      ${paths.logDir}`);
   console.log(`  safe mode:    ${readSafeMode(paths.configFile) ? kleur.yellow("enabled") : kleur.green("disabled")}`);
+  console.log();
+
+  const desktopUpdate = collectDesktopUpdateDiagnostics(paths);
+  console.log(kleur.bold("desktop update"));
+  console.log(`  phase:        ${desktopUpdate.receiptError ? "invalid" : desktopUpdate.receipt?.phase ?? "idle"}`);
+  console.log(`  safe official:${desktopUpdate.receipt === null ? " (n/a)" : ` ${desktopUpdate.receipt.safeOfficialMode}`}`);
+  console.log(`  resumable:    ${desktopUpdate.receipt?.resumable ?? false}`);
+  console.log(`  blocking:     ${desktopUpdate.blocking}${desktopUpdate.stale ? " (stale)" : ""}`);
+  console.log(`  receipt:      ${desktopUpdate.receiptPath}`);
+  console.log(`  log:          ${desktopUpdate.logPath}`);
+  if (desktopUpdate.receiptError) console.log(`  error:        ${kleur.red(desktopUpdate.receiptError)}`);
   console.log();
 
   if (!state) {

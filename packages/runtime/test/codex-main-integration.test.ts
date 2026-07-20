@@ -164,6 +164,22 @@ test("proactive desktop update checks are metadata-only, deduplicated, and exclu
   assert.match(mainSource, /PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 \* 60 \* 60 \* 1_000/);
 });
 
+test("startup desktop-update reconciliation is guarded, bounded, and uses the cutover launcher", () => {
+  assert.match(mainSource, /createDesktopUpdateStartupReconciler\(\{/);
+  assert.match(mainSource, /BrowserWindow\.getAllWindows\(\)\.some/);
+  assert.match(
+    mainSource,
+    /startInstalledCli\(cli, \["update-chatgpt-reconcile", "--json"\]\)/,
+  );
+  const readyStart = mainSource.indexOf("app.whenReady().then(() => {");
+  const readyEnd = mainSource.indexOf('app.on("will-quit"', readyStart);
+  const ready = mainSource.slice(readyStart, readyEnd);
+  assert.match(
+    ready,
+    /else \{[\s\S]*?scheduleProactiveDesktopUpdateChecks\(\);[\s\S]*?process\.platform === "darwin"[\s\S]*?desktopUpdateStartupReconciler\.schedule\(\)/,
+  );
+});
+
 test("runtime owns one watched MCP reconciler with status and repair IPC", () => {
   assert.match(mainSource, /const mcpReconciler = healthCheckOnly \? null : createMcpReconciler\(\{/);
   assert.match(mainSource, /configPath: CODEX_CONFIG_FILE/);
@@ -223,9 +239,10 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
   const launchdLaunch = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
   assert.match(mainSource, /function localCliRuntime[\s\S]*?resolveLocalCliRuntime\(\{/);
   assert.match(launchdLaunch, /localCliRuntime\(cli, args\)/);
-  assert.match(launchdLaunch, /runtime\.command, \.\.\.runtime\.args/);
+  assert.match(launchdLaunch, /command: runtime\.command/);
+  assert.match(launchdLaunch, /args: runtime\.args/);
   assert.doesNotMatch(launchdLaunch, /process\.execPath, cli/);
-  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE=1/);
+  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE: "1"/);
   for (const exactRootVariable of [
     "TWEAKERS_HOME",
     "TWEAKER_HOME",
@@ -233,10 +250,10 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
     "TWEAKER_USER_ROOT",
   ]) {
     assert.match(localRuntime, new RegExp(`${exactRootVariable}: userRoot!`));
-    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}=\\$\\{shellQuote\\(userRoot!\\)\\}`));
+    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}: userRoot!`));
   }
   assert.match(localRuntime, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
-  assert.match(launchdLaunch, /\$\{LEGACY_USER_ROOT_ENV\}=\$\{shellQuote\(userRoot!\)\}/);
+  assert.match(launchdLaunch, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
 });
 
 test("Sparkle update mode is committed only after the signed app restore", () => {
@@ -303,6 +320,9 @@ test("Codex version snapshots report the exact measured active backend separatel
   assert.match(body, /version: activeCliProbe\.version/);
   assert.match(body, /versionChannel: codexVersionChannel\(activeCliProbe\.version\)/);
   assert.match(body, /source: activeCliSource/);
+  assert.match(body, /resolveTerminalCodexBinary/);
+  assert.match(body, /terminalCli:\s*\{/);
+  assert.match(body, /version: terminalProbe\?\.version \?\? null/);
   assert.match(body, /Math\.min\(\.\.\.lookupCheckedAt\)/);
   assert.match(body, /managedAlphaVersion = managerState\.current\?\.version \?\? betaProbe\?\.version/);
   assert.match(body, /versionChannel: codexVersionChannel\(managedAlphaVersion\)/);
