@@ -37,8 +37,13 @@ import { waitForMacAppUpdateToSettle } from "./repair.js";
 import { confirmModeSwitch, isCodexRunning, openCodex, quitCodex } from "../alerts.js";
 import { signatureInfo, verifySignature } from "../codesign.js";
 import { OPENAI_TEAM_ID } from "../macos-variant.js";
-import { compareSemver } from "../version.js";
 import { acquireProcessLock, isLockHeldByLiveOwner, processAlive } from "../process-lock.js";
+import {
+  compareDesktopVersionIdentity,
+  desktopVersionIdentityEqual,
+  type DesktopVersionComparison,
+  type DesktopVersionIdentity,
+} from "../desktop-version.js";
 import {
   acquireTransactionLock,
   cloneAppTree,
@@ -439,13 +444,28 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
     const backupBuild = readBundleBuild(backup);
     const liveVersion = readCodexVersion(codex.metaPath);
     const liveBuild = readBundleBuild(codex.appRoot);
-    const backupIsOlderThanLive = isOlderBundle(
+    const backupComparedWithLive = compareOlderBundle(
       { version: backupVersion, build: backupBuild },
       { version: liveVersion, build: liveBuild },
     );
-    const backupIsOlderThanRecorded = backupVersion !== null
-      && state.codexVersion !== null
-      && compareSemver(backupVersion, state.codexVersion) < 0;
+    if (backupComparedWithLive === "unknown") {
+      throw new Error(
+        "Refusing to switch to ChatGPT mode: the pristine backup and live app version/build could not be compared safely.",
+      );
+    }
+    const backupComparedWithRecorded = backupVersion !== null && state.codexVersion !== null
+      ? compareOlderBundle(
+        { version: backupVersion, build: null },
+        { version: state.codexVersion, build: null },
+      )
+      : "not-newer";
+    if (backupComparedWithRecorded === "unknown") {
+      throw new Error(
+        "Refusing to switch to ChatGPT mode: the pristine backup and recorded app version could not be compared safely.",
+      );
+    }
+    const backupIsOlderThanLive = backupComparedWithLive === "newer";
+    const backupIsOlderThanRecorded = backupComparedWithRecorded === "newer";
     if (backupIsOlderThanLive || backupIsOlderThanRecorded) {
       const installedVersion = backupIsOlderThanLive ? liveVersion : state.codexVersion;
       const installedBuild = backupIsOlderThanLive ? liveBuild : null;
@@ -501,13 +521,19 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
           && !signature.adHoc
           && signature.teamIdentifier === OPENAI_TEAM_ID;
       };
-      if (
-        verifyOfficialPristine(codex.appRoot)
-        && isNewerBundle(
+      const settledIsOfficialPristine = verifyOfficialPristine(codex.appRoot);
+      const settledComparison = settledIsOfficialPristine
+        ? compareNewerBundle(
           { version: settledVersion, build: settledBuild },
           { versions: [backupVersion, state.codexVersion], build: settledBackupBuild },
         )
-      ) {
+        : "not-newer";
+      if (settledComparison === "unknown") {
+        throw new Error(
+          "Refusing to overwrite the settled official app because its version/build could not be compared safely.",
+        );
+      }
+      if (settledIsOfficialPristine && settledComparison === "newer") {
         refreshPristineBackupStaged(codex.appRoot, backup, {
           verify: verifyOfficialPristine,
           copy: deps.copyApp ?? cloneAppTree,
@@ -682,6 +708,7 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
       // Fingerprint the live official version only AFTER the settle wait:
       // Sparkle installs pending updates after the main process exits.
       const liveVersion = readCodexVersion(codex.metaPath);
+      const liveBuild = readBundleBuild(codex.appRoot);
       const payloadMeta = readPayloadMetadata(payloadMetadataFile(paths.root));
       const parkedPresent = existsSync(join(parkedApp, "Contents"));
       // An adopted or crash-orphaned park can lack payload.json; fall back to
@@ -689,9 +716,22 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
       // reports — so status and the fast path can never disagree.
       const parkedVersion = payloadMeta?.baseVersion
         ?? (parkedPresent ? readCodexVersion(join(parkedApp, "Contents", "Info.plist")) : null);
+      const parkedBuild = payloadMeta?.baseBuild
+        ?? (parkedPresent ? readBundleBuild(parkedApp) : null);
+      const parkedMatchesLive = parkedPresent
+        ? desktopVersionIdentityEqual(
+          { marketingVersion: parkedVersion, build: parkedBuild },
+          { marketingVersion: liveVersion, build: liveBuild },
+        )
+        : false;
+      if (parkedPresent && parkedMatchesLive === null) {
+        throw new Error(
+          "Refusing to overwrite either app because the parked payload and live app version/build could not be compared safely.",
+        );
+      }
 
       let unusablePayload: string | null = null;
-      if (parkedPresent && parkedVersion && liveVersion && parkedVersion === liveVersion) {
+      if (parkedPresent && parkedMatchesLive === true) {
         // Fast path: swap the parked patched payload straight in.
         writeModeTransition(modeTransitionFile(paths.root), { ...journal, phase: "swapping" });
         rmSync(outgoing, { recursive: true, force: true });
@@ -938,35 +978,49 @@ function readBundleBuild(appRoot: string): string | null {
  * Sparkle build numbers are authoritative when both sides provide valid
  * numeric values. Marketing versions are the fallback for older snapshots.
  */
-function isNewerBundle(
+function compareNewerBundle(
   candidate: { version: string | null; build: string | null },
   baseline: { versions: Array<string | null>; build: string | null },
-): boolean {
-  if (candidate.build && baseline.build) {
-    const buildComparison = compareNumericDotted(candidate.build, baseline.build);
-    if (buildComparison !== null) return buildComparison > 0;
+): DesktopVersionComparison {
+  if (candidate.build !== null || baseline.build !== null) {
+    return compareDesktopVersionIdentity(
+      { marketingVersion: null, build: baseline.build },
+      { marketingVersion: null, build: candidate.build },
+    );
   }
   const candidateVersion = candidate.version;
-  if (!candidateVersion) return false;
+  if (!candidateVersion) return "unknown";
   const versions = baseline.versions.filter((version): version is string => version !== null);
-  if (versions.length === 0) return false;
-  const comparisons = versions.map((version) => compareNumericDotted(candidateVersion, version));
-  if (comparisons.some((comparison) => comparison === null || comparison < 0)) return false;
-  if (comparisons.some((comparison) => comparison !== null && comparison > 0)) return true;
-  return false;
+  if (versions.length === 0) return "unknown";
+  let advanced = false;
+  for (const version of versions) {
+    const forward = compareDesktopVersionIdentity(
+      { marketingVersion: version, build: null },
+      { marketingVersion: candidateVersion, build: null },
+    );
+    if (forward === "unknown") return "unknown";
+    if (forward === "newer") {
+      advanced = true;
+      continue;
+    }
+    const reverse = compareDesktopVersionIdentity(
+      { marketingVersion: candidateVersion, build: null },
+      { marketingVersion: version, build: null },
+    );
+    if (reverse === "unknown") return "unknown";
+    if (reverse === "newer") return "not-newer";
+  }
+  return advanced ? "newer" : "not-newer";
 }
 
-function isOlderBundle(
+function compareOlderBundle(
   candidate: { version: string | null; build: string | null },
   baseline: { version: string | null; build: string | null },
-): boolean {
-  if (candidate.build && baseline.build) {
-    const buildComparison = compareNumericDotted(candidate.build, baseline.build);
-    if (buildComparison !== null) return buildComparison < 0;
-  }
-  if (!candidate.version || !baseline.version) return false;
-  const versionComparison = compareSemver(candidate.version, baseline.version);
-  return versionComparison < 0;
+): DesktopVersionComparison {
+  return compareDesktopVersionIdentity(
+    toDesktopVersionIdentity(candidate),
+    toDesktopVersionIdentity(baseline),
+  );
 }
 
 function bundleDisplay(version: string | null, build: string | null): string {
@@ -974,16 +1028,13 @@ function bundleDisplay(version: string | null, build: string | null): string {
   return build ? `${displayedVersion}, build ${build}` : displayedVersion;
 }
 
-function compareNumericDotted(a: string, b: string): number | null {
-  if (!/^\d+(?:\.\d+)*$/.test(a) || !/^\d+(?:\.\d+)*$/.test(b)) return null;
-  const left = a.split(".").map(Number);
-  const right = b.split(".").map(Number);
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const difference = (left[index] ?? 0) - (right[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
+function toDesktopVersionIdentity(
+  bundle: { version: string | null; build: string | null },
+): DesktopVersionIdentity {
+  return {
+    marketingVersion: bundle.version,
+    build: bundle.build,
+  };
 }
 
 function defaultWaitForSettle(appRoot: string): Promise<void> {

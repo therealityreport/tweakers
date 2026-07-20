@@ -49,7 +49,14 @@ export interface InstallerState {
    * Size + mtime of the patched app.asar at the last confirmed-intact repair.
    * Enables the watcher stat-guard early-exit; absent on older installs.
    */
-  patchedAsarStat?: { size: number; mtimeMs: number };
+  patchedAsarStat?: {
+    size: number;
+    mtimeMs: number;
+    dev?: number;
+    ino?: number;
+    ctimeMs?: number;
+    headerHash?: string;
+  };
   /**
    * Number of consecutive watcher stat-guard early-exits since the last full
    * pass. Cleanup hygiene runs every Nth guard hit. Absent on older installs.

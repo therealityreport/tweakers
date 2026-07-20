@@ -8,7 +8,16 @@ const crypto = require("node:crypto");
 const { _test } = require("../index.js");
 
 function auth(value) {
-  return JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { access_token: value, refresh_token: `refresh-${value}`, id_token: `id-${value}` } });
+  return JSON.stringify({
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      access_token: value,
+      refresh_token: `refresh-${value}`,
+      id_token: `id-${value}`,
+      account_id: `account-${value}`,
+    },
+  });
 }
 
 function fixture(options = {}) {
@@ -16,13 +25,23 @@ function fixture(options = {}) {
   const codexDir = path.join(root, ".codex");
   const accountsDir = path.join(codexDir, "auth_accounts");
   fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
-  const paths = { codexDir, accountsDir, authFile: path.join(codexDir, "auth.json"), currentMarker: path.join(codexDir, "current_account"), lkgFile: path.join(codexDir, "auth.account-switcher-lkg.json") };
+  const projectionDir = path.join(root, "Library", "Application Support", "codex-plusplus");
+  const paths = {
+    codexDir,
+    accountsDir,
+    authFile: path.join(codexDir, "auth.json"),
+    currentMarker: path.join(codexDir, "current_account"),
+    lkgFile: path.join(codexDir, "auth.account-switcher-lkg.json"),
+    projectionDir,
+    projectionFile: path.join(projectionDir, "account-analytics.v1.json"),
+  };
   fs.writeFileSync(paths.authFile, auth("current"), { mode: 0o600 });
   fs.writeFileSync(path.join(accountsDir, "work.json"), auth("work"), { mode: 0o600 });
   fs.writeFileSync(paths.currentMarker, "missing.json\n", { mode: 0o600 });
-  const deps = { fs: options.fs || fs, path, homedir: () => root, randomUUID: crypto.randomUUID, now: Date.now };
-  const service = _test.createAccountService({ log: { info() {} } }, { deps, paths });
-  return { root, paths, service };
+  const deps = { fs: options.fs || fs, path, homedir: () => root, randomUUID: crypto.randomUUID, now: options.now || Date.now };
+  const log = options.log || { info() {}, warn() {} };
+  const service = _test.createAccountService({ log }, { deps, paths, onSwitched: options.onSwitched });
+  return { root, paths, service, deps, log };
 }
 
 test("list is redacted, side-effect-free, and reports dangling marker", async (t) => {
@@ -38,6 +57,9 @@ test("list is redacted, side-effect-free, and reports dangling marker", async (t
 test("switch uses opaque intent, 0600 writes, and preserves LKG", async (t) => {
   const { root, paths, service } = fixture(); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.writeFileSync(paths.currentMarker, "work.json\n", { mode: 0o600 });
+  const live = JSON.parse(auth("current"));
+  live.tokens.account_id = "account-work";
+  fs.writeFileSync(paths.authFile, JSON.stringify(live), { mode: 0o600 });
   const list = await service.handle({ action: "list" });
   assert.equal(list.accounts[0].active, true);
   const prepared = await service.handle({ action: "prepare-switch", ref: list.accounts[0].ref });
@@ -96,6 +118,14 @@ test("switch saves the login being left so switching back uses its latest tokens
   assert.equal(JSON.parse(fs.readFileSync(paths.authFile)).tokens.access_token, "account-3");
   assert.equal(fs.readFileSync(paths.currentMarker, "utf8"), "account-3.json\n");
   assert.equal(restarts, 1);
+  const projectionPath = path.join(root, "Library", "Application Support", "codex-plusplus", "account-analytics.v1.json");
+  const projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  const priorKey = _test.accountKeyFromAuth(JSON.parse(session("account-2-refreshed", "acct-2")));
+  const nextKey = _test.accountKeyFromAuth(JSON.parse(session("account-3", "acct-3")));
+  assert.equal(projection.epochs.find((epoch) => epoch.accountKey === priorKey).endedAt !== null, true);
+  assert.equal(projection.epochs.at(-1).accountKey, nextKey);
+  assert.equal(projection.epochs.at(-1).source, "confirmed-switch");
+  assert.equal(projection.epochs.at(-1).endedAt, null);
 });
 
 test("corrupt, permissive, symlink, and traversal sources do not mutate auth or LKG", async (t) => {
@@ -201,6 +231,7 @@ test("authPaths honors CODEX_HOME and otherwise falls back to ~/.codex", () => {
   assert.equal(withHome.codexDir, "/tmp/custom-codex-home");
   assert.equal(withHome.authFile, path.join("/tmp/custom-codex-home", "auth.json"));
   assert.equal(withHome.accountsDir, path.join("/tmp/custom-codex-home", "auth_accounts"));
+  assert.equal(withHome.projectionFile, path.join("/home/whoever", "Library", "Application Support", "codex-plusplus", "account-analytics.v1.json"));
 
   const fallback = _test.authPaths({ path, homedir: () => "/home/whoever", codexHome: null });
   assert.equal(fallback.codexDir, path.join("/home/whoever", ".codex"));
@@ -208,7 +239,16 @@ test("authPaths honors CODEX_HOME and otherwise falls back to ~/.codex", () => {
 
 test("account labels use the saved ChatGPT identity without exposing tokens", () => {
   const token = `x.${Buffer.from(JSON.stringify({ name: "Tweakers", email: "tweakers@example.com" })).toString("base64url")}.x`;
-  assert.equal(_test.displayLabelFromAuth({ auth_mode: "chatgpt", tokens: { id_token: token } }, "fallback"), "Tweakers");
+  assert.equal(_test.displayLabelFromAuth({ auth_mode: "chatgpt", tokens: { id_token: token } }, "fallback"), "tweakers@example.com");
+  assert.equal(_test.displayLabelFromAuth({
+    user: { name: "Codex", email: "codex@thereality.report" },
+  }, "fallback"), "codex@thereality.report");
+  assert.equal(_test.displayLabelFromAuth({
+    user: { name: "Safe Account", email: "sk-proj-SECRET_CANARY" },
+  }, "fallback"), "Safe Account");
+  assert.equal(_test.displayLabelFromAuth({
+    user: { email: "Bearer SECRET_CANARY" },
+  }, "sk-proj-SECRET_CANARY"), "Saved account");
   assert.equal(_test.displayLabelFromAuth({}, "Work Account"), "Work Account");
 });
 
@@ -245,6 +285,299 @@ test("active snapshot sync propagates rotated tokens only for the same account",
   fs.writeFileSync(paths.authFile, withAccount("rotated-2", "acct-1"), { mode: 0o600 });
   _test.syncActiveSnapshot(deps, paths);
   assert.equal(JSON.parse(fs.readFileSync(path.join(accountsDir, "work.json"))).tokens.access_token, "rotated");
+});
+
+test("startup publishes only safe labels and a forward observation boundary", (t) => {
+  const observedAt = Date.parse("2026-07-19T14:00:00.000Z");
+  const { root, paths, service } = fixture({ now: () => observedAt });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const namedAuth = (label, accountId, canary) => JSON.stringify({
+    auth_mode: "chatgpt",
+    user: { name: label },
+    tokens: {
+      access_token: `access-${canary}`,
+      refresh_token: `refresh-${canary}`,
+      id_token: `id-${canary}`,
+      account_id: accountId,
+      unexpected_secret: canary,
+    },
+  });
+  fs.writeFileSync(path.join(paths.accountsDir, "work.json"), namedAuth("Work", "raw-account-work", "SECRET_CANARY_WORK"), { mode: 0o600 });
+  fs.writeFileSync(path.join(paths.accountsDir, "personal.json"), namedAuth("Personal", "raw-account-personal", "SECRET_CANARY_PERSONAL"), { mode: 0o600 });
+  fs.writeFileSync(paths.authFile, namedAuth("Work", "raw-account-work", "SECRET_CANARY_LIVE"), { mode: 0o600 });
+  fs.writeFileSync(paths.currentMarker, "work.json\n", { mode: 0o600 });
+
+  const result = service.observeStartup();
+  assert.equal(result.ok, true);
+  const projection = JSON.parse(fs.readFileSync(paths.projectionFile, "utf8"));
+  assert.equal(projection.version, 1);
+  assert.deepEqual(
+    projection.accounts
+      .filter((account) => ["Personal", "Work"].includes(account.label))
+      .map((account) => account.label)
+      .sort(),
+    ["Personal", "Work"],
+  );
+  assert.equal(projection.accounts.filter((account) => account.active).length, 1);
+  assert.deepEqual(projection.epochs, [{
+    accountKey: projection.accounts.find((account) => account.label === "Work").accountKey,
+    startedAt: "2026-07-19T14:00:00.000Z",
+    endedAt: null,
+    source: "startup-observation",
+  }]);
+  assert.equal(fs.statSync(paths.projectionFile).mode & 0o777, 0o600);
+  const serialized = JSON.stringify(projection);
+  for (const forbidden of ["raw-account", "SECRET_CANARY", "access_token", "refresh_token", "id_token", "cookie", paths.authFile]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+});
+
+test("startup refuses a stale marker whose saved account does not match live auth", async (t) => {
+  const observedAt = Date.parse("2026-07-19T14:30:00.000Z");
+  const { root, paths, service } = fixture({ now: () => observedAt });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const withAccount = (email, accountId) => JSON.stringify({
+    auth_mode: "chatgpt",
+    user: { email },
+    tokens: {
+      access_token: `access-${accountId}`,
+      refresh_token: `refresh-${accountId}`,
+      id_token: `id-${accountId}`,
+      account_id: accountId,
+    },
+  });
+  fs.writeFileSync(path.join(paths.accountsDir, "work.json"), withAccount("codex@thereality.report", "account-codex"), { mode: 0o600 });
+  fs.writeFileSync(paths.authFile, withAccount("admin@thereality.report", "account-admin"), { mode: 0o600 });
+  fs.writeFileSync(paths.currentMarker, "work.json\n", { mode: 0o600 });
+
+  const list = await service.list();
+  assert.equal(list.accounts.some((account) => account.active), false);
+  assert.equal(list.markerStatus, "identity-mismatch");
+  assert.equal(service.observeStartup().ok, true);
+  const projection = JSON.parse(fs.readFileSync(paths.projectionFile, "utf8"));
+  assert.equal(projection.accounts.some((account) => account.active), false);
+  assert.equal(projection.epochs.some((epoch) => epoch.endedAt === null), false);
+});
+
+test("projection identity follows the OpenAI account, not the saved filename", (t) => {
+  let observedAt = Date.parse("2026-07-19T15:00:00.000Z");
+  const { root, paths, service, deps } = fixture({ now: () => observedAt });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const withAccount = (email, accountId) => JSON.stringify({
+    auth_mode: "chatgpt",
+    user: { email },
+    tokens: {
+      access_token: `access-${accountId}`,
+      refresh_token: `refresh-${accountId}`,
+      id_token: `id-${accountId}`,
+      account_id: accountId,
+    },
+  });
+  const shared = withAccount("codex@thereality.report", "account-codex");
+  fs.writeFileSync(path.join(paths.accountsDir, "alpha.json"), shared, { mode: 0o600 });
+  fs.writeFileSync(path.join(paths.accountsDir, "beta.json"), shared, { mode: 0o600 });
+  fs.writeFileSync(paths.authFile, shared, { mode: 0o600 });
+  fs.writeFileSync(paths.currentMarker, "alpha.json\n", { mode: 0o600 });
+  assert.equal(service.observeStartup().ok, true);
+
+  let projection = JSON.parse(fs.readFileSync(paths.projectionFile, "utf8"));
+  const originalKey = _test.accountKeyFromAuth(JSON.parse(shared));
+  assert.equal(projection.accounts.filter((account) => account.accountKey === originalKey).length, 1);
+  assert.equal(projection.accounts.find((account) => account.accountKey === originalKey).active, true);
+
+  projection.epochs = projection.epochs.map((epoch) => (
+    epoch.accountKey === originalKey ? { ...epoch, endedAt: "2026-07-19T15:05:00.000Z" } : epoch
+  ));
+  projection.revision += 1;
+  projection.updatedAt = "2026-07-19T15:05:00.000Z";
+  _test.writeAccountProjection(deps, paths, projection);
+
+  observedAt = Date.parse("2026-07-19T15:10:00.000Z");
+  const replacement = withAccount("admin@thereality.report", "account-admin");
+  fs.writeFileSync(path.join(paths.accountsDir, "alpha.json"), replacement, { mode: 0o600 });
+  fs.writeFileSync(paths.authFile, replacement, { mode: 0o600 });
+  assert.equal(service.observeStartup().ok, true);
+  projection = JSON.parse(fs.readFileSync(paths.projectionFile, "utf8"));
+  const replacementKey = _test.accountKeyFromAuth(JSON.parse(replacement));
+  assert.notEqual(replacementKey, originalKey);
+  assert.equal(projection.accounts.find((account) => account.accountKey === originalKey).label, "codex@thereality.report");
+  assert.equal(projection.accounts.find((account) => account.accountKey === replacementKey).active, true);
+  assert.equal(projection.epochs.some((epoch) => epoch.accountKey === originalKey && epoch.endedAt !== null), true);
+});
+
+test("successful switch publishes the confirmed boundary before restart scheduling", async (t) => {
+  let setup;
+  let restartObservation;
+  setup = fixture({
+    now: () => Date.parse("2026-07-19T15:00:00.000Z"),
+    onSwitched: () => {
+      restartObservation = {
+        marker: fs.readFileSync(setup.paths.currentMarker, "utf8"),
+        projection: JSON.parse(fs.readFileSync(setup.paths.projectionFile, "utf8")),
+      };
+      return true;
+    },
+  });
+  const { root, service } = setup;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const list = await service.list();
+  const prepared = await service.prepareSwitch(list.accounts[0].ref);
+  const result = await service.switch(prepared.intent);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.restartScheduled, true);
+  assert.equal(restartObservation.marker, "work.json\n");
+  assert.equal(restartObservation.projection.epochs.at(-1).source, "confirmed-switch");
+  assert.equal(restartObservation.projection.epochs.at(-1).endedAt, null);
+  assert.equal(restartObservation.projection.accounts.find((account) => account.active).label, "work");
+});
+
+test("projection failure never rolls back a safe switch and invalidates stale epochs", async (t) => {
+  let failProjectionRename = false;
+  const warnings = [];
+  const guardedFs = Object.create(fs);
+  guardedFs.renameSync = (from, to) => {
+    if (failProjectionRename && to.endsWith("account-analytics.v1.json")) throw Object.assign(new Error("SECRET_CANARY_PATH /private/auth.json"), { code: "EIO" });
+    return fs.renameSync(from, to);
+  };
+  const setup = fixture({ fs: guardedFs, log: { info() {}, warn(...args) { warnings.push(args); } } });
+  const { root, paths, service } = setup;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const before = _test.readAccountProjection(setup.deps, paths);
+  before.epochs.push({ accountKey: before.accounts[0].accountKey, startedAt: "2026-07-19T10:00:00.000Z", endedAt: null, source: "startup-observation" });
+  _test.writeAccountProjection(setup.deps, paths, before);
+  failProjectionRename = true;
+
+  const list = await service.list();
+  const prepared = await service.prepareSwitch(list.accounts[0].ref);
+  const result = await service.switch(prepared.intent);
+
+  assert.equal(result.ok, true);
+  assert.equal(JSON.parse(fs.readFileSync(paths.authFile)).tokens.access_token, "work");
+  assert.equal(fs.readFileSync(paths.currentMarker, "utf8"), "work.json\n");
+  assert.equal(fs.existsSync(paths.projectionFile), false, "stale open epoch is removed after failed replacement");
+  const warningText = JSON.stringify(warnings);
+  assert.equal(warningText.includes("SECRET_CANARY"), false);
+  assert.equal(warningText.includes("/private"), false);
+  assert.match(warningText, /projection-update-failed/);
+});
+
+test("malformed projection is not trusted and cannot block switching", async (t) => {
+  const warnings = [];
+  const { root, paths, service } = fixture({ log: { info() {}, warn(...args) { warnings.push(args); } } });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(paths.projectionFile, JSON.stringify({ version: 1, access_token: "SECRET_CANARY" }), { mode: 0o600 });
+  const list = await service.list();
+  const prepared = await service.prepareSwitch(list.accounts[0].ref);
+  const result = await service.switch(prepared.intent);
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(paths.projectionFile), false);
+  assert.equal(JSON.stringify(warnings).includes("SECRET_CANARY"), false);
+});
+
+test("auth rollback completes before projection work begins", async (t) => {
+  let failMarkerOnce = false;
+  const guardedFs = Object.create(fs);
+  guardedFs.renameSync = (from, to) => {
+    if (failMarkerOnce && to.endsWith("current_account")) {
+      failMarkerOnce = false;
+      throw Object.assign(new Error("marker write failed"), { code: "EIO" });
+    }
+    return fs.renameSync(from, to);
+  };
+  const setup = fixture({ fs: guardedFs });
+  const { root, paths, service } = setup;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const before = {
+    auth: fs.readFileSync(paths.authFile),
+    marker: fs.readFileSync(paths.currentMarker),
+    projection: fs.readFileSync(paths.projectionFile),
+  };
+  const list = await service.list();
+  const prepared = await service.prepareSwitch(list.accounts[0].ref);
+  failMarkerOnce = true;
+  const result = await service.switch(prepared.intent);
+  assert.equal(result.ok, false);
+  assert.deepEqual(fs.readFileSync(paths.authFile), before.auth);
+  assert.deepEqual(fs.readFileSync(paths.currentMarker), before.marker);
+  assert.deepEqual(fs.readFileSync(paths.projectionFile), before.projection);
+});
+
+test("projection helpers reject permissive files, symlinks, unknown fields, and excessive history", (t) => {
+  const { root, paths, deps } = fixture();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const valid = _test.readAccountProjection(deps, paths);
+
+  fs.chmodSync(paths.projectionFile, 0o644);
+  assert.throws(() => _test.readAccountProjection(deps, paths), /projection-invalid/);
+  fs.chmodSync(paths.projectionFile, 0o600);
+  const target = `${paths.projectionFile}.target`;
+  fs.renameSync(paths.projectionFile, target);
+  fs.symlinkSync(target, paths.projectionFile);
+  assert.throws(() => _test.readAccountProjection(deps, paths), /projection-invalid/);
+  fs.unlinkSync(paths.projectionFile);
+
+  assert.throws(() => _test.writeAccountProjection(deps, paths, { ...valid, access_token: "SECRET_CANARY" }), /projection-invalid/);
+  assert.throws(() => _test.writeAccountProjection(deps, paths, {
+    ...valid,
+    accounts: [{ ...valid.accounts[0], label: "sk-proj-SECRET_CANARY" }],
+  }), /projection-invalid/);
+  assert.throws(() => _test.writeAccountProjection(deps, paths, {
+    ...valid,
+    epochs: [{ accountKey: "acct_00000000000000000000000000000000", startedAt: "2026-07-19T10:00:00.000Z", endedAt: null, source: "startup-observation" }],
+  }), /projection-invalid/);
+  assert.throws(() => _test.writeAccountProjection(deps, paths, {
+    ...valid,
+    quotaSnapshots: [{
+      accountKey: "acct_00000000000000000000000000000000",
+      capturedAt: "2026-07-19T10:00:00.000Z",
+      planType: "pro",
+      primary: {},
+      secondary: {},
+    }],
+  }), /projection-invalid/);
+  assert.throws(() => _test.writeAccountProjection(deps, paths, {
+    ...valid,
+    epochs: Array.from({ length: _test.PROJECTION_LIMITS.maxEpochs + 1 }, () => ({
+      accountKey: valid.accounts[0].accountKey,
+      startedAt: "2026-07-19T10:00:00.000Z",
+      endedAt: null,
+      source: "startup-observation",
+    })),
+  }), /projection-invalid/);
+});
+
+test("projection replacement is atomic and rejects a symlinked parent", (t) => {
+  let failRename = false;
+  const guardedFs = Object.create(fs);
+  guardedFs.renameSync = (from, to) => {
+    if (failRename && to.endsWith("account-analytics.v1.json")) throw Object.assign(new Error("replace failed"), { code: "EIO" });
+    return fs.renameSync(from, to);
+  };
+  const setup = fixture({ fs: guardedFs });
+  const { root, paths, deps } = setup;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const before = fs.readFileSync(paths.projectionFile);
+  const next = _test.readAccountProjection(deps, paths);
+  next.revision += 1;
+  next.updatedAt = "2026-07-19T16:00:00.000Z";
+  failRename = true;
+  assert.throws(() => _test.writeAccountProjection(deps, paths, next), /projection-write-failed/);
+  assert.deepEqual(fs.readFileSync(paths.projectionFile), before);
+
+  failRename = false;
+  const realDir = `${paths.projectionDir}-real`;
+  fs.renameSync(paths.projectionDir, realDir);
+  fs.symlinkSync(realDir, paths.projectionDir);
+  assert.throws(() => _test.writeAccountProjection(deps, paths, next), /projection-untrusted/);
+});
+
+test("quota ingestion is not exposed without a trustworthy quota producer", async (t) => {
+  const { root, service } = fixture();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const result = await service.handle({ action: "record-quota-snapshot", access_token: "SECRET_CANARY" });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "invalid-request");
 });
 
 test("renderer account-menu fallback chooses one nested menu instead of broad side containers", (t) => {

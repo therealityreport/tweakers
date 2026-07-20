@@ -40,6 +40,11 @@ export interface UserPaths {
   environmentReceiptRoot?: string;
   environmentLockFile?: string;
   environmentRuntimeProofFile?: string;
+  desktopUpdateReceiptFile?: string;
+  desktopUpdateArchiveRoot?: string;
+  desktopUpdateLockFile?: string;
+  desktopUpdateHeartbeatFile?: string;
+  desktopUpdateLogFile?: string;
 }
 
 export interface EnvironmentUserPaths {
@@ -54,7 +59,15 @@ export interface EnvironmentUserPaths {
   environmentRuntimeProofFile: string;
 }
 
-export type ResolvedUserPaths = UserPaths & EnvironmentUserPaths;
+export interface DesktopUpdateUserPaths {
+  desktopUpdateReceiptFile: string;
+  desktopUpdateArchiveRoot: string;
+  desktopUpdateLockFile: string;
+  desktopUpdateHeartbeatFile: string;
+  desktopUpdateLogFile: string;
+}
+
+export type ResolvedUserPaths = UserPaths & EnvironmentUserPaths & DesktopUpdateUserPaths;
 
 export function userPaths(): ResolvedUserPaths {
   const root = userRoot();
@@ -80,6 +93,11 @@ export function userPaths(): ResolvedUserPaths {
     environmentReceiptRoot: join(root, "transactions", "environment"),
     environmentLockFile: join(root, "transactions", "environment.lock"),
     environmentRuntimeProofFile: join(root, "environment-runtime-proof.json"),
+    desktopUpdateReceiptFile: join(root, "transactions", "desktop-update.json"),
+    desktopUpdateArchiveRoot: join(root, "transactions", "desktop-update"),
+    desktopUpdateLockFile: join(root, "transactions", "desktop-update.lock"),
+    desktopUpdateHeartbeatFile: join(root, "transactions", "desktop-update.heartbeat.json"),
+    desktopUpdateLogFile: join(root, "log", "desktop-update.log"),
   };
   return paths;
 }
@@ -95,6 +113,7 @@ export function ensureUserPaths(): ResolvedUserPaths {
     p.logDir,
     p.transactionRoot,
     p.environmentReceiptRoot,
+    p.desktopUpdateArchiveRoot,
   ]) {
     mkdirSync(dir, { recursive: true });
     chownForTargetUser(dir);

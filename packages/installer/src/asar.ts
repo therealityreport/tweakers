@@ -20,6 +20,10 @@ export interface AsarHeaderInfo {
   header: unknown;
 }
 
+export interface PatchAsarDependencies {
+  copyFile?: (from: string, to: string) => void;
+}
+
 /**
  * @electron/asar caches the parsed filesystem header per archive path for
  * `extractFile`. When we rewrite an asar in place (same path), that cache goes
@@ -59,6 +63,7 @@ export function readHeaderHash(asarPath: string): AsarHeaderInfo {
 export async function patchAsar(
   asarPath: string,
   mutate: (extractedDir: string) => Promise<void> | void,
+  dependencies: PatchAsarDependencies = {},
 ): Promise<AsarHeaderInfo> {
   const work = mkdtempSync(join(tmpdir(), "cxx-asar-"));
   const extractDir = join(work, "src");
@@ -83,19 +88,18 @@ export async function patchAsar(
     // same filesystem for `rename` to be atomic.
     const stagingPath = `${asarPath}.tweaker-new`;
     try {
-      cpSync(outAsar, stagingPath);
-    } catch (e) {
-      throw annotatePermError(e, asarPath);
-    }
-    try {
+      (dependencies.copyFile ?? cpSync)(outAsar, stagingPath);
       renameSync(stagingPath, asarPath);
+      // The on-disk asar just changed underneath any cached header for this path.
+      uncacheAsar(asarPath);
+      return readHeaderHash(asarPath);
     } catch (e) {
-      try { unlinkSync(stagingPath); } catch { /* best effort */ }
       throw annotatePermError(e, asarPath);
+    } finally {
+      // A failed copy can still leave a partial file. Use the same cleanup path
+      // for copy, rename, and post-replace verification failures.
+      try { unlinkSync(stagingPath); } catch { /* already moved/absent */ }
     }
-    // The on-disk asar just changed underneath any cached header for this path.
-    uncacheAsar(asarPath);
-    return readHeaderHash(asarPath);
   } finally {
     await cleanupTempTree(work);
   }

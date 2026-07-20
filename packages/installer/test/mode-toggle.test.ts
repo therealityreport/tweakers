@@ -804,6 +804,77 @@ test("mode tweakers: an adopted payload without payload.json still takes the fas
   });
 });
 
+test("mode tweakers: same marketing version with a different build cannot use the parked fast path", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", build: "200", asar: "pristine-asar" });
+    makeApp(parkedPayloadApp(root), {
+      version: "26.1.0",
+      build: "100",
+      asar: "patched-stale-asar",
+    });
+    writePayloadMetadata(payloadMetadataFile(root), {
+      schemaVersion: 1,
+      baseVersion: "26.1.0",
+      baseBuild: "100",
+      patchedAsarHash: "patched-hash",
+      parkedAt: "2026-07-13T00:00:00.000Z",
+    });
+    seedState(root, { appRoot: app, mode: "chatgpt", codexVersion: "26.1.0" });
+
+    let installs = 0;
+    const { deps } = makeDeps({
+      installApp: async () => {
+        installs += 1;
+        assert.equal(existsSync(parkedPayloadRoot(root)), false);
+        writeFileSync(appAsar(app), "patched-rebuilt-asar");
+      },
+    });
+
+    await mode("tweakers", { yes: true, app }, deps);
+
+    assert.equal(installs, 1);
+    assert.equal(readFileSync(appAsar(app), "utf8"), "patched-rebuilt-asar");
+  });
+});
+
+test("mode tweakers: malformed parked build preserves both apps and fails closed", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", build: "200", asar: "pristine-asar" });
+    makeApp(parkedPayloadApp(root), {
+      version: "26.1.0",
+      build: "not-a-build",
+      asar: "patched-unknown-asar",
+    });
+    writePayloadMetadata(payloadMetadataFile(root), {
+      schemaVersion: 1,
+      baseVersion: "26.1.0",
+      baseBuild: "not-a-build",
+      patchedAsarHash: "patched-hash",
+      parkedAt: "2026-07-13T00:00:00.000Z",
+    });
+    seedState(root, { appRoot: app, mode: "chatgpt", codexVersion: "26.1.0" });
+
+    const { deps } = makeDeps({
+      installApp: async () => {
+        assert.fail("unknown payload identity must not rebuild over either app");
+      },
+    });
+
+    await assert.rejects(
+      () => mode("tweakers", { yes: true, app }, deps),
+      /could not be compared safely/,
+    );
+
+    assert.equal(readFileSync(appAsar(app), "utf8"), "pristine-asar");
+    assert.equal(
+      readFileSync(appAsar(parkedPayloadApp(root)), "utf8"),
+      "patched-unknown-asar",
+    );
+  });
+});
+
 test("mode tweakers: fast-path backup refresh keeps the previous backup until the staged copy verifies", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");

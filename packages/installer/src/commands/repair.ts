@@ -54,12 +54,25 @@ interface Opts {
   watcher?: boolean;
 }
 
+export interface AsarStatFingerprint {
+  size: number;
+  mtimeMs: number;
+  dev: number;
+  ino: number;
+  ctimeMs: number;
+  headerHash: string;
+}
+
+type AsarStatObservation =
+  Pick<AsarStatFingerprint, "size" | "mtimeMs">
+  & Partial<Omit<AsarStatFingerprint, "size" | "mtimeMs">>;
+
 export interface RepairDependencies {
   install?: typeof install;
   signingAvailable?: typeof signingAvailable;
   notifySigningUnavailable?: () => void;
   // Stat-guard seams (task 5a). Default to the real implementations below.
-  statAsar?: (asarPath: string) => { size: number; mtimeMs: number } | null;
+  statAsar?: (asarPath: string) => AsarStatObservation | null;
   readHeaderHash?: typeof readHeaderHash;
   runtimeAssetsMatch?: typeof runtimeAssetsMatch;
   listProcesses?: typeof listProcesses;
@@ -211,11 +224,7 @@ async function repairWithLifecycle(
     const appRoot = opts.app ?? state.appRoot;
     const asarPath = join(appRoot, "Contents", "Resources", "app.asar");
     const current = statAsar(asarPath);
-    if (
-      current &&
-      current.size === state.patchedAsarStat.size &&
-      current.mtimeMs === state.patchedAsarStat.mtimeMs
-    ) {
+    if (asarFingerprintsMatch(current, state.patchedAsarStat)) {
       const passes = (state.watcherStatGuardPasses ?? 0) + 1;
       const expectedFingerprint = (dependencies.readExpectedRuntimeFingerprint
         ?? (() => readRuntimeFingerprint(packagedRuntimeRoot()))
@@ -805,13 +814,58 @@ function bundleSnapshot(paths: string[]): string {
     .join("|");
 }
 
-function statAsarFile(asarPath: string): { size: number; mtimeMs: number } | null {
+function statAsarFile(asarPath: string): AsarStatFingerprint | null {
   try {
     const st = statSync(asarPath);
-    return { size: st.size, mtimeMs: st.mtimeMs };
+    const { headerHash } = readHeaderHash(asarPath);
+    return {
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      dev: st.dev,
+      ino: st.ino,
+      ctimeMs: st.ctimeMs,
+      headerHash,
+    };
   } catch {
     return null;
   }
+}
+
+function asarFingerprintsMatch(
+  current: AsarStatObservation | null,
+  recorded: unknown,
+): boolean {
+  const left = completeAsarFingerprint(current);
+  const right = completeAsarFingerprint(recorded);
+  return left !== null
+    && right !== null
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.ctimeMs === right.ctimeMs
+    && left.headerHash === right.headerHash;
+}
+
+function completeAsarFingerprint(value: unknown): AsarStatFingerprint | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<AsarStatFingerprint>;
+  if (
+    !isFingerprintNumber(candidate.size)
+    || !isFingerprintNumber(candidate.mtimeMs)
+    || !isFingerprintNumber(candidate.dev)
+    || !isFingerprintNumber(candidate.ino)
+    || !isFingerprintNumber(candidate.ctimeMs)
+    || typeof candidate.headerHash !== "string"
+    || !/^[a-f0-9]{64}$/i.test(candidate.headerHash)
+  ) {
+    return null;
+  }
+  return candidate as AsarStatFingerprint;
+}
+
+function isFingerprintNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function packagedRuntimeRoot(): string {

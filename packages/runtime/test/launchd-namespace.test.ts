@@ -4,14 +4,18 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 const mainSource = readFileSync(resolve("packages/runtime/src/main.ts"), "utf8");
+const launchSource = readFileSync(resolve("packages/runtime/src/installed-cli-launch.ts"), "utf8");
 
 test("launchd patch helpers use the unified namespace and self-remove", () => {
   assert.doesNotMatch(mainSource, /com\.tweaker/);
   assert.match(mainSource, /com\.therealityreport\.tweakers\.patch-helper\./);
 
   const helperBody = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
-  assert.match(helperBody, /trap/);
-  assert.match(helperBody, /launchctl remove/);
+  assert.match(helperBody, /submitInstalledCliWithLaunchd/);
+  assert.match(launchSource, /trap cleanup_transient_launchd_job EXIT/);
+  assert.match(launchSource, /launchctl remove/);
+  assert.match(launchSource, /launchctl bootout/);
+  assert.doesNotMatch(launchSource, /\|\|\s*true/);
 });
 
 test("launchctl submit is reserved for installer CLI helpers", () => {
@@ -20,13 +24,14 @@ test("launchctl submit is reserved for installer CLI helpers", () => {
   const helperBody = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
   const helperBodyStart = mainSource.indexOf("{", helperStart) + 1;
   const helperEnd = helperBodyStart + helperBody.length;
-  // Assert on the actual invocation (`spawnSync("launchctl", ...)`), not the
-  // literal phrase "launchctl submit" — that phrase also appears in a comment
-  // and a log message, which are documentation, not a second submit site.
-  const submitIndexes = [...mainSource.matchAll(/spawnSync\(\s*"launchctl"/g)].map((match) => match.index ?? -1);
+  // The tested helper owns construction of the exact launchctl arguments; the
+  // runtime injects the process boundary here so launch failures are observable.
+  const submitIndexes = [...mainSource.matchAll(/spawnSync\(command, \[\.\.\.submitArgs\], options\)/g)]
+    .map((match) => match.index ?? -1);
 
   assert.equal(submitIndexes.length, 1, "unexpected launchctl invocation outside the installer helper");
   assert.ok(submitIndexes[0] >= helperStart && submitIndexes[0] < helperEnd, "launchctl submit must stay in the installer helper");
+  assert.match(launchSource, /\["submit", "-l", input\.label, "--", "\/bin\/sh", "-c", shellCommand\]/);
 
   const callers = [...mainSource.matchAll(/startInstalledCli\(([^;]*?)\);/g)].map((match) => match[1]);
   assert.ok(callers.length >= 2, "expected at least the update + refresh-local installer CLI helper callers");

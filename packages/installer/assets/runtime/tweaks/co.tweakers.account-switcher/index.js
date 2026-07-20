@@ -5,6 +5,12 @@ const SERVICE_KEY = "__tweakersAccountServiceV1";
 const HANDLER_KEY = "__tweakersAccountHandlerV1";
 const MAX_AUTH_BYTES = 1024 * 1024;
 const INTENT_TTL_MS = 30_000;
+const PROJECTION_LIMITS = Object.freeze({
+  maxBytes: 256 * 1024,
+  maxAccounts: 64,
+  maxEpochs: 512,
+  maxQuotaSnapshots: 512,
+});
 
 module.exports = {
   start(api) {
@@ -25,7 +31,13 @@ module.exports = {
       cleanupRenderer();
     }
   },
-  _test: { validateReferenceName, validateAuthObject, redact, createAccountService, stableRef, authPaths, displayLabelFromAuth, syncActiveSnapshot, accountMenuTargetFromCandidates },
+  _test: {
+    validateReferenceName, validateAuthObject, redact, createAccountService,
+    stableRef, authPaths, displayLabelFromAuth, syncActiveSnapshot,
+    accountMenuTargetFromCandidates, accountKeyFromAuth,
+    readAccountProjection, writeAccountProjection, validateAccountProjection,
+    PROJECTION_LIMITS,
+  },
 };
 
 function startMain(api) {
@@ -50,19 +62,36 @@ function createAccountService(api, options = {}) {
   let disposed = false;
   let queue = Promise.resolve();
 
+  const enqueueIntent = (message) => {
+    const task = () => executeIntent(deps, paths, refs, intents, message, options, api);
+    const result = queue.then(task, task);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  };
   const service = {
     handle(message) {
       if (disposed) return Promise.resolve(safeFailure("unavailable"));
-      if (message?.action === "list") return Promise.resolve(listAccounts(deps, paths, refs));
-      if (message?.action === "prepare-switch") return Promise.resolve(prepareIntent(deps, paths, refs, intents, "switch", message.ref));
-      if (message?.action === "prepare-save") return Promise.resolve(prepareIntent(deps, paths, refs, intents, "save", message.name));
-      if (message?.action === "switch" || message?.action === "save") {
-        const task = () => executeIntent(deps, paths, refs, intents, message, options);
-        const result = queue.then(task, task);
-        queue = result.then(() => undefined, () => undefined);
-        return result;
-      }
+      if (message?.action === "list") return service.list();
+      if (message?.action === "prepare-switch") return service.prepareSwitch(message.ref);
+      if (message?.action === "prepare-save") return service.prepareSave(message.name);
+      if (message?.action === "switch") return service.switch(message.intent);
+      if (message?.action === "save") return service.save(message.intent);
       return Promise.resolve(safeFailure("invalid-request"));
+    },
+    list() { return Promise.resolve(listAccounts(deps, paths, refs)); },
+    prepareSwitch(ref) { return Promise.resolve(prepareIntent(deps, paths, refs, intents, "switch", ref)); },
+    prepareSave(name) { return Promise.resolve(prepareIntent(deps, paths, refs, intents, "save", name)); },
+    switch(intent) { return enqueueIntent({ action: "switch", intent }); },
+    save(intent) { return enqueueIntent({ action: "save", intent }); },
+    observeStartup() {
+      if (disposed) return safeFailure("unavailable");
+      try {
+        reconcileStartupProjection(deps, paths);
+        return { ok: true };
+      } catch (error) {
+        logProjectionFailure(api, "startup-observation-failed", error);
+        return safeFailure("projection-unavailable");
+      }
     },
     dispose() { disposed = true; stopSnapshotSync(); intents.clear(); refs.clear(); },
   };
@@ -73,6 +102,7 @@ function createAccountService(api, options = {}) {
   // (observed 2026-07-13). Keep the active account's snapshot in lockstep
   // with auth.json so switching back always presents current tokens.
   const stopSnapshotSync = startActiveSnapshotSync(deps, paths, api, () => disposed);
+  service.observeStartup();
   return service;
 }
 
@@ -147,6 +177,12 @@ function listAccounts(deps, paths, refs) {
     refs.clear();
     ensureAccountsDirectory(deps.fs, paths.accountsDir, false);
     const current = readCurrentMarker(deps.fs, paths.currentMarker);
+    let liveAccountId = null;
+    try {
+      const live = readSecureAuth(deps.fs, paths.authFile);
+      try { liveAccountId = authAccountId(live.value); }
+      finally { live.bytes.fill(0); }
+    } catch {}
     const accounts = [];
     for (const entry of deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
@@ -161,12 +197,21 @@ function listAccounts(deps, paths, refs) {
         refs.set(opaque, entry.name);
         const auth = readSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, entry.name));
         const label = displayLabelFromAuth(auth.value, name);
+        const savedAccountId = authAccountId(auth.value);
         auth.bytes.fill(0);
-        accounts.push({ ref: opaque, label, active: current.value === entry.name });
+        accounts.push({
+          ref: opaque,
+          label,
+          active: current.value === entry.name
+            && Boolean(liveAccountId)
+            && savedAccountId === liveAccountId,
+        });
       } catch {}
     }
     accounts.sort((a, b) => a.label.localeCompare(b.label));
-    const markerStatus = current.value && !accounts.some((item) => item.active) ? "dangling-reference" : current.status;
+    const markerStatus = current.value && !accounts.some((item) => item.active)
+      ? (accounts.some((item) => refs.get(item.ref) === current.value) ? "identity-mismatch" : "dangling-reference")
+      : current.status;
     return redact({ ok: true, accounts, markerStatus });
   } catch {
     return safeFailure("account-list-unavailable");
@@ -198,14 +243,23 @@ function prepareIntent(deps, paths, refs, intents, action, rawValue) {
   }
 }
 
-async function executeIntent(deps, paths, refs, intents, message, options = {}) {
+async function executeIntent(deps, paths, refs, intents, message, options = {}, api) {
   const intent = intents.get(message.intent);
   intents.delete(message.intent);
   if (!intent || intent.action !== message.action || intent.expiresAt < deps.now()) return safeFailure("invalid-or-expired-intent");
   try {
-    if (intent.action === "switch") switchAccount(deps, paths, intent.target, intent.snapshot);
+    let switchBoundary = null;
+    if (intent.action === "switch") switchBoundary = switchAccount(deps, paths, intent.target, intent.snapshot);
     else saveCurrent(deps, paths, intent.target);
     refs.clear();
+    if (switchBoundary) {
+      try {
+        recordSwitchProjection(deps, paths, { ...switchBoundary, switchedAt: isoNow(deps) });
+      } catch (error) {
+        invalidateUnsafeProjection(deps, paths);
+        logProjectionFailure(api, "projection-update-failed", error);
+      }
+    }
     const restartScheduled = intent.action === "switch" ? options.onSwitched?.() === true : false;
     return { ok: true, action: intent.action, restartScheduled };
   } catch (error) {
@@ -241,6 +295,10 @@ function switchAccount(deps, paths, filename, snapshot) {
   const selected = readSecureAuth(fs, source);
   if (!snapshot || selected.identity !== snapshot.identity || selected.hash !== snapshot.hash) throw coded("source-changed");
   const current = readSecureAuth(fs, paths.authFile);
+  let previousAccountKey = null;
+  let accountKey = null;
+  try { previousAccountKey = accountKeyFromAuth(current.value); } catch {}
+  try { accountKey = accountKeyFromAuth(selected.value); } catch {}
   if (!current.bytes.length) throw coded("no-last-known-good");
   const revalidated = readSecureAuth(fs, source);
   if (selected.identity !== revalidated.identity || selected.hash !== revalidated.hash) throw coded("source-changed");
@@ -250,6 +308,7 @@ function switchAccount(deps, paths, filename, snapshot) {
   let activeSnapshotPath = null;
   let previousActiveSnapshot = null;
   let mutated = false;
+  let completed = false;
   try {
     // Persist the session being left synchronously. The background watcher
     // handles normal token rotation, but this closes the last-second race
@@ -277,6 +336,7 @@ function switchAccount(deps, paths, filename, snapshot) {
     atomicWrite(deps, paths.codexDir, paths.currentMarker, Buffer.from(`${filename}\n`, "utf8"));
     // The fixed LKG rotates only after auth and marker are both durable.
     atomicWrite(deps, paths.codexDir, paths.lkgFile, current.bytes);
+    completed = true;
   } catch (error) {
     if (mutated) {
       try {
@@ -296,6 +356,13 @@ function switchAccount(deps, paths, filename, snapshot) {
     if (Buffer.isBuffer(previousLkg)) previousLkg.fill(0);
     if (Buffer.isBuffer(previousActiveSnapshot)) previousActiveSnapshot.fill(0);
   }
+  if (!completed) throw coded("auth-write-failed");
+  return {
+    previousFilename: active.status === "ok" ? active.value : null,
+    filename,
+    previousAccountKey,
+    accountKey,
+  };
 }
 
 function saveCurrent(deps, paths, name) {
@@ -471,12 +538,15 @@ function authPaths(deps) {
   const codexDir = deps.codexHome && deps.codexHome.trim()
     ? deps.path.resolve(deps.codexHome)
     : deps.path.join(deps.homedir(), ".codex");
+  const projectionDir = deps.path.join(deps.homedir(), "Library", "Application Support", "codex-plusplus");
   return {
     codexDir,
     accountsDir: deps.path.join(codexDir, "auth_accounts"),
     authFile: deps.path.join(codexDir, "auth.json"),
     currentMarker: deps.path.join(codexDir, "current_account"),
     lkgFile: deps.path.join(codexDir, "auth.account-switcher-lkg.json"),
+    projectionDir,
+    projectionFile: deps.path.join(projectionDir, "account-analytics.v1.json"),
   };
 }
 
@@ -495,6 +565,306 @@ function nodeDeps() {
     randomUUID,
     now: Date.now,
   };
+}
+
+function projectionPaths(deps, paths) {
+  if (paths.projectionDir && paths.projectionFile) return paths;
+  const projectionDir = deps.path.join(deps.homedir(), "Library", "Application Support", "codex-plusplus");
+  return { ...paths, projectionDir, projectionFile: deps.path.join(projectionDir, "account-analytics.v1.json") };
+}
+
+function accountKeyFromAuth(value) {
+  const accountId = authAccountId(value);
+  if (!accountId) throw coded("projection-identity-unavailable");
+  return `acct_${stableRef(`openai-account:${accountId}`)}`;
+}
+
+function emptyAccountProjection() {
+  return { version: 1, revision: 0, updatedAt: "1970-01-01T00:00:00.000Z", accounts: [], epochs: [], quotaSnapshots: [] };
+}
+
+function isoNow(deps) {
+  const value = new Date(deps.now()).toISOString();
+  if (!isIsoTimestamp(value)) throw coded("projection-invalid");
+  return value;
+}
+
+function isIsoTimestamp(value) {
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+}
+
+function hasExactKeys(value, keys) {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validAccountKey(value) { return typeof value === "string" && /^acct_[0-9a-f]{32}$/.test(value); }
+function validLabel(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 120
+    && !/[\u0000-\u001f\u007f]/.test(value)
+    && !/(?:\bBearer\s+\S+|\b(?:sk-(?:proj-)?|gh[oprsu]_|xox[baprs]-)[A-Za-z0-9_-]{8,}|(?:^|[\s;])(?:authorization|cookie|set-cookie|access_token|refresh_token|id_token)\s*[:=]|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})/i.test(value);
+}
+
+function validateQuotaWindow(value) {
+  if (!isRecord(value) || Object.keys(value).length > 16) throw coded("projection-invalid");
+  const allowed = new Set(["usedPercent", "remainingPercent", "windowMinutes", "resetsAt", "limit", "remaining", "used"]);
+  for (const [key, item] of Object.entries(value)) {
+    if (!allowed.has(key)) throw coded("projection-invalid");
+    if (key === "resetsAt") {
+      if (item !== null && !isIsoTimestamp(item)) throw coded("projection-invalid");
+    } else if (item !== null && (typeof item !== "number" || !Number.isFinite(item) || item < 0)) {
+      throw coded("projection-invalid");
+    }
+  }
+  return true;
+}
+
+function validateAccountProjection(value) {
+  if (!hasExactKeys(value, ["version", "revision", "updatedAt", "accounts", "epochs", "quotaSnapshots"])) throw coded("projection-invalid");
+  if (value.version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 0 || !isIsoTimestamp(value.updatedAt)) throw coded("projection-invalid");
+  if (!Array.isArray(value.accounts) || value.accounts.length > PROJECTION_LIMITS.maxAccounts) throw coded("projection-invalid");
+  if (!Array.isArray(value.epochs) || value.epochs.length > PROJECTION_LIMITS.maxEpochs) throw coded("projection-invalid");
+  if (!Array.isArray(value.quotaSnapshots) || value.quotaSnapshots.length > PROJECTION_LIMITS.maxQuotaSnapshots) throw coded("projection-invalid");
+  const accountKeys = new Set();
+  let activeCount = 0;
+  for (const account of value.accounts) {
+    if (!hasExactKeys(account, ["accountKey", "label", "active"]) || !validAccountKey(account.accountKey) || !validLabel(account.label) || typeof account.active !== "boolean") throw coded("projection-invalid");
+    if (accountKeys.has(account.accountKey)) throw coded("projection-invalid");
+    accountKeys.add(account.accountKey);
+    if (account.active) activeCount += 1;
+  }
+  if (activeCount > 1) throw coded("projection-invalid");
+  for (const epoch of value.epochs) {
+    if (!hasExactKeys(epoch, ["accountKey", "startedAt", "endedAt", "source"]) || !validAccountKey(epoch.accountKey) || !isIsoTimestamp(epoch.startedAt)) throw coded("projection-invalid");
+    if (!accountKeys.has(epoch.accountKey)) throw coded("projection-invalid");
+    if (epoch.endedAt !== null && (!isIsoTimestamp(epoch.endedAt) || epoch.endedAt < epoch.startedAt)) throw coded("projection-invalid");
+    if (!new Set(["confirmed-switch", "startup-observation"]).has(epoch.source)) throw coded("projection-invalid");
+  }
+  for (const snapshot of value.quotaSnapshots) {
+    if (!hasExactKeys(snapshot, ["accountKey", "capturedAt", "planType", "primary", "secondary"])) throw coded("projection-invalid");
+    if (!validAccountKey(snapshot.accountKey) || !isIsoTimestamp(snapshot.capturedAt) || typeof snapshot.planType !== "string" || !/^[a-z0-9][a-z0-9._-]{0,31}$/.test(snapshot.planType)) throw coded("projection-invalid");
+    if (!accountKeys.has(snapshot.accountKey)) throw coded("projection-invalid");
+    validateQuotaWindow(snapshot.primary);
+    validateQuotaWindow(snapshot.secondary);
+  }
+  return true;
+}
+
+function assertTrustedProjectionDirectory(deps, dir, create) {
+  const fs = deps.fs;
+  const path = deps.path;
+  const home = path.resolve(deps.homedir());
+  const target = path.resolve(dir);
+  const relative = path.relative(home, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw coded("projection-untrusted");
+  let current = home;
+  assertOwnedDirectory(fs, current);
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    if (!fs.existsSync(current)) {
+      if (!create) throw coded("projection-missing");
+      fs.mkdirSync(current, { mode: 0o700 });
+    }
+    assertOwnedDirectory(fs, current);
+  }
+}
+
+function assertOwnedDirectory(fs, dir) {
+  const stat = fs.lstatSync(dir);
+  const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0) throw coded("projection-untrusted");
+}
+
+function readAccountProjection(deps, rawPaths) {
+  const paths = projectionPaths(deps, rawPaths);
+  const initialStat = lstatIfPresent(deps.fs, paths.projectionFile);
+  if (!initialStat) return emptyAccountProjection();
+  if (initialStat.isSymbolicLink()) throw coded("projection-invalid");
+  assertTrustedProjectionDirectory(deps, paths.projectionDir, false);
+  let fd;
+  try {
+    fd = deps.fs.openSync(paths.projectionFile, deps.fs.constants.O_RDONLY | (deps.fs.constants.O_NOFOLLOW || 0));
+    const stat = deps.fs.fstatSync(fd);
+    const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+    if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== uid || (stat.mode & 0o077) !== 0 || stat.size <= 0 || stat.size > PROJECTION_LIMITS.maxBytes) throw coded("projection-invalid");
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = deps.fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (!count) break;
+      offset += count;
+    }
+    if (offset !== bytes.length) throw coded("projection-invalid");
+    const value = JSON.parse(bytes.toString("utf8"));
+    validateAccountProjection(value);
+    return value;
+  } catch (error) {
+    if (error?.code === "projection-invalid" || error?.code === "projection-untrusted") throw error;
+    throw coded("projection-invalid");
+  } finally {
+    if (fd !== undefined) deps.fs.closeSync(fd);
+  }
+}
+
+function writeAccountProjection(deps, rawPaths, value) {
+  const paths = projectionPaths(deps, rawPaths);
+  validateAccountProjection(value);
+  const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  if (bytes.length > PROJECTION_LIMITS.maxBytes) throw coded("projection-invalid");
+  assertTrustedProjectionDirectory(deps, paths.projectionDir, true);
+  {
+    const stat = lstatIfPresent(deps.fs, paths.projectionFile);
+    if (stat) {
+      const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== uid || (stat.mode & 0o077) !== 0) throw coded("projection-invalid");
+    }
+  }
+  const tmp = `${paths.projectionFile}.tmp-${deps.randomUUID()}`;
+  let fd;
+  try {
+    fd = deps.fs.openSync(tmp, deps.fs.constants.O_CREAT | deps.fs.constants.O_EXCL | deps.fs.constants.O_WRONLY, 0o600);
+    deps.fs.writeFileSync(fd, bytes);
+    deps.fs.fsyncSync(fd);
+    deps.fs.closeSync(fd); fd = undefined;
+    deps.fs.renameSync(tmp, paths.projectionFile);
+    deps.fs.chmodSync(paths.projectionFile, 0o600);
+    fsyncDirectory(deps.fs, paths.projectionDir);
+  } catch {
+    throw coded("projection-write-failed");
+  } finally {
+    if (fd !== undefined) deps.fs.closeSync(fd);
+    try { deps.fs.unlinkSync(tmp); } catch {}
+    bytes.fill(0);
+  }
+}
+
+function discoverProjectionAccounts(deps, paths) {
+  ensureAccountsDirectory(deps.fs, paths.accountsDir, false);
+  assertTrustedDirectory(deps.fs, paths.accountsDir);
+  const marker = readCurrentMarker(deps.fs, paths.currentMarker);
+  let liveAccountKey = null;
+  try {
+    const live = readSecureAuth(deps.fs, paths.authFile);
+    try { liveAccountKey = accountKeyFromAuth(live.value); }
+    finally { live.bytes.fill(0); }
+  } catch {}
+  const accountsByKey = new Map();
+  for (const entry of deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    try {
+      const saved = readSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, entry.name));
+      let candidate;
+      try {
+        const accountKey = accountKeyFromAuth(saved.value);
+        candidate = {
+          accountKey,
+          label: displayLabelFromAuth(saved.value, entry.name.slice(0, -5)),
+          active: marker.status === "ok" && marker.value === entry.name && accountKey === liveAccountKey,
+        };
+      } finally {
+        saved.bytes.fill(0);
+      }
+      const existing = accountsByKey.get(candidate.accountKey);
+      if (!existing) {
+        accountsByKey.set(candidate.accountKey, candidate);
+      } else {
+        existing.active = existing.active || candidate.active;
+        if (candidate.active || (!existing.active && candidate.label.localeCompare(existing.label) < 0)) {
+          existing.label = candidate.label;
+        }
+      }
+    } catch {}
+  }
+  const accounts = [...accountsByKey.values()];
+  accounts.sort((a, b) => Number(b.active) - Number(a.active) || a.label.localeCompare(b.label) || a.accountKey.localeCompare(b.accountKey));
+  return { accounts };
+}
+
+function updateProjection(deps, paths, mutate) {
+  const previous = readAccountProjection(deps, paths);
+  const next = JSON.parse(JSON.stringify(previous));
+  mutate(next);
+  next.version = 1;
+  next.revision = previous.revision + 1;
+  next.updatedAt = isoNow(deps);
+  const accountKeys = new Set(next.accounts.map((account) => account.accountKey));
+  next.epochs = next.epochs.filter((epoch) => accountKeys.has(epoch.accountKey)).slice(-PROJECTION_LIMITS.maxEpochs);
+  next.quotaSnapshots = next.quotaSnapshots.filter((snapshot) => accountKeys.has(snapshot.accountKey)).slice(-PROJECTION_LIMITS.maxQuotaSnapshots);
+  validateAccountProjection(next);
+  writeAccountProjection(deps, paths, next);
+  return next;
+}
+
+function mergeProjectionAccounts(previous, discovered) {
+  const currentKeys = new Set(discovered.map((account) => account.accountKey));
+  const retained = previous.filter((account) => !currentKeys.has(account.accountKey)).map((account) => ({ ...account, active: false }));
+  return [...discovered, ...retained]
+    .slice(0, PROJECTION_LIMITS.maxAccounts)
+    .sort((a, b) => Number(b.active) - Number(a.active) || a.label.localeCompare(b.label) || a.accountKey.localeCompare(b.accountKey));
+}
+
+function reconcileStartupProjection(deps, rawPaths) {
+  const paths = projectionPaths(deps, rawPaths);
+  const observedAt = isoNow(deps);
+  const discovered = discoverProjectionAccounts(deps, paths);
+  return updateProjection(deps, paths, (next) => {
+    next.accounts = mergeProjectionAccounts(next.accounts, discovered.accounts);
+    const active = discovered.accounts.find((account) => account.active);
+    const retained = next.epochs.filter((epoch) => epoch.endedAt !== null || (active && epoch.accountKey === active.accountKey));
+    const hasOpenActive = active && retained.some((epoch) => epoch.accountKey === active.accountKey && epoch.endedAt === null);
+    next.epochs = retained;
+    if (active && !hasOpenActive) next.epochs.push({ accountKey: active.accountKey, startedAt: observedAt, endedAt: null, source: "startup-observation" });
+  });
+}
+
+function recordSwitchProjection(deps, rawPaths, boundary) {
+  const paths = projectionPaths(deps, rawPaths);
+  const discovered = discoverProjectionAccounts(deps, paths);
+  const targetKey = boundary.accountKey;
+  const previousKey = boundary.previousAccountKey;
+  if (!targetKey || !discovered.accounts.some((account) => account.accountKey === targetKey)) {
+    throw coded("projection-identity-unavailable");
+  }
+  return updateProjection(deps, paths, (next) => {
+    next.accounts = mergeProjectionAccounts(next.accounts, discovered.accounts);
+    next.epochs = next.epochs.flatMap((epoch) => {
+      if (epoch.endedAt !== null) return [epoch];
+      if (previousKey && epoch.accountKey === previousKey) return [{ ...epoch, endedAt: boundary.switchedAt }];
+      return [];
+    });
+    next.epochs.push({ accountKey: targetKey, startedAt: boundary.switchedAt, endedAt: null, source: "confirmed-switch" });
+  });
+}
+
+function invalidateUnsafeProjection(deps, rawPaths) {
+  const paths = projectionPaths(deps, rawPaths);
+  try {
+    assertTrustedProjectionDirectory(deps, paths.projectionDir, false);
+    const stat = lstatIfPresent(deps.fs, paths.projectionFile);
+    if (!stat) return;
+    const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== uid || (stat.mode & 0o077) !== 0) return;
+    deps.fs.unlinkSync(paths.projectionFile);
+    fsyncDirectory(deps.fs, paths.projectionDir);
+  } catch { /* a rejected projection remains unreadable to a conforming consumer */ }
+}
+
+function lstatIfPresent(fs, file) {
+  try { return fs.lstatSync(file); }
+  catch (error) { if (error?.code === "ENOENT") return null; throw error; }
+}
+
+function logProjectionFailure(api, operation, error) {
+  const code = error?.code === "projection-invalid" || error?.code === "projection-untrusted" || error?.code === "projection-write-failed"
+    ? error.code
+    : "projection-unavailable";
+  api?.log?.warn?.("account analytics projection unavailable", `${operation}:${code}`);
 }
 
 function startRenderer(api) {
@@ -715,18 +1085,31 @@ function hasDirectAccountSwitcherPanel(menu) {
 }
 function uniqueElements(elements) { return [...new Set(elements)].filter(Boolean); }
 function displayLabelFromAuth(value, fallback) {
-  const direct = [value?.user?.name, value?.user?.email, value?.account?.name, value?.account?.email, value?.email, value?.name]
+  const directEmail = [value?.user?.email, value?.account?.email, value?.email]
     .find((item) => typeof item === "string" && item.trim());
-  if (direct) return direct.trim().slice(0, 120);
+  if (directEmail) {
+    const label = directEmail.trim().slice(0, 120);
+    if (validLabel(label)) return label;
+  }
+  const directName = [value?.user?.name, value?.account?.name, value?.name]
+    .find((item) => typeof item === "string" && item.trim());
   const token = value?.tokens?.id_token;
   if (typeof token === "string") {
     try {
       const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-      const claim = [claims.name, claims.preferred_username, claims.email].find((item) => typeof item === "string" && item.trim());
-      if (claim) return claim.trim().slice(0, 120);
+      const claim = [claims.email, claims.preferred_username, claims.name].find((item) => typeof item === "string" && item.trim());
+      if (claim) {
+        const label = claim.trim().slice(0, 120);
+        if (validLabel(label)) return label;
+      }
     } catch {}
   }
-  return String(fallback || "Saved account").slice(0, 120);
+  if (directName) {
+    const label = directName.trim().slice(0, 120);
+    if (validLabel(label)) return label;
+  }
+  const fallbackLabel = String(fallback || "Saved account").slice(0, 120);
+  return validLabel(fallbackLabel) ? fallbackLabel : "Saved account";
 }
 function safeFailure(code) { return { ok: false, error: { code, message: "The account request could not be completed safely." } }; }
 function coded(code) { const error = new Error(code); error.code = code; return error; }

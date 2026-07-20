@@ -143,6 +143,7 @@ export interface CodexVersionsSnapshot {
   fromCache: boolean;
   stale: boolean;
   desktop: CodexDesktopVersionState;
+  terminalCli: CodexCliVersionState;
   activeCli: CodexActiveCliVersionState;
   cli: Record<CodexCliLane, CodexCliVersionState>;
   requestedLane: CodexCliLane | null;

@@ -11,6 +11,7 @@ import {
 } from "../src/environment-profile";
 import type { EnvironmentTransactionReceipt } from "../src/environment-transaction";
 import type { DesktopUpdateReceipt } from "../src/desktop-update-transaction";
+import { desktopReceiptBlocksLifecycle } from "../src/desktop-update-state";
 import {
   assertLifecycleReceiptsIdle,
   lifecycleLockFile,
@@ -79,6 +80,59 @@ function desktopReceipt(overrides: Partial<DesktopUpdateReceipt> = {}): DesktopU
     ...overrides,
   };
 }
+
+test("one desktop receipt table drives lifecycle blocking", () => {
+  const cases: Array<{
+    name: string;
+    receipt: DesktopUpdateReceipt;
+    blocks: boolean;
+  }> = [
+    {
+      name: "active phase",
+      receipt: desktopReceipt({ phase: "awaiting_native_update", resumable: true }),
+      blocks: true,
+    },
+    {
+      name: "completed",
+      receipt: desktopReceipt({ phase: "completed", safeOfficialMode: false }),
+      blocks: false,
+    },
+    {
+      name: "resumable rollback",
+      receipt: desktopReceipt({ phase: "rolled_back", resumable: true }),
+      blocks: true,
+    },
+    {
+      name: "terminal rollback",
+      receipt: desktopReceipt({ phase: "rolled_back", resumable: false }),
+      blocks: false,
+    },
+    {
+      name: "safe terminal cancellation",
+      receipt: desktopReceipt({ phase: "failed", safeOfficialMode: true, resumable: false }),
+      blocks: false,
+    },
+    {
+      name: "unsafe failure",
+      receipt: desktopReceipt({ phase: "failed", safeOfficialMode: false, resumable: false }),
+      blocks: true,
+    },
+    {
+      name: "rollback failure",
+      receipt: desktopReceipt({
+        phase: "failed",
+        safeOfficialMode: true,
+        resumable: false,
+        error: "refresh failed; rollback failed: app reopen failed",
+      }),
+      blocks: true,
+    },
+  ];
+
+  for (const entry of cases) {
+    assert.equal(desktopReceiptBlocksLifecycle(entry.receipt), entry.blocks, entry.name);
+  }
+});
 
 test("one lifecycle lock excludes unrelated same-process work while allowing nested owned work", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-lifecycle-lock-"));

@@ -2,6 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ConfigCardUpdateCoordinator = void 0;
 exports.createEnvironmentConfigController = createEnvironmentConfigController;
+exports.humanizeCodexPhase = humanizeCodexPhase;
+exports.desktopUpdatePresentation = desktopUpdatePresentation;
 exports.desktopUpdateStatusPresentation = desktopUpdateStatusPresentation;
 exports.restoreEnvironmentFocus = restoreEnvironmentFocus;
 function createEnvironmentConfigController(selected, effects, options = {}) {
@@ -160,6 +162,48 @@ function sameSelection(left, right) {
 }
 function environmentConfigError(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
+}
+function humanizeCodexPhase(value) {
+    return value.replace(/[-_]/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+function desktopUpdatePresentation(input) {
+    const { busy, status, transaction } = input;
+    const phase = transaction?.phase ?? null;
+    const resumable = transaction?.resumable === true;
+    const inactive = phase === null || phase === "idle";
+    const terminal = phase === "completed" || phase === "failed" || phase === "rolled_back";
+    const unsafeFailure = phase === "failed" && transaction?.safeOfficialMode !== true;
+    const blocksLifecycle = transaction?.blocksLifecycle
+        ?? (!terminal
+            || resumable
+            || (phase === "failed"
+                && (transaction?.safeOfficialMode !== true
+                    || /\brollback failed\b/i.test(transaction?.error ?? ""))));
+    const retryableUnsafeRecovery = unsafeFailure
+        && typeof transaction?.environmentTransactionId === "string";
+    const actions = [];
+    if (resumable && (phase === "failed" || phase === "rolled_back")) {
+        actions.push({ kind: "resume", label: "Resume", disabled: busy });
+    }
+    if (phase === "awaiting_native_update"
+        || (resumable && (phase === "failed" || phase === "rolled_back"))
+        || retryableUnsafeRecovery) {
+        actions.push({ kind: "cancel", label: "Cancel", disabled: busy });
+    }
+    return {
+        phaseLabel: phase === null ? null : humanizeCodexPhase(phase),
+        tone: phase === null
+            ? null
+            : phase === "completed"
+                ? "ok"
+                : phase === "failed" && !resumable
+                    ? "error"
+                    : "warn",
+        actions,
+        updateDisabled: busy
+            || status !== "update-available"
+            || (!inactive && blocksLifecycle),
+    };
 }
 function desktopUpdateStatusPresentation(status) {
     switch (status) {

@@ -7,6 +7,7 @@ import { repair } from "./commands/repair.js";
 import {
   cancelCodexUpdate,
   codexUpdateStatus,
+  reconcileCodexUpdate,
   resumeCodexUpdate,
   updateCodex,
 } from "./commands/update-codex.js";
@@ -226,6 +227,13 @@ prog
   .option("--app", "Path to Codex.app / install dir")
   .option("--json", "Print the schema-v1 transaction receipt as JSON")
   .action(wrap(resumeCodexUpdate));
+
+prog
+  .command("update-chatgpt-reconcile")
+  .describe("Reconcile an interrupted desktop update without relaunching ChatGPT")
+  .option("--app", "Path to Codex.app / install dir")
+  .option("--json", "Print the transaction receipt or explicit idle result as JSON")
+  .action(wrap(reconcileCodexUpdate));
 
 prog
   .command("update-chatgpt-cancel")

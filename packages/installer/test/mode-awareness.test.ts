@@ -10,6 +10,7 @@ import { cleanupModeArtifacts, shouldSkipRestoreForChatgptMode } from "../src/co
 import {
   cancelCodexUpdate,
   codexUpdateStatus,
+  reconcileCodexUpdate,
   resumeCodexUpdate,
   updateCodex,
 } from "../src/commands/update-codex";
@@ -513,7 +514,7 @@ test("uninstall wires the mode cleanup and switcher removal", () => {
 /* update-chatgpt guards                                                     */
 /* ------------------------------------------------------------------------- */
 
-test("update-chatgpt start/status/resume/cancel delegate to one durable transaction contract", async () => {
+test("update-chatgpt start/status/resume/reconcile/cancel delegate to one durable transaction contract", async () => {
   const calls: string[] = [];
   const receipt = {
     schemaVersion: 1,
@@ -525,6 +526,7 @@ test("update-chatgpt start/status/resume/cancel delegate to one durable transact
     start: async () => { calls.push("start"); return receipt; },
     status: () => { calls.push("status"); return receipt; },
     resume: async () => { calls.push("resume"); return { ...receipt, phase: "completed" }; },
+    reconcile: async () => { calls.push("reconcile"); return { ...receipt, phase: "completed" }; },
     cancel: async () => { calls.push("cancel"); return { ...receipt, phase: "failed" }; },
   };
   const output: string[] = [];
@@ -536,9 +538,34 @@ test("update-chatgpt start/status/resume/cancel delegate to one durable transact
   assert.equal((await updateCodex({ json: true }, deps)).transactionId, "desktop-1");
   assert.equal(codexUpdateStatus({ json: true }, deps)?.phase, "awaiting_native_update");
   assert.equal((await resumeCodexUpdate({ json: true }, deps)).phase, "completed");
+  assert.equal((await reconcileCodexUpdate({ json: true }, deps))?.phase, "completed");
   assert.equal((await cancelCodexUpdate({ json: true }, deps)).phase, "failed");
-  assert.deepEqual(calls, ["start", "status", "resume", "cancel"]);
-  assert.deepEqual(output.map((line) => JSON.parse(line).schemaVersion), [1, 1, 1, 1]);
+  assert.deepEqual(calls, ["start", "status", "resume", "reconcile", "cancel"]);
+  assert.deepEqual(output.map((line) => JSON.parse(line).schemaVersion), [1, 1, 1, 1, 1]);
+  assert.deepEqual(
+    output.map((line) => JSON.parse(line).blocksLifecycle),
+    [true, true, false, false, true],
+  );
+});
+
+test("update-chatgpt reconcile prints the explicit idle JSON contract when there is no receipt", async () => {
+  const output: string[] = [];
+  const transaction = {
+    reconcile: async () => null,
+  } as DesktopUpdateTransaction;
+
+  const receipt = await reconcileCodexUpdate(
+    { json: true },
+    {
+      createTransaction: () => transaction,
+      print: (line) => { output.push(line); },
+    },
+  );
+
+  assert.equal(receipt, null);
+  assert.deepEqual(output.map((line) => JSON.parse(line)), [
+    { transactionId: null, phase: "idle" },
+  ]);
 });
 
 test("update-chatgpt threads the exact --app option into its default transaction factory", () => {

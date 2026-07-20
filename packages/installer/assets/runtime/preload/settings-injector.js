@@ -1755,7 +1755,7 @@ function environmentTransactionLabel(phase) {
         case "rolling-back":
             return "Rolling back";
         default:
-            return humanizeCodexPhase(phase);
+            return (0, environment_config_controller_1.humanizeCodexPhase)(phase);
     }
 }
 function environmentTransactionTone(phase) {
@@ -1941,6 +1941,11 @@ function renderDesktopUpdateSection(sectionsWrap, cardUpdates) {
         const installed = result?.installed?.marketingVersion ?? "Unavailable";
         const latest = result?.latest?.marketingVersion ?? "Unavailable";
         const status = (0, environment_config_controller_1.desktopUpdateStatusPresentation)(result?.status);
+        const presentation = (0, environment_config_controller_1.desktopUpdatePresentation)({
+            busy,
+            status: result?.status,
+            transaction,
+        });
         const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
         const left = row.firstElementChild;
         left?.prepend(statusBadge(status.tone, status.label));
@@ -1979,10 +1984,7 @@ function renderDesktopUpdateSection(sectionsWrap, cardUpdates) {
                 .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
                 .finally(() => { busy = false; draw(); });
         });
-        update.disabled = busy
-            || result?.status !== "update-available"
-            || transactionIsActive()
-            || transaction?.resumable === true;
+        update.disabled = presentation.updateDisabled;
         actions?.appendChild(update);
         card.appendChild(row);
         if (result?.setupRequired) {
@@ -1994,7 +1996,7 @@ function renderDesktopUpdateSection(sectionsWrap, cardUpdates) {
         if (result?.checkedAt)
             card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
         if (transaction)
-            card.appendChild(desktopUpdateTransactionRow(transaction, {
+            card.appendChild(desktopUpdateTransactionRow(transaction, presentation, {
                 busy,
                 onResume: () => {
                     if (busy)
@@ -2088,8 +2090,7 @@ function normalizeDesktopUpdateTransaction(value) {
         phase: candidate.phase,
     };
 }
-function desktopUpdateTransactionRow(transaction, actions) {
-    const phase = humanizeCodexPhase(transaction.phase);
+function desktopUpdateTransactionRow(transaction, presentation, actions) {
     const detail = [
         transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
         transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
@@ -2100,26 +2101,15 @@ function desktopUpdateTransactionRow(transaction, actions) {
     row.setAttribute("role", "status");
     row.setAttribute("aria-live", "polite");
     const left = row.firstElementChild;
-    const tone = transaction.phase === "completed"
-        ? "ok"
-        : transaction.phase === "failed" && !transaction.resumable
-            ? "error"
-            : "warn";
-    left?.prepend(statusBadge(tone, phase));
-    const controls = row.querySelector("[data-tweaker-row-actions]");
-    const canResume = transaction.resumable === true
-        && (transaction.phase === "failed" || transaction.phase === "rolled_back");
-    const canCancel = transaction.phase === "awaiting_native_update"
-        || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase));
-    if (canResume) {
-        const resume = compactButton("Resume", actions.onResume);
-        resume.disabled = actions.busy;
-        controls?.appendChild(resume);
+    if (presentation.tone && presentation.phaseLabel) {
+        left?.prepend(statusBadge(presentation.tone, presentation.phaseLabel));
     }
-    if (canCancel) {
-        const cancel = compactButton("Cancel", actions.onCancel);
-        cancel.disabled = actions.busy;
-        controls?.appendChild(cancel);
+    const controls = row.querySelector("[data-tweaker-row-actions]");
+    for (const action of presentation.actions) {
+        const handler = action.kind === "resume" ? actions.onResume : actions.onCancel;
+        const button = compactButton(action.label, handler);
+        button.disabled = action.disabled;
+        controls?.appendChild(button);
     }
     return row;
 }
@@ -2148,7 +2138,7 @@ function renderMcpIntegrationSection(sectionsWrap, cardUpdates) {
                 : "ok";
         const row = actionRow("MCP integration", state.summary ?? state.error ?? (tone === "ok" ? "MCP configuration is synchronized." : "MCP configuration needs attention."));
         const left = row.firstElementChild;
-        left?.prepend(statusBadge(tone, status === "ok" ? "Healthy" : humanizeCodexPhase(status)));
+        left?.prepend(statusBadge(tone, status === "ok" ? "Healthy" : (0, environment_config_controller_1.humanizeCodexPhase)(status)));
         const actions = row.querySelector("[data-tweaker-row-actions]");
         const repair = compactButton("Repair", () => {
             repair.disabled = true;
@@ -2439,6 +2429,7 @@ function renderCodexVersionsCard(card, snapshot, reload) {
         const checked = new Date(snapshot.checkedAt).toLocaleString();
         card.appendChild(rowSimple(snapshot.stale ? "Cached information (refresh needed)" : "Cached information", `Showing the last known good result from ${checked} while current information loads.`));
     }
+    card.appendChild(codexVersionSurfaceOverview(snapshot));
     card.appendChild(codexActiveCliRow(snapshot));
     card.appendChild(codexEmbeddedCliRow(bundled, snapshot));
     card.appendChild(codexLatestStableReleaseRow(bundled));
@@ -2451,13 +2442,55 @@ function renderCodexVersionsCard(card, snapshot, reload) {
     if (snapshot.installProgress && snapshot.installProgress.phase && snapshot.installProgress.phase !== "idle") {
         const p = snapshot.installProgress;
         const amount = formatBytes(p.bytes);
-        const detail = p.error || [humanizeCodexPhase(p.phase), p.version, amount].filter(Boolean).join(" · ");
+        const detail = p.error || [(0, environment_config_controller_1.humanizeCodexPhase)(p.phase), p.version, amount].filter(Boolean).join(" · ");
         card.appendChild(rowSimple("Alpha operation", detail));
     }
     const stateMessage = codexRuntimeMessage(snapshot);
     if (stateMessage)
         card.appendChild(rowSimple("Runtime status", stateMessage));
     card.appendChild(codexFeatureBrowser(snapshot, busy, reload));
+}
+function codexVersionSurfaceOverview(snapshot) {
+    const stable = snapshot.cli.bundled.release?.version ?? "Not checked";
+    const prerelease = snapshot.cli.beta.release?.version ?? "Not checked";
+    const desktopPrerelease = snapshot.cli.bundled.versionChannel === "prerelease"
+        ? snapshot.cli.bundled.version ?? "Not checked"
+        : "Not included in this desktop release";
+    const overview = document.createElement("div");
+    overview.className = "grid grid-cols-1 gap-3 p-3 md:grid-cols-2";
+    overview.dataset.tweakerCodexVersionOverview = "true";
+    overview.append(codexVersionSurfaceSummary("Terminal", [
+        ["Latest Release", stable],
+        ["Latest Pre-Release", prerelease],
+        ["Current", snapshot.terminalCli.version ?? "Not installed"],
+    ]), codexVersionSurfaceSummary("Desktop macOS", [
+        ["Latest Release", stable],
+        ["Latest Pre-Release", desktopPrerelease],
+        ["Current", snapshot.activeCli.version ?? "Unavailable"],
+    ]));
+    return overview;
+}
+function codexVersionSurfaceSummary(titleText, metrics) {
+    const surface = document.createElement("div");
+    surface.className = "border-token-border flex min-w-0 flex-col gap-2 rounded-lg border p-3";
+    const title = document.createElement("div");
+    title.className = "text-sm font-semibold text-token-text-primary";
+    title.textContent = titleText;
+    surface.appendChild(title);
+    for (const [label, value] of metrics) {
+        const metric = document.createElement("div");
+        metric.className = "flex min-w-0 items-baseline justify-between gap-3";
+        const key = document.createElement("span");
+        key.className = "text-token-text-secondary text-xs";
+        key.textContent = label;
+        const version = document.createElement("span");
+        version.className = "min-w-0 truncate text-right font-mono text-sm text-token-text-primary";
+        version.textContent = value;
+        version.title = value;
+        metric.append(key, version);
+        surface.appendChild(metric);
+    }
+    return surface;
 }
 function codexActiveCliRow(snapshot) {
     const active = snapshot.activeCli;
@@ -2676,7 +2709,7 @@ function codexFilterSelect(label, options) {
     for (const value of options) {
         const option = document.createElement("option");
         option.value = value;
-        option.textContent = value === "all" ? `All ${label.toLowerCase()}s` : humanizeCodexPhase(value);
+        option.textContent = value === "all" ? `All ${label.toLowerCase()}s` : (0, environment_config_controller_1.humanizeCodexPhase)(value);
         select.appendChild(option);
     }
     return select;
@@ -2769,9 +2802,6 @@ function runCodexAction(row, channel, payload, reload) {
 }
 function safeUiError(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
-}
-function humanizeCodexPhase(value) {
-    return value.replace(/-/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 function formatBytes(value) {
     if (value < 1024)

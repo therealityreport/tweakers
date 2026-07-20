@@ -125,6 +125,9 @@ Runtime flow:
 | `tweaker repair` | Re-apply the patch after an app update or broken install. |
 | `tweaker update` | Install the latest published Tweakers release; keep the managed runtime unchanged when no release exists. |
 | `tweaker update-chatgpt` | Confirm official updates in ChatGPT mode, or show the required mode-switch steps in Tweakers mode. |
+| `tweaker update-chatgpt-resume` | Continue a safely paused desktop-update transaction. |
+| `tweaker update-chatgpt-cancel` | End a paused transaction while preserving the proved safe app state. |
+| `tweaker update-chatgpt-reconcile` | Reconcile an exited updater owner without relaunching the app. |
 | `tweaker update-codex` | Compatibility alias for `update-chatgpt`. |
 | `tweaker doctor` | Diagnose signatures, integrity, permissions, and common failures. |
 | `tweaker safe-mode` | Disable all tweaks without deleting them. |
@@ -309,16 +312,43 @@ tweaker update
 There is currently no published GitHub release. Until one exists, `update`
 reports that state and keeps the installed managed runtime unchanged.
 
-Check the official ChatGPT updater state on macOS:
+Use **Update and Reload** in Tweakers Settings to run an official ChatGPT
+desktop update on macOS. The operation is durable:
+
+1. Tweakers records the current desktop version and safely enters the pristine,
+   OpenAI-signed ChatGPT environment.
+2. The native updater installs the official update while Tweakers records
+   ownership and heartbeat evidence.
+3. After the version and build advance, Tweakers returns to the requested
+   environment, refreshes the runtime, and verifies the reopened app.
+
+If the owner exits, startup reconciliation classifies the durable receipt
+without relaunching the app. Settings offers **Resume** only when current
+official-app proof says continuation is safe, and **Cancel** when it can end
+the transaction without guessing. The equivalent commands are:
 
 ```sh
-tweaker update-chatgpt
+tweaker update-chatgpt-resume
+tweaker update-chatgpt-cancel
+tweaker update-chatgpt-reconcile --json
 ```
 
-In ChatGPT mode this is intentionally a no-op because the official updater
-already owns updates. In Tweakers mode it refuses and directs you through
-`tweaker mode chatgpt`, the official update, and `tweaker mode tweakers`.
-`update-codex` remains a compatibility alias.
+Updater evidence lives under the Tweakers user-data directory:
+
+- Current receipt: `transactions/desktop-update.json`
+- Receipt archive: `transactions/desktop-update/`
+- Heartbeat: `transactions/desktop-update.heartbeat.json`
+- Redacted event log: `log/desktop-update.log`
+
+While a receipt is blocking, the watcher records a deferred cycle and performs
+no update or repair mutation. `tweaker status`, `tweaker debug`, and
+`tweaker doctor` expose the phase, safety, resumability, staleness, and evidence
+paths.
+
+Building and verifying this source checkout does not replace the installed
+managed runtime. Promotion and any ChatGPT restart are a separate final action
+that occurs only through the validated refresh flow with explicit user
+confirmation.
 
 Repair Tweaker:
 

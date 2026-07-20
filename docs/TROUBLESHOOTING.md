@@ -41,6 +41,25 @@ systemctl --user status tweaker-watcher  # Linux
 schtasks /Query /TN tweaker-watcher       # Windows
 ```
 
+If a desktop update is paused or the updater owner exited, do not force repair
+over its durable receipt. Inspect it first:
+
+```sh
+tweaker status
+tweaker doctor
+tweaker debug
+tweaker update-chatgpt-reconcile --json
+```
+
+The current receipt is
+`<user-data-dir>/transactions/desktop-update.json`; archived receipts are in
+`transactions/desktop-update/`, the heartbeat is
+`transactions/desktop-update.heartbeat.json`, and the redacted event log is
+`log/desktop-update.log`. A blocking receipt deliberately makes the watcher
+stand down. Use **Resume** in Settings (or `tweaker update-chatgpt-resume`) only
+when offered. Use **Cancel** (or `tweaker update-chatgpt-cancel`) to end a safe
+paused transaction.
+
 ## macOS keeps asking: ChatGPT wants to access key "Codex Storage Key"
 
 The "Codex Storage Key" keychain item is Electron's `safeStorage` encryption

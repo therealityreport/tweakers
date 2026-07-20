@@ -11,6 +11,7 @@ import { inspectChromeBridge } from "../chrome-bridge-health.js";
 import { readAsarMarker, readCodexVersion } from "./install.js";
 import { describeChatgptModeAsar } from "./status.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
+import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 
 interface Check {
   name: string;
@@ -27,6 +28,24 @@ export async function doctor(): Promise<void> {
     name: "user dir writable",
     ok: tryWrite(paths.root),
     detail: paths.root,
+  });
+
+  const desktopUpdate = collectDesktopUpdateDiagnostics(paths);
+  checks.push({
+    name: "desktop update lifecycle",
+    ok: desktopUpdate.blocking ? "warn" : true,
+    detail: desktopUpdate.blocking
+      ? `${desktopUpdate.receiptError ?? desktopUpdate.receipt?.phase ?? "unknown"} blocks lifecycle${desktopUpdate.stale ? " and is stale" : ""}`
+      : `${desktopUpdate.receipt?.phase ?? "idle"} is not blocking`,
+  });
+  checks.push({
+    name: "desktop update safety",
+    ok: desktopUpdate.unsafe ? false : true,
+    detail: desktopUpdate.unsafe
+      ? desktopUpdate.receiptError
+        ?? desktopUpdate.receipt?.error
+        ?? "official-mode safety was not proved"
+      : "no unsafe failed receipt",
   });
 
   if (!state) {

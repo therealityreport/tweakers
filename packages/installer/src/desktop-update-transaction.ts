@@ -43,7 +43,7 @@ import { readPlist } from "./plist.js";
 import { acquireProcessLock, processAlive as isProcessAlive } from "./process-lock.js";
 import { assertLifecycleReceiptsIdle, withLifecycleLock } from "./lifecycle-lock.js";
 import { readState, writeState } from "./state.js";
-import { getLocalRefreshStatus, refreshLocal, type RefreshSource } from "./commands/refresh-local.js";
+import { getLocalRefreshStatus, refreshLocal, type LocalRefreshStatus, type RefreshSource } from "./commands/refresh-local.js";
 import {
   observeCodexMainProcess,
   openCodex,
@@ -55,6 +55,28 @@ import { isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
+import {
+  desktopReceiptBlocksLifecycle,
+  isTerminalDesktopUpdatePhaseValue,
+} from "./desktop-update-state.js";
+import {
+  desktopUpdateOwnerIsLive,
+  readDesktopUpdateHeartbeat,
+  removeDesktopUpdateHeartbeat,
+  writeDesktopUpdateHeartbeat,
+  type DesktopUpdateHeartbeat,
+} from "./desktop-update-heartbeat.js";
+import { appendDesktopUpdateLog, type DesktopUpdateLogEvent } from "./desktop-update-log.js";
+import { readProcessStartToken } from "./orphans.js";
+import {
+  compareDesktopVersionIdentity,
+  type DesktopVersionComparison,
+  type DesktopVersionIdentity,
+} from "./desktop-version.js";
+import { parkedPayloadRoot } from "./mode-transition.js";
+
+export type { DesktopVersionComparison, DesktopVersionIdentity } from "./desktop-version.js";
+export { compareDesktopVersionIdentity } from "./desktop-version.js";
 
 export const DESKTOP_UPDATE_SCHEMA_VERSION = 1 as const;
 
@@ -71,17 +93,16 @@ export type DesktopUpdatePhase =
 
 export type DesktopUpdateRefreshSource = Exclude<RefreshSource, "current">;
 
-export interface DesktopVersionIdentity {
-  marketingVersion: string | null;
-  build: string | null;
-}
-
 export interface DesktopUpdateReceipt {
   schemaVersion: typeof DESKTOP_UPDATE_SCHEMA_VERSION;
   kind: "desktop-update";
   transactionId: string;
   phase: DesktopUpdatePhase;
   ownerPid: number;
+  /** Stable OS process-start identity. Missing on legacy receipts. */
+  ownerToken?: string | null;
+  /** Fresh fencing UUID for each explicit ownership claim. Missing on legacy receipts. */
+  ownerGeneration?: string | null;
   source: EnvironmentSelection;
   official: EnvironmentSelection;
   baseline: DesktopVersionIdentity;
@@ -177,8 +198,10 @@ export interface DesktopUpdateDependencies {
     environmentReceipt: EnvironmentTransactionReceipt;
   }): RecoveredOfficialUpdate | null | Promise<RecoveredOfficialUpdate | null>;
   processAlive(pid: number): boolean;
+  readProcessStartToken(pid: number): string | null;
   now(): string;
   createId(): string;
+  createOwnerGeneration(): string;
 }
 
 export interface DesktopUpdateTransactionOptions {
@@ -186,6 +209,9 @@ export interface DesktopUpdateTransactionOptions {
   stateFile?: string;
   receiptRoot?: string;
   lockFile?: string;
+  heartbeatFile?: string;
+  logFile?: string;
+  jobLabel?: string | null;
   timeoutMs?: number;
   pollIntervalMs?: number;
   appPath?: string;
@@ -195,6 +221,7 @@ export interface DesktopUpdateTransaction {
   start(): Promise<DesktopUpdateReceipt>;
   resume(): Promise<DesktopUpdateReceipt>;
   cancel(): Promise<DesktopUpdateReceipt>;
+  reconcile(): Promise<DesktopUpdateReceipt | null>;
   status(): DesktopUpdateReceipt | null;
 }
 
@@ -207,6 +234,9 @@ export function createDesktopUpdateTransaction(
   const stateFile = options.stateFile ?? join(root, "transactions", "desktop-update.json");
   const receiptRoot = options.receiptRoot ?? join(root, "transactions", "desktop-update");
   const lockFile = options.lockFile ?? join(root, "transactions", "desktop-update.lock");
+  const heartbeatFile = options.heartbeatFile
+    ?? join(root, "transactions", "desktop-update.heartbeat.json");
+  const logFile = options.logFile ?? join(root, "log", "desktop-update.log");
   const environmentRegistryFile = join(root, "environment-registry.json");
   const environmentSelectionFile = join(root, "environment-selection.json");
   const environmentTransactionFile = join(root, "transactions", "environment.json");
@@ -240,9 +270,9 @@ export function createDesktopUpdateTransaction(
       readDesktopBundleIdentity(appPath).bundleId
     )),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
-    initiateNativeUpdate: overrides.initiateNativeUpdate ?? (({ selection, baseline, officialMainPid }) => {
+    initiateNativeUpdate: overrides.initiateNativeUpdate ?? (async ({ selection, baseline, officialMainPid }) => {
       const result: NativeUpdateHandoffResult = officialMainPid !== null
-        ? requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid)
+        ? await requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid)
         : {
             ok: false,
             kind: "process_not_proven",
@@ -301,10 +331,9 @@ export function createDesktopUpdateTransaction(
       writeEnvironmentProfileRegistry(environmentRegistryFile, loaded.registry);
       return loaded.current;
     }),
-    selectRefreshSource: overrides.selectRefreshSource ?? (() => {
-      const status = getLocalRefreshStatus(root);
-      return status.source === "development" ? "development" : "stable";
-    }),
+    selectRefreshSource: overrides.selectRefreshSource ?? (
+      () => preferredDesktopRefreshSource(getLocalRefreshStatus(root))
+    ),
     refreshTweakers: overrides.refreshTweakers ?? runSynchronousLocalRefresh,
     verifyFinal: overrides.verifyFinal ?? ((input) => verifyFinalDesktopReturn(
       input,
@@ -326,13 +355,74 @@ export function createDesktopUpdateTransaction(
       })
     )),
     processAlive: overrides.processAlive ?? isProcessAlive,
+    readProcessStartToken: overrides.readProcessStartToken ?? readProcessStartToken,
     now,
     createId: overrides.createId ?? randomUUID,
+    createOwnerGeneration: overrides.createOwnerGeneration ?? randomUUID,
   };
 
-  const persist = (receipt: DesktopUpdateReceipt, terminal = false): DesktopUpdateReceipt => {
+  const ownerIdentity = (): Pick<
+    DesktopUpdateReceipt,
+    "ownerPid" | "ownerToken" | "ownerGeneration"
+  > => {
+    const ownerToken = deps.readProcessStartToken(process.pid);
+    if (!ownerToken) {
+      throw new Error(`Cannot establish a stable process identity for desktop update owner PID ${process.pid}`);
+    }
+    return {
+      ownerPid: process.pid,
+      ownerToken,
+      ownerGeneration: deps.createOwnerGeneration(),
+    };
+  };
+
+  const writeHeartbeat = (receipt: DesktopUpdateReceipt): void => {
+    if (!receipt.ownerToken || !receipt.ownerGeneration) return;
+    writeDesktopUpdateHeartbeat(heartbeatFile, {
+      schemaVersion: 1,
+      transactionId: receipt.transactionId,
+      ownerPid: receipt.ownerPid,
+      ownerToken: receipt.ownerToken,
+      ownerGeneration: receipt.ownerGeneration,
+      phase: receipt.phase,
+      beatAt: deps.now(),
+    });
+  };
+
+  const persist = (
+    receipt: DesktopUpdateReceipt,
+    terminal = false,
+    event?: DesktopUpdateLogEvent,
+  ): DesktopUpdateReceipt => {
+    const previous = readDesktopUpdateReceipt(stateFile);
     writeDesktopUpdateReceipt(stateFile, receipt);
     if (terminal) writeDesktopUpdateReceipt(join(receiptRoot, `${receipt.transactionId}.json`), receipt);
+    if (receipt.phase === "awaiting_native_update") writeHeartbeat(receipt);
+    else removeDesktopUpdateHeartbeat(heartbeatFile);
+
+    const transitionEvent = event
+      ?? (previous === null || previous.ownerGeneration !== receipt.ownerGeneration
+        ? "owner_started"
+        : terminal
+          ? receipt.phase === "completed" ? "owner_completed" : "handled_failure"
+          : previous.phase !== receipt.phase ? "phase_transition" : null);
+    if (transitionEvent !== null) {
+      appendDesktopUpdateLog(logFile, {
+        transactionId: receipt.transactionId,
+        phase: receipt.phase,
+        ownerPid: receipt.ownerPid,
+        ownerToken: receipt.ownerToken ?? null,
+        ownerGeneration: receipt.ownerGeneration ?? null,
+        event: transitionEvent,
+        ...(receipt.error === null ? {} : { error: receipt.error }),
+        jobLabel: options.jobLabel
+          ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL
+          ?? null,
+      }, {
+        now: deps.now,
+        userRoot: root,
+      });
+    }
     return receipt;
   };
 
@@ -340,25 +430,38 @@ export function createDesktopUpdateTransaction(
     receipt: DesktopUpdateReceipt,
     patch: Partial<DesktopUpdateReceipt>,
     terminal = false,
-  ): DesktopUpdateReceipt => persist({ ...receipt, ...patch, updatedAt: deps.now() }, terminal);
+    event?: DesktopUpdateLogEvent,
+  ): DesktopUpdateReceipt => {
+    const latest = readDesktopUpdateReceipt(stateFile);
+    if (receipt.ownerGeneration
+      && latest?.transactionId === receipt.transactionId
+      && latest.ownerGeneration !== receipt.ownerGeneration) {
+      return latest;
+    }
+    return persist(
+      { ...receipt, ...patch, updatedAt: deps.now() },
+      terminal,
+      event,
+    );
+  };
 
   const status = (): DesktopUpdateReceipt | null => readDesktopUpdateReceipt(stateFile);
 
   async function start(): Promise<DesktopUpdateReceipt> {
-    return withLifecycleLock(lifecycleLockFile, "desktop update", startUnlocked);
+    const receipt = await withLifecycleLock(lifecycleLockFile, "desktop update", startUnlocked);
+    return receipt.phase === "awaiting_native_update"
+      ? awaitNativeUpdate(receipt)
+      : receipt;
   }
 
   async function startUnlocked(): Promise<DesktopUpdateReceipt> {
     assertLifecycleReceiptsIdle(root, { contextOwned: false });
     const receipt = await withDesktopUpdateLock(lockFile, async () => {
       const existing = status();
-      if (existing?.resumable) {
+      if (existing && desktopReceiptBlocksLifecycle(existing)) {
         throw new Error(
-          `Desktop update ${existing.transactionId} is resumable from ${existing.phase}; resume or cancel it before starting another update`,
+          `Desktop update ${existing.transactionId} is blocking from ${existing.phase}; resume or cancel it before starting another update`,
         );
-      }
-      if (existing && !isTerminalDesktopUpdatePhase(existing.phase)) {
-        throw new Error(`Desktop update ${existing.transactionId} is already ${existing.phase}`);
       }
       const source = await deps.readCurrentSelection();
       if (!source) throw new Error("No current environment selection is available");
@@ -380,12 +483,13 @@ export function createDesktopUpdateTransaction(
         requestedAt: deps.now(),
       });
       const now = deps.now();
+      const identity = ownerIdentity();
       return persist({
         schemaVersion: DESKTOP_UPDATE_SCHEMA_VERSION,
         kind: "desktop-update",
         transactionId: deps.createId(),
         phase: "preparing",
-        ownerPid: process.pid,
+        ...identity,
         source,
         official,
         baseline,
@@ -403,7 +507,7 @@ export function createDesktopUpdateTransaction(
         rolledBackAt: null,
       });
     });
-    return switchToOfficial(receipt);
+    return withDesktopUpdateLock(lockFile, () => switchToOfficial(receipt));
   }
 
   async function switchToOfficial(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
@@ -432,7 +536,7 @@ export function createDesktopUpdateTransaction(
         resumable: true,
         officialMainPid: committed.newMainPid,
       });
-      return handoffAndAwaitNativeUpdate(receipt);
+      return handoffNativeUpdate(receipt);
     } catch (error) {
       const failedPreparation = receipt.environmentTransactionId === null
         ? correlatedFailedPreparation(receipt, deps.environment.status())
@@ -446,7 +550,7 @@ export function createDesktopUpdateTransaction(
     }
   }
 
-  async function handoffAndAwaitNativeUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
+  async function handoffNativeUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
     try {
       await deps.initiateNativeUpdate({
         transactionId: initial.transactionId,
@@ -454,7 +558,7 @@ export function createDesktopUpdateTransaction(
         baseline: initial.baseline,
         officialMainPid: initial.officialMainPid ?? null,
       });
-      return awaitNativeUpdate(update(initial, { nativeUpdateHandoffAt: deps.now() }));
+      return update(initial, { nativeUpdateHandoffAt: deps.now() });
     } catch (error) {
       return update(initial, {
         phase: "failed",
@@ -466,13 +570,32 @@ export function createDesktopUpdateTransaction(
   }
 
   async function awaitNativeUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
-    const observed = await deps.waitForVersionChange({
-      transactionId: initial.transactionId,
-      appPath: initial.official.selectedDesktopPath,
-      baseline: initial.baseline,
-      timeoutMs,
-      pollIntervalMs,
-    });
+    const heartbeatTimer = setInterval(() => {
+      void withDesktopUpdateLock(lockFile, async () => {
+        const latest = status();
+        if (latest?.transactionId === initial.transactionId
+          && latest.phase === "awaiting_native_update"
+          && latest.ownerGeneration === initial.ownerGeneration) {
+          writeHeartbeat(latest);
+        }
+      }).catch(() => {
+        // The receipt remains authoritative; a failed beat is diagnosed by
+        // stale-owner reconciliation instead of crashing the updater owner.
+      });
+    }, 30_000);
+    heartbeatTimer.unref();
+    let observed: DesktopVersionIdentity | null;
+    try {
+      observed = await deps.waitForVersionChange({
+        transactionId: initial.transactionId,
+        appPath: initial.official.selectedDesktopPath,
+        baseline: initial.baseline,
+        timeoutMs,
+        pollIntervalMs,
+      });
+    } finally {
+      clearInterval(heartbeatTimer);
+    }
     await deps.beforeNativeWaitTransition?.();
     const transitioned = await withDesktopUpdateLock(lockFile, async () => {
       const latest = status();
@@ -482,6 +605,10 @@ export function createDesktopUpdateTransaction(
       // A cancellation or another exact continuation that won the lock is
       // authoritative. Never write the waiter's stale snapshot over it.
       if (latest.phase !== "awaiting_native_update") return { receipt: latest, shouldContinue: false };
+      if (initial.ownerGeneration
+        && latest.ownerGeneration !== initial.ownerGeneration) {
+        return { receipt: latest, shouldContinue: false };
+      }
       if (observed === null) {
         return {
           receipt: update(latest, {
@@ -493,13 +620,16 @@ export function createDesktopUpdateTransaction(
           shouldContinue: false,
         };
       }
-      if (!desktopVersionAdvanced(latest.baseline, observed)) {
+      const versionComparison = compareDesktopVersionIdentity(latest.baseline, observed);
+      if (versionComparison !== "newer") {
         return {
           receipt: update(latest, {
             phase: "failed",
             safeOfficialMode: true,
             resumable: true,
-            error: "The observed desktop version/build did not advance. ChatGPT remains safely in official mode.",
+            error: versionComparison === "unknown"
+              ? "The observed desktop version/build could not be compared safely. ChatGPT remains in official mode and the update is blocked."
+              : "The observed desktop version/build did not advance. ChatGPT remains safely in official mode.",
           }, true),
           shouldContinue: false,
         };
@@ -514,7 +644,26 @@ export function createDesktopUpdateTransaction(
       };
     });
     return transitioned.shouldContinue
-      ? returnToRequestedEnvironment(transitioned.receipt)
+      ? withLifecycleLock(
+        lifecycleLockFile,
+        "desktop update continuation",
+        async () => {
+          return withDesktopUpdateLock(lockFile, async () => {
+            const latest = status();
+            if (!latest
+              || latest.transactionId !== transitioned.receipt.transactionId
+              || latest.ownerGeneration !== transitioned.receipt.ownerGeneration) {
+              return latest ?? transitioned.receipt;
+            }
+            assertLifecycleReceiptsIdle(root, {
+              contextOwned: false,
+              desktopTransactionId: latest.transactionId,
+              environmentTransactionId: latest.environmentTransactionId ?? undefined,
+            });
+            return returnToRequestedEnvironment(latest);
+          });
+        },
+      )
       : transitioned.receipt;
   }
 
@@ -585,6 +734,7 @@ export function createDesktopUpdateTransaction(
         resumable: false,
         error: null,
         completedAt: deps.now(),
+        rolledBackAt: null,
       }, true);
     } catch (error) {
       const reason = errorMessage(error);
@@ -638,6 +788,7 @@ export function createDesktopUpdateTransaction(
       resumable: false,
       error: null,
       completedAt: deps.now(),
+      rolledBackAt: null,
     }, true);
   }
 
@@ -657,7 +808,47 @@ export function createDesktopUpdateTransaction(
   }
 
   async function resume(): Promise<DesktopUpdateReceipt> {
-    return withLifecycleLock(lifecycleLockFile, "desktop update resume", resumeUnlocked);
+    const receipt = await withLifecycleLock(
+      lifecycleLockFile,
+      "desktop update resume",
+      async () => {
+        const claimed = await resumeUnlocked();
+        return claimed.phase === "awaiting_native_update"
+          ? withDesktopUpdateLock(lockFile, async () => {
+            const latest = status();
+            if (!latest
+              || latest.transactionId !== claimed.transactionId
+              || latest.ownerGeneration !== claimed.ownerGeneration
+              || latest.phase !== "awaiting_native_update") {
+              return latest ?? claimed;
+            }
+            return handoffNativeUpdate(latest);
+          })
+          : claimed;
+      },
+    );
+    if (receipt.observed) {
+      return withLifecycleLock(
+        lifecycleLockFile,
+        "desktop update continuation",
+        () => withDesktopUpdateLock(lockFile, async () => {
+          const latest = status();
+          if (!latest
+            || latest.transactionId !== receipt.transactionId
+            || latest.ownerGeneration !== receipt.ownerGeneration) {
+            return latest ?? receipt;
+          }
+          assertLifecycleReceiptsIdle(root, {
+            contextOwned: false,
+            desktopTransactionId: latest.transactionId,
+            environmentTransactionId: latest.environmentTransactionId ?? undefined,
+          });
+          return returnToRequestedEnvironment(latest);
+        }),
+      );
+    }
+    if (receipt.phase === "failed") return receipt;
+    return awaitNativeUpdate(receipt);
   }
 
   async function resumeUnlocked(): Promise<DesktopUpdateReceipt> {
@@ -671,7 +862,13 @@ export function createDesktopUpdateTransaction(
       });
       if (!isTerminalDesktopUpdatePhase(existing.phase)
         && existing.ownerPid !== process.pid
-        && deps.processAlive(existing.ownerPid)) {
+        && desktopUpdateOwnerIsLive({
+          receipt: existing,
+          heartbeat: readDesktopUpdateHeartbeat(heartbeatFile),
+          nowMs: Date.parse(deps.now()),
+          processAlive: deps.processAlive,
+          readProcessStartToken: deps.readProcessStartToken,
+        })) {
         throw new Error(`Desktop update owner PID ${existing.ownerPid} is still active`);
       }
       if (!existing.resumable || !existing.safeOfficialMode) {
@@ -679,33 +876,49 @@ export function createDesktopUpdateTransaction(
           `Desktop update ${existing.transactionId} is not resumable from ${existing.phase}; cancel it to recover an exited owner`,
         );
       }
+      const identity = ownerIdentity();
       let liveOfficial: LiveOfficialDesktopObservation;
       try {
         liveOfficial = await deps.inspectLiveOfficialDesktop(existing.official);
       } catch (error) {
         return update(existing, {
           phase: "failed",
-          ownerPid: process.pid,
+          ...identity,
           safeOfficialMode: true,
           resumable: true,
           error: `Could not verify live official ChatGPT before resuming: ${errorMessage(error)}`,
         }, true);
       }
 
-      if (desktopVersionAdvanced(existing.baseline, liveOfficial.version)) {
+      const liveVersionComparison = compareDesktopVersionIdentity(
+        existing.baseline,
+        liveOfficial.version,
+      );
+      if (liveVersionComparison === "newer") {
         return update(existing, {
           phase: "returning_to_tweakers",
-          ownerPid: process.pid,
+          ...identity,
           observed: liveOfficial.version,
           officialMainPid: liveOfficial.mainPid,
           resumable: false,
           error: null,
         });
       }
+      if (liveVersionComparison === "unknown") {
+        return update(existing, {
+          phase: "failed",
+          ...identity,
+          observed: null,
+          officialMainPid: liveOfficial.mainPid,
+          safeOfficialMode: true,
+          resumable: true,
+          error: "The live official version/build could not be compared safely; refusing to restart into Tweakers.",
+        }, true);
+      }
       if (existing.observed !== null) {
         return update(existing, {
           phase: "failed",
-          ownerPid: process.pid,
+          ...identity,
           observed: null,
           officialMainPid: liveOfficial.mainPid,
           safeOfficialMode: true,
@@ -715,23 +928,21 @@ export function createDesktopUpdateTransaction(
       }
       return update(existing, {
         phase: "awaiting_native_update",
-        ownerPid: process.pid,
+        ...identity,
         officialMainPid: liveOfficial.mainPid,
         resumable: false,
         error: null,
       });
     });
-    if (receipt.observed) return returnToRequestedEnvironment(receipt);
-    if (receipt.phase === "failed") return receipt;
-    return handoffAndAwaitNativeUpdate(receipt);
+    return receipt;
   }
 
   async function cancel(): Promise<DesktopUpdateReceipt> {
     let existing = status();
     if (!existing) throw new Error("No desktop update exists to cancel");
 
-    // The native updater wait intentionally holds the lifecycle lease while it
-    // polls. Cancellation may bypass that lease only when the desktop receipt
+    // The native updater wait intentionally releases the lifecycle lease while
+    // it polls. Cancellation may bypass the ordinary lifecycle path only when the desktop receipt
     // is still authoritatively in that exact wait phase under its own lock.
     // If the waiter already advanced, fall back to the ordinary lifecycle path
     // so an active same-process continuation cannot be mistaken for a dead
@@ -750,7 +961,13 @@ export function createDesktopUpdateTransaction(
     }
 
     if (!isTerminalDesktopUpdatePhase(existing.phase)
-      && deps.processAlive(existing.ownerPid)) {
+      && desktopUpdateOwnerIsLive({
+        receipt: existing,
+        heartbeat: readDesktopUpdateHeartbeat(heartbeatFile),
+        nowMs: Date.parse(deps.now()),
+        processAlive: deps.processAlive,
+        readProcessStartToken: deps.readProcessStartToken,
+      })) {
       throw new Error(`Desktop update owner PID ${existing.ownerPid} is still active`);
     }
 
@@ -758,6 +975,155 @@ export function createDesktopUpdateTransaction(
       lifecycleLockFile,
       "desktop update cancel",
       () => cancelUnlocked(existing.transactionId),
+    );
+  }
+
+  async function reconcile(): Promise<DesktopUpdateReceipt | null> {
+    const observed = status();
+    if (!observed || isTerminalDesktopUpdatePhase(observed.phase)) return observed;
+    if (desktopUpdateOwnerIsLive({
+      receipt: observed,
+      heartbeat: readDesktopUpdateHeartbeat(heartbeatFile),
+      nowMs: Date.parse(deps.now()),
+      processAlive: deps.processAlive,
+      readProcessStartToken: deps.readProcessStartToken,
+    })) {
+      return observed;
+    }
+
+    return withLifecycleLock(
+      lifecycleLockFile,
+      "desktop update reconcile",
+      () => withDesktopUpdateLock(lockFile, async () => {
+        const existing = status();
+        if (!existing || isTerminalDesktopUpdatePhase(existing.phase)) return existing;
+        if (desktopUpdateOwnerIsLive({
+          receipt: existing,
+          heartbeat: readDesktopUpdateHeartbeat(heartbeatFile),
+          nowMs: Date.parse(deps.now()),
+          processAlive: deps.processAlive,
+          readProcessStartToken: deps.readProcessStartToken,
+        })) {
+          return existing;
+        }
+        assertLifecycleReceiptsIdle(root, {
+          contextOwned: false,
+          desktopTransactionId: existing.transactionId,
+          environmentTransactionId: existing.environmentTransactionId ?? undefined,
+        });
+        const identity = ownerIdentity();
+
+        if (existing.phase === "awaiting_native_update") {
+          let liveOfficial: LiveOfficialDesktopObservation;
+          try {
+            liveOfficial = await deps.inspectLiveOfficialDesktop(existing.official);
+          } catch (error) {
+            return update(existing, {
+              phase: "failed",
+              ...identity,
+              safeOfficialMode: false,
+              resumable: false,
+              error: `Could not prove the current official ChatGPT state during reconciliation: ${errorMessage(error)}`,
+            }, true);
+          }
+          const liveVersionComparison = compareDesktopVersionIdentity(
+            existing.baseline,
+            liveOfficial.version,
+          );
+          if (liveVersionComparison === "unknown") {
+            return update(existing, {
+              phase: "failed",
+              ...identity,
+              observed: null,
+              officialMainPid: liveOfficial.mainPid,
+              safeOfficialMode: false,
+              resumable: false,
+              error: "Desktop update owner exited and the current official version/build could not be compared safely.",
+            }, true);
+          }
+          if (liveVersionComparison === "not-newer") {
+            return update(existing, {
+              phase: "failed",
+              ...identity,
+              observed: null,
+              officialMainPid: liveOfficial.mainPid,
+              safeOfficialMode: true,
+              resumable: false,
+              error: "Desktop update owner exited before the official version/build advanced; ChatGPT remains safely in official mode.",
+            }, true);
+          }
+          return update(existing, {
+            phase: "failed",
+            ...identity,
+            observed: liveOfficial.version,
+            officialMainPid: liveOfficial.mainPid,
+            safeOfficialMode: true,
+            resumable: true,
+            error: "Desktop update owner exited after the official update advanced; resume to return to the requested environment.",
+          }, true);
+        }
+
+        const returning = existing.phase === "returning_to_tweakers"
+          || existing.phase === "refreshing_runtime"
+          || existing.phase === "verifying";
+        if (returning) {
+          let liveOfficial: LiveOfficialDesktopObservation;
+          try {
+            liveOfficial = await deps.inspectLiveOfficialDesktop(existing.official);
+          } catch (error) {
+            return unsafeRecoveryFailure(
+              existing,
+              `current advanced official proof failed: ${errorMessage(error)}`,
+              identity,
+            );
+          }
+          const liveVersionComparison = compareDesktopVersionIdentity(
+            existing.baseline,
+            liveOfficial.version,
+          );
+          if (liveVersionComparison !== "newer") {
+            return unsafeRecoveryFailure(
+              existing,
+              liveVersionComparison === "unknown"
+                ? "the current pristine official version/build could not be compared safely"
+                : "the current pristine official version/build did not advance from the baseline",
+              identity,
+            );
+          }
+          const current = update(existing, {
+            ...identity,
+            observed: liveOfficial.version,
+            officialMainPid: liveOfficial.mainPid,
+            safeOfficialMode: true,
+          });
+          if (current.source.appExperience === "chatgpt") {
+            const verification = await deps.verifyFinal({
+              expected: current.source,
+              baseline: current.baseline,
+              observed: liveOfficial.version,
+              previousMainPid: current.officialMainPid ?? null,
+            });
+            if (!verification.ok) {
+              return unsafeRecoveryFailure(
+                current,
+                verification.error ?? "final ChatGPT verification failed",
+                identity,
+              );
+            }
+            return update(current, {
+              phase: "completed",
+              safeOfficialMode: false,
+              resumable: false,
+              error: null,
+              completedAt: deps.now(),
+              rolledBackAt: null,
+            }, true);
+          }
+          return recoverExitedOwner(current, identity);
+        }
+
+        return recoverExitedOwner(existing, identity);
+      }),
     );
   }
 
@@ -778,9 +1144,10 @@ export function createDesktopUpdateTransaction(
         desktopTransactionId: existing.transactionId,
         environmentTransactionId: existing.environmentTransactionId ?? undefined,
       });
+      const identity = ownerIdentity();
       return update(existing, {
         phase: "failed",
-        ownerPid: process.pid,
+        ...identity,
         safeOfficialMode: true,
         resumable: false,
         error: "Desktop update was cancelled; ChatGPT remains in official mode.",
@@ -805,16 +1172,23 @@ export function createDesktopUpdateTransaction(
       if (existing.phase !== "awaiting_native_update"
         && !isTerminalDesktopUpdatePhase(existing.phase)
         && existing.ownerPid !== process.pid
-        && deps.processAlive(existing.ownerPid)) {
+        && desktopUpdateOwnerIsLive({
+          receipt: existing,
+          heartbeat: readDesktopUpdateHeartbeat(heartbeatFile),
+          nowMs: Date.parse(deps.now()),
+          processAlive: deps.processAlive,
+          readProcessStartToken: deps.readProcessStartToken,
+        })) {
         throw new Error(`Desktop update owner PID ${existing.ownerPid} is still active`);
       }
+      const identity = ownerIdentity();
       const supported = existing.phase === "awaiting_native_update"
         || (isTerminalDesktopUpdatePhase(existing.phase) && existing.resumable);
       if (supported) {
         const safeOfficialMode = existing.phase === "awaiting_native_update" || existing.safeOfficialMode;
         return update(existing, {
           phase: "failed",
-          ownerPid: process.pid,
+          ...identity,
           safeOfficialMode,
           resumable: false,
           error: safeOfficialMode
@@ -826,7 +1200,7 @@ export function createDesktopUpdateTransaction(
       if (existing.phase === "preparing") {
         return update(existing, {
           phase: "rolled_back",
-          ownerPid: process.pid,
+          ...identity,
           safeOfficialMode: existing.source.appExperience === "chatgpt",
           resumable: false,
           error: "Desktop update recovery cancelled before environment preparation began.",
@@ -847,11 +1221,17 @@ export function createDesktopUpdateTransaction(
         );
       }
 
-      return recoverExitedOwner(existing);
+      return recoverExitedOwner(existing, identity);
     });
   }
 
-  async function recoverExitedOwner(existing: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
+  async function recoverExitedOwner(
+    existing: DesktopUpdateReceipt,
+    identity: Pick<DesktopUpdateReceipt, "ownerPid" | "ownerToken" | "ownerGeneration">,
+  ): Promise<DesktopUpdateReceipt> {
+    const recoveryFailure = (reason: string): DesktopUpdateReceipt => (
+      unsafeRecoveryFailure(existing, reason, identity)
+    );
     const returning = existing.observed !== null
       || existing.phase === "returning_to_tweakers"
       || existing.phase === "refreshing_runtime"
@@ -872,7 +1252,7 @@ export function createDesktopUpdateTransaction(
         && (existing.phase === "switching_to_chatgpt" || existing.phase === "returning_to_tweakers")) {
         return update(existing, {
           phase: "rolled_back",
-          ownerPid: process.pid,
+          ...identity,
           safeOfficialMode: returning || existing.source.appExperience === "chatgpt",
           resumable: returning && existing.observed !== null,
           error: returning
@@ -881,13 +1261,12 @@ export function createDesktopUpdateTransaction(
           rolledBackAt: deps.now(),
         }, true);
       }
-      return unsafeRecoveryFailure(existing, "environment transaction state is missing");
+      return recoveryFailure("environment transaction state is missing");
     }
 
     if (existing.environmentTransactionId !== null
       && environmentReceipt.transactionId !== existing.environmentTransactionId) {
-      return unsafeRecoveryFailure(
-        existing,
+      return recoveryFailure(
         `environment transaction ${environmentReceipt.transactionId} does not match ${existing.environmentTransactionId}`,
       );
     }
@@ -901,15 +1280,14 @@ export function createDesktopUpdateTransaction(
     if (rollbackFailed || alreadyAdoptedOfficial) {
       if (environmentReceipt.ownerPid !== process.pid
         && deps.processAlive(environmentReceipt.ownerPid)) {
-        return unsafeRecoveryFailure(
-          existing,
+        return recoveryFailure(
           `environment transaction owner PID ${environmentReceipt.ownerPid} is still active`,
         );
       }
       const failedBeforeFirstReopen = rollbackFailed
         && returning
         && environmentReceipt.attempt === 0
-        && environmentReceipt.applied == null
+        && (environmentReceipt.applied === null || environmentReceipt.applied === undefined)
         && environmentReceipt.newMainPid === null
         && sameEnvironmentSelection(environmentReceipt.source, existing.official)
         && sameEnvironmentSelection(environmentReceipt.requested, existing.source);
@@ -921,7 +1299,7 @@ export function createDesktopUpdateTransaction(
             && sameEnvironmentSelection(recovered.applied.selection, existing.official)) {
             return update(existing, {
               phase: "rolled_back",
-              ownerPid: process.pid,
+              ...identity,
               safeOfficialMode: true,
               resumable: existing.observed !== null,
               error: "Desktop update owner exited; the environment was recovered to safe official mode.",
@@ -941,7 +1319,7 @@ export function createDesktopUpdateTransaction(
         if (adopted !== null) {
           return update(existing, {
             phase: "completed",
-            ownerPid: process.pid,
+            ...identity,
             official: adopted.selection,
             observed: adopted.observed,
             officialMainPid: adopted.mainPid,
@@ -949,19 +1327,18 @@ export function createDesktopUpdateTransaction(
             resumable: false,
             error: null,
             completedAt: deps.now(),
+            rolledBackAt: null,
           }, true);
         }
       } catch (error) {
-        return unsafeRecoveryFailure(
-          existing,
+        return recoveryFailure(
           `verified official update adoption failed: ${errorMessage(error)}`,
         );
       }
     }
 
     if (rollbackFailed) {
-      return unsafeRecoveryFailure(
-        existing,
+      return recoveryFailure(
         environmentReceipt.error ?? "environment rollback failed",
       );
     }
@@ -970,8 +1347,8 @@ export function createDesktopUpdateTransaction(
       let recovered: EnvironmentTransactionReceipt;
       const failedBeforePreparationCompleted = environmentReceipt.phase === "failed"
         && environmentReceipt.attempt === 0
-        && environmentReceipt.prepared == null
-        && environmentReceipt.applied == null;
+        && (environmentReceipt.prepared === null || environmentReceipt.prepared === undefined)
+        && (environmentReceipt.applied === null || environmentReceipt.applied === undefined);
       const failedInitialPreparation = failedBeforePreparationCompleted
         && !returning
         && sameEnvironmentSelection(environmentReceipt.source, existing.source)
@@ -988,20 +1365,20 @@ export function createDesktopUpdateTransaction(
       } else if (environmentReceipt.phase === "preparing" || environmentReceipt.phase === "prepared") {
         recovered = await deps.environment.cancel(environmentReceipt.transactionId);
         if (recovered.phase !== "cancelled") {
-          return unsafeRecoveryFailure(existing, `environment cancellation ended in ${recovered.phase}`);
+          return recoveryFailure(`environment cancellation ended in ${recovered.phase}`);
         }
       } else if (environmentReceipt.phase === "rolled-back" || environmentReceipt.phase === "cancelled") {
         recovered = environmentReceipt;
       } else {
         recovered = await deps.environment.rollback(environmentReceipt.transactionId);
         if (recovered.phase !== "rolled-back") {
-          return unsafeRecoveryFailure(existing, `environment rollback ended in ${recovered.phase}`);
+          return recoveryFailure(`environment rollback ended in ${recovered.phase}`);
         }
       }
 
       return update(existing, {
         phase: "rolled_back",
-        ownerPid: process.pid,
+        ...identity,
         safeOfficialMode: returning || existing.source.appExperience === "chatgpt",
         resumable: returning && existing.observed !== null,
         error: returning
@@ -1010,21 +1387,25 @@ export function createDesktopUpdateTransaction(
         rolledBackAt: deps.now(),
       }, true);
     } catch (error) {
-      return unsafeRecoveryFailure(existing, errorMessage(error));
+      return recoveryFailure(errorMessage(error));
     }
   }
 
-  function unsafeRecoveryFailure(existing: DesktopUpdateReceipt, reason: string): DesktopUpdateReceipt {
+  function unsafeRecoveryFailure(
+    existing: DesktopUpdateReceipt,
+    reason: string,
+    identity: Pick<DesktopUpdateReceipt, "ownerPid" | "ownerToken" | "ownerGeneration">,
+  ): DesktopUpdateReceipt {
     return update(existing, {
       phase: "failed",
-      ownerPid: process.pid,
+      ...identity,
       safeOfficialMode: false,
       resumable: false,
       error: `Desktop update owner-dead recovery failed: ${reason}`,
     }, true);
   }
 
-  return { start, resume, cancel, status };
+  return { start, resume, cancel, reconcile, status };
 }
 
 async function assertRequestedDesktopApp(
@@ -1114,7 +1495,7 @@ function adoptVerifiedOfficialUpdateLocked(
   validateOfficialEnvironmentProfile(selection);
 
   const observed = readDesktopVersion(appPath);
-  if (!desktopVersionAdvanced(receipt.baseline, observed)) return null;
+  if (compareDesktopVersionIdentity(receipt.baseline, observed) !== "newer") return null;
   const identity = readDesktopBundleIdentity(appPath);
   if (identity.bundleId !== selection.selectedDesktopBundleId) return null;
   const processObservation = observeCodexMainProcess(appPath);
@@ -1157,6 +1538,7 @@ function adoptVerifiedOfficialUpdateLocked(
     throw new Error(mcpRuntimeProof.error ?? "Regular ChatGPT MCP runtime could not be proven clean");
   }
 
+  const invalidatedPayload = invalidateParkedPayloadForOfficialAdoption(files.root);
   const {
     patchedAsarStat: _patchedAsarStat,
     watcherStatGuardPasses: _watcherStatGuardPasses,
@@ -1226,6 +1608,9 @@ function adoptVerifiedOfficialUpdateLocked(
   // if it exits after this write, retry recognizes the recovery marker and
   // idempotently finishes the desktop receipt.
   writeEnvironmentTransactionReceipt(files.environmentTransactionFile, terminalEnvironment);
+  if (invalidatedPayload !== null) {
+    rmSync(invalidatedPayload, { recursive: true, force: true });
+  }
 
   return {
     observed,
@@ -1251,17 +1636,38 @@ function correlatedFailedPreparation(
 }
 
 export function isTerminalDesktopUpdatePhase(phase: DesktopUpdatePhase): boolean {
-  return phase === "completed" || phase === "failed" || phase === "rolled_back";
+  return isTerminalDesktopUpdatePhaseValue(phase);
 }
 
 export function desktopVersionAdvanced(
   baseline: DesktopVersionIdentity,
   observed: DesktopVersionIdentity,
 ): boolean {
-  const buildComparison = compareNumericVersion(baseline.build, observed.build);
-  if (buildComparison !== null) return buildComparison < 0;
-  const marketingComparison = compareNumericVersion(baseline.marketingVersion, observed.marketingVersion);
-  return marketingComparison !== null && marketingComparison < 0;
+  return compareDesktopVersionIdentity(baseline, observed) === "newer";
+}
+
+export function invalidateParkedPayloadForOfficialAdoption(
+  userRoot: string,
+  adapters: {
+    exists?: (path: string) => boolean;
+    rename?: (source: string, destination: string) => void;
+  } = {},
+): string | null {
+  const exists = adapters.exists ?? existsSync;
+  const rename = adapters.rename ?? renameSync;
+  const current = parkedPayloadRoot(userRoot);
+  const invalidated = `${current}.invalidated`;
+  const currentExists = exists(current);
+  const invalidatedExists = exists(invalidated);
+  if (currentExists && invalidatedExists) {
+    throw new Error(
+      `Refusing official update adoption because both the active and invalidated parked payloads exist (${current}, ${invalidated})`,
+    );
+  }
+  if (invalidatedExists) return invalidated;
+  if (!currentExists) return null;
+  rename(current, invalidated);
+  return invalidated;
 }
 
 export function pristineBackupProvesObservedDesktop(
@@ -1283,6 +1689,20 @@ export function pristineBackupProvesObservedDesktop(
   } catch {
     return false;
   }
+}
+
+/**
+ * Prefer a registered development checkout even when it is hash-current: the
+ * stable path stages a published GitHub release, which may not exist or may
+ * lag the freshly updated desktop, while the dev checkout rebuilds against
+ * exactly the installed app.
+ */
+export function preferredDesktopRefreshSource(
+  status: Pick<LocalRefreshStatus, "source" | "developmentSourceRoot">,
+): DesktopUpdateRefreshSource {
+  return status.source === "development" || status.developmentSourceRoot !== null
+    ? "development"
+    : "stable";
 }
 
 export async function runSynchronousLocalRefresh(
@@ -1308,8 +1728,14 @@ async function verifyFinalDesktopReturn(
   runtimeProofFile: string,
   configFile: string,
 ): Promise<{ ok: boolean; error: string | null }> {
-  if (!desktopVersionAdvanced(input.baseline, input.observed)) {
-    return { ok: false, error: "The official desktop version/build did not advance" };
+  const versionComparison = compareDesktopVersionIdentity(input.baseline, input.observed);
+  if (versionComparison !== "newer") {
+    return {
+      ok: false,
+      error: versionComparison === "unknown"
+        ? "The official desktop version/build could not be compared safely"
+        : "The official desktop version/build did not advance",
+    };
   }
 
   if (input.expected.appExperience === "tweakers") {
@@ -1478,6 +1904,14 @@ function isDesktopUpdateReceipt(value: unknown): value is DesktopUpdateReceipt {
     && typeof receipt.transactionId === "string"
     && isDesktopUpdatePhase(receipt.phase)
     && typeof receipt.ownerPid === "number"
+    && (receipt.ownerToken === undefined || receipt.ownerToken === null
+      || (typeof receipt.ownerToken === "string" && receipt.ownerToken.length > 0))
+    && (receipt.ownerGeneration === undefined || receipt.ownerGeneration === null
+      || (typeof receipt.ownerGeneration === "string" && receipt.ownerGeneration.length > 0))
+    && (
+      (receipt.ownerToken === null || receipt.ownerToken === undefined)
+      === (receipt.ownerGeneration === null || receipt.ownerGeneration === undefined)
+    )
     && isEnvironmentSelection(receipt.source)
     && isEnvironmentSelection(receipt.official)
     && isDesktopVersion(receipt.baseline)
@@ -1574,25 +2008,6 @@ async function waitForVersionChange(
     });
   }
   return null;
-}
-
-function compareNumericVersion(baseline: string | null, observed: string | null): number | null {
-  if (!baseline || !observed) return null;
-  const left = baseline.trim().split(".");
-  const right = observed.trim().split(".");
-  if (!left.length || !right.length || !left.every(isDecimalSegment) || !right.every(isDecimalSegment)) return null;
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const a = BigInt(left[index] ?? "0");
-    const b = BigInt(right[index] ?? "0");
-    if (a < b) return -1;
-    if (a > b) return 1;
-  }
-  return 0;
-}
-
-function isDecimalSegment(value: string): boolean {
-  return /^(?:0|[1-9]\d*)$/.test(value);
 }
 
 async function withDesktopUpdateLock<T>(lockFile: string, operation: () => Promise<T>): Promise<T> {
