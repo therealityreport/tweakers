@@ -482,17 +482,34 @@ export function openCodex(appRoot: string, opts: OpenCodexOptions = {}): void {
 
   reconcileLaunchServices(appRoot);
   try {
-    alertExecFileSync("open", [appRoot], { stdio: "ignore" });
+    alertExecFileSync("open", reopenShouldActivate() ? [appRoot] : ["-g", appRoot], {
+      stdio: "ignore",
+    });
   } catch {}
 }
 
-/** Open the exact app path and explicitly activate it before restart verification. */
+/**
+ * Open the exact app path before restart verification. Interactive runs also
+ * activate the app; unattended runs open it in the background because restart
+ * verification only requires a visible window, never frontmost — activating
+ * would steal focus from whatever the user is typing in.
+ */
 export function openAndActivateCodex(appRoot: string): void {
   if (platform() !== "darwin") return;
   const bundleId = codexBundleId(appRoot);
-  alertExecFileSync("osascript", ["-e", codexReopenScript(appRoot, bundleId, 0)], {
-    stdio: "ignore",
-  });
+  alertExecFileSync(
+    "osascript",
+    ["-e", codexReopenScript(appRoot, bundleId, 0, reopenShouldActivate())],
+    { stdio: "ignore" },
+  );
+}
+
+/**
+ * Unattended reopens (watcher cycles, or any caller opting in via
+ * TWEAKER_REOPEN_BACKGROUND=1) must never take focus from the user.
+ */
+function reopenShouldActivate(): boolean {
+  return !isRunningFromWatcher() && process.env.TWEAKER_REOPEN_BACKGROUND !== "1";
 }
 
 function reconcileLaunchServices(appRoot: string): void {
@@ -606,28 +623,42 @@ function waitForProcessExit(pid: number, timeoutMs: number): boolean {
 }
 
 function spawnDetachedReopen(appRoot: string, bundleId: string, delayMs: number): void {
-  const child = spawn("osascript", ["-e", codexReopenScript(appRoot, bundleId, delayMs)], {
-    detached: true,
-    stdio: "ignore",
-  });
+  const child = spawn(
+    "osascript",
+    ["-e", codexReopenScript(appRoot, bundleId, delayMs, reopenShouldActivate())],
+    {
+      detached: true,
+      stdio: "ignore",
+    },
+  );
   child.unref();
 }
 
-export function codexReopenScript(appRoot: string, bundleId: string, delayMs: number): string {
+export function codexReopenScript(
+  appRoot: string,
+  bundleId: string,
+  delayMs: number,
+  activate = true,
+): string {
   const delaySeconds = Math.max(0, delayMs) / 1000;
   const reconcileByPath = `${LSREGISTER} -f ${shellQuote(appRoot)}`;
-  const openByPath = `/usr/bin/open ${shellQuote(appRoot)}`;
-  return [
+  const openByPath = `/usr/bin/open ${activate ? "" : "-g "}${shellQuote(appRoot)}`;
+  const lines = [
     `delay ${delaySeconds.toFixed(2)}`,
     "try",
     `do shell script ${appleScriptString(reconcileByPath)}`,
     "end try",
     `do shell script ${appleScriptString(openByPath)}`,
-    "delay 0.50",
-    "try",
-    `tell application id ${appleScriptString(bundleId)} to activate`,
-    "end try",
-  ].join("\n");
+  ];
+  if (activate) {
+    lines.push(
+      "delay 0.50",
+      "try",
+      `tell application id ${appleScriptString(bundleId)} to activate`,
+      "end try",
+    );
+  }
+  return lines.join("\n");
 }
 
 interface AlertOptions {

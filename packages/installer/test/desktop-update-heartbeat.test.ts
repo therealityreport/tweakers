@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,6 +45,27 @@ test("heartbeat publication is private, atomic, and removable", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("heartbeat publication fsyncs its parent directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-desktop-heartbeat-fsync-"));
+  const file = join(root, "transactions", "desktop-update.heartbeat.json");
+  const originalFsync = fs.fsyncSync;
+  let directoryFsyncs = 0;
+  fs.fsyncSync = (descriptor: number): void => {
+    if (fs.fstatSync(descriptor).isDirectory()) directoryFsyncs += 1;
+    originalFsync(descriptor);
+  };
+  syncBuiltinESMExports();
+  try {
+    writeDesktopUpdateHeartbeat(file, heartbeat());
+  } finally {
+    fs.fsyncSync = originalFsync;
+    syncBuiltinESMExports();
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  assert.equal(directoryFsyncs, 1);
 });
 
 test("new owners require exact process identity and a fresh matching heartbeat after grace", () => {

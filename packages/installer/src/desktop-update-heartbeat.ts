@@ -117,6 +117,7 @@ export function writeDesktopUpdateHeartbeat(
     descriptor = null;
     renameSync(temporary, file);
     chmodSync(file, 0o600);
+    fsyncDirectory(dirname(file));
   } finally {
     if (descriptor !== null) {
       try {
@@ -131,6 +132,15 @@ export function writeDesktopUpdateHeartbeat(
 
 export function removeDesktopUpdateHeartbeat(file: string): void {
   rmSync(file, { force: true });
+}
+
+function fsyncDirectory(directory: string): void {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function isDesktopUpdateHeartbeat(value: unknown): value is DesktopUpdateHeartbeat {

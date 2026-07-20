@@ -38,9 +38,24 @@ export async function runWatcherCycle(
   });
   const cycleId = (dependencies.randomId ?? randomUUID)();
   const startedAt = now().toISOString();
-  const desktopReceipt = readDesktopUpdateReceipt(
-    join(options.userRoot, "transactions", "desktop-update.json"),
-  );
+  const desktopReceiptPath = join(options.userRoot, "transactions", "desktop-update.json");
+  let desktopReceipt;
+  try {
+    desktopReceipt = readDesktopUpdateReceipt(desktopReceiptPath);
+  } catch {
+    const reason = "desktop-update-receipt-invalid";
+    (dependencies.warn ?? console.warn)(JSON.stringify({
+      schemaVersion: 1,
+      event: reason,
+    }));
+    return persistDeferredWatcherReceipt(
+      options.userRoot,
+      cycleId,
+      startedAt,
+      now().toISOString(),
+      reason,
+    );
+  }
   if (desktopReceipt && desktopReceiptBlocksLifecycle(desktopReceipt)) {
     const completedAtDate = now();
     const completedAt = completedAtDate.toISOString();
@@ -55,20 +70,13 @@ export async function runWatcherCycle(
         updatedAt: desktopReceipt.updatedAt,
       }));
     }
-    const deferred: WatcherCycleStep = {
-      status: "pending",
-      error: "desktop-update-in-flight",
-    };
-    return persistWatcherReceipt(options.userRoot, {
-      schemaVersion: 1,
+    return persistDeferredWatcherReceipt(
+      options.userRoot,
       cycleId,
       startedAt,
       completedAt,
-      update: deferred,
-      repair: { ...deferred },
-      outcome: "completed",
-      error: "desktop-update-in-flight",
-    });
+      "desktop-update-in-flight",
+    );
   }
 
   const updateResult = await runStep(update);
@@ -87,6 +95,29 @@ export async function runWatcherCycle(
   };
 
   return persistWatcherReceipt(options.userRoot, receipt);
+}
+
+function persistDeferredWatcherReceipt(
+  userRoot: string,
+  cycleId: string,
+  startedAt: string,
+  completedAt: string,
+  reason: string,
+): WatcherCycleReceipt {
+  const deferred: WatcherCycleStep = {
+    status: "pending",
+    error: reason,
+  };
+  return persistWatcherReceipt(userRoot, {
+    schemaVersion: 1,
+    cycleId,
+    startedAt,
+    completedAt,
+    update: deferred,
+    repair: { ...deferred },
+    outcome: "completed",
+    error: reason,
+  });
 }
 
 function persistWatcherReceipt(

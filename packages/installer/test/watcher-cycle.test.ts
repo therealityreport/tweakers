@@ -79,6 +79,41 @@ test("watcher cycle never ages out an old blocking desktop update receipt", asyn
   }
 });
 
+test("watcher cycle fails closed when the desktop update receipt is unreadable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-watcher-cycle-"));
+  const calls: string[] = [];
+  const warnings: string[] = [];
+  try {
+    const transactions = join(root, "transactions");
+    mkdirSync(transactions, { recursive: true });
+    writeFileSync(join(transactions, "desktop-update.json"), "{broken");
+
+    const receipt = await runWatcherCycle({ userRoot: root }, {
+      update: async () => { calls.push("update"); },
+      repair: async () => { calls.push("repair"); },
+      now: sequenceDates(),
+      randomId: () => "invalid-receipt-cycle",
+      warn: (message) => warnings.push(message),
+    });
+
+    assert.deepEqual(calls, []);
+    assert.equal(receipt.outcome, "completed");
+    assert.equal(receipt.error, "desktop-update-receipt-invalid");
+    assert.deepEqual(receipt.update, {
+      status: "pending",
+      error: "desktop-update-receipt-invalid",
+    });
+    assert.deepEqual(receipt.repair, receipt.update);
+    assert.deepEqual(warnings.map((message) => JSON.parse(message)), [{
+      schemaVersion: 1,
+      event: "desktop-update-receipt-invalid",
+    }]);
+    assert.deepEqual(readAutoRepairState(root)?.latestCompletedCycle, receipt);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("watcher cycle still repairs when the release update fails", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-watcher-cycle-"));
   const calls: string[] = [];

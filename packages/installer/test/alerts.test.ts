@@ -503,3 +503,27 @@ test(
     }
   },
 );
+
+test(
+  "watcher-driven reopen launches in the background without activating",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const { calls, restore } = installExecSpy();
+    const appRoot = "/tmp/Codex.app";
+    try {
+      withEnv({ TWEAKER_WATCHER: "1" }, () => {
+        openCodex(appRoot);
+      });
+
+      const launchCalls = calls.filter((call) => call.command === "open");
+      assert.equal(launchCalls.length, 1);
+      assert.deepEqual(launchCalls[0]?.args, ["-g", appRoot]);
+      assert.equal(
+        calls.some((call) => call.command === "osascript" && call.args.some((arg) => arg.includes("to activate"))),
+        false,
+      );
+    } finally {
+      restore();
+    }
+  },
+);

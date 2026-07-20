@@ -390,6 +390,15 @@ test("Codex reopen script launches by path after a LaunchServices reconcile", ()
   assert.match(script, /tell application id "com\.openai\.codex" to activate/);
 });
 
+test("Codex reopen script opens in the background without activating when activation is off", () => {
+  const script = codexReopenScript("/Applications/Codex.app", "com.openai.codex", 1000, false);
+
+  assert.match(script, /Support\/lsregister -f '\/Applications\/Codex\.app'/);
+  assert.match(script, /\/usr\/bin\/open -g '\/Applications\/Codex\.app'/);
+  assert.doesNotMatch(script, /\/usr\/bin\/open -b/);
+  assert.doesNotMatch(script, /to activate/);
+});
+
 test("App Management failures use the dedicated repair alert path", () => {
   assert.equal(
     isMacAppManagementError("macOS App Management is blocking modification of /Applications/Codex.app."),
