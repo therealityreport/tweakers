@@ -8,6 +8,8 @@ import { getLocalRefreshStatus, handoffRefreshLocalToLaunchd, hashTree, npmComma
 import { managedSourceRoot, writeDevelopmentProvenanceHash } from "../src/managed-runtime";
 import { modeCoordinatorConfigFile, modeCoordinatorStatus } from "../src/switcher-setup";
 
+const repositoryRoot = realpathSync(fileURLToPath(new URL("../../..", import.meta.url)));
+
 test("smart refresh selects a changed registered development checkout", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-"));
   try {
@@ -42,6 +44,68 @@ test("smart refresh prefers a registered development checkout over the stable st
   assert.match(source, /current\.source === "development" \|\| current\.developmentSourceRoot !== null \? "development" : "stable"/);
 });
 
+test("explicit development root overrides registration without changing config bytes", () => {
+  const userRoot = mkdtempSync(join(tmpdir(), "tweakers-refresh-explicit-"));
+  const configFile = join(userRoot, "config.json");
+  const configBytes = "{\n  \"tweaker\": {\n    \"developmentSourceRoot\": \"/wrong/registered/root\"\n  },\n  \"coOwned\": \"preserve exactly\"\n}\n";
+  try {
+    writeFileSync(configFile, configBytes, { mode: 0o600 });
+    const selection = resolveRefreshSelection(userRoot, {
+      source: "development",
+      developmentRoot: repositoryRoot,
+    });
+    assert.deepEqual(selection, {
+      selected: "development",
+      sourceRoot: repositoryRoot,
+      developmentSourceRoot: repositoryRoot,
+    });
+    assert.equal(readFileSync(configFile, "utf8"), configBytes);
+  } finally {
+    rmSync(userRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit development root rejects relative, missing, invalid package, non-worktree, and wrong-source inputs", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-refresh-source-validation-")));
+  try {
+    assert.throws(
+      () => resolveExplicitDevelopmentRoot({ source: "development", developmentRoot: "relative/repo" }),
+      /exact absolute path/,
+    );
+    assert.throws(
+      () => resolveExplicitDevelopmentRoot({ source: "development", developmentRoot: join(root, "missing") }),
+      /does not exist/,
+    );
+
+    const invalidPackage = join(root, "invalid-package");
+    mkdirSync(join(invalidPackage, "packages", "installer"), { recursive: true });
+    writeFileSync(join(invalidPackage, "package.json"), "{\"name\":\"not-tweakers\",\"workspaces\":[\"packages/*\"]}\n");
+    writeFileSync(join(invalidPackage, "packages", "installer", "package.json"), "{\"name\":\"not-installer\"}\n");
+    assert.throws(
+      () => resolveExplicitDevelopmentRoot({ source: "development", developmentRoot: invalidPackage }),
+      /not a Tweakers package root/,
+    );
+
+    const notWorktree = join(root, "not-worktree");
+    mkdirSync(join(notWorktree, "packages", "installer"), { recursive: true });
+    writeFileSync(join(notWorktree, "package.json"), "{\"name\":\"@therealityreport/tweakers\",\"workspaces\":[\"packages/*\"]}\n");
+    writeFileSync(join(notWorktree, "packages", "installer", "package.json"), "{\"name\":\"@therealityreport/tweakers-installer\"}\n");
+    assert.throws(
+      () => resolveExplicitDevelopmentRoot({ source: "development", developmentRoot: notWorktree }),
+      /not the root of a Tweakers Git worktree/,
+    );
+
+    for (const source of [undefined, "smart", "stable"] as const) {
+      assert.throws(
+        () => resolveExplicitDevelopmentRoot({ source, developmentRoot: repositoryRoot }),
+        /valid only with --source development/,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("refresh child failures capture output for the refresh-state and receipt error", () => {
   const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
   assert.match(source, /stdio: \["ignore", "pipe", "pipe"\]/);
@@ -57,7 +121,7 @@ test("stable refresh stages a release separately and holds a promotable candidat
 
 test("macOS refresh-local hands promotion to launchd before quitting the app", () => {
   const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
-  assert.match(source, /handoffRefreshLocalToLaunchd\(paths\.root\)/);
+  assert.match(source, /handoffRefreshLocalToLaunchd\(paths\.root,/);
   assert.match(source, /TWEAKERS_REFRESH_LOCAL_DETACHED === "1"/);
   assert.match(source, /launchctl", \["submit", "-l", label/);
   assert.match(source, /com\.therealityreport\.tweakers\.refresh-local/);
@@ -72,7 +136,7 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     const common = {
       platform: "darwin" as const,
       env: { PATH: "/opt/custom node/bin:/usr/bin" },
-      argv: ["node", "/tmp/tweaker cli.js", "refresh-local", "--source", "development"],
+      argv: ["node", "/tmp/tweaker cli.js", "refresh-local", "--source", "development", "--development-root", "/tmp/isolated source root"],
       execPath: "/tmp/node binary",
       cwd: "/tmp/source root",
       now: () => 123,
@@ -80,6 +144,9 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     assert.equal(handoffRefreshLocalToLaunchd(root, {
       ...common,
       submit: (command, args) => { calls.push({ command, args }); return { status: 0 }; },
+    }, {
+      source: "development",
+      developmentSourceRoot: "/tmp/isolated source root",
     }), true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.command, "launchctl");
@@ -87,6 +154,16 @@ test("launchd handoff succeeds, falls back on submit failure, and prevents recur
     assert.match(calls[0]?.args.at(-1) ?? "", /TWEAKERS_REFRESH_LOCAL_DETACHED=1/);
     assert.match(calls[0]?.args.at(-1) ?? "", /PATH='\/opt\/custom node\/bin:\/usr\/bin'/);
     assert.match(calls[0]?.args.at(-1) ?? "", /'\/tmp\/node binary' '\/tmp\/tweaker cli\.js'/);
+    assert.match(calls[0]?.args.at(-1) ?? "", /'--development-root' '\/tmp\/isolated source root'/);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, "refresh-state.json"), "utf8")), {
+      available: false,
+      source: "development",
+      phase: "preparing",
+      developmentSourceRoot: "/tmp/isolated source root",
+      detail: "Local refresh handed off to launchd",
+      error: null,
+      checkedAt: JSON.parse(readFileSync(join(root, "refresh-state.json"), "utf8")).checkedAt,
+    });
     const shell = calls[0]?.args.at(-1) ?? "";
     assert.match(shell, /trap cleanup_transient_launchd_job EXIT/);
     assert.match(shell, /launchctl remove 'com\.therealityreport\.tweakers\.refresh-local\.[0-9]+\.123'/);

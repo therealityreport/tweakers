@@ -3,51 +3,68 @@
 // icon), and ad-hoc signs it. The per-machine local-identity signature is
 // applied later, at `tweaker mode setup` time, because that identity only
 // exists on the end user's machine.
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const src = resolve(root, "src", "tweakers_switcher.m");
-const appRoot = resolve(root, "dist", "Tweakers Switcher.app");
-const contents = resolve(appRoot, "Contents");
-const binary = resolve(contents, "MacOS", "Tweakers Switcher");
+const distRoot = resolve(root, "dist");
+const outputAppRoot = resolve(distRoot, "Tweakers Switcher.app");
 
 if (process.platform !== "darwin") {
   console.log("[switcher] skipping macOS menu-bar switcher build on non-darwin platform");
   process.exit(0);
 }
 
-rmSync(appRoot, { recursive: true, force: true });
-mkdirSync(resolve(contents, "MacOS"), { recursive: true });
+const temporaryRoot = mkdtempSync(join(tmpdir(), "tweakers-switcher-build-"));
+const appRoot = resolve(temporaryRoot, "Tweakers Switcher.app");
+const contents = resolve(appRoot, "Contents");
+const binary = resolve(contents, "MacOS", "Tweakers Switcher");
 
-const sdkPath = run("xcrun", ["--show-sdk-path"]).trim();
+try {
+  mkdirSync(resolve(contents, "MacOS"), { recursive: true });
 
-run("xcrun", [
-  "clang",
-  "-fobjc-arc",
-  "-mmacosx-version-min=13.0",
-  "-isysroot",
-  sdkPath,
-  "-framework",
-  "AppKit",
-  "-framework",
-  "Foundation",
-  "-framework",
-  "Security",
-  src,
-  "-o",
-  binary,
-], { stdio: "inherit" });
+  const sdkPath = run("xcrun", ["--show-sdk-path"]).trim();
 
-writeFileSync(resolve(contents, "Info.plist"), infoPlist());
-writeFileSync(resolve(contents, "PkgInfo"), "APPL????");
+  run("xcrun", [
+    "clang",
+    "-fobjc-arc",
+    "-mmacosx-version-min=13.0",
+    "-isysroot",
+    sdkPath,
+    "-framework",
+    "AppKit",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Security",
+    src,
+    "-o",
+    binary,
+  ], { stdio: "inherit" });
 
-// Info.plist must exist before signing: the bundle seal covers it.
-run("codesign", ["--force", "--sign", "-", appRoot], { stdio: "inherit" });
-console.log(`[switcher] built ${appRoot}`);
+  writeFileSync(resolve(contents, "Info.plist"), infoPlist());
+  writeFileSync(resolve(contents, "PkgInfo"), "APPL????");
+
+  // File Provider-managed worktrees can reattach Finder metadata between an
+  // xattr cleanup and codesign. Assemble/sign in a local temporary directory,
+  // then publish the already sealed bundle into dist.
+  run("xattr", ["-cr", appRoot], { stdio: "inherit" });
+  run("codesign", ["--force", "--sign", "-", appRoot], { stdio: "inherit" });
+  run("codesign", ["--verify", "--strict", appRoot], { stdio: "inherit" });
+
+  mkdirSync(distRoot, { recursive: true });
+  rmSync(outputAppRoot, { recursive: true, force: true });
+  cpSync(appRoot, outputAppRoot, { recursive: true });
+  run("xattr", ["-cr", outputAppRoot], { stdio: "inherit" });
+  console.log(`[switcher] built ${outputAppRoot}`);
+} finally {
+  rmSync(temporaryRoot, { recursive: true, force: true });
+}
 
 function infoPlist() {
   return `<?xml version="1.0" encoding="UTF-8"?>

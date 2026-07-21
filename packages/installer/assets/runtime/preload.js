@@ -4664,9 +4664,9 @@ function maybeDumpDom() {
     const heading = panel?.querySelector(
       "h1, h2, h3, [class*='heading']"
     );
-    const fingerprint = `${activeNav?.textContent ?? ""}|${heading?.textContent ?? ""}|${panel?.children.length ?? 0}`;
-    if (state.fingerprint === fingerprint) return;
-    state.fingerprint = fingerprint;
+    const fingerprint2 = `${activeNav?.textContent ?? ""}|${heading?.textContent ?? ""}|${panel?.children.length ?? 0}`;
+    if (state.fingerprint === fingerprint2) return;
+    state.fingerprint = fingerprint2;
     plog("dom probe", {
       url: location.href,
       activeNav: activeNav?.textContent?.trim() ?? null,
@@ -4705,6 +4705,11 @@ var import_electron2 = require("electron");
 
 // src/preload/host-surfaces.ts
 var MAX_MATCHES = 100;
+var MAX_MCP_FIBER_DEPTH = 12;
+var MAX_MCP_SCHEMA_PROPERTIES = 128;
+var MAX_MCP_IDENTITY_LENGTH = 512;
+var MAX_MCP_VISIBILITY_ANCESTORS = 128;
+var MCP_CARRIER_NONCE_PREFIX = "__tweakers_carrier_nonce_";
 var listeners = /* @__PURE__ */ new Set();
 var sharedObserver = null;
 var pendingFrame = null;
@@ -4721,8 +4726,325 @@ var hostUiApi = {
   snapshot,
   observe,
   getActiveProject,
-  attachFiles
+  attachFiles,
+  attachMcpFormCarrier
 };
+function attachMcpFormCarrier(nonce) {
+  if (!validCarrierNonce(nonce)) return { status: "declined", reason: "invalid_nonce" };
+  if (typeof document === "undefined") return { status: "declined", reason: "carrier_not_found" };
+  const attached = [];
+  for (const form of Array.from(document.querySelectorAll("form"))) {
+    const result = attachMcpFormElement(form, nonce);
+    if (result.status === "attached") attached.push(result);
+  }
+  if (attached.length === 0) return { status: "declined", reason: "carrier_not_found" };
+  if (attached.length > 1) return { status: "declined", reason: "multiple_carriers" };
+  return attached[0];
+}
+function attachMcpFormElement(form, nonce, resolveFiber = (element) => fiberForNode(element)) {
+  if (!validCarrierNonce(nonce)) return { status: "declined", reason: "invalid_nonce" };
+  if (String(form?.tagName).toUpperCase() !== "FORM") {
+    return { status: "declined", reason: "not_semantic_form" };
+  }
+  if (!form.isConnected) return { status: "declined", reason: "disconnected_form" };
+  const inspected = inspectCarrierForm(form, nonce, resolveFiber);
+  if (inspected.status === "declined") return inspected;
+  const identity = publicCarrierIdentity(inspected.identity);
+  const controller = new SemanticMcpFormController(
+    form,
+    nonce,
+    identity,
+    inspected.identityShape,
+    resolveFiber
+  );
+  return {
+    status: "attached",
+    identity,
+    controller,
+    acknowledgement: deliveryAcknowledgement("carrier_attach")
+  };
+}
+var SemanticMcpFormController = class {
+  constructor(form, nonce, identity, identityShape, resolveFiber) {
+    this.form = form;
+    this.nonce = nonce;
+    this.identity = identity;
+    this.identityShape = identityShape;
+    this.resolveFiber = resolveFiber;
+    this.taskCardAnchor = form;
+  }
+  form;
+  nonce;
+  identity;
+  identityShape;
+  resolveFiber;
+  taskCardAnchor;
+  continueDispatched = false;
+  isCurrent() {
+    if (!this.form.isConnected) return false;
+    const current = inspectCarrierForm(this.form, this.nonce, this.resolveFiber);
+    return current.status === "attached" && current.identityShape === this.identityShape;
+  }
+  setRadio(propertyKey, optionKey) {
+    this.exactChoice("radio", propertyKey, optionKey).click();
+  }
+  setCheckbox(propertyKey, optionKey, checked) {
+    const button2 = this.exactChoice("checkbox", propertyKey, optionKey);
+    const selected = button2.getAttribute("aria-checked") === "true";
+    if (selected !== checked) button2.click();
+  }
+  setText(propertyKey, value) {
+    this.assertCurrent();
+    if (!this.identity.schemaPropertyNames.includes(propertyKey)) {
+      throw new Error("MCP form control drift: unknown property");
+    }
+    const matches = Array.from(
+      this.form.querySelectorAll('input:not([type]), input[type="text"], input[type="search"], textarea')
+    ).filter((element) => controlMatchesProperty(
+      element,
+      propertyKey,
+      this.identity.schemaPropertyNames,
+      this.resolveFiber
+    ));
+    if (matches.length !== 1) throw new Error("MCP form control drift: text control is not unique");
+    setControlledText(matches[0], value);
+  }
+  continueNormally() {
+    if (this.continueDispatched) return;
+    this.assertCurrent();
+    const controls = Array.from(this.form.querySelectorAll('button[type="submit"], input[type="submit"]'));
+    if (controls.length !== 1) throw new Error("MCP form control drift: submit control is not unique");
+    this.continueDispatched = true;
+    controls[0].click();
+  }
+  cancelNormally() {
+    this.assertCurrent();
+    const controls = Array.from(this.form.querySelectorAll(
+      'button[type="button"]:not([role="radio"]):not([role="checkbox"])'
+    ));
+    if (controls.length !== 1) throw new Error("MCP form control drift: cancel control is not unique");
+    controls[0].click();
+  }
+  mountAcknowledgement(owner) {
+    this.assertCurrent();
+    if (owner === "generic") this.assertVisibleGenericForm();
+    return deliveryAcknowledgement(owner === "owned" ? "owned_mount" : "generic_mount");
+  }
+  exactChoice(role, propertyKey, optionKey) {
+    this.assertCurrent();
+    if (!this.identity.schemaPropertyNames.includes(propertyKey)) {
+      throw new Error("MCP form control drift: unknown property");
+    }
+    const matches = Array.from(this.form.querySelectorAll(`button[role="${role}"]`)).filter(
+      (element) => controlMatchesProperty(
+        element,
+        propertyKey,
+        this.identity.schemaPropertyNames,
+        this.resolveFiber
+      ) && controlMatchesOption(element, optionKey, this.resolveFiber)
+    );
+    if (matches.length !== 1) throw new Error("MCP form control drift: choice control is not unique");
+    return matches[0];
+  }
+  assertCurrent() {
+    if (!this.isCurrent()) throw new Error("MCP form carrier is no longer current");
+  }
+  assertVisibleGenericForm() {
+    const form = this.form;
+    const ownerDocument = form.ownerDocument;
+    const documentElement = ownerDocument?.documentElement;
+    const view = form.ownerDocument?.defaultView;
+    if (!ownerDocument || !documentElement || !view || typeof view.getComputedStyle !== "function") {
+      throw new Error("MCP generic form visibility could not be measured");
+    }
+    const seen = /* @__PURE__ */ new Set();
+    let element = form;
+    let reachedDocumentElement = false;
+    for (let depth = 0; element && depth < MAX_MCP_VISIBILITY_ANCESTORS; depth += 1) {
+      if (seen.has(element)) {
+        throw new Error("MCP generic form visibility chain is cyclic");
+      }
+      seen.add(element);
+      if (element.ownerDocument !== ownerDocument || !element.isConnected) {
+        throw new Error("MCP generic form visibility chain is disconnected");
+      }
+      const visibilityElement = element;
+      if (visibilityElement.hidden === true || visibilityElement.inert === true || element.getAttribute("aria-hidden")?.trim().toLowerCase() === "true") {
+        throw new Error("MCP generic form is hidden or suppressed");
+      }
+      const style = view.getComputedStyle(element);
+      const opacity = Number.parseFloat(style.opacity);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || Number.isFinite(opacity) && opacity <= 0 || style.contentVisibility === "hidden") {
+        throw new Error("MCP generic form is not visibly painted");
+      }
+      if (element === documentElement) {
+        reachedDocumentElement = true;
+        break;
+      }
+      element = element.parentElement;
+    }
+    if (!reachedDocumentElement) {
+      throw new Error("MCP generic form visibility chain did not reach the document boundary");
+    }
+    const rects = Array.from(form.getClientRects());
+    const painted = rects.some((rect) => Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 0 && rect.height > 0);
+    if (!painted) throw new Error("MCP generic form has no painted geometry");
+    if (!form.isConnected || form.ownerDocument !== ownerDocument) {
+      throw new Error("MCP generic form visibility chain is disconnected");
+    }
+    this.assertCurrent();
+  }
+};
+function inspectCarrierForm(form, nonce, resolveFiber) {
+  const first = resolveFiber(form);
+  if (!first) return { status: "declined", reason: "missing_fiber" };
+  const identities = [];
+  const seen = /* @__PURE__ */ new Set();
+  let fiber = first;
+  let depth = 0;
+  let malformedCarrierProps = false;
+  while (fiber && depth < MAX_MCP_FIBER_DEPTH) {
+    if (seen.has(fiber)) return { status: "declined", reason: "ancestor_cycle" };
+    seen.add(fiber);
+    const props = asRecord(fiber.memoizedProps);
+    if (props && carrierSignal(props)) {
+      const identity2 = parseCarrierIdentity(props);
+      if (identity2) identities.push(identity2);
+      else malformedCarrierProps = true;
+    }
+    fiber = fiber.return;
+    depth += 1;
+  }
+  if (fiber) return { status: "declined", reason: "ancestor_bound_exceeded" };
+  if (malformedCarrierProps || identities.length === 0) {
+    return { status: "declined", reason: "missing_or_invalid_props" };
+  }
+  if (identities.length > 1) {
+    const shapes = new Set(identities.map(stableCarrierIdentityShape));
+    return { status: "declined", reason: shapes.size === 1 ? "duplicate_props" : "conflicting_props" };
+  }
+  const identity = identities[0];
+  if (!Object.hasOwn(identity.schemaProperties, `${MCP_CARRIER_NONCE_PREFIX}${nonce}`)) {
+    return { status: "declined", reason: "nonce_not_in_schema" };
+  }
+  return { status: "attached", identity, identityShape: stableCarrierIdentityShape(identity) };
+}
+function carrierSignal(props) {
+  return ["elicitation", "requestId", "conversationId", "hostId"].some((key) => Object.hasOwn(props, key));
+}
+function parseCarrierIdentity(props) {
+  const elicitation = asRecord(props.elicitation);
+  const schema = asRecord(elicitation?.schema);
+  const properties = asRecord(schema?.properties);
+  const requestId = boundedIdentity(props.requestId);
+  const conversationId = boundedIdentity(props.conversationId);
+  const hostId = boundedIdentity(props.hostId);
+  if (elicitation?.kind !== "formElicitation" || schema?.type !== "object" || !properties || !requestId || !conversationId || !hostId) return null;
+  const entries = Object.entries(properties);
+  if (entries.length === 0 || entries.length > MAX_MCP_SCHEMA_PROPERTIES) return null;
+  const schemaProperties = {};
+  for (const [key, value] of entries) {
+    const property = asRecord(value);
+    if (!key || key.length > MAX_MCP_IDENTITY_LENGTH || !property || typeof property.type !== "string") return null;
+    schemaProperties[key] = property;
+  }
+  return { requestId, conversationId, hostId, schemaProperties };
+}
+function stableCarrierIdentityShape(identity) {
+  return JSON.stringify({
+    requestId: identity.requestId,
+    conversationId: identity.conversationId,
+    hostId: identity.hostId,
+    propertyShape: Object.entries(identity.schemaProperties).sort(([left], [right]) => left.localeCompare(right)).map(([key, property]) => [
+      key,
+      property.type,
+      property.const ?? null,
+      property.enum ?? null,
+      asRecord(property.items)?.enum ?? null
+    ])
+  });
+}
+function publicCarrierIdentity(identity) {
+  return Object.freeze({
+    requestId: identity.requestId,
+    conversationId: identity.conversationId,
+    hostId: identity.hostId,
+    schemaPropertyNames: Object.freeze(Object.keys(identity.schemaProperties))
+  });
+}
+function controlMatchesProperty(element, expected, schemaPropertyNames, resolveFiber) {
+  const known = new Set(schemaPropertyNames);
+  const matches = /* @__PURE__ */ new Set();
+  const bounded = walkControlFibers(element, resolveFiber, (fiber) => {
+    const props = asRecord(fiber.memoizedProps);
+    if (!props) return;
+    const queue = [props];
+    const seen = /* @__PURE__ */ new Set();
+    for (let visited = 0; queue.length && visited < 32; visited += 1) {
+      const value = queue.shift();
+      const record = asRecord(value);
+      if (!record || seen.has(record)) continue;
+      seen.add(record);
+      for (const [key, item] of Object.entries(record)) {
+        if (["name", "propertyKey", "fieldName"].includes(key) && typeof item === "string" && known.has(item)) {
+          matches.add(item);
+        } else if (item && typeof item === "object") {
+          queue.push(item);
+        }
+      }
+    }
+  });
+  return bounded && matches.size === 1 && matches.has(expected);
+}
+function controlMatchesOption(element, expected, resolveFiber) {
+  const candidates = /* @__PURE__ */ new Set();
+  const bounded = walkControlFibers(element, resolveFiber, (fiber) => {
+    if (typeof fiber.key === "string" || typeof fiber.key === "number") {
+      const key = String(fiber.key);
+      candidates.add(key);
+      if (key.startsWith(".$")) candidates.add(key.slice(2));
+    }
+    const props = asRecord(fiber.memoizedProps);
+    for (const key of ["value", "optionKey"]) {
+      if (typeof props?.[key] === "string") candidates.add(props[key]);
+    }
+    const option = asRecord(props?.option);
+    if (typeof option?.value === "string") candidates.add(option.value);
+  });
+  return bounded && candidates.has(expected);
+}
+function walkControlFibers(element, resolveFiber, visitor) {
+  let fiber = resolveFiber(element);
+  const seen = /* @__PURE__ */ new Set();
+  for (let depth = 0; fiber && depth < MAX_MCP_FIBER_DEPTH; depth += 1) {
+    if (seen.has(fiber)) return false;
+    seen.add(fiber);
+    visitor(fiber);
+    fiber = fiber.return;
+  }
+  return fiber === null;
+}
+function setControlledText(input, value) {
+  const prototype = Object.getPrototypeOf(input);
+  const setter = prototype ? Object.getOwnPropertyDescriptor(prototype, "value")?.set : void 0;
+  if (setter) setter.call(input, value);
+  else input.value = value;
+  const inputEvent = typeof InputEvent === "function" ? new InputEvent("input", { bubbles: true, inputType: "insertText", data: null }) : new Event("input", { bubbles: true });
+  input.dispatchEvent(inputEvent);
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+function validCarrierNonce(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._~-]{8,128}$/.test(value);
+}
+function boundedIdentity(value) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_MCP_IDENTITY_LENGTH ? value : null;
+}
+function asRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function deliveryAcknowledgement(stage) {
+  return Object.freeze({ version: 1, stage, contentRedacted: true });
+}
 function queryHostSurfaces(kind) {
   if (typeof document === "undefined") return [];
   if (kind === "projects") return projectRows();
@@ -4936,10 +5258,155 @@ function runWithStartupTimeout(start, timeoutMs = DEFAULT_TWEAK_STARTUP_TIMEOUT_
 }
 var reloadSequence = Promise.resolve();
 
+// src/renderer-crypto.ts
+var SHA256_INITIAL = new Uint32Array([
+  1779033703,
+  3144134277,
+  1013904242,
+  2773480762,
+  1359893119,
+  2600822924,
+  528734635,
+  1541459225
+]);
+var SHA256_ROUND = new Uint32Array([
+  1116352408,
+  1899447441,
+  3049323471,
+  3921009573,
+  961987163,
+  1508970993,
+  2453635748,
+  2870763221,
+  3624381080,
+  310598401,
+  607225278,
+  1426881987,
+  1925078388,
+  2162078206,
+  2614888103,
+  3248222580,
+  3835390401,
+  4022224774,
+  264347078,
+  604807628,
+  770255983,
+  1249150122,
+  1555081692,
+  1996064986,
+  2554220882,
+  2821834349,
+  2952996808,
+  3210313671,
+  3336571891,
+  3584528711,
+  113926993,
+  338241895,
+  666307205,
+  773529912,
+  1294757372,
+  1396182291,
+  1695183700,
+  1986661051,
+  2177026350,
+  2456956037,
+  2730485921,
+  2820302411,
+  3259730800,
+  3345764771,
+  3516065817,
+  3600352804,
+  4094571909,
+  275423344,
+  430227734,
+  506948616,
+  659060556,
+  883997877,
+  958139571,
+  1322822218,
+  1537002063,
+  1747873779,
+  1955562222,
+  2024104815,
+  2227730452,
+  2361852424,
+  2428436474,
+  2756734187,
+  3204031479,
+  3329325298
+]);
+function rotateRight(value, amount) {
+  return value >>> amount | value << 32 - amount;
+}
+function sha256HexUtf8(value) {
+  const input = new TextEncoder().encode(value);
+  const paddedLength = Math.ceil((input.length + 9) / 64) * 64;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(input);
+  padded[input.length] = 128;
+  const bitLength = BigInt(input.length) * 8n;
+  const view = new DataView(padded.buffer);
+  view.setUint32(paddedLength - 8, Number(bitLength >> 32n & 0xffffffffn), false);
+  view.setUint32(paddedLength - 4, Number(bitLength & 0xffffffffn), false);
+  const state2 = new Uint32Array(SHA256_INITIAL);
+  const words = new Uint32Array(64);
+  for (let offset = 0; offset < paddedLength; offset += 64) {
+    for (let index = 0; index < 16; index += 1) {
+      words[index] = view.getUint32(offset + index * 4, false);
+    }
+    for (let index = 16; index < words.length; index += 1) {
+      const prior15 = words[index - 15];
+      const prior2 = words[index - 2];
+      const small0 = rotateRight(prior15, 7) ^ rotateRight(prior15, 18) ^ prior15 >>> 3;
+      const small1 = rotateRight(prior2, 17) ^ rotateRight(prior2, 19) ^ prior2 >>> 10;
+      words[index] = words[index - 16] + small0 + words[index - 7] + small1 >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = state2;
+    for (let index = 0; index < words.length; index += 1) {
+      const large1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+      const choose = e & f ^ ~e & g;
+      const temporary1 = h + large1 + choose + SHA256_ROUND[index] + words[index] >>> 0;
+      const large0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+      const majority = a & b ^ a & c ^ b & c;
+      const temporary2 = large0 + majority >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = d + temporary1 >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = temporary1 + temporary2 >>> 0;
+    }
+    state2[0] = state2[0] + a >>> 0;
+    state2[1] = state2[1] + b >>> 0;
+    state2[2] = state2[2] + c >>> 0;
+    state2[3] = state2[3] + d >>> 0;
+    state2[4] = state2[4] + e >>> 0;
+    state2[5] = state2[5] + f >>> 0;
+    state2[6] = state2[6] + g >>> 0;
+    state2[7] = state2[7] + h >>> 0;
+  }
+  return [...state2].map((word) => word.toString(16).padStart(8, "0")).join("");
+}
+function secureRendererUuid() {
+  const provider = globalThis.crypto;
+  if (typeof provider?.randomUUID === "function") return provider.randomUUID();
+  if (typeof provider?.getRandomValues !== "function") {
+    throw new Error("secure renderer randomness is unavailable");
+  }
+  const bytes = provider.getRandomValues(new Uint8Array(16));
+  bytes[6] = bytes[6] & 15 | 64;
+  bytes[8] = bytes[8] & 63 | 128;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
 // src/renderer-storage.ts
 var CURRENT_ID_PREFIX = "co.tweakers.";
 var LEGACY_STORAGE_PREFIX = `${["codex", "pp"].join("")}:storage:`;
 var CURRENT_STORAGE_PREFIX = "tweaker:storage:";
+var ARCHIVE_STORAGE_PREFIX = "tweaker:storage-archive:";
 function parseRecord(raw) {
   if (raw === null) return null;
   try {
@@ -4949,10 +5416,13 @@ function parseRecord(raw) {
     return null;
   }
 }
-function discoverLegacyPublisherKey(id, storage) {
-  if (!id.startsWith(CURRENT_ID_PREFIX)) return null;
+function fingerprint(raw) {
+  return raw === null ? "missing" : sha256HexUtf8(raw);
+}
+function discoverLegacyPublisherKeys(id, storage) {
+  if (!id.startsWith(CURRENT_ID_PREFIX)) return [];
   const suffix = id.slice(CURRENT_ID_PREFIX.length);
-  if (!suffix) return null;
+  if (!suffix) return [];
   const suffixMarker = `.${suffix}`;
   const candidates = /* @__PURE__ */ new Set();
   for (let index = 0; index < storage.length; index += 1) {
@@ -4963,36 +5433,153 @@ function discoverLegacyPublisherKey(id, storage) {
       candidates.add(key);
     }
   }
-  return candidates.size === 1 ? [...candidates][0] : null;
+  return [...candidates].sort();
+}
+function legacyKeysFor(id, storage) {
+  const exactLegacyKey = `${LEGACY_STORAGE_PREFIX}${id}`;
+  const keys = new Set(discoverLegacyPublisherKeys(id, storage));
+  if (storage.getItem(exactLegacyKey) !== null) keys.add(exactLegacyKey);
+  return [...keys].sort();
+}
+function planMigration(id, storage, transactionId = secureRendererUuid()) {
+  const currentKey = `${CURRENT_STORAGE_PREFIX}${id}`;
+  const canonicalRaw = storage.getItem(currentKey);
+  const legacyKeys = legacyKeysFor(id, storage);
+  const selectedLegacyKey = legacyKeys.length === 1 ? legacyKeys[0] : null;
+  const selectedLegacyRaw = selectedLegacyKey === null ? null : storage.getItem(selectedLegacyKey);
+  const base = {
+    schemaVersion: 1,
+    transactionId,
+    currentKey,
+    legacyKeys,
+    selectedLegacyKey,
+    createdCanonical: false,
+    canonicalBeforeHash: fingerprint(canonicalRaw),
+    canonicalAfterHash: fingerprint(canonicalRaw),
+    selectedLegacyHash: fingerprint(selectedLegacyRaw),
+    archiveKey: null,
+    phase: "planned"
+  };
+  if (!id.startsWith(CURRENT_ID_PREFIX)) {
+    return { receipt: { ...base, status: "not_applicable", holdPromotion: false }, canonicalRaw, selectedLegacyRaw };
+  }
+  if (legacyKeys.length > 1) {
+    return { receipt: { ...base, status: "ambiguous", holdPromotion: true }, canonicalRaw, selectedLegacyRaw };
+  }
+  if (canonicalRaw !== null && parseRecord(canonicalRaw) === null) {
+    return { receipt: { ...base, status: "invalid_canonical", holdPromotion: true }, canonicalRaw, selectedLegacyRaw };
+  }
+  if (selectedLegacyRaw !== null && parseRecord(selectedLegacyRaw) === null) {
+    return { receipt: { ...base, status: "invalid_legacy", holdPromotion: true }, canonicalRaw, selectedLegacyRaw };
+  }
+  if (canonicalRaw !== null) {
+    const mismatch = selectedLegacyRaw !== null && selectedLegacyRaw !== canonicalRaw;
+    return {
+      receipt: { ...base, status: mismatch ? "conflict" : "canonical", holdPromotion: mismatch },
+      canonicalRaw,
+      selectedLegacyRaw
+    };
+  }
+  if (selectedLegacyRaw === null) {
+    return { receipt: { ...base, status: "absent", holdPromotion: false }, canonicalRaw, selectedLegacyRaw };
+  }
+  return {
+    receipt: {
+      ...base,
+      status: "prepared",
+      holdPromotion: false,
+      createdCanonical: true,
+      canonicalAfterHash: fingerprint(selectedLegacyRaw)
+    },
+    canonicalRaw,
+    selectedLegacyRaw
+  };
+}
+function prepareRendererStorageMigration(id, storage, transactionId) {
+  const plan = planMigration(id, storage, transactionId);
+  if (!plan.receipt.createdCanonical || plan.selectedLegacyRaw === null) {
+    return { ...plan.receipt, phase: "prepared" };
+  }
+  try {
+    if (storage.getItem(plan.receipt.currentKey) !== null) {
+      return { ...plan.receipt, status: "conflict", holdPromotion: true, createdCanonical: false, phase: "prepared" };
+    }
+    storage.setItem(plan.receipt.currentKey, plan.selectedLegacyRaw);
+    if (fingerprint(storage.getItem(plan.receipt.currentKey)) !== plan.receipt.canonicalAfterHash) {
+      throw new Error("renderer storage verification failed");
+    }
+    return { ...plan.receipt, phase: "prepared" };
+  } catch {
+    return {
+      ...plan.receipt,
+      status: "write_failed",
+      holdPromotion: true,
+      createdCanonical: false,
+      canonicalAfterHash: fingerprint(storage.getItem(plan.receipt.currentKey)),
+      phase: "prepared"
+    };
+  }
+}
+function commitRendererStorageMigration(receipt, storage) {
+  if (receipt.phase === "committed") return receipt;
+  if (receipt.holdPromotion) throw new Error("renderer storage migration is on hold");
+  if (fingerprint(storage.getItem(receipt.currentKey)) !== receipt.canonicalAfterHash) {
+    throw new Error("renderer storage canonical value changed before commit");
+  }
+  if (receipt.selectedLegacyKey === null) return { ...receipt, phase: "committed" };
+  const legacyRaw = storage.getItem(receipt.selectedLegacyKey);
+  if (fingerprint(legacyRaw) !== receipt.selectedLegacyHash || legacyRaw === null) {
+    throw new Error("renderer storage legacy value changed before commit");
+  }
+  const archiveKey = `${ARCHIVE_STORAGE_PREFIX}${receipt.transactionId}:${encodeURIComponent(receipt.selectedLegacyKey)}`;
+  const archived = storage.getItem(archiveKey);
+  if (archived !== null && archived !== legacyRaw) {
+    throw new Error("renderer storage archive collision");
+  }
+  storage.setItem(archiveKey, legacyRaw);
+  if (storage.getItem(archiveKey) !== legacyRaw) throw new Error("renderer storage archive verification failed");
+  storage.removeItem(receipt.selectedLegacyKey);
+  return { ...receipt, archiveKey, phase: "committed" };
+}
+function rollbackRendererStorageMigration(receipt, storage) {
+  if (receipt.phase === "rolled_back") return receipt;
+  if (receipt.archiveKey !== null && receipt.selectedLegacyKey !== null) {
+    const archived = storage.getItem(receipt.archiveKey);
+    if (fingerprint(archived) !== receipt.selectedLegacyHash || archived === null) {
+      throw new Error("renderer storage archive changed before rollback");
+    }
+    const currentLegacy = storage.getItem(receipt.selectedLegacyKey);
+    if (currentLegacy !== null && fingerprint(currentLegacy) !== receipt.selectedLegacyHash) {
+      throw new Error("renderer storage legacy value changed before rollback");
+    }
+    if (currentLegacy === null) storage.setItem(receipt.selectedLegacyKey, archived);
+    storage.removeItem(receipt.archiveKey);
+  }
+  if (receipt.createdCanonical) {
+    if (fingerprint(storage.getItem(receipt.currentKey)) !== receipt.canonicalAfterHash) {
+      throw new Error("renderer storage canonical value changed before rollback");
+    }
+    storage.removeItem(receipt.currentKey);
+  }
+  return { ...receipt, phase: "rolled_back" };
 }
 function createRendererStorage(id, storage) {
+  let migration = prepareRendererStorageMigration(id, storage);
   const key = `${CURRENT_STORAGE_PREFIX}${id}`;
-  const legacyCurrentIdKey = `${LEGACY_STORAGE_PREFIX}${id}`;
-  const read = () => {
-    const current = parseRecord(storage.getItem(key));
-    const legacyCurrentId = parseRecord(storage.getItem(legacyCurrentIdKey));
-    const legacyPublisherKey = discoverLegacyPublisherKey(id, storage);
-    const legacyPublisher = legacyPublisherKey === null ? null : parseRecord(storage.getItem(legacyPublisherKey));
-    const legacyKeys = [
-      legacyCurrentId === null ? null : legacyCurrentIdKey,
-      legacyPublisher === null ? null : legacyPublisherKey
-    ].filter((candidate) => candidate !== null);
-    if (legacyKeys.length === 0) return current ?? {};
-    const merged = {
-      ...legacyPublisher ?? {},
-      ...legacyCurrentId ?? {},
-      ...current ?? {}
-    };
-    try {
-      storage.setItem(key, JSON.stringify(merged));
-    } catch {
-      return merged;
-    }
-    for (const legacyKey of legacyKeys) storage.removeItem(legacyKey);
-    return merged;
-  };
+  const read = () => parseRecord(storage.getItem(key)) ?? {};
   const write = (value) => storage.setItem(key, JSON.stringify(value));
   return {
+    get migration() {
+      return migration;
+    },
+    commitMigration: () => {
+      migration = commitRendererStorageMigration(migration, storage);
+      return migration;
+    },
+    rollbackMigration: () => {
+      migration = rollbackRendererStorageMigration(migration, storage);
+      return migration;
+    },
     get: (name, fallback) => {
       const current = read();
       return name in current ? current[name] : fallback;
@@ -5123,6 +5710,11 @@ async function loadTweak(t, paths) {
 }
 function makeRendererApi(manifest, paths) {
   const id = manifest.id;
+  const assertIpcPermission = () => {
+    if (!manifest.permissions?.includes("ipc")) {
+      throw new Error(`tweak ${id} must declare ipc permission`);
+    }
+  };
   const log = (level, ...a) => {
     const consoleFn = level === "debug" ? console.debug : level === "warn" ? console.warn : level === "error" ? console.error : console.log;
     consoleFn(`[tweaker][${id}]`, ...a);
@@ -5189,12 +5781,17 @@ function makeRendererApi(manifest, paths) {
     },
     ipc: {
       on: (c, h) => {
+        assertIpcPermission();
         const wrapped = (_e, ...args) => h(...args);
         import_electron2.ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
         return () => import_electron2.ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
       },
-      send: (c, ...args) => import_electron2.ipcRenderer.send(`tweaker:${id}:${c}`, ...args),
+      send: (c, ...args) => {
+        assertIpcPermission();
+        import_electron2.ipcRenderer.send(`tweaker:${id}:${c}`, ...args);
+      },
       invoke: (c, ...args) => {
+        assertIpcPermission();
         if (id === "co.tweakers.thread-summary-profiles" && c === "profiles.read") {
           return import_electron2.ipcRenderer.invoke(
             "tweaker:cross-tweak-read",
@@ -5584,6 +6181,29 @@ function startDesktopUpdateIndicator() {
   };
 }
 
+// src/preload/promotion-renderer-mount.ts
+function createPromotionRendererMountTracker() {
+  let sawStartupLoader = false;
+  let mounted = false;
+  return {
+    observe(observation) {
+      if (mounted) return "mounted";
+      if (!observation.rootPresent) return "waiting";
+      if (observation.startupLoaderPresent) {
+        sawStartupLoader = true;
+        return "waiting";
+      }
+      if (sawStartupLoader && Number.isSafeInteger(observation.elementChildCount) && observation.elementChildCount > 0) {
+        mounted = true;
+      }
+      return mounted ? "mounted" : "waiting";
+    },
+    result() {
+      return mounted ? "mounted" : "waiting";
+    }
+  };
+}
+
 // src/preload/index.ts
 var BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
 var BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
@@ -5591,6 +6211,9 @@ var BROWSER_UI_BRIDGE_RESPONSE = "tweaker:browser-ui-bridge-response";
 var BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 var BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 var BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
+var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+var PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4e3;
 var DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 var DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
 var DESKTOP_SHOW_CONTEXT_MENU = "codex_desktop:show-context-menu";
@@ -5628,6 +6251,7 @@ function safeStringify2(v) {
   }
 }
 fileLog("preload entry", { url: location.href });
+var promotionNonce = promotionRendererNonce(location.href);
 try {
   installBrowserUiHostBridge();
   fileLog("browser UI host bridge installed");
@@ -5640,13 +6264,118 @@ try {
 } catch (e) {
   fileLog("react hook FAILED", String(e));
 }
-queueMicrotask(() => {
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", boot, { once: true });
-  } else {
-    boot();
+if (promotionNonce) {
+  schedulePromotionRendererProof(promotionNonce);
+} else {
+  queueMicrotask(() => {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", boot, { once: true });
+    } else {
+      boot();
+    }
+  });
+}
+function promotionRendererNonce(href) {
+  try {
+    const parsed = new URL(href);
+    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.pathname !== "/index.html") return null;
+    const nonce = parsed.searchParams.get(PROMOTION_RENDERER_NONCE_QUERY);
+    return nonce && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(nonce) ? nonce : null;
+  } catch {
+    return null;
   }
-});
+}
+function schedulePromotionRendererProof(nonce) {
+  const mount = createPromotionRendererMountTracker();
+  let observer = null;
+  let timeout = null;
+  let settled = false;
+  const cleanup = () => {
+    observer?.disconnect();
+    observer = null;
+    if (timeout !== null) window.clearTimeout(timeout);
+    timeout = null;
+  };
+  const inspect = () => {
+    if (settled) return;
+    const root = document.getElementById("root");
+    const state2 = mount.observe({
+      rootPresent: root !== null,
+      startupLoaderPresent: root !== null && root.querySelector(":scope > .startup-loader") !== null,
+      elementChildCount: root?.children.length ?? 0
+    });
+    if (state2 !== "mounted") return;
+    settled = true;
+    cleanup();
+    const rendererStorageSelfTest = promotionRendererStorageSelfTest(nonce);
+    import_electron5.ipcRenderer.send(PROMOTION_RENDERER_IPC_CHANNEL, {
+      nonce,
+      url: location.href,
+      lifecycle: "renderer-mounted",
+      rendererStorageSelfTest
+    });
+    fileLog("promotion renderer mount proof sent", { rendererStorageSelfTest });
+  };
+  queueMicrotask(() => {
+    const observationRoot = document.documentElement;
+    if (!observationRoot) {
+      fileLog("promotion renderer mount proof incomplete", { reason: "document root unavailable" });
+      return;
+    }
+    observer = new MutationObserver(inspect);
+    observer.observe(observationRoot, { childList: true, subtree: true });
+    timeout = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fileLog("promotion renderer mount proof incomplete", {
+        reason: "startup loader was not replaced by renderer content",
+        timeoutMs: PROMOTION_RENDERER_MOUNT_TIMEOUT_MS
+      });
+    }, PROMOTION_RENDERER_MOUNT_TIMEOUT_MS);
+    inspect();
+  });
+}
+function promotionRendererStorageSelfTest(nonce) {
+  const suffix = `promotion-health-${nonce}`;
+  const currentId = `co.tweakers.${suffix}`;
+  const currentKey = `tweaker:storage:${currentId}`;
+  const legacyKey = `${["codex", "pp"].join("")}:storage:co.promotion-probe.${suffix}`;
+  const raw = JSON.stringify({ retained: true, nonce });
+  let archiveKey = null;
+  let ownsProbeKeys = false;
+  try {
+    if (localStorage.getItem(currentKey) !== null || localStorage.getItem(legacyKey) !== null) return "fail";
+    ownsProbeKeys = true;
+    localStorage.setItem(legacyKey, raw);
+    const prepared = prepareRendererStorageMigration(currentId, localStorage, nonce);
+    if (prepared.status !== "prepared" || prepared.holdPromotion || localStorage.getItem(currentKey) !== raw) return "fail";
+    const committed = commitRendererStorageMigration(prepared, localStorage);
+    archiveKey = committed.archiveKey;
+    if (committed.phase !== "committed" || !archiveKey || localStorage.getItem(legacyKey) !== null) return "fail";
+    const rolledBack = rollbackRendererStorageMigration(committed, localStorage);
+    return rolledBack.phase === "rolled_back" && localStorage.getItem(legacyKey) === raw && localStorage.getItem(currentKey) === null && localStorage.getItem(archiveKey) === null ? "pass" : "fail";
+  } catch {
+    return "fail";
+  } finally {
+    if (ownsProbeKeys) {
+      try {
+        localStorage.removeItem(currentKey);
+      } catch {
+      }
+      try {
+        localStorage.removeItem(legacyKey);
+      } catch {
+      }
+      if (archiveKey) {
+        try {
+          localStorage.removeItem(archiveKey);
+        } catch {
+        }
+      }
+    }
+  }
+}
 async function boot() {
   fileLog("boot start", { readyState: document.readyState });
   try {

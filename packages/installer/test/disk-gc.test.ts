@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  installTransactionSweepDirectories,
   runInstallTransaction,
   sweepStaleTempDirs,
 } from "../src/transaction";
@@ -112,6 +113,27 @@ test("sweepStaleTempDirs removes only dead-PID temp dirs older than 24h", () => 
 
   assert.deepEqual(removedPaths, expected);
   assert.deepEqual(removed, expected);
+});
+
+test("candidate-only sweeping cannot mutate the source app parent", () => {
+  const input = {
+    appRoot: "/preserved/OpenAI/ChatGPT.app",
+    runtimeRoot: "/private/tmp/candidate/runtime",
+    workRoot: "/private/tmp/candidate/transactions/app-install",
+  };
+  assert.deepEqual(installTransactionSweepDirectories({ ...input, candidateOnly: true }), [
+    "/private/tmp/candidate",
+    "/private/tmp/candidate/transactions/app-install",
+  ]);
+  assert.deepEqual(installTransactionSweepDirectories({ ...input, signingMode: "adhoc" }), [
+    "/private/tmp/candidate",
+    "/private/tmp/candidate/transactions/app-install",
+  ]);
+  assert.deepEqual(installTransactionSweepDirectories(input), [
+    "/preserved/OpenAI",
+    "/private/tmp/candidate",
+    "/private/tmp/candidate/transactions/app-install",
+  ]);
 });
 
 test("pruneParkedPatchedApps keeps only the newest parked copy", () => {

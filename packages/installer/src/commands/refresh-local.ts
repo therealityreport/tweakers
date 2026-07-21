@@ -5,7 +5,6 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ensureUserPaths } from "../paths.js";
 import { ensureModeCoordinatorConfigured } from "../switcher-setup.js";
 import { readConfigFile, updateConfigFile } from "../config.js";
-import { findSourceRoot } from "../source-root.js";
 import { installManagedRuntime, managedCliPath, managedSourceRoot, writeDevelopmentProvenanceHash } from "../managed-runtime.js";
 import { locateCodex } from "../platform.js";
 import { openCodex, quitCodex } from "../alerts.js";
@@ -34,6 +33,18 @@ interface WorkflowAdapters {
   promote(): void | Promise<void>;
   reopen(): void | Promise<void>;
   phase?(phase: RefreshPhase): void;
+}
+
+export interface RefreshLocalOptions {
+  source?: "smart" | "development" | "stable";
+  app?: string;
+  developmentRoot?: string;
+}
+
+export interface RefreshSelection {
+  selected: "development" | "stable";
+  sourceRoot: string;
+  developmentSourceRoot: string | null;
 }
 
 export async function runRefreshWorkflow(adapters: WorkflowAdapters): Promise<void> {
@@ -82,23 +93,25 @@ export function getLocalRefreshStatus(userRoot: string): LocalRefreshStatus {
   return status("current", false, developmentSourceRoot, "Local ChatGPT is current", refreshState);
 }
 
-export async function refreshLocal(opts: { source?: "smart" | "development" | "stable"; app?: string } = {}): Promise<void> {
+export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void> {
+  // An explicit root is invocation-scoped. Validate it before launchd handoff,
+  // then carry the original CLI argv through unchanged. In particular, do not
+  // consult or update the co-owned config.json development registration.
+  const explicitDevelopmentRoot = resolveExplicitDevelopmentRoot(opts);
   const paths = ensureUserPaths();
   // Refuse BEFORE the launchd handoff: a local refresh in ChatGPT mode would
   // rebuild and promote a patched bundle over the pristine official app.
   assertRefreshAllowedByMode(paths.stateFile, opts.app);
-  if (handoffRefreshLocalToLaunchd(paths.root)) return;
+  if (handoffRefreshLocalToLaunchd(paths.root, {}, explicitDevelopmentRoot === null ? undefined : {
+    source: "development",
+    developmentSourceRoot: explicitDevelopmentRoot,
+  })) return;
   await withLifecycleLock(lifecycleLockFile(paths.root), "local refresh", async () => {
   assertLifecycleReceiptsIdle(paths.root);
-  const current = getLocalRefreshStatus(paths.root);
-  // Smart selection prefers a registered development checkout even when it is
-  // hash-current: the stable path depends on a published release that may not
-  // exist or may lag the installed desktop. `--source stable` still forces it.
-  const selected: RefreshSource = opts.source === "development" ? "development"
-    : opts.source === "stable" ? "stable"
-    : current.source === "development" || current.developmentSourceRoot !== null ? "development" : "stable";
-  const sourceRoot = selected === "development" ? current.developmentSourceRoot : managedSourceRoot(paths.root);
-  if (!sourceRoot) throw new Error("No registered Tweakers development checkout is available");
+  const selection = explicitDevelopmentRoot === null
+    ? resolveRefreshSelection(paths.root, opts)
+    : explicitDevelopmentSelection(explicitDevelopmentRoot);
+  const { selected, sourceRoot } = selection;
   const lockFile = join(paths.root, "refresh-local.lock");
   const lock = acquireRefreshLock(lockFile);
   const stableStageRoot = join(paths.root, "refresh-stable-stage");
@@ -107,7 +120,7 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
     available: phase === "failed",
     source: selected,
     phase,
-    developmentSourceRoot: current.developmentSourceRoot,
+    developmentSourceRoot: selection.developmentSourceRoot,
     detail: phase === "complete" ? "Local ChatGPT refresh completed" : `Local refresh ${phase}`,
     error,
     checkedAt: new Date().toISOString(),
@@ -157,6 +170,88 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
     rmSync(stableStageRoot, { recursive: true, force: true });
   }
   });
+}
+
+export function resolveRefreshSelection(userRoot: string, opts: RefreshLocalOptions = {}): RefreshSelection {
+  const explicitDevelopmentRoot = resolveExplicitDevelopmentRoot(opts);
+  if (explicitDevelopmentRoot !== null) return explicitDevelopmentSelection(explicitDevelopmentRoot);
+
+  const current = getLocalRefreshStatus(userRoot);
+  // Smart selection prefers a registered development checkout even when it is
+  // hash-current: the stable path depends on a published release that may not
+  // exist or may lag the installed desktop. `--source stable` still forces it.
+  const selected = opts.source === "development" ? "development"
+    : opts.source === "stable" ? "stable"
+    : current.source === "development" || current.developmentSourceRoot !== null ? "development" : "stable";
+  const sourceRoot = selected === "development" ? current.developmentSourceRoot : managedSourceRoot(userRoot);
+  if (!sourceRoot) throw new Error("No registered Tweakers development checkout is available");
+  return {
+    selected,
+    sourceRoot,
+    developmentSourceRoot: current.developmentSourceRoot,
+  };
+}
+
+export function resolveExplicitDevelopmentRoot(opts: RefreshLocalOptions): string | null {
+  if (opts.developmentRoot === undefined) return null;
+  if (opts.source !== "development") {
+    throw new Error("--development-root is valid only with --source development");
+  }
+  const requested = opts.developmentRoot;
+  if (typeof requested !== "string" || requested.length === 0 || !isAbsolute(requested) || resolve(requested) !== requested) {
+    throw new Error("--development-root must be an exact absolute path to a Tweakers Git worktree");
+  }
+
+  let sourceRoot: string;
+  try {
+    sourceRoot = realpathSync(requested);
+  } catch {
+    throw new Error(`--development-root does not exist: ${requested}`);
+  }
+  if (sourceRoot !== requested || !statSync(sourceRoot).isDirectory()) {
+    throw new Error("--development-root must name an existing real directory without symlink or path aliases");
+  }
+
+  const rootPackage = readPackageRecord(join(sourceRoot, "package.json"));
+  const installerPackage = readPackageRecord(join(sourceRoot, "packages", "installer", "package.json"));
+  if (rootPackage?.name !== "@therealityreport/tweakers"
+    || !Array.isArray(rootPackage.workspaces)
+    || !rootPackage.workspaces.includes("packages/*")
+    || installerPackage?.name !== "@therealityreport/tweakers-installer") {
+    throw new Error(`--development-root is not a Tweakers package root: ${sourceRoot}`);
+  }
+
+  const git = spawnSync("git", ["-C", sourceRoot, "rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let gitRoot: string | null = null;
+  if (git.status === 0 && git.stdout.trim() !== "") {
+    try { gitRoot = realpathSync(git.stdout.trim()); } catch { gitRoot = null; }
+  }
+  if (gitRoot !== sourceRoot) {
+    throw new Error(`--development-root is not the root of a Tweakers Git worktree: ${sourceRoot}`);
+  }
+  return sourceRoot;
+}
+
+function explicitDevelopmentSelection(sourceRoot: string): RefreshSelection {
+  return {
+    selected: "development",
+    sourceRoot,
+    developmentSourceRoot: sourceRoot,
+  };
+}
+
+function readPackageRecord(path: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function assertRefreshAllowedByMode(stateFile: string, app?: string): void {
@@ -282,9 +377,15 @@ interface RefreshHandoffAdapters {
   submit(command: string, args: string[]): { status: number | null };
 }
 
+interface RefreshHandoffState {
+  source: RefreshSource;
+  developmentSourceRoot: string | null;
+}
+
 export function handoffRefreshLocalToLaunchd(
   userRoot: string,
   overrides: Partial<RefreshHandoffAdapters> = {},
+  state: RefreshHandoffState = { source: "current", developmentSourceRoot: null },
 ): boolean {
   const adapters: RefreshHandoffAdapters = {
     platform: process.platform,
@@ -302,9 +403,9 @@ export function handoffRefreshLocalToLaunchd(
   if (!cli) return false;
   writeRefreshState(userRoot, {
     available: false,
-    source: "current",
+    source: state.source,
     phase: "preparing",
-    developmentSourceRoot: null,
+    developmentSourceRoot: state.developmentSourceRoot,
     detail: "Local refresh handed off to launchd",
     error: null,
     checkedAt: new Date().toISOString(),

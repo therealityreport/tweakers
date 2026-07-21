@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -125,9 +125,24 @@ test("switcher mode indicator uses live bundle evidence instead of state.mode", 
 });
 
 test("switcher app passes ad-hoc codesign verification", { skip: process.platform !== "darwin" }, () => {
-  const result = spawnSync("codesign", ["--verify", "--strict", appRoot], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  assert.equal(result.status, 0, `codesign --verify failed: ${result.stderr}`);
+  // File Provider can reattach FinderInfo to the worktree copy after build.
+  // Verify an exact disposable copy outside that managed folder so the test
+  // measures the bundle seal, not workspace-provider metadata.
+  const directory = mkdtempSync(join(tmpdir(), "tweakers-switcher-signature-"));
+  try {
+    const candidate = join(directory, "Tweakers Switcher.app");
+    cpSync(appRoot, candidate, { recursive: true });
+    const clean = spawnSync("xattr", ["-cr", candidate], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.equal(clean.status, 0, `xattr cleanup failed: ${clean.stderr}`);
+    const result = spawnSync("codesign", ["--verify", "--strict", candidate], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.equal(result.status, 0, `codesign --verify failed: ${result.stderr}`);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

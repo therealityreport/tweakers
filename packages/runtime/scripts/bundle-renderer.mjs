@@ -31,7 +31,7 @@ await build({
   platform: "node",
   target: "node20",
   format: "cjs",
-  external: ["electron"],
+  external: ["electron", "original-fs"],
   sourcemap: "inline",
   minify: false,
   logLevel: "info",

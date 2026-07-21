@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 
 const repoRoot = process.cwd();
 const runtimeSource = readFileSync(resolve(repoRoot, "packages/runtime/src/main.ts"), "utf8");
@@ -107,11 +109,96 @@ test("source filesystem watcher defers reload while a dev snapshot is publishing
 test("source runtime exposes refresh status and starts the detached refresh CLI", () => {
   assert.match(runtimeSource, /ipcMain\.handle\("tweaker:get-refresh-status"/);
   assert.match(runtimeSource, /ipcMain\.handle\("tweaker:start-local-refresh"/);
-  assert.match(runtimeSource, /startInstalledCli\(cli, \["refresh-local"/);
+  assert.match(runtimeSource, /startLocalRefresh\(requested\)/);
+  assert.match(runtimeSource, /startInstalledCli\(dispatch\.cli, \["refresh-local", \.\.\.dispatch\.args\.slice\(1\)\]\)/);
   assert.match(runtimeSource, /tweaker:refresh-status-changed/);
   assert.match(runtimeSource, /chokidar\.watch\(\[/);
   assert.match(runtimeSource, /resolveLocalCliRuntime\(\{/);
   assert.match(runtimeSource, /localCliRuntime\(cli, \["refresh-status"\]\)/);
+});
+
+test("source refresh binding never resolves a promotion CLI from persisted development registration", () => {
+  const cli = extractFunctionBody(runtimeSource, "localRefreshCli");
+  const binding = extractFunctionBody(runtimeSource, "resolveLocalRefreshSourceBinding");
+
+  assert.match(cli, /LOCAL_REFRESH_SOURCE_BINDING\.cli/);
+  assert.doesNotMatch(cli, /developmentSourceRoot|readState\(/);
+  assert.match(binding, /readInstallerState\(\)\?\.sourceRoot/);
+  assert.match(binding, /realpathSync\(frozenRoot\)/);
+  assert.match(binding, /developmentRoot: exactRoot/);
+});
+
+test("registered dirty primary is disabled when it differs from the frozen runtime source", () => {
+  const normalize = extractFunctionBody(runtimeSource, "normalizeLocalRefreshStatus");
+
+  assert.match(normalize, /status\.developmentSourceRoot !== frozenRoot/);
+  assert.match(normalize, /available: false/);
+  assert.match(normalize, /source: "current"/);
+  assert.match(normalize, /Unsafe refresh source/);
+  assert.doesNotMatch(normalize, /writeState|developmentSourceRoot\s*=/);
+});
+
+test("verified development refresh preserves the exact CLI, root, and argv through dispatch", () => {
+  const dispatch = extractFunctionBody(runtimeSource, "buildLocalRefreshDispatch");
+  const start = extractFunctionBody(runtimeSource, "startLocalRefresh");
+
+  assert.match(dispatch, /status\.developmentSourceRoot !== developmentRoot/);
+  assert.match(dispatch, /cli: binding\.cli/);
+  assert.match(
+    dispatch,
+    /"refresh-local",\s*"--source", "development",\s*"--development-root", developmentRoot,\s*"--app", appRoot/s,
+  );
+  assert.match(start, /buildLocalRefreshDispatch\(status, requested, appRoot\)/);
+  assert.match(start, /dispatch\.args\[0\] !== "refresh-local"/);
+  assert.match(start, /startInstalledCli\(dispatch\.cli, \["refresh-local", \.\.\.dispatch\.args\.slice\(1\)\]\)/);
+});
+
+test("refresh dispatch rejects a dirty primary and carries the exact frozen root at runtime", () => {
+  const start = runtimeSource.indexOf("function buildLocalRefreshDispatch");
+  const end = runtimeSource.indexOf("async function startLocalRefresh", start);
+  assert.ok(start >= 0 && end > start, "missing refresh dispatch source");
+  const compiled = ts.transpileModule(
+    `${runtimeSource.slice(start, end)}\n(globalThis as any).__dispatch = buildLocalRefreshDispatch;`,
+    { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const frozenRoot = "/isolated/t11/tweakers";
+  const cli = `${frozenRoot}/packages/installer/dist/cli.js`;
+  const sandbox: Record<string, unknown> = {
+    LOCAL_REFRESH_SOURCE_BINDING: { cli, developmentRoot: frozenRoot, unsafeReason: null },
+  };
+  runInNewContext(compiled, sandbox);
+  const dispatch = sandbox.__dispatch as (
+    status: Record<string, unknown>,
+    requested: string,
+    appRoot: string,
+  ) => { cli: string; args: string[] };
+  const base = {
+    available: true,
+    source: "development",
+    phase: "idle",
+    detail: "Development checkout has unapplied runtime changes",
+    error: null,
+    checkedAt: "2026-07-21T00:00:00.000Z",
+  };
+
+  assert.throws(() => dispatch({
+    ...base,
+    developmentSourceRoot: "/Users/example/Projects/tweakers",
+  }, "smart", "/Applications/ChatGPT.app"), /not frozen to this runtime/);
+
+  const result = JSON.parse(JSON.stringify(dispatch({
+    ...base,
+    developmentSourceRoot: frozenRoot,
+  }, "smart", "/Applications/ChatGPT.app"))) as { cli: string; args: string[] };
+  assert.deepEqual(result, {
+    cli,
+    args: [
+      "refresh-local",
+      "--source", "development",
+      "--development-root", frozenRoot,
+      "--app", "/Applications/ChatGPT.app",
+    ],
+  });
 });
 
 test("bundled filesystem watcher reload delegates to lifecycle helper", () => {

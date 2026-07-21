@@ -145,6 +145,16 @@ function userRoot(): string {
   const legacyHome = process.env[LEGACY_HOME_ENV];
   if (legacyHome) return legacyHome;
 
+  // The repository test preload removes inherited installer-root aliases and
+  // supplies a process-local disposable fallback. Keep explicit aliases above
+  // authoritative so tests can still opt into their own fixture roots.
+  if (
+    process.env.TWEAKERS_TEST_ROOT_PRELOAD === "active"
+    && process.env.TWEAKERS_TEST_FALLBACK_ROOT
+  ) {
+    return process.env.TWEAKERS_TEST_FALLBACK_ROOT;
+  }
+
   const home = targetUserHome();
   switch (platform()) {
     case "darwin":

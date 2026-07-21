@@ -35,6 +35,7 @@ processes, and tweak-owned native modules.
 - [Common Commands](#common-commands)
 - [Where Files Live](#where-files-live)
 - [Writing Tweaks](#writing-tweaks)
+- [User Questions](#user-questions)
 - [Bundled Tweak Namespace](#bundled-tweak-namespace)
 - [Owl And Native Bridge](#owl-and-native-bridge)
 - [Browser Host Mode](#browser-host-mode)
@@ -243,6 +244,32 @@ tweaker dev ./my-tweak
 ```
 
 Full docs are in [Writing Tweaks](./docs/WRITING-TWEAKS.md).
+
+## User Questions
+
+The bundled User Questions tweak exposes
+`mcp__co_tweakers_user_questions__ask` for one bounded round of task-scoped
+preferences. Questions can include longer details, pros, cons, what each option
+gives up, an explicit Recommended marker, single- or multi-select choices,
+Other text, and an explicit Skip action.
+
+The enhanced card asks one question at a time and supports Back, review, Cancel,
+Resume, and Start over. If it cannot attach safely, the standard MCP form stays
+available with the same information and submitted-result contract. If no form
+is visibly acknowledged or the host returns an empty response, the tool reports
+a retryable `display_failed` result; it does not apply defaults or pretend the
+user skipped.
+
+Answers are preferences for the current task, not permanent rules. A conflicting
+constraint should be explained with its tradeoffs before the selected direction
+is materially changed. Question and answer content, Other text, raw task IDs,
+resume tokens, and drafts are excluded from diagnostic logs.
+
+The Settings page provides explicit, reversible policy controls. Preview is
+read-only; Apply requires its matching Preview and a separate click; Restore is
+also explicit. None of these actions restarts Codex automatically. See the
+[User Questions guide](./tweaks/user-questions/README.md) for the contract,
+fallback limits, draft retention, recovery behavior, and candidate checklist.
 
 ## Bundled Tweak Namespace
 

@@ -223,6 +223,8 @@ function createMcpRuntime(options = {}) {
       } catch {
         return toolError("submitted answers could not be finalized safely");
       }
+    } catch {
+      throw new BrokerProtocolError("request_failed");
     }
     return serializeToolResult(input, {
       status: "submitted",

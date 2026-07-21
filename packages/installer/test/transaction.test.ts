@@ -3,10 +3,42 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { archiveTransactionState, generateProductionHealthReceipt, probeNativeHealth, readProductionHealthReceipt, readTransactionState, runInstallTransaction, transactionLockFile, TransactionLockHeldError } from "../src/transaction";
+import {
+  archiveTransactionState,
+  generateProductionHealthReceipt,
+  probeNativeHealth,
+  PROMOTION_SURFACE_NAMES,
+  readProductionHealthReceipt,
+  readTransactionState,
+  runInstallTransaction,
+  transactionLockFile,
+  TransactionLockHeldError,
+  type ProductionHealthExpectationV2,
+} from "../src/transaction";
 import { createSignedBackupTransactionWiring, formatInvalidatedInstallError } from "../src/commands/install";
 
 type Health = { host: "pass" | "fail" | "unknown"; session: "pass" | "fail" | "unknown"; permissions: Record<string, "pass" | "fail" | "unknown"> };
+
+function promotionExpectation(): ProductionHealthExpectationV2 {
+  const after = Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name, index) => [
+    name,
+    name === "app" ? "a".repeat(64) : String((index + 1) % 10).repeat(64),
+  ])) as Record<(typeof PROMOTION_SURFACE_NAMES)[number], string>;
+  return {
+    schemaVersion: 2,
+    app: { version: "1.0.0", build: "fixture", hash: after.app },
+    requiredPermissions: ["accessibility"],
+    surfaces: Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [name, {
+      preimageHash: "0".repeat(64),
+      afterHash: after[name],
+    }])) as ProductionHealthExpectationV2["surfaces"],
+    userQuestions: {
+      id: "co.tweakers.user-questions",
+      version: "0.5.0",
+      payloadHash: "f".repeat(64),
+    },
+  };
+}
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "tweaker-transaction-"));
@@ -405,12 +437,39 @@ test("is idempotent after a successful promotion", async () => {
 test("candidate-only validates without promoting or opening the app", async () => {
   const f = fixture();
   try {
-    const injected = adapters();
+    let candidateHealthProbes = 0;
+    const injected = adapters({
+      probeCandidateHealth: (): Health => {
+        candidateHealthProbes += 1;
+        return { host: "pass", session: "pass", permissions: { accessibility: "pass" } };
+      },
+    });
     const result = await runInstallTransaction({ ...options(f), candidateOnly: true }, injected.adapters);
     assert.equal(result.status, "candidate-ready");
+    assert.equal(candidateHealthProbes, 1);
     assert.equal(injected.calls.includes("promoteCandidate"), false);
     assert.equal(injected.calls.includes("openApp"), false);
     assert.equal(result.state.pendingReason, "explicit-candidate-only");
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("candidate-only invalidates when disposable schema health fails", async () => {
+  const f = fixture();
+  try {
+    const injected = adapters({
+      probeCandidateHealth: (): Health => ({
+        host: "pass",
+        session: "unknown",
+        permissions: { accessibility: "pass" },
+      }),
+    });
+    const result = await runInstallTransaction({ ...options(f), candidateOnly: true }, injected.adapters);
+    assert.equal(result.status, "invalidated");
+    assert.match(result.state.failure ?? "", /candidate health: session health unknown/);
+    assert.equal(injected.calls.includes("promoteCandidate"), false);
+    assert.equal(injected.calls.includes("openApp"), false);
   } finally {
     clean(f.root);
   }
@@ -619,6 +678,99 @@ test("production health receipt requires mode 0600, fresh matching app/runtime i
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: new Date("2026-07-10T12:02:00.000Z") }).session, "unknown");
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, runtimeHash: "changed" }).host, "unknown");
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "changed" } }).host, "unknown");
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("schema-v2 production health accepts only the exact eight surfaces and canonical User Questions proof", () => {
+  const f = fixture();
+  try {
+    const receipt = join(f.root, "health-v2.json");
+    const expected = promotionExpectation();
+    const valid = {
+      schemaVersion: 2,
+      observedAt: "2026-07-10T12:00:00.000Z",
+      app: expected.app,
+      hostReady: "pass",
+      authenticatedSession: "pass",
+      declaredPermissions: { accessibility: "pass" },
+      surfaces: Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [name, {
+        preimageHash: expected.surfaces[name].preimageHash,
+        expectedHash: expected.surfaces[name].afterHash,
+        observedHash: expected.surfaces[name].afterHash,
+        status: "pass",
+      }])),
+      userQuestions: {
+        expected: expected.userQuestions,
+        observed: expected.userQuestions,
+        identity: "pass",
+        mainLifecycle: "pass",
+        brokerSelfTest: "pass",
+        schemaSelfTest: "pass",
+        rendererStorageSelfTest: "pass",
+        mcpConflictCount: 0,
+        zeroMcpConflicts: "pass",
+      },
+      promotionReady: "pass",
+    };
+    writeFileSync(receipt, JSON.stringify(valid), { mode: 0o600 });
+    chmodSync(receipt, 0o600);
+
+    assert.deepEqual(readProductionHealthReceipt(receipt, expected, {
+      now: new Date("2026-07-10T12:00:30.000Z"),
+    }), {
+      host: "pass",
+      session: "pass",
+      permissions: { accessibility: "pass" },
+      promotionReady: "pass",
+    });
+
+    const missingSurface = structuredClone(valid);
+    delete (missingSurface.surfaces as Record<string, unknown>).policy;
+    writeFileSync(receipt, JSON.stringify(missingSurface), { mode: 0o600 });
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "unknown");
+
+    const conflicting = structuredClone(valid);
+    conflicting.userQuestions.mcpConflictCount = 1;
+    conflicting.userQuestions.zeroMcpConflicts = "fail";
+    conflicting.promotionReady = "fail";
+    writeFileSync(receipt, JSON.stringify(conflicting), { mode: 0o600 });
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "fail");
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("strict v2 transaction accepts sidecars only after health and rolls them back on acceptance CAS failure", async () => {
+  const f = fixture();
+  try {
+    const calls: string[] = [];
+    const pass: Health & { promotionReady: "pass" } = {
+      host: "pass",
+      session: "pass",
+      permissions: { accessibility: "pass" },
+      promotionReady: "pass",
+    };
+    const injected = adapters({
+      probeCandidateHealth: () => pass,
+      probeHealth: () => pass,
+      acceptPromotion: () => {
+        calls.push("acceptPromotion");
+        throw new Error("snapshot CAS changed");
+      },
+      rollbackPromotion: () => calls.push("rollbackPromotion"),
+      restoreApp: () => calls.push("restoreApp"),
+      restoreRuntime: () => calls.push("restoreRuntime"),
+    });
+    const result = await runInstallTransaction({
+      ...options(f),
+      requirePromotionHealthV2: true,
+    }, injected.adapters);
+
+    assert.equal(result.status, "rolled-back");
+    assert.match(result.state.failure ?? "", /promotion acceptance: snapshot CAS changed/);
+    assert.deepEqual(calls, ["acceptPromotion", "rollbackPromotion", "restoreApp", "restoreRuntime"]);
   } finally {
     clean(f.root);
   }

@@ -179,10 +179,10 @@ var require_readdirp = __commonJS({
       }
       async _formatEntry(dirent, path) {
         let entry;
-        const basename6 = this._isDirent ? dirent.name : dirent;
+        const basename7 = this._isDirent ? dirent.name : dirent;
         try {
-          const fullPath = (0, node_path_1.resolve)((0, node_path_1.join)(path, basename6));
-          entry = { path: (0, node_path_1.relative)(this._root, fullPath), fullPath, basename: basename6 };
+          const fullPath = (0, node_path_1.resolve)((0, node_path_1.join)(path, basename7));
+          entry = { path: (0, node_path_1.relative)(this._root, fullPath), fullPath, basename: basename7 };
           entry[this._statsProp] = this._isDirent ? dirent : await this._stat(fullPath);
         } catch (err) {
           this._onError(err);
@@ -252,9 +252,9 @@ var require_readdirp = __commonJS({
       return new ReaddirpStream2(options);
     }
     function readdirpPromise(root, options = {}) {
-      return new Promise((resolve7, reject) => {
+      return new Promise((resolve8, reject) => {
         const files = [];
-        readdirp2(root, options).on("data", (entry) => files.push(entry)).on("end", () => resolve7(files)).on("error", (error) => reject(error));
+        readdirp2(root, options).on("data", (entry) => files.push(entry)).on("end", () => resolve8(files)).on("error", (error) => reject(error));
       });
     }
     exports2.default = readdirp2;
@@ -739,9 +739,9 @@ var require_handler = __commonJS({
       _watchWithNodeFs(path, listener) {
         const opts = this.fsw.options;
         const directory = sysPath3.dirname(path);
-        const basename6 = sysPath3.basename(path);
+        const basename7 = sysPath3.basename(path);
         const parent = this.fsw._getWatchedDir(directory);
-        parent.add(basename6);
+        parent.add(basename7);
         const absolutePath = sysPath3.resolve(path);
         const options = {
           persistent: opts.persistent
@@ -751,7 +751,7 @@ var require_handler = __commonJS({
         let closer;
         if (opts.usePolling) {
           const enableBin = opts.interval !== opts.binaryInterval;
-          options.interval = enableBin && isBinaryPath2(basename6) ? opts.binaryInterval : opts.interval;
+          options.interval = enableBin && isBinaryPath2(basename7) ? opts.binaryInterval : opts.interval;
           closer = setFsWatchFileListener2(path, absolutePath, options, {
             listener,
             rawEmitter: this.fsw._emitRaw
@@ -774,10 +774,10 @@ var require_handler = __commonJS({
           return;
         }
         const dirname9 = sysPath3.dirname(file);
-        const basename6 = sysPath3.basename(file);
+        const basename7 = sysPath3.basename(file);
         const parent = this.fsw._getWatchedDir(dirname9);
         let prevStats = stats;
-        if (parent.has(basename6))
+        if (parent.has(basename7))
           return;
         const listener = async (path, newStats) => {
           if (!this.fsw._throttle(THROTTLE_MODE_WATCH2, file, 5))
@@ -802,9 +802,9 @@ var require_handler = __commonJS({
                 prevStats = newStats2;
               }
             } catch (error) {
-              this.fsw._remove(dirname9, basename6);
+              this.fsw._remove(dirname9, basename7);
             }
-          } else if (parent.has(basename6)) {
+          } else if (parent.has(basename7)) {
             const at2 = newStats.atimeMs;
             const mt2 = newStats.mtimeMs;
             if (!at2 || at2 <= mt2 || mt2 !== prevStats.mtimeMs) {
@@ -898,7 +898,7 @@ var require_handler = __commonJS({
             this._addToNodeFs(path, initialAdd, wh, depth + 1);
           }
         }).on(EV2.ERROR, this._boundHandleError);
-        return new Promise((resolve7, reject) => {
+        return new Promise((resolve8, reject) => {
           if (!stream)
             return reject();
           stream.once(exports2.STR_END, () => {
@@ -907,7 +907,7 @@ var require_handler = __commonJS({
               return;
             }
             const wasThrottled = throttler ? throttler.clear() : false;
-            resolve7(void 0);
+            resolve8(void 0);
             previous.getChildren().filter((item) => {
               return item !== directory && !current.has(item);
             }).forEach((item) => {
@@ -1066,11 +1066,11 @@ var require_chokidar = __commonJS({
           if (matcher.path === string)
             return true;
           if (matcher.recursive) {
-            const relative8 = sysPath3.relative(matcher.path, string);
-            if (!relative8) {
+            const relative9 = sysPath3.relative(matcher.path, string);
+            if (!relative9) {
               return false;
             }
-            return !relative8.startsWith("..") && !sysPath3.isAbsolute(relative8);
+            return !relative9.startsWith("..") && !sysPath3.isAbsolute(relative9);
           }
           return false;
         };
@@ -1757,8 +1757,9 @@ var require_chokidar = __commonJS({
 // src/main.ts
 var import_electron4 = require("electron");
 var import_node_fs22 = require("node:fs");
+var originalFs = __toESM(require("original-fs"));
 var import_node_child_process4 = require("node:child_process");
-var import_node_crypto9 = require("node:crypto");
+var import_node_crypto10 = require("node:crypto");
 var import_node_path26 = require("node:path");
 var import_node_os3 = require("node:os");
 var import_node_stream3 = require("node:stream");
@@ -4816,10 +4817,10 @@ var ReaddirpStream = class extends import_node_stream2.Readable {
   }
   async _formatEntry(dirent, path) {
     let entry;
-    const basename6 = this._isDirent ? dirent.name : dirent;
+    const basename7 = this._isDirent ? dirent.name : dirent;
     try {
-      const fullPath = (0, import_node_path10.resolve)((0, import_node_path10.join)(path, basename6));
-      entry = { path: (0, import_node_path10.relative)(this._root, fullPath), fullPath, basename: basename6 };
+      const fullPath = (0, import_node_path10.resolve)((0, import_node_path10.join)(path, basename7));
+      entry = { path: (0, import_node_path10.relative)(this._root, fullPath), fullPath, basename: basename7 };
       entry[this._statsProp] = this._isDirent ? dirent : await this._stat(fullPath);
     } catch (err) {
       this._onError(err);
@@ -5358,9 +5359,9 @@ var NodeFsHandler = class {
   _watchWithNodeFs(path, listener) {
     const opts = this.fsw.options;
     const directory = sysPath.dirname(path);
-    const basename6 = sysPath.basename(path);
+    const basename7 = sysPath.basename(path);
     const parent = this.fsw._getWatchedDir(directory);
-    parent.add(basename6);
+    parent.add(basename7);
     const absolutePath = sysPath.resolve(path);
     const options = {
       persistent: opts.persistent
@@ -5370,7 +5371,7 @@ var NodeFsHandler = class {
     let closer;
     if (opts.usePolling) {
       const enableBin = opts.interval !== opts.binaryInterval;
-      options.interval = enableBin && isBinaryPath(basename6) ? opts.binaryInterval : opts.interval;
+      options.interval = enableBin && isBinaryPath(basename7) ? opts.binaryInterval : opts.interval;
       closer = setFsWatchFileListener(path, absolutePath, options, {
         listener,
         rawEmitter: this.fsw._emitRaw
@@ -5393,10 +5394,10 @@ var NodeFsHandler = class {
       return;
     }
     const dirname9 = sysPath.dirname(file);
-    const basename6 = sysPath.basename(file);
+    const basename7 = sysPath.basename(file);
     const parent = this.fsw._getWatchedDir(dirname9);
     let prevStats = stats;
-    if (parent.has(basename6))
+    if (parent.has(basename7))
       return;
     const listener = async (path, newStats) => {
       if (!this.fsw._throttle(THROTTLE_MODE_WATCH, file, 5))
@@ -5421,9 +5422,9 @@ var NodeFsHandler = class {
             prevStats = newStats2;
           }
         } catch (error) {
-          this.fsw._remove(dirname9, basename6);
+          this.fsw._remove(dirname9, basename7);
         }
-      } else if (parent.has(basename6)) {
+      } else if (parent.has(basename7)) {
         const at2 = newStats.atimeMs;
         const mt2 = newStats.mtimeMs;
         if (!at2 || at2 <= mt2 || mt2 !== prevStats.mtimeMs) {
@@ -5517,7 +5518,7 @@ var NodeFsHandler = class {
         this._addToNodeFs(path, initialAdd, wh, depth + 1);
       }
     }).on(EV.ERROR, this._boundHandleError);
-    return new Promise((resolve7, reject) => {
+    return new Promise((resolve8, reject) => {
       if (!stream)
         return reject();
       stream.once(STR_END, () => {
@@ -5526,7 +5527,7 @@ var NodeFsHandler = class {
           return;
         }
         const wasThrottled = throttler ? throttler.clear() : false;
-        resolve7(void 0);
+        resolve8(void 0);
         previous.getChildren().filter((item) => {
           return item !== directory && !current.has(item);
         }).forEach((item) => {
@@ -5670,11 +5671,11 @@ function createPattern(matcher) {
       if (matcher.path === string)
         return true;
       if (matcher.recursive) {
-        const relative8 = sysPath2.relative(matcher.path, string);
-        if (!relative8) {
+        const relative9 = sysPath2.relative(matcher.path, string);
+        if (!relative9) {
           return false;
         }
-        return !relative8.startsWith("..") && !sysPath2.isAbsolute(relative8);
+        return !relative9.startsWith("..") && !sysPath2.isAbsolute(relative9);
       }
       return false;
     };
@@ -6479,8 +6480,71 @@ function removeLegacyModeSwitcherState(rootDir) {
   }
 }
 
-// src/mcp-reconciliation.ts
+// src/health-probe-keychain.ts
+var HEALTH_PROBE_MOCK_KEYCHAIN_SWITCH = "use-mock-keychain";
+function applyHealthProbeKeychainIsolation(input) {
+  if (!input.healthCheckOnly || input.platform !== "darwin") return false;
+  if (!input.commandLine.hasSwitch(HEALTH_PROBE_MOCK_KEYCHAIN_SWITCH)) {
+    input.commandLine.appendSwitch(HEALTH_PROBE_MOCK_KEYCHAIN_SWITCH);
+  }
+  if (!input.commandLine.hasSwitch(HEALTH_PROBE_MOCK_KEYCHAIN_SWITCH)) {
+    throw new Error("health-only Electron process could not enable mock Keychain isolation");
+  }
+  return true;
+}
+
+// src/promotion-asar.ts
 var import_node_crypto2 = require("node:crypto");
+var nodeFs = __toESM(require("node:fs"));
+function readExactly(fileSystem, descriptor, buffer, position, truncatedMessage) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const remaining = buffer.length - offset;
+    const bytesRead = fileSystem.readSync(
+      descriptor,
+      buffer,
+      offset,
+      remaining,
+      position + offset
+    );
+    if (!Number.isInteger(bytesRead) || bytesRead < 0 || bytesRead > remaining) {
+      throw new Error("promotion ASAR read result is invalid");
+    }
+    if (bytesRead === 0) throw new Error(truncatedMessage);
+    offset += bytesRead;
+  }
+}
+function hashRawAsarHeader(archivePath, fileSystem = nodeFs) {
+  const stat4 = fileSystem.lstatSync(archivePath);
+  if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size < 16) {
+    throw new Error("promotion app surface is not a regular ASAR archive");
+  }
+  const descriptor = fileSystem.openSync(archivePath, "r");
+  try {
+    const sizeBuffer = Buffer.alloc(8);
+    readExactly(fileSystem, descriptor, sizeBuffer, 0, "promotion ASAR size pickle is truncated");
+    if (sizeBuffer.readUInt32LE(0) !== 4) throw new Error("promotion ASAR size pickle is invalid");
+    const headerSize = sizeBuffer.readUInt32LE(4);
+    if (headerSize < 8 || headerSize > 64 * 1024 * 1024 || headerSize + 8 > stat4.size) {
+      throw new Error("promotion ASAR header size is invalid");
+    }
+    const headerBuffer = Buffer.alloc(headerSize);
+    readExactly(fileSystem, descriptor, headerBuffer, 8, "promotion ASAR header is truncated");
+    const payloadSize = headerBuffer.readUInt32LE(0);
+    const stringSize = headerBuffer.readInt32LE(4);
+    if (payloadSize < 4 || payloadSize > headerSize - 4 || stringSize <= 0 || stringSize > payloadSize - 4) {
+      throw new Error("promotion ASAR header pickle is invalid");
+    }
+    const headerString = headerBuffer.subarray(8, 8 + stringSize).toString("utf8");
+    JSON.parse(headerString);
+    return (0, import_node_crypto2.createHash)("sha256").update(headerString).digest("hex");
+  } finally {
+    fileSystem.closeSync(descriptor);
+  }
+}
+
+// src/mcp-reconciliation.ts
+var import_node_crypto3 = require("node:crypto");
 var import_node_fs10 = require("node:fs");
 var import_node_path14 = require("node:path");
 var import_node_util = require("node:util");
@@ -6490,8 +6554,11 @@ var import_node_fs9 = require("node:fs");
 var import_node_path13 = require("node:path");
 var MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 var MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
-var USER_QUESTIONS_APPROVAL_POLICY = "approval_policy = { granular = { sandbox_approval = false, rules = false, skill_approval = false, request_permissions = false, mcp_elicitations = true } }";
-var USER_QUESTIONS_SANDBOX_MODE = 'sandbox_mode = "danger-full-access"';
+var USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
+var RESERVED_MANAGED_MCP_ENV_KEYS = [
+  "TWEAKER_TWEAK_DATA_DIR",
+  "TWEAKER_TWEAK_ID"
+];
 var LEGACY_MCP_MANAGED_START = ["# BEGIN CODEX", "++ MANAGED MCP SERVERS"].join("");
 var LEGACY_MCP_MANAGED_END = ["# END CODEX", "++ MANAGED MCP SERVERS"].join("");
 var activeMcpConfigMutations = /* @__PURE__ */ new Set();
@@ -6532,11 +6599,11 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
     const legacyName = legacyMcpServerName(tweak.manifest.id);
     const legacyTables = legacyName ? tables.filter((table) => table.name === legacyName) : [];
     const nestedLegacyTables = legacyName ? tables.filter((table) => table.name.startsWith(`${legacyName}.`)) : [];
-    const ownedLegacySpec = legacyTables.length === 1 && nestedLegacyTables.length === 0 ? matchingMcpTableSpec(legacyTables[0], tweak.dir, mcp) : null;
+    const ownedLegacySpec = legacyTables.length === 1 && nestedLegacyTables.length === 0 ? matchingMcpTableSpec(legacyTables[0], tweak.manifest.id, tweak.dir, mcp, true, tweak.dataDir) : null;
     const exactlyOwnedLegacy = ownedLegacySpec !== null;
     const priorManagedCanonicalTables = canonicalTables.length === 0 ? allTables.filter((table) => table.name === canonicalName) : [];
-    const priorManagedCanonicalSpec = priorManagedCanonicalTables.length === 1 ? matchingMcpTableSpec(priorManagedCanonicalTables[0], tweak.dir, mcp) : null;
-    const ownedCanonicalSpec = canonicalTables.length === 1 && nestedCanonicalTables.length === 0 ? matchingMcpTableSpec(canonicalTables[0], tweak.dir, mcp) : null;
+    const priorManagedCanonicalSpec = priorManagedCanonicalTables.length === 1 ? matchingMcpTableSpec(priorManagedCanonicalTables[0], tweak.manifest.id, tweak.dir, mcp, false, tweak.dataDir) : null;
+    const ownedCanonicalSpec = canonicalTables.length === 1 && nestedCanonicalTables.length === 0 ? matchingMcpTableSpec(canonicalTables[0], tweak.manifest.id, tweak.dir, mcp, false, tweak.dataDir) : null;
     const exactlyOwnedCanonical = ownedCanonicalSpec !== null;
     const observedOptions = ownedLegacySpec ?? ownedCanonicalSpec ?? priorManagedCanonicalSpec;
     if (observedOptions) {
@@ -6595,7 +6662,14 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
     }
     if (!desired) continue;
     appliedNames.push(canonicalName);
-    entries.push(formatMcpServer(canonicalName, tweak.dir, mcp, preservedOptions[canonicalName]));
+    entries.push(formatMcpServer(
+      canonicalName,
+      tweak.manifest.id,
+      tweak.dir,
+      mcp,
+      preservedOptions[canonicalName],
+      tweak.dataDir
+    ));
   }
   for (const range of [...rangesToRemove].sort((left, right) => right.start - left.start)) {
     manualToml = `${manualToml.slice(0, range.start)}${manualToml.slice(range.end)}`;
@@ -6620,83 +6694,20 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
 }
 var TOP_LEVEL_APPROVAL_POLICY_ASSIGNMENT = /^\s*(?:approval_policy|"approval_policy"|'approval_policy')\s*=/;
 var TOP_LEVEL_SANDBOX_MODE_ASSIGNMENT = /^\s*(?:sandbox_mode|"sandbox_mode"|'sandbox_mode')\s*=/;
-function planUserQuestionsApprovalPolicy({
-  currentToml,
-  candidateToml,
-  owned,
-  enabled,
-  preserved
-}) {
-  const currentAssignments = findTopLevelApprovalPolicies(currentToml);
-  const currentSandboxAssignments = findTopLevelSandboxModes(currentToml);
-  const beforeRaw = currentAssignments[0]?.raw ?? null;
-  const beforeSandboxModeRaw = currentSandboxAssignments[0]?.raw ?? null;
-  if (!owned) {
+function observeUserQuestionsApprovalPolicy(currentToml, preserved = null) {
+  const approvalAssignments = findTopLevelApprovalPolicies(currentToml);
+  const sandboxAssignments = findTopLevelSandboxModes(currentToml);
+  const beforeRaw = approvalAssignments[0]?.raw ?? null;
+  const sandboxModeRaw = sandboxAssignments[0]?.raw ?? null;
+  const receipt = unchangedApprovalPolicy(beforeRaw, preserved, sandboxModeRaw);
+  if (approvalAssignments.length > 1 || sandboxAssignments.length > 1) {
     return {
-      nextToml: candidateToml,
-      preserved: null,
-      receipt: unchangedApprovalPolicy(beforeRaw, null, beforeSandboxModeRaw)
+      ...receipt,
+      status: "conflict",
+      error: approvalAssignments.length > 1 ? "Duplicate top-level approval_policy assignments" : "Duplicate top-level sandbox_mode assignments"
     };
   }
-  if (currentAssignments.length > 1 || enabled && currentSandboxAssignments.length > 1) {
-    return {
-      nextToml: currentToml,
-      preserved,
-      receipt: {
-        ...unchangedApprovalPolicy(beforeRaw, preserved, beforeSandboxModeRaw),
-        status: "conflict",
-        error: currentAssignments.length > 1 ? "Duplicate top-level approval_policy assignments" : "Duplicate top-level sandbox_mode assignments"
-      }
-    };
-  }
-  if (enabled) {
-    const captured = preserved ?? {
-      present: currentAssignments.length === 1,
-      rawAssignment: beforeRaw
-    };
-    const withApprovalPolicy = replaceTopLevelApprovalPolicy(candidateToml, USER_QUESTIONS_APPROVAL_POLICY);
-    const nextToml2 = replaceTopLevelSandboxMode(withApprovalPolicy, USER_QUESTIONS_SANDBOX_MODE);
-    const afterRaw2 = findTopLevelApprovalPolicies(nextToml2)[0]?.raw ?? null;
-    const afterSandboxModeRaw2 = findTopLevelSandboxModes(nextToml2)[0]?.raw ?? null;
-    return {
-      nextToml: nextToml2,
-      preserved: captured,
-      receipt: {
-        status: nextToml2 === candidateToml ? "unchanged" : "managed",
-        beforeRaw,
-        afterRaw: afterRaw2,
-        preservedOriginalRaw: captured.rawAssignment,
-        preservedOriginalPresent: captured.present,
-        sandboxModeBeforeRaw: beforeSandboxModeRaw,
-        sandboxModeAfterRaw: afterSandboxModeRaw2,
-        restartRequired: nextToml2 !== candidateToml
-      }
-    };
-  }
-  if (!preserved) {
-    return {
-      nextToml: candidateToml,
-      preserved: null,
-      receipt: unchangedApprovalPolicy(beforeRaw, null, beforeSandboxModeRaw)
-    };
-  }
-  const nextToml = preserved.present && preserved.rawAssignment !== null ? replaceTopLevelApprovalPolicy(candidateToml, preserved.rawAssignment) : removeTopLevelApprovalPolicy(candidateToml);
-  const afterRaw = findTopLevelApprovalPolicies(nextToml)[0]?.raw ?? null;
-  const afterSandboxModeRaw = findTopLevelSandboxModes(nextToml)[0]?.raw ?? null;
-  return {
-    nextToml,
-    preserved: null,
-    receipt: {
-      status: nextToml === candidateToml ? "unchanged" : "restored",
-      beforeRaw,
-      afterRaw,
-      preservedOriginalRaw: preserved.rawAssignment,
-      preservedOriginalPresent: preserved.present,
-      sandboxModeBeforeRaw: beforeSandboxModeRaw,
-      sandboxModeAfterRaw: afterSandboxModeRaw,
-      restartRequired: nextToml !== candidateToml
-    }
-  };
+  return receipt;
 }
 function unchangedApprovalPolicy(raw, preserved, sandboxModeRaw = null) {
   return {
@@ -6751,32 +6762,6 @@ function findTopLevelAssignments(toml, assignmentPattern) {
     });
   }
   return assignments;
-}
-function replaceTopLevelApprovalPolicy(toml, raw) {
-  return replaceTopLevelAssignment(toml, raw, findTopLevelApprovalPolicies(toml));
-}
-function replaceTopLevelSandboxMode(toml, raw) {
-  return replaceTopLevelAssignment(toml, raw, findTopLevelSandboxModes(toml));
-}
-function replaceTopLevelAssignment(toml, raw, assignments) {
-  if (assignments.length > 1) return toml;
-  const existing = assignments[0];
-  if (existing) {
-    return `${toml.slice(0, existing.start)}${raw}${existing.lineEnding}${toml.slice(existing.end)}`;
-  }
-  const firstTableOrManagedBlock = classifyTomlLines(toml).find((line) => line.structural && (/^\s*\[/.test(line.text) || line.text.trim() === MCP_MANAGED_START || line.text.trim() === LEGACY_MCP_MANAGED_START));
-  const insertion = firstTableOrManagedBlock?.start ?? toml.length;
-  const prefix = toml.slice(0, insertion);
-  const separator = prefix && !/[\r\n]$/.test(prefix) ? "\n" : "";
-  const beforeManagedBlock = firstTableOrManagedBlock !== void 0 && [MCP_MANAGED_START, LEGACY_MCP_MANAGED_START].includes(firstTableOrManagedBlock.text.trim());
-  return `${prefix}${separator}${raw}
-${beforeManagedBlock ? "\n" : ""}${toml.slice(insertion)}`;
-}
-function removeTopLevelApprovalPolicy(toml) {
-  const assignments = findTopLevelApprovalPolicies(toml);
-  if (assignments.length !== 1) return toml;
-  const existing = assignments[0];
-  return `${toml.slice(0, existing.start)}${toml.slice(existing.end)}`;
 }
 function indexOwnedMcpTweaks(tweaks) {
   const indexed = /* @__PURE__ */ new Map();
@@ -7216,15 +7201,18 @@ function legacyMcpServerName(tweakId) {
   const suffix = match[1].replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
   return suffix ? `co-thomashulihan-${suffix}` : null;
 }
-function matchingMcpTableSpec(table, tweakDir, mcp) {
+function matchingMcpTableSpec(table, tweakId, tweakDir, mcp, legacyComparison = false, dataDir) {
   const observed = parseMcpTableBody(table.body);
   if (!observed) return null;
+  const injectedEnv = managedMcpEnvironment(tweakId, tweakDir, {}, dataDir);
+  const observedEnv = legacyComparison ? withoutExactReservedManagedEnv(observed.env, injectedEnv) : observed.env;
+  if (!observedEnv) return null;
   const expected = {
     command: resolveCommand(tweakDir, mcp.command),
     args: (mcp.args ?? []).map((arg) => resolveArg(tweakDir, arg)),
-    env: mcp.env ?? {}
+    env: legacyComparison ? mcp.env ?? {} : managedMcpEnvironment(tweakId, tweakDir, mcp.env ?? {}, dataDir)
   };
-  return observed.command === expected.command && arraysEqual(observed.args, expected.args) && recordsEqual(observed.env, expected.env) ? observed : null;
+  return observed.command === expected.command && arraysEqual(observed.args, expected.args) && recordsEqual(observedEnv, expected.env) ? observed : null;
 }
 function parseMcpTableBody(body) {
   const fields = /* @__PURE__ */ new Map();
@@ -7291,10 +7279,12 @@ function normalizeMcpServer(value) {
   if (value.env !== void 0) {
     if (!value.env || typeof value.env !== "object" || Array.isArray(value.env)) return null;
     if (Object.values(value.env).some((envValue) => typeof envValue !== "string")) return null;
+    const reserved = RESERVED_MANAGED_MCP_ENV_KEYS.find((key) => Object.hasOwn(value.env, key));
+    if (reserved) throw new Error(`MCP environment variable ${reserved} is reserved for Tweakers`);
   }
   return value;
 }
-function formatMcpServer(serverName, tweakDir, mcp, preserved = {}) {
+function formatMcpServer(serverName, tweakId, tweakDir, mcp, preserved = {}, dataDir) {
   const lines = [
     `[mcp_servers.${formatTomlKey(serverName)}]`,
     `command = ${formatTomlString(resolveCommand(tweakDir, mcp.command))}`
@@ -7302,13 +7292,39 @@ function formatMcpServer(serverName, tweakDir, mcp, preserved = {}) {
   if (mcp.args && mcp.args.length > 0) {
     lines.push(`args = ${formatTomlStringArray(mcp.args.map((arg) => resolveArg(tweakDir, arg)))}`);
   }
-  if (mcp.env && Object.keys(mcp.env).length > 0) {
-    lines.push(`env = ${formatTomlInlineTable(mcp.env)}`);
-  }
+  lines.push(`env = ${formatTomlInlineTable(managedMcpEnvironment(tweakId, tweakDir, mcp.env ?? {}, dataDir))}`);
   if (preserved.defaultToolsApprovalMode === "approve") {
     lines.push('default_tools_approval_mode = "approve"');
   }
   return lines.join("\n");
+}
+function managedMcpEnvironment(tweakId, tweakDir, declared, dataDir) {
+  if (RESERVED_MANAGED_MCP_ENV_KEYS.some((key) => Object.hasOwn(declared, key))) {
+    throw new Error(`Tweak ${tweakId} may not override reserved managed MCP environment variables`);
+  }
+  return {
+    ...declared,
+    TWEAKER_TWEAK_DATA_DIR: managedMcpDataDir(tweakId, tweakDir, dataDir),
+    TWEAKER_TWEAK_ID: tweakId
+  };
+}
+function managedMcpDataDir(tweakId, tweakDir, explicit) {
+  if (explicit !== void 0) {
+    if (!(0, import_node_path13.isAbsolute)(explicit) || explicit.includes("\0")) {
+      throw new Error(`Tweak ${tweakId} has an invalid managed MCP data directory`);
+    }
+    return (0, import_node_path13.resolve)(explicit);
+  }
+  return (0, import_node_path13.resolve)(tweakDir, "..", "..", "tweak-data", tweakId);
+}
+function withoutExactReservedManagedEnv(observed, injected) {
+  const comparable = { ...observed };
+  for (const key of RESERVED_MANAGED_MCP_ENV_KEYS) {
+    if (!Object.hasOwn(comparable, key)) continue;
+    if (comparable[key] !== injected[key]) return null;
+    delete comparable[key];
+  }
+  return comparable;
 }
 function resolveCommand(tweakDir, command) {
   if ((0, import_node_path13.isAbsolute)(command) || !looksLikeRelativePath(command)) return command;
@@ -7345,6 +7361,115 @@ function unquoteTomlKey(key) {
 }
 
 // src/mcp-reconciliation.ts
+function userQuestionsMcpReceiptMatchesEnabledState(receipt, enabled) {
+  if (receipt.status === "conflict" || receipt.status === "error" || receipt.conflicts.length !== 0 || receipt.approvalPolicy.status !== "unchanged" || receipt.approvalPolicy.beforeRaw !== receipt.approvalPolicy.afterRaw || receipt.approvalPolicy.sandboxModeBeforeRaw !== receipt.approvalPolicy.sandboxModeAfterRaw || receipt.approvalPolicy.restartRequired) return false;
+  const desiredCount = receipt.desiredNames.filter((name) => name === USER_QUESTIONS_MCP_SERVER_NAME).length;
+  const appliedCount = receipt.appliedNames.filter((name) => name === USER_QUESTIONS_MCP_SERVER_NAME).length;
+  if (!enabled) return desiredCount === 0 && appliedCount === 0;
+  return desiredCount === 1 && appliedCount === 1;
+}
+var MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
+var MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+function resolveMcpRuntimePaths(options) {
+  const env = options.env ?? process.env;
+  const statePath = (0, import_node_path14.join)(options.userRoot, "mcp-sync-state.json");
+  const ordinaryCodexHome = (0, import_node_path14.join)(options.homeDirectory, ".codex");
+  const candidateOptIn = env[MCP_CANDIDATE_RECONCILIATION_ENV];
+  if (candidateOptIn === void 0 || candidateOptIn === "") {
+    return {
+      codexHome: ordinaryCodexHome,
+      configPath: (0, import_node_path14.join)(ordinaryCodexHome, "config.toml"),
+      statePath,
+      candidateIsolated: false
+    };
+  }
+  if (candidateOptIn !== "1") {
+    throw new Error(`${MCP_CANDIDATE_RECONCILIATION_ENV} must be exactly 1`);
+  }
+  const candidateCodexHome = env[MCP_CANDIDATE_CODEX_HOME_ENV];
+  if (!candidateCodexHome) {
+    throw new Error(
+      `${MCP_CANDIDATE_CODEX_HOME_ENV} is required for candidate MCP reconciliation`
+    );
+  }
+  assertExactAbsolutePath(options.userRoot, "Tweakers candidate user root");
+  assertExactAbsolutePath(candidateCodexHome, "Candidate CODEX_HOME");
+  assertExistingDirectoryWithoutSymlinks(options.userRoot, "Tweakers candidate user root");
+  assertPathHasNoExistingSymlink(candidateCodexHome, "Candidate CODEX_HOME");
+  if (!isStrictDescendant(options.userRoot, candidateCodexHome)) {
+    throw new Error("Candidate CODEX_HOME must be contained under the Tweakers candidate user root");
+  }
+  const resolvedCandidateHome = resolveThroughExistingAncestor(candidateCodexHome);
+  const resolvedOrdinaryHome = resolveThroughExistingAncestor(ordinaryCodexHome);
+  if (resolvedCandidateHome === resolvedOrdinaryHome || isStrictDescendant(resolvedOrdinaryHome, resolvedCandidateHome) || isStrictDescendant(resolvedCandidateHome, resolvedOrdinaryHome)) {
+    throw new Error("Candidate CODEX_HOME must not resolve to or contain the real ~/.codex directory");
+  }
+  if ((0, import_node_fs10.existsSync)(candidateCodexHome) && !(0, import_node_fs10.lstatSync)(candidateCodexHome).isDirectory()) {
+    throw new Error("Candidate CODEX_HOME must be a directory when it already exists");
+  }
+  const configPath = (0, import_node_path14.join)(candidateCodexHome, "config.toml");
+  assertPathHasNoExistingSymlink(configPath, "Candidate Codex config");
+  assertPathHasNoExistingSymlink(statePath, "Candidate MCP receipt");
+  assertRegularFileWhenPresent(configPath, "Candidate Codex config");
+  assertRegularFileWhenPresent(statePath, "Candidate MCP receipt");
+  return {
+    codexHome: candidateCodexHome,
+    configPath,
+    statePath,
+    candidateIsolated: true
+  };
+}
+function assertExactAbsolutePath(path, label) {
+  if (!path || path.includes("\0") || !(0, import_node_path14.isAbsolute)(path) || (0, import_node_path14.resolve)(path) !== path) {
+    throw new Error(`${label} must be an exact normalized absolute path`);
+  }
+}
+function assertExistingDirectoryWithoutSymlinks(path, label) {
+  if (!(0, import_node_fs10.existsSync)(path) || !(0, import_node_fs10.lstatSync)(path).isDirectory()) {
+    throw new Error(`${label} must already exist as a directory`);
+  }
+  if ((0, import_node_fs10.lstatSync)(path).isSymbolicLink() || resolveThroughExistingAncestor(path) !== path) {
+    throw new Error(`${label} must not contain symbolic-link components`);
+  }
+}
+function assertPathHasNoExistingSymlink(path, label) {
+  const pathStat = lstatIfPresent(path);
+  if (pathStat?.isSymbolicLink() || resolveThroughExistingAncestor(path) !== path) {
+    throw new Error(`${label} must not contain symbolic-link components`);
+  }
+}
+function assertRegularFileWhenPresent(path, label) {
+  const pathStat = lstatIfPresent(path);
+  if (pathStat && !pathStat.isFile()) {
+    throw new Error(`${label} must be a regular file when it already exists`);
+  }
+  if (pathStat && pathStat.nlink !== 1) {
+    throw new Error(`${label} must not be hard-linked`);
+  }
+}
+function lstatIfPresent(path) {
+  try {
+    return (0, import_node_fs10.lstatSync)(path);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+function resolveThroughExistingAncestor(path) {
+  let ancestor = path;
+  const missing = [];
+  while (!(0, import_node_fs10.existsSync)(ancestor)) {
+    const parent = (0, import_node_path14.dirname)(ancestor);
+    if (parent === ancestor) break;
+    missing.unshift((0, import_node_path14.basename)(ancestor));
+    ancestor = parent;
+  }
+  return (0, import_node_path14.resolve)((0, import_node_fs10.realpathSync)(ancestor), ...missing);
+}
+function isStrictDescendant(root, candidate) {
+  const remainder = (0, import_node_path14.relative)(root, candidate);
+  return remainder.length > 0 && remainder !== ".." && !remainder.startsWith(`..${import_node_path14.sep}`) && !(0, import_node_path14.isAbsolute)(remainder);
+}
 function reconcileMcpConfig(options, dependencies = {}) {
   return withMcpConfigMutationLock(
     options.configPath,
@@ -7364,7 +7489,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
     durablePreservedApprovalPolicy
   );
   const now = dependencies.now ?? (() => /* @__PURE__ */ new Date());
-  const transactionId = dependencies.transactionId?.() ?? (0, import_node_crypto2.randomUUID)();
+  const transactionId = dependencies.transactionId?.() ?? (0, import_node_crypto3.randomUUID)();
   const startedAt = now().toISOString();
   let beforeBytes = readBytesIfExists(options.configPath);
   let beforeFingerprint = fingerprint(beforeBytes);
@@ -7577,7 +7702,7 @@ function retireCurrentConfig(configPath, expectedFingerprint) {
     fsyncDirectory((0, import_node_path14.dirname)(configPath));
     return retiredPath2;
   }
-  const retiredPath = retiredConfigPath(configPath, (0, import_node_crypto2.randomUUID)(), expectedFingerprint);
+  const retiredPath = retiredConfigPath(configPath, (0, import_node_crypto3.randomUUID)(), expectedFingerprint);
   const baseline = (0, import_node_fs10.readFileSync)(configPath);
   if (fingerprint(baseline) !== expectedFingerprint) {
     throw new Error("MCP config changed while its retained-inode baseline was captured");
@@ -7838,8 +7963,8 @@ function createMcpReconciler(options, dependencies = {}) {
   };
   const enqueue = (trigger, immediate) => {
     if (closed) return Promise.reject(new Error("MCP reconciler is closed"));
-    const promise = new Promise((resolve7, reject) => {
-      pending.push({ trigger, resolve: resolve7, reject });
+    const promise = new Promise((resolve8, reject) => {
+      pending.push({ trigger, resolve: resolve8, reject });
     });
     if (immediate && timer) {
       clearTimeout(timer);
@@ -7925,28 +8050,19 @@ function readPreservedOptions(statePath, ownedTweaks) {
   );
 }
 function fingerprint(value) {
-  return (0, import_node_crypto2.createHash)("sha256").update(value).digest("hex");
+  return (0, import_node_crypto3.createHash)("sha256").update(value).digest("hex");
 }
 function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
   const mcpPlan = planManagedMcpReconciliation(tweaks, currentToml, options);
   const ownedTweaks = options.ownedTweaks ?? tweaks;
-  const approvalPolicyPlan = planUserQuestionsApprovalPolicy({
-    currentToml,
-    candidateToml: mcpPlan.nextToml,
-    owned: ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions"),
-    enabled: tweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions"),
-    preserved: sanitizePreservedApprovalPolicy(options.preservedApprovalPolicy)
-  });
+  const preservedApprovalPolicy = sanitizePreservedApprovalPolicy(options.preservedApprovalPolicy);
+  const approvalPolicy = ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions") ? observeUserQuestionsApprovalPolicy(currentToml, preservedApprovalPolicy) : mcpPlan.approvalPolicy;
   const plan = {
     ...mcpPlan,
-    nextToml: approvalPolicyPlan.nextToml,
-    approvalPolicy: approvalPolicyPlan.receipt,
-    preservedApprovalPolicy: approvalPolicyPlan.preserved,
-    changed: approvalPolicyPlan.nextToml !== currentToml || mcpPlan.changed,
-    restartRequired: approvalPolicyPlan.nextToml !== currentToml || mcpPlan.restartRequired
+    approvalPolicy,
+    preservedApprovalPolicy
   };
-  const policyChanged = approvalPolicyPlan.nextToml !== mcpPlan.nextToml;
-  if (!mcpPlan.changed || policyChanged || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {
+  if (!mcpPlan.changed || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {
     return plan;
   }
   return {
@@ -8324,7 +8440,7 @@ function writeReceipt(statePath, receipt) {
 function writeDurableTemp(destination, content, mode) {
   const directory = (0, import_node_path14.dirname)(destination);
   (0, import_node_fs10.mkdirSync)(directory, { recursive: true });
-  const tempPath = (0, import_node_path14.join)(directory, `.${(0, import_node_path14.basename)(destination)}.${process.pid}.${(0, import_node_crypto2.randomUUID)()}.tmp`);
+  const tempPath = (0, import_node_path14.join)(directory, `.${(0, import_node_path14.basename)(destination)}.${process.pid}.${(0, import_node_crypto3.randomUUID)()}.tmp`);
   const descriptor = (0, import_node_fs10.openSync)(tempPath, "wx", mode);
   let completed = false;
   try {
@@ -8375,7 +8491,7 @@ function defaultConfigWatcher(configPath, onChange) {
 
 // src/watcher-health.ts
 var import_node_child_process = require("node:child_process");
-var import_node_crypto3 = require("node:crypto");
+var import_node_crypto4 = require("node:crypto");
 var import_node_fs11 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_path15 = require("node:path");
@@ -8734,7 +8850,7 @@ function readRuntimeFingerprint(root) {
   }
 }
 function computeRuntimeFingerprint(runtimeRoot) {
-  const hash = (0, import_node_crypto3.createHash)("sha256");
+  const hash = (0, import_node_crypto4.createHash)("sha256");
   let fileCount = 0;
   const walk = (directory) => {
     for (const entry of (0, import_node_fs11.readdirSync)(directory, { withFileTypes: true }).sort((a, b2) => a.name.localeCompare(b2.name))) {
@@ -8804,8 +8920,8 @@ async function withStartupTimeout(value, timeoutMs = DEFAULT_TWEAK_STARTUP_TIMEO
   const normalizedTimeoutMs = normalizeTweakStartupTimeoutMs(timeoutMs);
   let timer;
   const promise = Promise.resolve(value);
-  const timeout = new Promise((resolve7) => {
-    timer = setTimeout(() => resolve7({ status: "timed_out" }), normalizedTimeoutMs);
+  const timeout = new Promise((resolve8) => {
+    timer = setTimeout(() => resolve8({ status: "timed_out" }), normalizedTimeoutMs);
   });
   try {
     const result2 = await Promise.race([
@@ -9066,7 +9182,7 @@ function asRecord(value) {
 // src/native-bridge.ts
 var import_electron2 = require("electron");
 var import_node_child_process2 = require("node:child_process");
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 var import_node_fs15 = require("node:fs");
 var import_node_readline = require("node:readline");
 
@@ -9322,7 +9438,7 @@ var NativeBridge = class {
       parentWebContentsId: webContentsIdFor(parentWindow),
       parentNativeHandle
     });
-    const id = typeof asRecord2(value)?.id === "string" ? String(asRecord2(value)?.id) : (0, import_node_crypto4.randomUUID)();
+    const id = typeof asRecord2(value)?.id === "string" ? String(asRecord2(value)?.id) : (0, import_node_crypto5.randomUUID)();
     const windowId = typeof asRecord2(value)?.windowId === "number" ? Number(asRecord2(value)?.windowId) : null;
     const instance = {
       key: instanceKey(ctx.id, id),
@@ -9485,14 +9601,14 @@ var NativeBridge = class {
   }
   async requestHelper(tweakId, id, message, timeoutMs = 1e4) {
     const helper = this.helperFor(tweakId, id);
-    const requestId = (0, import_node_crypto4.randomUUID)();
+    const requestId = (0, import_node_crypto5.randomUUID)();
     const payload = { id: requestId, message };
-    return await new Promise((resolve7, reject) => {
+    return await new Promise((resolve8, reject) => {
       const timer = setTimeout(() => {
         helper.pending.delete(requestId);
         reject(new Error(`native helper request timed out: ${tweakId}:${id}`));
       }, timeoutMs);
-      helper.pending.set(requestId, { resolve: resolve7, reject, timer });
+      helper.pending.set(requestId, { resolve: resolve8, reject, timer });
       helper.child.stdin.write(`${JSON.stringify(payload)}
 `);
     });
@@ -9848,7 +9964,7 @@ function optionalGithubUrl(value) {
 
 // src/browser-ui.ts
 var import_electron3 = require("electron");
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 var import_node_fs17 = require("node:fs");
 var import_node_http = require("node:http");
 var import_node_path19 = require("node:path");
@@ -10158,13 +10274,13 @@ async function waitForWindowServices(options) {
 function callHiddenBridge(method, args) {
   assertBridgeMethod(method);
   return ensureBrowserUiHost().then((host) => {
-    const id = (0, import_node_crypto5.randomUUID)();
-    return new Promise((resolve7, reject) => {
+    const id = (0, import_node_crypto6.randomUUID)();
+    return new Promise((resolve8, reject) => {
       const timer = setTimeout(() => {
         bridgeRequests.delete(id);
         reject(new Error(`Timed out waiting for browser UI bridge method: ${method}`));
       }, 15e3);
-      bridgeRequests.set(id, { resolve: resolve7, reject, timer });
+      bridgeRequests.set(id, { resolve: resolve8, reject, timer });
       host.webContents.send(BRIDGE_REQUEST_CHANNEL, { id, method, args });
     });
   });
@@ -10750,7 +10866,7 @@ function makeWindowLikeForView(view) {
 function acceptWebSocket(req, socket, head) {
   const key = req.headers["sec-websocket-key"];
   if (typeof key !== "string") throw new Error("missing Sec-WebSocket-Key");
-  const accept = (0, import_node_crypto5.createHash)("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+  const accept = (0, import_node_crypto6.createHash)("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
   socket.write(
     [
       "HTTP/1.1 101 Switching Protocols",
@@ -10880,7 +10996,7 @@ function requestUrl(req) {
   }
 }
 function readJsonBody(req) {
-  return new Promise((resolve7, reject) => {
+  return new Promise((resolve8, reject) => {
     const chunks = [];
     let total = 0;
     req.on("data", (chunk) => {
@@ -10895,11 +11011,11 @@ function readJsonBody(req) {
     req.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf8");
       if (!raw) {
-        resolve7(null);
+        resolve8(null);
         return;
       }
       try {
-        resolve7(JSON.parse(raw));
+        resolve8(JSON.parse(raw));
       } catch (error) {
         reject(error);
       }
@@ -10968,7 +11084,7 @@ function safeJson(value) {
   return JSON.stringify(value).replace(/</g, "\\u003c");
 }
 function delay(ms2) {
-  return new Promise((resolve7) => setTimeout(resolve7, ms2));
+  return new Promise((resolve8) => setTimeout(resolve8, ms2));
 }
 
 // src/local-cli-runtime.ts
@@ -11292,9 +11408,81 @@ async function dispatchCrossTweakRead(requester, target, action, message, lookup
 
 // src/promotion-health.ts
 var import_node_fs19 = require("node:fs");
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto7 = require("node:crypto");
 var import_node_os2 = require("node:os");
 var import_node_path22 = require("node:path");
+var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+function createPromotionRendererProofTracker(expected) {
+  let expectedWebContentsId = null;
+  let windowCreated = false;
+  let didFinishLoad = false;
+  let handshake = false;
+  let failed = false;
+  let rendererStorageSelfTest = "unknown";
+  const expectedRenderer = (webContentsId) => expectedWebContentsId !== null && webContentsId === expectedWebContentsId;
+  const validId = (value) => Number.isSafeInteger(value) && value > 0;
+  return {
+    windowCreated(observation) {
+      if (expectedWebContentsId !== null) {
+        failed = true;
+        return;
+      }
+      expectedWebContentsId = validId(observation.webContentsId) ? observation.webContentsId : null;
+      windowCreated = expectedWebContentsId !== null && observation.url === expected.url && observation.preloadPath === expected.preloadPath;
+      if (!windowCreated) failed = true;
+    },
+    didFinishLoad(observation) {
+      if (!expectedRenderer(observation.webContentsId)) return;
+      if (observation.url !== expected.url) {
+        failed = true;
+        return;
+      }
+      didFinishLoad = true;
+    },
+    didFailLoad(observation) {
+      if (!expectedRenderer(observation.webContentsId)) return;
+      void observation.errorCode;
+      void observation.errorDescription;
+      void observation.url;
+      failed = true;
+      rendererStorageSelfTest = "fail";
+    },
+    renderProcessGone(observation) {
+      if (!expectedRenderer(observation.webContentsId)) return;
+      void observation.reason;
+      void observation.exitCode;
+      failed = true;
+      rendererStorageSelfTest = "fail";
+    },
+    rendererHandshake(observation) {
+      if (!expectedRenderer(observation.webContentsId)) return;
+      if (observation.nonce !== expected.nonce || observation.url !== expected.url || observation.lifecycle !== "renderer-mounted" || !validHealthValue(observation.rendererStorageSelfTest)) {
+        failed = true;
+        rendererStorageSelfTest = "fail";
+        return;
+      }
+      handshake = true;
+      rendererStorageSelfTest = observation.rendererStorageSelfTest;
+    },
+    result() {
+      if (failed) return { hostReady: "fail", rendererStorageSelfTest: "fail" };
+      return {
+        hostReady: windowCreated && didFinishLoad && handshake ? "pass" : "unknown",
+        rendererStorageSelfTest: handshake ? rendererStorageSelfTest : "unknown"
+      };
+    }
+  };
+}
+var PROMOTION_SURFACE_NAMES = [
+  "app",
+  "runtime",
+  "tweakTree",
+  "tweakersConfig",
+  "codexConfig",
+  "namespaceData",
+  "mainStorage",
+  "policy"
+];
 function hasAuthenticatedSessionCookie(cookies, now = Date.now()) {
   return cookies.some((cookie) => {
     const domain = (cookie.domain ?? "").replace(/^\./, "").toLowerCase();
@@ -11325,13 +11513,13 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
   let request;
   try {
     const stat4 = (0, import_node_fs19.lstatSync)(requestFile);
-    if (stat4.isSymbolicLink() || !stat4.isFile() || (stat4.mode & 511) !== 384) return false;
+    if (stat4.isSymbolicLink() || !stat4.isFile() || (stat4.mode & 511) !== 384 || stat4.size > 256 * 1024) return false;
     if (typeof process.getuid === "function" && stat4.uid !== process.getuid()) return false;
     request = JSON.parse((0, import_node_fs19.readFileSync)(requestFile, "utf8"));
     const now = (options.now ?? /* @__PURE__ */ new Date()).getTime();
     const requestedAt = Date.parse(request.requestedAt);
-    if (request.schemaVersion !== 1 || !Number.isFinite(requestedAt) || requestedAt > now + 5e3 || now - requestedAt > (options.maxAgeMs ?? 6e4)) return false;
-    if (!request.app || typeof request.runtimeHash !== "string" || !Array.isArray(request.requiredPermissions)) return false;
+    if (!Number.isFinite(requestedAt) || requestedAt > now + 5e3 || now - requestedAt > (options.maxAgeMs ?? 6e4)) return false;
+    if (!validPromotionRequest(request)) return false;
   } catch {
     return false;
   }
@@ -11347,17 +11535,18 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
     permission,
     await safe(() => probes.declaredPermission(permission))
   ])));
-  const receipt = {
+  const authenticatedSession = await safe(() => probes.authenticatedSession());
+  const receipt = request.schemaVersion === 1 ? {
     schemaVersion: 1,
     observedAt: (options.now ?? /* @__PURE__ */ new Date()).toISOString(),
     app: request.app,
     runtimeHash: request.runtimeHash,
     hostReady: "pass",
-    authenticatedSession: await safe(() => probes.authenticatedSession()),
+    authenticatedSession,
     declaredPermissions: permissions
-  };
+  } : await buildV2Receipt(request, probes, permissions, authenticatedSession, options.now ?? /* @__PURE__ */ new Date(), safe);
   (0, import_node_fs19.mkdirSync)((0, import_node_path22.dirname)(receiptFile), { recursive: true, mode: 448 });
-  const temporary = `${receiptFile}.${process.pid}.${(0, import_node_crypto6.randomUUID)()}.tmp`;
+  const temporary = `${receiptFile}.${process.pid}.${(0, import_node_crypto7.randomUUID)()}.tmp`;
   const fd = (0, import_node_fs19.openSync)(temporary, "wx", 384);
   try {
     (0, import_node_fs19.writeFileSync)(fd, `${JSON.stringify(receipt, null, 2)}
@@ -11375,10 +11564,124 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
   }
   return true;
 }
+async function buildV2Receipt(request, probes, permissions, authenticatedSession, now, safe) {
+  const surfaces = Object.fromEntries(await Promise.all(PROMOTION_SURFACE_NAMES.map(async (surface) => {
+    const expected = request.surfaces[surface];
+    let observedHash = "unknown";
+    try {
+      const observed = await probes.promotionSurface?.(surface);
+      if (validPromotionHash(observed)) observedHash = observed;
+    } catch {
+    }
+    return [surface, {
+      preimageHash: expected.preimageHash,
+      expectedHash: expected.afterHash,
+      observedHash,
+      status: observedHash === expected.afterHash ? "pass" : observedHash === "unknown" ? "unknown" : "fail"
+    }];
+  })));
+  let observedUserQuestions = null;
+  try {
+    const observed = await probes.userQuestionsHealth?.();
+    if (validUserQuestionsObservation(observed)) observedUserQuestions = observed;
+  } catch {
+  }
+  const expectedUserQuestions = request.userQuestions;
+  const hostReady = await safe(() => probes.rendererReady?.() ?? "unknown");
+  const identity = observedUserQuestions && observedUserQuestions.id === expectedUserQuestions.id && observedUserQuestions.version === expectedUserQuestions.version && observedUserQuestions.payloadHash === expectedUserQuestions.payloadHash ? "pass" : observedUserQuestions ? "fail" : "unknown";
+  const userQuestions = {
+    expected: expectedUserQuestions,
+    observed: observedUserQuestions ? {
+      id: observedUserQuestions.id,
+      version: observedUserQuestions.version,
+      payloadHash: observedUserQuestions.payloadHash
+    } : null,
+    identity,
+    mainLifecycle: observedUserQuestions?.mainLifecycle ?? "unknown",
+    brokerSelfTest: observedUserQuestions?.brokerSelfTest ?? "unknown",
+    schemaSelfTest: observedUserQuestions?.schemaSelfTest ?? "unknown",
+    rendererStorageSelfTest: observedUserQuestions?.rendererStorageSelfTest ?? "unknown",
+    mcpConflictCount: observedUserQuestions?.mcpConflictCount ?? null,
+    zeroMcpConflicts: observedUserQuestions ? observedUserQuestions.mcpConflictCount === 0 ? "pass" : "fail" : "unknown"
+  };
+  const allSurfacesPass = Object.values(surfaces).every((surface) => surface.status === "pass");
+  const allPermissionsPass = Object.values(permissions).every((permission) => permission === "pass");
+  const userQuestionsPass = [
+    userQuestions.identity,
+    userQuestions.mainLifecycle,
+    userQuestions.brokerSelfTest,
+    userQuestions.schemaSelfTest,
+    userQuestions.rendererStorageSelfTest,
+    userQuestions.zeroMcpConflicts
+  ].every((value) => value === "pass");
+  return {
+    schemaVersion: 2,
+    observedAt: now.toISOString(),
+    app: request.app,
+    hostReady,
+    authenticatedSession,
+    declaredPermissions: permissions,
+    surfaces,
+    userQuestions,
+    promotionReady: hostReady === "pass" && allSurfacesPass && allPermissionsPass && userQuestionsPass && authenticatedSession === "pass" ? "pass" : "fail"
+  };
+}
+function validPromotionRequest(value) {
+  if (!plainRecord(value)) return false;
+  if (value.schemaVersion === 1) {
+    if (!exactKeys(value, ["schemaVersion", "requestedAt", "app", "runtimeHash", "requiredPermissions"])) return false;
+    return validApp(value.app) && typeof value.runtimeHash === "string" && validPermissions(value.requiredPermissions);
+  }
+  if (value.schemaVersion !== 2 || !exactKeys(value, ["schemaVersion", "requestedAt", "app", "requiredPermissions", "surfaces", "userQuestions"])) return false;
+  if (!validApp(value.app) || !validPermissions(value.requiredPermissions) || !plainRecord(value.surfaces)) return false;
+  if (!exactKeys(value.surfaces, [...PROMOTION_SURFACE_NAMES])) return false;
+  const surfaces = value.surfaces;
+  for (const surface of PROMOTION_SURFACE_NAMES) {
+    const expectation = surfaces[surface];
+    if (!plainRecord(expectation) || !exactKeys(expectation, ["preimageHash", "afterHash"])) return false;
+    if (!validPromotionHash(expectation.preimageHash) || !validPromotionHash(expectation.afterHash)) return false;
+  }
+  if (surfaces.app.afterHash !== value.app.hash) return false;
+  if (!plainRecord(value.userQuestions) || !exactKeys(value.userQuestions, ["id", "version", "payloadHash"])) return false;
+  return value.userQuestions.id === "co.tweakers.user-questions" && typeof value.userQuestions.version === "string" && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value.userQuestions.version) && validPromotionHash(value.userQuestions.payloadHash) && value.userQuestions.payloadHash !== "missing";
+}
+function validApp(value) {
+  return plainRecord(value) && exactKeys(value, ["version", "build", "hash"]) && typeof value.version === "string" && value.version.length > 0 && typeof value.build === "string" && value.build.length > 0 && typeof value.hash === "string" && value.hash.length > 0;
+}
+function validPermissions(value) {
+  return Array.isArray(value) && value.length <= 64 && new Set(value).size === value.length && value.every((permission) => typeof permission === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(permission));
+}
+function validPromotionHash(value) {
+  return value === "missing" || typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+function validUserQuestionsObservation(value) {
+  if (!plainRecord(value) || !exactKeys(value, [
+    "id",
+    "version",
+    "payloadHash",
+    "mainLifecycle",
+    "brokerSelfTest",
+    "schemaSelfTest",
+    "rendererStorageSelfTest",
+    "mcpConflictCount"
+  ])) return false;
+  return typeof value.id === "string" && typeof value.version === "string" && validPromotionHash(value.payloadHash) && validHealthValue(value.mainLifecycle) && validHealthValue(value.brokerSelfTest) && validHealthValue(value.schemaSelfTest) && validHealthValue(value.rendererStorageSelfTest) && Number.isInteger(value.mcpConflictCount) && value.mcpConflictCount >= 0;
+}
+function validHealthValue(value) {
+  return value === "pass" || value === "fail" || value === "unknown";
+}
+function plainRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+function exactKeys(value, keys) {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
 
 // src/codex-cli-manager.ts
 var import_node_child_process3 = require("node:child_process");
-var import_node_crypto7 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 var import_node_fs20 = require("node:fs");
 var import_node_path23 = require("node:path");
 var EMPTY_STATE = { schemaVersion: 1, current: null, previous: null, updatedAt: "" };
@@ -11451,7 +11754,7 @@ function createCodexCliManager(input) {
             version: release.version,
             releaseTag: release.tag,
             digest: release.digest.toLowerCase(),
-            binaryDigest: (0, import_node_crypto7.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex"),
+            binaryDigest: (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex"),
             architecture: release.architecture,
             relativeDirectory: directoryName,
             binaryRelativePath,
@@ -11615,7 +11918,7 @@ function validateSelectedManagedBinarySync(selected) {
     if (!info.isFile() || info.isSymbolicLink() || (info.mode & 73) === 0) {
       throw new Error("Selected managed Alpha binary is not a regular executable file");
     }
-    const actualFingerprint = (0, import_node_crypto7.createHash)("sha256").update((0, import_node_fs20.readFileSync)(selected.binaryPath)).digest("hex");
+    const actualFingerprint = (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(selected.binaryPath)).digest("hex");
     if (actualFingerprint !== selected.fingerprint.toLowerCase()) {
       throw new Error("Selected managed Alpha fingerprint does not match");
     }
@@ -11721,7 +12024,7 @@ function validateReceiptFiles(paths, receipt, binary) {
   }
   const info = (0, import_node_fs20.lstatSync)(binary);
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 73) === 0) throw new Error("Managed Beta binary is not a regular executable file");
-  const binaryDigest = (0, import_node_crypto7.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex");
+  const binaryDigest = (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex");
   if (binaryDigest !== receipt.binaryDigest) throw new Error("Managed Beta binary digest does not agree with its receipt");
 }
 function reconcileStateSync(paths, value) {
@@ -13093,7 +13396,7 @@ function findCodexDesktopUpdateMenuItem(menu) {
 }
 
 // src/codex-desktop-update-profile.ts
-var import_node_crypto8 = require("node:crypto");
+var import_node_crypto9 = require("node:crypto");
 var import_node_path25 = require("node:path");
 var OPENAI_DESKTOP_TEAM_IDENTIFIER = "2DC432GLL2";
 function verifiedCodexDesktopProfileIdentity(registryValue, profile) {
@@ -13126,7 +13429,7 @@ function verifiedCodexDesktopProfileIdentity(registryValue, profile) {
     build,
     teamIdentifier: OPENAI_DESKTOP_TEAM_IDENTIFIER,
     designatedRequirement: candidate.designatedRequirement,
-    identityKey: (0, import_node_crypto8.createHash)("sha256").update(identityMaterial).digest("hex")
+    identityKey: (0, import_node_crypto9.createHash)("sha256").update(identityMaterial).digest("hex")
   };
 }
 function activeVerifiedCodexDesktopProfileIdentity(registryValue, selectionValue, activeAppPath) {
@@ -13263,11 +13566,16 @@ var TWEAKS_DIR = (0, import_node_path26.join)(userRoot, "tweaks");
 var LOG_DIR = (0, import_node_path26.join)(userRoot, "log");
 var LOG_FILE = (0, import_node_path26.join)(LOG_DIR, "main.log");
 var CONFIG_FILE = (0, import_node_path26.join)(userRoot, "config.json");
-var CODEX_CONFIG_FILE = (0, import_node_path26.join)((0, import_node_os3.homedir)(), ".codex", "config.toml");
+var MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({
+  userRoot,
+  homeDirectory: (0, import_node_os3.homedir)(),
+  env: process.env
+});
+var CODEX_CONFIG_FILE = MCP_RUNTIME_PATHS.configPath;
 var INSTALLER_STATE_FILE = (0, import_node_path26.join)(userRoot, "state.json");
 var UPDATE_MODE_FILE = (0, import_node_path26.join)(userRoot, "update-mode.json");
 var SELF_UPDATE_STATE_FILE = (0, import_node_path26.join)(userRoot, "self-update-state.json");
-var MCP_SYNC_STATE_FILE = (0, import_node_path26.join)(userRoot, "mcp-sync-state.json");
+var MCP_SYNC_STATE_FILE = MCP_RUNTIME_PATHS.statePath;
 var ENVIRONMENT_SELECTION_FILE = (0, import_node_path26.join)(userRoot, "environment-selection.json");
 var ENVIRONMENT_REGISTRY_FILE = (0, import_node_path26.join)(userRoot, "environment-registry.json");
 var ENVIRONMENT_RUNTIME_PROOF_FILE = (0, import_node_path26.join)(userRoot, "environment-runtime-proof.json");
@@ -13280,6 +13588,11 @@ var TWEAK_BUNDLED_SOURCE_DIR = (0, import_node_path26.join)(runtimeDir, "tweaks"
 var TWEAK_LIFECYCLE_FILE = (0, import_node_path26.join)(userRoot, "tweak-lifecycle.json");
 var TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 var healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+applyHealthProbeKeychainIsolation({
+  commandLine: import_electron4.app.commandLine,
+  healthCheckOnly,
+  platform: process.platform
+});
 if (healthCheckOnly && process.platform === "darwin") {
   try {
     import_electron4.app.setActivationPolicy("prohibited");
@@ -13568,7 +13881,7 @@ async function runProactiveDesktopUpdateCheck() {
 function createCodexCliManagerDependencies() {
   return {
     now: () => /* @__PURE__ */ new Date(),
-    operationId: import_node_crypto9.randomUUID,
+    operationId: import_node_crypto10.randomUUID,
     resolveRelease: async () => {
       const lookup = await codexVersionService.fetchLatestRelease("beta", { force: true });
       const release = lookup.release;
@@ -13616,7 +13929,7 @@ async function downloadManagedCodexArchive(release, destination, onBytes) {
   if (!response.ok || !response.body) throw new Error(`Codex download returned ${response.status}`);
   const declaredLength = Number(response.headers.get("content-length") ?? "0");
   if (declaredLength > MAX_CODEX_DOWNLOAD_BYTES) throw new Error("Codex download exceeds maximum size");
-  const digest = (0, import_node_crypto9.createHash)("sha256");
+  const digest = (0, import_node_crypto10.createHash)("sha256");
   let bytes = 0;
   const meter = new import_node_stream3.Transform({
     transform(chunk, _encoding, callback) {
@@ -13758,7 +14071,7 @@ function log(level, ...args) {
   }
   if (level === "error") console.error("[tweaker]", ...args);
 }
-var lifecycleAttemptId = (0, import_node_crypto9.randomUUID)();
+var lifecycleAttemptId = (0, import_node_crypto10.randomUUID)();
 var lifecycleJournal;
 function readTweakLifecycleJournal() {
   try {
@@ -13983,7 +14296,7 @@ function writeEnvironmentRuntimeProof() {
       backendLane: codexCliBootstrap.effectiveLane === "beta" ? "managed-alpha" : "bundled",
       binaryPath,
       backendVersion: version,
-      backendFingerprint: (0, import_node_crypto9.createHash)("sha256").update((0, import_node_fs22.readFileSync)(binaryPath)).digest("hex"),
+      backendFingerprint: (0, import_node_crypto10.createHash)("sha256").update((0, import_node_fs22.readFileSync)(binaryPath)).digest("hex"),
       observedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
     const temporary = `${ENVIRONMENT_RUNTIME_PROOF_FILE}.${process.pid}.tmp`;
@@ -14024,11 +14337,12 @@ var tweakState = {
   discovered: [],
   loadedMain: /* @__PURE__ */ new Map()
 };
+var mainIpcHandlerRegistrations = /* @__PURE__ */ new Map();
 var mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   configPath: CODEX_CONFIG_FILE,
   statePath: MCP_SYNC_STATE_FILE,
-  getTweaks: () => tweakState.discovered.filter((tweak) => isTweakEnabled(tweak.manifest.id)),
-  getOwnedTweaks: () => tweakState.discovered,
+  getTweaks: () => mcpSyncTweaks(true),
+  getOwnedTweaks: () => mcpSyncTweaks(false),
   onReceipt: (receipt) => {
     const summary = receipt.conflicts.length > 0 ? receipt.conflicts.map((conflict) => `${conflict.observedName} -> ${conflict.canonicalName} (${conflict.reason})`).join(", ") : receipt.appliedNames.join(", ") || "none";
     log("info", `MCP reconciliation ${receipt.status}: ${summary}`);
@@ -14039,6 +14353,14 @@ var mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   onError: (error) => log("warn", "failed to reconcile Codex MCP config:", error)
 });
 var initialMcpReconciliationPending = true;
+var nextReloadMcpTrigger = "tweak-reload";
+function mcpSyncTweaks(enabledOnly) {
+  return tweakState.discovered.filter((tweak) => !enabledOnly || isTweakEnabled(tweak.manifest.id)).map((tweak) => ({
+    dir: tweak.dir,
+    dataDir: (0, import_node_path26.join)(userRoot, "tweak-data", tweak.manifest.id),
+    manifest: tweak.manifest
+  }));
+}
 var nativeBridge = new NativeBridge(log, {
   nativeHostPath: resolveRuntimeNativeHostPath({
     resourcesPath: process.resourcesPath,
@@ -14049,7 +14371,12 @@ var nativeBridge = new NativeBridge(log, {
 });
 var owlViews = /* @__PURE__ */ new Map();
 var tweakLifecycleDeps = {
-  logInfo: (message) => log("info", message),
+  logInfo: (message) => {
+    if (message.startsWith("reloading tweaks (")) {
+      nextReloadMcpTrigger = message === "reloading tweaks (enabled-toggle)" ? "enabled-state" : "tweak-reload";
+    }
+    log("info", message);
+  },
   setTweakEnabled,
   stopAllMainTweaks,
   clearTweakModuleCache,
@@ -14079,13 +14406,13 @@ function registerPreload(s3, label) {
   }
 }
 function withTimeout(promise, ms2) {
-  return new Promise((resolve7, reject) => {
+  return new Promise((resolve8, reject) => {
     const timer = setTimeout(() => reject(new Error(`timed out after ${ms2}ms`)), ms2);
     if (typeof timer.unref === "function") timer.unref();
     promise.then(
       (value) => {
         clearTimeout(timer);
-        resolve7(value);
+        resolve8(value);
       },
       (error) => {
         clearTimeout(timer);
@@ -15112,38 +15439,47 @@ import_electron4.app.whenReady().then(() => {
     const watchdog = setTimeout(() => {
       log("warn", "health-check watchdog fired; exiting");
       import_electron4.app.exit(0);
-    }, 8e3);
+    }, 12e3);
     watchdog.unref?.();
   } else {
     scheduleProactiveDesktopUpdateChecks();
     if (process.platform === "darwin") desktopUpdateStartupReconciler.schedule();
   }
-  void answerPromotionHealthRequest(userRoot, {
-    authenticatedSession: async () => {
-      if (hasAuthenticatedCodexToken(readCodexAuth())) return "pass";
-      try {
-        const cookies = await withTimeout(import_electron4.session.defaultSession.cookies.get({}), 3e3);
-        if (cookies && hasAuthenticatedSessionCookie(cookies)) return "pass";
-      } catch {
+  void (async () => {
+    const rendererProof = healthCheckOnly ? await runPromotionRendererProof() : { hostReady: "unknown", rendererStorageSelfTest: "unknown" };
+    void answerPromotionHealthRequest(userRoot, {
+      authenticatedSession: async () => {
+        if (hasAuthenticatedCodexToken(readCodexAuth(MCP_RUNTIME_PATHS.codexHome))) return "pass";
+        try {
+          const cookies = await withTimeout(import_electron4.session.defaultSession.cookies.get({}), 3e3);
+          if (cookies && hasAuthenticatedSessionCookie(cookies)) return "pass";
+        } catch {
+        }
+        return "unknown";
+      },
+      declaredPermission: (permission) => {
+        if (process.platform !== "darwin") return "unknown";
+        if (permission === "accessibility") return import_electron4.systemPreferences.isTrustedAccessibilityClient(false) ? "pass" : "fail";
+        if (permission === "screen-recording") return import_electron4.systemPreferences.getMediaAccessStatus("screen") === "granted" ? "pass" : "fail";
+        if (permission === "screen-capture") return import_electron4.systemPreferences.getMediaAccessStatus("screen") === "granted" ? "pass" : "fail";
+        if (permission === "global-shortcut") return "pass";
+        return "unknown";
+      },
+      rendererReady: () => rendererProof.hostReady,
+      promotionSurface: promotionSurfaceHash,
+      userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest)
+    }).then((answered) => {
+      if (!answered) {
+        const requestPending = (0, import_node_fs22.existsSync)((0, import_node_path26.join)(userRoot, "health", "request.json"));
+        log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
       }
-      return "unknown";
-    },
-    declaredPermission: (permission) => {
-      if (process.platform !== "darwin") return "unknown";
-      if (permission === "accessibility") return import_electron4.systemPreferences.isTrustedAccessibilityClient(false) ? "pass" : "fail";
-      if (permission === "screen-recording") return import_electron4.systemPreferences.getMediaAccessStatus("screen") === "granted" ? "pass" : "fail";
-      if (permission === "screen-capture") return import_electron4.systemPreferences.getMediaAccessStatus("screen") === "granted" ? "pass" : "fail";
-      if (permission === "global-shortcut") return "pass";
-      return "unknown";
-    }
-  }).then((answered) => {
-    if (!answered) {
-      const requestPending = (0, import_node_fs22.existsSync)((0, import_node_path26.join)(userRoot, "health", "request.json"));
-      log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
-    }
-    if (healthCheckOnly) import_electron4.app.exit(0);
-  }).catch((error) => {
-    log("warn", "promotion health receipt failed", error);
+      if (healthCheckOnly) import_electron4.app.exit(0);
+    }).catch((error) => {
+      log("warn", "promotion health receipt failed", error);
+      if (healthCheckOnly) import_electron4.app.exit(0);
+    });
+  })().catch((error) => {
+    log("warn", "promotion renderer bootstrap failed", error);
     if (healthCheckOnly) import_electron4.app.exit(0);
   });
   if (!healthCheckOnly) {
@@ -15866,15 +16202,7 @@ import_electron4.ipcMain.handle("tweaker:run-tweaker-update", async () => {
   return pending;
 });
 import_electron4.ipcMain.handle("tweaker:get-refresh-status", () => localRefreshStatus());
-import_electron4.ipcMain.handle("tweaker:start-local-refresh", async (_e2, requested) => {
-  const status = await localRefreshStatus();
-  if (!status.available) return { started: false, status };
-  const cli = localRefreshCli(status);
-  const appRoot = readInstallerState()?.appRoot;
-  if (!appRoot || !(0, import_node_fs22.existsSync)(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-  startInstalledCli(cli, ["refresh-local", "--source", requested ?? "smart", "--app", appRoot]);
-  return { started: true, status: { ...status, phase: "preparing" } };
-});
+import_electron4.ipcMain.handle("tweaker:start-local-refresh", async (_e2, requested) => startLocalRefresh(requested));
 import_electron4.ipcMain.handle("tweaker:get-watcher-health", () => getWatcherHealth(userRoot));
 import_electron4.ipcMain.handle("tweaker:repair-auto-maintenance", async (_e2, ...args) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
@@ -15893,7 +16221,7 @@ import_electron4.ipcMain.handle("tweaker:get-tweak-store", async () => {
   const store = await fetchTweakStoreRegistry();
   const registry = store.registry;
   const installed = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
-  const entries = shuffleStoreEntries(registry.entries, import_node_crypto9.randomInt);
+  const entries = shuffleStoreEntries(registry.entries, import_node_crypto10.randomInt);
   return {
     ...registry,
     sourceUrl: TWEAK_STORE_INDEX_URL,
@@ -16166,13 +16494,14 @@ async function loadAllMainTweaks() {
     log("error", "tweak discovery failed:", e);
     tweakState.discovered = [];
   }
-  const mcpTrigger = initialMcpReconciliationPending ? "startup" : "tweak-reload";
+  const mcpTrigger = initialMcpReconciliationPending ? "startup" : nextReloadMcpTrigger;
   initialMcpReconciliationPending = false;
-  let userQuestionsPolicyReady = false;
+  nextReloadMcpTrigger = "tweak-reload";
+  let userQuestionsMcpReady = false;
   if (mcpReconciler) {
     try {
       const receipt = await mcpReconciler.reconcileNow(mcpTrigger);
-      userQuestionsPolicyReady = receipt.status !== "conflict" && receipt.status !== "error" && receipt.approvalPolicy.status !== "conflict" && receipt.approvalPolicy.afterRaw === USER_QUESTIONS_APPROVAL_POLICY && receipt.approvalPolicy.sandboxModeAfterRaw === USER_QUESTIONS_SANDBOX_MODE;
+      userQuestionsMcpReady = userQuestionsMcpReceiptMatchesEnabledState(receipt, true);
     } catch (error) {
       log("error", "MCP reconciliation failed before main tweak startup:", error);
     }
@@ -16184,8 +16513,8 @@ async function loadAllMainTweaks() {
       log("info", `skipping disabled main tweak: ${t.manifest.id}`);
       continue;
     }
-    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsPolicyReady) {
-      const error = "authoritative approval policy reconciliation did not complete";
+    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsMcpReady) {
+      const error = "canonical User Questions MCP reconciliation did not complete";
       recordTweakLifecycle(t.manifest.id, "main", "failed", error);
       recordTweakHealth(t.manifest.id, "failed", error);
       log("error", `skipping User Questions main migration: ${error}`);
@@ -16202,7 +16531,7 @@ async function loadAllMainTweaks() {
           process: "main",
           log: makeLogger(t.manifest.id),
           storage,
-          ipc: makeMainIpc(t.manifest.id),
+          ipc: makeMainIpc(t),
           fs: makeMainFs(t.manifest.id),
           codex: makeCodexApi(t)
         });
@@ -16693,7 +17022,7 @@ function collectTweakFileHashes(root, dir, out) {
       continue;
     }
     if (!stat4.isFile()) continue;
-    out[rel] = (0, import_node_crypto9.createHash)("sha256").update((0, import_node_fs22.readFileSync)(full)).digest("hex");
+    out[rel] = (0, import_node_crypto10.createHash)("sha256").update((0, import_node_fs22.readFileSync)(full)).digest("hex");
   }
 }
 function sameFileHashes(a, b2) {
@@ -16879,6 +17208,7 @@ function attachEnvironmentHelperDiagnostics(value) {
 var refreshStatusCache = null;
 var refreshStatusInFlight = null;
 var REFRESH_STATUS_TTL_MS = 4e3;
+var LOCAL_REFRESH_SOURCE_BINDING = resolveLocalRefreshSourceBinding();
 function localRefreshStatus() {
   if (refreshStatusCache && Date.now() - refreshStatusCache.at < REFRESH_STATUS_TTL_MS) {
     return Promise.resolve(refreshStatusCache.value);
@@ -16899,8 +17229,8 @@ function probeLocalRefreshStatus() {
     source: "current",
     phase: "failed",
     developmentSourceRoot: null,
-    detail: "Tweakers refresh CLI is unavailable",
-    error: "refresh CLI missing",
+    detail: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ?? "Tweakers refresh CLI is unavailable",
+    error: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ? `unsafe-source: ${LOCAL_REFRESH_SOURCE_BINDING.unsafeReason}` : "refresh CLI missing",
     checkedAt: (/* @__PURE__ */ new Date()).toISOString()
   });
   return new Promise((resolvePromise, rejectPromise) => {
@@ -16926,12 +17256,113 @@ function probeLocalRefreshStatus() {
       clearTimeout(timer);
       if (code !== 0) return rejectPromise(new Error(stderr.trim() || "Could not read Tweakers refresh status"));
       try {
-        resolvePromise(JSON.parse(stdout.trim()));
+        resolvePromise(normalizeLocalRefreshStatus(JSON.parse(stdout.trim())));
       } catch (error) {
         rejectPromise(error);
       }
     });
   });
+}
+function resolveLocalRefreshSourceBinding() {
+  const managedCli = (0, import_node_path26.join)(userRoot, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+  const frozenRoot = readInstallerState()?.sourceRoot ?? null;
+  if (!frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "No frozen Tweakers installation source is recorded; development refresh is disabled."
+    };
+  }
+  let exactRoot;
+  try {
+    exactRoot = (0, import_node_fs22.realpathSync)(frozenRoot);
+  } catch {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source no longer exists; development refresh is disabled."
+    };
+  }
+  if (!(0, import_node_path26.isAbsolute)(frozenRoot) || exactRoot !== frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source is not an exact real path; development refresh is disabled."
+    };
+  }
+  const sourceCli = (0, import_node_path26.join)(exactRoot, "packages", "installer", "dist", "cli.js");
+  if (describeInstallationSource(exactRoot).kind === "local-dev") {
+    if (!(0, import_node_fs22.existsSync)(sourceCli)) {
+      return {
+        cli: managedCli,
+        developmentRoot: null,
+        unsafeReason: "The frozen development checkout has no built Tweakers CLI; development refresh is disabled."
+      };
+    }
+    return { cli: sourceCli, developmentRoot: exactRoot, unsafeReason: null };
+  }
+  if ((0, import_node_fs22.existsSync)(managedCli)) return { cli: managedCli, developmentRoot: null, unsafeReason: null };
+  if ((0, import_node_fs22.existsSync)(sourceCli)) return { cli: sourceCli, developmentRoot: null, unsafeReason: null };
+  return {
+    cli: managedCli,
+    developmentRoot: null,
+    unsafeReason: "No exact Tweakers refresh CLI is available; refresh is disabled."
+  };
+}
+function normalizeLocalRefreshStatus(status) {
+  if (status.source !== "development") return status;
+  const frozenRoot = LOCAL_REFRESH_SOURCE_BINDING.developmentRoot;
+  const mismatch = frozenRoot === null || status.developmentSourceRoot !== frozenRoot;
+  if (!mismatch && LOCAL_REFRESH_SOURCE_BINDING.unsafeReason === null) return status;
+  const reason = LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ?? "The registered dirty development checkout does not match this runtime's frozen source; refresh is disabled.";
+  return {
+    ...status,
+    available: false,
+    source: "current",
+    phase: "failed",
+    detail: `Unsafe refresh source: ${reason}`,
+    error: `unsafe-source: ${reason}`
+  };
+}
+function buildLocalRefreshDispatch(status, requested, appRoot, binding = LOCAL_REFRESH_SOURCE_BINDING) {
+  if (!status.available || status.error?.startsWith("unsafe-source:")) {
+    throw new Error(status.detail || "Tweakers refresh is unavailable");
+  }
+  const selected = requested === void 0 || requested === "smart" ? status.source : requested;
+  if (selected !== status.source || selected !== "development" && selected !== "stable") {
+    throw new Error("The requested refresh source is not the currently verified source");
+  }
+  if (selected === "development") {
+    const developmentRoot = binding.developmentRoot;
+    if (!developmentRoot || binding.unsafeReason !== null || status.developmentSourceRoot !== developmentRoot) throw new Error("Unsafe refresh source: the development worktree is not frozen to this runtime");
+    return {
+      cli: binding.cli,
+      args: [
+        "refresh-local",
+        "--source",
+        "development",
+        "--development-root",
+        developmentRoot,
+        "--app",
+        appRoot
+      ]
+    };
+  }
+  return {
+    cli: binding.cli,
+    args: ["refresh-local", "--source", "stable", "--app", appRoot]
+  };
+}
+async function startLocalRefresh(requested) {
+  const status = await localRefreshStatus();
+  if (!status.available) return { started: false, status };
+  const appRoot = readInstallerState()?.appRoot;
+  if (!appRoot) throw new Error("Tweakers refresh app root is unavailable");
+  const dispatch = buildLocalRefreshDispatch(status, requested, appRoot);
+  if (!(0, import_node_fs22.existsSync)(dispatch.cli)) throw new Error("Tweakers refresh CLI is unavailable");
+  if (dispatch.args[0] !== "refresh-local") throw new Error("Tweakers refresh dispatch is invalid");
+  startInstalledCli(dispatch.cli, ["refresh-local", ...dispatch.args.slice(1)]);
+  return { started: true, status: { ...status, phase: "preparing" } };
 }
 function localCliRuntime(cli, args) {
   const env = {
@@ -16951,20 +17382,8 @@ function localCliRuntime(cli, args) {
     env
   });
 }
-function localRefreshCli(status) {
-  let developmentSourceRoot = status?.developmentSourceRoot ?? null;
-  if (!developmentSourceRoot) {
-    try {
-      const section = readState2().tweaker;
-      if (typeof section?.developmentSourceRoot === "string") developmentSourceRoot = section.developmentSourceRoot;
-    } catch {
-    }
-  }
-  if ((status?.source === "development" || !status) && developmentSourceRoot) {
-    const cli = (0, import_node_path26.join)(developmentSourceRoot, "packages", "installer", "dist", "cli.js");
-    if ((0, import_node_fs22.existsSync)(cli)) return cli;
-  }
-  return (0, import_node_path26.join)(userRoot, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+function localRefreshCli() {
+  return LOCAL_REFRESH_SOURCE_BINDING.cli;
 }
 function startInstalledCliWithLaunchd(cli, args) {
   const label = `com.therealityreport.tweakers.patch-helper.${process.pid}.${Date.now()}`;
@@ -17045,15 +17464,19 @@ function makeLogger(scope) {
     error: (...a) => log("error", `[${scope}]`, ...a)
   };
 }
-function makeMainIpc(id) {
+function makeMainIpc(tweak) {
+  const id = tweak.manifest.id;
   const ch = (c) => `tweaker:${id}:${c}`;
+  const requireIpc = () => assertTweakPermission(tweak, "ipc");
   return {
     on: (c, h) => {
+      requireIpc();
       const wrapped = (_e2, ...args) => h(...args);
       import_electron4.ipcMain.on(ch(c), wrapped);
       return () => import_electron4.ipcMain.removeListener(ch(c), wrapped);
     },
     send: (c, ...args) => {
+      requireIpc();
       for (const wc of import_electron4.webContents.getAllWebContents()) {
         try {
           wc.send(ch(c), ...args);
@@ -17062,6 +17485,7 @@ function makeMainIpc(id) {
       }
     },
     sendToPrimary: (c, ...args) => {
+      requireIpc();
       const win = getPrimaryCodexWindow();
       if (!win || win.isDestroyed()) return false;
       try {
@@ -17071,22 +17495,67 @@ function makeMainIpc(id) {
         return false;
       }
     },
+    sendToRenderer: (webContentsId, c, ...args) => {
+      requireIpc();
+      const target = ownedCodexRenderer(webContentsId);
+      if (!target) return false;
+      try {
+        target.send(ch(c), ...args);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     invoke: (_c) => {
       throw new Error("ipc.invoke is renderer\u2192main; main side uses handle");
     },
     handle: (c, handler) => {
+      requireIpc();
       const channel = ch(c);
+      const registration = Symbol(channel);
       try {
         import_electron4.ipcMain.removeHandler(channel);
       } catch {
       }
+      mainIpcHandlerRegistrations.set(channel, registration);
       const invokeHandler = async (...args) => handler(...args);
       import_electron4.ipcMain.handle(channel, async (_e2, ...args) => invokeHandler(...args));
       if (id === "co.tweakers.projects" && c === "projects") {
         mainTweakReadHandlers.set(`${id}:${c}`, invokeHandler);
       }
       return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
         if (mainTweakReadHandlers.get(`${id}:${c}`) === invokeHandler) mainTweakReadHandlers.delete(`${id}:${c}`);
+        try {
+          import_electron4.ipcMain.removeHandler(channel);
+        } catch {
+        }
+      };
+    },
+    handleWithContext: (c, handler) => {
+      requireIpc();
+      const channel = ch(c);
+      const registration = Symbol(channel);
+      try {
+        import_electron4.ipcMain.removeHandler(channel);
+      } catch {
+      }
+      mainIpcHandlerRegistrations.set(channel, registration);
+      mainTweakReadHandlers.delete(`${id}:${c}`);
+      import_electron4.ipcMain.handle(channel, async (event, ...args) => {
+        const sender = ownedCodexRenderer(event.sender.id);
+        if (!sender || sender !== event.sender) {
+          throw new Error("IPC invoke sender is not an owned Codex renderer");
+        }
+        const context = Object.freeze({
+          sender: Object.freeze({ webContentsId: sender.id })
+        });
+        return handler(context, ...args);
+      });
+      return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
         try {
           import_electron4.ipcMain.removeHandler(channel);
         } catch {
@@ -17094,6 +17563,14 @@ function makeMainIpc(id) {
       };
     }
   };
+}
+function ownedCodexRenderer(webContentsId) {
+  if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) return null;
+  const target = import_electron4.webContents.fromId(webContentsId);
+  if (!target || target.isDestroyed()) return null;
+  const owner = import_electron4.BrowserWindow.fromWebContents(target);
+  if (!owner || owner.isDestroyed() || owner.webContents !== target) return null;
+  return import_electron4.BrowserWindow.getAllWindows().some((window) => window === owner) ? target : null;
 }
 function makeMainFs(id) {
   const dir = (0, import_node_path26.join)(userRoot, "tweak-data", id);
@@ -17239,7 +17716,7 @@ async function captureFrontmostWindow(options = {}) {
   const size = source.thumbnail.getSize();
   if (size.width * size.height > MAX_APPSHOT_PIXELS) throw new Error("frontmost window capture exceeded the AppShots pixel limit");
   return {
-    captureId: (0, import_node_crypto9.randomUUID)(),
+    captureId: (0, import_node_crypto10.randomUUID)(),
     capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
     app: {
       name: frontmost.appName || "Unknown",
@@ -17384,7 +17861,7 @@ function getOwlViewCapabilities() {
   };
 }
 async function createOwlView(ctx, opts) {
-  const id = assertBridgeId2(opts.id ?? (0, import_node_crypto9.randomUUID)(), "Codex view id");
+  const id = assertBridgeId2(opts.id ?? (0, import_node_crypto10.randomUUID)(), "Codex view id");
   const key = owlViewKey(ctx.id, id);
   if (owlViews.has(key)) throw new Error(`Codex view already exists: ${ctx.id}:${id}`);
   const parent = typeof opts.parentWindowId === "number" ? import_electron4.BrowserWindow.fromId(opts.parentWindowId) : getPrimaryCodexWindow();
@@ -17733,15 +18210,7 @@ function makeCodexApi(tweak) {
     },
     refresh: {
       getStatus: async () => localRefreshStatus(),
-      start: async (source) => {
-        const status = await localRefreshStatus();
-        if (!status.available) return { started: false, status };
-        const cli = localRefreshCli(status);
-        const appRoot = readInstallerState()?.appRoot;
-        if (!appRoot || !(0, import_node_fs22.existsSync)(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-        startInstalledCli(cli, ["refresh-local", "--source", source ?? "smart", "--app", appRoot]);
-        return { started: true, status: { ...status, phase: "preparing" } };
-      },
+      start: async (source) => startLocalRefresh(source),
       onStatusChanged: () => () => {
       }
     },

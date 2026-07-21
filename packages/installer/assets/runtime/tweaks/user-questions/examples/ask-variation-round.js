@@ -10,6 +10,7 @@ const PROTOCOL_VERSION = "2025-11-25";
 const INITIALIZE_ID = 1;
 const ASK_ID = 2;
 const RESPONSE_TIMEOUT_MS = 5_000;
+const CARRIER_PREFIX = "__tweakers_carrier_nonce_";
 const input = JSON.parse(fs.readFileSync(path.join(__dirname, "variation-round.json"), "utf8"));
 const scriptedContent = {
   improvements: ["faster", "accessible", "__other__"],

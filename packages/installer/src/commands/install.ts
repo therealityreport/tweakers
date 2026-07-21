@@ -2,7 +2,7 @@ import kleur from "kleur";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync, readdirSync, rmSync, copyFileSync, renameSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -28,7 +28,7 @@ import {
   patchCodexWindowServicesSource,
   type CodexWindowServicesSourceDiagnostics,
 } from "../codex-window-services.js";
-import { chownForTargetUser, targetUserHome } from "../ownership.js";
+import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
@@ -38,11 +38,12 @@ import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
-  generateProductionHealthReceipt,
+  PROMOTION_SURFACE_NAMES,
   runInstallTransaction,
   readProductionHealthReceipt,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
+  type ProductionHealthExpectationV2,
   type TransactionResult,
 } from "../transaction.js";
 import { migrateAutomatically } from "./migrate.js";
@@ -53,7 +54,24 @@ import { applyMacAppIdentity, type MacAppIdentity } from "../macos-variant.js";
 import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
-import { migrateLegacyTweakNamespaces, prepareLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import {
+  fingerprintPath,
+  inspectUserQuestionsSource,
+  LEGACY_USER_QUESTIONS_TWEAK_IDS,
+  USER_QUESTIONS_FOLDER,
+  USER_QUESTIONS_TWEAK_ID,
+} from "../user-questions-source.js";
+import {
+  commitUserQuestionsRollout,
+  defaultUserQuestionsRolloutOptions,
+  planUserQuestionsRollout,
+  prepareUserQuestionsRollout,
+  readUserQuestionsRolloutReceipt,
+  rollbackUserQuestionsRollout,
+  sealUserQuestionsRollout,
+  type UserQuestionsRolloutReceipt,
+} from "../user-questions-transaction.js";
 
 interface Opts {
   app?: string;
@@ -246,6 +264,17 @@ export function verifyNativeHostMatchesApp(
   if (appIdentity.teamIdentifier === null) {
     const appAuthorities = appIdentity.authority.join("\n");
     const hostAuthorities = hostIdentity.authority.join("\n");
+    const appIsBareAdHoc = appIdentity.adHoc && appAuthorities.length === 0;
+    const hostIsBareAdHoc = hostIdentity.adHoc && hostAuthorities.length === 0;
+    if (appIsBareAdHoc || hostIsBareAdHoc) {
+      if (!appIsBareAdHoc || !hostIsBareAdHoc) {
+        throw new Error("Staged native host does not share the candidate's local signing identity");
+      }
+      // Strict verification above proves the host is sealed into this exact
+      // candidate. Bare ad-hoc signatures intentionally have no certificate
+      // authority or leaf hash to compare.
+      return;
+    }
     if (appIdentity.adHoc !== hostIdentity.adHoc
       || appAuthorities.length === 0
       || appAuthorities !== hostAuthorities) {
@@ -382,21 +411,41 @@ export function loadVerifiedSwapHost(
 export function spawnHiddenHealthProbe(
   executable: string,
   userRoot: string,
-  deps: { spawn?: typeof spawnSync } = {},
+  deps: {
+    spawn?: typeof spawnSync;
+    /** Exact contained Codex home for a disposable candidate; omitted for a real post-promotion probe. */
+    candidateCodexHome?: string;
+    platform?: NodeJS.Platform;
+  } = {},
 ): ReturnType<typeof spawnSync> {
   const spawn = deps.spawn ?? spawnSync;
+  const platform = deps.platform ?? process.platform;
+  const candidateEnvironment = deps.candidateCodexHome
+    ? {
+      TWEAKERS_CANDIDATE_MCP_RECONCILIATION: "1",
+      CODEX_HOME: deps.candidateCodexHome,
+    }
+    : {};
   // The disposable probe must never attach to the real Electron profile: the
   // owl fork resolves userData natively at startup, so a probe launched while
   // the same-productName app is running hits Chromium's process singleton and
   // is forwarded ("Opening in existing browser session.") before any JS —
   // including the health-receipt path — can run. An explicit throwaway
   // --user-data-dir sidesteps both the singleton and profile writes.
-  return spawn(executable, [`--user-data-dir=${join(userRoot, "electron-user-data")}`], {
+  const chromiumArgs = [
+    `--user-data-dir=${join(userRoot, "electron-user-data")}`,
+    // Chromium's supported macOS test switch keeps OSCrypt and its utility
+    // processes on a mock Keychain from process start. Runtime asserts the
+    // same switch again before app ready; normal launches use neither path.
+    ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
+  ];
+  return spawn(executable, chromiumArgs, {
     env: {
       ...process.env,
       TWEAKERS_HEALTH_CHECK_ONLY: "1",
       TWEAKERS_HEALTH_USER_ROOT: userRoot,
       TWEAKERS_HEALTH_BACKGROUND: "1",
+      ...candidateEnvironment,
     },
     stdio: "ignore",
     timeout: 15_000,
@@ -433,6 +482,15 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const payloadHash = installerPayloadHash();
   const candidateUserRoot = join(paths.transactionRoot, "candidate-user");
   const candidatePaths = transactionUserPaths(candidateUserRoot);
+  const liveCodexHome = join(targetUserHome(), ".codex");
+  const candidateCodexHome = join(candidateUserRoot, "codex-home");
+  const rolloutKey = `${source.hash}-${payloadHash}`;
+  const liveUserQuestionsReceiptFile = join(paths.transactionRoot, "user-questions", `${rolloutKey}.json`);
+  const liveUserQuestionsArchiveRoot = join(paths.transactionRoot, "user-questions", rolloutKey);
+  let candidateHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let liveHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let liveUserQuestionsReceipt: UserQuestionsRolloutReceipt | null = null;
+  let liveMcpConflictCount: number | null = null;
   const candidateSignedBackup = join(candidatePaths.backup, "Codex.app");
   const liveSignedBackup = join(paths.backup, "Codex.app");
   const signedBackupSnapshot = join(paths.transactionRoot, "last-known-good-backup");
@@ -459,6 +517,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       bundleId: opts.macAppIdentity?.bundleId ?? codex.bundleId ?? "com.openai.codex",
       nonLiveAppRoots,
       garbageCollect: options.garbageCollect,
+      mutate: !candidateOnly,
     });
     if (launchServices.failed.length > 0 && !opts.quiet) {
       console.warn(kleur.yellow(`LaunchServices cleanup was incomplete: ${launchServices.failed.map((failure) => failure.path).join(", ")}`));
@@ -483,6 +542,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
       resetCandidateUserRootForBuild(candidateUserRoot);
+      stageCandidateRolloutInputs({
+        livePaths: paths,
+        candidatePaths,
+        liveCodexHome,
+        candidateCodexHome,
+      });
       await installCandidateInPlace({
         ...opts,
         app: candidateRoot,
@@ -490,6 +555,52 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         quiet: true,
         localSigning: signingMode === "local-identity",
         candidateContext: { paths: candidatePaths, finalUserRoot: paths.root },
+      });
+      stageBundledTweaks(candidatePaths.tweaks, candidatePaths.runtime);
+      const candidateRolloutOptions = defaultUserQuestionsRolloutOptions({
+        userRoot: candidateUserRoot,
+        liveTweaksRoot: candidatePaths.tweaks,
+        tweakersConfigPath: candidatePaths.configFile,
+        codexConfigPath: join(candidateCodexHome, "config.toml"),
+        receiptFile: join(candidateUserRoot, "transactions", "user-questions-rollout.json"),
+        archiveRoot: join(candidateUserRoot, "transactions", "user-questions-rollout"),
+        transactionId: `candidate-${payloadHash}`,
+      });
+      const candidatePrepared = prepareUserQuestionsRollout(planUserQuestionsRollout(candidateRolloutOptions));
+      if (candidatePrepared.phase !== "prepared") {
+        throw new Error("Candidate User Questions rollout held before health validation");
+      }
+      const candidateMcpReceipt = reconcilePromotionMcpConfig({
+        runtimeRoot: candidatePaths.runtime,
+        tweaksRoot: candidatePaths.tweaks,
+        userRoot: candidateUserRoot,
+        tweakersConfigPath: candidatePaths.configFile,
+        codexConfigPath: join(candidateCodexHome, "config.toml"),
+        statePath: join(candidateUserRoot, "mcp-sync-state.json"),
+      });
+      sealUserQuestionsRollout(candidatePrepared, { mcpConflictCount: candidateMcpReceipt.conflictCount });
+      assertPromotionMcpReceipt(candidateMcpReceipt, "candidate");
+      const candidate = locateCodex(candidateRoot);
+      candidateHealthExpectation = buildPromotionHealthExpectation({
+        app: fingerprintCodex(candidate),
+        before: promotionSurfaceRoots({
+          appHash: source.hash,
+          runtimeRoot: paths.runtime,
+          tweaksRoot: paths.tweaks,
+          userRoot: paths.root,
+          tweakersConfigPath: paths.configFile,
+          codexHome: liveCodexHome,
+        }),
+        after: promotionSurfaceRoots({
+          appHash: fingerprintCodex(candidate).hash,
+          runtimeRoot: candidatePaths.runtime,
+          tweaksRoot: candidatePaths.tweaks,
+          userRoot: candidateUserRoot,
+          tweakersConfigPath: candidatePaths.configFile,
+          codexHome: candidateCodexHome,
+        }),
+        requiredPermissions,
+        userQuestionsRoot: join(candidatePaths.tweaks, USER_QUESTIONS_FOLDER),
       });
     },
     validateCandidate: (candidateRoot) => {
@@ -503,6 +614,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         const marker = readAsarMarker(candidate.asarPath);
         if (marker === "unreadable") throw new Error("candidate app.asar could not be read (corrupt or locked)");
         if (marker === "absent") throw new Error("patch marker absent from candidate app.asar (asar not patched)");
+        validateMainRendererAsarEntrypoint(candidate.asarPath);
         return true;
       } finally {
         reconcileMacRegistrations({ garbageCollect: false });
@@ -519,25 +631,29 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       return restored.platform === "darwin" ? signatureInfo(appRoot).ok : true;
     },
     probeCandidateHealth: ({ candidateRoot }) => {
+      let removeCandidateAuth: (() => void) | null = null;
       try {
+        removeCandidateAuth = stageCandidateCodexAuth(liveCodexHome, candidateCodexHome);
         const candidate = locateCodex(candidateRoot);
-        const expected = {
-          app: fingerprintCodex(candidate),
-          runtimeHash: hashDirectoryTree(candidatePaths.runtime),
-          requiredPermissions,
-        };
+        validateMainRendererAsarEntrypoint(candidate.asarPath);
+        const expected = candidateHealthExpectation;
+        if (!expected || !sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
+          return unknownPromotionHealth(requiredPermissions);
+        }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
         writeHealthRequest(join(candidateUserRoot, "health", "request.json"), {
-          schemaVersion: 1,
-          requestedAt: new Date().toISOString(),
           ...expected,
+          requestedAt: new Date().toISOString(),
         });
-        const launched = spawnHiddenHealthProbe(candidate.executable, candidateUserRoot);
+        const launched = spawnHiddenHealthProbe(candidate.executable, candidateUserRoot, { candidateCodexHome });
         if (launched.error || launched.status !== 0) {
-          return { host: "unknown", session: "unknown", permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])) };
+          return unknownPromotionHealth(requiredPermissions);
         }
         return readProductionHealthReceipt(receiptFile, expected);
+      } catch {
+        return unknownPromotionHealth(requiredPermissions);
       } finally {
+        removeCandidateAuth?.();
         reconcileMacRegistrations({ garbageCollect: false });
       }
     },
@@ -550,12 +666,52 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       }
       signedBackupWiring.snapshotLive();
     },
-    promoteCandidate: (candidateRoot, appRoot) => {
-      // Verify and promote the pristine Developer-ID backup before mutating
-      // the app. If a later app/runtime swap fails, restore backup continuity
-      // immediately; the outer transaction owns app/runtime recovery.
-      signedBackupWiring.promoteCandidate();
+    promoteCandidate: async (candidateRoot, appRoot) => {
+      // dev-sync already owns the schema-v2 managed-tree transaction. Load its
+      // public seam lazily to avoid an eager install.ts <-> dev-sync.ts cycle.
+      const {
+        prepareDevSnapshot,
+        readDevSnapshotReceipt,
+        rollbackDevSnapshot,
+      } = await import("./dev-sync.js");
       try {
+        prepareDevSnapshot(candidatePaths.tweaks, paths.tweaks);
+        const existingRollout = readUserQuestionsRolloutReceipt(liveUserQuestionsReceiptFile);
+        liveUserQuestionsReceipt = existingRollout ?? planUserQuestionsRollout(defaultUserQuestionsRolloutOptions({
+          userRoot: paths.root,
+          liveTweaksRoot: paths.tweaks,
+          tweakersConfigPath: paths.configFile,
+          codexConfigPath: join(liveCodexHome, "config.toml"),
+          receiptFile: liveUserQuestionsReceiptFile,
+          archiveRoot: liveUserQuestionsArchiveRoot,
+          transactionId: rolloutKey,
+        }));
+        if (liveUserQuestionsReceipt.phase === "planned" || liveUserQuestionsReceipt.phase === "held") {
+          liveUserQuestionsReceipt = prepareUserQuestionsRollout(liveUserQuestionsReceipt);
+        }
+        if (liveUserQuestionsReceipt.phase !== "prepared" && liveUserQuestionsReceipt.phase !== "sealed") {
+          throw new Error(`User Questions promotion transaction is not preparable: ${liveUserQuestionsReceipt.phase}`);
+        }
+        const mcpReceipt = reconcilePromotionMcpConfig({
+          runtimeRoot: candidatePaths.runtime,
+          tweaksRoot: paths.tweaks,
+          userRoot: paths.root,
+          tweakersConfigPath: paths.configFile,
+          codexConfigPath: join(liveCodexHome, "config.toml"),
+          statePath: join(paths.root, "mcp-sync-state.json"),
+        });
+        liveMcpConflictCount = mcpReceipt.conflictCount;
+        if (liveUserQuestionsReceipt.phase === "prepared") {
+          liveUserQuestionsReceipt = sealUserQuestionsRollout(liveUserQuestionsReceipt, {
+            mcpConflictCount: mcpReceipt.conflictCount,
+          });
+        }
+        assertPromotionMcpReceipt(mcpReceipt, "live");
+
+        // Verify and promote the pristine Developer-ID backup before mutating
+        // the app. If a later app/runtime swap fails, restore backup continuity
+        // immediately; the outer transaction owns app/runtime recovery.
+        signedBackupWiring.promoteCandidate();
         replaceAppBundlePreservingIdentity(candidateRoot, appRoot, {
           validateDestination: (promotedRoot) => verifySignature(promotedRoot).ok,
           onCleanupFailure: (path, error) => {
@@ -564,8 +720,31 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         });
         replaceDirectory(candidatePaths.runtime, paths.runtime);
         reconcileMacIdentityAfterPromotion();
+        const promoted = locateCodex(appRoot);
+        if (!candidateHealthExpectation) throw new Error("Candidate promotion preimages are unavailable");
+        liveHealthExpectation = buildPromotionHealthExpectation({
+          app: fingerprintCodex(promoted),
+          before: promotionPreimageHashes(candidateHealthExpectation),
+          after: promotionSurfaceRoots({
+            appHash: fingerprintCodex(promoted).hash,
+            runtimeRoot: paths.runtime,
+            tweaksRoot: paths.tweaks,
+            userRoot: paths.root,
+            tweakersConfigPath: paths.configFile,
+            codexHome: liveCodexHome,
+          }),
+          requiredPermissions,
+          userQuestionsRoot: join(paths.tweaks, USER_QUESTIONS_FOLDER),
+        });
       } catch (error) {
         signedBackupWiring.restoreLive();
+        if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
+          try { liveUserQuestionsReceipt = rollbackUserQuestionsRollout(liveUserQuestionsReceipt); } catch { /* outer recovery reports any persistent drift */ }
+        }
+        const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+        if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+          try { rollbackDevSnapshot(paths.tweaks); } catch { /* outer recovery reports any persistent drift */ }
+        }
         throw error;
       }
     },
@@ -584,41 +763,49 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       signedBackupWiring.restoreLive();
     },
     probeHealth: async () => {
-      const expected = {
-        app: fingerprintCodex(locateCodex(codex.appRoot)),
-        runtimeHash: hashDirectoryTree(paths.runtime),
-        requiredPermissions,
-      };
+      const expected = liveHealthExpectation;
+      if (!expected) return unknownPromotionHealth(requiredPermissions);
+      try {
+        validateMainRendererAsarEntrypoint(locateCodex(codex.appRoot).asarPath);
+      } catch {
+        return unknownPromotionHealth(requiredPermissions);
+      }
       const receiptFile = join(paths.root, "health", "promotion.json");
-      if (opts.nativeHealthProbe) {
-        await generateProductionHealthReceipt(receiptFile, expected, opts.nativeHealthProbe);
-      } else {
-        // A separately identified variant may be unable to complete a normal
-        // foreground launch while the official app owns OpenAI's shared
-        // session. Validate the exact promoted bytes/runtime through the same
-        // isolated one-shot probe used for the disposable candidate.
-        if (opts.macAppIdentity) {
-          spawnHiddenHealthProbe(locateCodex(codex.appRoot).executable, paths.root);
-        }
-        const deadline = Date.now() + 15_000;
-        while (Date.now() < deadline) {
-          const observed = readProductionHealthReceipt(receiptFile, expected);
-          if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const observed = readProductionHealthReceipt(receiptFile, expected);
+        if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
       return readProductionHealthReceipt(receiptFile, expected);
     },
+    acceptPromotion: async () => {
+      if (!liveUserQuestionsReceipt || liveUserQuestionsReceipt.phase !== "sealed" || liveMcpConflictCount !== 0) {
+        throw new Error("User Questions rollout is not sealed with zero MCP conflicts");
+      }
+      liveUserQuestionsReceipt = commitUserQuestionsRollout(liveUserQuestionsReceipt);
+      const { acceptDevSnapshot, readDevSnapshotReceipt } = await import("./dev-sync.js");
+      const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+      if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+        acceptDevSnapshot(paths.tweaks);
+      }
+    },
+    rollbackPromotion: async () => {
+      if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
+        liveUserQuestionsReceipt = rollbackUserQuestionsRollout(liveUserQuestionsReceipt);
+      }
+      const { readDevSnapshotReceipt, rollbackDevSnapshot } = await import("./dev-sync.js");
+      const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+      if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+        rollbackDevSnapshot(paths.tweaks);
+      }
+    },
     openApp: (appRoot) => {
-      // Promotion has committed and the visible app is still closed. Migrate
-      // persistent IDs before the new runtime's health probe can read config.
-      prepareLegacyTweakNamespaces(paths.root, paths.configFile);
+      const expected = liveHealthExpectation;
+      if (!expected) throw new Error("Schema-v2 live health expectation is unavailable");
       writeHealthRequest(join(paths.root, "health", "request.json"), {
-        schemaVersion: 1,
+        ...expected,
         requestedAt: new Date().toISOString(),
-        app: fingerprintCodex(locateCodex(appRoot)),
-        runtimeHash: hashDirectoryTree(paths.runtime),
-        requiredPermissions,
       });
       // Generate the promotion-health receipt with the hidden health-check
       // probe rather than a plain `open`. A normal launch of an app whose
@@ -641,6 +828,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     source,
     payloadHash,
     requiredPermissions,
+    requirePromotionHealthV2: true,
     candidateOnly,
     candidateOnlyReason: opts.candidateOnlyReason ?? "explicit",
     signingMode,
@@ -1225,6 +1413,328 @@ function transactionUserPaths(root: string): UserPaths {
   };
 }
 
+interface PromotionSurfaceRoots {
+  appHash: string;
+  runtimeRoot: string;
+  tweaksRoot: string;
+  tweakersConfigPath: string;
+  codexConfigPath: string;
+  namespaceDataPath: string;
+  mainStoragePath: string;
+  policyPath: string;
+}
+
+type PromotionSurfaceHashes = Record<(typeof PROMOTION_SURFACE_NAMES)[number], string>;
+
+export function promotionSurfaceRoots(input: {
+  appHash: string;
+  runtimeRoot: string;
+  tweaksRoot: string;
+  userRoot: string;
+  tweakersConfigPath: string;
+  codexHome: string;
+}): PromotionSurfaceRoots {
+  return {
+    appHash: input.appHash,
+    runtimeRoot: input.runtimeRoot,
+    tweaksRoot: input.tweaksRoot,
+    tweakersConfigPath: input.tweakersConfigPath,
+    codexConfigPath: join(input.codexHome, "config.toml"),
+    namespaceDataPath: join(input.userRoot, "tweak-data", USER_QUESTIONS_TWEAK_ID),
+    mainStoragePath: join(input.userRoot, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`),
+    policyPath: join(input.codexHome, ".codex-global-state.json"),
+  };
+}
+
+export function buildPromotionHealthExpectation(input: {
+  app: AppFingerprint;
+  before: PromotionSurfaceRoots | PromotionSurfaceHashes;
+  after: PromotionSurfaceRoots | PromotionSurfaceHashes;
+  requiredPermissions: string[];
+  userQuestionsRoot: string;
+}): ProductionHealthExpectationV2 {
+  const before = "appHash" in input.before ? fingerprintPromotionSurfaces(input.before) : input.before;
+  const after = "appHash" in input.after ? fingerprintPromotionSurfaces(input.after) : input.after;
+  if (after.app !== input.app.hash) throw new Error("Promotion app surface does not match the app fingerprint");
+  const userQuestions = inspectUserQuestionsSource(input.userQuestionsRoot);
+  return {
+    schemaVersion: 2,
+    app: { ...input.app },
+    requiredPermissions: [...input.requiredPermissions],
+    surfaces: Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [name, {
+      preimageHash: before[name],
+      afterHash: after[name],
+    }])) as ProductionHealthExpectationV2["surfaces"],
+    userQuestions: {
+      id: userQuestions.id,
+      version: userQuestions.version,
+      payloadHash: userQuestions.payloadHash,
+    },
+  };
+}
+
+function promotionPreimageHashes(expectation: ProductionHealthExpectationV2): PromotionSurfaceHashes {
+  return Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [
+    name,
+    expectation.surfaces[name].preimageHash,
+  ])) as PromotionSurfaceHashes;
+}
+
+function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSurfaceHashes {
+  return {
+    app: roots.appHash,
+    runtime: fingerprintPromotionPath(roots.runtimeRoot),
+    tweakTree: fingerprintPromotionPath(roots.tweaksRoot),
+    tweakersConfig: fingerprintPromotionPath(roots.tweakersConfigPath),
+    codexConfig: fingerprintPromotionPath(roots.codexConfigPath),
+    namespaceData: fingerprintPromotionPath(roots.namespaceDataPath),
+    mainStorage: fingerprintPromotionPath(roots.mainStoragePath),
+    policy: fingerprintPromotionPath(roots.policyPath),
+  };
+}
+
+/** Mode- and link-aware deterministic fingerprint shared with the runtime responder. */
+export function fingerprintPromotionPath(path: string): string {
+  if (!existsSync(path)) return "missing";
+  const digest = createHash("sha256");
+  const visit = (entryPath: string, name: string): void => {
+    const stat = lstatSync(entryPath);
+    digest.update(name).update("\0").update(String(stat.mode & 0o777)).update("\0");
+    if (stat.isDirectory()) {
+      digest.update("directory\0");
+      for (const child of readdirSync(entryPath).sort()) {
+        visit(join(entryPath, child), name ? `${name}/${child}` : child);
+      }
+      return;
+    }
+    if (stat.isFile()) {
+      digest.update("file\0").update(readFileSync(entryPath));
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      digest.update("symlink\0").update(readlinkSync(entryPath));
+      return;
+    }
+    throw new Error(`Unsupported promotion surface entry: ${entryPath}`);
+  };
+  visit(path, "");
+  return digest.digest("hex");
+}
+
+export function stageCandidateRolloutInputs(input: {
+  livePaths: UserPaths;
+  candidatePaths: UserPaths;
+  liveCodexHome: string;
+  candidateCodexHome: string;
+}): void {
+  mkdirSync(input.candidatePaths.root, { recursive: true, mode: 0o700 });
+  mkdirSync(input.candidateCodexHome, { recursive: true, mode: 0o700 });
+  const copies: Array<[string, string]> = [
+    [input.livePaths.configFile, input.candidatePaths.configFile],
+    [join(input.liveCodexHome, "config.toml"), join(input.candidateCodexHome, "config.toml")],
+    [join(input.liveCodexHome, ".codex-global-state.json"), join(input.candidateCodexHome, ".codex-global-state.json")],
+  ];
+  for (const id of [USER_QUESTIONS_TWEAK_ID, ...LEGACY_USER_QUESTIONS_TWEAK_IDS]) {
+    copies.push(
+      [join(input.livePaths.root, "tweak-data", id), join(input.candidatePaths.root, "tweak-data", id)],
+      [join(input.livePaths.root, "storage", `${id}.json`), join(input.candidatePaths.root, "storage", `${id}.json`)],
+    );
+  }
+  for (const [source, destination] of copies) copyCandidatePreimage(source, destination);
+}
+
+/**
+ * Stage only the durable Codex authentication proof into the contained
+ * candidate home immediately before its synchronous one-shot probe. The
+ * returned cleanup must run after the probe so credentials never persist in a
+ * held candidate transaction.
+ */
+export function stageCandidateCodexAuth(liveCodexHome: string, candidateCodexHome: string): () => void {
+  if (!isAbsolute(liveCodexHome) || resolve(liveCodexHome) !== liveCodexHome) {
+    throw new Error("Live Codex home must be an exact absolute path");
+  }
+  if (!isAbsolute(candidateCodexHome) || resolve(candidateCodexHome) !== candidateCodexHome) {
+    throw new Error("Candidate Codex home must be an exact absolute path");
+  }
+  const candidateHomeStat = lstatSync(candidateCodexHome);
+  if (!candidateHomeStat.isDirectory() || candidateHomeStat.isSymbolicLink()) {
+    throw new Error("Candidate Codex home must be a real directory");
+  }
+
+  const source = join(liveCodexHome, "auth.json");
+  const destination = join(candidateCodexHome, "auth.json");
+  const sourceFd = openSync(source, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let bytes: Buffer;
+  try {
+    const stat = fstatSync(sourceFd);
+    const owner = targetUserOwnership();
+    if (
+      !stat.isFile()
+      || (stat.mode & 0o777) !== 0o600
+      || stat.size <= 0
+      || stat.size > 1024 * 1024
+      || (owner !== null && stat.uid !== owner.uid)
+    ) {
+      throw new Error("Codex authentication proof must be a bounded owner-only regular file");
+    }
+    bytes = readFileSync(sourceFd);
+    if (bytes.byteLength !== stat.size) throw new Error("Codex authentication proof changed while being read");
+  } finally {
+    closeSync(sourceFd);
+  }
+
+  const temporary = `${destination}.${process.pid}.tmp`;
+  rmSync(temporary, { force: true });
+  try {
+    writeFileSync(temporary, bytes, { flag: "wx", mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    chownForTargetUser(temporary);
+    const staged = lstatSync(temporary);
+    const owner = targetUserOwnership();
+    if (
+      !staged.isFile()
+      || staged.isSymbolicLink()
+      || (staged.mode & 0o777) !== 0o600
+      || staged.size !== bytes.byteLength
+      || (owner !== null && staged.uid !== owner.uid)
+    ) {
+      throw new Error("Contained Codex authentication proof failed verification");
+    }
+    renameSync(temporary, destination);
+  } finally {
+    bytes.fill(0);
+    rmSync(temporary, { force: true });
+  }
+  return () => {
+    rmSync(destination, { force: true });
+  };
+}
+
+function copyCandidatePreimage(source: string, destination: string): void {
+  const before = fingerprintPath(source);
+  if (before.kind === "missing") return;
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+  cpSync(source, destination, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+  const after = fingerprintPath(destination);
+  if (before.kind !== after.kind || before.mode !== after.mode || before.hash !== after.hash) {
+    throw new Error(`Candidate rollout preimage copy failed verification: ${source}`);
+  }
+}
+
+interface PromotionMcpReceiptSummary {
+  status: "updated" | "unchanged" | "conflict" | "error";
+  conflictCount: number;
+  userQuestionsStateConsistent: boolean;
+}
+
+export function reconcilePromotionMcpConfig(input: {
+  runtimeRoot: string;
+  tweaksRoot: string;
+  userRoot: string;
+  tweakersConfigPath: string;
+  codexConfigPath: string;
+  statePath: string;
+}): PromotionMcpReceiptSummary {
+  const runtimeModulePath = join(input.runtimeRoot, "mcp-reconciliation.js");
+  const stat = lstatSync(runtimeModulePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Candidate MCP reconciler is not a regular runtime file");
+  const runtime = createRequire(import.meta.url)(runtimeModulePath) as {
+    reconcileMcpConfig(options: Record<string, unknown>): Record<string, unknown>;
+    userQuestionsMcpReceiptMatchesEnabledState(receipt: Record<string, unknown>, enabled: boolean): boolean;
+  };
+  if (typeof runtime.reconcileMcpConfig !== "function") throw new Error("Candidate runtime does not expose MCP reconciliation");
+  if (typeof runtime.userQuestionsMcpReceiptMatchesEnabledState !== "function") {
+    throw new Error("Candidate runtime does not expose User Questions MCP state validation");
+  }
+  const config = readJsonRecord(input.tweakersConfigPath);
+  const ownedTweaks = readdirSync(input.tweaksRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .map((entry) => {
+      const dir = join(input.tweaksRoot, entry.name);
+      const manifestPath = join(dir, "manifest.json");
+      const manifestStat = lstatSync(manifestPath);
+      if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 64 * 1024) {
+        throw new Error(`Promotion tweak manifest is unsafe: ${entry.name}`);
+      }
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+      if (typeof manifest.id !== "string" || !manifest.mcp || typeof manifest.mcp !== "object") return null;
+      return {
+        dir,
+        dataDir: join(input.userRoot, "tweak-data", manifest.id),
+        manifest,
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  if (!ownedTweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID)) {
+    throw new Error("Canonical User Questions MCP source is missing from the promotion tree");
+  }
+  const tweaks = ownedTweaks.filter((tweak) => tweakEnabledInConfig(config, String(tweak.manifest.id)));
+  const userQuestionsEnabled = tweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID);
+  mkdirSync(dirname(input.codexConfigPath), { recursive: true, mode: 0o700 });
+  const receipt = runtime.reconcileMcpConfig({
+    configPath: input.codexConfigPath,
+    statePath: input.statePath,
+    tweaks,
+    ownedTweaks,
+    trigger: "startup",
+  });
+  const status = receipt.status;
+  const conflicts = receipt.conflicts;
+  const appliedNames = receipt.appliedNames;
+  const approvalPolicy = receipt.approvalPolicy;
+  if (
+    !["updated", "unchanged", "conflict", "error"].includes(String(status))
+    || !Array.isArray(conflicts)
+    || !Array.isArray(appliedNames)
+    || !approvalPolicy
+    || typeof approvalPolicy !== "object"
+  ) throw new Error("Candidate MCP reconciliation returned an invalid receipt");
+  return {
+    status: status as PromotionMcpReceiptSummary["status"],
+    conflictCount: conflicts.length,
+    userQuestionsStateConsistent: runtime.userQuestionsMcpReceiptMatchesEnabledState(receipt, userQuestionsEnabled),
+  };
+}
+
+function assertPromotionMcpReceipt(receipt: PromotionMcpReceiptSummary, scope: string): void {
+  if (receipt.status === "conflict" || receipt.status === "error" || receipt.conflictCount !== 0 || !receipt.userQuestionsStateConsistent) {
+    throw new Error(`${scope} MCP reconciliation did not prove the expected User Questions enabled state`);
+  }
+}
+
+function tweakEnabledInConfig(config: Record<string, unknown>, id: string): boolean {
+  const tweaker = recordValue(config.tweaker);
+  if (tweaker?.safeMode === true) return false;
+  const health = recordValue(recordValue(config.tweakHealth)?.[id]);
+  if (health?.status === "quarantined") return false;
+  const tweak = recordValue(recordValue(config.tweaks)?.[id]);
+  return tweak?.enabled !== false;
+}
+
+function readJsonRecord(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Expected a JSON object: ${path}`);
+  return value as Record<string, unknown>;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function unknownPromotionHealth(requiredPermissions: string[]) {
+  return {
+    host: "unknown" as const,
+    session: "unknown" as const,
+    permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])),
+    promotionReady: "unknown" as const,
+  };
+}
+
+function sameAppFingerprint(left: AppFingerprint, right: AppFingerprint): boolean {
+  return left.version === right.version && left.build === right.build && left.hash === right.hash;
+}
+
 function fingerprintCodex(codex: CodexInstall): AppFingerprint {
   const plist = codex.metaPath ? readPlist(codex.metaPath) : {};
   return {
@@ -1716,6 +2226,201 @@ export function readAsarPatchSchema(asarPath: string): AsarPatchSchema {
   } catch {
     return "unreadable";
   }
+}
+
+const MAIN_RENDERER_ASAR_ENTRY = "webview/index.html";
+const MAX_ASAR_PACKAGE_BYTES = 1024 * 1024;
+const MAX_MAIN_PROCESS_ENTRY_BYTES = 128 * 1024 * 1024;
+const MAX_MAIN_RENDERER_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_MAIN_RENDERER_ASSET_BYTES = 128 * 1024 * 1024;
+
+interface AsarFileEntry {
+  files?: Record<string, unknown>;
+  integrity?: unknown;
+  link?: unknown;
+  offset?: unknown;
+  size?: unknown;
+  unpacked?: unknown;
+}
+
+/**
+ * Prove the patched archive still contains the real application bootstrap and
+ * a complete main renderer document. The one-shot runtime health process does
+ * not execute OpenAI's original main module, so its receipt cannot substitute
+ * for this sealed-ASAR validation.
+ */
+export function validateMainRendererAsarEntrypoint(asarPath: string): void {
+  const header = readHeaderHash(asarPath).header;
+  const readEntry = (entryPath: string, maxBytes: number): Buffer => (
+    readVerifiedInlineAsarEntry(asarPath, header, entryPath, maxBytes)
+  );
+  const packageBytes = readEntry("package.json", MAX_ASAR_PACKAGE_BYTES);
+  let pkg: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(packageBytes)) as unknown;
+    const record = recordValue(parsed);
+    if (!record) throw new Error("package root is not an object");
+    pkg = record;
+  } catch (error) {
+    throw new Error(`candidate app.asar package.json is corrupt: ${errorMessage(error)}`);
+  }
+
+  const current = recordValue(pkg.__tweaker);
+  const legacy = recordValue(pkg[LEGACY_ASAR_META_KEY]);
+  const metadata = current ?? legacy;
+  const loaderEntry = current ? "tweaker-loader.cjs" : legacy ? LEGACY_LOADER_FILE : null;
+  const originalMain = metadata?.originalMain;
+  if (!loaderEntry || pkg.main !== loaderEntry || typeof originalMain !== "string") {
+    throw new Error("candidate app.asar loader metadata is incomplete");
+  }
+  const normalizedOriginalMain = normalizeContainedAsarPath(originalMain, "original main entry");
+  readEntry(loaderEntry, MAX_ASAR_PACKAGE_BYTES);
+  readEntry(normalizedOriginalMain, MAX_MAIN_PROCESS_ENTRY_BYTES);
+
+  const rendererBytes = readEntry(MAIN_RENDERER_ASAR_ENTRY, MAX_MAIN_RENDERER_ENTRY_BYTES);
+  let html: string;
+  try {
+    html = new TextDecoder("utf-8", { fatal: true }).decode(rendererBytes);
+  } catch {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} is not valid UTF-8`);
+  }
+  if (!completeMainRendererDocument(html)) {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} is corrupt or truncated`);
+  }
+
+  const moduleEntries = moduleScriptSources(html).map((source) => {
+    const withoutQuery = source.split(/[?#]/, 1)[0] ?? "";
+    if (!withoutQuery || withoutQuery.startsWith("/") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(withoutQuery)) {
+      throw new Error(`candidate main renderer module source is not contained in app.asar: ${source}`);
+    }
+    const resolved = posix.normalize(posix.join(posix.dirname(MAIN_RENDERER_ASAR_ENTRY), withoutQuery));
+    if (!resolved.startsWith("webview/") || resolved === "webview") {
+      throw new Error(`candidate main renderer module source escapes its ASAR root: ${source}`);
+    }
+    return normalizeContainedAsarPath(resolved, "main renderer module entry");
+  });
+  if (moduleEntries.length === 0) {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} has no module bootstrap`);
+  }
+  for (const moduleEntry of new Set(moduleEntries)) {
+    readEntry(moduleEntry, MAX_MAIN_RENDERER_ASSET_BYTES);
+  }
+}
+
+function readVerifiedInlineAsarEntry(
+  asarPath: string,
+  header: unknown,
+  entryPath: string,
+  maxBytes: number,
+): Buffer {
+  const entry = asarHeaderFileEntry(header, entryPath);
+  if (entry.files || entry.link !== undefined || entry.unpacked === true) {
+    throw new Error(`candidate app.asar entry is not a sealed inline file: ${entryPath}`);
+  }
+  if (!Number.isSafeInteger(entry.size) || Number(entry.size) <= 0 || Number(entry.size) > maxBytes) {
+    throw new Error(`candidate app.asar entry has an invalid size: ${entryPath}`);
+  }
+  if (typeof entry.offset !== "string" || !/^\d+$/.test(entry.offset)) {
+    throw new Error(`candidate app.asar entry has an invalid offset: ${entryPath}`);
+  }
+  const bytes = readInlineAsarBytes(asarPath, entryPath, Number(entry.offset), Number(entry.size));
+  if (bytes.length !== entry.size) {
+    throw new Error(`candidate app.asar entry is truncated: ${entryPath}`);
+  }
+  const integrity = recordValue(entry.integrity);
+  const expectedHash = integrity?.hash;
+  if (integrity?.algorithm !== "SHA256" || typeof expectedHash !== "string" || !/^[a-f0-9]{64}$/i.test(expectedHash)) {
+    throw new Error(`candidate app.asar entry has no valid SHA-256 integrity proof: ${entryPath}`);
+  }
+  const observedHash = createHash("sha256").update(bytes).digest("hex");
+  if (observedHash !== expectedHash.toLowerCase()) {
+    throw new Error(`candidate app.asar entry failed its SHA-256 integrity proof: ${entryPath}`);
+  }
+  return bytes;
+}
+
+function readInlineAsarBytes(
+  asarPath: string,
+  entryPath: string,
+  entryOffset: number,
+  entrySize: number,
+): Buffer {
+  const descriptor = openSync(asarPath, "r");
+  try {
+    const archiveStat = fstatSync(descriptor);
+    const sizePickle = Buffer.alloc(8);
+    if (!readExactly(descriptor, sizePickle, 0) || sizePickle.readUInt32LE(0) !== 4) {
+      throw new Error(`candidate app.asar header is unreadable while reading: ${entryPath}`);
+    }
+    const headerSize = sizePickle.readUInt32LE(4);
+    const position = 8 + headerSize + entryOffset;
+    if (!Number.isSafeInteger(position) || position < 8 || position + entrySize > archiveStat.size) {
+      throw new Error(`candidate app.asar entry exceeds the archive bounds: ${entryPath}`);
+    }
+    const bytes = Buffer.alloc(entrySize);
+    if (!readExactly(descriptor, bytes, position)) {
+      throw new Error(`candidate app.asar entry is truncated: ${entryPath}`);
+    }
+    return bytes;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readExactly(descriptor: number, buffer: Buffer, position: number): boolean {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const bytesRead = readSync(descriptor, buffer, offset, buffer.length - offset, position + offset);
+    if (bytesRead <= 0) return false;
+    offset += bytesRead;
+  }
+  return true;
+}
+
+function asarHeaderFileEntry(header: unknown, entryPath: string): AsarFileEntry {
+  let node = recordValue(header);
+  for (const segment of entryPath.split("/")) {
+    const files = recordValue(node?.files);
+    if (!files || !Object.prototype.hasOwnProperty.call(files, segment)) {
+      throw new Error(`candidate app.asar is missing required entry: ${entryPath}`);
+    }
+    node = recordValue(files[segment]);
+    if (!node) throw new Error(`candidate app.asar has an invalid header entry: ${entryPath}`);
+  }
+  return node as AsarFileEntry;
+}
+
+function normalizeContainedAsarPath(entryPath: string, label: string): string {
+  if (!entryPath || entryPath.includes("\\") || entryPath.startsWith("/") || entryPath.includes("\0")) {
+    throw new Error(`candidate app.asar ${label} is unsafe`);
+  }
+  const normalized = posix.normalize(entryPath.replace(/^\.\//, ""));
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error(`candidate app.asar ${label} escapes the archive root`);
+  }
+  return normalized;
+}
+
+function completeMainRendererDocument(html: string): boolean {
+  const document = html.trim();
+  return /^<!doctype\s+html\b/i.test(document)
+    && /<html\b/i.test(document)
+    && /<head\b/i.test(document)
+    && /<\/head\s*>/i.test(document)
+    && /<body\b/i.test(document)
+    && /<\/body\s*>/i.test(document)
+    && /<\/html\s*>\s*$/i.test(document);
+}
+
+function moduleScriptSources(html: string): string[] {
+  const sources: string[] = [];
+  for (const match of html.matchAll(/<script\b[^>]*>/gi)) {
+    const tag = match[0];
+    if (!/\btype\s*=\s*["']module["']/i.test(tag)) continue;
+    const source = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1];
+    if (source) sources.push(source);
+  }
+  return sources;
 }
 
 export function formatInvalidatedInstallError(liveAppRoot: string, failure?: string, pendingReason?: string): string {

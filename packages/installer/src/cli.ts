@@ -126,9 +126,18 @@ async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolea
   return devSync(opts);
 }
 
-async function runRefreshLocal(opts: { source?: "smart" | "development" | "stable"; app?: string }): Promise<void> {
+async function runRefreshLocal(opts: {
+  source?: "smart" | "development" | "stable";
+  app?: string;
+  developmentRoot?: string;
+  "development-root"?: string;
+}): Promise<void> {
   const { refreshLocal } = await import("./commands/refresh-local.js");
-  return refreshLocal(opts);
+  return refreshLocal({
+    source: opts.source,
+    app: opts.app,
+    developmentRoot: opts.developmentRoot ?? opts["development-root"],
+  });
 }
 
 async function runMode(target: string, opts: { json?: boolean; yes?: boolean; app?: string }): Promise<void> {
@@ -383,6 +392,7 @@ prog
   .command("refresh-local")
   .describe("Validate, quit, refresh, and reopen the local ChatGPT app")
   .option("--source", "Refresh source: smart, development, or stable", "smart")
+  .option("--development-root", "Exact absolute Tweakers Git worktree root; requires --source development")
   .option("--app", "Path to ChatGPT.app / install dir")
   .action(wrap(runRefreshLocal));
 

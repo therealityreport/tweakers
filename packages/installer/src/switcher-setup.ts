@@ -28,7 +28,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeF
 import { platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { prepareCodeSigning } from "./codesign.js";
+import { codeSigningKeychainArgs, prepareCodeSigning } from "./codesign.js";
 import { managedCliPath } from "./managed-runtime.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "./ownership.js";
 import { ensureUserPaths, userPaths } from "./paths.js";
@@ -448,7 +448,14 @@ function defaultCopyApp(source: string, destination: string): void {
  */
 function signWithLocalIdentity(appRoot: string): void {
   const identity = prepareCodeSigning({});
-  execFileSync("codesign", ["--force", "--deep", "--sign", identity?.hash ?? "-", appRoot], {
+  execFileSync("codesign", [
+    "--force",
+    "--deep",
+    "--sign",
+    identity?.hash ?? "-",
+    ...codeSigningKeychainArgs(identity),
+    appRoot,
+  ], {
     stdio: ["ignore", "ignore", "pipe"],
   });
 }

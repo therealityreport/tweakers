@@ -39,9 +39,51 @@ export interface TransactionHealth {
   host: HealthValue;
   session: HealthValue;
   permissions: Record<string, HealthValue>;
+  /** Present only when a schema-v2 promotion receipt was requested and verified. */
+  promotionReady?: HealthValue;
 }
 
-export interface ProductionHealthReceipt {
+export const PROMOTION_SURFACE_NAMES = [
+  "app",
+  "runtime",
+  "tweakTree",
+  "tweakersConfig",
+  "codexConfig",
+  "namespaceData",
+  "mainStorage",
+  "policy",
+] as const;
+
+export type PromotionSurfaceName = typeof PROMOTION_SURFACE_NAMES[number];
+
+export interface PromotionSurfaceExpectation {
+  preimageHash: string;
+  afterHash: string;
+}
+
+export interface UserQuestionsPromotionExpectation {
+  id: "co.tweakers.user-questions";
+  version: string;
+  payloadHash: string;
+}
+
+export interface LegacyProductionHealthExpectation {
+  app: AppFingerprint;
+  runtimeHash: string;
+  requiredPermissions: string[];
+}
+
+export interface ProductionHealthExpectationV2 {
+  schemaVersion: 2;
+  app: AppFingerprint;
+  requiredPermissions: string[];
+  surfaces: Record<PromotionSurfaceName, PromotionSurfaceExpectation>;
+  userQuestions: UserQuestionsPromotionExpectation;
+}
+
+export type ProductionHealthExpectation = LegacyProductionHealthExpectation | ProductionHealthExpectationV2;
+
+export interface ProductionHealthReceiptV1 {
   schemaVersion: 1;
   observedAt: string;
   app: AppFingerprint;
@@ -50,6 +92,39 @@ export interface ProductionHealthReceipt {
   authenticatedSession: HealthValue;
   declaredPermissions: Record<string, HealthValue>;
 }
+
+export interface PromotionSurfaceObservation {
+  preimageHash: string;
+  expectedHash: string;
+  observedHash: string;
+  status: HealthValue;
+}
+
+export interface UserQuestionsPromotionObservation {
+  expected: UserQuestionsPromotionExpectation;
+  observed: UserQuestionsPromotionExpectation | null;
+  identity: HealthValue;
+  mainLifecycle: HealthValue;
+  brokerSelfTest: HealthValue;
+  schemaSelfTest: HealthValue;
+  rendererStorageSelfTest: HealthValue;
+  mcpConflictCount: number | null;
+  zeroMcpConflicts: HealthValue;
+}
+
+export interface ProductionHealthReceiptV2 {
+  schemaVersion: 2;
+  observedAt: string;
+  app: AppFingerprint;
+  hostReady: HealthValue;
+  authenticatedSession: HealthValue;
+  declaredPermissions: Record<string, HealthValue>;
+  surfaces: Record<PromotionSurfaceName, PromotionSurfaceObservation>;
+  userQuestions: UserQuestionsPromotionObservation;
+  promotionReady: HealthValue;
+}
+
+export type ProductionHealthReceipt = ProductionHealthReceiptV1 | ProductionHealthReceiptV2;
 
 export interface NativeHealthProbeAdapter {
   probeHostReady(): HealthValue | Promise<HealthValue>;
@@ -102,6 +177,8 @@ export interface TransactionOptions {
   /** Rebuilds a held candidate whenever its patch payload changes, even if the official app did not. */
   payloadHash?: string;
   requiredPermissions: string[];
+  /** Real promotion entrypoints require the complete schema-v2 surface/User Questions proof. */
+  requirePromotionHealthV2?: boolean;
   candidateOnly?: boolean;
   candidateOnlyReason?: "explicit" | "baseline-health-unavailable" | "coordinated-refresh";
   maxCandidateAgeMs?: number;
@@ -133,6 +210,10 @@ export interface TransactionAdapters {
     appRoot: string;
     requiredPermissions: string[];
   }): TransactionHealth | Promise<TransactionHealth>;
+  /** Runs only after health passes, before the transaction is marked healthy. */
+  acceptPromotion?(health: TransactionHealth): void | Promise<void>;
+  /** Unwinds sidecar/config/snapshot work when promotion or acceptance fails. */
+  rollbackPromotion?(): void | Promise<void>;
   openApp(appRoot: string): void | Promise<void>;
 }
 
@@ -160,6 +241,16 @@ const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SUFFIX_TEMP_RE = /\.tweakers-(?:replacement|previous|incoming)-(\d+)$/;
 // .next-<pid> / .previous-<pid>
 const DOT_TEMP_RE = /^\.(?:next|previous)-(\d+)$/;
+
+export function installTransactionSweepDirectories(
+  options: Pick<TransactionOptions, "appRoot" | "runtimeRoot" | "workRoot" | "candidateOnly" | "signingMode">,
+): string[] {
+  const directories = [dirname(resolve(options.runtimeRoot)), resolve(options.workRoot)];
+  if (!options.candidateOnly && options.signingMode !== "adhoc") {
+    directories.unshift(dirname(resolve(options.appRoot)));
+  }
+  return [...new Set(directories)];
+}
 
 /**
  * Best-effort sweep of interrupted-run temp dirs: remove entries whose owning
@@ -257,11 +348,7 @@ async function runLockedInstallTransaction(
   const now = options.now ?? new Date();
   const existing = readTransactionState(options.stateFile);
   try {
-    sweepStaleTempDirs([
-      dirname(resolve(options.appRoot)),
-      dirname(resolve(options.runtimeRoot)),
-      resolve(options.workRoot),
-    ]);
+    sweepStaleTempDirs(installTransactionSweepDirectories(options));
   } catch { /* best-effort startup sweep */ }
 
   if (
@@ -373,6 +460,16 @@ async function runLockedInstallTransaction(
   }
 
   if (options.candidateOnly || options.signingMode === "adhoc") {
+    const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
+      candidateRoot: state.candidateRoot,
+      requiredPermissions: [...options.requiredPermissions],
+    }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
+    if (candidateFailure) {
+      await adapters.removeApp(state.candidateRoot);
+      state.failure = `candidate health: ${candidateFailure}`;
+      invalidateTransactionState(options.stateFile, state, now, existing);
+      return { status: "invalidated", state };
+    }
     state.phase = "pendingPromotion";
     state.pendingReason = options.signingMode === "adhoc"
       ? "adhoc-never-promotes"
@@ -397,7 +494,7 @@ async function runLockedInstallTransaction(
   const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
     candidateRoot: state.candidateRoot,
     requiredPermissions: [...options.requiredPermissions],
-  }), options.requiredPermissions);
+  }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
   if (candidateFailure) {
     await adapters.removeApp(state.candidateRoot);
     state.failure = `candidate health: ${candidateFailure}`;
@@ -427,12 +524,17 @@ async function recoverInterruptedPromotion(
   state.updatedAt = now.toISOString();
   writeTransactionState(options.stateFile, state);
   try {
-    await adapters.restoreApp(state.lastKnownGoodRoot, options.appRoot);
-    await adapters.restoreRuntime(state.lastKnownGoodRuntimeRoot, options.runtimeRoot);
-    const validate = adapters.validateRestoredApp ?? adapters.validateCandidate;
-    const valid = await validate(options.appRoot);
-    if (valid === false) throw new Error("Restored app validation failed");
-    await adapters.openApp(options.appRoot);
+    const rollbackErrors: string[] = [];
+    try { await adapters.rollbackPromotion?.(); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.restoreApp(state.lastKnownGoodRoot, options.appRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.restoreRuntime(state.lastKnownGoodRuntimeRoot, options.runtimeRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try {
+      const validate = adapters.validateRestoredApp ?? adapters.validateCandidate;
+      const valid = await validate(options.appRoot);
+      if (valid === false) throw new Error("Restored app validation failed");
+    } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.openApp(options.appRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    if (rollbackErrors.length > 0) throw new Error(rollbackErrors.join("; "));
     state.rollbackResult = "succeeded";
   } catch (error) {
     state.rollbackResult = "failed";
@@ -494,7 +596,7 @@ async function continuePendingPromotion(
   const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
     candidateRoot: state.candidateRoot,
     requiredPermissions: [...options.requiredPermissions],
-  }), options.requiredPermissions);
+  }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
   if (candidateFailure) {
     await adapters.removeApp(state.candidateRoot);
     state.failure = `candidate health: ${candidateFailure}`;
@@ -507,10 +609,11 @@ async function continuePendingPromotion(
 
 export function readProductionHealthReceipt(
   receiptFile: string,
-  expected: { app: AppFingerprint; runtimeHash: string; requiredPermissions: string[] },
+  expected: ProductionHealthExpectation,
   options: { now?: Date; maxAgeMs?: number; maxBytes?: number } = {},
 ): TransactionHealth {
-  const unknown = unknownHealth(expected.requiredPermissions);
+  const v2Expected = isV2HealthExpectation(expected);
+  const unknown = unknownHealth(expected.requiredPermissions, v2Expected);
   try {
     const stat = lstatSync(receiptFile);
     if (
@@ -518,13 +621,15 @@ export function readProductionHealthReceipt(
       !stat.isFile() ||
       (stat.mode & 0o777) !== 0o600 ||
       (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
-      stat.size > (options.maxBytes ?? 64 * 1024)
+      stat.size > (options.maxBytes ?? 256 * 1024)
     ) return unknown;
-    const receipt = JSON.parse(readFileSync(receiptFile, "utf8")) as ProductionHealthReceipt;
-    if (receipt.schemaVersion !== 1 || !sameFingerprint(receipt.app, expected.app) || receipt.runtimeHash !== expected.runtimeHash) return unknown;
+    const receipt = JSON.parse(readFileSync(receiptFile, "utf8")) as unknown;
+    if (!plainRecord(receipt) || !sameFingerprintValue(receipt.app, expected.app)) return unknown;
     const now = (options.now ?? new Date()).getTime();
-    const observedAt = Date.parse(receipt.observedAt);
+    const observedAt = Date.parse(typeof receipt.observedAt === "string" ? receipt.observedAt : "");
     if (!Number.isFinite(observedAt) || observedAt > now + 5_000 || now - observedAt > (options.maxAgeMs ?? 60_000)) return unknown;
+    if (v2Expected) return readV2HealthReceipt(receipt, expected, unknown);
+    if (!validLegacyHealthReceipt(receipt, expected)) return unknown;
     return {
       host: validHealthValue(receipt.hostReady),
       session: validHealthValue(receipt.authenticatedSession),
@@ -562,7 +667,7 @@ export async function probeNativeHealth(
 /** Atomically publish a fail-safe observation from the native probe surface. */
 export async function generateProductionHealthReceipt(
   receiptFile: string,
-  expected: { app: AppFingerprint; runtimeHash: string; requiredPermissions: string[] },
+  expected: LegacyProductionHealthExpectation,
   adapter: NativeHealthProbeAdapter,
   options: { now?: Date } = {},
 ): Promise<TransactionHealth> {
@@ -642,7 +747,18 @@ async function promoteAndVerify(
     state.failure = errorMessage(error);
   }
 
-  const failure = healthFailure(health, options.requiredPermissions);
+  let failure = healthFailure(
+    health,
+    options.requiredPermissions,
+    options.requirePromotionHealthV2 === true,
+  );
+  if (!failure) {
+    try {
+      await adapters.acceptPromotion?.(health);
+    } catch (error) {
+      failure = `promotion acceptance: ${errorMessage(error)}`;
+    }
+  }
   if (!failure) {
     state.phase = "healthy";
     state.pendingReason = undefined;
@@ -660,12 +776,17 @@ async function promoteAndVerify(
   state.updatedAt = now.toISOString();
   writeTransactionState(options.stateFile, state);
   try {
-    await adapters.restoreApp(state.lastKnownGoodRoot, options.appRoot);
-    await adapters.restoreRuntime(state.lastKnownGoodRuntimeRoot, options.runtimeRoot);
-    const validate = adapters.validateRestoredApp ?? adapters.validateCandidate;
-    const valid = await validate(options.appRoot);
-    if (valid === false) throw new Error("Restored app validation failed");
-    await adapters.openApp(options.appRoot);
+    const rollbackErrors: string[] = [];
+    try { await adapters.rollbackPromotion?.(); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.restoreApp(state.lastKnownGoodRoot, options.appRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.restoreRuntime(state.lastKnownGoodRuntimeRoot, options.runtimeRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try {
+      const validate = adapters.validateRestoredApp ?? adapters.validateCandidate;
+      const valid = await validate(options.appRoot);
+      if (valid === false) throw new Error("Restored app validation failed");
+    } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    try { await adapters.openApp(options.appRoot); } catch (error) { rollbackErrors.push(errorMessage(error)); }
+    if (rollbackErrors.length > 0) throw new Error(rollbackErrors.join("; "));
     state.rollbackResult = "succeeded";
   } catch (error) {
     state.rollbackResult = "failed";
@@ -869,12 +990,19 @@ function candidateIntentMatches(state: TransactionState, options: TransactionOpt
     && state.signingMode !== "adhoc";
 }
 
-function healthFailure(health: TransactionHealth, requiredPermissions: string[]): string | null {
+function healthFailure(
+  health: TransactionHealth,
+  requiredPermissions: string[],
+  requirePromotionHealthV2 = false,
+): string | null {
   if (health.host !== "pass") return `host health ${health.host}`;
   if (health.session !== "pass") return `session health ${health.session}`;
   for (const permission of requiredPermissions) {
     const value = health.permissions[permission] ?? "unknown";
     if (value !== "pass") return `${permission} permission health ${value}`;
+  }
+  if (requirePromotionHealthV2 && health.promotionReady !== "pass") {
+    return `promotion proof ${health.promotionReady ?? "unknown"}`;
   }
   return null;
 }
@@ -887,14 +1015,217 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function unknownHealth(requiredPermissions: string[]): TransactionHealth {
+function unknownHealth(requiredPermissions: string[], promotionV2 = false): TransactionHealth {
   return {
     host: "unknown",
     session: "unknown",
     permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown"])),
+    ...(promotionV2 ? { promotionReady: "unknown" as const } : {}),
   };
 }
 
 function validHealthValue(value: unknown): HealthValue {
   return value === "pass" || value === "fail" || value === "unknown" ? value : "unknown";
+}
+
+function isV2HealthExpectation(value: ProductionHealthExpectation): value is ProductionHealthExpectationV2 {
+  return "schemaVersion" in value && value.schemaVersion === 2;
+}
+
+function validLegacyHealthReceipt(
+  value: Record<string, unknown>,
+  expected: LegacyProductionHealthExpectation,
+): value is ProductionHealthReceiptV1 & Record<string, unknown> {
+  return exactKeys(value, [
+    "schemaVersion",
+    "observedAt",
+    "app",
+    "runtimeHash",
+    "hostReady",
+    "authenticatedSession",
+    "declaredPermissions",
+  ])
+    && value.schemaVersion === 1
+    && value.runtimeHash === expected.runtimeHash
+    && sameFingerprintValue(value.app, expected.app)
+    && validPermissionHealth(value.declaredPermissions, expected.requiredPermissions);
+}
+
+function readV2HealthReceipt(
+  value: Record<string, unknown>,
+  expected: ProductionHealthExpectationV2,
+  unknown: TransactionHealth,
+): TransactionHealth {
+  if (!validV2HealthReceipt(value, expected)) return unknown;
+  return {
+    host: value.hostReady,
+    session: value.authenticatedSession,
+    permissions: Object.fromEntries(expected.requiredPermissions.map((permission) => [
+      permission,
+      value.declaredPermissions[permission]!,
+    ])),
+    promotionReady: value.promotionReady,
+  };
+}
+
+function validV2HealthReceipt(
+  value: Record<string, unknown>,
+  expected: ProductionHealthExpectationV2,
+): value is ProductionHealthReceiptV2 & Record<string, unknown> {
+  if (!exactKeys(value, [
+    "schemaVersion",
+    "observedAt",
+    "app",
+    "hostReady",
+    "authenticatedSession",
+    "declaredPermissions",
+    "surfaces",
+    "userQuestions",
+    "promotionReady",
+  ])) return false;
+  if (
+    value.schemaVersion !== 2
+    || !sameFingerprintValue(value.app, expected.app)
+    || validHealthValue(value.hostReady) !== value.hostReady
+    || validHealthValue(value.authenticatedSession) !== value.authenticatedSession
+    || !validPermissionHealth(value.declaredPermissions, expected.requiredPermissions)
+    || !validPromotionExpectation(expected)
+    || !plainRecord(value.surfaces)
+    || !exactKeys(value.surfaces, [...PROMOTION_SURFACE_NAMES])
+  ) return false;
+
+  const surfaceStatuses: HealthValue[] = [];
+  for (const name of PROMOTION_SURFACE_NAMES) {
+    const observed = value.surfaces[name];
+    const wanted = expected.surfaces[name];
+    if (!plainRecord(observed) || !exactKeys(observed, [
+      "preimageHash", "expectedHash", "observedHash", "status",
+    ])) return false;
+    if (observed.preimageHash !== wanted.preimageHash || observed.expectedHash !== wanted.afterHash) return false;
+    if (observed.observedHash !== "unknown" && !validPromotionHash(observed.observedHash)) return false;
+    const expectedStatus: HealthValue = observed.observedHash === wanted.afterHash
+      ? "pass"
+      : observed.observedHash === "unknown" ? "unknown" : "fail";
+    if (observed.status !== expectedStatus) return false;
+    surfaceStatuses.push(expectedStatus);
+  }
+
+  if (!validUserQuestionsReceipt(value.userQuestions, expected.userQuestions)) return false;
+  const userQuestions = value.userQuestions;
+  const declaredPermissions = value.declaredPermissions as Record<string, HealthValue>;
+  const allPermissionsPass = expected.requiredPermissions.every((permission) => (
+    declaredPermissions[permission] === "pass"
+  ));
+  const allUserQuestionsPass = [
+    userQuestions.identity,
+    userQuestions.mainLifecycle,
+    userQuestions.brokerSelfTest,
+    userQuestions.schemaSelfTest,
+    userQuestions.rendererStorageSelfTest,
+    userQuestions.zeroMcpConflicts,
+  ].every((status) => status === "pass");
+  const expectedReady: HealthValue = surfaceStatuses.every((status) => status === "pass")
+    && allPermissionsPass
+    && allUserQuestionsPass
+    && value.authenticatedSession === "pass"
+    ? "pass"
+    : "fail";
+  return value.promotionReady === expectedReady;
+}
+
+function validUserQuestionsReceipt(
+  value: unknown,
+  expected: UserQuestionsPromotionExpectation,
+): value is UserQuestionsPromotionObservation {
+  if (!plainRecord(value) || !exactKeys(value, [
+    "expected",
+    "observed",
+    "identity",
+    "mainLifecycle",
+    "brokerSelfTest",
+    "schemaSelfTest",
+    "rendererStorageSelfTest",
+    "mcpConflictCount",
+    "zeroMcpConflicts",
+  ])) return false;
+  if (!sameUserQuestionsExpectation(value.expected, expected)) return false;
+  const observed = value.observed === null
+    ? null
+    : validUserQuestionsExpectation(value.observed) ? value.observed : undefined;
+  if (observed === undefined) return false;
+  const expectedIdentity: HealthValue = observed === null
+    ? "unknown"
+    : sameUserQuestionsExpectation(observed, expected) ? "pass" : "fail";
+  if (value.identity !== expectedIdentity) return false;
+  if (
+    validHealthValue(value.mainLifecycle) !== value.mainLifecycle
+    || validHealthValue(value.brokerSelfTest) !== value.brokerSelfTest
+    || validHealthValue(value.schemaSelfTest) !== value.schemaSelfTest
+    || validHealthValue(value.rendererStorageSelfTest) !== value.rendererStorageSelfTest
+  ) return false;
+  if (value.mcpConflictCount !== null && (
+    !Number.isInteger(value.mcpConflictCount) || (value.mcpConflictCount as number) < 0
+  )) return false;
+  const zeroMcpConflicts: HealthValue = value.mcpConflictCount === null
+    ? "unknown"
+    : value.mcpConflictCount === 0 ? "pass" : "fail";
+  return value.zeroMcpConflicts === zeroMcpConflicts;
+}
+
+function validPromotionExpectation(expected: ProductionHealthExpectationV2): boolean {
+  if (
+    !validUserQuestionsExpectation(expected.userQuestions)
+    || !plainRecord(expected.surfaces)
+    || !exactKeys(expected.surfaces, [...PROMOTION_SURFACE_NAMES])
+    || expected.surfaces.app.afterHash !== expected.app.hash
+  ) return false;
+  return PROMOTION_SURFACE_NAMES.every((name) => (
+    validPromotionHash(expected.surfaces[name].preimageHash)
+    && validPromotionHash(expected.surfaces[name].afterHash)
+  ));
+}
+
+function validUserQuestionsExpectation(value: unknown): value is UserQuestionsPromotionExpectation {
+  return plainRecord(value)
+    && exactKeys(value, ["id", "version", "payloadHash"])
+    && value.id === "co.tweakers.user-questions"
+    && typeof value.version === "string"
+    && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value.version)
+    && validPromotionHash(value.payloadHash)
+    && value.payloadHash !== "missing";
+}
+
+function sameUserQuestionsExpectation(value: unknown, expected: UserQuestionsPromotionExpectation): boolean {
+  return validUserQuestionsExpectation(value)
+    && value.id === expected.id
+    && value.version === expected.version
+    && value.payloadHash === expected.payloadHash;
+}
+
+function validPermissionHealth(value: unknown, requiredPermissions: string[]): value is Record<string, HealthValue> {
+  return plainRecord(value)
+    && exactKeys(value, requiredPermissions)
+    && requiredPermissions.every((permission) => validHealthValue(value[permission]) === value[permission]);
+}
+
+function sameFingerprintValue(value: unknown, expected: AppFingerprint): value is AppFingerprint {
+  return plainRecord(value)
+    && exactKeys(value, ["version", "build", "hash"])
+    && value.version === expected.version
+    && value.build === expected.build
+    && value.hash === expected.hash;
+}
+
+function validPromotionHash(value: unknown): value is string {
+  return value === "missing" || (typeof value === "string" && /^[a-f0-9]{64}$/.test(value));
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function exactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }

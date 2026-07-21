@@ -1,7 +1,89 @@
-type HealthValue = "pass" | "fail" | "unknown";
+export type HealthValue = "pass" | "fail" | "unknown";
+export declare const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+export interface PromotionRendererProofResult {
+    hostReady: HealthValue;
+    rendererStorageSelfTest: HealthValue;
+}
+export interface PromotionRendererProofTracker {
+    windowCreated(observation: {
+        webContentsId: number;
+        url: string;
+        preloadPath: string | null;
+    }): void;
+    didFinishLoad(observation: {
+        webContentsId: number;
+        url: string;
+    }): void;
+    didFailLoad(observation: {
+        webContentsId: number;
+        errorCode: number;
+        errorDescription: string;
+        url: string;
+    }): void;
+    renderProcessGone(observation: {
+        webContentsId: number;
+        reason: string;
+        exitCode: number;
+    }): void;
+    rendererHandshake(observation: {
+        webContentsId: number;
+        nonce: string;
+        url: string;
+        lifecycle: string;
+        rendererStorageSelfTest: HealthValue;
+    }): void;
+    result(): PromotionRendererProofResult;
+}
+/**
+ * Tracks the candidate's real renderer without importing Electron into tests.
+ * Every positive signal is bound to one nonce, URL, preload, and webContents.
+ */
+export declare function createPromotionRendererProofTracker(expected: {
+    nonce: string;
+    url: string;
+    preloadPath: string;
+}): PromotionRendererProofTracker;
+export declare const PROMOTION_SURFACE_NAMES: readonly ["app", "runtime", "tweakTree", "tweakersConfig", "codexConfig", "namespaceData", "mainStorage", "policy"];
+export type PromotionSurfaceName = typeof PROMOTION_SURFACE_NAMES[number];
+export interface PromotionSurfaceExpectation {
+    preimageHash: string;
+    afterHash: string;
+}
+export interface UserQuestionsPromotionExpectation {
+    id: string;
+    version: string;
+    payloadHash: string;
+}
+export interface PromotionHealthRequestV2 {
+    schemaVersion: 2;
+    requestedAt: string;
+    app: {
+        version: string;
+        build: string;
+        hash: string;
+    };
+    requiredPermissions: string[];
+    surfaces: Record<PromotionSurfaceName, PromotionSurfaceExpectation>;
+    userQuestions: UserQuestionsPromotionExpectation;
+}
+export interface UserQuestionsHealthObservation {
+    id: string;
+    version: string;
+    payloadHash: string;
+    mainLifecycle: HealthValue;
+    brokerSelfTest: HealthValue;
+    schemaSelfTest: HealthValue;
+    rendererStorageSelfTest: HealthValue;
+    mcpConflictCount: number;
+}
 export interface RuntimePromotionProbes {
     authenticatedSession(): HealthValue | Promise<HealthValue>;
     declaredPermission(permission: string): HealthValue | Promise<HealthValue>;
+    /** A nonce-bound real BrowserWindow/preload lifecycle proof. Missing means unknown. */
+    rendererReady?(): HealthValue | Promise<HealthValue>;
+    /** V2 observations are injected so disposable candidates never infer or read live config paths. */
+    promotionSurface?(surface: PromotionSurfaceName): string | Promise<string>;
+    userQuestionsHealth?(): UserQuestionsHealthObservation | Promise<UserQuestionsHealthObservation>;
 }
 export interface SessionCookieObservation {
     name: string;
@@ -35,4 +117,3 @@ export declare function answerPromotionHealthRequest(userRoot: string, probes: R
     now?: Date;
     maxAgeMs?: number;
 }): Promise<boolean>;
-export {};

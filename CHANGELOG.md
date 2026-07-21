@@ -6,7 +6,18 @@ This project uses semver for the installer, runtime, SDK, and published CLI pack
 
 ## Unreleased
 
+### Added
+
+- Added User Questions 0.5.0 with rich option details and tradeoffs, explicit
+  Skip/Other and multi-select answers, task-bound resumable drafts, acknowledged
+  enhanced/generic delivery, and retryable `display_failed` recovery.
+
 ### Changed
+
+- User Questions answers now state preference-not-rule semantics and conflict
+  guidance. Its policy compatibility flow is explicit Preview/Apply/Restore,
+  never restarts Codex automatically, and keeps question, answer, task, token,
+  and draft content out of diagnostic logs.
 
 - Rebranded all former plus-plus product, CLI, runtime, IPC, storage, native
   host, documentation, and generated-asset identifiers as `Tweaker`,

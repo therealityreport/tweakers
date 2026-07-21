@@ -57,6 +57,8 @@ export interface PreparedSigningIdentity {
   name: string;
   hash: string;
   created: boolean;
+  /** Dedicated keychain to pass directly to codesign without changing the user search list. */
+  keychainPath?: string;
 }
 
 export interface SecurityCommandResult {
@@ -66,6 +68,10 @@ export interface SecurityCommandResult {
 }
 
 export type SecurityCommandRunner = (command: string, args: string[]) => SecurityCommandResult;
+
+export interface UserKeychainPreferenceOptions {
+  run?: SecurityCommandRunner;
+}
 
 function defaultSecurityRunner(command: string, args: string[]): SecurityCommandResult {
   const result = spawnSync(command, args, {
@@ -106,6 +112,7 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
     ? opts.preparedIdentity ?? ensureLocalSigningIdentity(opts.identityName ?? DEFAULT_LOCAL_SIGNING_IDENTITY, posture)
     : null;
   const signingIdentity = localIdentity?.hash ?? "-";
+  const keychainArgs = codeSigningKeychainArgs(localIdentity);
   const portableSignature = localIdentity
     ? preparePortableSignature(appRoot, localIdentity.hash, posture)
     : null;
@@ -113,14 +120,14 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
   // Step 1: pre-sign every nested Mach-O inside-out with one identity before
   // the bundle-level pass re-signs the wrappers.
   for (const root of codeSigningWalkRoots(appRoot)) {
-    walkAndSign(root, signingIdentity);
+    walkAndSign(root, signingIdentity, keychainArgs);
   }
 
   // Step 2: sign the bundle itself with --deep (covers Frameworks, Helpers).
   try {
     execFileSync(
       "codesign",
-      ["--force", "--deep", "--sign", signingIdentity, appRoot],
+      ["--force", "--deep", "--sign", signingIdentity, ...keychainArgs, appRoot],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
 
@@ -137,6 +144,7 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
           portableSignature.entitlementsPath,
           "--requirements",
           `=${portableSignature.requirement}`,
+          ...keychainArgs,
           appRoot,
         ],
         { stdio: ["ignore", "ignore", "pipe"] },
@@ -255,6 +263,13 @@ export function prepareCodeSigning(opts: CodeSigningOptions = {}): PreparedSigni
 
   const posture = resolveSigningPosture(opts.signingPosture);
   const identityName = opts.identityName ?? DEFAULT_LOCAL_SIGNING_IDENTITY;
+  if (posture === "contained") {
+    const containedKeychain = containedSigningKeychainPath();
+    if (existsSync(containedKeychain)) {
+      const contained = findCodeSigningIdentity(identityName, containedKeychain);
+      if (contained) return { ...contained, created: false };
+    }
+  }
   const existing = findCodeSigningIdentity(identityName);
   if (existing) return { ...existing, created: false };
 
@@ -322,7 +337,10 @@ export function signingAvailable(opts: { identityName?: string } = {}): boolean 
   if (platform() !== "darwin") return false;
 
   const identityName = opts.identityName ?? DEFAULT_LOCAL_SIGNING_IDENTITY;
-  const identity = findCodeSigningIdentity(identityName);
+  const containedKeychain = containedSigningKeychainPath();
+  const identity = existsSync(containedKeychain)
+    ? findCodeSigningIdentity(identityName, containedKeychain) ?? findCodeSigningIdentity(identityName)
+    : findCodeSigningIdentity(identityName);
   if (!identity) return false;
 
   const dir = mkdtempSync(join(tmpdir(), "tweakers-signing-probe-"));
@@ -331,11 +349,15 @@ export function signingAvailable(opts: { identityName?: string } = {}): boolean 
     // codesign needs a real code object; a copied system Mach-O is small,
     // disposable, and exercises private-key access without touching its source.
     copyFileSync("/usr/bin/true", scratch);
-    const result = spawnSync("codesign", ["--sign", identity.hash, "--force", scratch], {
+    const result = spawnSync(
+      "codesign",
+      ["--sign", identity.hash, ...codeSigningKeychainArgs(identity), "--force", scratch],
+      {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 750,
-    });
+      },
+    );
     const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}\n${result.error?.message ?? ""}`;
     if (LOCKED_KEYCHAIN_SIGNING_ERROR.test(output)) return false;
     return result.status === 0 && result.error === undefined;
@@ -346,9 +368,9 @@ export function signingAvailable(opts: { identityName?: string } = {}): boolean 
   }
 }
 
-function walkAndSign(root: string, signingIdentity: string): void {
+function walkAndSign(root: string, signingIdentity: string, keychainArgs: string[]): void {
   const failures: string[] = [];
-  walkAndSignInto(root, root, signingIdentity, failures);
+  walkAndSignInto(root, root, signingIdentity, keychainArgs, failures);
   if (failures.length > 0) {
     throw new Error(
       `Failed to sign ${failures.length} Mach-O file${failures.length === 1 ? "" : "s"} under ${root}:\n${failures.map((failure) => `  ${failure}`).join("\n")}`,
@@ -356,7 +378,13 @@ function walkAndSign(root: string, signingIdentity: string): void {
   }
 }
 
-function walkAndSignInto(root: string, current: string, signingIdentity: string, failures: string[]): void {
+function walkAndSignInto(
+  root: string,
+  current: string,
+  signingIdentity: string,
+  keychainArgs: string[],
+  failures: string[],
+): void {
   let entries: string[];
   try {
     entries = readdirSync(current);
@@ -374,7 +402,7 @@ function walkAndSignInto(root: string, current: string, signingIdentity: string,
     }
     if (st.isSymbolicLink()) continue;
     if (st.isDirectory()) {
-      walkAndSignInto(root, full, signingIdentity, failures);
+      walkAndSignInto(root, full, signingIdentity, keychainArgs, failures);
       continue;
     }
     if (!st.isFile()) continue;
@@ -382,7 +410,14 @@ function walkAndSignInto(root: string, current: string, signingIdentity: string,
     try {
       execFileSync(
         "codesign",
-        ["--force", "--sign", signingIdentity, "--preserve-metadata=entitlements,flags", full],
+        [
+          "--force",
+          "--sign",
+          signingIdentity,
+          ...keychainArgs,
+          "--preserve-metadata=entitlements,flags",
+          full,
+        ],
         { stdio: ["ignore", "ignore", "pipe"] },
       );
     } catch (e) {
@@ -407,16 +442,30 @@ function ensureLocalSigningIdentity(identityName: string, posture: SigningPostur
   })();
 }
 
-function findCodeSigningIdentity(identityName: string): Omit<PreparedSigningIdentity, "created"> | null {
-  const result = spawnSync("security", ["find-identity", "-v", "-p", "codesigning"], {
+function findCodeSigningIdentity(
+  identityName: string,
+  keychainPath?: string,
+): Omit<PreparedSigningIdentity, "created"> | null {
+  const args = ["find-identity", "-v", "-p", "codesigning"];
+  if (keychainPath) args.push(keychainPath);
+  const result = spawnSync("security", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  return parseCodeSigningIdentities(output).find((identity) => identity.name === identityName) ?? null;
+  const identity = parseCodeSigningIdentities(output).find((candidate) => candidate.name === identityName);
+  return identity ? { ...identity, ...(keychainPath ? { keychainPath } : {}) } : null;
 }
 
 function createLocalSigningIdentity(identityName: string, posture: SigningPosture): PreparedSigningIdentity {
+  const create = () => createLocalSigningIdentityUnprotected(identityName, posture);
+  return posture === "contained" ? withRestoredUserKeychainPreferences(create) : create();
+}
+
+function createLocalSigningIdentityUnprotected(
+  identityName: string,
+  posture: SigningPosture,
+): PreparedSigningIdentity {
   const dir = mkdtempSync(join(tmpdir(), "tweaker-signing-"));
   try {
     const configPath = join(dir, "openssl.cnf");
@@ -511,7 +560,7 @@ function createLocalSigningIdentity(identityName: string, posture: SigningPostur
     // without a trusted root. If find-identity cannot see the untrusted identity
     // on a real device, the guarded run can flip to contained mode.
 
-    const created = findCodeSigningIdentity(identityName);
+    const created = findCodeSigningIdentity(identityName, posture === "contained" ? keychain : undefined);
     if (!created) {
       throw new Error("created certificate was not found as a valid code signing identity");
     }
@@ -556,22 +605,138 @@ function ensureContainedSigningKeychain(): string {
     [password],
   );
 
-  const listed = spawnSync("security", ["list-keychains", "-d", "user"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const output = `${listed.stdout ?? ""}${listed.stderr ?? ""}`;
-  if (listed.status !== 0) {
-    throw new Error(`could not read the user keychain search list: ${output.trim()}`);
+  return keychain;
+}
+
+interface UserKeychainPreferences {
+  searchList: string[];
+  defaultKeychain: string | null;
+}
+
+/**
+ * Contains any preference changes made implicitly by `security create-keychain`.
+ * Restoration is attempted after both successful and failed actions, and the
+ * final state is read back before returning. A pre-existing null default fails
+ * closed before the action: choosing a replacement default requires separate
+ * user authorization and must not be hidden inside disposable signing work.
+ */
+export function withRestoredUserKeychainPreferences<T>(
+  action: () => T,
+  opts: UserKeychainPreferenceOptions = {},
+): T {
+  const run = opts.run ?? defaultSecurityRunner;
+  const before = readUserKeychainPreferences(run);
+  const searchList = before.searchList;
+  if (!before.defaultKeychain) {
+    throw new Error(
+      "Refusing contained signing because the user default keychain is null; choosing a replacement requires separate user authorization",
+    );
   }
-  const existing = [...output.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-  if (!existing.includes(keychain)) {
-    execFileSync("security", ["list-keychains", "-d", "user", "-s", ...existing, keychain], {
-      stdio: "ignore",
-    });
+  const defaultKeychain = before.defaultKeychain;
+
+  let value!: T;
+  let actionFailed = false;
+  let actionError: unknown;
+  try {
+    value = action();
+  } catch (error) {
+    actionFailed = true;
+    actionError = error;
   }
 
-  return keychain;
+  let restoreError: unknown;
+  try {
+    restoreUserKeychainPreferences(run, { searchList, defaultKeychain });
+  } catch (error) {
+    restoreError = error;
+  }
+
+  if (actionFailed && restoreError) {
+    throw new AggregateError(
+      [actionError, restoreError],
+      "Keychain action failed and user Keychain preferences could not be restored",
+    );
+  }
+  if (actionFailed) throw actionError;
+  if (restoreError) throw restoreError;
+  return value;
+}
+
+function readUserKeychainPreferences(run: SecurityCommandRunner): UserKeychainPreferences {
+  const list = runSecurity(run, ["list-keychains", "-d", "user"]);
+  const searchList = parseKeychainList(list.stdout);
+  if (searchList.length === 0) {
+    throw new Error("Refusing Keychain mutation because the user keychain search list is empty");
+  }
+  const currentDefault = runSecurity(run, ["default-keychain", "-d", "user"]);
+  return {
+    searchList,
+    defaultKeychain: parseDefaultKeychain(currentDefault.stdout),
+  };
+}
+
+function restoreUserKeychainPreferences(
+  run: SecurityCommandRunner,
+  preferences: { searchList: string[]; defaultKeychain: string },
+): void {
+  const failures: unknown[] = [];
+  try {
+    runSecurity(run, ["list-keychains", "-d", "user", "-s", ...preferences.searchList]);
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    runSecurity(run, ["default-keychain", "-d", "user", "-s", preferences.defaultKeychain]);
+  } catch (error) {
+    failures.push(error);
+  }
+
+  try {
+    const restored = readUserKeychainPreferences(run);
+    if (!sameStringList(restored.searchList, preferences.searchList)) {
+      failures.push(new Error("user keychain search list did not match its saved state after restoration"));
+    }
+    if (restored.defaultKeychain !== preferences.defaultKeychain) {
+      failures.push(new Error("user default keychain was null or did not match its saved state after restoration"));
+    }
+  } catch (error) {
+    failures.push(error);
+  }
+
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Failed to restore user Keychain preferences");
+  }
+}
+
+function runSecurity(run: SecurityCommandRunner, args: string[]): SecurityCommandResult {
+  const result = run("security", args);
+  if (result.status !== 0) {
+    const output = `${result.stderr}\n${result.stdout}`.trim();
+    throw new Error(`security ${args[0]} failed${output ? `: ${output}` : ""}`);
+  }
+  return result;
+}
+
+function parseKeychainList(output: string): string[] {
+  return [...output.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+}
+
+function parseDefaultKeychain(output: string): string | null {
+  const value = output.trim();
+  if (!value || /^<?null>?$/i.test(value)) return null;
+  const quoted = /^"([^"]+)"$/.exec(value);
+  return quoted?.[1] ?? value;
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+export function codeSigningKeychainArgs(
+  identity: Pick<PreparedSigningIdentity, "keychainPath"> | null | undefined,
+): string[] {
+  return identity?.keychainPath ? ["--keychain", identity.keychainPath] : [];
 }
 
 function execFileSyncRedacted(

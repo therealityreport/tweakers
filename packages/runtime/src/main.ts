@@ -8,10 +8,11 @@
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
 import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
-import { cpSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import * as originalFs from "original-fs";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Transform, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -83,7 +84,18 @@ import {
 import { maybeStartBrowserUiServer } from "./browser-ui";
 import { resolveLocalCliRuntime } from "./local-cli-runtime";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
-import { answerPromotionHealthRequest, hasAuthenticatedSessionCookie, hasAuthenticatedCodexToken, readCodexAuth } from "./promotion-health";
+import {
+  answerPromotionHealthRequest,
+  createPromotionRendererProofTracker,
+  hasAuthenticatedSessionCookie,
+  hasAuthenticatedCodexToken,
+  PROMOTION_RENDERER_IPC_CHANNEL,
+  readCodexAuth,
+  type HealthValue,
+  type PromotionRendererProofResult,
+  type PromotionSurfaceName,
+  type UserQuestionsHealthObservation,
+} from "./promotion-health";
 import {
   applyManagedCodexCliLaneAtBootstrap,
   createCodexCliManager,
@@ -165,11 +177,16 @@ const TWEAKS_DIR = join(userRoot, "tweaks");
 const LOG_DIR = join(userRoot, "log");
 const LOG_FILE = join(LOG_DIR, "main.log");
 const CONFIG_FILE = join(userRoot, "config.json");
-const CODEX_CONFIG_FILE = join(homedir(), ".codex", "config.toml");
+const MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({
+  userRoot,
+  homeDirectory: homedir(),
+  env: process.env,
+});
+const CODEX_CONFIG_FILE = MCP_RUNTIME_PATHS.configPath;
 const INSTALLER_STATE_FILE = join(userRoot, "state.json");
 const UPDATE_MODE_FILE = join(userRoot, "update-mode.json");
 const SELF_UPDATE_STATE_FILE = join(userRoot, "self-update-state.json");
-const MCP_SYNC_STATE_FILE = join(userRoot, "mcp-sync-state.json");
+const MCP_SYNC_STATE_FILE = MCP_RUNTIME_PATHS.statePath;
 const ENVIRONMENT_SELECTION_FILE = join(userRoot, "environment-selection.json");
 const ENVIRONMENT_REGISTRY_FILE = join(userRoot, "environment-registry.json");
 const ENVIRONMENT_RUNTIME_PROOF_FILE = join(userRoot, "environment-runtime-proof.json");
@@ -182,6 +199,15 @@ const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+
+// Defense in depth for one-shot macOS health processes. The installer passes
+// --use-mock-keychain from process start; assert the Chromium switch again at
+// the earliest runtime point and fail closed if Electron cannot retain it.
+applyHealthProbeKeychainIsolation({
+  commandLine: app.commandLine,
+  healthCheckOnly,
+  platform: process.platform,
+});
 
 // Candidate validation is a background bootstrap, not a second user-facing
 // ChatGPT launch. Suppress LaunchServices/Dock activation before Electron is
@@ -1331,6 +1357,17 @@ const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   onError: (error) => log("warn", "failed to reconcile Codex MCP config:", error),
 });
 let initialMcpReconciliationPending = true;
+let nextReloadMcpTrigger: McpSyncTrigger = "tweak-reload";
+
+function mcpSyncTweaks(enabledOnly: boolean) {
+  return tweakState.discovered
+    .filter((tweak) => !enabledOnly || isTweakEnabled(tweak.manifest.id))
+    .map((tweak) => ({
+      dir: tweak.dir,
+      dataDir: join(userRoot!, "tweak-data", tweak.manifest.id),
+      manifest: tweak.manifest,
+    }));
+}
 
 function mcpSyncTweaks(enabledOnly: boolean) {
   return tweakState.discovered
@@ -1354,7 +1391,16 @@ const nativeBridge = new NativeBridge(log, {
 const owlViews = new Map<string, ManagedOwlView>();
 
 const tweakLifecycleDeps = {
-  logInfo: (message: string) => log("info", message),
+  logInfo: (message: string) => {
+    // reloadTweaks emits this inside its serialized operation immediately
+    // before discovery/load, so overlapping reloads cannot steal the trigger.
+    if (message.startsWith("reloading tweaks (")) {
+      nextReloadMcpTrigger = message === "reloading tweaks (enabled-toggle)"
+        ? "enabled-state"
+        : "tweak-reload";
+    }
+    log("info", message);
+  },
   setTweakEnabled,
   stopAllMainTweaks,
   clearTweakModuleCache,
@@ -2553,20 +2599,24 @@ app.whenReady().then(() => {
     const watchdog = setTimeout(() => {
       log("warn", "health-check watchdog fired; exiting");
       app.exit(0);
-    }, 8_000);
+    }, 12_000);
     watchdog.unref?.();
   } else {
     // Raw Sparkle scheduling stays disabled in the locally signed app. This
     // bounded metadata-only loop restores proactive update notification safely.
     scheduleProactiveDesktopUpdateChecks();
   }
-  void answerPromotionHealthRequest(userRoot!, {
+  void (async () => {
+    const rendererProof = healthCheckOnly
+      ? await runPromotionRendererProof()
+      : { hostReady: "unknown", rendererStorageSelfTest: "unknown" } satisfies PromotionRendererProofResult;
+    void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
       // Check the Codex account token FIRST: it is a fast, synchronous file read
       // and is the real sign-in signal for the desktop app. The web session
       // cookie read below can stall in a bare health-probe launch, so only reach
       // for it (with a timeout) when no durable token is present.
-      if (hasAuthenticatedCodexToken(readCodexAuth())) return "pass";
+      if (hasAuthenticatedCodexToken(readCodexAuth(MCP_RUNTIME_PATHS.codexHome))) return "pass";
       try {
         const cookies = await withTimeout(session.defaultSession.cookies.get({}), 3_000);
         if (cookies && hasAuthenticatedSessionCookie(cookies)) return "pass";
@@ -2583,16 +2633,23 @@ app.whenReady().then(() => {
       if (permission === "global-shortcut") return "pass";
       return "unknown";
     },
-  }).then((answered) => {
-    if (!answered) {
-      // No pending request file is the normal case on an ordinary launch;
-      // only a request that exists but fails validation deserves a warn.
-      const requestPending = existsSync(join(userRoot!, "health", "request.json"));
-      log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
-    }
-    if (healthCheckOnly) app.exit(0);
-  }).catch((error) => {
-    log("warn", "promotion health receipt failed", error);
+    rendererReady: () => rendererProof.hostReady,
+    promotionSurface: promotionSurfaceHash,
+    userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
+    }).then((answered) => {
+      if (!answered) {
+        // No pending request file is the normal case on an ordinary launch;
+        // only a request that exists but fails validation deserves a warn.
+        const requestPending = existsSync(join(userRoot!, "health", "request.json"));
+        log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
+      }
+      if (healthCheckOnly) app.exit(0);
+    }).catch((error) => {
+      log("warn", "promotion health receipt failed", error);
+      if (healthCheckOnly) app.exit(0);
+    });
+  })().catch((error) => {
+    log("warn", "promotion renderer bootstrap failed", error);
     if (healthCheckOnly) app.exit(0);
   });
   if (!healthCheckOnly) {
@@ -3431,15 +3488,9 @@ ipcMain.handle("tweaker:run-tweaker-update", async () => {
 });
 
 ipcMain.handle("tweaker:get-refresh-status", () => localRefreshStatus());
-ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => {
-  const status = await localRefreshStatus();
-  if (!status.available) return { started: false, status };
-  const cli = localRefreshCli(status);
-  const appRoot = readInstallerState()?.appRoot;
-  if (!appRoot || !existsSync(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-  startInstalledCli(cli, ["refresh-local", "--source", requested ?? "smart", "--app", appRoot]);
-  return { started: true, status: { ...status, phase: "preparing" } };
-});
+ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => (
+  startLocalRefresh(requested)
+));
 
 ipcMain.handle("tweaker:get-watcher-health", () => getAndPublishWatcherHealth(userRoot!));
 ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
@@ -3765,7 +3816,9 @@ async function loadAllMainTweaks(): Promise<void> {
     tweakState.discovered = [];
   }
 
-  const mcpTrigger = initialMcpReconciliationPending ? "startup" : "tweak-reload";
+  const mcpTrigger: McpSyncTrigger = initialMcpReconciliationPending
+    ? "startup"
+    : nextReloadMcpTrigger;
   initialMcpReconciliationPending = false;
   let userQuestionsMcpReady = false;
   if (mcpReconciler) {
@@ -4790,6 +4843,24 @@ interface LocalRefreshStatusValue {
   checkedAt: string;
 }
 
+interface LocalRefreshSourceBinding {
+  /** Exact CLI selected once for this runtime process. */
+  cli: string;
+  /** Exact real Git worktree root allowed to promote development bytes. */
+  developmentRoot: string | null;
+  unsafeReason: string | null;
+}
+
+interface LocalRefreshDispatch {
+  cli: string;
+  args: string[];
+}
+
+interface LocalRefreshStartResult {
+  started: boolean;
+  status: LocalRefreshStatusValue;
+}
+
 // Renderer tweaks poll refresh status on DOM mutations, so this must never
 // block the main process (a synchronous CLI spawn here froze the UI on
 // hover) and must never spawn the Electron binary as a full second app —
@@ -4797,6 +4868,7 @@ interface LocalRefreshStatusValue {
 let refreshStatusCache: { value: LocalRefreshStatusValue; at: number } | null = null;
 let refreshStatusInFlight: Promise<LocalRefreshStatusValue> | null = null;
 const REFRESH_STATUS_TTL_MS = 4_000;
+const LOCAL_REFRESH_SOURCE_BINDING = resolveLocalRefreshSourceBinding();
 
 function localRefreshStatus(): Promise<LocalRefreshStatusValue> {
   if (refreshStatusCache && Date.now() - refreshStatusCache.at < REFRESH_STATUS_TTL_MS) {
@@ -4814,7 +4886,9 @@ function probeLocalRefreshStatus(): Promise<LocalRefreshStatusValue> {
   const cli = localRefreshCli();
   if (!existsSync(cli)) return Promise.resolve({
     available: false, source: "current", phase: "failed", developmentSourceRoot: null,
-    detail: "Tweakers refresh CLI is unavailable", error: "refresh CLI missing", checkedAt: new Date().toISOString(),
+    detail: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ?? "Tweakers refresh CLI is unavailable",
+    error: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ? `unsafe-source: ${LOCAL_REFRESH_SOURCE_BINDING.unsafeReason}` : "refresh CLI missing",
+    checkedAt: new Date().toISOString(),
   });
   return new Promise((resolvePromise, rejectPromise) => {
     const runtime = localCliRuntime(cli, ["refresh-status"]);
@@ -4831,10 +4905,124 @@ function probeLocalRefreshStatus(): Promise<LocalRefreshStatusValue> {
     child.once("close", (code) => {
       clearTimeout(timer);
       if (code !== 0) return rejectPromise(new Error(stderr.trim() || "Could not read Tweakers refresh status"));
-      try { resolvePromise(JSON.parse(stdout.trim()) as LocalRefreshStatusValue); }
+      try { resolvePromise(normalizeLocalRefreshStatus(JSON.parse(stdout.trim()) as LocalRefreshStatusValue)); }
       catch (error) { rejectPromise(error as Error); }
     });
   });
+}
+
+function resolveLocalRefreshSourceBinding(): LocalRefreshSourceBinding {
+  const managedCli = join(userRoot!, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+  const frozenRoot = readInstallerState()?.sourceRoot ?? null;
+  if (!frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "No frozen Tweakers installation source is recorded; development refresh is disabled.",
+    };
+  }
+  let exactRoot: string;
+  try {
+    exactRoot = realpathSync(frozenRoot);
+  } catch {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source no longer exists; development refresh is disabled.",
+    };
+  }
+  if (!isAbsolute(frozenRoot) || exactRoot !== frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source is not an exact real path; development refresh is disabled.",
+    };
+  }
+  const sourceCli = join(exactRoot, "packages", "installer", "dist", "cli.js");
+  if (describeInstallationSource(exactRoot).kind === "local-dev") {
+    if (!existsSync(sourceCli)) {
+      return {
+        cli: managedCli,
+        developmentRoot: null,
+        unsafeReason: "The frozen development checkout has no built Tweakers CLI; development refresh is disabled.",
+      };
+    }
+    return { cli: sourceCli, developmentRoot: exactRoot, unsafeReason: null };
+  }
+  if (existsSync(managedCli)) return { cli: managedCli, developmentRoot: null, unsafeReason: null };
+  if (existsSync(sourceCli)) return { cli: sourceCli, developmentRoot: null, unsafeReason: null };
+  return {
+    cli: managedCli,
+    developmentRoot: null,
+    unsafeReason: "No exact Tweakers refresh CLI is available; refresh is disabled.",
+  };
+}
+
+function normalizeLocalRefreshStatus(status: LocalRefreshStatusValue): LocalRefreshStatusValue {
+  if (status.source !== "development") return status;
+  const frozenRoot = LOCAL_REFRESH_SOURCE_BINDING.developmentRoot;
+  const mismatch = frozenRoot === null || status.developmentSourceRoot !== frozenRoot;
+  if (!mismatch && LOCAL_REFRESH_SOURCE_BINDING.unsafeReason === null) return status;
+  const reason = LOCAL_REFRESH_SOURCE_BINDING.unsafeReason
+    ?? "The registered dirty development checkout does not match this runtime's frozen source; refresh is disabled.";
+  return {
+    ...status,
+    available: false,
+    source: "current",
+    phase: "failed",
+    detail: `Unsafe refresh source: ${reason}`,
+    error: `unsafe-source: ${reason}`,
+  };
+}
+
+function buildLocalRefreshDispatch(
+  status: LocalRefreshStatusValue,
+  requested: "smart" | "development" | "stable" | undefined,
+  appRoot: string,
+  binding: LocalRefreshSourceBinding = LOCAL_REFRESH_SOURCE_BINDING,
+): LocalRefreshDispatch {
+  if (!status.available || status.error?.startsWith("unsafe-source:")) {
+    throw new Error(status.detail || "Tweakers refresh is unavailable");
+  }
+  const selected = requested === undefined || requested === "smart" ? status.source : requested;
+  if (selected !== status.source || (selected !== "development" && selected !== "stable")) {
+    throw new Error("The requested refresh source is not the currently verified source");
+  }
+  if (selected === "development") {
+    const developmentRoot = binding.developmentRoot;
+    if (
+      !developmentRoot
+      || binding.unsafeReason !== null
+      || status.developmentSourceRoot !== developmentRoot
+    ) throw new Error("Unsafe refresh source: the development worktree is not frozen to this runtime");
+    return {
+      cli: binding.cli,
+      args: [
+        "refresh-local",
+        "--source", "development",
+        "--development-root", developmentRoot,
+        "--app", appRoot,
+      ],
+    };
+  }
+  return {
+    cli: binding.cli,
+    args: ["refresh-local", "--source", "stable", "--app", appRoot],
+  };
+}
+
+async function startLocalRefresh(
+  requested?: "smart" | "development" | "stable",
+): Promise<LocalRefreshStartResult> {
+  const status = await localRefreshStatus();
+  if (!status.available) return { started: false, status };
+  const appRoot = readInstallerState()?.appRoot;
+  if (!appRoot) throw new Error("Tweakers refresh app root is unavailable");
+  const dispatch = buildLocalRefreshDispatch(status, requested, appRoot);
+  if (!existsSync(dispatch.cli)) throw new Error("Tweakers refresh CLI is unavailable");
+  if (dispatch.args[0] !== "refresh-local") throw new Error("Tweakers refresh dispatch is invalid");
+  startInstalledCli(dispatch.cli, ["refresh-local", ...dispatch.args.slice(1)]);
+  return { started: true, status: { ...status, phase: "preparing" } };
 }
 
 // The OpenAI-bundled renderer Node enforces Team-ID library validation and
@@ -4860,19 +5048,8 @@ function localCliRuntime(cli: string, args: string[]): { command: string; args: 
   });
 }
 
-function localRefreshCli(status?: { source?: string; developmentSourceRoot?: string | null }): string {
-  let developmentSourceRoot = status?.developmentSourceRoot ?? null;
-  if (!developmentSourceRoot) {
-    try {
-      const section = readState().tweaker as { developmentSourceRoot?: unknown } | undefined;
-      if (typeof section?.developmentSourceRoot === "string") developmentSourceRoot = section.developmentSourceRoot;
-    } catch {}
-  }
-  if ((status?.source === "development" || !status) && developmentSourceRoot) {
-    const cli = join(developmentSourceRoot, "packages", "installer", "dist", "cli.js");
-    if (existsSync(cli)) return cli;
-  }
-  return join(userRoot!, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+function localRefreshCli(): string {
+  return LOCAL_REFRESH_SOURCE_BINDING.cli;
 }
 
 // This launchd helper runs the installer CLI, which must outlive the app's own
@@ -5835,15 +6012,7 @@ function makeCodexApi(tweak: DiscoveredTweak) {
     },
     refresh: {
       getStatus: async () => localRefreshStatus(),
-      start: async (source?: "smart" | "development" | "stable") => {
-        const status = await localRefreshStatus();
-        if (!status.available) return { started: false, status };
-        const cli = localRefreshCli(status);
-        const appRoot = readInstallerState()?.appRoot;
-        if (!appRoot || !existsSync(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-        startInstalledCli(cli, ["refresh-local", "--source", source ?? "smart", "--app", appRoot]);
-        return { started: true, status: { ...status, phase: "preparing" } };
-      },
+      start: async (source?: "smart" | "development" | "stable") => startLocalRefresh(source),
       onStatusChanged: () => () => {},
     },
     capture: {
