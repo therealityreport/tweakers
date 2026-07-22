@@ -11452,6 +11452,16 @@ function promotionOriginalRendererLogUrl(value) {
   if (evidence.canonicalUrl === null) return "[redacted-url]";
   return evidence.queryKeys.length === 0 ? evidence.canonicalUrl : `${evidence.canonicalUrl}?[${evidence.queryKeys.join(",")}:redacted]`;
 }
+function hasUniqueSandboxedPromotionRendererProcess(processMetrics, rendererProcessId) {
+  if (typeof rendererProcessId !== "number" || !Number.isSafeInteger(rendererProcessId) || rendererProcessId <= 0 || !Array.isArray(processMetrics) || processMetrics.length > 4096) return false;
+  let matchingMetric = null;
+  for (const metric of processMetrics) {
+    if (!plainRecord(metric) || metric.pid !== rendererProcessId) continue;
+    if (matchingMetric !== null) return false;
+    matchingMetric = metric;
+  }
+  return matchingMetric?.sandboxed === true;
+}
 function authorizePromotionOriginalRenderer(context, payload, nonce) {
   if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
   if (!context.windowHidden) return { accepted: false, reason: "proof window visible", response: null };
@@ -11462,10 +11472,10 @@ function authorizePromotionOriginalRenderer(context, payload, nonce) {
     return { accepted: false, reason: "sender URL mismatch", response: null };
   }
   if (context.consumed) return { accepted: false, reason: "authorization already consumed", response: null };
-  if (!plainRecord(payload) || !exactKeys(payload, ["url", "version"])) {
+  if (!plainRecord(payload) || !exactKeys(payload, ["rendererSandboxed", "url", "version"])) {
     return { accepted: false, reason: "payload invalid", response: null };
   }
-  if (payload.version !== 1 || payload.url !== canonicalUrl) {
+  if (payload.version !== 1 || payload.url !== canonicalUrl || payload.rendererSandboxed !== true) {
     return { accepted: false, reason: "payload binding invalid", response: null };
   }
   if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
@@ -11507,7 +11517,7 @@ function createPromotionOriginalRendererProofTracker(nonce) {
       capturedWindowCount += 1;
     },
     eligibleWindow(observation) {
-      if (canonicalPromotionOriginalRendererUrl(observation.url) === null || !Number.isSafeInteger(observation.webContentsId) || observation.webContentsId <= 0 || !observation.isDefaultSession || observation.sandbox !== true || observation.contextIsolation !== true || observation.nodeIntegration !== false || observation.originalPreloadValid !== true) {
+      if (canonicalPromotionOriginalRendererUrl(observation.url) === null || !Number.isSafeInteger(observation.webContentsId) || observation.webContentsId <= 0 || !observation.isDefaultSession || observation.sandbox !== true && observation.sandbox !== void 0 || observation.contextIsolation !== true || observation.nodeIntegration !== false || observation.originalPreloadValid !== true) {
         permanentlyFail("eligible renderer was not canonical and sandbox-safe");
         return;
       }
@@ -11552,8 +11562,8 @@ function createPromotionOriginalRendererProofTracker(nonce) {
         permanentlyFail("mount handshake replayed");
         return;
       }
-      if (!authorized || observation.nonce !== nonce || observation.url !== canonicalUrl || observation.lifecycle !== "renderer-mounted" || !validHealthValue(observation.rendererStorageSelfTest)) {
-        permanentlyFail("mount handshake binding invalid");
+      if (!authorized || observation.nonce !== nonce || observation.url !== canonicalUrl || observation.lifecycle !== "renderer-mounted" || observation.rendererSandboxed !== true || !validHealthValue(observation.rendererStorageSelfTest)) {
+        permanentlyFail(observation.rendererSandboxed === false ? "renderer was not effectively sandboxed" : "mount handshake binding invalid");
         return;
       }
       mounted = true;
@@ -11649,6 +11659,38 @@ function validatePromotionRendererHandshake(context, payload, nonce) {
       nonce,
       url: context.expectedUrl,
       lifecycle: "renderer-mounted",
+      rendererStorageSelfTest: payload.rendererStorageSelfTest
+    }
+  };
+}
+function validatePromotionOriginalRendererHandshake(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "rendererStorageSelfTest", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mounted") {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  if (typeof payload.rendererSandboxed !== "boolean") {
+    return { accepted: false, reason: "sandbox result invalid", observation: null };
+  }
+  if (!validHealthValue(payload.rendererStorageSelfTest)) {
+    return { accepted: false, reason: "storage result invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mounted",
+      rendererSandboxed: payload.rendererSandboxed,
       rendererStorageSelfTest: payload.rendererStorageSelfTest
     }
   };
@@ -12883,6 +12925,22 @@ function createCodexVersionService(dependencies) {
 }
 
 // src/codex-sparkle-bridge.ts
+var HEALTH_PROBE_UPDATE_DISABLED_REASON = "Desktop updates are disabled during health probes.";
+function createHealthProbeCodexSparkleBridgeOptions() {
+  return Object.freeze({
+    suppressNativeSideEffects: true,
+    requestManualCheck: () => void 0,
+    requestBackgroundCheck: () => void 0,
+    requestInstall: () => void 0,
+    prepareForInstall: () => false,
+    getInstallPrerequisite: () => ({
+      ok: false,
+      reason: HEALTH_PROBE_UPDATE_DISABLED_REASON
+    }),
+    onFeedCaptured: () => void 0,
+    onNativeControlActivityChanged: () => void 0
+  });
+}
 var SAFE_LIFECYCLE = /* @__PURE__ */ new Set([
   "idle",
   "checking",
@@ -13071,6 +13129,19 @@ var CodexSparkleBridge = class {
     if (typeof original !== "function") return;
     const bridge = this;
     addon.init = function tweakerSparkleInit(...args) {
+      if (bridge.options.suppressNativeSideEffects) {
+        bridge.headers = void 0;
+        bridge.state.available = false;
+        bridge.state.lifecycle = "idle";
+        bridge.state.downloadProgressPercent = null;
+        bridge.state.installProgressPercent = null;
+        bridge.state.ready = false;
+        bridge.state.feedUrl = null;
+        bridge.state.fallbackFeedUrl = null;
+        bridge.state.lastError = null;
+        bridge.refreshActionability();
+        return void 0;
+      }
       bridge.captureInit(args);
       try {
         const result2 = Reflect.apply(original, this, args);
@@ -13137,6 +13208,47 @@ var CodexSparkleBridge = class {
     }
   }
   disableNativeScheduler(addon) {
+    if (this.options.suppressNativeSideEffects) {
+      let acted2 = false;
+      for (const name of [
+        "setAutomaticallyChecksForUpdates",
+        "setUpdateCheckInterval",
+        "scheduleNextUpdateCheck",
+        "resetUpdateCycle"
+      ]) {
+        try {
+          if (typeof addon[name] !== "function") continue;
+          addon[name] = function tweakerInertHealthScheduler() {
+            return void 0;
+          };
+          acted2 = true;
+        } catch {
+        }
+      }
+      for (const [name, value] of [
+        ["automaticallyChecksForUpdates", false],
+        ["updateCheckInterval", 0]
+      ]) {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(addon, name);
+          if (!descriptor || descriptor.configurable) {
+            Object.defineProperty(addon, name, {
+              configurable: true,
+              enumerable: descriptor?.enumerable ?? true,
+              get: () => value,
+              set: () => void 0
+            });
+            acted2 = true;
+          } else if ("value" in descriptor && descriptor.writable) {
+            addon[name] = value;
+            acted2 = true;
+          }
+        } catch {
+        }
+      }
+      this.nativeSchedulerDisabled ||= acted2;
+      return;
+    }
     let acted = false;
     try {
       if (typeof addon.setAutomaticallyChecksForUpdates === "function") {
@@ -13173,6 +13285,12 @@ var CodexSparkleBridge = class {
   wrapSink(addon, name, observe) {
     const original = addon[name];
     if (typeof original !== "function") return;
+    if (this.options.suppressNativeSideEffects) {
+      addon[name] = function tweakerInertHealthSinkSetter() {
+        return void 0;
+      };
+      return;
+    }
     const bridge = this;
     addon[name] = function tweakerSparkleSinkSetter(sink) {
       const wasActive = bridge.nativeUpdateControlActive();
@@ -14816,25 +14934,32 @@ process.on("uncaughtException", (e) => {
 process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { value: String(e) });
 });
-configureCodexSparkleBridge({
-  requestManualCheck: async () => {
-    await requestCodexDesktopManualCheck("native-sparkle");
-  },
-  requestBackgroundCheck: runProactiveDesktopUpdateCheck,
-  requestInstall: startCodexDesktopUpdateTransaction,
-  prepareForInstall: prepareSignedCodexForSparkleInstall,
-  getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
-  onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
-  onNativeControlActivityChanged: () => {
-    queueMicrotask(() => {
-      if (!lastPublishedCodexDesktopUpdate) return;
-      const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
-      if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
-      lastPublishedCodexDesktopUpdate = published;
-      broadcastCodexDesktopUpdateResult(published);
-    });
+function configureCodexSparkleForProcess() {
+  if (healthCheckOnly) {
+    configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
+    return;
   }
-});
+  configureCodexSparkleBridge({
+    requestManualCheck: async () => {
+      await requestCodexDesktopManualCheck("native-sparkle");
+    },
+    requestBackgroundCheck: runProactiveDesktopUpdateCheck,
+    requestInstall: startCodexDesktopUpdateTransaction,
+    prepareForInstall: prepareSignedCodexForSparkleInstall,
+    getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
+    onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
+    onNativeControlActivityChanged: () => {
+      queueMicrotask(() => {
+        if (!lastPublishedCodexDesktopUpdate) return;
+        const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
+        if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
+        lastPublishedCodexDesktopUpdate = published;
+        broadcastCodexDesktopUpdateResult(published);
+      });
+    }
+  });
+}
+configureCodexSparkleForProcess();
 installSparkleUpdateHook();
 var tweakState = {
   discovered: [],
@@ -16240,6 +16365,7 @@ function readPersistedCodexAppcast(profile, identityKey, desktopVersion) {
   };
 }
 function persistCodexAppcast(profile, identityKey, desktopVersion, metadata) {
+  if (healthCheckOnly) return;
   if (!desktopVersion || metadata.error || metadata.stale) return;
   const feedUrl = safeAppcastCacheUrl(metadata.feedUrl);
   const releaseUrl = metadata.releaseUrl === null ? null : safeAppcastCacheUrl(metadata.releaseUrl);

@@ -11,6 +11,7 @@ import {
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
+  hasUniqueSandboxedPromotionRendererProcess,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_ORIGINAL_RENDERER_URL,
@@ -21,6 +22,7 @@ import {
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
+  validatePromotionOriginalRendererHandshake,
   validatePromotionRendererHandshake,
 } from "../src/promotion-health";
 
@@ -49,7 +51,11 @@ test("original renderer authorization is exact, hidden, main-frame, and one-shot
     senderUrl: PROMOTION_ORIGINAL_RENDERER_URL,
     consumed: false,
   };
-  const payload = { version: 1, url: PROMOTION_ORIGINAL_RENDERER_URL };
+  const payload = {
+    version: 1,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    rendererSandboxed: true,
+  };
   assert.deepEqual(authorizePromotionOriginalRenderer(context, payload, nonce), {
     accepted: true,
     reason: "accepted",
@@ -58,7 +64,7 @@ test("original renderer authorization is exact, hidden, main-frame, and one-shot
   const queriedUrl = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123&initialRoute=%2Fsettings`;
   assert.deepEqual(authorizePromotionOriginalRenderer(
     { ...context, senderUrl: queriedUrl },
-    { version: 1, url: queriedUrl },
+    { version: 1, url: queriedUrl, rendererSandboxed: true },
     nonce,
   ), {
     accepted: true,
@@ -84,6 +90,9 @@ test("original renderer authorization is exact, hidden, main-frame, and one-shot
     { ...payload, extra: true },
     { version: 2, url: PROMOTION_ORIGINAL_RENDERER_URL },
     { version: 1, url: `${PROMOTION_ORIGINAL_RENDERER_URL}?nonce=untrusted` },
+    { ...payload, rendererSandboxed: false },
+    { version: 1, url: PROMOTION_ORIGINAL_RENDERER_URL, rendererSandboxed: undefined },
+    { ...payload, rendererSandboxed: "true" },
   ]) {
     assert.equal(authorizePromotionOriginalRenderer(context, malformed, nonce).accepted, false);
   }
@@ -113,6 +122,29 @@ test("original renderer URL accepts exact production queries and rejects normali
   assert.doesNotMatch(logged, /secret-value|oauth|host-123/);
 });
 
+test("original renderer process proof requires one matching sandboxed OS metric", () => {
+  assert.equal(hasUniqueSandboxedPromotionRendererProcess([
+    { pid: 200, sandboxed: false },
+    { pid: 201, sandboxed: true },
+  ], 201), true);
+
+  for (const [metrics, pid] of [
+    [[], 201],
+    [[{ pid: 201, sandboxed: true }, { pid: 201, sandboxed: true }], 201],
+    [[{ pid: 201, sandboxed: true }, { pid: 201, sandboxed: false }], 201],
+    [[{ pid: 201, sandboxed: false }], 201],
+    [[{ pid: 201 }], 201],
+    [[{ pid: 202, sandboxed: true }], 201],
+    [[{ pid: 201, sandboxed: true }], 0],
+    [[{ pid: 201, sandboxed: true }], -1],
+    [[{ pid: 201, sandboxed: true }], 201.5],
+    [[{ pid: 201, sandboxed: true }], "201"],
+    [null, 201],
+  ] as const) {
+    assert.equal(hasUniqueSandboxedPromotionRendererProcess(metrics, pid), false);
+  }
+});
+
 test("original renderer proof requires safe exact window, auth, load, mount, and cleanup", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
   const originalUrl = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
@@ -133,6 +165,7 @@ test("original renderer proof requires safe exact window, auth, load, mount, and
     nonce,
     url: originalUrl,
     lifecycle: "renderer-mounted",
+    rendererSandboxed: true,
     rendererStorageSelfTest: "pass",
   });
   assert.equal(tracker.result().hostReady, "unknown");
@@ -158,6 +191,64 @@ test("original renderer proof requires safe exact window, auth, load, mount, and
       failureReason: null,
     },
   });
+});
+
+test("original renderer accepts an omitted sandbox default only with positive effective proof", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const tracker = createPromotionOriginalRendererProofTracker(nonce);
+  tracker.eligibleWindow({
+    webContentsId: 76,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    isDefaultSession: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  tracker.authorization(76);
+  tracker.didFinishLoad(76, PROMOTION_ORIGINAL_RENDERER_URL);
+  tracker.rendererHandshake({
+    webContentsId: 76,
+    nonce,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    lifecycle: "renderer-mounted",
+    rendererSandboxed: true,
+    rendererStorageSelfTest: "pass",
+  });
+  tracker.cleanup(true);
+
+  assert.equal(tracker.result().hostReady, "pass");
+});
+
+test("original renderer rejects explicit sandbox disablement and a false effective proof", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const base = {
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    isDefaultSession: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  };
+  const explicitlyDisabled = createPromotionOriginalRendererProofTracker(nonce);
+  explicitlyDisabled.eligibleWindow({ webContentsId: 77, sandbox: false, ...base });
+  explicitlyDisabled.cleanup(true);
+  assert.equal(explicitlyDisabled.result().hostReady, "fail");
+  assert.equal(explicitlyDisabled.summary().failureReason, "eligible renderer was not canonical and sandbox-safe");
+
+  const ineffectiveDefault = createPromotionOriginalRendererProofTracker(nonce);
+  ineffectiveDefault.eligibleWindow({ webContentsId: 78, ...base });
+  ineffectiveDefault.authorization(78);
+  ineffectiveDefault.didFinishLoad(78, PROMOTION_ORIGINAL_RENDERER_URL);
+  ineffectiveDefault.rendererHandshake({
+    webContentsId: 78,
+    nonce,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    lifecycle: "renderer-mounted",
+    rendererSandboxed: false,
+    rendererStorageSelfTest: "pass",
+  });
+  ineffectiveDefault.cleanup(true);
+  assert.equal(ineffectiveDefault.result().hostReady, "fail");
+  assert.equal(ineffectiveDefault.summary().failureReason, "renderer was not effectively sandboxed");
 });
 
 test("original renderer proof permanently rejects unsafe, duplicate, replay, failure, and cleanup failure", () => {
@@ -296,6 +387,45 @@ test("promotion renderer handshake rejects pre-auth, wrong context, malformed pa
     { ...payload, rendererStorageSelfTest: "maybe" },
   ]) {
     assert.equal(validatePromotionRendererHandshake(context, malformed, nonce).accepted, false);
+  }
+});
+
+test("original renderer handshake requires an exact boolean effective sandbox result", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
+  const context = {
+    windowAlive: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: url,
+    expectedUrl: url,
+    authorizationConsumed: true,
+    handshakeConsumed: false,
+  };
+  const payload = {
+    nonce,
+    rendererSandboxed: true,
+    rendererStorageSelfTest: "pass",
+    lifecycle: "renderer-mounted",
+    url,
+  };
+
+  assert.deepEqual(validatePromotionOriginalRendererHandshake(context, payload, nonce), {
+    accepted: true,
+    reason: "accepted",
+    observation: payload,
+  });
+  assert.equal(validatePromotionOriginalRendererHandshake(
+    context,
+    { ...payload, rendererSandboxed: false },
+    nonce,
+  ).accepted, true, "a negative boolean is structurally valid so the tracker can fail closed immediately");
+  for (const malformed of [
+    { nonce, rendererStorageSelfTest: "pass", lifecycle: "renderer-mounted", url },
+    { ...payload, rendererSandboxed: "true" },
+    { ...payload, rendererSandboxed: true, extra: true },
+  ]) {
+    assert.equal(validatePromotionOriginalRendererHandshake(context, malformed, nonce).accepted, false);
   }
 });
 

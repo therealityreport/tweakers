@@ -10,6 +10,7 @@ const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-ren
 const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
 const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
+const effectiveRendererSandboxed = process.sandboxed === true;
 
 const MOUNT_TIMEOUT_MS = 20_000;
 
@@ -85,6 +86,7 @@ if (canonicalUrl !== null) {
     authorization = ipcRenderer.sendSync(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL, {
       version: 1,
       url: canonicalUrl,
+      rendererSandboxed: effectiveRendererSandboxed,
     });
   } catch {
     authorization = null;
@@ -124,6 +126,7 @@ function observeOriginalRendererMount(authorized: Authorization): void {
       nonce: authorized.nonce,
       url: unmodifiedUrl,
       lifecycle: "renderer-mounted",
+      rendererSandboxed: effectiveRendererSandboxed,
       rendererStorageSelfTest: verifyRendererStorageRollback(localStorage, authorized.nonce),
     });
   }

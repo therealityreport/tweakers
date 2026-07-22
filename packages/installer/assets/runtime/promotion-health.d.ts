@@ -39,6 +39,13 @@ export type PromotionOriginalRendererAuthorizationDecision = {
     };
 };
 /**
+ * Requires one unambiguous main-process metric for the renderer OS process.
+ * ProcessMetric.sandboxed is optional even on supported platforms, so only an
+ * explicit true is positive evidence; absent, duplicate, or malformed data
+ * fails closed before the authorization nonce can leave the main process.
+ */
+export declare function hasUniqueSandboxedPromotionRendererProcess(processMetrics: unknown, rendererProcessId: unknown): boolean;
+/**
  * Authorizes the dedicated original-main preload synchronously. The renderer
  * sends only its unmodified canonical URL; the main process supplies the nonce
  * after binding the sender to the one hidden, safe BrowserWindow.
@@ -48,7 +55,8 @@ export interface PromotionOriginalRendererWindowObservation {
     webContentsId: number;
     url: string;
     isDefaultSession: boolean;
-    sandbox: boolean;
+    /** Omission means Electron's default and must be proven in-renderer later. */
+    sandbox?: boolean;
     contextIsolation: boolean;
     nodeIntegration: boolean;
     originalPreloadValid: boolean;
@@ -78,6 +86,7 @@ export interface PromotionOriginalRendererProofTracker {
         nonce: string;
         url: string;
         lifecycle: string;
+        rendererSandboxed: boolean;
         rendererStorageSelfTest: HealthValue;
     }): void;
     fail(reason: string, webContentsId?: number): void;
@@ -132,10 +141,32 @@ export type PromotionRendererHandshakeDecision = {
         rendererStorageSelfTest: HealthValue;
     };
 };
+export type PromotionOriginalRendererHandshakeDecision = {
+    accepted: false;
+    reason: string;
+    observation: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+        nonce: string;
+        url: string;
+        lifecycle: "renderer-mounted";
+        rendererSandboxed: boolean;
+        rendererStorageSelfTest: HealthValue;
+    };
+};
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 export declare function authorizePromotionRenderer(context: PromotionRendererAuthorizationContext, payload: unknown, nonce: string): PromotionRendererAuthorizationDecision;
 /** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
 export declare function validatePromotionRendererHandshake(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionRendererHandshakeDecision;
+/**
+ * Validates the original-main preload's mount proof. Unlike the synthetic
+ * renderer proof, this requires the renderer to report Electron's effective
+ * sandbox state so an omitted default WebPreference cannot be mistaken for
+ * an explicit sandbox disablement or accepted without a positive signal.
+ */
+export declare function validatePromotionOriginalRendererHandshake(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionOriginalRendererHandshakeDecision;
 export interface PromotionRendererProtocolRequest {
     url: string;
 }

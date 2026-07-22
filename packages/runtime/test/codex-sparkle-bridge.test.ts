@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CodexSparkleBridge,
+  createHealthProbeCodexSparkleBridgeOptions,
   type SparkleNativeExports,
 } from "../src/codex-sparkle-bridge";
 
@@ -98,6 +99,87 @@ test("manual and background checks use safe callbacks while native checks and in
   assert.equal(backgroundResult, false);
   assert.deepEqual(preparations, []);
   assert.equal(bridge.getSnapshot().installPrerequisiteFailure, "Native desktop updates are paused while Tweakers is active; use the signed-app refresh flow.");
+});
+
+test("health-probe options keep every native updater action inert after initialization", async () => {
+  const rawCalls: string[] = [];
+  const networkCalls: string[] = [];
+  const downstreamCalls: string[] = [];
+  const addon: SparkleNativeExports = {
+    init: () => { rawCalls.push("init"); },
+    checkForUpdates: () => { rawCalls.push("raw-manual"); },
+    checkForUpdatesInBackground: () => { rawCalls.push("raw-background"); },
+    installLatestUpdate: () => { rawCalls.push("raw-install-latest"); return true; },
+    installUpdatesIfAvailable: () => { rawCalls.push("raw-install-available"); return true; },
+    setAutomaticallyChecksForUpdates: () => { rawCalls.push("raw-auto-check-setter"); },
+    setUpdateCheckInterval: () => { rawCalls.push("raw-interval-setter"); },
+    scheduleNextUpdateCheck: () => { rawCalls.push("raw-schedule"); },
+    resetUpdateCycle: () => { rawCalls.push("raw-reset"); },
+    setUpdateLifecycleStateSink: () => { rawCalls.push("raw-lifecycle-sink-setter"); },
+    setDownloadProgressSink: () => { rawCalls.push("raw-download-sink-setter"); },
+    setInstallProgressSink: () => { rawCalls.push("raw-install-sink-setter"); },
+    setUpdateReadySink: () => { rawCalls.push("raw-ready-sink-setter"); },
+  };
+  const healthOptions = createHealthProbeCodexSparkleBridgeOptions();
+  assert.equal(Object.isFrozen(healthOptions), true);
+  assert.deepEqual(Object.keys(healthOptions).sort(), [
+    "getInstallPrerequisite",
+    "onFeedCaptured",
+    "onNativeControlActivityChanged",
+    "prepareForInstall",
+    "requestBackgroundCheck",
+    "requestInstall",
+    "requestManualCheck",
+    "suppressNativeSideEffects",
+  ]);
+  assert.equal(healthOptions.suppressNativeSideEffects, true);
+  assert.equal("fetch" in healthOptions, false);
+
+  const bridge = new CodexSparkleBridge({
+    ...healthOptions,
+    fetch: async (url) => {
+      networkCalls.push(url);
+      throw new Error("health probe attempted a network request");
+    },
+  });
+  bridge.wrapExports(addon);
+  const initResult = addon.init?.(
+    "https://updates.example.test/private.xml",
+    { Authorization: "Bearer ephemeral" },
+    "https://updates.example.test/public.xml",
+  );
+
+  addon.setAutomaticallyChecksForUpdates?.(true);
+  addon.setUpdateCheckInterval?.(3_600);
+  addon.scheduleNextUpdateCheck?.();
+  addon.resetUpdateCycle?.();
+  addon.setUpdateLifecycleStateSink?.(() => { downstreamCalls.push("lifecycle"); });
+  addon.setDownloadProgressSink?.(() => { downstreamCalls.push("download"); });
+  addon.setInstallProgressSink?.(() => { downstreamCalls.push("install"); });
+  addon.setUpdateReadySink?.(() => { downstreamCalls.push("ready"); });
+
+  assert.equal(initResult, undefined);
+  assert.equal(addon.checkForUpdates?.(), false);
+  assert.equal(addon.checkForUpdatesInBackground?.(), false);
+  assert.equal(addon.installLatestUpdate?.(), false);
+  assert.equal(addon.installUpdatesIfAvailable?.(), false);
+  assert.equal(await bridge.installUpdate(), false);
+
+  assert.deepEqual(rawCalls, []);
+  assert.deepEqual(downstreamCalls, []);
+  assert.deepEqual(networkCalls, []);
+  assert.equal(addon.automaticallyChecksForUpdates, false);
+  assert.equal(addon.updateCheckInterval, 0);
+  const snapshot = bridge.getSnapshot();
+  assert.equal(snapshot.available, false);
+  assert.equal(snapshot.feedUrl, null);
+  assert.equal(snapshot.fallbackFeedUrl, null);
+  assert.equal((bridge as unknown as { headers?: unknown }).headers, undefined);
+  assert.equal(bridge.getSnapshot().canInstall, false);
+  assert.equal(
+    bridge.getSnapshot().installPrerequisiteFailure,
+    "The native updater is unavailable.",
+  );
 });
 
 test("safe metadata drives OpenAI's ready control and redirects its install click", async () => {

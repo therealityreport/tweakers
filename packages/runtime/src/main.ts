@@ -92,6 +92,7 @@ import {
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
+  hasUniqueSandboxedPromotionRendererProcess,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_RENDERER_AUTH_CHANNEL,
@@ -105,6 +106,7 @@ import {
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
+  validatePromotionOriginalRendererHandshake,
   validatePromotionRendererHandshake,
   type HealthValue,
   type PromotionRendererProofResult,
@@ -135,6 +137,7 @@ import {
 } from "./codex-version-service";
 import {
   configureCodexSparkleBridge,
+  createHealthProbeCodexSparkleBridgeOptions,
   getCodexSparkleBridge,
   type SparkleAppcastMetadata,
 } from "./codex-sparkle-bridge";
@@ -1269,25 +1272,38 @@ process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { value: String(e) });
 });
 
-configureCodexSparkleBridge({
-  requestManualCheck: async () => {
-    await requestCodexDesktopManualCheck("native-sparkle");
-  },
-  requestBackgroundCheck: runProactiveDesktopUpdateCheck,
-  requestInstall: startCodexDesktopUpdateTransaction,
-  prepareForInstall: prepareSignedCodexForSparkleInstall,
-  getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
-  onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
-  onNativeControlActivityChanged: () => {
-    queueMicrotask(() => {
-      if (!lastPublishedCodexDesktopUpdate) return;
-      const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
-      if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
-      lastPublishedCodexDesktopUpdate = published;
-      broadcastCodexDesktopUpdateResult(published);
-    });
-  },
-});
+function configureCodexSparkleForProcess(): void {
+  if (healthCheckOnly) {
+    // The original main initializes and may invoke its updater while the
+    // renderer proof is running. Keep the native methods wrapped/inert, but do
+    // not connect any health-only invocation to networking, dialogs,
+    // notifications, transactions, signed-app preparation, or persistence.
+    configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
+    return;
+  }
+
+  configureCodexSparkleBridge({
+    requestManualCheck: async () => {
+      await requestCodexDesktopManualCheck("native-sparkle");
+    },
+    requestBackgroundCheck: runProactiveDesktopUpdateCheck,
+    requestInstall: startCodexDesktopUpdateTransaction,
+    prepareForInstall: prepareSignedCodexForSparkleInstall,
+    getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
+    onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
+    onNativeControlActivityChanged: () => {
+      queueMicrotask(() => {
+        if (!lastPublishedCodexDesktopUpdate) return;
+        const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
+        if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
+        lastPublishedCodexDesktopUpdate = published;
+        broadcastCodexDesktopUpdateResult(published);
+      });
+    },
+  });
+}
+
+configureCodexSparkleForProcess();
 installSparkleUpdateHook();
 
 interface LoadedMainTweak {
@@ -3001,6 +3017,12 @@ function persistCodexAppcast(
   desktopVersion: string | null,
   metadata: SparkleAppcastMetadata,
 ): void {
+  // OpenAI's original main invokes its background updater during the one-shot
+  // renderer probe. The redirected check may refresh this bounded cache, but
+  // a health probe must remain observational: its expected promotion surfaces
+  // were sealed before launch. Suppress only this cache writer so every other
+  // unexpected config mutation still fails the exact surface comparison.
+  if (healthCheckOnly) return;
   if (!desktopVersion || metadata.error || metadata.stale) return;
   const feedUrl = safeAppcastCacheUrl(metadata.feedUrl);
   const releaseUrl = metadata.releaseUrl === null ? null : safeAppcastCacheUrl(metadata.releaseUrl);

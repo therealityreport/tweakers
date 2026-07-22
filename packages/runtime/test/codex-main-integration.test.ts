@@ -184,6 +184,29 @@ test("proactive desktop update checks are metadata-only, deduplicated, and exclu
   assert.match(mainSource, /PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 \* 60 \* 60 \* 1_000/);
 });
 
+test("health probes select the inert Sparkle contract while normal launches retain the managed update flow", () => {
+  const configure = extractFunctionBody(mainSource, "configureCodexSparkleForProcess");
+  const healthStart = configure.indexOf("if (healthCheckOnly)");
+  const healthEnd = configure.indexOf("return;", healthStart);
+  assert.ok(healthStart >= 0 && healthEnd > healthStart, "missing bounded health-only Sparkle branch");
+  const health = configure.slice(healthStart, healthEnd);
+  assert.match(health, /configureCodexSparkleBridge\(createHealthProbeCodexSparkleBridgeOptions\(\)\)/);
+  assert.doesNotMatch(
+    health,
+    /requestCodexDesktopManualCheck|runProactiveDesktopUpdateCheck|startCodexDesktopUpdateTransaction|prepareSignedCodexForSparkleInstall|codexDesktopInstallPrerequisiteFailure|persistCapturedCodexDesktopProfileFeed|publishCodexDesktopUpdateResult|broadcastCodexDesktopUpdateResult|Notification\.|fetch\(/,
+  );
+
+  const normal = configure.slice(healthEnd + "return;".length);
+  assert.match(normal, /requestCodexDesktopManualCheck\("native-sparkle"\)/);
+  assert.match(normal, /requestBackgroundCheck: runProactiveDesktopUpdateCheck/);
+  assert.match(normal, /requestInstall: startCodexDesktopUpdateTransaction/);
+  assert.match(normal, /prepareForInstall: prepareSignedCodexForSparkleInstall/);
+  assert.match(normal, /getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure/);
+  assert.match(normal, /onFeedCaptured: persistCapturedCodexDesktopProfileFeed/);
+  assert.match(normal, /broadcastCodexDesktopUpdateResult\(published\)/);
+  assert.match(mainSource, /configureCodexSparkleForProcess\(\);\s*installSparkleUpdateHook\(\);/);
+});
+
 test("startup desktop-update reconciliation is guarded, bounded, and uses the cutover launcher", () => {
   assert.match(mainSource, /createDesktopUpdateStartupReconciler\(\{/);
   assert.match(mainSource, /BrowserWindow\.getAllWindows\(\)\.some/);
@@ -285,14 +308,19 @@ test("Sparkle update mode is committed only after the signed app restore", () =>
   assert.match(body, /rmSync\(UPDATE_MODE_FILE, \{ force: true \}\)/);
 });
 
-test("appcast cache is version-keyed, bounded to 24 hours, and never persists headers", () => {
+test("appcast cache is version-keyed, bounded to 24 hours, and health probes cannot persist it", () => {
   assert.match(mainSource, /CODEX_APPCAST_CACHE_TTL_MS = 24 \* 60 \* 60 \* 1000/);
   assert.match(mainSource, /codexAppcastCache\?: \{\s*schemaVersion: 1;\s*desktopVersion: string;/);
   const writer = extractFunctionBody(mainSource, "persistCodexAppcast");
+  const healthGuard = writer.indexOf("if (healthCheckOnly) return;");
+  const stateRead = writer.indexOf("const state = readState();");
+  assert.ok(healthGuard >= 0, "health-only appcast persistence guard is missing");
+  assert.ok(stateRead > healthGuard, "health-only guard must run before config state is read or written");
   assert.match(writer, /desktopVersion,/);
   assert.match(writer, /marketingVersion: metadata\.marketingVersion/);
   assert.match(writer, /build: metadata\.build/);
   assert.match(writer, /feedUrl,/);
+  assert.match(writer, /writeState\(state\)/);
   assert.doesNotMatch(writer, /headers|authorization|token/i);
   const reader = extractFunctionBody(mainSource, "readPersistedCodexAppcast");
   assert.match(reader, /cache\.desktopVersion !== desktopVersion/);

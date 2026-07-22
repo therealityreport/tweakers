@@ -96,6 +96,32 @@ export type PromotionOriginalRendererAuthorizationDecision =
   | { accepted: true; reason: "accepted"; response: { version: 1; nonce: string; url: string } };
 
 /**
+ * Requires one unambiguous main-process metric for the renderer OS process.
+ * ProcessMetric.sandboxed is optional even on supported platforms, so only an
+ * explicit true is positive evidence; absent, duplicate, or malformed data
+ * fails closed before the authorization nonce can leave the main process.
+ */
+export function hasUniqueSandboxedPromotionRendererProcess(
+  processMetrics: unknown,
+  rendererProcessId: unknown,
+): boolean {
+  if (
+    typeof rendererProcessId !== "number"
+    || !Number.isSafeInteger(rendererProcessId)
+    || rendererProcessId <= 0
+    || !Array.isArray(processMetrics)
+    || processMetrics.length > 4_096
+  ) return false;
+  let matchingMetric: Record<string, unknown> | null = null;
+  for (const metric of processMetrics) {
+    if (!plainRecord(metric) || metric.pid !== rendererProcessId) continue;
+    if (matchingMetric !== null) return false;
+    matchingMetric = metric;
+  }
+  return matchingMetric?.sandboxed === true;
+}
+
+/**
  * Authorizes the dedicated original-main preload synchronously. The renderer
  * sends only its unmodified canonical URL; the main process supplies the nonce
  * after binding the sender to the one hidden, safe BrowserWindow.
@@ -114,10 +140,10 @@ export function authorizePromotionOriginalRenderer(
     return { accepted: false, reason: "sender URL mismatch", response: null };
   }
   if (context.consumed) return { accepted: false, reason: "authorization already consumed", response: null };
-  if (!plainRecord(payload) || !exactKeys(payload, ["url", "version"])) {
+  if (!plainRecord(payload) || !exactKeys(payload, ["rendererSandboxed", "url", "version"])) {
     return { accepted: false, reason: "payload invalid", response: null };
   }
-  if (payload.version !== 1 || payload.url !== canonicalUrl) {
+  if (payload.version !== 1 || payload.url !== canonicalUrl || payload.rendererSandboxed !== true) {
     return { accepted: false, reason: "payload binding invalid", response: null };
   }
   if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
@@ -134,7 +160,8 @@ export interface PromotionOriginalRendererWindowObservation {
   webContentsId: number;
   url: string;
   isDefaultSession: boolean;
-  sandbox: boolean;
+  /** Omission means Electron's default and must be proven in-renderer later. */
+  sandbox?: boolean;
   contextIsolation: boolean;
   nodeIntegration: boolean;
   originalPreloadValid: boolean;
@@ -166,6 +193,7 @@ export interface PromotionOriginalRendererProofTracker {
     nonce: string;
     url: string;
     lifecycle: string;
+    rendererSandboxed: boolean;
     rendererStorageSelfTest: HealthValue;
   }): void;
   fail(reason: string, webContentsId?: number): void;
@@ -213,7 +241,7 @@ export function createPromotionOriginalRendererProofTracker(
         || !Number.isSafeInteger(observation.webContentsId)
         || observation.webContentsId <= 0
         || !observation.isDefaultSession
-        || observation.sandbox !== true
+        || (observation.sandbox !== true && observation.sandbox !== undefined)
         || observation.contextIsolation !== true
         || observation.nodeIntegration !== false
         || observation.originalPreloadValid !== true
@@ -272,9 +300,12 @@ export function createPromotionOriginalRendererProofTracker(
         || observation.nonce !== nonce
         || observation.url !== canonicalUrl
         || observation.lifecycle !== "renderer-mounted"
+        || observation.rendererSandboxed !== true
         || !validHealthValue(observation.rendererStorageSelfTest)
       ) {
-        permanentlyFail("mount handshake binding invalid");
+        permanentlyFail(observation.rendererSandboxed === false
+          ? "renderer was not effectively sandboxed"
+          : "mount handshake binding invalid");
         return;
       }
       mounted = true;
@@ -358,6 +389,20 @@ export type PromotionRendererHandshakeDecision =
     };
   };
 
+export type PromotionOriginalRendererHandshakeDecision =
+  | { accepted: false; reason: string; observation: null }
+  | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+      nonce: string;
+      url: string;
+      lifecycle: "renderer-mounted";
+      rendererSandboxed: boolean;
+      rendererStorageSelfTest: HealthValue;
+    };
+  };
+
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 export function authorizePromotionRenderer(
   context: PromotionRendererAuthorizationContext,
@@ -418,6 +463,49 @@ export function validatePromotionRendererHandshake(
       nonce,
       url: context.expectedUrl,
       lifecycle: "renderer-mounted",
+      rendererStorageSelfTest: payload.rendererStorageSelfTest,
+    },
+  };
+}
+
+/**
+ * Validates the original-main preload's mount proof. Unlike the synthetic
+ * renderer proof, this requires the renderer to report Electron's effective
+ * sandbox state so an omitted default WebPreference cannot be mistaken for
+ * an explicit sandbox disablement or accepted without a positive signal.
+ */
+export function validatePromotionOriginalRendererHandshake(
+  context: PromotionRendererHandshakeContext,
+  payload: unknown,
+  nonce: string,
+): PromotionOriginalRendererHandshakeDecision {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "rendererStorageSelfTest", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mounted") {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  if (typeof payload.rendererSandboxed !== "boolean") {
+    return { accepted: false, reason: "sandbox result invalid", observation: null };
+  }
+  if (!validHealthValue(payload.rendererStorageSelfTest)) {
+    return { accepted: false, reason: "storage result invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mounted",
+      rendererSandboxed: payload.rendererSandboxed,
       rendererStorageSelfTest: payload.rendererStorageSelfTest,
     },
   };

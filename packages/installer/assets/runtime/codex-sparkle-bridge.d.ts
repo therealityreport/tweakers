@@ -68,6 +68,8 @@ export type SparkleFetch = (url: string, init: {
     redirect: "manual";
 }) => Promise<SparkleFetchResponse>;
 export interface CodexSparkleBridgeOptions {
+    /** Health-only: wrap native updater exports without entering native code. */
+    suppressNativeSideEffects?: boolean;
     /** Runs the bounded Tweakers-owned manual update check without invoking raw Sparkle/XPC. */
     requestManualCheck?: () => void | Promise<void>;
     /** Runs the bounded metadata-only check used by OpenAI's startup/interval timer. */
@@ -88,6 +90,12 @@ export interface CodexSparkleBridgeOptions {
     /** Receives only redacted HTTPS URLs after OpenAI's native init succeeds. */
     onFeedCaptured?: (capture: SparkleFeedCapture) => void;
 }
+/**
+ * Keeps OpenAI's native updater entry points wrapped but observational during
+ * one-shot health execution. No returned callback reaches networking, UI,
+ * persistence, app replacement, or signed-app preparation.
+ */
+export declare function createHealthProbeCodexSparkleBridgeOptions(): CodexSparkleBridgeOptions;
 export declare const CODEX_PUBLIC_PRODUCTION_APPCAST = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 /**
  * A narrow observer/action seam around OpenAI's native Sparkle addon.

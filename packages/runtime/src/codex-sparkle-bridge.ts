@@ -80,6 +80,8 @@ export type SparkleFetch = (
 ) => Promise<SparkleFetchResponse>;
 
 export interface CodexSparkleBridgeOptions {
+  /** Health-only: wrap native updater exports without entering native code. */
+  suppressNativeSideEffects?: boolean;
   /** Runs the bounded Tweakers-owned manual update check without invoking raw Sparkle/XPC. */
   requestManualCheck?: () => void | Promise<void>;
   /** Runs the bounded metadata-only check used by OpenAI's startup/interval timer. */
@@ -99,6 +101,29 @@ export interface CodexSparkleBridgeOptions {
   onNativeControlActivityChanged?: (active: boolean) => void;
   /** Receives only redacted HTTPS URLs after OpenAI's native init succeeds. */
   onFeedCaptured?: (capture: SparkleFeedCapture) => void;
+}
+
+const HEALTH_PROBE_UPDATE_DISABLED_REASON = "Desktop updates are disabled during health probes.";
+
+/**
+ * Keeps OpenAI's native updater entry points wrapped but observational during
+ * one-shot health execution. No returned callback reaches networking, UI,
+ * persistence, app replacement, or signed-app preparation.
+ */
+export function createHealthProbeCodexSparkleBridgeOptions(): CodexSparkleBridgeOptions {
+  return Object.freeze({
+    suppressNativeSideEffects: true,
+    requestManualCheck: () => undefined,
+    requestBackgroundCheck: () => undefined,
+    requestInstall: () => undefined,
+    prepareForInstall: () => false,
+    getInstallPrerequisite: () => ({
+      ok: false,
+      reason: HEALTH_PROBE_UPDATE_DISABLED_REASON,
+    }),
+    onFeedCaptured: () => undefined,
+    onNativeControlActivityChanged: () => undefined,
+  });
 }
 
 const SAFE_LIFECYCLE = new Set<SparkleLifecycleState>([
@@ -342,6 +367,19 @@ export class CodexSparkleBridge {
     if (typeof original !== "function") return;
     const bridge = this;
     addon.init = function tweakerSparkleInit(this: unknown, ...args: unknown[]) {
+      if (bridge.options.suppressNativeSideEffects) {
+        bridge.headers = undefined;
+        bridge.state.available = false;
+        bridge.state.lifecycle = "idle";
+        bridge.state.downloadProgressPercent = null;
+        bridge.state.installProgressPercent = null;
+        bridge.state.ready = false;
+        bridge.state.feedUrl = null;
+        bridge.state.fallbackFeedUrl = null;
+        bridge.state.lastError = null;
+        bridge.refreshActionability();
+        return undefined;
+      }
       bridge.captureInit(args);
       try {
         const result = Reflect.apply(original, this, args);
@@ -412,6 +450,50 @@ export class CodexSparkleBridge {
   }
 
   private disableNativeScheduler(addon: SparkleNativeExports): void {
+    if (this.options.suppressNativeSideEffects) {
+      let acted = false;
+      for (const name of [
+        "setAutomaticallyChecksForUpdates",
+        "setUpdateCheckInterval",
+        "scheduleNextUpdateCheck",
+        "resetUpdateCycle",
+      ] as const) {
+        try {
+          if (typeof addon[name] !== "function") continue;
+          addon[name] = function tweakerInertHealthScheduler() { return undefined; };
+          acted = true;
+        } catch {
+          // A missing optional seam remains harmless because native init and
+          // both native check methods are also inert in health mode.
+        }
+      }
+      for (const [name, value] of [
+        ["automaticallyChecksForUpdates", false],
+        ["updateCheckInterval", 0],
+      ] as const) {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(addon, name);
+          if (!descriptor || descriptor.configurable) {
+            Object.defineProperty(addon, name, {
+              configurable: true,
+              enumerable: descriptor?.enumerable ?? true,
+              get: () => value,
+              set: () => undefined,
+            });
+            acted = true;
+          } else if ("value" in descriptor && descriptor.writable) {
+            (addon as Record<string, unknown>)[name] = value;
+            acted = true;
+          }
+        } catch {
+          // Never invoke a native accessor merely to adjust optional health
+          // metadata. Check and init entry points remain independently inert.
+        }
+      }
+      this.nativeSchedulerDisabled ||= acted;
+      return;
+    }
+
     let acted = false;
 
     try {
@@ -461,6 +543,10 @@ export class CodexSparkleBridge {
   ): void {
     const original = addon[name];
     if (typeof original !== "function") return;
+    if (this.options.suppressNativeSideEffects) {
+      addon[name] = function tweakerInertHealthSinkSetter() { return undefined; };
+      return;
+    }
     const bridge = this;
     addon[name] = function tweakerSparkleSinkSetter(this: unknown, sink: unknown) {
       const wasActive = bridge.nativeUpdateControlActive();

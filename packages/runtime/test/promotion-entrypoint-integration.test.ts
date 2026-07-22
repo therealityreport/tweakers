@@ -381,6 +381,23 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /existsSync\(exactPath\) && lstatSync\(exactPath\)\.isFile\(\)/);
   assert.match(controller, /originalPreloadValid,/);
   assert.match(controller, /tracker\.eligibleWindow\(\{[\s\S]*?url: canonicalUrl,/);
+  assert.match(controller, /sandbox: preferences\.sandbox,/);
+  assert.match(controller, /validatePromotionOriginalRendererHandshake/);
+  assert.match(controller, /rendererSandboxed: decision\.observation\.rendererSandboxed/);
+  const originalAuthorization = controller.slice(
+    controller.indexOf("const onAuthorization ="),
+    controller.indexOf("const onHandshake ="),
+  );
+  assert.match(originalAuthorization, /process\.platform === "darwin"/);
+  assert.match(originalAuthorization, /event\.sender\.getOSProcessId\(\)/);
+  assert.match(originalAuthorization, /app\.getAppMetrics\(\)/);
+  assert.match(originalAuthorization, /hasUniqueSandboxedPromotionRendererProcess/);
+  assert.match(originalAuthorization, /canonical renderer sandbox process proof failed/);
+  assert.ok(
+    originalAuthorization.indexOf("hasUniqueSandboxedPromotionRendererProcess")
+      < originalAuthorization.indexOf("authorizationConsumed = true"),
+    "the OS-level sandbox proof must pass before the nonce is released",
+  );
   assert.match(controller, /promotion original renderer eligible window observed[\s\S]*?url: promotionOriginalRendererLogUrl\(canonicalUrl\)/);
   assert.match(controller, /preloadErrorWebContentsIds\.add\(contents\.id\)/);
   assert.match(controller, /tracker\.preloadError\(contents\.id\)/);
@@ -415,6 +432,7 @@ test("original-main health mode observes Codex's hidden real window without owni
 
   assert.match(originalHealthPreloadSource, /location\.href/);
   assert.match(originalHealthPreloadSource, /sendSync\(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL/);
+  assert.match(originalHealthPreloadSource, /rendererSandboxed: effectiveRendererSandboxed/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_URL = "app:\/\/-\/index\.html"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof"/);
@@ -424,6 +442,8 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(originalHealthPreloadSource, /observer\.observe\(document/);
   assert.match(originalHealthPreloadSource, /:scope > \.startup-loader/);
   assert.match(originalHealthPreloadSource, /verifyRendererStorageRollback/);
+  assert.match(originalHealthPreloadSource, /const effectiveRendererSandboxed = process\.sandboxed === true/);
+  assert.match(originalHealthPreloadSource, /rendererSandboxed: effectiveRendererSandboxed/);
   assert.doesNotMatch(originalHealthPreloadSource, /process\.(?:env|argv)/);
   assert.match(originalHealthPreloadSource, /searchParams\.has\(PROMOTION_RENDERER_NONCE_QUERY\)/);
 });
