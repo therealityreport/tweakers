@@ -24,6 +24,7 @@ const BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 const BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 const BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+const PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 const PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4_000;
 const DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 const DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
@@ -68,7 +69,25 @@ function safeStringify(v) {
     }
 }
 fileLog("preload entry", { url: location.href });
-const promotionNonce = (0, promotion_renderer_mount_1.promotionRendererNonce)(location.href, process.argv);
+const promotionAttempt = (0, promotion_renderer_mount_1.promotionRendererAuthorizationAttempt)(location.href);
+let promotionNonce = null;
+if (promotionAttempt.kind === "candidate") {
+    let response = null;
+    let rejectionReason = "main authorization rejected";
+    try {
+        response = electron_1.ipcRenderer.sendSync(PROMOTION_RENDERER_AUTH_CHANNEL, promotionAttempt.request);
+    }
+    catch {
+        rejectionReason = "synchronous authorization failed";
+    }
+    promotionNonce = (0, promotion_renderer_mount_1.promotionRendererAuthorizedNonce)(promotionAttempt, response);
+    if (promotionNonce === null) {
+        fileLog("promotion renderer authorization incomplete", { reason: rejectionReason });
+    }
+}
+else if (promotionAttempt.kind === "invalid-candidate") {
+    fileLog("promotion renderer authorization incomplete", { reason: promotionAttempt.reason });
+}
 try {
     installBrowserUiHostBridge();
     fileLog("browser UI host bridge installed");
@@ -87,7 +106,7 @@ catch (e) {
 if (promotionNonce) {
     schedulePromotionRendererProof(promotionNonce);
 }
-else {
+else if (promotionAttempt.kind === "ordinary") {
     queueMicrotask(() => {
         if (document.readyState === "loading") {
             document.addEventListener("DOMContentLoaded", boot, { once: true });

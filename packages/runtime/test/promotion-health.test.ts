@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   answerPromotionHealthRequest,
+  authorizePromotionRenderer,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
   hasAuthenticatedSessionCookie,
@@ -15,7 +16,103 @@ import {
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
+  validatePromotionRendererHandshake,
 } from "../src/promotion-health";
+
+test("promotion renderer authorization rejects wrong sender, frame, URL, payload, and replay", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = promotionRendererDocumentUrl(nonce);
+  const context = {
+    windowAlive: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: url,
+    expectedUrl: url,
+    consumed: false,
+  };
+  const request = { version: 1, url };
+
+  assert.deepEqual(authorizePromotionRenderer(context, request, nonce), {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url },
+  });
+  for (const [override, reason] of [
+    [{ windowAlive: false }, "proof window unavailable"],
+    [{ senderMatches: false }, "sender mismatch"],
+    [{ frameMatches: false }, "frame mismatch"],
+    [{ senderUrl: `${url}&spoof=1` }, "sender URL mismatch"],
+    [{ consumed: true }, "authorization already consumed"],
+  ] as const) {
+    assert.deepEqual(authorizePromotionRenderer({ ...context, ...override }, request, nonce), {
+      accepted: false,
+      reason,
+      response: null,
+    });
+  }
+  for (const payload of [
+    null,
+    [],
+    { version: 1 },
+    { version: 1, url, extra: true },
+    { version: 2, url },
+    { version: 1, url: `${url}&spoof=1` },
+  ]) {
+    assert.equal(authorizePromotionRenderer(context, payload, nonce).accepted, false);
+  }
+  assert.equal(authorizePromotionRenderer(context, request, "not-a-uuid").accepted, false);
+});
+
+test("promotion renderer handshake rejects pre-auth, wrong context, malformed payload, and replay", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = promotionRendererDocumentUrl(nonce);
+  const context = {
+    windowAlive: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: url,
+    expectedUrl: url,
+    authorizationConsumed: true,
+    handshakeConsumed: false,
+  };
+  const payload = {
+    nonce,
+    rendererStorageSelfTest: "pass",
+    lifecycle: "renderer-mounted",
+    url,
+  };
+
+  assert.deepEqual(validatePromotionRendererHandshake(context, payload, nonce), {
+    accepted: true,
+    reason: "accepted",
+    observation: payload,
+  });
+  for (const [override, reason] of [
+    [{ windowAlive: false }, "proof window unavailable"],
+    [{ senderMatches: false }, "sender mismatch"],
+    [{ frameMatches: false }, "frame mismatch"],
+    [{ senderUrl: `${url}&spoof=1` }, "sender URL mismatch"],
+    [{ authorizationConsumed: false }, "authorization required"],
+    [{ handshakeConsumed: true }, "handshake already consumed"],
+  ] as const) {
+    assert.deepEqual(validatePromotionRendererHandshake({ ...context, ...override }, payload, nonce), {
+      accepted: false,
+      reason,
+      observation: null,
+    });
+  }
+  for (const malformed of [
+    null,
+    [],
+    { ...payload, extra: true },
+    { ...payload, nonce: "123e4567-e89b-42d3-a456-426614174001" },
+    { ...payload, url: `${url}&spoof=1` },
+    { ...payload, lifecycle: "dom-content-loaded" },
+    { ...payload, rendererStorageSelfTest: "maybe" },
+  ]) {
+    assert.equal(validatePromotionRendererHandshake(context, malformed, nonce).accepted, false);
+  }
+});
 
 test("promotion renderer URL selects the exact production origin document", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";

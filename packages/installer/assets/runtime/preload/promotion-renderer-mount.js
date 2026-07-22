@@ -1,71 +1,79 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.promotionRendererBindingArgument = promotionRendererBindingArgument;
-exports.promotionRendererNonce = promotionRendererNonce;
+exports.promotionRendererAuthorizationAttempt = promotionRendererAuthorizationAttempt;
+exports.promotionRendererAuthorizedNonce = promotionRendererAuthorizedNonce;
 exports.createPromotionRendererMountTracker = createPromotionRendererMountTracker;
 const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
-const PROMOTION_RENDERER_BINDING_PREFIX = "--tweaker-promotion-renderer-proof=";
 const PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 /**
- * Creates the one renderer-process argument that binds a proof window to its
- * main-generated nonce and exact candidate ASAR URL. Electron exposes argv in
- * sandboxed preloads even though it does not expose process.resourcesPath.
+ * Classifies the current document before page scripts run. Ordinary windows
+ * take the normal preload path. A URL that carries the reserved proof query is
+ * fail-closed unless it is the one exact candidate document shape.
  */
-function promotionRendererBindingArgument(nonce, url) {
-    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce))
-        throw new Error("invalid promotion renderer nonce");
-    const parsed = new URL(url);
-    const queryEntries = [...parsed.searchParams.entries()];
-    if (parsed.protocol !== "app:"
-        || parsed.hostname !== "-"
-        || parsed.username !== ""
-        || parsed.password !== ""
-        || parsed.port !== ""
-        || parsed.pathname !== "/index.html"
-        || parsed.hash !== ""
-        || queryEntries.length !== 1
-        || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY
-        || queryEntries[0][1] !== nonce)
-        throw new Error("invalid promotion renderer URL binding");
-    return `${PROMOTION_RENDERER_BINDING_PREFIX}${encodeURIComponent(JSON.stringify({
-        version: 1,
-        nonce,
-        url: parsed.toString(),
-    }))}`;
-}
-/** Accepts only the exact URL/nonce binding supplied to this proof renderer. */
-function promotionRendererNonce(href, argv) {
+function promotionRendererAuthorizationAttempt(href) {
     try {
-        const bindings = argv.filter((argument) => argument.startsWith(PROMOTION_RENDERER_BINDING_PREFIX));
-        if (bindings.length !== 1)
-            return null;
-        const encoded = bindings[0].slice(PROMOTION_RENDERER_BINDING_PREFIX.length);
-        if (encoded.length === 0)
-            return null;
-        const decoded = JSON.parse(decodeURIComponent(encoded));
-        if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded))
-            return null;
-        const binding = decoded;
-        if (Object.keys(binding).sort().join(",") !== "nonce,url,version")
-            return null;
-        if (binding.version !== 1 || typeof binding.nonce !== "string" || typeof binding.url !== "string")
-            return null;
-        if (!PROMOTION_RENDERER_NONCE_PATTERN.test(binding.nonce) || binding.url !== href)
-            return null;
-        const parsed = new URL(binding.url);
+        const parsed = new URL(href);
+        const queryEntries = [...parsed.searchParams.entries()];
+        const hasReservedQuery = queryEntries.some(([key]) => key === PROMOTION_RENDERER_NONCE_QUERY);
+        if (!hasReservedQuery)
+            return { kind: "ordinary" };
         if (parsed.protocol !== "app:"
             || parsed.hostname !== "-"
             || parsed.username !== ""
             || parsed.password !== ""
             || parsed.port !== ""
             || parsed.pathname !== "/index.html"
-            || parsed.hash !== "")
-            return null;
-        const queryEntries = [...parsed.searchParams.entries()];
-        if (queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY)
-            return null;
+            || parsed.hash !== ""
+            || queryEntries.length !== 1
+            || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY)
+            return { kind: "invalid-candidate", reason: "candidate URL shape invalid" };
         const nonce = queryEntries[0][1];
-        return nonce === binding.nonce ? nonce : null;
+        if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+            return { kind: "invalid-candidate", reason: "candidate nonce invalid" };
+        }
+        if (parsed.toString() !== href) {
+            return { kind: "invalid-candidate", reason: "candidate URL is not canonical" };
+        }
+        return {
+            kind: "candidate",
+            nonce,
+            request: { version: 1, url: href },
+        };
+    }
+    catch {
+        return { kind: "ordinary" };
+    }
+}
+/** Accepts only the exact synchronous main-process authorization response. */
+function promotionRendererAuthorizedNonce(attempt, response) {
+    if (attempt.kind !== "candidate" || response === null || typeof response !== "object" || Array.isArray(response)) {
+        return null;
+    }
+    const value = response;
+    if (Object.keys(value).sort().join(",") !== "nonce,url,version")
+        return null;
+    if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string")
+        return null;
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce))
+        return null;
+    if (value.nonce !== attempt.nonce || value.url !== attempt.request.url)
+        return null;
+    try {
+        const parsed = new URL(value.url);
+        const entries = [...parsed.searchParams.entries()];
+        if (parsed.protocol !== "app:"
+            || parsed.hostname !== "-"
+            || parsed.username !== ""
+            || parsed.password !== ""
+            || parsed.port !== ""
+            || parsed.pathname !== "/index.html"
+            || parsed.hash !== ""
+            || entries.length !== 1
+            || entries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY
+            || entries[0][1] !== value.nonce
+            || parsed.toString() !== value.url)
+            return null;
+        return value.nonce;
     }
     catch {
         return null;

@@ -8,14 +8,33 @@ export interface PromotionRendererMountTracker {
     observe(observation: PromotionRendererRootObservation): PromotionRendererMountState;
     result(): PromotionRendererMountState;
 }
+export interface PromotionRendererAuthorizationRequest {
+    version: 1;
+    url: string;
+}
+export interface PromotionRendererAuthorizationResponse {
+    version: 1;
+    nonce: string;
+    url: string;
+}
+export type PromotionRendererAuthorizationAttempt = {
+    kind: "ordinary";
+} | {
+    kind: "invalid-candidate";
+    reason: string;
+} | {
+    kind: "candidate";
+    nonce: string;
+    request: PromotionRendererAuthorizationRequest;
+};
 /**
- * Creates the one renderer-process argument that binds a proof window to its
- * main-generated nonce and exact candidate ASAR URL. Electron exposes argv in
- * sandboxed preloads even though it does not expose process.resourcesPath.
+ * Classifies the current document before page scripts run. Ordinary windows
+ * take the normal preload path. A URL that carries the reserved proof query is
+ * fail-closed unless it is the one exact candidate document shape.
  */
-export declare function promotionRendererBindingArgument(nonce: string, url: string): string;
-/** Accepts only the exact URL/nonce binding supplied to this proof renderer. */
-export declare function promotionRendererNonce(href: string, argv: readonly string[]): string | null;
+export declare function promotionRendererAuthorizationAttempt(href: string): PromotionRendererAuthorizationAttempt;
+/** Accepts only the exact synchronous main-process authorization response. */
+export declare function promotionRendererAuthorizedNonce(attempt: PromotionRendererAuthorizationAttempt, response: unknown): string | null;
 /**
  * Proves the application renderer replaced its static startup loader with real
  * content. A pre-existing non-empty root is insufficient: the tracker must

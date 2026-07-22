@@ -1,8 +1,57 @@
 export type HealthValue = "pass" | "fail" | "unknown";
 export declare const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+export declare const PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 export declare const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 export declare const PROMOTION_RENDERER_SCHEME = "app";
 export declare const PROMOTION_RENDERER_HOST = "-";
+export interface PromotionRendererAuthorizationContext {
+    windowAlive: boolean;
+    senderMatches: boolean;
+    frameMatches: boolean;
+    senderUrl: string;
+    expectedUrl: string;
+    consumed: boolean;
+}
+export type PromotionRendererAuthorizationDecision = {
+    accepted: false;
+    reason: string;
+    response: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    response: {
+        version: 1;
+        nonce: string;
+        url: string;
+    };
+};
+export interface PromotionRendererHandshakeContext {
+    windowAlive: boolean;
+    senderMatches: boolean;
+    frameMatches: boolean;
+    senderUrl: string;
+    expectedUrl: string;
+    authorizationConsumed: boolean;
+    handshakeConsumed: boolean;
+}
+export type PromotionRendererHandshakeDecision = {
+    accepted: false;
+    reason: string;
+    observation: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+        nonce: string;
+        url: string;
+        lifecycle: "renderer-mounted";
+        rendererStorageSelfTest: HealthValue;
+    };
+};
+/** Pure, bounded decision used by the synchronous health-only IPC handler. */
+export declare function authorizePromotionRenderer(context: PromotionRendererAuthorizationContext, payload: unknown, nonce: string): PromotionRendererAuthorizationDecision;
+/** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
+export declare function validatePromotionRendererHandshake(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionRendererHandshakeDecision;
 export interface PromotionRendererProtocolRequest {
     url: string;
 }

@@ -1,6 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_AUTH_CHANNEL = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.authorizePromotionRenderer = authorizePromotionRenderer;
+exports.validatePromotionRendererHandshake = validatePromotionRendererHandshake;
 exports.promotionRendererDocumentUrl = promotionRendererDocumentUrl;
 exports.promotionRendererAssetRoute = promotionRendererAssetRoute;
 exports.promotionRendererAssetMimeType = promotionRendererAssetMimeType;
@@ -16,9 +18,78 @@ const node_crypto_1 = require("node:crypto");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
 exports.PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+exports.PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 exports.PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 exports.PROMOTION_RENDERER_SCHEME = "app";
 exports.PROMOTION_RENDERER_HOST = "-";
+/** Pure, bounded decision used by the synchronous health-only IPC handler. */
+function authorizePromotionRenderer(context, payload, nonce) {
+    if (!context.windowAlive)
+        return { accepted: false, reason: "proof window unavailable", response: null };
+    if (!context.senderMatches)
+        return { accepted: false, reason: "sender mismatch", response: null };
+    if (!context.frameMatches)
+        return { accepted: false, reason: "frame mismatch", response: null };
+    if (context.senderUrl !== context.expectedUrl)
+        return { accepted: false, reason: "sender URL mismatch", response: null };
+    if (context.consumed)
+        return { accepted: false, reason: "authorization already consumed", response: null };
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+        return { accepted: false, reason: "payload invalid", response: null };
+    }
+    const value = payload;
+    if (Object.keys(value).sort().join(",") !== "url,version") {
+        return { accepted: false, reason: "payload keys invalid", response: null };
+    }
+    if (value.version !== 1 || value.url !== context.expectedUrl) {
+        return { accepted: false, reason: "payload binding invalid", response: null };
+    }
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+        return { accepted: false, reason: "nonce invalid", response: null };
+    }
+    return {
+        accepted: true,
+        reason: "accepted",
+        response: { version: 1, nonce, url: context.expectedUrl },
+    };
+}
+/** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
+function validatePromotionRendererHandshake(context, payload, nonce) {
+    if (!context.windowAlive)
+        return { accepted: false, reason: "proof window unavailable", observation: null };
+    if (!context.senderMatches)
+        return { accepted: false, reason: "sender mismatch", observation: null };
+    if (!context.frameMatches)
+        return { accepted: false, reason: "frame mismatch", observation: null };
+    if (context.senderUrl !== context.expectedUrl)
+        return { accepted: false, reason: "sender URL mismatch", observation: null };
+    if (!context.authorizationConsumed)
+        return { accepted: false, reason: "authorization required", observation: null };
+    if (context.handshakeConsumed)
+        return { accepted: false, reason: "handshake already consumed", observation: null };
+    if (!plainRecord(payload))
+        return { accepted: false, reason: "payload invalid", observation: null };
+    if (!exactKeys(payload, ["nonce", "rendererStorageSelfTest", "lifecycle", "url"])) {
+        return { accepted: false, reason: "payload keys invalid", observation: null };
+    }
+    if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mounted") {
+        return { accepted: false, reason: "payload binding invalid", observation: null };
+    }
+    if (!validHealthValue(payload.rendererStorageSelfTest)) {
+        return { accepted: false, reason: "storage result invalid", observation: null };
+    }
+    return {
+        accepted: true,
+        reason: "accepted",
+        observation: {
+            nonce,
+            url: context.expectedUrl,
+            lifecycle: "renderer-mounted",
+            rendererStorageSelfTest: payload.rendererStorageSelfTest,
+        },
+    };
+}
+const PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 /**
  * Selects the real production renderer origin. The health-only main process
  * owns a temporary app:// handler that serves bytes from its candidate ASAR.

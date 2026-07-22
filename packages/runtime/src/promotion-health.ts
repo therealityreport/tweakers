@@ -6,9 +6,113 @@ import { dirname, extname, join } from "node:path";
 export type HealthValue = "pass" | "fail" | "unknown";
 
 export const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+export const PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 export const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 export const PROMOTION_RENDERER_SCHEME = "app";
 export const PROMOTION_RENDERER_HOST = "-";
+
+export interface PromotionRendererAuthorizationContext {
+  windowAlive: boolean;
+  senderMatches: boolean;
+  frameMatches: boolean;
+  senderUrl: string;
+  expectedUrl: string;
+  consumed: boolean;
+}
+
+export type PromotionRendererAuthorizationDecision =
+  | { accepted: false; reason: string; response: null }
+  | { accepted: true; reason: "accepted"; response: { version: 1; nonce: string; url: string } };
+
+export interface PromotionRendererHandshakeContext {
+  windowAlive: boolean;
+  senderMatches: boolean;
+  frameMatches: boolean;
+  senderUrl: string;
+  expectedUrl: string;
+  authorizationConsumed: boolean;
+  handshakeConsumed: boolean;
+}
+
+export type PromotionRendererHandshakeDecision =
+  | { accepted: false; reason: string; observation: null }
+  | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+      nonce: string;
+      url: string;
+      lifecycle: "renderer-mounted";
+      rendererStorageSelfTest: HealthValue;
+    };
+  };
+
+/** Pure, bounded decision used by the synchronous health-only IPC handler. */
+export function authorizePromotionRenderer(
+  context: PromotionRendererAuthorizationContext,
+  payload: unknown,
+  nonce: string,
+): PromotionRendererAuthorizationDecision {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", response: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", response: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", response: null };
+  if (context.consumed) return { accepted: false, reason: "authorization already consumed", response: null };
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return { accepted: false, reason: "payload invalid", response: null };
+  }
+  const value = payload as Record<string, unknown>;
+  if (Object.keys(value).sort().join(",") !== "url,version") {
+    return { accepted: false, reason: "payload keys invalid", response: null };
+  }
+  if (value.version !== 1 || value.url !== context.expectedUrl) {
+    return { accepted: false, reason: "payload binding invalid", response: null };
+  }
+  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+    return { accepted: false, reason: "nonce invalid", response: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url: context.expectedUrl },
+  };
+}
+
+/** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
+export function validatePromotionRendererHandshake(
+  context: PromotionRendererHandshakeContext,
+  payload: unknown,
+  nonce: string,
+): PromotionRendererHandshakeDecision {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererStorageSelfTest", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mounted") {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  if (!validHealthValue(payload.rendererStorageSelfTest)) {
+    return { accepted: false, reason: "storage result invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mounted",
+      rendererStorageSelfTest: payload.rendererStorageSelfTest,
+    },
+  };
+}
+
+const PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface PromotionRendererProtocolRequest {
   url: string;

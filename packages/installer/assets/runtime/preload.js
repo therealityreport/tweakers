@@ -6183,26 +6183,44 @@ function startDesktopUpdateIndicator() {
 
 // src/preload/promotion-renderer-mount.ts
 var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
-var PROMOTION_RENDERER_BINDING_PREFIX = "--tweaker-promotion-renderer-proof=";
 var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-function promotionRendererNonce(href, argv) {
+function promotionRendererAuthorizationAttempt(href) {
   try {
-    const bindings = argv.filter((argument) => argument.startsWith(PROMOTION_RENDERER_BINDING_PREFIX));
-    if (bindings.length !== 1) return null;
-    const encoded = bindings[0].slice(PROMOTION_RENDERER_BINDING_PREFIX.length);
-    if (encoded.length === 0) return null;
-    const decoded = JSON.parse(decodeURIComponent(encoded));
-    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return null;
-    const binding = decoded;
-    if (Object.keys(binding).sort().join(",") !== "nonce,url,version") return null;
-    if (binding.version !== 1 || typeof binding.nonce !== "string" || typeof binding.url !== "string") return null;
-    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(binding.nonce) || binding.url !== href) return null;
-    const parsed = new URL(binding.url);
-    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "") return null;
+    const parsed = new URL(href);
     const queryEntries = [...parsed.searchParams.entries()];
-    if (queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY) return null;
+    const hasReservedQuery = queryEntries.some(([key]) => key === PROMOTION_RENDERER_NONCE_QUERY);
+    if (!hasReservedQuery) return { kind: "ordinary" };
+    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY) return { kind: "invalid-candidate", reason: "candidate URL shape invalid" };
     const nonce = queryEntries[0][1];
-    return nonce === binding.nonce ? nonce : null;
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+      return { kind: "invalid-candidate", reason: "candidate nonce invalid" };
+    }
+    if (parsed.toString() !== href) {
+      return { kind: "invalid-candidate", reason: "candidate URL is not canonical" };
+    }
+    return {
+      kind: "candidate",
+      nonce,
+      request: { version: 1, url: href }
+    };
+  } catch {
+    return { kind: "ordinary" };
+  }
+}
+function promotionRendererAuthorizedNonce(attempt, response) {
+  if (attempt.kind !== "candidate" || response === null || typeof response !== "object" || Array.isArray(response)) {
+    return null;
+  }
+  const value = response;
+  if (Object.keys(value).sort().join(",") !== "nonce,url,version") return null;
+  if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string") return null;
+  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce)) return null;
+  if (value.nonce !== attempt.nonce || value.url !== attempt.request.url) return null;
+  try {
+    const parsed = new URL(value.url);
+    const entries = [...parsed.searchParams.entries()];
+    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || entries.length !== 1 || entries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY || entries[0][1] !== value.nonce || parsed.toString() !== value.url) return null;
+    return value.nonce;
   } catch {
     return null;
   }
@@ -6237,6 +6255,7 @@ var BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 var BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 var BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+var PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 var PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4e3;
 var DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 var DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
@@ -6275,7 +6294,23 @@ function safeStringify2(v) {
   }
 }
 fileLog("preload entry", { url: location.href });
-var promotionNonce = promotionRendererNonce(location.href, process.argv);
+var promotionAttempt = promotionRendererAuthorizationAttempt(location.href);
+var promotionNonce = null;
+if (promotionAttempt.kind === "candidate") {
+  let response = null;
+  let rejectionReason = "main authorization rejected";
+  try {
+    response = import_electron5.ipcRenderer.sendSync(PROMOTION_RENDERER_AUTH_CHANNEL, promotionAttempt.request);
+  } catch {
+    rejectionReason = "synchronous authorization failed";
+  }
+  promotionNonce = promotionRendererAuthorizedNonce(promotionAttempt, response);
+  if (promotionNonce === null) {
+    fileLog("promotion renderer authorization incomplete", { reason: rejectionReason });
+  }
+} else if (promotionAttempt.kind === "invalid-candidate") {
+  fileLog("promotion renderer authorization incomplete", { reason: promotionAttempt.reason });
+}
 try {
   installBrowserUiHostBridge();
   fileLog("browser UI host bridge installed");
@@ -6290,7 +6325,7 @@ try {
 }
 if (promotionNonce) {
   schedulePromotionRendererProof(promotionNonce);
-} else {
+} else if (promotionAttempt.kind === "ordinary") {
   queueMicrotask(() => {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", boot, { once: true });

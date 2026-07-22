@@ -11412,9 +11412,64 @@ var import_node_crypto7 = require("node:crypto");
 var import_node_os2 = require("node:os");
 var import_node_path22 = require("node:path");
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+var PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 var PROMOTION_RENDERER_SCHEME = "app";
 var PROMOTION_RENDERER_HOST = "-";
+function authorizePromotionRenderer(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", response: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", response: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", response: null };
+  if (context.consumed) return { accepted: false, reason: "authorization already consumed", response: null };
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return { accepted: false, reason: "payload invalid", response: null };
+  }
+  const value = payload;
+  if (Object.keys(value).sort().join(",") !== "url,version") {
+    return { accepted: false, reason: "payload keys invalid", response: null };
+  }
+  if (value.version !== 1 || value.url !== context.expectedUrl) {
+    return { accepted: false, reason: "payload binding invalid", response: null };
+  }
+  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+    return { accepted: false, reason: "nonce invalid", response: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url: context.expectedUrl }
+  };
+}
+function validatePromotionRendererHandshake(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererStorageSelfTest", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mounted") {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  if (!validHealthValue(payload.rendererStorageSelfTest)) {
+    return { accepted: false, reason: "storage result invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mounted",
+      rendererStorageSelfTest: payload.rendererStorageSelfTest
+    }
+  };
+}
+var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function promotionRendererDocumentUrl(nonce) {
   const url = new URL(`${PROMOTION_RENDERER_SCHEME}://${PROMOTION_RENDERER_HOST}/index.html`);
   url.searchParams.set(PROMOTION_RENDERER_NONCE_QUERY, nonce);
@@ -11783,22 +11838,6 @@ function exactKeys(value, keys) {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
-}
-
-// src/preload/promotion-renderer-mount.ts
-var PROMOTION_RENDERER_NONCE_QUERY2 = "tweakerPromotionNonce";
-var PROMOTION_RENDERER_BINDING_PREFIX = "--tweaker-promotion-renderer-proof=";
-var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-function promotionRendererBindingArgument(nonce, url) {
-  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) throw new Error("invalid promotion renderer nonce");
-  const parsed = new URL(url);
-  const queryEntries = [...parsed.searchParams.entries()];
-  if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY2 || queryEntries[0][1] !== nonce) throw new Error("invalid promotion renderer URL binding");
-  return `${PROMOTION_RENDERER_BINDING_PREFIX}${encodeURIComponent(JSON.stringify({
-    version: 1,
-    nonce,
-    url: parsed.toString()
-  }))}`;
 }
 
 // src/codex-cli-manager.ts
@@ -14873,7 +14912,6 @@ async function runPromotionRendererProof() {
       skipTaskbar: true,
       webPreferences: {
         preload: PRELOAD_PATH,
-        additionalArguments: [bindingArgument],
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,

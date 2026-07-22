@@ -2,40 +2,47 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createPromotionRendererMountTracker,
-  promotionRendererBindingArgument,
-  promotionRendererNonce,
+  promotionRendererAuthorizationAttempt,
+  promotionRendererAuthorizedNonce,
 } from "../src/preload/promotion-renderer-mount";
 
-test("promotion nonce is bound to the main-created exact renderer argument", () => {
+test("promotion renderer requests authorization only for one exact candidate URL", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
   const exactUrl = `app://-/index.html?tweakerPromotionNonce=${nonce}`;
-  const siblingUrl = `app://-/sibling.html?tweakerPromotionNonce=${nonce}`;
-  const binding = promotionRendererBindingArgument(nonce, exactUrl);
-
-  assert.equal(promotionRendererNonce(exactUrl, ["/candidate/ChatGPT Helper", binding]), nonce);
-  assert.equal(promotionRendererNonce(siblingUrl, ["/candidate/ChatGPT Helper", binding]), null);
-  assert.equal(promotionRendererNonce(exactUrl, ["/candidate/ChatGPT Helper"]), null);
-  assert.equal(promotionRendererNonce(exactUrl, [binding, binding]), null);
-  assert.equal(promotionRendererNonce(exactUrl, ["--tweaker-promotion-renderer-proof=%"]), null);
+  assert.deepEqual(promotionRendererAuthorizationAttempt(exactUrl), {
+    kind: "candidate",
+    nonce,
+    request: { version: 1, url: exactUrl },
+  });
+  assert.deepEqual(promotionRendererAuthorizationAttempt("app://-/index.html"), { kind: "ordinary" });
+  assert.deepEqual(promotionRendererAuthorizationAttempt("https://chatgpt.com/"), { kind: "ordinary" });
 });
 
-test("promotion renderer binding rejects a nonce not bound to its URL", () => {
+test("reserved promotion query fails closed when its URL or nonce is spoofed", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
-  const otherNonce = "123e4567-e89b-42d3-a456-426614174001";
-  const url = `app://-/index.html?tweakerPromotionNonce=${nonce}`;
+  for (const url of [
+    "app://-/index.html?tweakerPromotionNonce=spoof",
+    `app://other/index.html?tweakerPromotionNonce=${nonce}`,
+    `app://-/sibling.html?tweakerPromotionNonce=${nonce}`,
+    `file:///candidate/index.html?tweakerPromotionNonce=${nonce}`,
+    `app://-/index.html?tweakerPromotionNonce=${nonce}&other=1`,
+    `app://-/index.html?tweakerPromotionNonce=${nonce}#fragment`,
+  ]) {
+    assert.equal(promotionRendererAuthorizationAttempt(url).kind, "invalid-candidate", url);
+  }
+});
 
-  assert.throws(
-    () => promotionRendererBindingArgument(otherNonce, url),
-    /invalid promotion renderer URL binding/,
-  );
-  assert.throws(
-    () => promotionRendererBindingArgument(nonce, `app://other/index.html?tweakerPromotionNonce=${nonce}`),
-    /invalid promotion renderer URL binding/,
-  );
-  assert.throws(
-    () => promotionRendererBindingArgument(nonce, `file:///candidate/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`),
-    /invalid promotion renderer URL binding/,
-  );
+test("promotion authorization response must exactly bind version, nonce, URL, and keys", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = `app://-/index.html?tweakerPromotionNonce=${nonce}`;
+  const attempt = promotionRendererAuthorizationAttempt(url);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, { version: 1, nonce, url }), nonce);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, null), null);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, { version: 2, nonce, url }), null);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, { version: 1, nonce: "123e4567-e89b-42d3-a456-426614174001", url }), null);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, { version: 1, nonce, url: `${url}&spoof=1` }), null);
+  assert.equal(promotionRendererAuthorizedNonce(attempt, { version: 1, nonce, url, extra: true }), null);
+  assert.equal(promotionRendererAuthorizedNonce({ kind: "ordinary" }, { version: 1, nonce, url }), null);
 });
 
 test("promotion renderer mount proves startup loader replacement with real content", () => {
