@@ -415,17 +415,14 @@ export function spawnHiddenHealthProbe(
     spawn?: typeof spawnSync;
     /** Exact contained Codex home for a disposable candidate; omitted for a real post-promotion probe. */
     candidateCodexHome?: string;
+    /** Internal seam for proving that ambient authentication data is excluded. */
+    environment?: NodeJS.ProcessEnv;
     platform?: NodeJS.Platform;
   } = {},
 ): ReturnType<typeof spawnSync> {
   const spawn = deps.spawn ?? spawnSync;
   const platform = deps.platform ?? process.platform;
-  const candidateEnvironment = deps.candidateCodexHome
-    ? {
-      TWEAKERS_CANDIDATE_MCP_RECONCILIATION: "1",
-      CODEX_HOME: deps.candidateCodexHome,
-    }
-    : {};
+  const tempRoot = prepareHealthProbeTempDirectory(userRoot);
   // The disposable probe must never attach to the real Electron profile: the
   // owl fork resolves userData natively at startup, so a probe launched while
   // the same-productName app is running hits Chromium's process singleton and
@@ -440,13 +437,13 @@ export function spawnHiddenHealthProbe(
     ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
   ];
   return spawn(executable, chromiumArgs, {
-    env: {
-      ...process.env,
-      TWEAKERS_HEALTH_CHECK_ONLY: "1",
-      TWEAKERS_HEALTH_USER_ROOT: userRoot,
-      TWEAKERS_HEALTH_BACKGROUND: "1",
-      ...candidateEnvironment,
-    },
+    env: healthProbeEnvironment(
+      userRoot,
+      tempRoot,
+      deps.candidateCodexHome,
+      platform,
+      deps.environment ?? process.env,
+    ),
     stdio: "ignore",
     timeout: 15_000,
   });

@@ -11411,7 +11411,22 @@ var import_node_fs19 = require("node:fs");
 var import_node_crypto7 = require("node:crypto");
 var import_node_os2 = require("node:os");
 var import_node_path22 = require("node:path");
+var import_node_url = require("node:url");
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+function promotionRendererDocumentUrl(resourcesPath, nonce) {
+  const url = (0, import_node_url.pathToFileURL)((0, import_node_path22.join)(resourcesPath, "app.asar", "webview", "index.html"));
+  url.searchParams.set(PROMOTION_RENDERER_NONCE_QUERY, nonce);
+  return url.toString();
+}
+function promotionRendererLoadRejection(error, requestedUrl) {
+  const value = error !== null && typeof error === "object" ? error : null;
+  return {
+    errorCode: typeof value?.errno === "number" ? value.errno : -2,
+    errorDescription: error instanceof Error ? error.message : String(error),
+    url: typeof value?.url === "string" && value.url.length > 0 ? value.url : requestedUrl
+  };
+}
 function createPromotionRendererProofTracker(expected) {
   let expectedWebContentsId = null;
   let windowCreated = false;
@@ -11677,6 +11692,22 @@ function exactKeys(value, keys) {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+// src/preload/promotion-renderer-mount.ts
+var PROMOTION_RENDERER_NONCE_QUERY2 = "tweakerPromotionNonce";
+var PROMOTION_RENDERER_BINDING_PREFIX = "--tweaker-promotion-renderer-proof=";
+var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function promotionRendererBindingArgument(nonce, url) {
+  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) throw new Error("invalid promotion renderer nonce");
+  const parsed = new URL(url);
+  const queryEntries = [...parsed.searchParams.entries()];
+  if (parsed.protocol !== "file:" || parsed.hash !== "" || queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY2 || queryEntries[0][1] !== nonce) throw new Error("invalid promotion renderer URL binding");
+  return `${PROMOTION_RENDERER_BINDING_PREFIX}${encodeURIComponent(JSON.stringify({
+    version: 1,
+    nonce,
+    url: parsed.toString()
+  }))}`;
 }
 
 // src/codex-cli-manager.ts
@@ -14738,6 +14769,7 @@ async function runPromotionRendererProof() {
       skipTaskbar: true,
       webPreferences: {
         preload: PRELOAD_PATH,
+        additionalArguments: [bindingArgument],
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,

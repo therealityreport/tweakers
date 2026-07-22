@@ -90,12 +90,15 @@ import {
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_RENDERER_IPC_CHANNEL,
+  promotionRendererDocumentUrl,
+  promotionRendererLoadRejection,
   readCodexAuth,
   type HealthValue,
   type PromotionRendererProofResult,
   type PromotionSurfaceName,
   type UserQuestionsHealthObservation,
 } from "./promotion-health";
+import { promotionRendererBindingArgument } from "./preload/promotion-renderer-mount";
 import {
   applyManagedCodexCliLaneAtBootstrap,
   createCodexCliManager,
@@ -1797,6 +1800,7 @@ async function runPromotionRendererProof(): Promise<PromotionRendererProofResult
       skipTaskbar: true,
       webPreferences: {
         preload: PRELOAD_PATH,
+        additionalArguments: [bindingArgument],
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,

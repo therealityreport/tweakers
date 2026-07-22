@@ -1,6 +1,11 @@
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  findGeneratedConflictCopies,
+  publishGeneratedDirectorySync,
+  removeGeneratedConflictCopies,
+} from "./generated-assets.mjs";
 
 const MANIFEST_FIELDS = ["id", "name", "version", "githubRepo", "description", "author", "homepage", "iconUrl", "tags", "scope", "main", "minRuntime", "permissions", "mcp", "mcpServer"];
 
@@ -50,29 +55,77 @@ export function synchronizedCatalog(root, catalog, now = new Date().toISOString(
   return { ...catalog, entries: [...nonBundled, ...bundled].sort((a, b) => a.id.localeCompare(b.id)) };
 }
 
-export function syncTweaks(root, { check = false, now } = {}) {
+export function syncTweaks(root, {
+  check = false,
+  now,
+  packagedRuntimeRoot,
+  deferCatalogWrite = false,
+  publicationDependencies,
+} = {}) {
   const catalogPath = join(root, "store", "index.json");
   const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
   const nextCatalog = synchronizedCatalog(root, catalog, now);
   const serialized = JSON.stringify(nextCatalog, null, 2) + "\n";
-  const packagedRoot = join(root, "packages", "installer", "assets", "runtime", "tweaks");
+  const canonicalRuntimeRoot = join(root, "packages", "installer", "assets", "runtime");
+  const runtimeRoot = packagedRuntimeRoot ? resolve(packagedRuntimeRoot) : canonicalRuntimeRoot;
+  const packagedRoot = join(runtimeRoot, "tweaks");
+  const generatedCatalogPath = join(runtimeRoot, "catalog.json");
   const expected = discoverCanonicalTweaks(root);
   const staleCatalog = readFileSync(catalogPath, "utf8") !== serialized;
   const stalePackage = !packageMatches(expected, packagedRoot);
+  const staleGeneratedCatalog = !existsSync(generatedCatalogPath) || readFileSync(generatedCatalogPath, "utf8") !== serialized;
+  const staleConflicts = findGeneratedConflictCopies(runtimeRoot).length > 0;
+  let cleanupErrors = [];
   if (check) {
-    if (staleCatalog || stalePackage) throw new Error(`tweak synchronization is stale:${staleCatalog ? " catalog" : ""}${stalePackage ? " packaged-assets" : ""}`);
+    if (staleCatalog || stalePackage || staleGeneratedCatalog || staleConflicts) {
+      throw new Error(`tweak synchronization is stale:${staleCatalog ? " catalog" : ""}${stalePackage || staleGeneratedCatalog || staleConflicts ? " packaged-assets" : ""}`);
+    }
     return { changed: false, count: expected.length };
   }
-  if (staleCatalog) writeFileSync(catalogPath, serialized, "utf8");
-  rmSync(packagedRoot, { recursive: true, force: true });
-  mkdirSync(packagedRoot, { recursive: true });
-  for (const tweak of expected) cpSync(tweak.sourceDir, join(packagedRoot, tweak.folder), {
-    recursive: true,
-    verbatimSymlinks: true,
-    filter: (path) => !path.split(/[\\/]/).some((part) => [".git", "node_modules", "test", "tests"].includes(part)),
-  });
-  writeFileSync(join(root, "packages", "installer", "assets", "runtime", "catalog.json"), serialized, "utf8");
-  return { changed: staleCatalog || stalePackage, count: expected.length };
+
+  const writePackagedOutput = (outputRuntimeRoot) => {
+    removeGeneratedConflictCopies(outputRuntimeRoot);
+    const outputTweaksRoot = join(outputRuntimeRoot, "tweaks");
+    rmSync(outputTweaksRoot, { recursive: true, force: true });
+    mkdirSync(outputTweaksRoot, { recursive: true });
+    for (const tweak of expected) cpSync(tweak.sourceDir, join(outputTweaksRoot, tweak.folder), {
+      recursive: true,
+      verbatimSymlinks: true,
+      filter: (path) => !path.split(/[\\/]/).some((part) => [".git", "node_modules", "test", "tests"].includes(part)),
+    });
+    writeFileSync(join(outputRuntimeRoot, "catalog.json"), serialized, "utf8");
+  };
+
+  if (packagedRuntimeRoot) {
+    mkdirSync(runtimeRoot, { recursive: true });
+    writePackagedOutput(runtimeRoot);
+  } else if (staleCatalog || stalePackage || staleGeneratedCatalog || staleConflicts) {
+    const publication = publishGeneratedDirectorySync(runtimeRoot, (stagedRuntimeRoot) => {
+      if (existsSync(runtimeRoot)) cpSync(runtimeRoot, stagedRuntimeRoot, {
+        recursive: true,
+        verbatimSymlinks: true,
+        preserveTimestamps: true,
+      });
+      else mkdirSync(stagedRuntimeRoot, { recursive: true });
+      writePackagedOutput(stagedRuntimeRoot);
+    }, {
+      ...publicationDependencies,
+      companionFiles: staleCatalog
+        ? [{ destination: catalogPath, data: serialized }]
+        : [],
+    });
+    cleanupErrors = publication.cleanupErrors;
+  }
+
+  if (staleCatalog && !deferCatalogWrite && packagedRuntimeRoot) {
+    writeFileSync(catalogPath, serialized, "utf8");
+  }
+  return {
+    changed: staleCatalog || stalePackage || staleGeneratedCatalog || staleConflicts,
+    count: expected.length,
+    pendingCatalog: staleCatalog && deferCatalogWrite ? { path: catalogPath, serialized } : null,
+    cleanupErrors,
+  };
 }
 
 function pickManifest(manifest) {

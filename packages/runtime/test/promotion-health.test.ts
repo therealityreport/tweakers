@@ -9,8 +9,19 @@ import {
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_SURFACE_NAMES,
+  promotionRendererDocumentUrl,
+  promotionRendererLoadRejection,
   readCodexAuth,
 } from "../src/promotion-health";
+
+test("promotion renderer URL selects the exact candidate ASAR document", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+
+  assert.equal(
+    promotionRendererDocumentUrl("/private/tmp/Candidate App.app/Contents/Resources", nonce),
+    `file:///private/tmp/Candidate%20App.app/Contents/Resources/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`,
+  );
+});
 
 test("promotion renderer proof stays unknown when no BrowserWindow exists", () => {
   const tracker = createPromotionRendererProofTracker({
@@ -43,6 +54,30 @@ test("promotion renderer proof permanently fails after did-fail-load including E
     lifecycle: "renderer-mounted",
     rendererStorageSelfTest: "pass",
   });
+
+  assert.deepEqual(tracker.result(), {
+    hostReady: "fail",
+    rendererStorageSelfTest: "fail",
+  });
+});
+
+test("a rejected renderer load retains its requested URL and permanently fails the proof", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = promotionRendererDocumentUrl("/candidate/ChatGPT.app/Contents/Resources", nonce);
+  const tracker = createPromotionRendererProofTracker({
+    nonce,
+    url,
+    preloadPath: "/candidate/runtime/preload.js",
+  });
+  tracker.windowCreated({ webContentsId: 45, url, preloadPath: "/candidate/runtime/preload.js" });
+
+  const rejection = promotionRendererLoadRejection(new Error("ERR_FAILED (-2) loading renderer"), url);
+  assert.deepEqual(rejection, {
+    errorCode: -2,
+    errorDescription: "ERR_FAILED (-2) loading renderer",
+    url,
+  });
+  tracker.didFailLoad({ webContentsId: 45, ...rejection });
 
   assert.deepEqual(tracker.result(), {
     hostReady: "fail",

@@ -2,10 +2,38 @@ import { chmodSync, lstatSync, mkdirSync, openSync, closeSync, fsyncSync, readFi
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 export type HealthValue = "pass" | "fail" | "unknown";
 
 export const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+export const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+
+/**
+ * Selects the real renderer entry from the candidate's own ASAR. The one-shot
+ * health process deliberately skips Codex's normal bootstrap, so its app://
+ * protocol is not registered. Electron's ASAR-aware file loader still resolves
+ * the renderer's relative assets from this exact packaged document.
+ */
+export function promotionRendererDocumentUrl(resourcesPath: string, nonce: string): string {
+  const url = pathToFileURL(join(resourcesPath, "app.asar", "webview", "index.html"));
+  url.searchParams.set(PROMOTION_RENDERER_NONCE_QUERY, nonce);
+  return url.toString();
+}
+
+export function promotionRendererLoadRejection(
+  error: unknown,
+  requestedUrl: string,
+): { errorCode: number; errorDescription: string; url: string } {
+  const value = error !== null && typeof error === "object"
+    ? error as { errno?: unknown; url?: unknown }
+    : null;
+  return {
+    errorCode: typeof value?.errno === "number" ? value.errno : -2,
+    errorDescription: error instanceof Error ? error.message : String(error),
+    url: typeof value?.url === "string" && value.url.length > 0 ? value.url : requestedUrl,
+  };
+}
 
 export interface PromotionRendererProofResult {
   hostReady: HealthValue;

@@ -27,7 +27,6 @@ const BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 const BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 const BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
-const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4_000;
 
 const DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
@@ -77,7 +76,7 @@ function safeStringify(v: unknown): string {
 
 fileLog("preload entry", { url: location.href });
 
-const promotionNonce = promotionRendererNonce(location.href);
+const promotionNonce = promotionRendererNonce(location.href, process.argv);
 try {
   installBrowserUiHostBridge();
   fileLog("browser UI host bridge installed");
@@ -103,19 +102,6 @@ if (promotionNonce) {
       boot();
     }
   });
-}
-
-function promotionRendererNonce(href: string): string | null {
-  try {
-    const parsed = new URL(href);
-    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.pathname !== "/index.html") return null;
-    const nonce = parsed.searchParams.get(PROMOTION_RENDERER_NONCE_QUERY);
-    return nonce && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(nonce)
-      ? nonce
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function schedulePromotionRendererProof(nonce: string): void {

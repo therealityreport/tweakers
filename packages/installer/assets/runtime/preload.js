@@ -6182,6 +6182,31 @@ function startDesktopUpdateIndicator() {
 }
 
 // src/preload/promotion-renderer-mount.ts
+var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+var PROMOTION_RENDERER_BINDING_PREFIX = "--tweaker-promotion-renderer-proof=";
+var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function promotionRendererNonce(href, argv) {
+  try {
+    const bindings = argv.filter((argument) => argument.startsWith(PROMOTION_RENDERER_BINDING_PREFIX));
+    if (bindings.length !== 1) return null;
+    const encoded = bindings[0].slice(PROMOTION_RENDERER_BINDING_PREFIX.length);
+    if (encoded.length === 0) return null;
+    const decoded = JSON.parse(decodeURIComponent(encoded));
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return null;
+    const binding = decoded;
+    if (Object.keys(binding).sort().join(",") !== "nonce,url,version") return null;
+    if (binding.version !== 1 || typeof binding.nonce !== "string" || typeof binding.url !== "string") return null;
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(binding.nonce) || binding.url !== href) return null;
+    const parsed = new URL(binding.url);
+    if (parsed.protocol !== "file:" || parsed.hash !== "") return null;
+    const queryEntries = [...parsed.searchParams.entries()];
+    if (queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY) return null;
+    const nonce = queryEntries[0][1];
+    return nonce === binding.nonce ? nonce : null;
+  } catch {
+    return null;
+  }
+}
 function createPromotionRendererMountTracker() {
   let sawStartupLoader = false;
   let mounted = false;
@@ -6212,7 +6237,6 @@ var BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 var BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 var BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
-var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 var PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4e3;
 var DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 var DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
@@ -6251,7 +6275,7 @@ function safeStringify2(v) {
   }
 }
 fileLog("preload entry", { url: location.href });
-var promotionNonce = promotionRendererNonce(location.href);
+var promotionNonce = promotionRendererNonce(location.href, process.argv);
 try {
   installBrowserUiHostBridge();
   fileLog("browser UI host bridge installed");
@@ -6274,16 +6298,6 @@ if (promotionNonce) {
       boot();
     }
   });
-}
-function promotionRendererNonce(href) {
-  try {
-    const parsed = new URL(href);
-    if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.pathname !== "/index.html") return null;
-    const nonce = parsed.searchParams.get(PROMOTION_RENDERER_NONCE_QUERY);
-    return nonce && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(nonce) ? nonce : null;
-  } catch {
-    return null;
-  }
 }
 function schedulePromotionRendererProof(nonce) {
   const mount = createPromotionRendererMountTracker();

@@ -120,17 +120,23 @@ test("candidate authentication proof is private, contained, and removed after th
 
 test("candidate health process receives only the contained Codex home opt-in", () => {
   let observed: SpawnSyncOptions | null = null;
-  const candidateCodexHome = "/private/tmp/tweakers-candidate/codex-home";
+  const userRoot = mkdtempSync(join(tmpdir(), "tweakers-candidate-launch-"));
+  const candidateCodexHome = join(userRoot, "codex-home");
   const fakeSpawn = ((_command: string, _args: readonly string[], options: SpawnSyncOptions) => {
     observed = options;
     return { status: 0 } as ReturnType<typeof spawnSync>;
   }) as typeof spawnSync;
-  spawnHiddenHealthProbe("/private/tmp/Codex", "/private/tmp/tweakers-candidate", {
-    candidateCodexHome,
-    spawn: fakeSpawn,
-  });
-  assert.equal(observed?.env?.TWEAKERS_CANDIDATE_MCP_RECONCILIATION, "1");
-  assert.equal(observed?.env?.CODEX_HOME, candidateCodexHome);
+  try {
+    spawnHiddenHealthProbe("/private/tmp/Codex", userRoot, {
+      candidateCodexHome,
+      spawn: fakeSpawn,
+    });
+    assert.equal(observed?.env?.TWEAKERS_CANDIDATE_MCP_RECONCILIATION, "1");
+    assert.equal(observed?.env?.CODEX_HOME, candidateCodexHome);
+    assert.equal(observed?.env?.TMPDIR, join(userRoot, "health", "tmp"));
+  } finally {
+    rmSync(userRoot, { recursive: true, force: true });
+  }
 });
 
 test("candidate ASAR validation proves the original bootstrap and real main renderer", async () => {

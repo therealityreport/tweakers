@@ -98,15 +98,19 @@ test("copy-assets never deletes a committed generated asset when its source is m
   // deleting the destination before the source check would silently strip the
   // checked-in fallback from the working tree.
   const source = readFileSync(new URL("../scripts/copy-assets.mjs", import.meta.url), "utf8");
-  const skip = source.indexOf("if (!existsSync(src))");
-  const remove = source.indexOf("rmSync(dest");
-  assert.ok(skip >= 0, "copy-assets must check the source before copying");
-  assert.ok(remove > skip, "the missing-source skip must run before rmSync(dest)");
+  const availability = source.indexOf("const runtimeAvailable = existsSync(runtimeSource)");
+  const skip = source.indexOf("if (runtimeAvailable)");
+  const stagedRemoval = source.indexOf("rmSync(stagedRuntime");
+  const reconcile = source.indexOf("publishGeneratedDirectorySync(out");
+  assert.ok(availability >= 0 && skip > availability, "copy-assets must check the runtime source before copying");
+  assert.ok(stagedRemoval > skip, "runtime replacement must occur only in staging after the source check");
+  assert.ok(reconcile >= 0, "assets must use content-aware publication");
+  assert.doesNotMatch(source, /rmSync\(runtimeDestination/);
 });
 
 test("copy-assets prunes the retired standalone switcher instead of packaging it", () => {
   const source = readFileSync(new URL("../scripts/copy-assets.mjs", import.meta.url), "utf8");
-  assert.match(source, /rmSync\(resolve\(out, "switcher"\), \{ recursive: true, force: true \}\)/);
+  assert.match(source, /rmSync\(resolve\(stagedAssets, "switcher"\), \{ recursive: true, force: true \}\)/);
   assert.doesNotMatch(source, /packages\/switcher\/dist/);
 });
 

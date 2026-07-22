@@ -1,5 +1,18 @@
 export type HealthValue = "pass" | "fail" | "unknown";
 export declare const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+export declare const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+/**
+ * Selects the real renderer entry from the candidate's own ASAR. The one-shot
+ * health process deliberately skips Codex's normal bootstrap, so its app://
+ * protocol is not registered. Electron's ASAR-aware file loader still resolves
+ * the renderer's relative assets from this exact packaged document.
+ */
+export declare function promotionRendererDocumentUrl(resourcesPath: string, nonce: string): string;
+export declare function promotionRendererLoadRejection(error: unknown, requestedUrl: string): {
+    errorCode: number;
+    errorDescription: string;
+    url: string;
+};
 export interface PromotionRendererProofResult {
     hostReady: HealthValue;
     rendererStorageSelfTest: HealthValue;

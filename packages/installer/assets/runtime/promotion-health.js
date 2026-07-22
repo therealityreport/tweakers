@@ -1,6 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.promotionRendererDocumentUrl = promotionRendererDocumentUrl;
+exports.promotionRendererLoadRejection = promotionRendererLoadRejection;
 exports.createPromotionRendererProofTracker = createPromotionRendererProofTracker;
 exports.hasAuthenticatedSessionCookie = hasAuthenticatedSessionCookie;
 exports.hasAuthenticatedCodexToken = hasAuthenticatedCodexToken;
@@ -10,7 +12,30 @@ const node_fs_1 = require("node:fs");
 const node_crypto_1 = require("node:crypto");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
+const node_url_1 = require("node:url");
 exports.PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+exports.PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+/**
+ * Selects the real renderer entry from the candidate's own ASAR. The one-shot
+ * health process deliberately skips Codex's normal bootstrap, so its app://
+ * protocol is not registered. Electron's ASAR-aware file loader still resolves
+ * the renderer's relative assets from this exact packaged document.
+ */
+function promotionRendererDocumentUrl(resourcesPath, nonce) {
+    const url = (0, node_url_1.pathToFileURL)((0, node_path_1.join)(resourcesPath, "app.asar", "webview", "index.html"));
+    url.searchParams.set(exports.PROMOTION_RENDERER_NONCE_QUERY, nonce);
+    return url.toString();
+}
+function promotionRendererLoadRejection(error, requestedUrl) {
+    const value = error !== null && typeof error === "object"
+        ? error
+        : null;
+    return {
+        errorCode: typeof value?.errno === "number" ? value.errno : -2,
+        errorDescription: error instanceof Error ? error.message : String(error),
+        url: typeof value?.url === "string" && value.url.length > 0 ? value.url : requestedUrl,
+    };
+}
 /**
  * Tracks the candidate's real renderer without importing Electron into tests.
  * Every positive signal is bound to one nonce, URL, preload, and webContents.

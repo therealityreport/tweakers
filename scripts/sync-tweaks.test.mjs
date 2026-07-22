@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -42,6 +42,85 @@ test("manifest folders synchronize catalog and packaged assets deterministically
     assert.equal(alpha.manifest.version, "0.2.0");
     assert.deepEqual(alpha.manifest.mcp, { command: "node", args: ["mcp-server.js"] });
     assert.doesNotThrow(() => syncTweaks(root, { check: true }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("sync:tweaks reconciles exact generated content without replacing unchanged runtime paths", () => {
+  const root = fixture();
+  const runtime = join(root, "packages", "installer", "assets", "runtime");
+  try {
+    writeTweak(root, "alpha", "com.example.alpha");
+    writeFileSync(join(root, "store", "index.json"), `${JSON.stringify({ schemaVersion: 1, entries: [] }, null, 2)}\n`);
+    writeFileSync(join(runtime, "main.js"), "preserved runtime\n");
+    writeFileSync(join(runtime, "main 2.js"), "FileProvider conflict\n");
+    writeFileSync(join(runtime, "main 10.js"), "multi-digit FileProvider conflict\n");
+    writeFileSync(join(root, "packages", "installer", "assets", "outside.js"), "outside canonical\n");
+    writeFileSync(join(root, "packages", "installer", "assets", "outside 2.js"), "outside conflict\n");
+    mkdirSync(join(runtime, "tweaks", "stale"), { recursive: true });
+    writeFileSync(join(runtime, "tweaks", "stale", "index.js"), "stale bundled tweak\n");
+    const originalRuntimeInode = statSync(runtime).ino;
+    const originalMainInode = statSync(join(runtime, "main.js")).ino;
+
+    assert.throws(() => syncTweaks(root, { check: true }), /packaged-assets/);
+    const result = syncTweaks(root, { now: "2026-07-12T00:00:00.000Z" });
+    assert.equal(result.changed, true);
+    assert.equal(readFileSync(join(runtime, "main.js"), "utf8"), "preserved runtime\n");
+    assert.equal(existsSync(join(runtime, "main 2.js")), false);
+    assert.equal(existsSync(join(runtime, "main 10.js")), false);
+    assert.equal(readFileSync(join(root, "packages", "installer", "assets", "outside 2.js"), "utf8"), "outside conflict\n");
+    assert.equal(existsSync(join(runtime, "tweaks", "stale")), false);
+    assert.equal(existsSync(join(runtime, "tweaks", "alpha", "index.js")), true);
+    assert.equal(statSync(runtime).ino, originalRuntimeInode);
+    assert.equal(statSync(join(runtime, "main.js")).ino, originalMainInode);
+    assert.doesNotThrow(() => syncTweaks(root, { check: true }));
+
+    const stableTweaksInode = statSync(join(runtime, "tweaks")).ino;
+    const stableAlphaInode = statSync(join(runtime, "tweaks", "alpha")).ino;
+    const oldIndexInode = statSync(join(runtime, "tweaks", "alpha", "index.js")).ino;
+    assert.equal(syncTweaks(root).changed, false);
+    assert.equal(statSync(runtime).ino, originalRuntimeInode);
+    assert.equal(statSync(join(runtime, "main.js")).ino, originalMainInode);
+    assert.equal(statSync(join(runtime, "tweaks")).ino, stableTweaksInode);
+    assert.equal(statSync(join(runtime, "tweaks", "alpha")).ino, stableAlphaInode);
+    assert.equal(statSync(join(runtime, "tweaks", "alpha", "index.js")).ino, oldIndexInode);
+
+    writeFileSync(join(root, "tweaks", "alpha", "index.js"), "module.exports = { changed: true };\n");
+    assert.equal(syncTweaks(root).changed, true);
+    assert.equal(statSync(runtime).ino, originalRuntimeInode);
+    assert.equal(statSync(join(runtime, "main.js")).ino, originalMainInode);
+    assert.equal(statSync(join(runtime, "tweaks")).ino, stableTweaksInode);
+    assert.equal(statSync(join(runtime, "tweaks", "alpha")).ino, stableAlphaInode);
+    assert.notEqual(statSync(join(runtime, "tweaks", "alpha", "index.js")).ino, oldIndexInode);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("sync:tweaks rolls generated output and the canonical catalog back as one transaction", () => {
+  const root = fixture();
+  const runtime = join(root, "packages", "installer", "assets", "runtime");
+  const catalogPath = join(root, "store", "index.json");
+  try {
+    writeTweak(root, "alpha", "com.example.alpha");
+    writeFileSync(catalogPath, `${JSON.stringify({ schemaVersion: 1, entries: [] }, null, 2)}\n`);
+    writeFileSync(join(runtime, "main.js"), "prior runtime\n");
+    mkdirSync(join(runtime, "tweaks", "stale"), { recursive: true });
+    writeFileSync(join(runtime, "tweaks", "stale", "index.js"), "prior stale\n");
+    const priorCatalog = [readFileSync(catalogPath, "utf8"), statSync(catalogPath).mode & 0o777, statSync(catalogPath).ino];
+    const priorMainInode = statSync(join(runtime, "main.js")).ino;
+
+    assert.throws(() => syncTweaks(root, {
+      publicationDependencies: {
+        afterMutation: ({ operation }) => {
+          if (operation === "replace-companion") throw new Error("simulated direct catalog failure");
+        },
+      },
+    }), /simulated direct catalog failure/);
+
+    assert.deepEqual([readFileSync(catalogPath, "utf8"), statSync(catalogPath).mode & 0o777, statSync(catalogPath).ino], priorCatalog);
+    assert.equal(readFileSync(join(runtime, "main.js"), "utf8"), "prior runtime\n");
+    assert.equal(statSync(join(runtime, "main.js")).ino, priorMainInode);
+    assert.equal(readFileSync(join(runtime, "tweaks", "stale", "index.js"), "utf8"), "prior stale\n");
+    assert.equal(existsSync(join(runtime, "tweaks", "alpha")), false);
+    assert.equal(existsSync(join(runtime, "catalog.json")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
