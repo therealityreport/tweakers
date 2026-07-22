@@ -25,7 +25,12 @@ export function promotionRendererBindingArgument(nonce: string, url: string): st
   const parsed = new URL(url);
   const queryEntries = [...parsed.searchParams.entries()];
   if (
-    parsed.protocol !== "file:"
+    parsed.protocol !== "app:"
+    || parsed.hostname !== "-"
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.port !== ""
+    || parsed.pathname !== "/index.html"
     || parsed.hash !== ""
     || queryEntries.length !== 1
     || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY
@@ -53,7 +58,15 @@ export function promotionRendererNonce(href: string, argv: readonly string[]): s
     if (!PROMOTION_RENDERER_NONCE_PATTERN.test(binding.nonce) || binding.url !== href) return null;
 
     const parsed = new URL(binding.url);
-    if (parsed.protocol !== "file:" || parsed.hash !== "") return null;
+    if (
+      parsed.protocol !== "app:"
+      || parsed.hostname !== "-"
+      || parsed.username !== ""
+      || parsed.password !== ""
+      || parsed.port !== ""
+      || parsed.pathname !== "/index.html"
+      || parsed.hash !== ""
+    ) return null;
     const queryEntries = [...parsed.searchParams.entries()];
     if (queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY) return null;
     const nonce = queryEntries[0][1];

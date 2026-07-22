@@ -5,22 +5,89 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   answerPromotionHealthRequest,
+  createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_SURFACE_NAMES,
+  promotionRendererAssetMimeType,
+  promotionRendererAssetRoute,
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
 } from "../src/promotion-health";
 
-test("promotion renderer URL selects the exact candidate ASAR document", () => {
+test("promotion renderer URL selects the exact production origin document", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
 
   assert.equal(
-    promotionRendererDocumentUrl("/private/tmp/Candidate App.app/Contents/Resources", nonce),
-    `file:///private/tmp/Candidate%20App.app/Contents/Resources/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`,
+    promotionRendererDocumentUrl(nonce),
+    `app://-/index.html?tweakerPromotionNonce=${nonce}`,
   );
+});
+
+test("promotion renderer routes decode once and stay below the webview root", () => {
+  assert.equal(promotionRendererAssetRoute("app://-/index.html?cache=1"), "index.html");
+  assert.equal(promotionRendererAssetRoute("app://-/assets/main%20bundle.js"), "assets/main bundle.js");
+
+  for (const url of [
+    "https://-/index.html",
+    "app://other/index.html",
+    "app://user@-/index.html",
+    "app://-:99/index.html",
+    "app://-/index.html#fragment",
+    "app://-//index.html",
+    "app://-/../outside.js",
+    "app://-/%2e%2e/outside.js",
+    "app://-/%252e%252e/outside.js",
+    "app://-/assets/%2e%2e/outside.js",
+    "app://-/assets/%252e%252e/outside.js",
+    "app://-/assets\\outside.js",
+    "app://-/assets/%5coutside.js",
+    "app://-/assets/%255coutside.js",
+    "app://-/assets/%00outside.js",
+    "app://-/assets/%2500outside.js",
+  ]) {
+    assert.equal(promotionRendererAssetRoute(url), null, url);
+  }
+});
+
+test("promotion renderer responder serves ASAR-aware bytes with explicit MIME and 404s", async () => {
+  const reads: string[] = [];
+  const responder = createPromotionRendererProtocolResponder(
+    "/candidate/ChatGPT.app/Contents/Resources/app.asar/webview",
+    (path) => {
+      reads.push(path);
+      if (path.endsWith("missing.js")) throw new Error("ENOENT");
+      return Buffer.from(path.endsWith("index.html") ? "<!doctype html>" : "console.log('ok')");
+    },
+  );
+
+  const html = responder({ url: "app://-/index.html?tweakerPromotionNonce=nonce" });
+  assert.equal(html.status, 200);
+  assert.equal(html.headers.get("content-type"), "text/html; charset=utf-8");
+  assert.equal(await html.text(), "<!doctype html>");
+  assert.equal(
+    reads[0],
+    "/candidate/ChatGPT.app/Contents/Resources/app.asar/webview/index.html",
+  );
+
+  const script = responder({ url: "app://-/assets/main.js" });
+  assert.equal(script.status, 200);
+  assert.equal(script.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.equal(await script.text(), "console.log('ok')");
+  assert.equal(responder({ url: "app://-/assets/missing.js" }).status, 404);
+  assert.equal(responder({ url: "app://-/%252e%252e/secret" }).status, 404);
+});
+
+test("promotion renderer MIME table covers document, code, and common assets", () => {
+  assert.equal(promotionRendererAssetMimeType("index.html"), "text/html; charset=utf-8");
+  assert.equal(promotionRendererAssetMimeType("main.js"), "text/javascript; charset=utf-8");
+  assert.equal(promotionRendererAssetMimeType("main.css"), "text/css; charset=utf-8");
+  assert.equal(promotionRendererAssetMimeType("font.woff2"), "font/woff2");
+  assert.equal(promotionRendererAssetMimeType("image.png"), "image/png");
+  assert.equal(promotionRendererAssetMimeType("module.wasm"), "application/wasm");
+  assert.equal(promotionRendererAssetMimeType("asset.bin"), "application/octet-stream");
 });
 
 test("promotion renderer proof stays unknown when no BrowserWindow exists", () => {
@@ -63,7 +130,7 @@ test("promotion renderer proof permanently fails after did-fail-load including E
 
 test("a rejected renderer load retains its requested URL and permanently fails the proof", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
-  const url = promotionRendererDocumentUrl("/candidate/ChatGPT.app/Contents/Resources", nonce);
+  const url = promotionRendererDocumentUrl(nonce);
   const tracker = createPromotionRendererProofTracker({
     nonce,
     url,

@@ -1,13 +1,27 @@
 export type HealthValue = "pass" | "fail" | "unknown";
 export declare const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
 export declare const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+export declare const PROMOTION_RENDERER_SCHEME = "app";
+export declare const PROMOTION_RENDERER_HOST = "-";
+export interface PromotionRendererProtocolRequest {
+    url: string;
+}
+export type PromotionRendererReadFile = (path: string) => Buffer;
 /**
- * Selects the real renderer entry from the candidate's own ASAR. The one-shot
- * health process deliberately skips Codex's normal bootstrap, so its app://
- * protocol is not registered. Electron's ASAR-aware file loader still resolves
- * the renderer's relative assets from this exact packaged document.
+ * Selects the real production renderer origin. The health-only main process
+ * owns a temporary app:// handler that serves bytes from its candidate ASAR.
  */
-export declare function promotionRendererDocumentUrl(resourcesPath: string, nonce: string): string;
+export declare function promotionRendererDocumentUrl(nonce: string): string;
+/**
+ * Maps one app://- request to a relative file below the candidate webview.
+ * Inspect the raw URL before URL parsing can normalize dot segments, decode the
+ * path exactly once, and reject any residual encoding that could hide a second
+ * traversal/backslash/NUL decode.
+ */
+export declare function promotionRendererAssetRoute(requestUrl: string): string | null;
+export declare function promotionRendererAssetMimeType(relativePath: string): string;
+/** Creates the health process's ASAR-aware, read-only app:// responder. */
+export declare function createPromotionRendererProtocolResponder(webviewRoot: string, readFile?: PromotionRendererReadFile): (request: PromotionRendererProtocolRequest) => Response;
 export declare function promotionRendererLoadRejection(error: unknown, requestedUrl: string): {
     errorCode: number;
     errorDescription: string;

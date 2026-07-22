@@ -8,8 +8,8 @@ import {
 
 test("promotion nonce is bound to the main-created exact renderer argument", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
-  const exactUrl = `file:///private/tmp/Candidate%20App.app/Contents/Resources/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`;
-  const siblingUrl = `file:///private/tmp/Sibling%20App.app/Contents/Resources/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`;
+  const exactUrl = `app://-/index.html?tweakerPromotionNonce=${nonce}`;
+  const siblingUrl = `app://-/sibling.html?tweakerPromotionNonce=${nonce}`;
   const binding = promotionRendererBindingArgument(nonce, exactUrl);
 
   assert.equal(promotionRendererNonce(exactUrl, ["/candidate/ChatGPT Helper", binding]), nonce);
@@ -22,10 +22,18 @@ test("promotion nonce is bound to the main-created exact renderer argument", () 
 test("promotion renderer binding rejects a nonce not bound to its URL", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
   const otherNonce = "123e4567-e89b-42d3-a456-426614174001";
-  const url = `file:///candidate/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`;
+  const url = `app://-/index.html?tweakerPromotionNonce=${nonce}`;
 
   assert.throws(
     () => promotionRendererBindingArgument(otherNonce, url),
+    /invalid promotion renderer URL binding/,
+  );
+  assert.throws(
+    () => promotionRendererBindingArgument(nonce, `app://other/index.html?tweakerPromotionNonce=${nonce}`),
+    /invalid promotion renderer URL binding/,
+  );
+  assert.throws(
+    () => promotionRendererBindingArgument(nonce, `file:///candidate/app.asar/webview/index.html?tweakerPromotionNonce=${nonce}`),
     /invalid promotion renderer URL binding/,
   );
 });

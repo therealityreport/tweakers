@@ -7,7 +7,7 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
+import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, protocol, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
 import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as originalFs from "original-fs";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
@@ -86,10 +86,12 @@ import { resolveLocalCliRuntime } from "./local-cli-runtime";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import {
   answerPromotionHealthRequest,
+  createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_RENDERER_IPC_CHANNEL,
+  PROMOTION_RENDERER_SCHEME,
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
@@ -202,6 +204,23 @@ const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+
+// The health-only process skips Codex's bootstrap, so register the production
+// renderer scheme during module evaluation, before Electron becomes ready.
+// The request handler itself remains scoped to the one renderer proof below.
+if (healthCheckOnly) {
+  protocol.registerSchemesAsPrivileged([{
+    scheme: PROMOTION_RENDERER_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+      codeCache: true,
+    },
+  }]);
+}
 
 // Defense in depth for one-shot macOS health processes. The installer passes
 // --use-mock-keychain from process start; assert the Chromium switch again at

@@ -11411,13 +11411,104 @@ var import_node_fs19 = require("node:fs");
 var import_node_crypto7 = require("node:crypto");
 var import_node_os2 = require("node:os");
 var import_node_path22 = require("node:path");
-var import_node_url = require("node:url");
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
 var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
-function promotionRendererDocumentUrl(resourcesPath, nonce) {
-  const url = (0, import_node_url.pathToFileURL)((0, import_node_path22.join)(resourcesPath, "app.asar", "webview", "index.html"));
+var PROMOTION_RENDERER_SCHEME = "app";
+var PROMOTION_RENDERER_HOST = "-";
+function promotionRendererDocumentUrl(nonce) {
+  const url = new URL(`${PROMOTION_RENDERER_SCHEME}://${PROMOTION_RENDERER_HOST}/index.html`);
   url.searchParams.set(PROMOTION_RENDERER_NONCE_QUERY, nonce);
   return url.toString();
+}
+function promotionRendererAssetRoute(requestUrl2) {
+  const prefix = `${PROMOTION_RENDERER_SCHEME}://${PROMOTION_RENDERER_HOST}`;
+  if (!requestUrl2.startsWith(`${prefix}/`)) return null;
+  let parsed;
+  try {
+    parsed = new URL(requestUrl2);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== `${PROMOTION_RENDERER_SCHEME}:` || parsed.hostname !== PROMOTION_RENDERER_HOST || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.hash !== "") return null;
+  const pathAndQuery = requestUrl2.slice(prefix.length);
+  const queryIndex = pathAndQuery.indexOf("?");
+  const fragmentIndex = pathAndQuery.indexOf("#");
+  const pathEnd = [queryIndex, fragmentIndex].filter((index) => index >= 0).reduce((smallest, index) => Math.min(smallest, index), pathAndQuery.length);
+  const rawPath = pathAndQuery.slice(0, pathEnd);
+  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("\\") || rawPath.includes("\0")) {
+    return null;
+  }
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  if (decodedPath.includes("\\") || decodedPath.includes("\0") || /%[0-9a-f]{2}/i.test(decodedPath)) return null;
+  const segments = decodedPath.slice(1).split("/");
+  if (segments.length === 0 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) return null;
+  return segments.join("/");
+}
+function promotionRendererAssetMimeType(relativePath) {
+  switch ((0, import_node_path22.extname)(relativePath).toLowerCase()) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+    case ".map":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".avif":
+      return "image/avif";
+    case ".ico":
+      return "image/x-icon";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    case ".ttf":
+      return "font/ttf";
+    case ".otf":
+      return "font/otf";
+    case ".wasm":
+      return "application/wasm";
+    case ".txt":
+      return "text/plain; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+function createPromotionRendererProtocolResponder(webviewRoot2, readFile = import_node_fs19.readFileSync) {
+  return (request) => {
+    const relativePath = promotionRendererAssetRoute(request.url);
+    if (!relativePath) return new Response(null, { status: 404 });
+    try {
+      const bytes = readFile((0, import_node_path22.join)(webviewRoot2, ...relativePath.split("/")));
+      return new Response(new Uint8Array(bytes), {
+        status: 200,
+        headers: {
+          "Content-Type": promotionRendererAssetMimeType(relativePath),
+          "X-Content-Type-Options": "nosniff"
+        }
+      });
+    } catch {
+      return new Response(null, { status: 404 });
+    }
+  };
 }
 function promotionRendererLoadRejection(error, requestedUrl) {
   const value = error !== null && typeof error === "object" ? error : null;
@@ -11702,7 +11793,7 @@ function promotionRendererBindingArgument(nonce, url) {
   if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) throw new Error("invalid promotion renderer nonce");
   const parsed = new URL(url);
   const queryEntries = [...parsed.searchParams.entries()];
-  if (parsed.protocol !== "file:" || parsed.hash !== "" || queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY2 || queryEntries[0][1] !== nonce) throw new Error("invalid promotion renderer URL binding");
+  if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || queryEntries.length !== 1 || queryEntries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY2 || queryEntries[0][1] !== nonce) throw new Error("invalid promotion renderer URL binding");
   return `${PROMOTION_RENDERER_BINDING_PREFIX}${encodeURIComponent(JSON.stringify({
     version: 1,
     nonce,
@@ -13619,6 +13710,19 @@ var TWEAK_BUNDLED_SOURCE_DIR = (0, import_node_path26.join)(runtimeDir, "tweaks"
 var TWEAK_LIFECYCLE_FILE = (0, import_node_path26.join)(userRoot, "tweak-lifecycle.json");
 var TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 var healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+if (healthCheckOnly) {
+  import_electron4.protocol.registerSchemesAsPrivileged([{
+    scheme: PROMOTION_RENDERER_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+      codeCache: true
+    }
+  }]);
+}
 applyHealthProbeKeychainIsolation({
   commandLine: import_electron4.app.commandLine,
   healthCheckOnly,

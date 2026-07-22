@@ -1,7 +1,10 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
 exports.promotionRendererDocumentUrl = promotionRendererDocumentUrl;
+exports.promotionRendererAssetRoute = promotionRendererAssetRoute;
+exports.promotionRendererAssetMimeType = promotionRendererAssetMimeType;
+exports.createPromotionRendererProtocolResponder = createPromotionRendererProtocolResponder;
 exports.promotionRendererLoadRejection = promotionRendererLoadRejection;
 exports.createPromotionRendererProofTracker = createPromotionRendererProofTracker;
 exports.hasAuthenticatedSessionCookie = hasAuthenticatedSessionCookie;
@@ -12,19 +15,115 @@ const node_fs_1 = require("node:fs");
 const node_crypto_1 = require("node:crypto");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
-const node_url_1 = require("node:url");
 exports.PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
 exports.PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+exports.PROMOTION_RENDERER_SCHEME = "app";
+exports.PROMOTION_RENDERER_HOST = "-";
 /**
- * Selects the real renderer entry from the candidate's own ASAR. The one-shot
- * health process deliberately skips Codex's normal bootstrap, so its app://
- * protocol is not registered. Electron's ASAR-aware file loader still resolves
- * the renderer's relative assets from this exact packaged document.
+ * Selects the real production renderer origin. The health-only main process
+ * owns a temporary app:// handler that serves bytes from its candidate ASAR.
  */
-function promotionRendererDocumentUrl(resourcesPath, nonce) {
-    const url = (0, node_url_1.pathToFileURL)((0, node_path_1.join)(resourcesPath, "app.asar", "webview", "index.html"));
+function promotionRendererDocumentUrl(nonce) {
+    const url = new URL(`${exports.PROMOTION_RENDERER_SCHEME}://${exports.PROMOTION_RENDERER_HOST}/index.html`);
     url.searchParams.set(exports.PROMOTION_RENDERER_NONCE_QUERY, nonce);
     return url.toString();
+}
+/**
+ * Maps one app://- request to a relative file below the candidate webview.
+ * Inspect the raw URL before URL parsing can normalize dot segments, decode the
+ * path exactly once, and reject any residual encoding that could hide a second
+ * traversal/backslash/NUL decode.
+ */
+function promotionRendererAssetRoute(requestUrl) {
+    const prefix = `${exports.PROMOTION_RENDERER_SCHEME}://${exports.PROMOTION_RENDERER_HOST}`;
+    if (!requestUrl.startsWith(`${prefix}/`))
+        return null;
+    let parsed;
+    try {
+        parsed = new URL(requestUrl);
+    }
+    catch {
+        return null;
+    }
+    if (parsed.protocol !== `${exports.PROMOTION_RENDERER_SCHEME}:`
+        || parsed.hostname !== exports.PROMOTION_RENDERER_HOST
+        || parsed.username !== ""
+        || parsed.password !== ""
+        || parsed.port !== ""
+        || parsed.hash !== "")
+        return null;
+    const pathAndQuery = requestUrl.slice(prefix.length);
+    const queryIndex = pathAndQuery.indexOf("?");
+    const fragmentIndex = pathAndQuery.indexOf("#");
+    const pathEnd = [queryIndex, fragmentIndex]
+        .filter((index) => index >= 0)
+        .reduce((smallest, index) => Math.min(smallest, index), pathAndQuery.length);
+    const rawPath = pathAndQuery.slice(0, pathEnd);
+    if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("\\") || rawPath.includes("\0")) {
+        return null;
+    }
+    let decodedPath;
+    try {
+        decodedPath = decodeURIComponent(rawPath);
+    }
+    catch {
+        return null;
+    }
+    if (decodedPath.includes("\\")
+        || decodedPath.includes("\0")
+        || /%[0-9a-f]{2}/i.test(decodedPath))
+        return null;
+    const segments = decodedPath.slice(1).split("/");
+    if (segments.length === 0
+        || segments.some((segment) => segment === "" || segment === "." || segment === ".."))
+        return null;
+    return segments.join("/");
+}
+function promotionRendererAssetMimeType(relativePath) {
+    switch ((0, node_path_1.extname)(relativePath).toLowerCase()) {
+        case ".html": return "text/html; charset=utf-8";
+        case ".js":
+        case ".mjs": return "text/javascript; charset=utf-8";
+        case ".css": return "text/css; charset=utf-8";
+        case ".json":
+        case ".map": return "application/json; charset=utf-8";
+        case ".svg": return "image/svg+xml";
+        case ".png": return "image/png";
+        case ".jpg":
+        case ".jpeg": return "image/jpeg";
+        case ".gif": return "image/gif";
+        case ".webp": return "image/webp";
+        case ".avif": return "image/avif";
+        case ".ico": return "image/x-icon";
+        case ".woff": return "font/woff";
+        case ".woff2": return "font/woff2";
+        case ".ttf": return "font/ttf";
+        case ".otf": return "font/otf";
+        case ".wasm": return "application/wasm";
+        case ".txt": return "text/plain; charset=utf-8";
+        default: return "application/octet-stream";
+    }
+}
+/** Creates the health process's ASAR-aware, read-only app:// responder. */
+function createPromotionRendererProtocolResponder(webviewRoot, readFile = node_fs_1.readFileSync) {
+    return (request) => {
+        const relativePath = promotionRendererAssetRoute(request.url);
+        if (!relativePath)
+            return new Response(null, { status: 404 });
+        try {
+            const bytes = readFile((0, node_path_1.join)(webviewRoot, ...relativePath.split("/")));
+            return new Response(new Uint8Array(bytes), {
+                status: 200,
+                headers: {
+                    "Content-Type": promotionRendererAssetMimeType(relativePath),
+                    "X-Content-Type-Options": "nosniff",
+                },
+            });
+        }
+        catch {
+            return new Response(null, { status: 404 });
+        }
+    };
 }
 function promotionRendererLoadRejection(error, requestedUrl) {
     const value = error !== null && typeof error === "object"

@@ -1,24 +1,134 @@
 import { chmodSync, lstatSync, mkdirSync, openSync, closeSync, fsyncSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, extname, join } from "node:path";
 
 export type HealthValue = "pass" | "fail" | "unknown";
 
 export const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
 export const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
+export const PROMOTION_RENDERER_SCHEME = "app";
+export const PROMOTION_RENDERER_HOST = "-";
+
+export interface PromotionRendererProtocolRequest {
+  url: string;
+}
+
+export type PromotionRendererReadFile = (path: string) => Buffer;
 
 /**
- * Selects the real renderer entry from the candidate's own ASAR. The one-shot
- * health process deliberately skips Codex's normal bootstrap, so its app://
- * protocol is not registered. Electron's ASAR-aware file loader still resolves
- * the renderer's relative assets from this exact packaged document.
+ * Selects the real production renderer origin. The health-only main process
+ * owns a temporary app:// handler that serves bytes from its candidate ASAR.
  */
-export function promotionRendererDocumentUrl(resourcesPath: string, nonce: string): string {
-  const url = pathToFileURL(join(resourcesPath, "app.asar", "webview", "index.html"));
+export function promotionRendererDocumentUrl(nonce: string): string {
+  const url = new URL(`${PROMOTION_RENDERER_SCHEME}://${PROMOTION_RENDERER_HOST}/index.html`);
   url.searchParams.set(PROMOTION_RENDERER_NONCE_QUERY, nonce);
   return url.toString();
+}
+
+/**
+ * Maps one app://- request to a relative file below the candidate webview.
+ * Inspect the raw URL before URL parsing can normalize dot segments, decode the
+ * path exactly once, and reject any residual encoding that could hide a second
+ * traversal/backslash/NUL decode.
+ */
+export function promotionRendererAssetRoute(requestUrl: string): string | null {
+  const prefix = `${PROMOTION_RENDERER_SCHEME}://${PROMOTION_RENDERER_HOST}`;
+  if (!requestUrl.startsWith(`${prefix}/`)) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(requestUrl);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== `${PROMOTION_RENDERER_SCHEME}:`
+    || parsed.hostname !== PROMOTION_RENDERER_HOST
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.port !== ""
+    || parsed.hash !== ""
+  ) return null;
+
+  const pathAndQuery = requestUrl.slice(prefix.length);
+  const queryIndex = pathAndQuery.indexOf("?");
+  const fragmentIndex = pathAndQuery.indexOf("#");
+  const pathEnd = [queryIndex, fragmentIndex]
+    .filter((index) => index >= 0)
+    .reduce((smallest, index) => Math.min(smallest, index), pathAndQuery.length);
+  const rawPath = pathAndQuery.slice(0, pathEnd);
+  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("\\") || rawPath.includes("\0")) {
+    return null;
+  }
+
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  if (
+    decodedPath.includes("\\")
+    || decodedPath.includes("\0")
+    || /%[0-9a-f]{2}/i.test(decodedPath)
+  ) return null;
+
+  const segments = decodedPath.slice(1).split("/");
+  if (
+    segments.length === 0
+    || segments.some((segment) => segment === "" || segment === "." || segment === "..")
+  ) return null;
+  return segments.join("/");
+}
+
+export function promotionRendererAssetMimeType(relativePath: string): string {
+  switch (extname(relativePath).toLowerCase()) {
+    case ".html": return "text/html; charset=utf-8";
+    case ".js":
+    case ".mjs": return "text/javascript; charset=utf-8";
+    case ".css": return "text/css; charset=utf-8";
+    case ".json":
+    case ".map": return "application/json; charset=utf-8";
+    case ".svg": return "image/svg+xml";
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    case ".avif": return "image/avif";
+    case ".ico": return "image/x-icon";
+    case ".woff": return "font/woff";
+    case ".woff2": return "font/woff2";
+    case ".ttf": return "font/ttf";
+    case ".otf": return "font/otf";
+    case ".wasm": return "application/wasm";
+    case ".txt": return "text/plain; charset=utf-8";
+    default: return "application/octet-stream";
+  }
+}
+
+/** Creates the health process's ASAR-aware, read-only app:// responder. */
+export function createPromotionRendererProtocolResponder(
+  webviewRoot: string,
+  readFile: PromotionRendererReadFile = readFileSync,
+): (request: PromotionRendererProtocolRequest) => Response {
+  return (request) => {
+    const relativePath = promotionRendererAssetRoute(request.url);
+    if (!relativePath) return new Response(null, { status: 404 });
+    try {
+      const bytes = readFile(join(webviewRoot, ...relativePath.split("/")));
+      return new Response(new Uint8Array(bytes), {
+        status: 200,
+        headers: {
+          "Content-Type": promotionRendererAssetMimeType(relativePath),
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    } catch {
+      return new Response(null, { status: 404 });
+    }
+  };
 }
 
 export function promotionRendererLoadRejection(
