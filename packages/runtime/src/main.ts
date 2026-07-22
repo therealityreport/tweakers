@@ -2706,7 +2706,13 @@ app.whenReady().then(() => {
       }
       if (healthCheckOnly) app.exit(0);
     }).catch((error) => {
-      log("warn", "promotion health receipt failed", error);
+      if (
+        error === null
+        || (typeof error !== "object" && typeof error !== "function")
+        || !SANITIZED_PROMOTION_POLICY_FAILURES.has(error)
+      ) {
+        log("warn", "promotion health receipt failed", error);
+      }
       if (healthCheckOnly) app.exit(0);
     });
   })().catch((error) => {

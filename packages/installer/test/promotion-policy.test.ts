@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,13 +18,20 @@ import { PROMOTION_POLICY_FILE_MAX_BYTES } from "@therealityreport/tweakers-sdk"
 import {
   buildPromotionHealthExpectation,
 } from "../src/commands/install";
-import { fingerprintPromotionPolicyPath as fingerprintInstallerPolicy } from "../src/promotion-policy";
+import {
+  fingerprintPromotionPolicyPath as fingerprintInstallerPolicy,
+  trustedPromotionPolicyMode as installerTrustedPolicyMode,
+} from "../src/promotion-policy";
 import promotionHealth from "../../runtime/src/promotion-health";
 import runtimePolicy from "../../runtime/src/promotion-policy";
 import { inspectUserQuestionsSource } from "../src/user-questions-source";
 
 const { answerPromotionHealthRequest, PROMOTION_SURFACE_NAMES } = promotionHealth;
-const { fingerprintPromotionPolicyPath: fingerprintRuntimePolicy } = runtimePolicy;
+const {
+  fingerprintPromotionPolicyPath: fingerprintRuntimePolicy,
+  promotionPolicyFingerprintFailureReason,
+  trustedPromotionPolicyMode: runtimeTrustedPolicyMode,
+} = runtimePolicy;
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const userQuestionsRoot = join(repositoryRoot, "tweaks", "user-questions");
 
@@ -52,6 +60,13 @@ function writePolicy(path: string, state: unknown, mode = 0o600): void {
   chmodSync(path, mode);
 }
 
+function atomicWritePolicy(path: string, state: unknown, mode: number): void {
+  const replacement = `${path}.replacement`;
+  rmSync(replacement, { force: true });
+  writePolicy(replacement, state, mode);
+  renameSync(replacement, path);
+}
+
 test("installer and runtime share stable semantic policy fingerprints", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-policy-parity-"));
   try {
@@ -60,6 +75,12 @@ test("installer and runtime share stable semantic policy fingerprints", () => {
     writePolicy(policy, state);
     const expected = fingerprintInstallerPolicy(policy);
     assert.equal(fingerprintRuntimePolicy(policy), expected);
+
+    for (const mode of [0o600, 0o640, 0o644]) {
+      writePolicy(policy, state, mode);
+      assert.equal(fingerprintInstallerPolicy(policy), expected, `installer mode ${mode.toString(8)}`);
+      assert.equal(fingerprintRuntimePolicy(policy), expected, `runtime mode ${mode.toString(8)}`);
+    }
 
     const reordered = reverseObjectOrder(state);
     writePolicy(policy, reordered);
@@ -78,6 +99,17 @@ test("installer and runtime share stable semantic policy fingerprints", () => {
     assert.equal(fingerprintRuntimePolicy(policy), expected);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted policy mode allowlist is exact across installer and runtime", () => {
+  for (const mode of [0o600, 0o640, 0o644]) {
+    assert.equal(installerTrustedPolicyMode(mode), true, `installer safe ${mode.toString(8)}`);
+    assert.equal(runtimeTrustedPolicyMode(mode), true, `runtime safe ${mode.toString(8)}`);
+  }
+  for (const mode of [0o604, 0o666, 0o620, 0o602, 0o645, 0o755, 0o1600, 0o2640, 0o4644]) {
+    assert.equal(installerTrustedPolicyMode(mode), false, `installer unsafe ${mode.toString(8)}`);
+    assert.equal(runtimeTrustedPolicyMode(mode), false, `runtime unsafe ${mode.toString(8)}`);
   }
 });
 
@@ -207,7 +239,7 @@ test("installer and runtime golden vectors preserve container and arbitrary thre
   }
 });
 
-test("missing, malformed, oversized, permissive, and symlink policy files fail closed", () => {
+test("missing, malformed, oversized, untrusted-mode, and symlink policy files fail closed", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-policy-invalid-"));
   try {
     const policy = join(root, ".codex-global-state.json");
@@ -231,25 +263,35 @@ test("missing, malformed, oversized, permissive, and symlink policy files fail c
     assert.throws(() => fingerprintRuntimePolicy(policy), /duplicate JSON key/);
 
     writePolicy(policy, { "electron-persisted-atom-state": [] });
-    assert.throws(() => fingerprintInstallerPolicy(policy), /persisted atom state must be an object/);
-    assert.throws(() => fingerprintRuntimePolicy(policy), /persisted atom state must be an object/);
+    assert.throws(() => fingerprintInstallerPolicy(policy), /policy state schema is invalid/);
+    assert.throws(() => fingerprintRuntimePolicy(policy), /policy state schema is invalid/);
 
     const typeDrift = policyState();
     const typeAtoms = typeDrift["electron-persisted-atom-state"] as Record<string, unknown>;
     const typeThreads = typeAtoms["heartbeat-thread-permissions-by-id"] as Record<string, unknown>;
     (typeThreads.alpha as Record<string, unknown>).runtimeWorkspaceRoots = ["/valid", 42];
     writePolicy(policy, typeDrift);
-    assert.throws(() => fingerprintInstallerPolicy(policy), /invalid value type/);
-    assert.throws(() => fingerprintRuntimePolicy(policy), /invalid value type/);
+    assert.throws(() => fingerprintInstallerPolicy(policy), /policy state schema is invalid/);
+    assert.throws(() => fingerprintRuntimePolicy(policy), /policy state schema is invalid/);
 
-    writePolicy(policy, policyState(), 0o644);
-    assert.throws(() => fingerprintInstallerPolicy(policy), /owner-only bounded regular file/);
-    assert.throws(() => fingerprintRuntimePolicy(policy), /owner-only bounded regular file/);
+    for (const mode of [0o604, 0o666, 0o620, 0o602, 0o645, 0o755]) {
+      writePolicy(policy, policyState(), mode);
+      assert.throws(
+        () => fingerprintInstallerPolicy(policy),
+        /trusted bounded file metadata/,
+        `installer mode ${mode.toString(8)}`,
+      );
+      assert.throws(
+        () => fingerprintRuntimePolicy(policy),
+        /trusted bounded file metadata/,
+        `runtime mode ${mode.toString(8)}`,
+      );
+    }
 
     writeFileSync(policy, Buffer.alloc(PROMOTION_POLICY_FILE_MAX_BYTES + 1, 0x20), { mode: 0o600 });
     chmodSync(policy, 0o600);
-    assert.throws(() => fingerprintInstallerPolicy(policy), /owner-only bounded regular file/);
-    assert.throws(() => fingerprintRuntimePolicy(policy), /owner-only bounded regular file/);
+    assert.throws(() => fingerprintInstallerPolicy(policy), /trusted bounded file metadata/);
+    assert.throws(() => fingerprintRuntimePolicy(policy), /trusted bounded file metadata/);
 
     const target = join(root, "target.json");
     writePolicy(target, policyState());
@@ -284,7 +326,7 @@ test("schema-v2 request and receipt align installer expectation with runtime sem
 
     const changed = policyState();
     changed["ui-window-state"] = { route: "/persisted-by-original-main", session: 2 };
-    writePolicy(policy, changed);
+    atomicWritePolicy(policy, changed, 0o644);
     const runtimePolicyHash = fingerprintRuntimePolicy(policy);
     assert.equal(runtimePolicyHash, policyHash);
 
@@ -335,6 +377,65 @@ test("schema-v2 request and receipt align installer expectation with runtime sem
       status: "pass",
     });
     assert.equal(receipt.promotionReady, "pass");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("post-read atomic path replacement fails installer and runtime identity checks", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-policy-race-"));
+  try {
+    const policy = join(root, ".codex-global-state.json");
+    const replacement = structuredClone(policyState());
+    replacement["ui-window-state"] = { route: "/atomic-replacement", session: 2 };
+    writePolicy(policy, policyState());
+    assert.throws(() => fingerprintInstallerPolicy(policy, {
+      afterRead: () => atomicWritePolicy(policy, replacement, 0o644),
+    }), /policy state path changed during observation/);
+
+    writePolicy(policy, policyState());
+    assert.throws(() => fingerprintRuntimePolicy(policy, {
+      afterRead: () => atomicWritePolicy(policy, replacement, 0o644),
+    }), /policy state path changed during observation/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime exposes stable nonsecret policy failure reasons", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-policy-reasons-"));
+  try {
+    const policy = join(root, ".codex-global-state.json");
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "open_failed");
+
+    writePolicy(policy, policyState(), 0o666);
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "unsafe_metadata");
+
+    writePolicy(policy, policyState(), 0o600);
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy, {
+      duringRead: () => chmodSync(policy, 0o640),
+    })), "changed_during_read");
+
+    writePolicy(policy, policyState(), 0o600);
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy, {
+      afterRead: () => atomicWritePolicy(policy, policyState(), 0o644),
+    })), "path_changed");
+
+    writeFileSync(policy, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]), { mode: 0o600 });
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "invalid_utf8");
+
+    writeFileSync(policy, "{", { mode: 0o600 });
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "invalid_json");
+
+    writeFileSync(
+      policy,
+      '{"electron-openai-mcp-form-elicitations-enabled":false,"electron-openai-mcp-form-elicitations-enabled":true}',
+      { mode: 0o600 },
+    );
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "duplicate_json_key");
+
+    writePolicy(policy, { "electron-persisted-atom-state": [] });
+    assert.equal(captureRuntimeReason(() => fingerprintRuntimePolicy(policy)), "invalid_schema");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -425,4 +526,13 @@ function policySurfaceHashes(policy: string): Record<(typeof PROMOTION_SURFACE_N
     name,
     name === "policy" ? policy : String((index + 1) % 10).repeat(64),
   ])) as Record<(typeof PROMOTION_SURFACE_NAMES)[number], string>;
+}
+
+function captureRuntimeReason(operation: () => unknown): string {
+  try {
+    operation();
+  } catch (error) {
+    return promotionPolicyFingerprintFailureReason(error);
+  }
+  assert.fail("expected runtime policy fingerprint failure");
 }

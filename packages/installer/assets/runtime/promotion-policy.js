@@ -1,5 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.PromotionPolicyFingerprintError = void 0;
+exports.promotionPolicyFingerprintFailureReason = promotionPolicyFingerprintFailureReason;
+exports.trustedPromotionPolicyMode = trustedPromotionPolicyMode;
 exports.fingerprintPromotionPolicyPath = fingerprintPromotionPolicyPath;
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
@@ -15,42 +18,125 @@ const PERSISTED_ATOMS_KEY = "electron-persisted-atom-state";
 const AGENT_MODES_KEY = "agent-mode-by-host-id";
 const THREAD_PERMISSIONS_KEY = "heartbeat-thread-permissions-by-id";
 const MCP_FORM_KEY = "electron-openai-mcp-form-elicitations-enabled";
+class PromotionPolicyFingerprintError extends Error {
+    reason;
+    code = "PROMOTION_POLICY_FINGERPRINT_FAILED";
+    constructor(reason, message) {
+        super(message);
+        this.reason = reason;
+        this.name = "PromotionPolicyFingerprintError";
+    }
+}
+exports.PromotionPolicyFingerprintError = PromotionPolicyFingerprintError;
+function promotionPolicyFingerprintFailureReason(error) {
+    return error instanceof PromotionPolicyFingerprintError ? error.reason : "unexpected_error";
+}
+/** Final forensic allowlist: exact trusted modes, with no special bits. */
+function trustedPromotionPolicyMode(mode) {
+    const permissions = mode & 0o7777;
+    return permissions === 0o600 || permissions === 0o640 || permissions === 0o644;
+}
 /** Semantic, bounded and no-follow policy proof used by runtime observation. */
-function fingerprintPromotionPolicyPath(path) {
-    const fd = (0, node_fs_1.openSync)(path, node_fs_1.constants.O_RDONLY | node_fs_1.constants.O_NOFOLLOW);
+function fingerprintPromotionPolicyPath(path, deps = {}) {
+    let fd;
     try {
-        const before = (0, node_fs_1.fstatSync)(fd);
+        fd = (0, node_fs_1.openSync)(path, node_fs_1.constants.O_RDONLY | node_fs_1.constants.O_NOFOLLOW);
+    }
+    catch {
+        throw policyFailure("open_failed", "Promotion policy state could not be opened safely");
+    }
+    try {
+        let before;
+        try {
+            before = (0, node_fs_1.fstatSync)(fd);
+        }
+        catch {
+            throw policyFailure("open_failed", "Promotion policy state metadata could not be read");
+        }
         const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
         if (!before.isFile()
             || before.size <= 0
             || before.size > PROMOTION_POLICY_FILE_MAX_BYTES
-            || (before.mode & 0o777) !== 0o600
+            || !trustedPromotionPolicyMode(before.mode)
             || (currentUid !== null && before.uid !== currentUid)) {
-            throw new Error("Promotion policy state must be an owner-only bounded regular file");
+            throw policyFailure("unsafe_metadata", "Promotion policy state must use trusted bounded file metadata");
         }
-        const bytes = (0, node_fs_1.readFileSync)(fd);
-        const after = (0, node_fs_1.fstatSync)(fd);
+        let bytes;
+        try {
+            bytes = (0, node_fs_1.readFileSync)(fd);
+        }
+        catch {
+            throw policyFailure("changed_during_read", "Promotion policy state could not be read stably");
+        }
+        deps.duringRead?.();
+        let after;
+        try {
+            after = (0, node_fs_1.fstatSync)(fd);
+        }
+        catch {
+            throw policyFailure("changed_during_read", "Promotion policy state changed during observation");
+        }
         if (bytes.byteLength !== before.size
             || before.dev !== after.dev
             || before.ino !== after.ino
+            || before.uid !== after.uid
+            || (before.mode & 0o7777) !== (after.mode & 0o7777)
             || before.size !== after.size
             || before.mtimeMs !== after.mtimeMs
             || before.ctimeMs !== after.ctimeMs) {
-            throw new Error("Promotion policy state changed while being read");
+            throw policyFailure("changed_during_read", "Promotion policy state changed during observation");
+        }
+        deps.afterRead?.();
+        let current;
+        try {
+            current = (0, node_fs_1.lstatSync)(path);
+        }
+        catch {
+            throw policyFailure("path_changed", "Promotion policy state path changed during observation");
+        }
+        if (!current.isFile()
+            || current.isSymbolicLink()
+            || current.dev !== after.dev
+            || current.ino !== after.ino
+            || current.uid !== after.uid
+            || (current.mode & 0o7777) !== (after.mode & 0o7777)
+            || current.size !== after.size
+            || current.mtimeMs !== after.mtimeMs
+            || current.ctimeMs !== after.ctimeMs) {
+            throw policyFailure("path_changed", "Promotion policy state path changed during observation");
         }
         let raw;
         try {
             raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         }
         catch {
-            throw new Error("Promotion policy state must be valid UTF-8");
+            throw policyFailure("invalid_utf8", "Promotion policy state must be valid UTF-8");
         }
-        const canonical = canonicalPromotionPolicyText(raw);
+        let canonical;
+        try {
+            canonical = canonicalPromotionPolicyText(raw);
+        }
+        catch (error) {
+            throw classifyCanonicalPolicyFailure(error);
+        }
         return (0, node_crypto_1.createHash)("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
     }
     finally {
         (0, node_fs_1.closeSync)(fd);
     }
+}
+function policyFailure(reason, message) {
+    return new PromotionPolicyFingerprintError(reason, message);
+}
+function classifyCanonicalPolicyFailure(error) {
+    const message = error instanceof Error ? error.message : "";
+    if (message.includes("duplicate JSON key")) {
+        return policyFailure("duplicate_json_key", "Promotion policy state contains a duplicate JSON key");
+    }
+    if (message.includes("valid JSON")) {
+        return policyFailure("invalid_json", "Promotion policy state must be valid JSON");
+    }
+    return policyFailure("invalid_schema", "Promotion policy state schema is invalid");
 }
 function canonicalPromotionPolicyText(raw) {
     if (raw.length === 0 || raw.length > PROMOTION_POLICY_FILE_MAX_BYTES) {

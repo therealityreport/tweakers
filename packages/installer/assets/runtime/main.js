@@ -6555,30 +6555,95 @@ var PERSISTED_ATOMS_KEY = "electron-persisted-atom-state";
 var AGENT_MODES_KEY = "agent-mode-by-host-id";
 var THREAD_PERMISSIONS_KEY = "heartbeat-thread-permissions-by-id";
 var MCP_FORM_KEY = "electron-openai-mcp-form-elicitations-enabled";
-function fingerprintPromotionPolicyPath(path) {
-  const fd = (0, import_node_fs9.openSync)(path, import_node_fs9.constants.O_RDONLY | import_node_fs9.constants.O_NOFOLLOW);
+var PromotionPolicyFingerprintError = class extends Error {
+  constructor(reason, message) {
+    super(message);
+    this.reason = reason;
+    this.name = "PromotionPolicyFingerprintError";
+  }
+  reason;
+  code = "PROMOTION_POLICY_FINGERPRINT_FAILED";
+};
+function promotionPolicyFingerprintFailureReason(error) {
+  return error instanceof PromotionPolicyFingerprintError ? error.reason : "unexpected_error";
+}
+function trustedPromotionPolicyMode(mode) {
+  const permissions = mode & 4095;
+  return permissions === 384 || permissions === 416 || permissions === 420;
+}
+function fingerprintPromotionPolicyPath(path, deps = {}) {
+  let fd;
   try {
-    const before = (0, import_node_fs9.fstatSync)(fd);
-    const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
-    if (!before.isFile() || before.size <= 0 || before.size > PROMOTION_POLICY_FILE_MAX_BYTES || (before.mode & 511) !== 384 || currentUid !== null && before.uid !== currentUid) {
-      throw new Error("Promotion policy state must be an owner-only bounded regular file");
+    fd = (0, import_node_fs9.openSync)(path, import_node_fs9.constants.O_RDONLY | import_node_fs9.constants.O_NOFOLLOW);
+  } catch {
+    throw policyFailure("open_failed", "Promotion policy state could not be opened safely");
+  }
+  try {
+    let before;
+    try {
+      before = (0, import_node_fs9.fstatSync)(fd);
+    } catch {
+      throw policyFailure("open_failed", "Promotion policy state metadata could not be read");
     }
-    const bytes = (0, import_node_fs9.readFileSync)(fd);
-    const after = (0, import_node_fs9.fstatSync)(fd);
-    if (bytes.byteLength !== before.size || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      throw new Error("Promotion policy state changed while being read");
+    const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (!before.isFile() || before.size <= 0 || before.size > PROMOTION_POLICY_FILE_MAX_BYTES || !trustedPromotionPolicyMode(before.mode) || currentUid !== null && before.uid !== currentUid) {
+      throw policyFailure("unsafe_metadata", "Promotion policy state must use trusted bounded file metadata");
+    }
+    let bytes;
+    try {
+      bytes = (0, import_node_fs9.readFileSync)(fd);
+    } catch {
+      throw policyFailure("changed_during_read", "Promotion policy state could not be read stably");
+    }
+    deps.duringRead?.();
+    let after;
+    try {
+      after = (0, import_node_fs9.fstatSync)(fd);
+    } catch {
+      throw policyFailure("changed_during_read", "Promotion policy state changed during observation");
+    }
+    if (bytes.byteLength !== before.size || before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid || (before.mode & 4095) !== (after.mode & 4095) || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw policyFailure("changed_during_read", "Promotion policy state changed during observation");
+    }
+    deps.afterRead?.();
+    let current;
+    try {
+      current = (0, import_node_fs9.lstatSync)(path);
+    } catch {
+      throw policyFailure("path_changed", "Promotion policy state path changed during observation");
+    }
+    if (!current.isFile() || current.isSymbolicLink() || current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid || (current.mode & 4095) !== (after.mode & 4095) || current.size !== after.size || current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) {
+      throw policyFailure("path_changed", "Promotion policy state path changed during observation");
     }
     let raw;
     try {
       raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
-      throw new Error("Promotion policy state must be valid UTF-8");
+      throw policyFailure("invalid_utf8", "Promotion policy state must be valid UTF-8");
     }
-    const canonical = canonicalPromotionPolicyText(raw);
+    let canonical;
+    try {
+      canonical = canonicalPromotionPolicyText(raw);
+    } catch (error) {
+      throw classifyCanonicalPolicyFailure(error);
+    }
     return (0, import_node_crypto3.createHash)("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
   } finally {
     (0, import_node_fs9.closeSync)(fd);
   }
+}
+function policyFailure(reason, message) {
+  return new PromotionPolicyFingerprintError(reason, message);
+}
+function classifyCanonicalPolicyFailure(error) {
+  const message = error instanceof Error ? error.message : "";
+  if (message.includes("duplicate JSON key")) {
+    return policyFailure("duplicate_json_key", "Promotion policy state contains a duplicate JSON key");
+  }
+  if (message.includes("valid JSON")) {
+    return policyFailure("invalid_json", "Promotion policy state must be valid JSON");
+  }
+  return policyFailure("invalid_schema", "Promotion policy state schema is invalid");
 }
 function canonicalPromotionPolicyText(raw) {
   if (raw.length === 0 || raw.length > PROMOTION_POLICY_FILE_MAX_BYTES) {
@@ -16346,7 +16411,9 @@ import_electron4.app.whenReady().then(() => {
       }
       if (healthCheckOnly) import_electron4.app.exit(0);
     }).catch((error) => {
-      log("warn", "promotion health receipt failed", error);
+      if (error === null || typeof error !== "object" && typeof error !== "function" || !SANITIZED_PROMOTION_POLICY_FAILURES.has(error)) {
+        log("warn", "promotion health receipt failed", error);
+      }
       if (healthCheckOnly) import_electron4.app.exit(0);
     });
   })().catch((error) => {
