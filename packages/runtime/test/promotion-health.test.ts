@@ -8,6 +8,7 @@ import {
   authorizePromotionOriginalRenderer,
   authorizePromotionRenderer,
   canonicalPromotionOriginalRendererUrl,
+  createPromotionOriginalRendererDeadlineController,
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
@@ -15,6 +16,11 @@ import {
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
   PROMOTION_ORIGINAL_RENDERER_URL,
+  PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS,
+  PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS,
+  PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS,
+  PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS,
+  PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
   PROMOTION_SURFACE_NAMES,
   promotionOriginalRendererLogUrl,
   promotionRendererAssetMimeType,
@@ -22,7 +28,9 @@ import {
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
+  shouldFailPromotionOriginalRendererProvisionalLoad,
   validatePromotionOriginalRendererHandshake,
+  validatePromotionOriginalRendererMountTimeout,
   validatePromotionRendererHandshake,
 } from "../src/promotion-health";
 
@@ -145,6 +153,135 @@ test("original renderer process proof requires one matching sandboxed OS metric"
   }
 });
 
+function fakeDeadlineClock() {
+  let now = 0;
+  let nextId = 1;
+  const timers = new Map<number, { at: number; callback: () => void }>();
+  return {
+    scheduler: {
+      set(callback: () => void, timeoutMs: number): unknown {
+        const id = nextId++;
+        timers.set(id, { at: now + timeoutMs, callback });
+        return id;
+      },
+      clear(handle: unknown): void {
+        timers.delete(handle as number);
+      },
+    },
+    advance(timeoutMs: number): void {
+      const target = now + timeoutMs;
+      while (true) {
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.at <= target)
+          .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].at;
+        due[1].callback();
+      }
+      now = target;
+    },
+    timerCount(): number {
+      return timers.size;
+    },
+  };
+}
+
+test("original renderer deadlines give a selection at 19.999s its full non-extendable completion phase", () => {
+  const clock = fakeDeadlineClock();
+  const timedOut: string[] = [];
+  const deadline = createPromotionOriginalRendererDeadlineController({
+    scheduler: clock.scheduler,
+    onTimeout: (phase) => timedOut.push(phase),
+  });
+
+  clock.advance(PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS - 1);
+  assert.deepEqual(timedOut, []);
+  assert.equal(deadline.canonicalSelected(), true);
+  assert.equal(deadline.phase(), "completion");
+  clock.advance(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS - 1);
+  assert.deepEqual(timedOut, []);
+  assert.equal(deadline.canonicalSelected(), false, "repeated eligibility cannot rearm completion");
+  clock.advance(1);
+  assert.deepEqual(timedOut, ["completion"]);
+  assert.equal(deadline.phase(), "settled");
+  assert.equal(clock.timerCount(), 0);
+});
+
+test("original renderer startup fails without a window and settlement cancels each active phase once", () => {
+  const startupClock = fakeDeadlineClock();
+  const startupTimeouts: string[] = [];
+  createPromotionOriginalRendererDeadlineController({
+    scheduler: startupClock.scheduler,
+    onTimeout: (phase) => startupTimeouts.push(phase),
+  });
+  startupClock.advance(PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS);
+  assert.deepEqual(startupTimeouts, ["startup"]);
+
+  const settledClock = fakeDeadlineClock();
+  const settledTimeouts: string[] = [];
+  const settled = createPromotionOriginalRendererDeadlineController({
+    scheduler: settledClock.scheduler,
+    onTimeout: (phase) => settledTimeouts.push(phase),
+  });
+  assert.equal(settled.canonicalSelected(), true);
+  settled.settle();
+  settled.settle();
+  settledClock.advance(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS + 1);
+  assert.deepEqual(settledTimeouts, []);
+  assert.equal(settled.phase(), "settled");
+  assert.equal(settledClock.timerCount(), 0);
+});
+
+test("only a canonical main-frame provisional failure poisons renderer health", () => {
+  assert.equal(shouldFailPromotionOriginalRendererProvisionalLoad({
+    isMainFrame: true,
+    webContentsId: 71,
+    canonicalWebContentsId: 71,
+  }), true);
+  assert.equal(shouldFailPromotionOriginalRendererProvisionalLoad({
+    isMainFrame: false,
+    webContentsId: 71,
+    canonicalWebContentsId: 71,
+  }), false);
+  assert.equal(shouldFailPromotionOriginalRendererProvisionalLoad({
+    isMainFrame: true,
+    webContentsId: 72,
+    canonicalWebContentsId: 71,
+  }), false);
+  assert.equal(shouldFailPromotionOriginalRendererProvisionalLoad({
+    isMainFrame: true,
+    webContentsId: 71,
+    canonicalWebContentsId: null,
+  }), false);
+
+  const tracker = createPromotionOriginalRendererProofTracker("123e4567-e89b-42d3-a456-426614174000");
+  tracker.eligibleWindow({
+    webContentsId: 71,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    isDefaultSession: true,
+    sandbox: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  tracker.fail("canonical renderer provisional load failed", 71);
+  assert.equal(tracker.complete(), true);
+  assert.equal(tracker.summary().loadFailed, true);
+  assert.equal(tracker.summary().failureReason, "canonical renderer provisional load failed");
+});
+
+test("promotion timeout ordering leaves preload and cleanup headroom inside the outer process cap", () => {
+  const outerProcessTimeoutMs = 90_000;
+  assert.ok(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS > PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS);
+  assert.ok(outerProcessTimeoutMs > (
+    PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS
+    + PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS
+    + PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS
+  ));
+  assert.ok(PROMOTION_HEALTH_REQUEST_MAX_AGE_MS > outerProcessTimeoutMs);
+});
+
 test("original renderer proof requires safe exact window, auth, load, mount, and cleanup", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
   const originalUrl = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
@@ -191,6 +328,42 @@ test("original renderer proof requires safe exact window, auth, load, mount, and
       failureReason: null,
     },
   });
+});
+
+test("original renderer finish-only and mount-only observations never pass", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = PROMOTION_ORIGINAL_RENDERER_URL;
+  const eligible = (tracker: ReturnType<typeof createPromotionOriginalRendererProofTracker>, id: number): void => {
+    tracker.eligibleWindow({
+      webContentsId: id,
+      url,
+      isDefaultSession: true,
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      originalPreloadValid: true,
+    });
+    tracker.authorization(id);
+  };
+
+  const finishOnly = createPromotionOriginalRendererProofTracker(nonce);
+  eligible(finishOnly, 92);
+  finishOnly.didFinishLoad(92, url);
+  finishOnly.cleanup(true);
+  assert.equal(finishOnly.result().hostReady, "unknown");
+
+  const mountOnly = createPromotionOriginalRendererProofTracker(nonce);
+  eligible(mountOnly, 93);
+  mountOnly.rendererHandshake({
+    webContentsId: 93,
+    nonce,
+    url,
+    lifecycle: "renderer-mounted",
+    rendererSandboxed: true,
+    rendererStorageSelfTest: "pass",
+  });
+  mountOnly.cleanup(true);
+  assert.equal(mountOnly.result().hostReady, "unknown");
 });
 
 test("original renderer accepts an omitted sandbox default only with positive effective proof", () => {
@@ -427,6 +600,83 @@ test("original renderer handshake requires an exact boolean effective sandbox re
   ]) {
     assert.equal(validatePromotionOriginalRendererHandshake(context, malformed, nonce).accepted, false);
   }
+});
+
+test("original renderer mount timeout is exact, sandbox-bound, and one-shot", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
+  const context = {
+    windowAlive: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: url,
+    expectedUrl: url,
+    authorizationConsumed: true,
+    handshakeConsumed: false,
+  };
+  const payload = {
+    nonce,
+    rendererSandboxed: true,
+    lifecycle: "renderer-mount-timeout",
+    url,
+  };
+
+  assert.deepEqual(validatePromotionOriginalRendererMountTimeout(context, payload, nonce), {
+    accepted: true,
+    reason: "accepted",
+    observation: payload,
+  });
+  for (const [override, reason] of [
+    [{ windowAlive: false }, "proof window unavailable"],
+    [{ senderMatches: false }, "sender mismatch"],
+    [{ frameMatches: false }, "frame mismatch"],
+    [{ senderUrl: `${url}&spoof=1` }, "sender URL mismatch"],
+    [{ authorizationConsumed: false }, "authorization required"],
+    [{ handshakeConsumed: true }, "proof event already consumed"],
+  ] as const) {
+    assert.deepEqual(validatePromotionOriginalRendererMountTimeout(
+      { ...context, ...override },
+      payload,
+      nonce,
+    ), { accepted: false, reason, observation: null });
+  }
+  for (const malformed of [
+    null,
+    [],
+    { ...payload, extra: true },
+    { ...payload, nonce: "123e4567-e89b-42d3-a456-426614174001" },
+    { ...payload, url: `${url}&spoof=1` },
+    { ...payload, lifecycle: "renderer-mounted" },
+    { ...payload, rendererSandboxed: false },
+    { ...payload, rendererSandboxed: "true" },
+  ]) {
+    assert.equal(validatePromotionOriginalRendererMountTimeout(context, malformed, nonce).accepted, false);
+  }
+
+  const tracker = createPromotionOriginalRendererProofTracker(nonce);
+  tracker.eligibleWindow({
+    webContentsId: 91,
+    url,
+    isDefaultSession: true,
+    sandbox: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  tracker.authorization(91);
+  tracker.fail("canonical renderer mount timed out", 91);
+  tracker.didFinishLoad(91, url);
+  tracker.rendererHandshake({
+    webContentsId: 91,
+    nonce,
+    url,
+    lifecycle: "renderer-mounted",
+    rendererSandboxed: true,
+    rendererStorageSelfTest: "pass",
+  });
+  tracker.cleanup(true);
+  assert.equal(tracker.result().hostReady, "fail", "a valid timeout remains permanent after late success signals");
+  assert.equal(tracker.summary().failureReason, "canonical renderer mount timed out");
 });
 
 test("promotion renderer URL selects the exact production origin document", () => {
@@ -696,6 +946,39 @@ test("patched runtime answers a secure promotion request with mocked probes", as
       authenticatedSession: "pass",
       declaredPermissions: { accessibility: "pass" },
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion request freshness covers the bounded outer renderer probe but still expires", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-freshness-"));
+  try {
+    const health = join(root, "health");
+    mkdirSync(health);
+    const request = join(health, "request.json");
+    const value = {
+      schemaVersion: 1,
+      requestedAt: "2026-07-10T12:00:00.000Z",
+      app: { version: "1", build: "2", hash: "app-hash" },
+      runtimeHash: "runtime-hash",
+      requiredPermissions: [] as string[],
+    };
+    const probes = {
+      authenticatedSession: () => "pass" as const,
+      declaredPermission: () => "pass" as const,
+    };
+    writeFileSync(request, JSON.stringify(value), { mode: 0o600 });
+    assert.equal(await answerPromotionHealthRequest(root, probes, {
+      now: new Date("2026-07-10T12:01:30.000Z"),
+      maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
+    }), true);
+
+    writeFileSync(request, JSON.stringify(value), { mode: 0o600 });
+    assert.equal(await answerPromotionHealthRequest(root, probes, {
+      now: new Date("2026-07-10T12:02:00.001Z"),
+      maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
+    }), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

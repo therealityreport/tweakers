@@ -89,6 +89,7 @@ import {
   authorizePromotionOriginalRenderer,
   authorizePromotionRenderer,
   canonicalPromotionOriginalRendererUrl,
+  createPromotionOriginalRendererDeadlineController,
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
@@ -101,12 +102,15 @@ import {
   PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL,
   PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL,
   PROMOTION_ORIGINAL_RENDERER_URL,
+  PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
   promotionOriginalRendererEvidenceUrl,
   promotionOriginalRendererLogUrl,
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
+  shouldFailPromotionOriginalRendererProvisionalLoad,
   validatePromotionOriginalRendererHandshake,
+  validatePromotionOriginalRendererMountTimeout,
   validatePromotionRendererHandshake,
   type HealthValue,
   type PromotionRendererProofResult,
@@ -2495,6 +2499,35 @@ function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
       fail("canonical renderer mount timed out", event.sender.id);
       return;
     }
+    const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).lifecycle
+      : null;
+    if (lifecycle === "renderer-mount-timeout") {
+      const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!timeoutDecision.accepted) {
+        log("warn", "promotion original renderer mount-timeout rejected", {
+          webContentsId: event.sender.id,
+          reason: timeoutDecision.reason,
+        });
+        return;
+      }
+      handshakeConsumed = true;
+      log("warn", "promotion original renderer mount timed out", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(timeoutDecision.observation.url),
+        rendererSandboxed: timeoutDecision.observation.rendererSandboxed,
+      });
+      fail("canonical renderer mount timed out", event.sender.id);
+      return;
+    }
     const decision = validatePromotionOriginalRendererHandshake({
       windowAlive,
       senderMatches,
@@ -2697,7 +2730,7 @@ app.whenReady().then(() => {
     rendererProof: () => rendererProof.proofSummary ?? null,
     promotionSurface: promotionSurfaceHash,
     userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
-    }).then((answered) => {
+    }, { maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS }).then((answered) => {
       if (!answered) {
         // No pending request file is the normal case on an ordinary launch;
         // only a request that exists but fails validation deserves a warn.

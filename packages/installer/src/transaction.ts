@@ -29,6 +29,9 @@ import {
 
 export type HealthValue = "pass" | "fail" | "unknown";
 
+/** Longer than the contained probe cap, while still rejecting old receipts. */
+export const PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS = 120_000;
+
 export interface AppFingerprint {
   version: string;
   build: string;
@@ -644,7 +647,11 @@ export function readProductionHealthReceipt(
     if (!plainRecord(receipt) || !sameFingerprintValue(receipt.app, expected.app)) return unknown;
     const now = (options.now ?? new Date()).getTime();
     const observedAt = Date.parse(typeof receipt.observedAt === "string" ? receipt.observedAt : "");
-    if (!Number.isFinite(observedAt) || observedAt > now + 5_000 || now - observedAt > (options.maxAgeMs ?? 60_000)) return unknown;
+    if (
+      !Number.isFinite(observedAt)
+      || observedAt > now + 5_000
+      || now - observedAt > (options.maxAgeMs ?? PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS)
+    ) return unknown;
     if (v2Expected) return readV2HealthReceipt(receipt, expected, unknown);
     if (!validLegacyHealthReceipt(receipt, expected)) return unknown;
     return {

@@ -7,6 +7,34 @@ export declare const PROMOTION_RENDERER_HOST = "-";
 export declare const PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 export declare const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 export declare const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+export declare const PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 20000;
+export declare const PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 60000;
+export declare const PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = 55000;
+export declare const PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = 5000;
+export declare const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 120000;
+export type PromotionOriginalRendererDeadlinePhase = "startup" | "completion" | "settled";
+export interface PromotionOriginalRendererDeadlineScheduler {
+    set(callback: () => void, timeoutMs: number): unknown;
+    clear(handle: unknown): void;
+}
+export interface PromotionOriginalRendererDeadlineController {
+    /** Arms the completion phase only for the first exact canonical selection. */
+    canonicalSelected(): boolean;
+    /** Permanently cancels the currently armed deadline. */
+    settle(): void;
+    phase(): PromotionOriginalRendererDeadlinePhase;
+}
+/**
+ * One-shot, phase-relative deadline controller for the original renderer.
+ * Repeated navigation, eligibility and authorization signals cannot rearm or
+ * extend either phase.
+ */
+export declare function createPromotionOriginalRendererDeadlineController(options: {
+    onTimeout: (phase: Exclude<PromotionOriginalRendererDeadlinePhase, "settled">) => void;
+    scheduler?: PromotionOriginalRendererDeadlineScheduler;
+    startupTimeoutMs?: number;
+    completionTimeoutMs?: number;
+}): PromotionOriginalRendererDeadlineController;
 /**
  * Accept the production Owl document, including its exact observed query,
  * without accepting a synthetic proof nonce or URL normalization ambiguity.
@@ -95,6 +123,12 @@ export interface PromotionOriginalRendererProofTracker {
     result(): PromotionRendererProofResult;
     summary(): PromotionOriginalRendererProofSummary;
 }
+/** Only the selected canonical main frame may poison provisional-load health. */
+export declare function shouldFailPromotionOriginalRendererProvisionalLoad(input: {
+    isMainFrame: boolean;
+    webContentsId: number;
+    canonicalWebContentsId: number | null;
+}): boolean;
 /** Pure state machine for the original Codex renderer promotion gate. */
 export declare function createPromotionOriginalRendererProofTracker(nonce: string): PromotionOriginalRendererProofTracker;
 export interface PromotionRendererAuthorizationContext {
@@ -156,6 +190,20 @@ export type PromotionOriginalRendererHandshakeDecision = {
         rendererStorageSelfTest: HealthValue;
     };
 };
+export type PromotionOriginalRendererMountTimeoutDecision = {
+    accepted: false;
+    reason: string;
+    observation: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+        nonce: string;
+        url: string;
+        lifecycle: "renderer-mount-timeout";
+        rendererSandboxed: true;
+    };
+};
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 export declare function authorizePromotionRenderer(context: PromotionRendererAuthorizationContext, payload: unknown, nonce: string): PromotionRendererAuthorizationDecision;
 /** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
@@ -167,6 +215,11 @@ export declare function validatePromotionRendererHandshake(context: PromotionRen
  * an explicit sandbox disablement or accepted without a positive signal.
  */
 export declare function validatePromotionOriginalRendererHandshake(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionOriginalRendererHandshakeDecision;
+/**
+ * Validates the preload's fail-closed mount timeout on the same exact sender,
+ * frame, URL, authorization, nonce and effective-sandbox boundary as success.
+ */
+export declare function validatePromotionOriginalRendererMountTimeout(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionOriginalRendererMountTimeoutDecision;
 export interface PromotionRendererProtocolRequest {
     url: string;
 }

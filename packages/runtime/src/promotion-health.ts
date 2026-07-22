@@ -13,7 +13,83 @@ export const PROMOTION_RENDERER_HOST = "-";
 export const PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 export const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 export const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+export const PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 20_000;
+export const PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 60_000;
+export const PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = 55_000;
+export const PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = 5_000;
+export const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 120_000;
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
+
+export type PromotionOriginalRendererDeadlinePhase = "startup" | "completion" | "settled";
+
+export interface PromotionOriginalRendererDeadlineScheduler {
+  set(callback: () => void, timeoutMs: number): unknown;
+  clear(handle: unknown): void;
+}
+
+export interface PromotionOriginalRendererDeadlineController {
+  /** Arms the completion phase only for the first exact canonical selection. */
+  canonicalSelected(): boolean;
+  /** Permanently cancels the currently armed deadline. */
+  settle(): void;
+  phase(): PromotionOriginalRendererDeadlinePhase;
+}
+
+/**
+ * One-shot, phase-relative deadline controller for the original renderer.
+ * Repeated navigation, eligibility and authorization signals cannot rearm or
+ * extend either phase.
+ */
+export function createPromotionOriginalRendererDeadlineController(options: {
+  onTimeout: (phase: Exclude<PromotionOriginalRendererDeadlinePhase, "settled">) => void;
+  scheduler?: PromotionOriginalRendererDeadlineScheduler;
+  startupTimeoutMs?: number;
+  completionTimeoutMs?: number;
+}): PromotionOriginalRendererDeadlineController {
+  const scheduler = options.scheduler ?? {
+    set(callback, timeoutMs) {
+      const handle = setTimeout(callback, timeoutMs);
+      handle.unref?.();
+      return handle;
+    },
+    clear(handle) {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    },
+  };
+  const startupTimeoutMs = options.startupTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS;
+  const completionTimeoutMs = options.completionTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS;
+  let phase: PromotionOriginalRendererDeadlinePhase = "startup";
+  let handle: unknown = null;
+
+  const arm = (expectedPhase: Exclude<PromotionOriginalRendererDeadlinePhase, "settled">, timeoutMs: number): void => {
+    handle = scheduler.set(() => {
+      if (phase !== expectedPhase) return;
+      handle = null;
+      phase = "settled";
+      options.onTimeout(expectedPhase);
+    }, timeoutMs);
+  };
+  arm("startup", startupTimeoutMs);
+
+  return {
+    canonicalSelected() {
+      if (phase !== "startup") return false;
+      if (handle !== null) scheduler.clear(handle);
+      phase = "completion";
+      arm("completion", completionTimeoutMs);
+      return true;
+    },
+    settle() {
+      if (phase === "settled") return;
+      if (handle !== null) scheduler.clear(handle);
+      handle = null;
+      phase = "settled";
+    },
+    phase() {
+      return phase;
+    },
+  };
+}
 
 /**
  * Accept the production Owl document, including its exact observed query,
@@ -203,6 +279,18 @@ export interface PromotionOriginalRendererProofTracker {
   summary(): PromotionOriginalRendererProofSummary;
 }
 
+/** Only the selected canonical main frame may poison provisional-load health. */
+export function shouldFailPromotionOriginalRendererProvisionalLoad(input: {
+  isMainFrame: boolean;
+  webContentsId: number;
+  canonicalWebContentsId: number | null;
+}): boolean {
+  return input.isMainFrame === true
+    && Number.isSafeInteger(input.webContentsId)
+    && input.webContentsId > 0
+    && input.canonicalWebContentsId === input.webContentsId;
+}
+
 /** Pure state machine for the original Codex renderer promotion gate. */
 export function createPromotionOriginalRendererProofTracker(
   nonce: string,
@@ -223,7 +311,10 @@ export function createPromotionOriginalRendererProofTracker(
   const preloadErrorIds = new Set<number>();
   const isCanonical = (id: number): boolean => canonicalWebContentsId === id;
   const permanentlyFail = (reason: string): void => {
-    if (reason === "canonical renderer load failed") loadFailed = true;
+    if (
+      reason === "canonical renderer load failed"
+      || reason === "canonical renderer provisional load failed"
+    ) loadFailed = true;
     if (reason === "canonical renderer process exited") rendererExited = true;
     if (reason === "canonical original preload failed") preloadFailed = true;
     if (failureReason === null) {
@@ -403,6 +494,19 @@ export type PromotionOriginalRendererHandshakeDecision =
     };
   };
 
+export type PromotionOriginalRendererMountTimeoutDecision =
+  | { accepted: false; reason: string; observation: null }
+  | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+      nonce: string;
+      url: string;
+      lifecycle: "renderer-mount-timeout";
+      rendererSandboxed: true;
+    };
+  };
+
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 export function authorizePromotionRenderer(
   context: PromotionRendererAuthorizationContext,
@@ -507,6 +611,45 @@ export function validatePromotionOriginalRendererHandshake(
       lifecycle: "renderer-mounted",
       rendererSandboxed: payload.rendererSandboxed,
       rendererStorageSelfTest: payload.rendererStorageSelfTest,
+    },
+  };
+}
+
+/**
+ * Validates the preload's fail-closed mount timeout on the same exact sender,
+ * frame, URL, authorization, nonce and effective-sandbox boundary as success.
+ */
+export function validatePromotionOriginalRendererMountTimeout(
+  context: PromotionRendererHandshakeContext,
+  payload: unknown,
+  nonce: string,
+): PromotionOriginalRendererMountTimeoutDecision {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (
+    payload.nonce !== nonce
+    || payload.url !== context.expectedUrl
+    || payload.lifecycle !== "renderer-mount-timeout"
+    || payload.rendererSandboxed !== true
+  ) {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mount-timeout",
+      rendererSandboxed: true,
     },
   };
 }

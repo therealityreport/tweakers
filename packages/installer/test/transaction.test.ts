@@ -7,6 +7,7 @@ import {
   archiveTransactionState,
   generateProductionHealthReceipt,
   probeNativeHealth,
+  PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS,
   PROMOTION_SURFACE_NAMES,
   readProductionHealthReceipt,
   readTransactionState,
@@ -675,7 +676,11 @@ test("production health receipt requires mode 0600, fresh matching app/runtime i
     chmodSync(receipt, 0o644);
     assert.equal(readProductionHealthReceipt(receipt, expected).host, "unknown");
     chmodSync(receipt, 0o600);
-    assert.equal(readProductionHealthReceipt(receipt, expected, { now: new Date("2026-07-10T12:02:00.000Z") }).session, "unknown");
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: new Date("2026-07-10T12:01:30.000Z") }).session, "pass");
+    assert.equal(readProductionHealthReceipt(receipt, expected, {
+      now: new Date("2026-07-10T12:02:00.001Z"),
+    }).session, "unknown");
+    assert.equal(PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS, 120_000);
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, runtimeHash: "changed" }).host, "unknown");
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "changed" } }).host, "unknown");
   } finally {

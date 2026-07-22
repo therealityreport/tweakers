@@ -12,7 +12,9 @@ const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
 const effectiveRendererSandboxed = process.sandboxed === true;
 
-const MOUNT_TIMEOUT_MS = 20_000;
+// Kept below the main-process completion phase so this exact, bound failure is
+// observed and cleaned up before the outer completion deadline can fire.
+const MOUNT_TIMEOUT_MS = 55_000;
 
 type Authorization = { version: 1; nonce: string; url: string };
 
@@ -108,6 +110,12 @@ function observeOriginalRendererMount(authorized: Authorization): void {
     if (settled) return;
     settled = true;
     observer.disconnect();
+    ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
+      nonce: authorized.nonce,
+      url: unmodifiedUrl,
+      lifecycle: "renderer-mount-timeout",
+      rendererSandboxed: effectiveRendererSandboxed,
+    });
   }, MOUNT_TIMEOUT_MS);
 
   function inspect(): void {

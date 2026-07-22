@@ -1,15 +1,18 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_URL = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_AUTH_CHANNEL = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = exports.PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = exports.PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = exports.PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = exports.PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = exports.PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_URL = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_AUTH_CHANNEL = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.createPromotionOriginalRendererDeadlineController = createPromotionOriginalRendererDeadlineController;
 exports.canonicalPromotionOriginalRendererUrl = canonicalPromotionOriginalRendererUrl;
 exports.promotionOriginalRendererEvidenceUrl = promotionOriginalRendererEvidenceUrl;
 exports.promotionOriginalRendererLogUrl = promotionOriginalRendererLogUrl;
 exports.hasUniqueSandboxedPromotionRendererProcess = hasUniqueSandboxedPromotionRendererProcess;
 exports.authorizePromotionOriginalRenderer = authorizePromotionOriginalRenderer;
+exports.shouldFailPromotionOriginalRendererProvisionalLoad = shouldFailPromotionOriginalRendererProvisionalLoad;
 exports.createPromotionOriginalRendererProofTracker = createPromotionOriginalRendererProofTracker;
 exports.authorizePromotionRenderer = authorizePromotionRenderer;
 exports.validatePromotionRendererHandshake = validatePromotionRendererHandshake;
 exports.validatePromotionOriginalRendererHandshake = validatePromotionOriginalRendererHandshake;
+exports.validatePromotionOriginalRendererMountTimeout = validatePromotionOriginalRendererMountTimeout;
 exports.promotionRendererDocumentUrl = promotionRendererDocumentUrl;
 exports.promotionRendererAssetRoute = promotionRendererAssetRoute;
 exports.promotionRendererAssetMimeType = promotionRendererAssetMimeType;
@@ -32,7 +35,65 @@ exports.PROMOTION_RENDERER_HOST = "-";
 exports.PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 exports.PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 exports.PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+exports.PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 20_000;
+exports.PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 60_000;
+exports.PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = 55_000;
+exports.PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = 5_000;
+exports.PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 120_000;
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
+/**
+ * One-shot, phase-relative deadline controller for the original renderer.
+ * Repeated navigation, eligibility and authorization signals cannot rearm or
+ * extend either phase.
+ */
+function createPromotionOriginalRendererDeadlineController(options) {
+    const scheduler = options.scheduler ?? {
+        set(callback, timeoutMs) {
+            const handle = setTimeout(callback, timeoutMs);
+            handle.unref?.();
+            return handle;
+        },
+        clear(handle) {
+            clearTimeout(handle);
+        },
+    };
+    const startupTimeoutMs = options.startupTimeoutMs ?? exports.PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS;
+    const completionTimeoutMs = options.completionTimeoutMs ?? exports.PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS;
+    let phase = "startup";
+    let handle = null;
+    const arm = (expectedPhase, timeoutMs) => {
+        handle = scheduler.set(() => {
+            if (phase !== expectedPhase)
+                return;
+            handle = null;
+            phase = "settled";
+            options.onTimeout(expectedPhase);
+        }, timeoutMs);
+    };
+    arm("startup", startupTimeoutMs);
+    return {
+        canonicalSelected() {
+            if (phase !== "startup")
+                return false;
+            if (handle !== null)
+                scheduler.clear(handle);
+            phase = "completion";
+            arm("completion", completionTimeoutMs);
+            return true;
+        },
+        settle() {
+            if (phase === "settled")
+                return;
+            if (handle !== null)
+                scheduler.clear(handle);
+            handle = null;
+            phase = "settled";
+        },
+        phase() {
+            return phase;
+        },
+    };
+}
 /**
  * Accept the production Owl document, including its exact observed query,
  * without accepting a synthetic proof nonce or URL normalization ambiguity.
@@ -152,6 +213,13 @@ function authorizePromotionOriginalRenderer(context, payload, nonce) {
         response: { version: 1, nonce, url: canonicalUrl },
     };
 }
+/** Only the selected canonical main frame may poison provisional-load health. */
+function shouldFailPromotionOriginalRendererProvisionalLoad(input) {
+    return input.isMainFrame === true
+        && Number.isSafeInteger(input.webContentsId)
+        && input.webContentsId > 0
+        && input.canonicalWebContentsId === input.webContentsId;
+}
 /** Pure state machine for the original Codex renderer promotion gate. */
 function createPromotionOriginalRendererProofTracker(nonce) {
     let capturedWindowCount = 0;
@@ -170,7 +238,8 @@ function createPromotionOriginalRendererProofTracker(nonce) {
     const preloadErrorIds = new Set();
     const isCanonical = (id) => canonicalWebContentsId === id;
     const permanentlyFail = (reason) => {
-        if (reason === "canonical renderer load failed")
+        if (reason === "canonical renderer load failed"
+            || reason === "canonical renderer provisional load failed")
             loadFailed = true;
         if (reason === "canonical renderer process exited")
             rendererExited = true;
@@ -411,6 +480,45 @@ function validatePromotionOriginalRendererHandshake(context, payload, nonce) {
             lifecycle: "renderer-mounted",
             rendererSandboxed: payload.rendererSandboxed,
             rendererStorageSelfTest: payload.rendererStorageSelfTest,
+        },
+    };
+}
+/**
+ * Validates the preload's fail-closed mount timeout on the same exact sender,
+ * frame, URL, authorization, nonce and effective-sandbox boundary as success.
+ */
+function validatePromotionOriginalRendererMountTimeout(context, payload, nonce) {
+    if (!context.windowAlive)
+        return { accepted: false, reason: "proof window unavailable", observation: null };
+    if (!context.senderMatches)
+        return { accepted: false, reason: "sender mismatch", observation: null };
+    if (!context.frameMatches)
+        return { accepted: false, reason: "frame mismatch", observation: null };
+    if (context.senderUrl !== context.expectedUrl)
+        return { accepted: false, reason: "sender URL mismatch", observation: null };
+    if (!context.authorizationConsumed)
+        return { accepted: false, reason: "authorization required", observation: null };
+    if (context.handshakeConsumed)
+        return { accepted: false, reason: "proof event already consumed", observation: null };
+    if (!plainRecord(payload))
+        return { accepted: false, reason: "payload invalid", observation: null };
+    if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
+        return { accepted: false, reason: "payload keys invalid", observation: null };
+    }
+    if (payload.nonce !== nonce
+        || payload.url !== context.expectedUrl
+        || payload.lifecycle !== "renderer-mount-timeout"
+        || payload.rendererSandboxed !== true) {
+        return { accepted: false, reason: "payload binding invalid", observation: null };
+    }
+    return {
+        accepted: true,
+        reason: "accepted",
+        observation: {
+            nonce,
+            url: context.expectedUrl,
+            lifecycle: "renderer-mount-timeout",
+            rendererSandboxed: true,
         },
     };
 }

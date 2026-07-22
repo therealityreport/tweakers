@@ -7,12 +7,19 @@ import test from "node:test";
 import {
   HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH,
   HEALTH_PROBE_PROCESS_TIMEOUT_MS,
+  HEALTH_PROBE_RECEIPT_TIMEOUT_MS,
   HEALTH_PROBE_ROOT_PREFIX,
   HEALTH_PROBE_TEMP_RELATIVE_PATH,
   HEALTH_PROBE_USER_DATA_RELATIVE_PATH,
   spawnAuthenticatedHiddenHealthProbe,
   spawnHiddenHealthProbe,
 } from "../src/commands/install";
+
+test("health probe timeouts cover startup, completion, and bounded cleanup headroom", () => {
+  assert.equal(HEALTH_PROBE_PROCESS_TIMEOUT_MS, 90_000);
+  assert.equal(HEALTH_PROBE_RECEIPT_TIMEOUT_MS, 90_000);
+  assert.ok(HEALTH_PROBE_PROCESS_TIMEOUT_MS > 20_000 + 60_000 + 5_000);
+});
 
 interface RecordedSpawnCall {
   command: string;

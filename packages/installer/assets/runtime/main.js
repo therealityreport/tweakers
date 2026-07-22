@@ -11723,7 +11723,53 @@ var PROMOTION_RENDERER_HOST = "-";
 var PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 var PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 var PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+var PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 2e4;
+var PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 6e4;
+var PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 12e4;
 var PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = /* @__PURE__ */ new Set(["hostId", "initialRoute"]);
+function createPromotionOriginalRendererDeadlineController(options) {
+  const scheduler = options.scheduler ?? {
+    set(callback, timeoutMs) {
+      const handle2 = setTimeout(callback, timeoutMs);
+      handle2.unref?.();
+      return handle2;
+    },
+    clear(handle2) {
+      clearTimeout(handle2);
+    }
+  };
+  const startupTimeoutMs = options.startupTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS;
+  const completionTimeoutMs = options.completionTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS;
+  let phase = "startup";
+  let handle = null;
+  const arm = (expectedPhase, timeoutMs) => {
+    handle = scheduler.set(() => {
+      if (phase !== expectedPhase) return;
+      handle = null;
+      phase = "settled";
+      options.onTimeout(expectedPhase);
+    }, timeoutMs);
+  };
+  arm("startup", startupTimeoutMs);
+  return {
+    canonicalSelected() {
+      if (phase !== "startup") return false;
+      if (handle !== null) scheduler.clear(handle);
+      phase = "completion";
+      arm("completion", completionTimeoutMs);
+      return true;
+    },
+    settle() {
+      if (phase === "settled") return;
+      if (handle !== null) scheduler.clear(handle);
+      handle = null;
+      phase = "settled";
+    },
+    phase() {
+      return phase;
+    }
+  };
+}
 function canonicalPromotionOriginalRendererUrl(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) return null;
   let parsed;
@@ -11791,6 +11837,9 @@ function authorizePromotionOriginalRenderer(context, payload, nonce) {
     response: { version: 1, nonce, url: canonicalUrl }
   };
 }
+function shouldFailPromotionOriginalRendererProvisionalLoad(input) {
+  return input.isMainFrame === true && Number.isSafeInteger(input.webContentsId) && input.webContentsId > 0 && input.canonicalWebContentsId === input.webContentsId;
+}
 function createPromotionOriginalRendererProofTracker(nonce) {
   let capturedWindowCount = 0;
   let canonicalWebContentsId = null;
@@ -11808,7 +11857,7 @@ function createPromotionOriginalRendererProofTracker(nonce) {
   const preloadErrorIds = /* @__PURE__ */ new Set();
   const isCanonical = (id) => canonicalWebContentsId === id;
   const permanentlyFail = (reason) => {
-    if (reason === "canonical renderer load failed") loadFailed = true;
+    if (reason === "canonical renderer load failed" || reason === "canonical renderer provisional load failed") loadFailed = true;
     if (reason === "canonical renderer process exited") rendererExited = true;
     if (reason === "canonical original preload failed") preloadFailed = true;
     if (failureReason === null) {
@@ -11996,6 +12045,31 @@ function validatePromotionOriginalRendererHandshake(context, payload, nonce) {
       lifecycle: "renderer-mounted",
       rendererSandboxed: payload.rendererSandboxed,
       rendererStorageSelfTest: payload.rendererStorageSelfTest
+    }
+  };
+}
+function validatePromotionOriginalRendererMountTimeout(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-mount-timeout" || payload.rendererSandboxed !== true) {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-mount-timeout",
+      rendererSandboxed: true
     }
   };
 }
@@ -16236,6 +16310,33 @@ function createPromotionOriginalMainProbe() {
       fail("canonical renderer mount timed out", event.sender.id);
       return;
     }
+    const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload.lifecycle : null;
+    if (lifecycle === "renderer-mount-timeout") {
+      const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        handshakeConsumed
+      }, payload, nonce);
+      if (!timeoutDecision.accepted) {
+        log("warn", "promotion original renderer mount-timeout rejected", {
+          webContentsId: event.sender.id,
+          reason: timeoutDecision.reason
+        });
+        return;
+      }
+      handshakeConsumed = true;
+      log("warn", "promotion original renderer mount timed out", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(timeoutDecision.observation.url),
+        rendererSandboxed: timeoutDecision.observation.rendererSandboxed
+      });
+      fail("canonical renderer mount timed out", event.sender.id);
+      return;
+    }
     const decision = validatePromotionOriginalRendererHandshake({
       windowAlive,
       senderMatches,
@@ -16404,7 +16505,7 @@ import_electron4.app.whenReady().then(() => {
       rendererProof: () => rendererProof.proofSummary ?? null,
       promotionSurface: promotionSurfaceHash,
       userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest)
-    }).then((answered) => {
+    }, { maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS }).then((answered) => {
       if (!answered) {
         const requestPending = (0, import_node_fs23.existsSync)((0, import_node_path26.join)(userRoot, "health", "request.json"));
         log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");

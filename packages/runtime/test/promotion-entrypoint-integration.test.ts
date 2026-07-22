@@ -361,7 +361,11 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /app\.removeListener\("ready", onAppReady\)/);
   assert.match(controller, /registerPreloadScript/);
   assert.match(controller, /PROMOTION_HEALTH_PRELOAD_PATH/);
-  assert.match(controller, /setTimeout\(\(\) => \{\s*fail\("promotion original renderer watchdog expired"\);\s*\}, 25_000\)/);
+  assert.match(controller, /createPromotionOriginalRendererDeadlineController/);
+  assert.match(controller, /promotion original renderer startup timed out/);
+  assert.match(controller, /promotion original renderer completion timed out/);
+  assert.match(controller, /deadlineController\.canonicalSelected\(\)/);
+  assert.doesNotMatch(controller, /promotion original renderer watchdog expired/);
   assert.match(controller, /window\.setFocusable\(false\)/);
   assert.match(controller, /window\.hide\(\)/);
   assert.match(controller, /\["show", "showInactive", "focus", "restore"\] as const/);
@@ -383,6 +387,9 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /tracker\.eligibleWindow\(\{[\s\S]*?url: canonicalUrl,/);
   assert.match(controller, /sandbox: preferences\.sandbox,/);
   assert.match(controller, /validatePromotionOriginalRendererHandshake/);
+  assert.match(controller, /validatePromotionOriginalRendererMountTimeout/);
+  assert.match(controller, /promotion original renderer mount timed out/);
+  assert.match(controller, /canonical renderer mount timed out/);
   assert.match(controller, /rendererSandboxed: decision\.observation\.rendererSandboxed/);
   const originalAuthorization = controller.slice(
     controller.indexOf("const onAuthorization ="),
@@ -405,7 +412,14 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /promotion original renderer preload failed/);
   assert.match(controller, /event\.returnValue = JSON\.stringify\(decision\.response\)/);
   assert.match(controller, /"did-start-navigation"/);
+  assert.match(controller, /"dom-ready"/);
+  assert.match(controller, /promotion original renderer DOM ready/);
+  assert.match(controller, /"did-stop-loading"/);
+  assert.match(controller, /promotion original renderer stopped loading/);
   assert.match(controller, /"did-fail-load"/);
+  assert.match(controller, /"did-fail-provisional-load"/);
+  assert.match(controller, /shouldFailPromotionOriginalRendererProvisionalLoad/);
+  assert.match(controller, /canonical renderer provisional load failed/);
   assert.match(controller, /"render-process-gone"/);
   assert.match(controller, /cleanupTrackedParents\(\)/);
   assert.match(controller, /unregisterPreloadScript/);
@@ -433,6 +447,8 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(originalHealthPreloadSource, /location\.href/);
   assert.match(originalHealthPreloadSource, /sendSync\(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL/);
   assert.match(originalHealthPreloadSource, /rendererSandboxed: effectiveRendererSandboxed/);
+  assert.match(originalHealthPreloadSource, /const MOUNT_TIMEOUT_MS = 55_000/);
+  assert.match(originalHealthPreloadSource, /lifecycle: "renderer-mount-timeout"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_URL = "app:\/\/-\/index\.html"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof"/);
