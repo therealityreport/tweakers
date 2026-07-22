@@ -693,6 +693,21 @@ test("schema-v2 production health accepts only the exact eight surfaces and cano
       observedAt: "2026-07-10T12:00:00.000Z",
       app: expected.app,
       hostReady: "pass",
+      rendererProof: {
+        capturedWindowCount: 1,
+        canonicalWebContentsId: 71,
+        canonicalUrl: "app://-/index.html",
+        queryKeys: ["hostId"],
+        authorized: true,
+        didFinishLoad: true,
+        mounted: true,
+        originalPreload: true,
+        preloadFailed: false,
+        loadFailed: false,
+        rendererExited: false,
+        cleanup: "pass",
+        failureReason: null,
+      },
       authenticatedSession: "pass",
       declaredPermissions: { accessibility: "pass" },
       surfaces: Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [name, {
@@ -737,6 +752,25 @@ test("schema-v2 production health accepts only the exact eight surfaces and cano
     conflicting.promotionReady = "fail";
     writeFileSync(receipt, JSON.stringify(conflicting), { mode: 0o600 });
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "fail");
+
+    const missingRendererProof = structuredClone(valid) as Record<string, unknown>;
+    delete missingRendererProof.rendererProof;
+    writeFileSync(receipt, JSON.stringify(missingRendererProof), { mode: 0o600 });
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "unknown");
+
+    const failedRendererProof = structuredClone(valid);
+    failedRendererProof.hostReady = "fail";
+    failedRendererProof.rendererProof.rendererExited = true;
+    failedRendererProof.rendererProof.failureReason = "canonical renderer process exited";
+    failedRendererProof.promotionReady = "fail";
+    writeFileSync(receipt, JSON.stringify(failedRendererProof), { mode: 0o600 });
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "fail");
+
+    const forgedHostReady = structuredClone(valid);
+    forgedHostReady.hostReady = "fail";
+    forgedHostReady.promotionReady = "pass";
+    writeFileSync(receipt, JSON.stringify(forgedHostReady), { mode: 0o600 });
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "unknown");
   } finally {
     clean(f.root);
   }

@@ -5,12 +5,17 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   answerPromotionHealthRequest,
+  authorizePromotionOriginalRenderer,
   authorizePromotionRenderer,
+  canonicalPromotionOriginalRendererUrl,
+  createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
+  PROMOTION_ORIGINAL_RENDERER_URL,
   PROMOTION_SURFACE_NAMES,
+  promotionOriginalRendererLogUrl,
   promotionRendererAssetMimeType,
   promotionRendererAssetRoute,
   promotionRendererDocumentUrl,
@@ -18,6 +23,186 @@ import {
   readCodexAuth,
   validatePromotionRendererHandshake,
 } from "../src/promotion-health";
+
+const PASSING_RENDERER_PROOF = {
+  capturedWindowCount: 1,
+  canonicalWebContentsId: 71,
+  canonicalUrl: `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`,
+  authorized: true,
+  didFinishLoad: true,
+  mounted: true,
+  originalPreload: true,
+  preloadFailed: false,
+  loadFailed: false,
+  rendererExited: false,
+  cleanup: "pass" as const,
+  failureReason: null,
+};
+
+test("original renderer authorization is exact, hidden, main-frame, and one-shot", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const context = {
+    windowAlive: true,
+    windowHidden: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: PROMOTION_ORIGINAL_RENDERER_URL,
+    consumed: false,
+  };
+  const payload = { version: 1, url: PROMOTION_ORIGINAL_RENDERER_URL };
+  assert.deepEqual(authorizePromotionOriginalRenderer(context, payload, nonce), {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url: PROMOTION_ORIGINAL_RENDERER_URL },
+  });
+  const queriedUrl = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123&initialRoute=%2Fsettings`;
+  assert.deepEqual(authorizePromotionOriginalRenderer(
+    { ...context, senderUrl: queriedUrl },
+    { version: 1, url: queriedUrl },
+    nonce,
+  ), {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url: queriedUrl },
+  });
+  for (const override of [
+    { windowAlive: false },
+    { windowHidden: false },
+    { senderMatches: false },
+    { frameMatches: false },
+    { senderUrl: `${PROMOTION_ORIGINAL_RENDERER_URL}?tweakerPromotionNonce=untrusted` },
+    { senderUrl: "https://-/index.html?hostId=host-123" },
+    { senderUrl: "app://-/other.html?hostId=host-123" },
+    { senderUrl: `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123#fragment` },
+    { consumed: true },
+  ]) {
+    assert.equal(authorizePromotionOriginalRenderer({ ...context, ...override }, payload, nonce).accepted, false);
+  }
+  for (const malformed of [
+    null,
+    { version: 1 },
+    { ...payload, extra: true },
+    { version: 2, url: PROMOTION_ORIGINAL_RENDERER_URL },
+    { version: 1, url: `${PROMOTION_ORIGINAL_RENDERER_URL}?nonce=untrusted` },
+  ]) {
+    assert.equal(authorizePromotionOriginalRenderer(context, malformed, nonce).accepted, false);
+  }
+});
+
+test("original renderer URL accepts exact production queries and rejects normalization ambiguity", () => {
+  for (const url of [
+    PROMOTION_ORIGINAL_RENDERER_URL,
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=123e4567-e89b-42d3-a456-426614174000`,
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123&initialRoute=%2Fsettings`,
+  ]) assert.equal(canonicalPromotionOriginalRendererUrl(url), url);
+
+  for (const url of [
+    "https://-/index.html?hostId=host-123",
+    "app://user@-/index.html?hostId=host-123",
+    "app://-:123/index.html?hostId=host-123",
+    "app://-/other.html?hostId=host-123",
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123#fragment`,
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?tweakerPromotionNonce=untrusted`,
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?code=secret-oauth-code`,
+    `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123\nspoof=1`,
+  ]) assert.equal(canonicalPromotionOriginalRendererUrl(url), null, url);
+
+  const sensitiveRoute = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123&initialRoute=%2Foauth%3Fcode%3Dsecret-value`;
+  const logged = promotionOriginalRendererLogUrl(sensitiveRoute);
+  assert.equal(logged, `${PROMOTION_ORIGINAL_RENDERER_URL}?[hostId,initialRoute:redacted]`);
+  assert.doesNotMatch(logged, /secret-value|oauth|host-123/);
+});
+
+test("original renderer proof requires safe exact window, auth, load, mount, and cleanup", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const originalUrl = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
+  const tracker = createPromotionOriginalRendererProofTracker(nonce);
+  tracker.windowCaptured();
+  tracker.eligibleWindow({
+    webContentsId: 71,
+    url: originalUrl,
+    isDefaultSession: true,
+    sandbox: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  tracker.authorization(71);
+  tracker.rendererHandshake({
+    webContentsId: 71,
+    nonce,
+    url: originalUrl,
+    lifecycle: "renderer-mounted",
+    rendererStorageSelfTest: "pass",
+  });
+  assert.equal(tracker.result().hostReady, "unknown");
+  tracker.didFinishLoad(71, originalUrl);
+  assert.equal(tracker.complete(), true);
+  assert.equal(tracker.result().hostReady, "unknown", "cleanup is a required final gate");
+  tracker.cleanup(true);
+  assert.deepEqual(tracker.result(), {
+    hostReady: "pass",
+    rendererStorageSelfTest: "pass",
+    proofSummary: {
+      capturedWindowCount: 1,
+      canonicalWebContentsId: 71,
+      canonicalUrl: originalUrl,
+      authorized: true,
+      didFinishLoad: true,
+      mounted: true,
+      originalPreload: true,
+      preloadFailed: false,
+      loadFailed: false,
+      rendererExited: false,
+      cleanup: "pass",
+      failureReason: null,
+    },
+  });
+});
+
+test("original renderer proof permanently rejects unsafe, duplicate, replay, failure, and cleanup failure", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const unsafe = createPromotionOriginalRendererProofTracker(nonce);
+  unsafe.eligibleWindow({
+    webContentsId: 72,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    isDefaultSession: true,
+    sandbox: false,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  unsafe.cleanup(true);
+  assert.equal(unsafe.result().hostReady, "fail");
+
+  const duplicate = createPromotionOriginalRendererProofTracker(nonce);
+  const safe = (webContentsId: number) => ({
+    webContentsId,
+    url: PROMOTION_ORIGINAL_RENDERER_URL,
+    isDefaultSession: true,
+    sandbox: true,
+    contextIsolation: true,
+    nodeIntegration: false,
+    originalPreloadValid: true,
+  });
+  duplicate.eligibleWindow(safe(73));
+  duplicate.eligibleWindow(safe(74));
+  duplicate.authorization(73);
+  duplicate.authorization(73);
+  duplicate.didFinishLoad(73, PROMOTION_ORIGINAL_RENDERER_URL);
+  duplicate.fail("canonical renderer process exited", 73);
+  duplicate.cleanup(false);
+  assert.equal(duplicate.result().hostReady, "fail");
+  assert.equal(duplicate.result().rendererStorageSelfTest, "fail");
+  assert.equal(duplicate.summary().failureReason, "duplicate eligible renderer");
+
+  const preloadFailure = createPromotionOriginalRendererProofTracker(nonce);
+  preloadFailure.preloadError(75);
+  preloadFailure.eligibleWindow({ ...safe(75), webContentsId: 75 });
+  preloadFailure.cleanup(true);
+  assert.equal(preloadFailure.result().hostReady, "fail");
+  assert.equal(preloadFailure.summary().preloadFailed, true);
+});
 
 test("promotion renderer authorization rejects wrong sender, frame, URL, payload, and replay", () => {
   const nonce = "123e4567-e89b-42d3-a456-426614174000";
@@ -445,6 +630,7 @@ test("schema-v2 receipt proves every promoted surface and canonical User Questio
       authenticatedSession: () => "pass",
       declaredPermission: () => "pass",
       rendererReady: () => "pass",
+      rendererProof: () => PASSING_RENDERER_PROOF,
       promotionSurface: (surface) => {
         observedSurfaces.push(surface);
         return hashes[surface];
@@ -468,11 +654,17 @@ test("schema-v2 receipt proves every promoted surface and canonical User Questio
       promotionReady: string;
       hostReady: string;
       surfaces: Record<string, { preimageHash: string; expectedHash: string; observedHash: string; status: string }>;
+      rendererProof: Record<string, unknown>;
       userQuestions: Record<string, unknown>;
     };
     assert.equal(receipt.schemaVersion, 2);
     assert.equal(receipt.hostReady, "pass");
     assert.equal(receipt.promotionReady, "pass");
+    assert.deepEqual(receipt.rendererProof, {
+      ...PASSING_RENDERER_PROOF,
+      canonicalUrl: PROMOTION_ORIGINAL_RENDERER_URL,
+      queryKeys: ["hostId"],
+    });
     assert.deepEqual(observedSurfaces.sort(), [...PROMOTION_SURFACE_NAMES].sort());
     for (const name of PROMOTION_SURFACE_NAMES) {
       assert.deepEqual(receipt.surfaces[name], {

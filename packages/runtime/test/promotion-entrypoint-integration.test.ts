@@ -350,6 +350,84 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(originalHealthPreloadSource, /searchParams\.has\(PROMOTION_RENDERER_NONCE_QUERY\)/);
 });
 
+test("original-main health mode observes Codex's hidden real window without owning protocol or window creation", () => {
+  const controller = sourceBlock("function createPromotionOriginalMainProbe", "// Construct this controller");
+  assert.doesNotMatch(controller, /new BrowserWindow/);
+  assert.doesNotMatch(controller, /protocol\.(?:handle|registerSchemesAsPrivileged)/);
+  assert.match(controller, /app\.on\("session-created", onSessionCreated\)/);
+  assert.match(controller, /app\.on\("browser-window-created", onBrowserWindowCreated\)/);
+  assert.match(controller, /app\.once\("ready", onAppReady\)/);
+  assert.match(controller, /registerSession\(session\.defaultSession, "defaultSession-ready"\)/);
+  assert.match(controller, /app\.removeListener\("ready", onAppReady\)/);
+  assert.match(controller, /registerPreloadScript/);
+  assert.match(controller, /PROMOTION_HEALTH_PRELOAD_PATH/);
+  assert.match(controller, /setTimeout\(\(\) => \{\s*fail\("promotion original renderer watchdog expired"\);\s*\}, 25_000\)/);
+  assert.match(controller, /window\.setFocusable\(false\)/);
+  assert.match(controller, /window\.hide\(\)/);
+  assert.match(controller, /\["show", "showInactive", "focus", "restore"\] as const/);
+  assert.match(controller, /suppressWindowActivationMethod\(window, method, removers\)/);
+  assert.match(controller, /captured window \$\{method\} interception unavailable/);
+  assert.match(controller, /captured window \$\{method\} interception failed/);
+  assert.match(controller, /captured window \$\{method\} interception did not stick/);
+  assert.match(controller, /if \(mutableWindow\[method\] === suppressed\) mutableWindow\[method\] = original/);
+  assert.match(controller, /if \(initiallyVisible\) fail\(`captured window \$\{contents\.id\} was initially visible`\)/);
+  assert.match(controller, /fail\(`captured window \$\{contents\.id\} emitted show`\)/);
+  assert.match(controller, /fail\(`captured window \$\{contents\.id\} emitted focus`\)/);
+  assert.match(controller, /typeof preloadPath !== "string" \|\| !isAbsolute\(preloadPath\)/);
+  assert.match(controller, /preloadPath !== exactPath/);
+  assert.match(controller, /exactPath === resolve\(PROMOTION_HEALTH_PRELOAD_PATH\)/);
+  assert.match(controller, /resolve\(process\.resourcesPath, "app\.asar"\)/);
+  assert.match(controller, /containedPath\.startsWith\("\.\."\)/);
+  assert.match(controller, /existsSync\(exactPath\) && lstatSync\(exactPath\)\.isFile\(\)/);
+  assert.match(controller, /originalPreloadValid,/);
+  assert.match(controller, /tracker\.eligibleWindow\(\{[\s\S]*?url: canonicalUrl,/);
+  assert.match(controller, /promotion original renderer eligible window observed[\s\S]*?url: promotionOriginalRendererLogUrl\(canonicalUrl\)/);
+  assert.match(controller, /preloadErrorWebContentsIds\.add\(contents\.id\)/);
+  assert.match(controller, /tracker\.preloadError\(contents\.id\)/);
+  assert.match(controller, /"preload-error"/);
+  assert.match(controller, /promotion original renderer preload failed/);
+  assert.match(controller, /event\.returnValue = JSON\.stringify\(decision\.response\)/);
+  assert.match(controller, /"did-start-navigation"/);
+  assert.match(controller, /"did-fail-load"/);
+  assert.match(controller, /"render-process-gone"/);
+  assert.match(controller, /cleanupTrackedParents\(\)/);
+  assert.match(controller, /unregisterPreloadScript/);
+  assert.match(controller, /window\.destroy\(\)/);
+  assert.match(controller, /if \(cleaningUp\) \{[\s\S]*lateWindowDuringCleanup = true;[\s\S]*window\.destroy\(\)/);
+  assert.match(controller, /if \(cleanupFinished\) app\.exit\(1\)/);
+  assert.doesNotMatch(controller, /removeListener\("browser-window-created", onBrowserWindowCreated\)/);
+  assert.ok(
+    controller.indexOf("window.destroy()") < controller.indexOf("for (const removers of windowCleanup.values())"),
+    "captured windows must be destroyed before activation interceptors are restored",
+  );
+
+  const ready = sourceBlock("app.whenReady().then", "if (!healthCheckOnly) {\n  app.on(\"session-created\"");
+  assert.match(ready, /originalMainPromotionProbe\?\.registerSession\(session\.defaultSession/);
+  assert.match(ready, /healthOriginalMain\s*\? await originalMainPromotionProbe!\.run\(\)/);
+  assert.ok(
+    mainSource.indexOf("const originalMainPromotionProbe =") < mainSource.indexOf("app.whenReady().then"),
+    "the original-main controller and its ready listener must be created before the whenReady fallback",
+  );
+  assert.match(mainSource, /healthOriginalMain && process\.platform === "darwin" && !codexAppServerParent\.installed/);
+  assert.match(mainSource, /if \(!healthCheckOnly\) removeLegacyModeSwitcherState\(userRoot\)/);
+  assert.match(mainSource, /persistFailure: healthCheckOnly \? undefined : \(message\) =>/);
+  assert.match(mainSource, /if \(!healthCheckOnly\) codexCliManager\.recover\(\)/);
+
+  assert.match(originalHealthPreloadSource, /location\.href/);
+  assert.match(originalHealthPreloadSource, /sendSync\(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL/);
+  assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_URL = "app:\/\/-\/index\.html"/);
+  assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize"/);
+  assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof"/);
+  assert.doesNotMatch(originalHealthPreloadSource, /from "\.\/promotion-health"/);
+  assert.match(originalHealthPreloadSource, /value\.length > 1_024/);
+  assert.match(originalHealthPreloadSource, /JSON\.parse\(value\)/);
+  assert.match(originalHealthPreloadSource, /observer\.observe\(document/);
+  assert.match(originalHealthPreloadSource, /:scope > \.startup-loader/);
+  assert.match(originalHealthPreloadSource, /verifyRendererStorageRollback/);
+  assert.doesNotMatch(originalHealthPreloadSource, /process\.(?:env|argv)/);
+  assert.match(originalHealthPreloadSource, /searchParams\.has\(PROMOTION_RENDERER_NONCE_QUERY\)/);
+});
+
 test("ASAR and tree probes are bounded, deterministic, and do not import installer state", () => {
   const asar = sourceBlock("function promotionAppHeaderHash", "/** Mode- and link-aware deterministic hash paired with install.ts. */");
   assert.match(asar, /join\(process\.resourcesPath, "app\.asar"\)/);

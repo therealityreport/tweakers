@@ -25,6 +25,19 @@ await build({
 });
 
 await build({
+  entryPoints: [resolve(root, "src/promotion-health-preload.ts")],
+  bundle: true,
+  outfile: resolve(root, "dist/promotion-health-preload.js"),
+  platform: "browser",
+  target: "es2022",
+  format: "cjs",
+  external: ["electron"],
+  sourcemap: "inline",
+  minify: false,
+  logLevel: "info",
+});
+
+await build({
   entryPoints: [resolve(root, "src/main.ts")],
   bundle: true,
   outfile: resolve(root, "dist/main.js"),
@@ -41,4 +54,4 @@ await build({
   // handles missing fsevents internally — this is just future-proofing.)
 });
 
-console.log("[bundle] preload + main bundled");
+console.log("[bundle] preload + promotion health preload + main bundled");

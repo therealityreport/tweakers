@@ -11416,6 +11416,190 @@ var PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
 var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 var PROMOTION_RENDERER_SCHEME = "app";
 var PROMOTION_RENDERER_HOST = "-";
+var PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
+var PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
+var PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+var PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = /* @__PURE__ */ new Set(["hostId", "initialRoute"]);
+function canonicalPromotionOriginalRendererUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) return null;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || parsed.searchParams.has(PROMOTION_RENDERER_NONCE_QUERY) || parsed.toString() !== value) return null;
+  const queryKeys = [...parsed.searchParams.keys()];
+  if (queryKeys.some((key) => !PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS.has(key)) || new Set(queryKeys).size !== queryKeys.length) return null;
+  const hostId = parsed.searchParams.get("hostId");
+  const initialRoute = parsed.searchParams.get("initialRoute");
+  if (hostId !== null && !/^[A-Za-z0-9._:-]{1,256}$/.test(hostId)) return null;
+  if (initialRoute !== null && (initialRoute.length === 0 || initialRoute.length > 2048 || !initialRoute.startsWith("/") || /[\u0000-\u001f\u007f]/.test(initialRoute))) return null;
+  return value;
+}
+function promotionOriginalRendererEvidenceUrl(value) {
+  if (value === null || canonicalPromotionOriginalRendererUrl(value) === null) {
+    return { canonicalUrl: null, queryKeys: [] };
+  }
+  return {
+    canonicalUrl: PROMOTION_ORIGINAL_RENDERER_URL,
+    queryKeys: [...new URL(value).searchParams.keys()].sort()
+  };
+}
+function promotionOriginalRendererLogUrl(value) {
+  if (typeof value !== "string") return "[redacted-url]";
+  const evidence = promotionOriginalRendererEvidenceUrl(value);
+  if (evidence.canonicalUrl === null) return "[redacted-url]";
+  return evidence.queryKeys.length === 0 ? evidence.canonicalUrl : `${evidence.canonicalUrl}?[${evidence.queryKeys.join(",")}:redacted]`;
+}
+function authorizePromotionOriginalRenderer(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
+  if (!context.windowHidden) return { accepted: false, reason: "proof window visible", response: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", response: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", response: null };
+  const canonicalUrl = canonicalPromotionOriginalRendererUrl(context.senderUrl);
+  if (canonicalUrl === null) {
+    return { accepted: false, reason: "sender URL mismatch", response: null };
+  }
+  if (context.consumed) return { accepted: false, reason: "authorization already consumed", response: null };
+  if (!plainRecord(payload) || !exactKeys(payload, ["url", "version"])) {
+    return { accepted: false, reason: "payload invalid", response: null };
+  }
+  if (payload.version !== 1 || payload.url !== canonicalUrl) {
+    return { accepted: false, reason: "payload binding invalid", response: null };
+  }
+  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+    return { accepted: false, reason: "nonce invalid", response: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    response: { version: 1, nonce, url: canonicalUrl }
+  };
+}
+function createPromotionOriginalRendererProofTracker(nonce) {
+  let capturedWindowCount = 0;
+  let canonicalWebContentsId = null;
+  let canonicalUrl = null;
+  let authorized = false;
+  let didFinishLoad = false;
+  let mounted = false;
+  let originalPreload = false;
+  let preloadFailed = false;
+  let loadFailed = false;
+  let rendererExited = false;
+  let rendererStorageSelfTest = "unknown";
+  let cleanup = "pending";
+  let failureReason = null;
+  const preloadErrorIds = /* @__PURE__ */ new Set();
+  const isCanonical = (id) => canonicalWebContentsId === id;
+  const permanentlyFail = (reason) => {
+    if (reason === "canonical renderer load failed") loadFailed = true;
+    if (reason === "canonical renderer process exited") rendererExited = true;
+    if (reason === "canonical original preload failed") preloadFailed = true;
+    if (failureReason === null) {
+      failureReason = reason.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 256);
+    }
+    rendererStorageSelfTest = "fail";
+  };
+  return {
+    windowCaptured() {
+      capturedWindowCount += 1;
+    },
+    eligibleWindow(observation) {
+      if (canonicalPromotionOriginalRendererUrl(observation.url) === null || !Number.isSafeInteger(observation.webContentsId) || observation.webContentsId <= 0 || !observation.isDefaultSession || observation.sandbox !== true || observation.contextIsolation !== true || observation.nodeIntegration !== false || observation.originalPreloadValid !== true) {
+        permanentlyFail("eligible renderer was not canonical and sandbox-safe");
+        return;
+      }
+      if (canonicalWebContentsId !== null && (canonicalWebContentsId !== observation.webContentsId || canonicalUrl !== observation.url)) {
+        permanentlyFail(canonicalWebContentsId !== observation.webContentsId ? "duplicate eligible renderer" : "canonical renderer URL changed");
+        return;
+      }
+      canonicalWebContentsId = observation.webContentsId;
+      canonicalUrl = observation.url;
+      originalPreload = true;
+      if (preloadErrorIds.has(observation.webContentsId)) permanentlyFail("canonical original preload failed");
+    },
+    preloadError(webContentsId) {
+      preloadErrorIds.add(webContentsId);
+      if (isCanonical(webContentsId)) permanentlyFail("canonical original preload failed");
+    },
+    authorization(webContentsId) {
+      if (!isCanonical(webContentsId)) {
+        permanentlyFail("authorization sender was not canonical");
+        return;
+      }
+      if (authorized) {
+        permanentlyFail("authorization replayed");
+        return;
+      }
+      authorized = true;
+    },
+    didFinishLoad(webContentsId, url) {
+      if (!isCanonical(webContentsId)) return;
+      if (url !== canonicalUrl) {
+        permanentlyFail("canonical renderer finished at wrong URL");
+        return;
+      }
+      didFinishLoad = true;
+    },
+    rendererHandshake(observation) {
+      if (!isCanonical(observation.webContentsId)) {
+        permanentlyFail("mount sender was not canonical");
+        return;
+      }
+      if (mounted) {
+        permanentlyFail("mount handshake replayed");
+        return;
+      }
+      if (!authorized || observation.nonce !== nonce || observation.url !== canonicalUrl || observation.lifecycle !== "renderer-mounted" || !validHealthValue(observation.rendererStorageSelfTest)) {
+        permanentlyFail("mount handshake binding invalid");
+        return;
+      }
+      mounted = true;
+      rendererStorageSelfTest = observation.rendererStorageSelfTest;
+      if (rendererStorageSelfTest !== "pass") permanentlyFail("renderer storage self-test failed");
+    },
+    fail(reason, webContentsId) {
+      if (webContentsId !== void 0 && !isCanonical(webContentsId)) return;
+      permanentlyFail(reason);
+    },
+    cleanup(success) {
+      cleanup = success ? "pass" : "fail";
+      if (!success) permanentlyFail("promotion renderer cleanup failed");
+    },
+    complete() {
+      return failureReason !== null || authorized && didFinishLoad && mounted && rendererStorageSelfTest === "pass";
+    },
+    result() {
+      const proofComplete = authorized && didFinishLoad && mounted && rendererStorageSelfTest === "pass";
+      if (failureReason !== null || cleanup === "fail") {
+        return { hostReady: "fail", rendererStorageSelfTest: "fail", proofSummary: this.summary() };
+      }
+      return {
+        hostReady: proofComplete && cleanup === "pass" ? "pass" : "unknown",
+        rendererStorageSelfTest: mounted ? rendererStorageSelfTest : "unknown",
+        proofSummary: this.summary()
+      };
+    },
+    summary() {
+      return {
+        capturedWindowCount,
+        canonicalWebContentsId,
+        canonicalUrl,
+        authorized,
+        didFinishLoad,
+        mounted,
+        originalPreload,
+        preloadFailed,
+        loadFailed,
+        rendererExited,
+        cleanup,
+        failureReason
+      };
+    }
+  };
+}
 function authorizePromotionRenderer(context, payload, nonce) {
   if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
   if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", response: null };
@@ -11749,6 +11933,13 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
   }
   const expectedUserQuestions = request.userQuestions;
   const hostReady = await safe(() => probes.rendererReady?.() ?? "unknown");
+  let observedRendererProof = unavailableRendererProofSummary();
+  try {
+    const observed = await probes.rendererProof?.();
+    if (validRendererProofSummary(observed)) observedRendererProof = observed;
+  } catch {
+  }
+  const rendererProof = rendererProofReceiptSummary(observedRendererProof);
   const identity = observedUserQuestions && observedUserQuestions.id === expectedUserQuestions.id && observedUserQuestions.version === expectedUserQuestions.version && observedUserQuestions.payloadHash === expectedUserQuestions.payloadHash ? "pass" : observedUserQuestions ? "fail" : "unknown";
   const userQuestions = {
     expected: expectedUserQuestions,
@@ -11775,17 +11966,64 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
     userQuestions.rendererStorageSelfTest,
     userQuestions.zeroMcpConflicts
   ].every((value) => value === "pass");
+  const rendererProofPass = passingRendererProofSummary(observedRendererProof);
   return {
     schemaVersion: 2,
     observedAt: now.toISOString(),
     app: request.app,
     hostReady,
+    rendererProof,
     authenticatedSession,
     declaredPermissions: permissions,
     surfaces,
     userQuestions,
-    promotionReady: hostReady === "pass" && allSurfacesPass && allPermissionsPass && userQuestionsPass && authenticatedSession === "pass" ? "pass" : "fail"
+    promotionReady: hostReady === "pass" && rendererProofPass && allSurfacesPass && allPermissionsPass && userQuestionsPass && authenticatedSession === "pass" ? "pass" : "fail"
   };
+}
+function rendererProofReceiptSummary(value) {
+  const evidenceUrl = promotionOriginalRendererEvidenceUrl(value.canonicalUrl);
+  return {
+    ...value,
+    canonicalUrl: evidenceUrl.canonicalUrl,
+    queryKeys: evidenceUrl.queryKeys
+  };
+}
+function unavailableRendererProofSummary() {
+  return {
+    capturedWindowCount: 0,
+    canonicalWebContentsId: null,
+    canonicalUrl: null,
+    authorized: false,
+    didFinishLoad: false,
+    mounted: false,
+    originalPreload: false,
+    preloadFailed: false,
+    loadFailed: false,
+    rendererExited: false,
+    cleanup: "pending",
+    failureReason: "renderer proof unavailable"
+  };
+}
+function validRendererProofSummary(value) {
+  if (!plainRecord(value) || !exactKeys(value, [
+    "capturedWindowCount",
+    "canonicalWebContentsId",
+    "canonicalUrl",
+    "authorized",
+    "didFinishLoad",
+    "mounted",
+    "originalPreload",
+    "preloadFailed",
+    "loadFailed",
+    "rendererExited",
+    "cleanup",
+    "failureReason"
+  ])) return false;
+  if (!Number.isSafeInteger(value.capturedWindowCount) || value.capturedWindowCount < 0 || value.capturedWindowCount > 64 || value.canonicalWebContentsId !== null && (!Number.isSafeInteger(value.canonicalWebContentsId) || value.canonicalWebContentsId <= 0) || value.canonicalUrl !== null && canonicalPromotionOriginalRendererUrl(value.canonicalUrl) === null || typeof value.authorized !== "boolean" || typeof value.didFinishLoad !== "boolean" || typeof value.mounted !== "boolean" || typeof value.originalPreload !== "boolean" || typeof value.preloadFailed !== "boolean" || typeof value.loadFailed !== "boolean" || typeof value.rendererExited !== "boolean" || !["pending", "pass", "fail"].includes(value.cleanup) || value.failureReason !== null && (typeof value.failureReason !== "string" || value.failureReason.length === 0 || value.failureReason.length > 256 || /[\u0000-\u001f\u007f]/.test(value.failureReason))) return false;
+  return true;
+}
+function passingRendererProofSummary(value) {
+  return value.capturedWindowCount >= 1 && value.canonicalWebContentsId !== null && value.canonicalUrl !== null && value.authorized && value.didFinishLoad && value.mounted && value.originalPreload && !value.preloadFailed && !value.loadFailed && !value.rendererExited && value.cleanup === "pass" && value.failureReason === null;
 }
 function validPromotionRequest(value) {
   if (!plainRecord(value)) return false;
@@ -13253,17 +13491,28 @@ const child = spawn(command, args, {
   stdio: "inherit",
 });
 let forwardedSignal = null;
+let escalationTimer = null;
+const childIsRunning = () => child.exitCode === null && child.signalCode === null;
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
-    forwardedSignal = signal;
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    if (forwardedSignal === null) forwardedSignal = signal;
+    if (!childIsRunning()) return;
+    child.kill(signal);
+    if (escalationTimer === null) {
+      escalationTimer = setTimeout(() => {
+        escalationTimer = null;
+        if (childIsRunning()) child.kill("SIGKILL");
+      }, 1000);
+    }
   });
 }
 child.once("error", (error) => {
+  if (escalationTimer !== null) clearTimeout(escalationTimer);
   process.stderr.write("Tweakers Codex parent: " + error.message + "\n");
   process.exitCode = 1;
 });
 child.once("exit", (code, signal) => {
+  if (escalationTimer !== null) clearTimeout(escalationTimer);
   if (typeof code === "number") {
     process.exit(code);
     return;
@@ -13314,17 +13563,30 @@ function installCodexAppServerParent(options = {}) {
     return result(false, bundledNodePath, "missing-bundled-node", childProcess);
   }
   const originalSpawn = childProcess.spawn;
+  const installed = {
+    originalSpawn,
+    wrappedSpawn: void 0,
+    children: /* @__PURE__ */ new Set(),
+    cleanupStarted: false
+  };
   const wrappedSpawn = function wrappedCodexSpawn(command, argsOrOptions, maybeOptions) {
     if (Array.isArray(argsOrOptions) && isCodexAppServerSpawn(command, argsOrOptions, maybeOptions)) {
-      return Reflect.apply(originalSpawn, this, [
+      if (installed.cleanupStarted) {
+        throw new Error("Tweakers Codex parent: app-server cleanup has started");
+      }
+      const child = Reflect.apply(originalSpawn, this, [
         bundledNodePath,
         buildCodexAppServerParentArgs(command, argsOrOptions),
         sanitizeParentSpawnOptions(maybeOptions)
       ]);
+      installed.children.add(child);
+      child.once?.("exit", () => installed.children.delete(child));
+      child.once?.("error", () => installed.children.delete(child));
+      return child;
     }
     return Reflect.apply(originalSpawn, this, [command, argsOrOptions, maybeOptions]);
   };
-  const installed = { originalSpawn, wrappedSpawn };
+  installed.wrappedSpawn = wrappedSpawn;
   childProcess.spawn = wrappedSpawn;
   childProcess[INSTALL_MARKER] = installed;
   return result(true, bundledNodePath, "installed", childProcess, installed);
@@ -13339,12 +13601,74 @@ function result(installed, bundledNodePath, reason, childProcess, state) {
     installed,
     bundledNodePath,
     reason,
+    async cleanupTrackedParents(options = {}) {
+      if (!state || childProcess[INSTALL_MARKER] !== state) {
+        return { tracked: 0, terminated: 0, forced: 0, failed: 0 };
+      }
+      state.cleanupStarted = true;
+      if (state.cleanupInFlight) return state.cleanupInFlight;
+      state.cleanupInFlight = drainTrackedParents(
+        state,
+        options.termTimeoutMs ?? 2e3,
+        options.killTimeoutMs ?? 1e3
+      );
+      try {
+        return await state.cleanupInFlight;
+      } finally {
+        state.cleanupInFlight = void 0;
+      }
+    },
     uninstall() {
       if (!state || childProcess[INSTALL_MARKER] !== state) return;
       if (childProcess.spawn === state.wrappedSpawn) childProcess.spawn = state.originalSpawn;
       delete childProcess[INSTALL_MARKER];
     }
   };
+}
+async function terminateTrackedParent(child, termTimeoutMs, killTimeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return "already-exited";
+  if (!child.kill("SIGTERM")) return "failed";
+  const completionTimeoutMs = Math.max(0, termTimeoutMs) + Math.max(0, killTimeoutMs);
+  if (!await waitForChildExit(child, completionTimeoutMs)) return "failed";
+  return child.signalCode === "SIGKILL" ? "forced" : "terminated";
+}
+async function drainTrackedParents(state, termTimeoutMs, killTimeoutMs) {
+  const attempted = /* @__PURE__ */ new Set();
+  let terminated = 0;
+  let forced = 0;
+  let failed = 0;
+  while (true) {
+    const pending = [...state.children].filter((child) => !attempted.has(child));
+    if (pending.length === 0) break;
+    for (const child of pending) {
+      attempted.add(child);
+      const outcome = await terminateTrackedParent(child, termTimeoutMs, killTimeoutMs);
+      if (outcome === "terminated") terminated += 1;
+      else if (outcome === "forced") forced += 1;
+      else if (outcome === "failed") failed += 1;
+      if (outcome !== "failed") state.children.delete(child);
+    }
+  }
+  return { tracked: attempted.size, terminated, forced, failed };
+}
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const settle = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onError);
+      resolvePromise(exited);
+    };
+    const onExit = () => settle(true);
+    const onError = () => settle(false);
+    const timer = setTimeout(() => settle(false), Math.max(0, timeoutMs));
+    child.once("exit", onExit);
+    child.once("error", onError);
+  });
 }
 
 // src/codex-desktop-update-service.ts
@@ -13721,8 +14045,9 @@ if (!userRoot || !runtimeDir) {
     "Tweakers runtime started without a supported user-root/runtime environment"
   );
 }
-installCodexAppServerParent();
+var codexAppServerParent = installCodexAppServerParent();
 var PRELOAD_PATH = (0, import_node_path26.resolve)(runtimeDir, "preload.js");
+var PROMOTION_HEALTH_PRELOAD_PATH = (0, import_node_path26.resolve)(runtimeDir, "promotion-health-preload.js");
 var TWEAKS_DIR = (0, import_node_path26.join)(userRoot, "tweaks");
 var LOG_DIR = (0, import_node_path26.join)(userRoot, "log");
 var LOG_FILE = (0, import_node_path26.join)(LOG_DIR, "main.log");
@@ -13749,7 +14074,11 @@ var TWEAK_BUNDLED_SOURCE_DIR = (0, import_node_path26.join)(runtimeDir, "tweaks"
 var TWEAK_LIFECYCLE_FILE = (0, import_node_path26.join)(userRoot, "tweak-lifecycle.json");
 var TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 var healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
-if (healthCheckOnly) {
+var healthOriginalMain = healthCheckOnly && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
+if (healthOriginalMain && process.platform === "darwin" && !codexAppServerParent.installed) {
+  throw new Error("original-main health requires the owned signed Codex app-server parent tracker");
+}
+if (healthCheckOnly && !healthOriginalMain) {
   import_electron4.protocol.registerSchemesAsPrivileged([{
     scheme: PROMOTION_RENDERER_SCHEME,
     privileges: {
@@ -13804,7 +14133,7 @@ var CODEX_WINDOW_SERVICES_KEY = "__tweaker_window_services__";
 var mainTweakReadHandlers = /* @__PURE__ */ new Map();
 (0, import_node_fs22.mkdirSync)(LOG_DIR, { recursive: true });
 (0, import_node_fs22.mkdirSync)(TWEAKS_DIR, { recursive: true });
-removeLegacyModeSwitcherState(userRoot);
+if (!healthCheckOnly) removeLegacyModeSwitcherState(userRoot);
 var refreshStatusWatcher = esm_default.watch([
   SELF_UPDATE_STATE_FILE,
   (0, import_node_path26.join)(userRoot, "refresh-state.json"),
@@ -13857,7 +14186,7 @@ var codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
   userRoot,
   env: process.env,
   selectedManagedCli,
-  persistFailure: (message) => {
+  persistFailure: healthCheckOnly ? void 0 : (message) => {
     const state = readState2();
     state.tweaker ??= {};
     state.tweaker.codexCliBootstrapFailure = message;
@@ -13900,7 +14229,7 @@ var codexCliManager = createCodexCliManager({
   userRoot,
   deps: createCodexCliManagerDependencies()
 });
-codexCliManager.recover();
+if (!healthCheckOnly) codexCliManager.recover();
 var CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
 var lastPublishedCodexDesktopUpdate = null;
 var originalSetApplicationMenu = null;
@@ -15609,18 +15938,21 @@ var desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
 });
 import_electron4.app.whenReady().then(() => {
   log("info", "app ready fired");
+  originalMainPromotionProbe?.registerSession(import_electron4.session.defaultSession, "defaultSession-whenReady");
   if (healthCheckOnly) {
-    const watchdog = setTimeout(() => {
-      log("warn", "health-check watchdog fired; exiting");
-      import_electron4.app.exit(0);
-    }, 12e3);
-    watchdog.unref?.();
+    if (!healthOriginalMain) {
+      const watchdog = setTimeout(() => {
+        log("warn", "health-check watchdog fired; exiting");
+        import_electron4.app.exit(0);
+      }, 12e3);
+      watchdog.unref?.();
+    }
   } else {
     scheduleProactiveDesktopUpdateChecks();
     if (process.platform === "darwin") desktopUpdateStartupReconciler.schedule();
   }
   void (async () => {
-    const rendererProof = healthCheckOnly ? await runPromotionRendererProof() : { hostReady: "unknown", rendererStorageSelfTest: "unknown" };
+    const rendererProof = healthOriginalMain ? await originalMainPromotionProbe.run() : healthCheckOnly ? await runPromotionRendererProof() : { hostReady: "unknown", rendererStorageSelfTest: "unknown" };
     void answerPromotionHealthRequest(userRoot, {
       authenticatedSession: async () => {
         if (hasAuthenticatedCodexToken(readCodexAuth(MCP_RUNTIME_PATHS.codexHome))) return "pass";
@@ -15640,6 +15972,7 @@ import_electron4.app.whenReady().then(() => {
         return "unknown";
       },
       rendererReady: () => rendererProof.hostReady,
+      rendererProof: () => rendererProof.proofSummary ?? null,
       promotionSurface: promotionSurfaceHash,
       userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest)
     }).then((answered) => {

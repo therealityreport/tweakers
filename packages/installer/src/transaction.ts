@@ -112,11 +112,28 @@ export interface UserQuestionsPromotionObservation {
   zeroMcpConflicts: HealthValue;
 }
 
+export interface RendererPromotionProofObservation {
+  capturedWindowCount: number;
+  canonicalWebContentsId: number | null;
+  canonicalUrl: string | null;
+  queryKeys: string[];
+  authorized: boolean;
+  didFinishLoad: boolean;
+  mounted: boolean;
+  originalPreload: boolean;
+  preloadFailed: boolean;
+  loadFailed: boolean;
+  rendererExited: boolean;
+  cleanup: "pending" | "pass" | "fail";
+  failureReason: string | null;
+}
+
 export interface ProductionHealthReceiptV2 {
   schemaVersion: 2;
   observedAt: string;
   app: AppFingerprint;
   hostReady: HealthValue;
+  rendererProof: RendererPromotionProofObservation;
   authenticatedSession: HealthValue;
   declaredPermissions: Record<string, HealthValue>;
   surfaces: Record<PromotionSurfaceName, PromotionSurfaceObservation>;
@@ -1077,6 +1094,7 @@ function validV2HealthReceipt(
     "observedAt",
     "app",
     "hostReady",
+    "rendererProof",
     "authenticatedSession",
     "declaredPermissions",
     "surfaces",
@@ -1087,6 +1105,7 @@ function validV2HealthReceipt(
     value.schemaVersion !== 2
     || !sameFingerprintValue(value.app, expected.app)
     || validHealthValue(value.hostReady) !== value.hostReady
+    || !validRendererProofReceipt(value.rendererProof)
     || validHealthValue(value.authenticatedSession) !== value.authenticatedSession
     || !validPermissionHealth(value.declaredPermissions, expected.requiredPermissions)
     || !validPromotionExpectation(expected)
@@ -1125,12 +1144,74 @@ function validV2HealthReceipt(
     userQuestions.zeroMcpConflicts,
   ].every((status) => status === "pass");
   const expectedReady: HealthValue = surfaceStatuses.every((status) => status === "pass")
+    && value.hostReady === "pass"
+    && passingRendererProofReceipt(value.rendererProof)
     && allPermissionsPass
     && allUserQuestionsPass
     && value.authenticatedSession === "pass"
     ? "pass"
     : "fail";
   return value.promotionReady === expectedReady;
+}
+
+function validRendererProofReceipt(value: unknown): value is RendererPromotionProofObservation {
+  if (!plainRecord(value) || !exactKeys(value, [
+    "capturedWindowCount",
+    "canonicalWebContentsId",
+    "canonicalUrl",
+    "queryKeys",
+    "authorized",
+    "didFinishLoad",
+    "mounted",
+    "originalPreload",
+    "preloadFailed",
+    "loadFailed",
+    "rendererExited",
+    "cleanup",
+    "failureReason",
+  ])) return false;
+  const queryKeys = value.queryKeys;
+  if (!Array.isArray(queryKeys)) return false;
+  return Number.isSafeInteger(value.capturedWindowCount)
+    && (value.capturedWindowCount as number) >= 0
+    && (value.capturedWindowCount as number) <= 64
+    && (value.canonicalWebContentsId === null || (
+      Number.isSafeInteger(value.canonicalWebContentsId)
+      && (value.canonicalWebContentsId as number) > 0
+    ))
+    && (value.canonicalUrl === null || value.canonicalUrl === "app://-/index.html")
+    && queryKeys.every((key) => key === "hostId" || key === "initialRoute")
+    && new Set(queryKeys).size === queryKeys.length
+    && [...queryKeys].sort().every((key, index) => key === queryKeys[index])
+    && typeof value.authorized === "boolean"
+    && typeof value.didFinishLoad === "boolean"
+    && typeof value.mounted === "boolean"
+    && typeof value.originalPreload === "boolean"
+    && typeof value.preloadFailed === "boolean"
+    && typeof value.loadFailed === "boolean"
+    && typeof value.rendererExited === "boolean"
+    && (value.cleanup === "pending" || value.cleanup === "pass" || value.cleanup === "fail")
+    && (value.failureReason === null || (
+      typeof value.failureReason === "string"
+      && value.failureReason.length > 0
+      && value.failureReason.length <= 256
+      && !/[\u0000-\u001f\u007f]/.test(value.failureReason)
+    ));
+}
+
+function passingRendererProofReceipt(value: RendererPromotionProofObservation): boolean {
+  return value.capturedWindowCount >= 1
+    && value.canonicalWebContentsId !== null
+    && value.canonicalUrl !== null
+    && value.authorized
+    && value.didFinishLoad
+    && value.mounted
+    && value.originalPreload
+    && !value.preloadFailed
+    && !value.loadFailed
+    && !value.rendererExited
+    && value.cleanup === "pass"
+    && value.failureReason === null;
 }
 
 function validUserQuestionsReceipt(

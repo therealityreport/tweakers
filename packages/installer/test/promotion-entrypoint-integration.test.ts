@@ -88,6 +88,18 @@ const VALID_RENDERER_HTML = `<!doctype html>
 </html>
 `;
 
+const installSource = readFileSync(new URL("../src/commands/install.ts", import.meta.url), "utf8");
+
+test("post-promotion health requires a clean probe exit before its receipt can be accepted", () => {
+  const start = installSource.indexOf("openApp: (appRoot) => {");
+  const end = installSource.indexOf("\n    },\n  });", start);
+  assert.ok(start >= 0 && end > start);
+  const openApp = installSource.slice(start, end);
+  assert.match(openApp, /const launched = spawnAuthenticatedHiddenHealthProbe\(/);
+  assert.match(openApp, /launched\.error \|\| launched\.status !== 0 \|\| launched\.signal !== null/);
+  assert.match(openApp, /throw new Error\("Post-promotion health process did not exit cleanly"\)/);
+});
+
 test("candidate authentication proof is private, contained, and removed after the one-shot probe", () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-promotion-auth-"));
   try {
@@ -120,10 +132,13 @@ test("candidate authentication proof is private, contained, and removed after th
 
 test("candidate health process receives only the contained Codex home opt-in", () => {
   let observed: SpawnSyncOptions | null = null;
+  let probeRoot = "";
   const userRoot = mkdtempSync(join(tmpdir(), "tweakers-candidate-launch-"));
   const candidateCodexHome = join(userRoot, "codex-home");
+  mkdirSync(candidateCodexHome, { mode: 0o700 });
   const fakeSpawn = ((_command: string, _args: readonly string[], options: SpawnSyncOptions) => {
     observed = options;
+    probeRoot = options.env?.HOME ?? "";
     return { status: 0 } as ReturnType<typeof spawnSync>;
   }) as typeof spawnSync;
   try {
@@ -132,8 +147,11 @@ test("candidate health process receives only the contained Codex home opt-in", (
       spawn: fakeSpawn,
     });
     assert.equal(observed?.env?.TWEAKERS_CANDIDATE_MCP_RECONCILIATION, "1");
-    assert.equal(observed?.env?.CODEX_HOME, candidateCodexHome);
-    assert.equal(observed?.env?.TMPDIR, join(userRoot, "health", "tmp"));
+    assert.equal(observed?.env?.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN, "1");
+    assert.equal(observed?.env?.HOME, probeRoot);
+    assert.equal(observed?.env?.CODEX_HOME, join(probeRoot, "codex-home"));
+    assert.equal(observed?.env?.TMPDIR, join(probeRoot, "tmp"));
+    assert.equal(existsSync(probeRoot), false);
   } finally {
     rmSync(userRoot, { recursive: true, force: true });
   }

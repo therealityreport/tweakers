@@ -34,3 +34,9 @@ export declare function createRendererStorage(id: string, storage: StorageLike):
     delete: (name: string) => void;
     all: () => Record<string, unknown>;
 };
+/**
+ * Exercise the exact prepare/commit/rollback path used by a promotion probe.
+ * Every synthetic key is removed and verified before success is returned;
+ * cleanup failure is a failed health result, never a silent residue.
+ */
+export declare function verifyRendererStorageRollback(storage: StorageLike, nonce: string): "pass" | "fail";

@@ -408,44 +408,81 @@ export function loadVerifiedSwapHost(
   return (first, second) => nativeHost.swapDirectories(first, second);
 }
 
+function launchHealthProbe(
+  executable: string,
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  deps: HealthProbeLaunchDependencies,
+): ReturnType<typeof spawnSync> {
+  const platform = deps.platform ?? process.platform;
+  const chromiumArgs = [
+    `--user-data-dir=${sandbox.userDataRoot}`,
+    ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
+  ];
+  return (deps.spawn ?? spawnSync)(executable, chromiumArgs, {
+    env: healthProbeEnvironment(userRoot, sandbox, platform, deps.environment ?? process.env),
+    stdio: "ignore",
+    timeout: HEALTH_PROBE_PROCESS_TIMEOUT_MS,
+  });
+}
+
+function stageBoundedCodexInputs(sourceCodexHome: string, containedCodexHome: string): void {
+  for (const name of ["config.toml", ".codex-global-state.json"] as const) {
+    const source = join(sourceCodexHome, name);
+    if (!existsSync(source)) continue;
+    const sourceStat = lstatSync(source);
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile() || sourceStat.size > 10 * 1024 * 1024) {
+      throw new Error(`Health probe Codex input must be a bounded regular file: ${source}`);
+    }
+    copyCandidatePreimage(source, join(containedCodexHome, name));
+  }
+}
+
 export function spawnHiddenHealthProbe(
   executable: string,
   userRoot: string,
-  deps: {
-    spawn?: typeof spawnSync;
-    /** Exact contained Codex home for a disposable candidate; omitted for a real post-promotion probe. */
-    candidateCodexHome?: string;
-    /** Internal seam for proving that ambient authentication data is excluded. */
-    environment?: NodeJS.ProcessEnv;
-    platform?: NodeJS.Platform;
-  } = {},
+  deps: HealthProbeLaunchDependencies = {},
 ): ReturnType<typeof spawnSync> {
-  const spawn = deps.spawn ?? spawnSync;
-  const platform = deps.platform ?? process.platform;
-  const tempRoot = prepareHealthProbeTempDirectory(userRoot);
-  // The disposable probe must never attach to the real Electron profile: the
-  // owl fork resolves userData natively at startup, so a probe launched while
-  // the same-productName app is running hits Chromium's process singleton and
-  // is forwarded ("Opening in existing browser session.") before any JS —
-  // including the health-receipt path — can run. An explicit throwaway
-  // --user-data-dir sidesteps both the singleton and profile writes.
-  const chromiumArgs = [
-    `--user-data-dir=${join(userRoot, "electron-user-data")}`,
-    // Chromium's supported macOS test switch keeps OSCrypt and its utility
-    // processes on a mock Keychain from process start. Runtime asserts the
-    // same switch again before app ready; normal launches use neither path.
-    ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
-  ];
-  return spawn(executable, chromiumArgs, {
-    env: healthProbeEnvironment(
-      userRoot,
-      tempRoot,
-      deps.candidateCodexHome,
-      platform,
-      deps.environment ?? process.env,
-    ),
-    stdio: "ignore",
-    timeout: 15_000,
+  if (deps.candidateCodexHome !== undefined) {
+    requireCodexInputSource(deps.candidateCodexHome, "Health probe candidate Codex home", userRoot);
+  }
+  return withHealthProbeSandbox(userRoot, deps, (sandbox) => {
+    if (deps.candidateCodexHome !== undefined) {
+      stageBoundedCodexInputs(deps.candidateCodexHome, sandbox.codexHome);
+    }
+    return launchHealthProbe(executable, userRoot, sandbox, deps);
+  });
+}
+
+/**
+ * Run one contained health process with a private, short-lived copy of the
+ * durable Codex authentication proof. Candidate and post-promotion probes use
+ * this same seam so neither can fall back to an ambient home or retain auth.
+ */
+export function spawnAuthenticatedHiddenHealthProbe(
+  executable: string,
+  userRoot: string,
+  liveCodexHome: string,
+  deps: HealthProbeLaunchDependencies = {},
+): ReturnType<typeof spawnSync> {
+  requireCodexInputSource(liveCodexHome, "Live Codex home");
+  const sourceCodexHome = deps.candidateCodexHome ?? liveCodexHome;
+  requireCodexInputSource(
+    sourceCodexHome,
+    deps.candidateCodexHome === undefined ? "Live Codex home" : "Health probe candidate Codex home",
+    deps.candidateCodexHome === undefined ? undefined : userRoot,
+  );
+  return withHealthProbeSandbox(userRoot, deps, (sandbox) => {
+    stageBoundedCodexInputs(sourceCodexHome, sandbox.codexHome);
+    const removeAuth = stageCandidateCodexAuth(liveCodexHome, sandbox.codexHome);
+    try {
+      return launchHealthProbe(executable, userRoot, sandbox, deps);
+    } finally {
+      removeAuth();
+      if (existsSync(join(sandbox.codexHome, "auth.json"))) {
+        throw new Error("Contained Codex authentication proof was not removed after health probe");
+      }
+    }
   });
 }
 
@@ -628,9 +665,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       return restored.platform === "darwin" ? signatureInfo(appRoot).ok : true;
     },
     probeCandidateHealth: ({ candidateRoot }) => {
-      let removeCandidateAuth: (() => void) | null = null;
       try {
-        removeCandidateAuth = stageCandidateCodexAuth(liveCodexHome, candidateCodexHome);
         const candidate = locateCodex(candidateRoot);
         validateMainRendererAsarEntrypoint(candidate.asarPath);
         const expected = candidateHealthExpectation;
@@ -642,7 +677,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           ...expected,
           requestedAt: new Date().toISOString(),
         });
-        const launched = spawnHiddenHealthProbe(candidate.executable, candidateUserRoot, { candidateCodexHome });
+        const launched = spawnAuthenticatedHiddenHealthProbe(
+          candidate.executable,
+          candidateUserRoot,
+          liveCodexHome,
+          { candidateCodexHome },
+        );
         if (launched.error || launched.status !== 0) {
           return unknownPromotionHealth(requiredPermissions);
         }
@@ -650,7 +690,6 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       } catch {
         return unknownPromotionHealth(requiredPermissions);
       } finally {
-        removeCandidateAuth?.();
         reconcileMacRegistrations({ garbageCollect: false });
       }
     },
@@ -768,7 +807,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         return unknownPromotionHealth(requiredPermissions);
       }
       const receiptFile = join(paths.root, "health", "promotion.json");
-      const deadline = Date.now() + 15_000;
+      const deadline = Date.now() + HEALTH_PROBE_RECEIPT_TIMEOUT_MS;
       while (Date.now() < deadline) {
         const observed = readProductionHealthReceipt(receiptFile, expected);
         if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
@@ -813,7 +852,14 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       // gets a distinct singleton and always runs far enough to answer. The
       // user-visible relaunch is handled separately by the reopen-after-patch
       // path; this launch is only for the receipt.
-      spawnHiddenHealthProbe(locateCodex(appRoot).executable, paths.root);
+      const launched = spawnAuthenticatedHiddenHealthProbe(
+        locateCodex(appRoot).executable,
+        paths.root,
+        liveCodexHome,
+      );
+      if (launched.error || launched.status !== 0 || launched.signal !== null) {
+        throw new Error("Post-promotion health process did not exit cleanly");
+      }
     },
   });
 

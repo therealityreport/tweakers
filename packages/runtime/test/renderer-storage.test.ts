@@ -9,6 +9,7 @@ import {
   prepareRendererStorageMigration,
   rollbackRendererStorageMigration,
   type StorageLike,
+  verifyRendererStorageRollback,
 } from "../src/renderer-storage";
 
 test("renderer crypto matches Node SHA-256 for UTF-8 values and generates UUIDs", () => {
@@ -28,9 +29,10 @@ test("renderer storage and its browser helper do not import Node built-ins", () 
 
 function fakeStorage(
   entries: Array<[string, string]>,
-  options: { failWrites?: boolean } = {},
+  options: { failWrites?: boolean; failRemoveAt?: number } = {},
 ): { storage: StorageLike; values: Map<string, string> } {
   const values = new Map(entries);
+  let removeCount = 0;
   const storage: StorageLike = {
     get length() { return values.size; },
     getItem: (key) => values.get(key) ?? null,
@@ -39,7 +41,11 @@ function fakeStorage(
       if (options.failWrites) throw new Error("write failed");
       values.set(key, value);
     },
-    removeItem: (key) => { values.delete(key); },
+    removeItem: (key) => {
+      removeCount += 1;
+      if (removeCount === options.failRemoveAt) throw new Error("remove failed");
+      values.delete(key);
+    },
   };
   return { storage, values };
 }
@@ -170,4 +176,34 @@ test("renderer storage facade carries the committed receipt into rollback", () =
   assert.equal(facade.rollbackMigration().phase, "rolled_back");
   assert.equal(values.get(legacyKey), raw);
   assert.equal(values.has(currentKey), false);
+});
+
+test("promotion storage self-test passes only after removing every synthetic key", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const suffix = `promotion-health-original-${nonce}`;
+  const currentKey = `tweaker:storage:co.tweakers.${suffix}`;
+  const legacyKey = `${["codex", "pp"].join("")}:storage:co.promotion-probe.${suffix}`;
+  const { storage, values } = fakeStorage([]);
+
+  assert.equal(verifyRendererStorageRollback(storage, nonce), "pass");
+  assert.equal(values.has(currentKey), false);
+  assert.equal(values.has(legacyKey), false);
+  assert.equal([...values.keys()].some((key) => key.startsWith("tweaker:storage-archive:")), false);
+});
+
+test("promotion storage self-test fails closed when final cleanup throws", () => {
+  const { storage } = fakeStorage([], { failRemoveAt: 4 });
+
+  assert.equal(
+    verifyRendererStorageRollback(storage, "123e4567-e89b-42d3-a456-426614174001"),
+    "fail",
+  );
+});
+
+test("promotion storage self-test removes a deterministic archive after commit fails mid-write", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174002";
+  const { storage, values } = fakeStorage([], { failRemoveAt: 1 });
+
+  assert.equal(verifyRendererStorageRollback(storage, nonce), "fail");
+  assert.deepEqual([...values.keys()], []);
 });

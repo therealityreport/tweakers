@@ -1,6 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_AUTH_CHANNEL = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.PROMOTION_SURFACE_NAMES = exports.PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = exports.PROMOTION_ORIGINAL_RENDERER_URL = exports.PROMOTION_RENDERER_HOST = exports.PROMOTION_RENDERER_SCHEME = exports.PROMOTION_RENDERER_NONCE_QUERY = exports.PROMOTION_RENDERER_AUTH_CHANNEL = exports.PROMOTION_RENDERER_IPC_CHANNEL = void 0;
+exports.canonicalPromotionOriginalRendererUrl = canonicalPromotionOriginalRendererUrl;
+exports.promotionOriginalRendererEvidenceUrl = promotionOriginalRendererEvidenceUrl;
+exports.promotionOriginalRendererLogUrl = promotionOriginalRendererLogUrl;
+exports.authorizePromotionOriginalRenderer = authorizePromotionOriginalRenderer;
+exports.createPromotionOriginalRendererProofTracker = createPromotionOriginalRendererProofTracker;
 exports.authorizePromotionRenderer = authorizePromotionRenderer;
 exports.validatePromotionRendererHandshake = validatePromotionRendererHandshake;
 exports.promotionRendererDocumentUrl = promotionRendererDocumentUrl;
@@ -22,6 +27,253 @@ exports.PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize"
 exports.PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 exports.PROMOTION_RENDERER_SCHEME = "app";
 exports.PROMOTION_RENDERER_HOST = "-";
+exports.PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
+exports.PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
+exports.PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
+/**
+ * Accept the production Owl document, including its exact observed query,
+ * without accepting a synthetic proof nonce or URL normalization ambiguity.
+ */
+function canonicalPromotionOriginalRendererUrl(value) {
+    if (typeof value !== "string"
+        || value.length === 0
+        || value.length > 8_192
+        || /[\u0000-\u001f\u007f]/.test(value))
+        return null;
+    let parsed;
+    try {
+        parsed = new URL(value);
+    }
+    catch {
+        return null;
+    }
+    if (parsed.protocol !== "app:"
+        || parsed.hostname !== "-"
+        || parsed.username !== ""
+        || parsed.password !== ""
+        || parsed.port !== ""
+        || parsed.pathname !== "/index.html"
+        || parsed.hash !== ""
+        || parsed.searchParams.has(exports.PROMOTION_RENDERER_NONCE_QUERY)
+        || parsed.toString() !== value)
+        return null;
+    const queryKeys = [...parsed.searchParams.keys()];
+    if (queryKeys.some((key) => !PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS.has(key))
+        || new Set(queryKeys).size !== queryKeys.length)
+        return null;
+    const hostId = parsed.searchParams.get("hostId");
+    const initialRoute = parsed.searchParams.get("initialRoute");
+    if (hostId !== null && (!/^[A-Za-z0-9._:-]{1,256}$/.test(hostId)))
+        return null;
+    if (initialRoute !== null && (initialRoute.length === 0
+        || initialRoute.length > 2_048
+        || !initialRoute.startsWith("/")
+        || /[\u0000-\u001f\u007f]/.test(initialRoute)))
+        return null;
+    return value;
+}
+function promotionOriginalRendererEvidenceUrl(value) {
+    if (value === null || canonicalPromotionOriginalRendererUrl(value) === null) {
+        return { canonicalUrl: null, queryKeys: [] };
+    }
+    return {
+        canonicalUrl: exports.PROMOTION_ORIGINAL_RENDERER_URL,
+        queryKeys: [...new URL(value).searchParams.keys()].sort(),
+    };
+}
+function promotionOriginalRendererLogUrl(value) {
+    if (typeof value !== "string")
+        return "[redacted-url]";
+    const evidence = promotionOriginalRendererEvidenceUrl(value);
+    if (evidence.canonicalUrl === null)
+        return "[redacted-url]";
+    return evidence.queryKeys.length === 0
+        ? evidence.canonicalUrl
+        : `${evidence.canonicalUrl}?[${evidence.queryKeys.join(",")}:redacted]`;
+}
+/**
+ * Authorizes the dedicated original-main preload synchronously. The renderer
+ * sends only its unmodified canonical URL; the main process supplies the nonce
+ * after binding the sender to the one hidden, safe BrowserWindow.
+ */
+function authorizePromotionOriginalRenderer(context, payload, nonce) {
+    if (!context.windowAlive)
+        return { accepted: false, reason: "proof window unavailable", response: null };
+    if (!context.windowHidden)
+        return { accepted: false, reason: "proof window visible", response: null };
+    if (!context.senderMatches)
+        return { accepted: false, reason: "sender mismatch", response: null };
+    if (!context.frameMatches)
+        return { accepted: false, reason: "frame mismatch", response: null };
+    const canonicalUrl = canonicalPromotionOriginalRendererUrl(context.senderUrl);
+    if (canonicalUrl === null) {
+        return { accepted: false, reason: "sender URL mismatch", response: null };
+    }
+    if (context.consumed)
+        return { accepted: false, reason: "authorization already consumed", response: null };
+    if (!plainRecord(payload) || !exactKeys(payload, ["url", "version"])) {
+        return { accepted: false, reason: "payload invalid", response: null };
+    }
+    if (payload.version !== 1 || payload.url !== canonicalUrl) {
+        return { accepted: false, reason: "payload binding invalid", response: null };
+    }
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(nonce)) {
+        return { accepted: false, reason: "nonce invalid", response: null };
+    }
+    return {
+        accepted: true,
+        reason: "accepted",
+        response: { version: 1, nonce, url: canonicalUrl },
+    };
+}
+/** Pure state machine for the original Codex renderer promotion gate. */
+function createPromotionOriginalRendererProofTracker(nonce) {
+    let capturedWindowCount = 0;
+    let canonicalWebContentsId = null;
+    let canonicalUrl = null;
+    let authorized = false;
+    let didFinishLoad = false;
+    let mounted = false;
+    let originalPreload = false;
+    let preloadFailed = false;
+    let loadFailed = false;
+    let rendererExited = false;
+    let rendererStorageSelfTest = "unknown";
+    let cleanup = "pending";
+    let failureReason = null;
+    const preloadErrorIds = new Set();
+    const isCanonical = (id) => canonicalWebContentsId === id;
+    const permanentlyFail = (reason) => {
+        if (reason === "canonical renderer load failed")
+            loadFailed = true;
+        if (reason === "canonical renderer process exited")
+            rendererExited = true;
+        if (reason === "canonical original preload failed")
+            preloadFailed = true;
+        if (failureReason === null) {
+            failureReason = reason.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 256);
+        }
+        rendererStorageSelfTest = "fail";
+    };
+    return {
+        windowCaptured() {
+            capturedWindowCount += 1;
+        },
+        eligibleWindow(observation) {
+            if (canonicalPromotionOriginalRendererUrl(observation.url) === null
+                || !Number.isSafeInteger(observation.webContentsId)
+                || observation.webContentsId <= 0
+                || !observation.isDefaultSession
+                || observation.sandbox !== true
+                || observation.contextIsolation !== true
+                || observation.nodeIntegration !== false
+                || observation.originalPreloadValid !== true) {
+                permanentlyFail("eligible renderer was not canonical and sandbox-safe");
+                return;
+            }
+            if (canonicalWebContentsId !== null
+                && (canonicalWebContentsId !== observation.webContentsId || canonicalUrl !== observation.url)) {
+                permanentlyFail(canonicalWebContentsId !== observation.webContentsId
+                    ? "duplicate eligible renderer"
+                    : "canonical renderer URL changed");
+                return;
+            }
+            canonicalWebContentsId = observation.webContentsId;
+            canonicalUrl = observation.url;
+            originalPreload = true;
+            if (preloadErrorIds.has(observation.webContentsId))
+                permanentlyFail("canonical original preload failed");
+        },
+        preloadError(webContentsId) {
+            preloadErrorIds.add(webContentsId);
+            if (isCanonical(webContentsId))
+                permanentlyFail("canonical original preload failed");
+        },
+        authorization(webContentsId) {
+            if (!isCanonical(webContentsId)) {
+                permanentlyFail("authorization sender was not canonical");
+                return;
+            }
+            if (authorized) {
+                permanentlyFail("authorization replayed");
+                return;
+            }
+            authorized = true;
+        },
+        didFinishLoad(webContentsId, url) {
+            if (!isCanonical(webContentsId))
+                return;
+            if (url !== canonicalUrl) {
+                permanentlyFail("canonical renderer finished at wrong URL");
+                return;
+            }
+            didFinishLoad = true;
+        },
+        rendererHandshake(observation) {
+            if (!isCanonical(observation.webContentsId)) {
+                permanentlyFail("mount sender was not canonical");
+                return;
+            }
+            if (mounted) {
+                permanentlyFail("mount handshake replayed");
+                return;
+            }
+            if (!authorized
+                || observation.nonce !== nonce
+                || observation.url !== canonicalUrl
+                || observation.lifecycle !== "renderer-mounted"
+                || !validHealthValue(observation.rendererStorageSelfTest)) {
+                permanentlyFail("mount handshake binding invalid");
+                return;
+            }
+            mounted = true;
+            rendererStorageSelfTest = observation.rendererStorageSelfTest;
+            if (rendererStorageSelfTest !== "pass")
+                permanentlyFail("renderer storage self-test failed");
+        },
+        fail(reason, webContentsId) {
+            if (webContentsId !== undefined && !isCanonical(webContentsId))
+                return;
+            permanentlyFail(reason);
+        },
+        cleanup(success) {
+            cleanup = success ? "pass" : "fail";
+            if (!success)
+                permanentlyFail("promotion renderer cleanup failed");
+        },
+        complete() {
+            return failureReason !== null || (authorized && didFinishLoad && mounted && rendererStorageSelfTest === "pass");
+        },
+        result() {
+            const proofComplete = authorized && didFinishLoad && mounted && rendererStorageSelfTest === "pass";
+            if (failureReason !== null || cleanup === "fail") {
+                return { hostReady: "fail", rendererStorageSelfTest: "fail", proofSummary: this.summary() };
+            }
+            return {
+                hostReady: proofComplete && cleanup === "pass" ? "pass" : "unknown",
+                rendererStorageSelfTest: mounted ? rendererStorageSelfTest : "unknown",
+                proofSummary: this.summary(),
+            };
+        },
+        summary() {
+            return {
+                capturedWindowCount,
+                canonicalWebContentsId,
+                canonicalUrl,
+                authorized,
+                didFinishLoad,
+                mounted,
+                originalPreload,
+                preloadFailed,
+                loadFailed,
+                rendererExited,
+                cleanup,
+                failureReason,
+            };
+        },
+    };
+}
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 function authorizePromotionRenderer(context, payload, nonce) {
     if (!context.windowAlive)
@@ -422,6 +674,14 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
     catch { /* fail closed below */ }
     const expectedUserQuestions = request.userQuestions;
     const hostReady = await safe(() => probes.rendererReady?.() ?? "unknown");
+    let observedRendererProof = unavailableRendererProofSummary();
+    try {
+        const observed = await probes.rendererProof?.();
+        if (validRendererProofSummary(observed))
+            observedRendererProof = observed;
+    }
+    catch { /* fail closed below */ }
+    const rendererProof = rendererProofReceiptSummary(observedRendererProof);
     const identity = observedUserQuestions &&
         observedUserQuestions.id === expectedUserQuestions.id &&
         observedUserQuestions.version === expectedUserQuestions.version &&
@@ -454,18 +714,95 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
         userQuestions.rendererStorageSelfTest,
         userQuestions.zeroMcpConflicts,
     ].every((value) => value === "pass");
+    const rendererProofPass = passingRendererProofSummary(observedRendererProof);
     return {
         schemaVersion: 2,
         observedAt: now.toISOString(),
         app: request.app,
         hostReady,
+        rendererProof,
         authenticatedSession,
         declaredPermissions: permissions,
         surfaces,
         userQuestions,
-        promotionReady: hostReady === "pass" && allSurfacesPass && allPermissionsPass && userQuestionsPass && authenticatedSession === "pass"
+        promotionReady: hostReady === "pass" && rendererProofPass && allSurfacesPass && allPermissionsPass && userQuestionsPass && authenticatedSession === "pass"
             ? "pass" : "fail",
     };
+}
+function rendererProofReceiptSummary(value) {
+    const evidenceUrl = promotionOriginalRendererEvidenceUrl(value.canonicalUrl);
+    return {
+        ...value,
+        canonicalUrl: evidenceUrl.canonicalUrl,
+        queryKeys: evidenceUrl.queryKeys,
+    };
+}
+function unavailableRendererProofSummary() {
+    return {
+        capturedWindowCount: 0,
+        canonicalWebContentsId: null,
+        canonicalUrl: null,
+        authorized: false,
+        didFinishLoad: false,
+        mounted: false,
+        originalPreload: false,
+        preloadFailed: false,
+        loadFailed: false,
+        rendererExited: false,
+        cleanup: "pending",
+        failureReason: "renderer proof unavailable",
+    };
+}
+function validRendererProofSummary(value) {
+    if (!plainRecord(value) || !exactKeys(value, [
+        "capturedWindowCount",
+        "canonicalWebContentsId",
+        "canonicalUrl",
+        "authorized",
+        "didFinishLoad",
+        "mounted",
+        "originalPreload",
+        "preloadFailed",
+        "loadFailed",
+        "rendererExited",
+        "cleanup",
+        "failureReason",
+    ]))
+        return false;
+    if (!Number.isSafeInteger(value.capturedWindowCount)
+        || value.capturedWindowCount < 0
+        || value.capturedWindowCount > 64
+        || (value.canonicalWebContentsId !== null && (!Number.isSafeInteger(value.canonicalWebContentsId)
+            || value.canonicalWebContentsId <= 0))
+        || (value.canonicalUrl !== null && canonicalPromotionOriginalRendererUrl(value.canonicalUrl) === null)
+        || typeof value.authorized !== "boolean"
+        || typeof value.didFinishLoad !== "boolean"
+        || typeof value.mounted !== "boolean"
+        || typeof value.originalPreload !== "boolean"
+        || typeof value.preloadFailed !== "boolean"
+        || typeof value.loadFailed !== "boolean"
+        || typeof value.rendererExited !== "boolean"
+        || !["pending", "pass", "fail"].includes(value.cleanup)
+        || (value.failureReason !== null && (typeof value.failureReason !== "string"
+            || value.failureReason.length === 0
+            || value.failureReason.length > 256
+            || /[\u0000-\u001f\u007f]/.test(value.failureReason))))
+        return false;
+    return true;
+}
+function passingRendererProofSummary(value) {
+    return value.capturedWindowCount >= 1
+        && value.canonicalWebContentsId !== null
+        && value.canonicalUrl !== null
+        && value.authorized
+        && value.didFinishLoad
+        && value.mounted
+        && value.originalPreload
+        && !value.preloadFailed
+        && !value.loadFailed
+        && !value.rendererExited
+        && value.cleanup === "pass"
+        && value.failureReason === null;
 }
 function validPromotionRequest(value) {
     if (!plainRecord(value))

@@ -28,17 +28,28 @@ const child = spawn(command, args, {
   stdio: "inherit",
 });
 let forwardedSignal = null;
+let escalationTimer = null;
+const childIsRunning = () => child.exitCode === null && child.signalCode === null;
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
-    forwardedSignal = signal;
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    if (forwardedSignal === null) forwardedSignal = signal;
+    if (!childIsRunning()) return;
+    child.kill(signal);
+    if (escalationTimer === null) {
+      escalationTimer = setTimeout(() => {
+        escalationTimer = null;
+        if (childIsRunning()) child.kill("SIGKILL");
+      }, 1000);
+    }
   });
 }
 child.once("error", (error) => {
+  if (escalationTimer !== null) clearTimeout(escalationTimer);
   process.stderr.write("Tweakers Codex parent: " + error.message + "\n");
   process.exitCode = 1;
 });
 child.once("exit", (code, signal) => {
+  if (escalationTimer !== null) clearTimeout(escalationTimer);
   if (typeof code === "number") {
     process.exit(code);
     return;
@@ -67,6 +78,16 @@ export interface MutableChildProcessModule {
 interface InstalledParent {
   originalSpawn: SpawnFunction;
   wrappedSpawn: SpawnFunction;
+  children: Set<ChildProcess>;
+  cleanupStarted: boolean;
+  cleanupInFlight?: Promise<CodexAppServerParentCleanupResult>;
+}
+
+export interface CodexAppServerParentCleanupResult {
+  tracked: number;
+  terminated: number;
+  forced: number;
+  failed: number;
 }
 
 export interface CodexAppServerParentInstallOptions {
@@ -80,6 +101,10 @@ export interface CodexAppServerParentInstallResult {
   installed: boolean;
   bundledNodePath: string | null;
   reason: "installed" | "already-installed" | "unsupported-platform" | "missing-bundled-node";
+  cleanupTrackedParents(options?: {
+    termTimeoutMs?: number;
+    killTimeoutMs?: number;
+  }): Promise<CodexAppServerParentCleanupResult>;
   uninstall(): void;
 }
 
@@ -142,6 +167,12 @@ export function installCodexAppServerParent(
   }
 
   const originalSpawn = childProcess.spawn;
+  const installed = {
+    originalSpawn,
+    wrappedSpawn: undefined as unknown as SpawnFunction,
+    children: new Set<ChildProcess>(),
+    cleanupStarted: false,
+  } satisfies InstalledParent;
   const wrappedSpawn: SpawnFunction = function wrappedCodexSpawn(
     this: unknown,
     command: string,
@@ -152,16 +183,23 @@ export function installCodexAppServerParent(
       Array.isArray(argsOrOptions) &&
       isCodexAppServerSpawn(command, argsOrOptions, maybeOptions)
     ) {
-      return Reflect.apply(originalSpawn, this, [
+      if (installed.cleanupStarted) {
+        throw new Error("Tweakers Codex parent: app-server cleanup has started");
+      }
+      const child = Reflect.apply(originalSpawn, this, [
         bundledNodePath,
         buildCodexAppServerParentArgs(command, argsOrOptions),
         sanitizeParentSpawnOptions(maybeOptions),
       ]) as ChildProcess;
+      installed.children.add(child);
+      child.once?.("exit", () => installed.children.delete(child));
+      child.once?.("error", () => installed.children.delete(child));
+      return child;
     }
     return Reflect.apply(originalSpawn, this, [command, argsOrOptions, maybeOptions]) as ChildProcess;
   };
 
-  const installed: InstalledParent = { originalSpawn, wrappedSpawn };
+  installed.wrappedSpawn = wrappedSpawn;
   childProcess.spawn = wrappedSpawn;
   childProcess[INSTALL_MARKER] = installed;
   return result(true, bundledNodePath, "installed", childProcess, installed);
@@ -184,10 +222,87 @@ function result(
     installed,
     bundledNodePath,
     reason,
+    async cleanupTrackedParents(options = {}) {
+      if (!state || childProcess[INSTALL_MARKER] !== state) {
+        return { tracked: 0, terminated: 0, forced: 0, failed: 0 };
+      }
+      state.cleanupStarted = true;
+      if (state.cleanupInFlight) return state.cleanupInFlight;
+      state.cleanupInFlight = drainTrackedParents(
+        state,
+        options.termTimeoutMs ?? 2_000,
+        options.killTimeoutMs ?? 1_000,
+      );
+      try {
+        return await state.cleanupInFlight;
+      } finally {
+        state.cleanupInFlight = undefined;
+      }
+    },
     uninstall() {
       if (!state || childProcess[INSTALL_MARKER] !== state) return;
       if (childProcess.spawn === state.wrappedSpawn) childProcess.spawn = state.originalSpawn;
       delete childProcess[INSTALL_MARKER];
     },
   };
+}
+
+type TrackedParentTermination = "already-exited" | "terminated" | "forced" | "failed";
+
+async function terminateTrackedParent(
+  child: ChildProcess,
+  termTimeoutMs: number,
+  killTimeoutMs: number,
+): Promise<TrackedParentTermination> {
+  if (child.exitCode !== null || child.signalCode !== null) return "already-exited";
+  if (!child.kill("SIGTERM")) return "failed";
+  const completionTimeoutMs = Math.max(0, termTimeoutMs) + Math.max(0, killTimeoutMs);
+  if (!await waitForChildExit(child, completionTimeoutMs)) return "failed";
+  return child.signalCode === "SIGKILL" ? "forced" : "terminated";
+}
+
+async function drainTrackedParents(
+  state: InstalledParent,
+  termTimeoutMs: number,
+  killTimeoutMs: number,
+): Promise<CodexAppServerParentCleanupResult> {
+  const attempted = new Set<ChildProcess>();
+  let terminated = 0;
+  let forced = 0;
+  let failed = 0;
+
+  while (true) {
+    const pending = [...state.children].filter((child) => !attempted.has(child));
+    if (pending.length === 0) break;
+    for (const child of pending) {
+      attempted.add(child);
+      const outcome = await terminateTrackedParent(child, termTimeoutMs, killTimeoutMs);
+      if (outcome === "terminated") terminated += 1;
+      else if (outcome === "forced") forced += 1;
+      else if (outcome === "failed") failed += 1;
+      if (outcome !== "failed") state.children.delete(child);
+    }
+  }
+
+  return { tracked: attempted.size, terminated, forced, failed };
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const settle = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onError);
+      resolvePromise(exited);
+    };
+    const onExit = (): void => settle(true);
+    const onError = (): void => settle(false);
+    const timer = setTimeout(() => settle(false), Math.max(0, timeoutMs));
+    child.once("exit", onExit);
+    child.once("error", onError);
+  });
 }

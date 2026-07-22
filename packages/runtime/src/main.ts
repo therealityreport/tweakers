@@ -86,7 +86,10 @@ import { resolveLocalCliRuntime } from "./local-cli-runtime";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import {
   answerPromotionHealthRequest,
+  authorizePromotionOriginalRenderer,
   authorizePromotionRenderer,
+  canonicalPromotionOriginalRendererUrl,
+  createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
   hasAuthenticatedSessionCookie,
@@ -94,6 +97,11 @@ import {
   PROMOTION_RENDERER_AUTH_CHANNEL,
   PROMOTION_RENDERER_IPC_CHANNEL,
   PROMOTION_RENDERER_SCHEME,
+  PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL,
+  PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL,
+  PROMOTION_ORIGINAL_RENDERER_URL,
+  promotionOriginalRendererEvidenceUrl,
+  promotionOriginalRendererLogUrl,
   promotionRendererDocumentUrl,
   promotionRendererLoadRejection,
   readCodexAuth,
@@ -177,9 +185,10 @@ if (!userRoot || !runtimeDir) {
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
-installCodexAppServerParent();
+const codexAppServerParent = installCodexAppServerParent();
 
 const PRELOAD_PATH = resolve(runtimeDir, "preload.js");
+const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-preload.js");
 const TWEAKS_DIR = join(userRoot, "tweaks");
 const LOG_DIR = join(userRoot, "log");
 const LOG_FILE = join(LOG_DIR, "main.log");
@@ -206,11 +215,17 @@ const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+const healthOriginalMain = healthCheckOnly
+  && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
+
+if (healthOriginalMain && process.platform === "darwin" && !codexAppServerParent.installed) {
+  throw new Error("original-main health requires the owned signed Codex app-server parent tracker");
+}
 
 // The health-only process skips Codex's bootstrap, so register the production
 // renderer scheme during module evaluation, before Electron becomes ready.
 // The request handler itself remains scoped to the one renderer proof below.
-if (healthCheckOnly) {
+if (healthCheckOnly && !healthOriginalMain) {
   protocol.registerSchemesAsPrivileged([{
     scheme: PROMOTION_RENDERER_SCHEME,
     privileges: {
@@ -283,7 +298,7 @@ mkdirSync(TWEAKS_DIR, { recursive: true });
 // One-time migration: the retired mode-switcher tweak persisted a soft
 // vanilla mode; app modes are now real bundle swaps owned by the installer
 // (`tweaker mode`). Drop the stale key so it can never gate tweaks again.
-removeLegacyModeSwitcherState(userRoot);
+if (!healthCheckOnly) removeLegacyModeSwitcherState(userRoot);
 const refreshStatusWatcher = chokidar.watch([
   SELF_UPDATE_STATE_FILE,
   join(userRoot, "refresh-state.json"),
@@ -479,7 +494,7 @@ const codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
   userRoot,
   env: process.env,
   selectedManagedCli,
-  persistFailure: (message) => {
+  persistFailure: healthCheckOnly ? undefined : (message) => {
     const state = readState();
     state.tweaker ??= {};
     state.tweaker.codexCliBootstrapFailure = message;
@@ -525,7 +540,7 @@ const codexCliManager = createCodexCliManager({
   userRoot,
   deps: createCodexCliManagerDependencies(),
 });
-codexCliManager.recover();
+if (!healthCheckOnly) codexCliManager.recover();
 
 const CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
 let lastPublishedCodexDesktopUpdate: CodexDesktopUpdateCheckResult | null = null;
@@ -2614,25 +2629,30 @@ const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
 
 app.whenReady().then(() => {
   log("info", "app ready fired");
+  originalMainPromotionProbe?.registerSession(session.defaultSession, "defaultSession-whenReady");
   // A disposable health probe launches Codex's main process only far enough to
   // reach app.whenReady — the real Codex bootstrap never runs, so services the
   // normal session cookie read depends on may never settle and could hang. Bound
   // the whole receipt path and force-exit so the installer's probe can never
   // hang on us; a missing receipt fails safe (promotion is blocked, app intact).
   if (healthCheckOnly) {
-    const watchdog = setTimeout(() => {
-      log("warn", "health-check watchdog fired; exiting");
-      app.exit(0);
-    }, 12_000);
-    watchdog.unref?.();
+    if (!healthOriginalMain) {
+      const watchdog = setTimeout(() => {
+        log("warn", "health-check watchdog fired; exiting");
+        app.exit(0);
+      }, 12_000);
+      watchdog.unref?.();
+    }
   } else {
     // Raw Sparkle scheduling stays disabled in the locally signed app. This
     // bounded metadata-only loop restores proactive update notification safely.
     scheduleProactiveDesktopUpdateChecks();
   }
   void (async () => {
-    const rendererProof = healthCheckOnly
-      ? await runPromotionRendererProof()
+    const rendererProof = healthOriginalMain
+      ? await originalMainPromotionProbe!.run()
+      : healthCheckOnly
+        ? await runPromotionRendererProof()
       : { hostReady: "unknown", rendererStorageSelfTest: "unknown" } satisfies PromotionRendererProofResult;
     void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
@@ -2658,6 +2678,7 @@ app.whenReady().then(() => {
       return "unknown";
     },
     rendererReady: () => rendererProof.hostReady,
+    rendererProof: () => rendererProof.proofSummary ?? null,
     promotionSurface: promotionSurfaceHash,
     userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
     }).then((answered) => {

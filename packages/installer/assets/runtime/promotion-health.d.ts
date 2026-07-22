@@ -4,6 +4,90 @@ export declare const PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-render
 export declare const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 export declare const PROMOTION_RENDERER_SCHEME = "app";
 export declare const PROMOTION_RENDERER_HOST = "-";
+export declare const PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
+export declare const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
+export declare const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
+/**
+ * Accept the production Owl document, including its exact observed query,
+ * without accepting a synthetic proof nonce or URL normalization ambiguity.
+ */
+export declare function canonicalPromotionOriginalRendererUrl(value: unknown): string | null;
+export declare function promotionOriginalRendererEvidenceUrl(value: string | null): {
+    canonicalUrl: typeof PROMOTION_ORIGINAL_RENDERER_URL | null;
+    queryKeys: string[];
+};
+export declare function promotionOriginalRendererLogUrl(value: unknown): string;
+export interface PromotionOriginalRendererAuthorizationContext {
+    windowAlive: boolean;
+    windowHidden: boolean;
+    senderMatches: boolean;
+    frameMatches: boolean;
+    senderUrl: string;
+    consumed: boolean;
+}
+export type PromotionOriginalRendererAuthorizationDecision = {
+    accepted: false;
+    reason: string;
+    response: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    response: {
+        version: 1;
+        nonce: string;
+        url: string;
+    };
+};
+/**
+ * Authorizes the dedicated original-main preload synchronously. The renderer
+ * sends only its unmodified canonical URL; the main process supplies the nonce
+ * after binding the sender to the one hidden, safe BrowserWindow.
+ */
+export declare function authorizePromotionOriginalRenderer(context: PromotionOriginalRendererAuthorizationContext, payload: unknown, nonce: string): PromotionOriginalRendererAuthorizationDecision;
+export interface PromotionOriginalRendererWindowObservation {
+    webContentsId: number;
+    url: string;
+    isDefaultSession: boolean;
+    sandbox: boolean;
+    contextIsolation: boolean;
+    nodeIntegration: boolean;
+    originalPreloadValid: boolean;
+}
+export interface PromotionOriginalRendererProofSummary {
+    capturedWindowCount: number;
+    canonicalWebContentsId: number | null;
+    canonicalUrl: string | null;
+    authorized: boolean;
+    didFinishLoad: boolean;
+    mounted: boolean;
+    originalPreload: boolean;
+    preloadFailed: boolean;
+    loadFailed: boolean;
+    rendererExited: boolean;
+    cleanup: "pending" | "pass" | "fail";
+    failureReason: string | null;
+}
+export interface PromotionOriginalRendererProofTracker {
+    windowCaptured(): void;
+    eligibleWindow(observation: PromotionOriginalRendererWindowObservation): void;
+    preloadError(webContentsId: number): void;
+    authorization(webContentsId: number): void;
+    didFinishLoad(webContentsId: number, url: string): void;
+    rendererHandshake(observation: {
+        webContentsId: number;
+        nonce: string;
+        url: string;
+        lifecycle: string;
+        rendererStorageSelfTest: HealthValue;
+    }): void;
+    fail(reason: string, webContentsId?: number): void;
+    cleanup(success: boolean): void;
+    complete(): boolean;
+    result(): PromotionRendererProofResult;
+    summary(): PromotionOriginalRendererProofSummary;
+}
+/** Pure state machine for the original Codex renderer promotion gate. */
+export declare function createPromotionOriginalRendererProofTracker(nonce: string): PromotionOriginalRendererProofTracker;
 export interface PromotionRendererAuthorizationContext {
     windowAlive: boolean;
     senderMatches: boolean;
@@ -79,6 +163,8 @@ export declare function promotionRendererLoadRejection(error: unknown, requested
 export interface PromotionRendererProofResult {
     hostReady: HealthValue;
     rendererStorageSelfTest: HealthValue;
+    /** Targeted original-main detail is logged; the installer receipt remains schema compatible. */
+    proofSummary?: PromotionOriginalRendererProofSummary;
 }
 export interface PromotionRendererProofTracker {
     windowCreated(observation: {
@@ -157,6 +243,8 @@ export interface RuntimePromotionProbes {
     declaredPermission(permission: string): HealthValue | Promise<HealthValue>;
     /** A nonce-bound real BrowserWindow/preload lifecycle proof. Missing means unknown. */
     rendererReady?(): HealthValue | Promise<HealthValue>;
+    /** Bounded targeted renderer load/failure/exit/mount evidence for the existing V2 receipt. */
+    rendererProof?(): PromotionOriginalRendererProofSummary | null | Promise<PromotionOriginalRendererProofSummary | null>;
     /** V2 observations are injected so disposable candidates never infer or read live config paths. */
     promotionSurface?(surface: PromotionSurfaceName): string | Promise<string>;
     userQuestionsHealth?(): UserQuestionsHealthObservation | Promise<UserQuestionsHealthObservation>;

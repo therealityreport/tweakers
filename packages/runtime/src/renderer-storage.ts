@@ -273,3 +273,71 @@ export function createRendererStorage(id: string, storage: StorageLike) {
     all: () => read(),
   };
 }
+
+/**
+ * Exercise the exact prepare/commit/rollback path used by a promotion probe.
+ * Every synthetic key is removed and verified before success is returned;
+ * cleanup failure is a failed health result, never a silent residue.
+ */
+export function verifyRendererStorageRollback(
+  storage: StorageLike,
+  nonce: string,
+): "pass" | "fail" {
+  const suffix = `promotion-health-original-${nonce}`;
+  const currentId = `co.tweakers.${suffix}`;
+  const currentKey = `${CURRENT_STORAGE_PREFIX}${currentId}`;
+  const legacyKey = `${LEGACY_STORAGE_PREFIX}co.promotion-probe.${suffix}`;
+  const expectedArchiveKey = `${ARCHIVE_STORAGE_PREFIX}${nonce}:${encodeURIComponent(legacyKey)}`;
+  const raw = JSON.stringify({ retained: true, nonce });
+  let ownsProbeKeys = false;
+  let result: "pass" | "fail" = "fail";
+  let cleanupSucceeded = true;
+
+  try {
+    if (storage.getItem(currentKey) !== null || storage.getItem(legacyKey) !== null) {
+      result = "fail";
+    } else {
+      ownsProbeKeys = true;
+      storage.setItem(legacyKey, raw);
+      const prepared = prepareRendererStorageMigration(currentId, storage, nonce);
+      if (prepared.status !== "prepared" || prepared.holdPromotion || storage.getItem(currentKey) !== raw) {
+        result = "fail";
+      } else {
+        const committed = commitRendererStorageMigration(prepared, storage);
+        if (
+          committed.phase !== "committed"
+          || committed.archiveKey !== expectedArchiveKey
+          || storage.getItem(legacyKey) !== null
+        ) {
+          result = "fail";
+        } else {
+          const rolledBack = rollbackRendererStorageMigration(committed, storage);
+          result = rolledBack.phase === "rolled_back"
+            && storage.getItem(legacyKey) === raw
+            && storage.getItem(currentKey) === null
+            && storage.getItem(expectedArchiveKey) === null
+            ? "pass"
+            : "fail";
+        }
+      }
+    }
+  } catch {
+    result = "fail";
+  } finally {
+    if (ownsProbeKeys) {
+      const removeAndVerify = (key: string): boolean => {
+        try {
+          storage.removeItem(key);
+          return storage.getItem(key) === null;
+        } catch {
+          return false;
+        }
+      };
+      cleanupSucceeded = removeAndVerify(currentKey) && cleanupSucceeded;
+      cleanupSucceeded = removeAndVerify(legacyKey) && cleanupSucceeded;
+      cleanupSucceeded = removeAndVerify(expectedArchiveKey) && cleanupSucceeded;
+    }
+  }
+
+  return result === "pass" && cleanupSucceeded ? "pass" : "fail";
+}
