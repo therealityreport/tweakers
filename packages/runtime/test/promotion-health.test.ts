@@ -17,7 +17,8 @@ import {
   hasAuthenticatedCodexToken,
   PROMOTION_ORIGINAL_RENDERER_URL,
   PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS,
-  PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS,
+  PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS,
+  PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS,
   PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS,
   PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS,
   PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
@@ -187,7 +188,7 @@ function fakeDeadlineClock() {
   };
 }
 
-test("original renderer deadlines give a selection at 19.999s its full non-extendable completion phase", () => {
+test("original renderer deadlines grant full non-extendable load and mount phases at each edge", () => {
   const clock = fakeDeadlineClock();
   const timedOut: string[] = [];
   const deadline = createPromotionOriginalRendererDeadlineController({
@@ -198,17 +199,22 @@ test("original renderer deadlines give a selection at 19.999s its full non-exten
   clock.advance(PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS - 1);
   assert.deepEqual(timedOut, []);
   assert.equal(deadline.canonicalSelected(), true);
-  assert.equal(deadline.phase(), "completion");
-  clock.advance(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS - 1);
+  assert.equal(deadline.phase(), "load");
+  clock.advance(PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS - 1);
   assert.deepEqual(timedOut, []);
-  assert.equal(deadline.canonicalSelected(), false, "repeated eligibility cannot rearm completion");
+  assert.equal(deadline.canonicalSelected(), false, "repeated eligibility cannot rearm load");
+  assert.equal(deadline.canonicalLoaded(), true);
+  assert.equal(deadline.phase(), "mount");
+  clock.advance(PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS - 1);
+  assert.deepEqual(timedOut, []);
+  assert.equal(deadline.canonicalLoaded(), false, "repeated finish cannot rearm mount");
   clock.advance(1);
-  assert.deepEqual(timedOut, ["completion"]);
+  assert.deepEqual(timedOut, ["mount"]);
   assert.equal(deadline.phase(), "settled");
   assert.equal(clock.timerCount(), 0);
 });
 
-test("original renderer startup fails without a window and settlement cancels each active phase once", () => {
+test("original renderer startup/load failure and settlement cancel each active phase once", () => {
   const startupClock = fakeDeadlineClock();
   const startupTimeouts: string[] = [];
   createPromotionOriginalRendererDeadlineController({
@@ -218,6 +224,17 @@ test("original renderer startup fails without a window and settlement cancels ea
   startupClock.advance(PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS);
   assert.deepEqual(startupTimeouts, ["startup"]);
 
+  const loadClock = fakeDeadlineClock();
+  const loadTimeouts: string[] = [];
+  const loading = createPromotionOriginalRendererDeadlineController({
+    scheduler: loadClock.scheduler,
+    onTimeout: (phase) => loadTimeouts.push(phase),
+  });
+  assert.equal(loading.canonicalSelected(), true);
+  loadClock.advance(PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS);
+  assert.deepEqual(loadTimeouts, ["load"]);
+  assert.equal(loading.canonicalLoaded(), false, "a late finish cannot revive a settled deadline");
+
   const settledClock = fakeDeadlineClock();
   const settledTimeouts: string[] = [];
   const settled = createPromotionOriginalRendererDeadlineController({
@@ -225,9 +242,10 @@ test("original renderer startup fails without a window and settlement cancels ea
     onTimeout: (phase) => settledTimeouts.push(phase),
   });
   assert.equal(settled.canonicalSelected(), true);
+  assert.equal(settled.canonicalLoaded(), true);
   settled.settle();
   settled.settle();
-  settledClock.advance(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS + 1);
+  settledClock.advance(PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS + 1);
   assert.deepEqual(settledTimeouts, []);
   assert.equal(settled.phase(), "settled");
   assert.equal(settledClock.timerCount(), 0);
@@ -272,14 +290,18 @@ test("only a canonical main-frame provisional failure poisons renderer health", 
 });
 
 test("promotion timeout ordering leaves preload and cleanup headroom inside the outer process cap", () => {
-  const outerProcessTimeoutMs = 90_000;
-  assert.ok(PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS > PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS);
+  const outerProcessTimeoutMs = 170_000;
+  assert.equal(
+    PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS - PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS,
+    5_000,
+  );
   assert.ok(outerProcessTimeoutMs > (
     PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS
-    + PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS
+    + PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS
+    + PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS
     + PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS
   ));
-  assert.ok(PROMOTION_HEALTH_REQUEST_MAX_AGE_MS > outerProcessTimeoutMs);
+  assert.equal(PROMOTION_HEALTH_REQUEST_MAX_AGE_MS - outerProcessTimeoutMs, 30_000);
 });
 
 test("original renderer proof requires safe exact window, auth, load, mount, and cleanup", () => {
@@ -970,13 +992,13 @@ test("promotion request freshness covers the bounded outer renderer probe but st
     };
     writeFileSync(request, JSON.stringify(value), { mode: 0o600 });
     assert.equal(await answerPromotionHealthRequest(root, probes, {
-      now: new Date("2026-07-10T12:01:30.000Z"),
+      now: new Date("2026-07-10T12:02:50.000Z"),
       maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
     }), true);
 
     writeFileSync(request, JSON.stringify(value), { mode: 0o600 });
     assert.equal(await answerPromotionHealthRequest(root, probes, {
-      now: new Date("2026-07-10T12:02:00.001Z"),
+      now: new Date("2026-07-10T12:03:20.001Z"),
       maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
     }), false);
   } finally {

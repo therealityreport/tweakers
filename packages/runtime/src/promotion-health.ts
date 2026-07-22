@@ -14,13 +14,14 @@ export const PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 export const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 export const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
 export const PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 20_000;
-export const PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 60_000;
+export const PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS = 75_000;
+export const PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS = 60_000;
 export const PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = 55_000;
 export const PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = 5_000;
-export const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 120_000;
+export const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 200_000;
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
 
-export type PromotionOriginalRendererDeadlinePhase = "startup" | "completion" | "settled";
+export type PromotionOriginalRendererDeadlinePhase = "startup" | "load" | "mount" | "settled";
 
 export interface PromotionOriginalRendererDeadlineScheduler {
   set(callback: () => void, timeoutMs: number): unknown;
@@ -28,8 +29,10 @@ export interface PromotionOriginalRendererDeadlineScheduler {
 }
 
 export interface PromotionOriginalRendererDeadlineController {
-  /** Arms the completion phase only for the first exact canonical selection. */
+  /** Arms the load phase only for the first exact canonical selection. */
   canonicalSelected(): boolean;
+  /** Arms the mount phase only for the selected renderer's first completed load. */
+  canonicalLoaded(): boolean;
   /** Permanently cancels the currently armed deadline. */
   settle(): void;
   phase(): PromotionOriginalRendererDeadlinePhase;
@@ -37,14 +40,15 @@ export interface PromotionOriginalRendererDeadlineController {
 
 /**
  * One-shot, phase-relative deadline controller for the original renderer.
- * Repeated navigation, eligibility and authorization signals cannot rearm or
- * extend either phase.
+ * Repeated navigation, eligibility, authorization and load signals cannot
+ * rearm or extend any phase.
  */
 export function createPromotionOriginalRendererDeadlineController(options: {
   onTimeout: (phase: Exclude<PromotionOriginalRendererDeadlinePhase, "settled">) => void;
   scheduler?: PromotionOriginalRendererDeadlineScheduler;
   startupTimeoutMs?: number;
-  completionTimeoutMs?: number;
+  loadTimeoutMs?: number;
+  mountTimeoutMs?: number;
 }): PromotionOriginalRendererDeadlineController {
   const scheduler = options.scheduler ?? {
     set(callback, timeoutMs) {
@@ -57,7 +61,8 @@ export function createPromotionOriginalRendererDeadlineController(options: {
     },
   };
   const startupTimeoutMs = options.startupTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS;
-  const completionTimeoutMs = options.completionTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS;
+  const loadTimeoutMs = options.loadTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS;
+  const mountTimeoutMs = options.mountTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS;
   let phase: PromotionOriginalRendererDeadlinePhase = "startup";
   let handle: unknown = null;
 
@@ -75,8 +80,15 @@ export function createPromotionOriginalRendererDeadlineController(options: {
     canonicalSelected() {
       if (phase !== "startup") return false;
       if (handle !== null) scheduler.clear(handle);
-      phase = "completion";
-      arm("completion", completionTimeoutMs);
+      phase = "load";
+      arm("load", loadTimeoutMs);
+      return true;
+    },
+    canonicalLoaded() {
+      if (phase !== "load") return false;
+      if (handle !== null) scheduler.clear(handle);
+      phase = "mount";
+      arm("mount", mountTimeoutMs);
       return true;
     },
     settle() {
@@ -1048,7 +1060,11 @@ export async function answerPromotionHealthRequest(
     request = JSON.parse(readFileSync(requestFile, "utf8")) as LegacyHealthRequest | PromotionHealthRequestV2;
     const now = (options.now ?? new Date()).getTime();
     const requestedAt = Date.parse(request.requestedAt);
-    if (!Number.isFinite(requestedAt) || requestedAt > now + 5_000 || now - requestedAt > (options.maxAgeMs ?? 60_000)) return false;
+    if (
+      !Number.isFinite(requestedAt)
+      || requestedAt > now + 5_000
+      || now - requestedAt > (options.maxAgeMs ?? PROMOTION_HEALTH_REQUEST_MAX_AGE_MS)
+    ) return false;
     if (!validPromotionRequest(request)) return false;
   } catch {
     return false;

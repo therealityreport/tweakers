@@ -15,10 +15,10 @@ import {
   spawnHiddenHealthProbe,
 } from "../src/commands/install";
 
-test("health probe timeouts cover startup, completion, and bounded cleanup headroom", () => {
-  assert.equal(HEALTH_PROBE_PROCESS_TIMEOUT_MS, 90_000);
-  assert.equal(HEALTH_PROBE_RECEIPT_TIMEOUT_MS, 90_000);
-  assert.ok(HEALTH_PROBE_PROCESS_TIMEOUT_MS > 20_000 + 60_000 + 5_000);
+test("health probe timeouts cover startup, load, mount, and bounded cleanup headroom", () => {
+  assert.equal(HEALTH_PROBE_PROCESS_TIMEOUT_MS, 170_000);
+  assert.equal(HEALTH_PROBE_RECEIPT_TIMEOUT_MS, 170_000);
+  assert.ok(HEALTH_PROBE_PROCESS_TIMEOUT_MS > 20_000 + 75_000 + 60_000 + 5_000);
 });
 
 interface RecordedSpawnCall {

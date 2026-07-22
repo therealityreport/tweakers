@@ -8,32 +8,36 @@ export declare const PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 export declare const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 export declare const PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
 export declare const PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 20000;
-export declare const PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 60000;
+export declare const PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS = 75000;
+export declare const PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS = 60000;
 export declare const PROMOTION_ORIGINAL_RENDERER_PRELOAD_TIMEOUT_MS = 55000;
 export declare const PROMOTION_ORIGINAL_RENDERER_CLEANUP_BUDGET_MS = 5000;
-export declare const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 120000;
-export type PromotionOriginalRendererDeadlinePhase = "startup" | "completion" | "settled";
+export declare const PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 200000;
+export type PromotionOriginalRendererDeadlinePhase = "startup" | "load" | "mount" | "settled";
 export interface PromotionOriginalRendererDeadlineScheduler {
     set(callback: () => void, timeoutMs: number): unknown;
     clear(handle: unknown): void;
 }
 export interface PromotionOriginalRendererDeadlineController {
-    /** Arms the completion phase only for the first exact canonical selection. */
+    /** Arms the load phase only for the first exact canonical selection. */
     canonicalSelected(): boolean;
+    /** Arms the mount phase only for the selected renderer's first completed load. */
+    canonicalLoaded(): boolean;
     /** Permanently cancels the currently armed deadline. */
     settle(): void;
     phase(): PromotionOriginalRendererDeadlinePhase;
 }
 /**
  * One-shot, phase-relative deadline controller for the original renderer.
- * Repeated navigation, eligibility and authorization signals cannot rearm or
- * extend either phase.
+ * Repeated navigation, eligibility, authorization and load signals cannot
+ * rearm or extend any phase.
  */
 export declare function createPromotionOriginalRendererDeadlineController(options: {
     onTimeout: (phase: Exclude<PromotionOriginalRendererDeadlinePhase, "settled">) => void;
     scheduler?: PromotionOriginalRendererDeadlineScheduler;
     startupTimeoutMs?: number;
-    completionTimeoutMs?: number;
+    loadTimeoutMs?: number;
+    mountTimeoutMs?: number;
 }): PromotionOriginalRendererDeadlineController;
 /**
  * Accept the production Owl document, including its exact observed query,

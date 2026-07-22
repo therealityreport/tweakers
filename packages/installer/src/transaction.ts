@@ -29,8 +29,8 @@ import {
 
 export type HealthValue = "pass" | "fail" | "unknown";
 
-/** Longer than the contained probe cap, while still rejecting old receipts. */
-export const PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS = 120_000;
+/** Thirty seconds beyond the contained probe cap, while still rejecting old receipts. */
+export const PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS = 200_000;
 
 export interface AppFingerprint {
   version: string;

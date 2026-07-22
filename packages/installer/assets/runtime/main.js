@@ -11724,8 +11724,9 @@ var PROMOTION_ORIGINAL_RENDERER_URL = "app://-/index.html";
 var PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize";
 var PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL = "tweaker:promotion-original-renderer-proof";
 var PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS = 2e4;
-var PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS = 6e4;
-var PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 12e4;
+var PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS = 75e3;
+var PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS = 6e4;
+var PROMOTION_HEALTH_REQUEST_MAX_AGE_MS = 2e5;
 var PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = /* @__PURE__ */ new Set(["hostId", "initialRoute"]);
 function createPromotionOriginalRendererDeadlineController(options) {
   const scheduler = options.scheduler ?? {
@@ -11739,7 +11740,8 @@ function createPromotionOriginalRendererDeadlineController(options) {
     }
   };
   const startupTimeoutMs = options.startupTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_STARTUP_TIMEOUT_MS;
-  const completionTimeoutMs = options.completionTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_COMPLETION_TIMEOUT_MS;
+  const loadTimeoutMs = options.loadTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_LOAD_TIMEOUT_MS;
+  const mountTimeoutMs = options.mountTimeoutMs ?? PROMOTION_ORIGINAL_RENDERER_MOUNT_TIMEOUT_MS;
   let phase = "startup";
   let handle = null;
   const arm = (expectedPhase, timeoutMs) => {
@@ -11755,8 +11757,15 @@ function createPromotionOriginalRendererDeadlineController(options) {
     canonicalSelected() {
       if (phase !== "startup") return false;
       if (handle !== null) scheduler.clear(handle);
-      phase = "completion";
-      arm("completion", completionTimeoutMs);
+      phase = "load";
+      arm("load", loadTimeoutMs);
+      return true;
+    },
+    canonicalLoaded() {
+      if (phase !== "load") return false;
+      if (handle !== null) scheduler.clear(handle);
+      phase = "mount";
+      arm("mount", mountTimeoutMs);
       return true;
     },
     settle() {
@@ -12283,7 +12292,7 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
     request = JSON.parse((0, import_node_fs20.readFileSync)(requestFile, "utf8"));
     const now = (options.now ?? /* @__PURE__ */ new Date()).getTime();
     const requestedAt = Date.parse(request.requestedAt);
-    if (!Number.isFinite(requestedAt) || requestedAt > now + 5e3 || now - requestedAt > (options.maxAgeMs ?? 6e4)) return false;
+    if (!Number.isFinite(requestedAt) || requestedAt > now + 5e3 || now - requestedAt > (options.maxAgeMs ?? PROMOTION_HEALTH_REQUEST_MAX_AGE_MS)) return false;
     if (!validPromotionRequest(request)) return false;
   } catch {
     return false;

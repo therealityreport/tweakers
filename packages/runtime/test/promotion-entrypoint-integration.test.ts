@@ -448,6 +448,8 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(originalHealthPreloadSource, /sendSync\(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL/);
   assert.match(originalHealthPreloadSource, /rendererSandboxed: effectiveRendererSandboxed/);
   assert.match(originalHealthPreloadSource, /const MOUNT_TIMEOUT_MS = 55_000/);
+  assert.match(originalHealthPreloadSource, /window\.addEventListener\("load", onWindowLoad, \{ once: true \}\)/);
+  assert.match(originalHealthPreloadSource, /document\.readyState === "complete"/);
   assert.match(originalHealthPreloadSource, /lifecycle: "renderer-mount-timeout"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_URL = "app:\/\/-\/index\.html"/);
   assert.match(originalHealthPreloadSource, /const PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL = "tweaker:promotion-original-renderer-authorize"/);

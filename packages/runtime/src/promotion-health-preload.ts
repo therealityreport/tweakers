@@ -1,5 +1,6 @@
 import { ipcRenderer } from "electron";
 import { verifyRendererStorageRollback } from "./renderer-storage";
+import { createPromotionOriginalRendererMountLifecycle } from "./preload/promotion-original-renderer-lifecycle";
 import { createPromotionRendererMountTracker } from "./preload/promotion-renderer-mount";
 
 // Keep this dedicated sandbox preload browser-only. Importing the main-process
@@ -12,8 +13,8 @@ const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_ORIGINAL_RENDERER_QUERY_KEYS = new Set(["hostId", "initialRoute"]);
 const effectiveRendererSandboxed = process.sandboxed === true;
 
-// Kept below the main-process completion phase so this exact, bound failure is
-// observed and cleaned up before the outer completion deadline can fire.
+// Kept five seconds below the main-process mount phase so this exact, bound
+// failure is observed and cleaned up before the outer mount deadline can fire.
 const MOUNT_TIMEOUT_MS = 55_000;
 
 type Authorization = { version: 1; nonce: string; url: string };
@@ -104,22 +105,40 @@ if (parsedAuthorization) {
 
 function observeOriginalRendererMount(authorized: Authorization): void {
   const mount = createPromotionRendererMountTracker();
-  let settled = false;
-  const observer = new MutationObserver(inspect);
-  const timeout = window.setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    observer.disconnect();
-    ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
-      nonce: authorized.nonce,
-      url: unmodifiedUrl,
-      lifecycle: "renderer-mount-timeout",
-      rendererSandboxed: effectiveRendererSandboxed,
-    });
-  }, MOUNT_TIMEOUT_MS);
+  let observer: MutationObserver | null = null;
+  const stopObserving = (): void => {
+    window.removeEventListener("load", onWindowLoad);
+    observer?.disconnect();
+  };
+  const lifecycle = createPromotionOriginalRendererMountLifecycle({
+    timeoutMs: MOUNT_TIMEOUT_MS,
+    onMounted() {
+      stopObserving();
+      ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
+        nonce: authorized.nonce,
+        url: unmodifiedUrl,
+        lifecycle: "renderer-mounted",
+        rendererSandboxed: effectiveRendererSandboxed,
+        rendererStorageSelfTest: verifyRendererStorageRollback(localStorage, authorized.nonce),
+      });
+    },
+    onTimeout() {
+      stopObserving();
+      ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
+        nonce: authorized.nonce,
+        url: unmodifiedUrl,
+        lifecycle: "renderer-mount-timeout",
+        rendererSandboxed: effectiveRendererSandboxed,
+      });
+    },
+  });
+
+  function onWindowLoad(): void {
+    lifecycle.windowLoaded();
+  }
 
   function inspect(): void {
-    if (settled) return;
+    if (lifecycle.phase() === "settled") return;
     const root = document.getElementById("root");
     const state = mount.observe({
       rootPresent: root !== null,
@@ -127,18 +146,14 @@ function observeOriginalRendererMount(authorized: Authorization): void {
       elementChildCount: root?.children.length ?? 0,
     });
     if (state !== "mounted") return;
-    settled = true;
-    observer.disconnect();
-    window.clearTimeout(timeout);
-    ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
-      nonce: authorized.nonce,
-      url: unmodifiedUrl,
-      lifecycle: "renderer-mounted",
-      rendererSandboxed: effectiveRendererSandboxed,
-      rendererStorageSelfTest: verifyRendererStorageRollback(localStorage, authorized.nonce),
-    });
+    lifecycle.mountObserved();
   }
 
+  observer = new MutationObserver(inspect);
+  window.addEventListener("load", onWindowLoad, { once: true });
+  // The preload normally runs before load, but this closes the registration
+  // race without granting another deadline or emitting twice.
+  if (document.readyState === "complete") onWindowLoad();
   observer.observe(document, { childList: true, subtree: true });
   inspect();
 }
