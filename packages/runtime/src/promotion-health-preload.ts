@@ -112,6 +112,14 @@ function observeOriginalRendererMount(authorized: Authorization): void {
   };
   const lifecycle = createPromotionOriginalRendererMountLifecycle({
     timeoutMs: MOUNT_TIMEOUT_MS,
+    onLoadObserved() {
+      ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {
+        nonce: authorized.nonce,
+        url: unmodifiedUrl,
+        lifecycle: "renderer-load-observed",
+        rendererSandboxed: effectiveRendererSandboxed,
+      });
+    },
     onMounted() {
       stopObserving();
       ipcRenderer.send(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, {

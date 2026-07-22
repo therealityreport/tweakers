@@ -17,6 +17,7 @@ function createPromotionOriginalRendererMountLifecycle(options) {
     };
     let phase = "loading";
     let mounted = false;
+    let loadObserved = false;
     let handle = null;
     const settle = (callback) => {
         if (phase === "settled")
@@ -37,8 +38,16 @@ function createPromotionOriginalRendererMountLifecycle(options) {
             return true;
         },
         windowLoaded() {
-            if (phase !== "loading")
+            if (phase !== "loading" || loadObserved)
                 return false;
+            loadObserved = true;
+            try {
+                options.onLoadObserved();
+            }
+            catch (error) {
+                phase = "settled";
+                throw error;
+            }
             phase = "mount";
             if (mounted) {
                 settle(options.onMounted);

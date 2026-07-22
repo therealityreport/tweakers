@@ -17,6 +17,7 @@ export interface PromotionOriginalRendererMountLifecycle {
  * successful proof remain gated on the document's actual load event.
  */
 export declare function createPromotionOriginalRendererMountLifecycle(options: {
+    onLoadObserved: () => void;
     onMounted: () => void;
     onTimeout: () => void;
     timeoutMs: number;

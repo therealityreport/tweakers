@@ -387,7 +387,18 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /tracker\.eligibleWindow\(\{[\s\S]*?url: canonicalUrl,/);
   assert.match(controller, /sandbox: preferences\.sandbox,/);
   assert.match(controller, /validatePromotionOriginalRendererHandshake/);
+  assert.match(controller, /validatePromotionOriginalRendererLoadObserved/);
   assert.match(controller, /validatePromotionOriginalRendererMountTimeout/);
+  assert.match(controller, /requireBackgroundThrottlingDisabled\(event\.sender, "renderer-load-observed"\)/);
+  assert.match(controller, /requireBackgroundThrottlingDisabled\(event\.sender, "renderer-mounted"\)/);
+  assert.match(controller, /requireBackgroundThrottlingDisabled\(event\.sender, "renderer-mount-timeout"\)/);
+  assert.match(controller, /promotion original renderer load observation accepted/);
+  const loadObservationBranch = controller.slice(
+    controller.indexOf('if (lifecycle === "renderer-load-observed")'),
+    controller.indexOf('if (lifecycle === "renderer-mount-timeout")'),
+  );
+  assert.match(loadObservationBranch, /loadObservedConsumed = true/);
+  assert.doesNotMatch(loadObservationBranch, /handshakeConsumed = true/);
   assert.match(controller, /promotion original renderer mount timed out/);
   assert.match(controller, /canonical renderer mount timed out/);
   assert.match(controller, /rendererSandboxed: decision\.observation\.rendererSandboxed/);
@@ -448,6 +459,8 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(originalHealthPreloadSource, /sendSync\(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL/);
   assert.match(originalHealthPreloadSource, /rendererSandboxed: effectiveRendererSandboxed/);
   assert.match(originalHealthPreloadSource, /const MOUNT_TIMEOUT_MS = 55_000/);
+  assert.match(originalHealthPreloadSource, /lifecycle: "renderer-load-observed"/);
+  assert.match(originalHealthPreloadSource, /onLoadObserved\(\)/);
   assert.match(originalHealthPreloadSource, /window\.addEventListener\("load", onWindowLoad, \{ once: true \}\)/);
   assert.match(originalHealthPreloadSource, /document\.readyState === "complete"/);
   assert.match(originalHealthPreloadSource, /lifecycle: "renderer-mount-timeout"/);

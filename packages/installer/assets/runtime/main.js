@@ -11821,6 +11821,36 @@ function hasUniqueSandboxedPromotionRendererProcess(processMetrics, rendererProc
   }
   return matchingMetric?.sandboxed === true;
 }
+function disablePromotionOriginalRendererBackgroundThrottling(target) {
+  const get = target.getBackgroundThrottling;
+  const set = target.setBackgroundThrottling;
+  if (typeof get !== "function" || typeof set !== "function") {
+    return { ok: false, previous: null, observed: null };
+  }
+  let previous = null;
+  let observed = null;
+  try {
+    const value = get.call(target);
+    if (typeof value !== "boolean") return { ok: false, previous: null, observed: null };
+    previous = value;
+    set.call(target, false);
+    const after = get.call(target);
+    observed = typeof after === "boolean" ? after : null;
+  } catch {
+    return { ok: false, previous, observed };
+  }
+  return { ok: observed === false, previous, observed };
+}
+function verifyPromotionOriginalRendererBackgroundThrottlingDisabled(target) {
+  const get = target.getBackgroundThrottling;
+  if (typeof get !== "function") return { ok: false, observed: null };
+  try {
+    const observed = get.call(target);
+    return typeof observed === "boolean" ? { ok: observed === false, observed } : { ok: false, observed: null };
+  } catch {
+    return { ok: false, observed: null };
+  }
+}
 function authorizePromotionOriginalRenderer(context, payload, nonce) {
   if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", response: null };
   if (!context.windowHidden) return { accepted: false, reason: "proof window visible", response: null };
@@ -12031,6 +12061,7 @@ function validatePromotionOriginalRendererHandshake(context, payload, nonce) {
   if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
   if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
   if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (!context.loadObservedConsumed) return { accepted: false, reason: "renderer load observation required", observation: null };
   if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
   if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
   if (!exactKeys(payload, ["nonce", "rendererSandboxed", "rendererStorageSelfTest", "lifecycle", "url"])) {
@@ -12057,12 +12088,39 @@ function validatePromotionOriginalRendererHandshake(context, payload, nonce) {
     }
   };
 }
+function validatePromotionOriginalRendererLoadObserved(context, payload, nonce) {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.loadObservedConsumed) return { accepted: false, reason: "load observation already consumed", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (payload.nonce !== nonce || payload.url !== context.expectedUrl || payload.lifecycle !== "renderer-load-observed" || payload.rendererSandboxed !== true) {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-load-observed",
+      rendererSandboxed: true
+    }
+  };
+}
 function validatePromotionOriginalRendererMountTimeout(context, payload, nonce) {
   if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
   if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
   if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
   if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
   if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (!context.loadObservedConsumed) return { accepted: false, reason: "renderer load observation required", observation: null };
   if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
   if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
   if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
@@ -16320,6 +16378,33 @@ function createPromotionOriginalMainProbe() {
       return;
     }
     const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload.lifecycle : null;
+    if (lifecycle === "renderer-load-observed") {
+      const loadDecision = validatePromotionOriginalRendererLoadObserved({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed
+      }, payload, nonce);
+      if (!loadDecision.accepted) {
+        log("warn", "promotion original renderer load observation rejected", {
+          webContentsId: event.sender.id,
+          reason: loadDecision.reason
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-load-observed")) return;
+      loadObservedConsumed = true;
+      log("info", "promotion original renderer load observation accepted", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(loadDecision.observation.url),
+        rendererSandboxed: loadDecision.observation.rendererSandboxed
+      });
+      return;
+    }
     if (lifecycle === "renderer-mount-timeout") {
       const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
         windowAlive,
@@ -16328,6 +16413,7 @@ function createPromotionOriginalMainProbe() {
         senderUrl: event.senderFrame?.url ?? "",
         expectedUrl: tracker.summary().canonicalUrl ?? "",
         authorizationConsumed,
+        loadObservedConsumed,
         handshakeConsumed
       }, payload, nonce);
       if (!timeoutDecision.accepted) {
@@ -16337,6 +16423,7 @@ function createPromotionOriginalMainProbe() {
         });
         return;
       }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mount-timeout")) return;
       handshakeConsumed = true;
       log("warn", "promotion original renderer mount timed out", {
         webContentsId: event.sender.id,

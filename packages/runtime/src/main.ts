@@ -93,6 +93,7 @@ import {
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
+  disablePromotionOriginalRendererBackgroundThrottling,
   hasUniqueSandboxedPromotionRendererProcess,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
@@ -109,9 +110,11 @@ import {
   promotionRendererLoadRejection,
   readCodexAuth,
   shouldFailPromotionOriginalRendererProvisionalLoad,
+  validatePromotionOriginalRendererLoadObserved,
   validatePromotionOriginalRendererHandshake,
   validatePromotionOriginalRendererMountTimeout,
   validatePromotionRendererHandshake,
+  verifyPromotionOriginalRendererBackgroundThrottlingDisabled,
   type HealthValue,
   type PromotionRendererProofResult,
   type PromotionSurfaceName,
@@ -2502,6 +2505,33 @@ function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
     const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload)
       ? (payload as Record<string, unknown>).lifecycle
       : null;
+    if (lifecycle === "renderer-load-observed") {
+      const loadDecision = validatePromotionOriginalRendererLoadObserved({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!loadDecision.accepted) {
+        log("warn", "promotion original renderer load observation rejected", {
+          webContentsId: event.sender.id,
+          reason: loadDecision.reason,
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-load-observed")) return;
+      loadObservedConsumed = true;
+      log("info", "promotion original renderer load observation accepted", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(loadDecision.observation.url),
+        rendererSandboxed: loadDecision.observation.rendererSandboxed,
+      });
+      return;
+    }
     if (lifecycle === "renderer-mount-timeout") {
       const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
         windowAlive,
@@ -2510,6 +2540,7 @@ function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
         senderUrl: event.senderFrame?.url ?? "",
         expectedUrl: tracker.summary().canonicalUrl ?? "",
         authorizationConsumed,
+        loadObservedConsumed,
         handshakeConsumed,
       }, payload, nonce);
       if (!timeoutDecision.accepted) {
@@ -2519,6 +2550,7 @@ function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
         });
         return;
       }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mount-timeout")) return;
       handshakeConsumed = true;
       log("warn", "promotion original renderer mount timed out", {
         webContentsId: event.sender.id,

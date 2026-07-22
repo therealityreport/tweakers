@@ -209,6 +209,57 @@ export function hasUniqueSandboxedPromotionRendererProcess(
   return matchingMetric?.sandboxed === true;
 }
 
+export interface PromotionOriginalRendererBackgroundThrottlingResult {
+  ok: boolean;
+  previous: boolean | null;
+  observed: boolean | null;
+}
+
+interface PromotionOriginalRendererBackgroundThrottlingTarget {
+  getBackgroundThrottling?: unknown;
+  setBackgroundThrottling?: unknown;
+}
+
+/** Disable background throttling on the one selected hidden proof renderer. */
+export function disablePromotionOriginalRendererBackgroundThrottling(
+  target: PromotionOriginalRendererBackgroundThrottlingTarget,
+): PromotionOriginalRendererBackgroundThrottlingResult {
+  const get = target.getBackgroundThrottling;
+  const set = target.setBackgroundThrottling;
+  if (typeof get !== "function" || typeof set !== "function") {
+    return { ok: false, previous: null, observed: null };
+  }
+  let previous: boolean | null = null;
+  let observed: boolean | null = null;
+  try {
+    const value = get.call(target);
+    if (typeof value !== "boolean") return { ok: false, previous: null, observed: null };
+    previous = value;
+    set.call(target, false);
+    const after = get.call(target);
+    observed = typeof after === "boolean" ? after : null;
+  } catch {
+    return { ok: false, previous, observed };
+  }
+  return { ok: observed === false, previous, observed };
+}
+
+/** Recheck the selected proof renderer without mutating it again. */
+export function verifyPromotionOriginalRendererBackgroundThrottlingDisabled(
+  target: PromotionOriginalRendererBackgroundThrottlingTarget,
+): { ok: boolean; observed: boolean | null } {
+  const get = target.getBackgroundThrottling;
+  if (typeof get !== "function") return { ok: false, observed: null };
+  try {
+    const observed = get.call(target);
+    return typeof observed === "boolean"
+      ? { ok: observed === false, observed }
+      : { ok: false, observed: null };
+  } catch {
+    return { ok: false, observed: null };
+  }
+}
+
 /**
  * Authorizes the dedicated original-main preload synchronously. The renderer
  * sends only its unmodified canonical URL; the main process supplies the nonce
@@ -479,6 +530,10 @@ export interface PromotionRendererHandshakeContext {
   handshakeConsumed: boolean;
 }
 
+export interface PromotionOriginalRendererProofEventContext extends PromotionRendererHandshakeContext {
+  loadObservedConsumed: boolean;
+}
+
 export type PromotionRendererHandshakeDecision =
   | { accepted: false; reason: string; observation: null }
   | {
@@ -515,6 +570,19 @@ export type PromotionOriginalRendererMountTimeoutDecision =
       nonce: string;
       url: string;
       lifecycle: "renderer-mount-timeout";
+      rendererSandboxed: true;
+    };
+  };
+
+export type PromotionOriginalRendererLoadObservedDecision =
+  | { accepted: false; reason: string; observation: null }
+  | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+      nonce: string;
+      url: string;
+      lifecycle: "renderer-load-observed";
       rendererSandboxed: true;
     };
   };
@@ -591,7 +659,7 @@ export function validatePromotionRendererHandshake(
  * an explicit sandbox disablement or accepted without a positive signal.
  */
 export function validatePromotionOriginalRendererHandshake(
-  context: PromotionRendererHandshakeContext,
+  context: PromotionOriginalRendererProofEventContext,
   payload: unknown,
   nonce: string,
 ): PromotionOriginalRendererHandshakeDecision {
@@ -600,6 +668,7 @@ export function validatePromotionOriginalRendererHandshake(
   if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
   if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
   if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (!context.loadObservedConsumed) return { accepted: false, reason: "renderer load observation required", observation: null };
   if (context.handshakeConsumed) return { accepted: false, reason: "handshake already consumed", observation: null };
   if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
   if (!exactKeys(payload, ["nonce", "rendererSandboxed", "rendererStorageSelfTest", "lifecycle", "url"])) {
@@ -628,11 +697,51 @@ export function validatePromotionOriginalRendererHandshake(
 }
 
 /**
+ * Bind the preload's one-shot window-load observation to the selected hidden
+ * renderer before either terminal mount event may be accepted.
+ */
+export function validatePromotionOriginalRendererLoadObserved(
+  context: PromotionOriginalRendererProofEventContext,
+  payload: unknown,
+  nonce: string,
+): PromotionOriginalRendererLoadObservedDecision {
+  if (!context.windowAlive) return { accepted: false, reason: "proof window unavailable", observation: null };
+  if (!context.senderMatches) return { accepted: false, reason: "sender mismatch", observation: null };
+  if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
+  if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
+  if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (context.loadObservedConsumed) return { accepted: false, reason: "load observation already consumed", observation: null };
+  if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
+  if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
+  if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {
+    return { accepted: false, reason: "payload keys invalid", observation: null };
+  }
+  if (
+    payload.nonce !== nonce
+    || payload.url !== context.expectedUrl
+    || payload.lifecycle !== "renderer-load-observed"
+    || payload.rendererSandboxed !== true
+  ) {
+    return { accepted: false, reason: "payload binding invalid", observation: null };
+  }
+  return {
+    accepted: true,
+    reason: "accepted",
+    observation: {
+      nonce,
+      url: context.expectedUrl,
+      lifecycle: "renderer-load-observed",
+      rendererSandboxed: true,
+    },
+  };
+}
+
+/**
  * Validates the preload's fail-closed mount timeout on the same exact sender,
  * frame, URL, authorization, nonce and effective-sandbox boundary as success.
  */
 export function validatePromotionOriginalRendererMountTimeout(
-  context: PromotionRendererHandshakeContext,
+  context: PromotionOriginalRendererProofEventContext,
   payload: unknown,
   nonce: string,
 ): PromotionOriginalRendererMountTimeoutDecision {
@@ -641,6 +750,7 @@ export function validatePromotionOriginalRendererMountTimeout(
   if (!context.frameMatches) return { accepted: false, reason: "frame mismatch", observation: null };
   if (context.senderUrl !== context.expectedUrl) return { accepted: false, reason: "sender URL mismatch", observation: null };
   if (!context.authorizationConsumed) return { accepted: false, reason: "authorization required", observation: null };
+  if (!context.loadObservedConsumed) return { accepted: false, reason: "renderer load observation required", observation: null };
   if (context.handshakeConsumed) return { accepted: false, reason: "proof event already consumed", observation: null };
   if (!plainRecord(payload)) return { accepted: false, reason: "payload invalid", observation: null };
   if (!exactKeys(payload, ["nonce", "rendererSandboxed", "lifecycle", "url"])) {

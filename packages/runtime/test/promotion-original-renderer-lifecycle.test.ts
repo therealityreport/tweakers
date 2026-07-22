@@ -45,6 +45,7 @@ test("original renderer preload buffers an early mount until window load without
   const lifecycle = createPromotionOriginalRendererMountLifecycle({
     scheduler: clock.scheduler,
     timeoutMs: 55_000,
+    onLoadObserved: () => events.push("load"),
     onMounted: () => events.push("mounted"),
     onTimeout: () => events.push("timeout"),
   });
@@ -57,12 +58,12 @@ test("original renderer preload buffers an early mount until window load without
   assert.equal(lifecycle.mountObserved(), false, "repeated observations are one-shot");
 
   assert.equal(lifecycle.windowLoaded(), true);
-  assert.deepEqual(events, ["mounted"]);
+  assert.deepEqual(events, ["load", "mounted"]);
   assert.equal(lifecycle.phase(), "settled");
   assert.equal(clock.timerCount(), 0);
   assert.equal(lifecycle.windowLoaded(), false);
   assert.equal(lifecycle.mountObserved(), false);
-  assert.deepEqual(events, ["mounted"], "repeated signals cannot emit twice");
+  assert.deepEqual(events, ["load", "mounted"], "repeated signals cannot emit twice");
 });
 
 test("original renderer preload grants exactly 55 seconds after load and cannot be extended", () => {
@@ -71,6 +72,10 @@ test("original renderer preload grants exactly 55 seconds after load and cannot 
   const lifecycle = createPromotionOriginalRendererMountLifecycle({
     scheduler: clock.scheduler,
     timeoutMs: 55_000,
+    onLoadObserved: () => {
+      assert.equal(clock.timerCount(), 0, "load is emitted before the timeout is armed");
+      events.push("load");
+    },
     onMounted: () => events.push("mounted"),
     onTimeout: () => events.push("timeout"),
   });
@@ -78,14 +83,14 @@ test("original renderer preload grants exactly 55 seconds after load and cannot 
   assert.equal(lifecycle.windowLoaded(), true);
   assert.deepEqual(clock.scheduledTimeouts, [55_000]);
   clock.advance(54_999);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, ["load"]);
   assert.equal(lifecycle.windowLoaded(), false, "repeated load cannot rearm the deadline");
   assert.deepEqual(clock.scheduledTimeouts, [55_000]);
   assert.equal(lifecycle.mountObserved(), true);
-  assert.deepEqual(events, ["mounted"]);
+  assert.deepEqual(events, ["load", "mounted"]);
   assert.equal(clock.timerCount(), 0);
   clock.advance(1);
-  assert.deepEqual(events, ["mounted"]);
+  assert.deepEqual(events, ["load", "mounted"]);
 });
 
 test("original renderer preload timeout is exact and remains terminal", () => {
@@ -94,19 +99,20 @@ test("original renderer preload timeout is exact and remains terminal", () => {
   const lifecycle = createPromotionOriginalRendererMountLifecycle({
     scheduler: clock.scheduler,
     timeoutMs: 55_000,
+    onLoadObserved: () => events.push("load"),
     onMounted: () => events.push("mounted"),
     onTimeout: () => events.push("timeout"),
   });
 
   lifecycle.windowLoaded();
   clock.advance(54_999);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, ["load"]);
   clock.advance(1);
-  assert.deepEqual(events, ["timeout"]);
+  assert.deepEqual(events, ["load", "timeout"]);
   assert.equal(lifecycle.phase(), "settled");
   assert.equal(lifecycle.mountObserved(), false);
   assert.equal(lifecycle.windowLoaded(), false);
-  assert.deepEqual(events, ["timeout"], "late signals cannot replace an exact timeout");
+  assert.deepEqual(events, ["load", "timeout"], "late signals cannot replace an exact timeout");
 });
 
 test("original renderer preload settlement cancels the active post-load timer", () => {
@@ -115,6 +121,7 @@ test("original renderer preload settlement cancels the active post-load timer", 
   const lifecycle = createPromotionOriginalRendererMountLifecycle({
     scheduler: clock.scheduler,
     timeoutMs: 55_000,
+    onLoadObserved: () => events.push("load"),
     onMounted: () => events.push("mounted"),
     onTimeout: () => events.push("timeout"),
   });
@@ -125,5 +132,5 @@ test("original renderer preload settlement cancels the active post-load timer", 
   lifecycle.settle();
   assert.equal(clock.timerCount(), 0);
   clock.advance(55_000);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, ["load"]);
 });

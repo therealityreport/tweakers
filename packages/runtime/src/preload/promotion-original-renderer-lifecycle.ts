@@ -20,6 +20,7 @@ export interface PromotionOriginalRendererMountLifecycle {
  * successful proof remain gated on the document's actual load event.
  */
 export function createPromotionOriginalRendererMountLifecycle(options: {
+  onLoadObserved: () => void;
   onMounted: () => void;
   onTimeout: () => void;
   timeoutMs: number;
@@ -35,6 +36,7 @@ export function createPromotionOriginalRendererMountLifecycle(options: {
   };
   let phase: PromotionOriginalRendererMountPhase = "loading";
   let mounted = false;
+  let loadObserved = false;
   let handle: unknown = null;
 
   const settle = (callback?: () => void): void => {
@@ -53,7 +55,14 @@ export function createPromotionOriginalRendererMountLifecycle(options: {
       return true;
     },
     windowLoaded() {
-      if (phase !== "loading") return false;
+      if (phase !== "loading" || loadObserved) return false;
+      loadObserved = true;
+      try {
+        options.onLoadObserved();
+      } catch (error) {
+        phase = "settled";
+        throw error;
+      }
       phase = "mount";
       if (mounted) {
         settle(options.onMounted);

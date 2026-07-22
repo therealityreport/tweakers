@@ -12,6 +12,7 @@ import {
   createPromotionOriginalRendererProofTracker,
   createPromotionRendererProtocolResponder,
   createPromotionRendererProofTracker,
+  disablePromotionOriginalRendererBackgroundThrottling,
   hasUniqueSandboxedPromotionRendererProcess,
   hasAuthenticatedSessionCookie,
   hasAuthenticatedCodexToken,
@@ -30,9 +31,11 @@ import {
   promotionRendererLoadRejection,
   readCodexAuth,
   shouldFailPromotionOriginalRendererProvisionalLoad,
+  validatePromotionOriginalRendererLoadObserved,
   validatePromotionOriginalRendererHandshake,
   validatePromotionOriginalRendererMountTimeout,
   validatePromotionRendererHandshake,
+  verifyPromotionOriginalRendererBackgroundThrottlingDisabled,
 } from "../src/promotion-health";
 
 const PASSING_RENDERER_PROOF = {
@@ -152,6 +155,57 @@ test("original renderer process proof requires one matching sandboxed OS metric"
   ] as const) {
     assert.equal(hasUniqueSandboxedPromotionRendererProcess(metrics, pid), false);
   }
+});
+
+test("original renderer background throttling is disabled once and positively rechecked", () => {
+  let throttled = true;
+  const setValues: boolean[] = [];
+  const target = {
+    getBackgroundThrottling: () => throttled,
+    setBackgroundThrottling(value: boolean) {
+      setValues.push(value);
+      throttled = value;
+    },
+  };
+
+  assert.deepEqual(disablePromotionOriginalRendererBackgroundThrottling(target), {
+    ok: true,
+    previous: true,
+    observed: false,
+  });
+  assert.deepEqual(setValues, [false]);
+  assert.deepEqual(verifyPromotionOriginalRendererBackgroundThrottlingDisabled(target), {
+    ok: true,
+    observed: false,
+  });
+  assert.deepEqual(setValues, [false], "rechecks never mutate the selected renderer again");
+});
+
+test("original renderer background throttling fails closed on unavailable, throwing, and non-sticking APIs", () => {
+  assert.equal(disablePromotionOriginalRendererBackgroundThrottling({}).ok, false);
+  assert.equal(disablePromotionOriginalRendererBackgroundThrottling({
+    getBackgroundThrottling() { throw new Error("get failed"); },
+    setBackgroundThrottling() {},
+  }).ok, false);
+  assert.equal(disablePromotionOriginalRendererBackgroundThrottling({
+    getBackgroundThrottling: () => true,
+    setBackgroundThrottling() {},
+  }).ok, false);
+  assert.equal(disablePromotionOriginalRendererBackgroundThrottling({
+    getBackgroundThrottling: () => true,
+    setBackgroundThrottling() { throw new Error("set failed"); },
+  }).ok, false);
+
+  assert.deepEqual(verifyPromotionOriginalRendererBackgroundThrottlingDisabled({}), {
+    ok: false,
+    observed: null,
+  });
+  assert.deepEqual(verifyPromotionOriginalRendererBackgroundThrottlingDisabled({
+    getBackgroundThrottling: () => true,
+  }), { ok: false, observed: true });
+  assert.deepEqual(verifyPromotionOriginalRendererBackgroundThrottlingDisabled({
+    getBackgroundThrottling() { throw new Error("recheck failed"); },
+  }), { ok: false, observed: null });
 });
 
 function fakeDeadlineClock() {
@@ -595,6 +649,7 @@ test("original renderer handshake requires an exact boolean effective sandbox re
     senderUrl: url,
     expectedUrl: url,
     authorizationConsumed: true,
+    loadObservedConsumed: true,
     handshakeConsumed: false,
   };
   const payload = {
@@ -615,12 +670,71 @@ test("original renderer handshake requires an exact boolean effective sandbox re
     { ...payload, rendererSandboxed: false },
     nonce,
   ).accepted, true, "a negative boolean is structurally valid so the tracker can fail closed immediately");
+  assert.deepEqual(validatePromotionOriginalRendererHandshake(
+    { ...context, loadObservedConsumed: false },
+    payload,
+    nonce,
+  ), { accepted: false, reason: "renderer load observation required", observation: null });
   for (const malformed of [
     { nonce, rendererStorageSelfTest: "pass", lifecycle: "renderer-mounted", url },
     { ...payload, rendererSandboxed: "true" },
     { ...payload, rendererSandboxed: true, extra: true },
   ]) {
     assert.equal(validatePromotionOriginalRendererHandshake(context, malformed, nonce).accepted, false);
+  }
+});
+
+test("original renderer load observation is exact, bound, ordered, and one-shot", () => {
+  const nonce = "123e4567-e89b-42d3-a456-426614174000";
+  const url = `${PROMOTION_ORIGINAL_RENDERER_URL}?hostId=host-123`;
+  const context = {
+    windowAlive: true,
+    senderMatches: true,
+    frameMatches: true,
+    senderUrl: url,
+    expectedUrl: url,
+    authorizationConsumed: true,
+    loadObservedConsumed: false,
+    handshakeConsumed: false,
+  };
+  const payload = {
+    nonce,
+    rendererSandboxed: true,
+    lifecycle: "renderer-load-observed",
+    url,
+  };
+
+  assert.deepEqual(validatePromotionOriginalRendererLoadObserved(context, payload, nonce), {
+    accepted: true,
+    reason: "accepted",
+    observation: payload,
+  });
+  for (const [override, reason] of [
+    [{ windowAlive: false }, "proof window unavailable"],
+    [{ senderMatches: false }, "sender mismatch"],
+    [{ frameMatches: false }, "frame mismatch"],
+    [{ senderUrl: `${url}&spoof=1` }, "sender URL mismatch"],
+    [{ authorizationConsumed: false }, "authorization required"],
+    [{ loadObservedConsumed: true }, "load observation already consumed"],
+    [{ handshakeConsumed: true }, "proof event already consumed"],
+  ] as const) {
+    assert.deepEqual(validatePromotionOriginalRendererLoadObserved(
+      { ...context, ...override },
+      payload,
+      nonce,
+    ), { accepted: false, reason, observation: null });
+  }
+  for (const malformed of [
+    null,
+    [],
+    { ...payload, extra: true },
+    { ...payload, nonce: "123e4567-e89b-42d3-a456-426614174001" },
+    { ...payload, url: `${url}&spoof=1` },
+    { ...payload, lifecycle: "renderer-mounted" },
+    { ...payload, rendererSandboxed: false },
+    { ...payload, rendererSandboxed: "true" },
+  ]) {
+    assert.equal(validatePromotionOriginalRendererLoadObserved(context, malformed, nonce).accepted, false);
   }
 });
 
@@ -634,6 +748,7 @@ test("original renderer mount timeout is exact, sandbox-bound, and one-shot", ()
     senderUrl: url,
     expectedUrl: url,
     authorizationConsumed: true,
+    loadObservedConsumed: true,
     handshakeConsumed: false,
   };
   const payload = {
@@ -654,6 +769,7 @@ test("original renderer mount timeout is exact, sandbox-bound, and one-shot", ()
     [{ frameMatches: false }, "frame mismatch"],
     [{ senderUrl: `${url}&spoof=1` }, "sender URL mismatch"],
     [{ authorizationConsumed: false }, "authorization required"],
+    [{ loadObservedConsumed: false }, "renderer load observation required"],
     [{ handshakeConsumed: true }, "proof event already consumed"],
   ] as const) {
     assert.deepEqual(validatePromotionOriginalRendererMountTimeout(

@@ -77,6 +77,22 @@ export type PromotionOriginalRendererAuthorizationDecision = {
  * fails closed before the authorization nonce can leave the main process.
  */
 export declare function hasUniqueSandboxedPromotionRendererProcess(processMetrics: unknown, rendererProcessId: unknown): boolean;
+export interface PromotionOriginalRendererBackgroundThrottlingResult {
+    ok: boolean;
+    previous: boolean | null;
+    observed: boolean | null;
+}
+interface PromotionOriginalRendererBackgroundThrottlingTarget {
+    getBackgroundThrottling?: unknown;
+    setBackgroundThrottling?: unknown;
+}
+/** Disable background throttling on the one selected hidden proof renderer. */
+export declare function disablePromotionOriginalRendererBackgroundThrottling(target: PromotionOriginalRendererBackgroundThrottlingTarget): PromotionOriginalRendererBackgroundThrottlingResult;
+/** Recheck the selected proof renderer without mutating it again. */
+export declare function verifyPromotionOriginalRendererBackgroundThrottlingDisabled(target: PromotionOriginalRendererBackgroundThrottlingTarget): {
+    ok: boolean;
+    observed: boolean | null;
+};
 /**
  * Authorizes the dedicated original-main preload synchronously. The renderer
  * sends only its unmodified canonical URL; the main process supplies the nonce
@@ -165,6 +181,9 @@ export interface PromotionRendererHandshakeContext {
     authorizationConsumed: boolean;
     handshakeConsumed: boolean;
 }
+export interface PromotionOriginalRendererProofEventContext extends PromotionRendererHandshakeContext {
+    loadObservedConsumed: boolean;
+}
 export type PromotionRendererHandshakeDecision = {
     accepted: false;
     reason: string;
@@ -208,6 +227,20 @@ export type PromotionOriginalRendererMountTimeoutDecision = {
         rendererSandboxed: true;
     };
 };
+export type PromotionOriginalRendererLoadObservedDecision = {
+    accepted: false;
+    reason: string;
+    observation: null;
+} | {
+    accepted: true;
+    reason: "accepted";
+    observation: {
+        nonce: string;
+        url: string;
+        lifecycle: "renderer-load-observed";
+        rendererSandboxed: true;
+    };
+};
 /** Pure, bounded decision used by the synchronous health-only IPC handler. */
 export declare function authorizePromotionRenderer(context: PromotionRendererAuthorizationContext, payload: unknown, nonce: string): PromotionRendererAuthorizationDecision;
 /** Pure, bounded gate in front of the proof tracker's one allowed handshake. */
@@ -218,12 +251,17 @@ export declare function validatePromotionRendererHandshake(context: PromotionRen
  * sandbox state so an omitted default WebPreference cannot be mistaken for
  * an explicit sandbox disablement or accepted without a positive signal.
  */
-export declare function validatePromotionOriginalRendererHandshake(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionOriginalRendererHandshakeDecision;
+export declare function validatePromotionOriginalRendererHandshake(context: PromotionOriginalRendererProofEventContext, payload: unknown, nonce: string): PromotionOriginalRendererHandshakeDecision;
+/**
+ * Bind the preload's one-shot window-load observation to the selected hidden
+ * renderer before either terminal mount event may be accepted.
+ */
+export declare function validatePromotionOriginalRendererLoadObserved(context: PromotionOriginalRendererProofEventContext, payload: unknown, nonce: string): PromotionOriginalRendererLoadObservedDecision;
 /**
  * Validates the preload's fail-closed mount timeout on the same exact sender,
  * frame, URL, authorization, nonce and effective-sandbox boundary as success.
  */
-export declare function validatePromotionOriginalRendererMountTimeout(context: PromotionRendererHandshakeContext, payload: unknown, nonce: string): PromotionOriginalRendererMountTimeoutDecision;
+export declare function validatePromotionOriginalRendererMountTimeout(context: PromotionOriginalRendererProofEventContext, payload: unknown, nonce: string): PromotionOriginalRendererMountTimeoutDecision;
 export interface PromotionRendererProtocolRequest {
     url: string;
 }
@@ -369,3 +407,4 @@ export declare function answerPromotionHealthRequest(userRoot: string, probes: R
     now?: Date;
     maxAgeMs?: number;
 }): Promise<boolean>;
+export {};
