@@ -6184,6 +6184,7 @@ function startDesktopUpdateIndicator() {
 // src/preload/promotion-renderer-mount.ts
 var PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 var PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS = 1024;
 function promotionRendererAuthorizationAttempt(href) {
   try {
     const parsed = new URL(href);
@@ -6208,15 +6209,17 @@ function promotionRendererAuthorizationAttempt(href) {
   }
 }
 function promotionRendererAuthorizedNonce(attempt, response) {
-  if (attempt.kind !== "candidate" || response === null || typeof response !== "object" || Array.isArray(response)) {
+  if (attempt.kind !== "candidate" || typeof response !== "string" || response.length === 0 || response.length > PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS) {
     return null;
   }
-  const value = response;
-  if (Object.keys(value).sort().join(",") !== "nonce,url,version") return null;
-  if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string") return null;
-  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce)) return null;
-  if (value.nonce !== attempt.nonce || value.url !== attempt.request.url) return null;
   try {
+    const decoded = JSON.parse(response);
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return null;
+    const value = decoded;
+    if (Object.keys(value).sort().join(",") !== "nonce,url,version") return null;
+    if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string") return null;
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce)) return null;
+    if (value.nonce !== attempt.nonce || value.url !== attempt.request.url) return null;
     const parsed = new URL(value.url);
     const entries = [...parsed.searchParams.entries()];
     if (parsed.protocol !== "app:" || parsed.hostname !== "-" || parsed.username !== "" || parsed.password !== "" || parsed.port !== "" || parsed.pathname !== "/index.html" || parsed.hash !== "" || entries.length !== 1 || entries[0]?.[0] !== PROMOTION_RENDERER_NONCE_QUERY || entries[0][1] !== value.nonce || parsed.toString() !== value.url) return null;

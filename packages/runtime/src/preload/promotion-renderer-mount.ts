@@ -13,6 +13,7 @@ export interface PromotionRendererMountTracker {
 
 const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS = 1_024;
 
 export interface PromotionRendererAuthorizationRequest {
   version: 1;
@@ -78,16 +79,23 @@ export function promotionRendererAuthorizedNonce(
   attempt: PromotionRendererAuthorizationAttempt,
   response: unknown,
 ): string | null {
-  if (attempt.kind !== "candidate" || response === null || typeof response !== "object" || Array.isArray(response)) {
+  if (
+    attempt.kind !== "candidate"
+    || typeof response !== "string"
+    || response.length === 0
+    || response.length > PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS
+  ) {
     return null;
   }
-  const value = response as Record<string, unknown>;
-  if (Object.keys(value).sort().join(",") !== "nonce,url,version") return null;
-  if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string") return null;
-  if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce)) return null;
-  if (value.nonce !== attempt.nonce || value.url !== attempt.request.url) return null;
 
   try {
+    const decoded = JSON.parse(response) as unknown;
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return null;
+    const value = decoded as Record<string, unknown>;
+    if (Object.keys(value).sort().join(",") !== "nonce,url,version") return null;
+    if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string") return null;
+    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce)) return null;
+    if (value.nonce !== attempt.nonce || value.url !== attempt.request.url) return null;
     const parsed = new URL(value.url);
     const entries = [...parsed.searchParams.entries()];
     if (

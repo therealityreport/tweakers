@@ -5,6 +5,7 @@ exports.promotionRendererAuthorizedNonce = promotionRendererAuthorizedNonce;
 exports.createPromotionRendererMountTracker = createPromotionRendererMountTracker;
 const PROMOTION_RENDERER_NONCE_QUERY = "tweakerPromotionNonce";
 const PROMOTION_RENDERER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS = 1_024;
 /**
  * Classifies the current document before page scripts run. Ordinary windows
  * take the normal preload path. A URL that carries the reserved proof query is
@@ -46,19 +47,25 @@ function promotionRendererAuthorizationAttempt(href) {
 }
 /** Accepts only the exact synchronous main-process authorization response. */
 function promotionRendererAuthorizedNonce(attempt, response) {
-    if (attempt.kind !== "candidate" || response === null || typeof response !== "object" || Array.isArray(response)) {
+    if (attempt.kind !== "candidate"
+        || typeof response !== "string"
+        || response.length === 0
+        || response.length > PROMOTION_RENDERER_AUTH_RESPONSE_MAX_CHARS) {
         return null;
     }
-    const value = response;
-    if (Object.keys(value).sort().join(",") !== "nonce,url,version")
-        return null;
-    if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string")
-        return null;
-    if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce))
-        return null;
-    if (value.nonce !== attempt.nonce || value.url !== attempt.request.url)
-        return null;
     try {
+        const decoded = JSON.parse(response);
+        if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded))
+            return null;
+        const value = decoded;
+        if (Object.keys(value).sort().join(",") !== "nonce,url,version")
+            return null;
+        if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.url !== "string")
+            return null;
+        if (!PROMOTION_RENDERER_NONCE_PATTERN.test(value.nonce))
+            return null;
+        if (value.nonce !== attempt.nonce || value.url !== attempt.request.url)
+            return null;
         const parsed = new URL(value.url);
         const entries = [...parsed.searchParams.entries()];
         if (parsed.protocol !== "app:"
