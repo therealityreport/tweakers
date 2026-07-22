@@ -288,18 +288,22 @@ Browser host mode opens the Codex React UI in a normal browser tab while a
 hidden Codex window provides the private app bridge:
 
 ```sh
-tweaker browser --port 8765
+npm run browser -- --port 8765
 ```
 
-Then open:
+The command keeps the app-owned server private on `127.0.0.1:8765`, registers
+that port as a non-forcing Portless alias, and opens:
 
 ```text
-http://127.0.0.1:8765/
+https://tweakers.localhost/
 ```
 
 This is useful for debugging and browser automation. It is experimental. The
 in-app browser uses iframe shims in this mode, so some websites may block
-embedding.
+embedding. Starting browser host mode may restart Codex, so finish source-side
+work and request explicit confirmation before running it. Portless must be
+installed globally; a conflicting live `tweakers.localhost` route fails safely
+instead of being overwritten.
 
 ## Updates And Recovery
 

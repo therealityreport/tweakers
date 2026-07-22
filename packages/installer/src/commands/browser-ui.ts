@@ -14,6 +14,10 @@ interface BrowserUiOpts {
 
 const DEFAULT_PORT = 8765;
 const DEFAULT_BUNDLE_ID = "com.openai.codex";
+const PORTLESS_NAME = "tweakers";
+const PORTLESS_URL = "https://tweakers.localhost/";
+
+type CommandRunner = (command: string, args: string[], captureOutput?: boolean) => string;
 
 export async function browserUi(opts: BrowserUiOpts = {}): Promise<void> {
   if (platform() !== "darwin") {
@@ -22,25 +26,71 @@ export async function browserUi(opts: BrowserUiOpts = {}): Promise<void> {
 
   const codex = locateCodex(opts.app);
   const port = parsePort(opts.port, DEFAULT_PORT);
-  const url = `http://127.0.0.1:${port}/`;
+  const loopbackUrl = `http://127.0.0.1:${port}/`;
   const hideMainWindow = opts.keepWindow !== true && opts["keep-window"] !== true;
   const shouldOpen = opts.open !== false;
 
   console.log(`${kleur.dim("[1]")} Codex: ${kleur.cyan(codex.appRoot)}`);
+  console.log(`${kleur.dim("[2]")} Portless: ${kleur.cyan(PORTLESS_URL)}`);
+  preparePortlessBrowserUiRoute(port);
+
   if (isCodexRunning(codex.appRoot)) {
-    console.log(`${kleur.dim("[2]")} Restarting Codex with browser UI enabled`);
+    console.log(`${kleur.dim("[3]")} Restarting Codex with browser UI enabled`);
     quitCodex(codex.appRoot);
   } else {
-    console.log(`${kleur.dim("[2]")} Launching Codex with browser UI enabled`);
+    console.log(`${kleur.dim("[3]")} Launching Codex with browser UI enabled`);
   }
 
   launchCodexBrowserHost(codex.bundleId ?? DEFAULT_BUNDLE_ID, port, hideMainWindow);
-  await waitForBrowserUi(url);
-  console.log(`${kleur.dim("[3]")} Browser UI: ${kleur.cyan(url)}`);
+  await waitForBrowserUi(loopbackUrl);
+  console.log(`${kleur.dim("[4]")} Browser UI: ${kleur.cyan(PORTLESS_URL)}`);
 
   if (shouldOpen) {
-    execFileSync("open", [url], { stdio: "ignore" });
+    execFileSync("open", [PORTLESS_URL], { stdio: "ignore" });
   }
+}
+
+/**
+ * Keep the app-owned browser host on loopback while exposing its stable
+ * operator URL through a static Portless alias. The alias intentionally does
+ * not use --force: a conflicting live route must fail before Codex is
+ * restarted rather than terminating or replacing another process.
+ */
+export function preparePortlessBrowserUiRoute(
+  port: number,
+  runCommand: CommandRunner = runBrowserUiCommand,
+): string {
+  try {
+    runCommand("portless", ["proxy", "start", "--https", "-p", "443", "--tld", "localhost"]);
+
+    const configuredUrl = new URL(
+      runCommand("portless", ["get", PORTLESS_NAME, "--no-worktree"], true).trim(),
+    ).toString();
+    if (configuredUrl !== PORTLESS_URL) {
+      throw new Error(
+        `Portless is configured for ${configuredUrl}, but Tweakers requires ${PORTLESS_URL}. ` +
+          "Stop the existing proxy and restart it with HTTPS on port 443 using the localhost TLD.",
+      );
+    }
+
+    runCommand("portless", ["alias", PORTLESS_NAME, String(port)]);
+    return PORTLESS_URL;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Could not prepare ${PORTLESS_URL} before launching browser host mode. ` +
+        `Codex was not restarted. Ensure the global Portless CLI is installed and healthy. ${detail}`,
+      { cause: error },
+    );
+  }
+}
+
+function runBrowserUiCommand(command: string, args: string[], captureOutput = false): string {
+  if (captureOutput) {
+    return execFileSync(command, args, { encoding: "utf8" });
+  }
+  execFileSync(command, args, { stdio: "inherit" });
+  return "";
 }
 
 function launchCodexBrowserHost(bundleId: string, port: number, hideMainWindow: boolean): void {

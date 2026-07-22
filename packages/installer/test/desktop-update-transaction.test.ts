@@ -236,6 +236,7 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
       version: { marketingVersion: "1.0.0", build: "100" },
       mainPid: 101,
     }),
+    launchOfficialDesktop: () => { calls.push("launch-official-desktop"); },
     initiateNativeUpdate: async () => { calls.push("native-update-handoff"); },
     waitForVersionChange: async () => ({ marketingVersion: "1.1.0", build: "110" }),
     refreshEnvironmentTruth: async () => { calls.push("refresh-environment-truth"); },
@@ -306,6 +307,68 @@ test("a real official version change returns to Tweakers, refreshes the chosen s
     ]);
     assert.equal(transaction.status()?.phase, "completed");
     assert.equal(readdirSync(fixture.receiptRoot).length, 1);
+  });
+});
+
+test("desktop update transaction logs one ordered event per persisted phase transition", async () => {
+  await withFixture(async (fixture) => {
+    const { deps } = dependencies();
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    await transaction.start();
+
+    const records = readFileSync(
+      join(fixture.root, "log", "desktop-update.log"),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { event: string; phase: string });
+    assert.deepEqual(
+      records.map(({ event, phase }) => `${event}:${phase}`),
+      [
+        "owner_started:preparing",
+        "phase_transition:switching_to_chatgpt",
+        "phase_transition:awaiting_native_update",
+        "handoff_result:awaiting_native_update",
+        "phase_transition:returning_to_tweakers",
+        "phase_transition:refreshing_runtime",
+        "phase_transition:verifying",
+        "owner_completed:completed",
+      ],
+    );
+  });
+});
+
+test("recovery transaction logs redact the user root and end with handled failure evidence", async () => {
+  await withFixture(async (fixture) => {
+    const { deps } = dependencies({
+      refreshTweakers: async () => {
+        throw new Error(`refresh failed under ${fixture.root}/managed-runtime`);
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const result = await transaction.start();
+    const log = readFileSync(join(fixture.root, "log", "desktop-update.log"), "utf8");
+    const records = log
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { event: string; phase: string; error?: string });
+
+    assert.equal(result.phase, "rolled_back");
+    assert.equal(log.includes(fixture.root), false);
+    assert.deepEqual(records.at(-1), {
+      schemaVersion: 1,
+      ts: NOW,
+      transactionId: "desktop-1",
+      phase: "rolled_back",
+      ownerPid: process.pid,
+      ownerToken: "test-owner-start",
+      ownerGeneration: "owner-generation-1",
+      event: "handled_failure",
+      error: "refresh failed under [user-root]/managed-runtime",
+    });
   });
 });
 
@@ -1745,5 +1808,145 @@ test("native updater handoff failure remains safe and resumable in official mode
     assert.equal(receipt.nativeUpdateHandoffAt, null);
     assert.match(receipt.error ?? "", /native updater unavailable/i);
     assert.deepEqual(calls, ["refresh-environment-truth", "prepare:chatgpt", "commit:chatgpt", "native-update-handoff"]);
+  });
+});
+
+test("a click-level handoff failure keeps awaiting the native update and completes when the version advances", async () => {
+  await withFixture(async (fixture) => {
+    const { calls, deps } = dependencies({
+      initiateNativeUpdate: async () => {
+        calls.push("native-update-handoff");
+        return {
+          ok: false as const,
+          kind: "menu_item_not_found" as const,
+          message: "ChatGPT's native update menu item could not be found.",
+          permissionGuidance: null,
+        };
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.error, null);
+    assert.equal(receipt.nativeUpdateHandoffAt, null);
+    assert.deepEqual(calls, [
+      "refresh-environment-truth",
+      "prepare:chatgpt",
+      "commit:chatgpt",
+      "native-update-handoff",
+      "refresh-environment-truth",
+      "prepare:tweakers",
+      "commit:tweakers",
+      "refresh:development",
+    ]);
+  });
+});
+
+test("a dead official PID during handoff still completes via the version wait (Sparkle relaunch)", async () => {
+  await withFixture(async (fixture) => {
+    const { deps } = dependencies({
+      initiateNativeUpdate: async () => ({
+        ok: false as const,
+        kind: "process_not_proven" as const,
+        message: "The exact ChatGPT process 9754 could not be proven at /Applications/ChatGPT.app.",
+        permissionGuidance: null,
+      }),
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.error, null);
+  });
+});
+
+test("an unsupported-platform handoff failure fails terminal, safe, and resumable", async () => {
+  await withFixture(async (fixture) => {
+    const { deps } = dependencies({
+      initiateNativeUpdate: async () => ({
+        ok: false as const,
+        kind: "unsupported_platform" as const,
+        message: "OpenAI's native desktop updater is available only on macOS.",
+        permissionGuidance: null,
+      }),
+      waitForVersionChange: async () => {
+        throw new Error("must not wait on an unsupported platform");
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.equal(receipt.resumable, true);
+    assert.match(receipt.error ?? "", /available only on macOS/i);
+  });
+});
+
+test("resume relaunches a closed official app before verifying, then returns to Tweakers", async () => {
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      officialMainPid: 82156,
+      safeOfficialMode: true,
+      resumable: true,
+      error: "Native updater handoff failed for stale PID 82156",
+    }));
+    let inspectCalls = 0;
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => {
+        inspectCalls += 1;
+        if (inspectCalls === 1) {
+          throw new Error("The exact official ChatGPT process could not be proven at /Applications/ChatGPT.app");
+        }
+        return {
+          version: { marketingVersion: "1.1.0", build: "110" },
+          mainPid: 26138,
+        };
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(
+      { ...fixture, resumeLaunchWaitMs: 2_000, pollIntervalMs: 5 },
+      deps,
+    );
+
+    const receipt = await transaction.resume();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(receipt.observed, { marketingVersion: "1.1.0", build: "110" });
+    assert.equal(receipt.officialMainPid, 26138);
+    assert.equal(calls[0], "launch-official-desktop");
+    assert.ok(inspectCalls >= 2);
+  });
+});
+
+test("resume does not relaunch when the live desktop fails a disk-level proof", async () => {
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      officialMainPid: 82156,
+      safeOfficialMode: true,
+      resumable: true,
+      error: "Native updater handoff failed for stale PID 82156",
+    }));
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => {
+        throw new Error("The live desktop at /Applications/ChatGPT.app is not pristine ChatGPT");
+      },
+    });
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "failed");
+    assert.match(receipt.error ?? "", /not pristine/i);
+    assert.deepEqual(calls, []);
   });
 });

@@ -341,6 +341,10 @@ test("Codex version snapshots report the exact measured active backend separatel
   assert.match(body, /versionChannel: codexVersionChannel\(activeCliProbe\.version\)/);
   assert.match(body, /source: activeCliSource/);
   assert.match(body, /resolveTerminalCodexBinary/);
+  assert.match(body, /loginShellPath: terminalCodexFromLoginShell\(\)/);
+  const loginShellProbe = extractFunctionBody(mainSource, "terminalCodexFromLoginShell");
+  assert.match(loginShellProbe, /spawnSync\(shellPath, \["-lic", "command -v codex"\]/);
+  assert.match(loginShellProbe, /timeout: 5_000/);
   assert.match(body, /terminalCli:\s*\{/);
   assert.match(body, /version: terminalProbe\?\.version \?\? null/);
   assert.match(body, /Math\.min\(\.\.\.lookupCheckedAt\)/);

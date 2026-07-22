@@ -6,8 +6,9 @@
  * NOT a modal dialog. The sidebar lives inside a `<div class="flex flex-col
  * gap-1 gap-0">` wrapper that holds one or more `<div class="flex flex-col
  * gap-px">` groups of buttons. There are no stable `role` / `aria-label` /
- * `data-testid` hooks on the shell so we identify the sidebar by text-content
- * match against known item labels (General, Appearance, Configuration, …).
+ * `data-testid` hook on the shell. Native settings rows do expose stable
+ * `data-settings-panel-slug` markers, so those own the surface and localized
+ * item labels only rank candidates inside that surface.
  *
  * Layout we inject:
  *
@@ -57,6 +58,7 @@ const state = {
     sidebarRestoreHandler: null,
     settingsSurfaceVisible: false,
     settingsSurfaceHideTimer: null,
+    sidebarProbeStatus: null,
     tweakStore: null,
     tweakStorePromise: null,
     tweakStoreError: null,
@@ -274,7 +276,12 @@ function tryInject() {
     const itemsGroup = findSidebarItemsGroup();
     if (!itemsGroup) {
         scheduleSettingsSurfaceHidden();
-        plog("sidebar not found");
+        // tryInject polls every 500ms; log only on the transition into this state
+        // so repeated misses don't flood preload.log.
+        if (state.sidebarProbeStatus !== "missing") {
+            state.sidebarProbeStatus = "missing";
+            plog("sidebar not found");
+        }
         return;
     }
     if (state.settingsSurfaceHideTimer) {
@@ -287,12 +294,18 @@ function tryInject() {
     const outer = itemsGroup;
     if (!isSettingsSidebarCandidate(itemsGroup)) {
         scheduleSettingsSurfaceHidden();
-        plog("rejected non-settings sidebar candidate", {
-            itemsGroup: describe(itemsGroup),
-            outer: describe(outer),
-        });
+        // Same transition-only throttling as the "sidebar not found" branch.
+        if (state.sidebarProbeStatus !== "rejected") {
+            state.sidebarProbeStatus = "rejected";
+            plog("rejected non-settings sidebar candidate", {
+                itemsGroup: describe(itemsGroup),
+                outer: describe(outer),
+            });
+        }
         return;
     }
+    // Success transition already logs via setSettingsSurfaceVisible("sidebar-found").
+    state.sidebarProbeStatus = "found";
     state.sidebarRoot = outer;
     syncNativeSettingsHeader(itemsGroup, outer);
     bindSettingsSearch(outer);
@@ -444,7 +457,7 @@ function scheduleSettingsSurfaceHidden() {
     }, 1500);
 }
 function isSettingsTextVisible() {
-    return isTweakerSettingsLabelSet(tweakerSettingsLabelsFrom(document));
+    return nativeSettingsPanelSlugCount(document) >= 2;
 }
 function compactSettingsText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
@@ -590,15 +603,16 @@ function tweakerMarkerCount(labels, markers) {
     }
     return matched.size;
 }
-function hasTweakerSettingsOnlySignal(labels) {
-    return tweakerMarkerCount(labels, TWEAKER_SETTINGS_ONLY_LABELS) > 0;
-}
-function hasMainAppSidebarSignals(labels) {
-    return tweakerMarkerCount(labels, TWEAKER_MAIN_APP_NAV_LABELS) >= 2;
-}
-function isTweakerSettingsLabelSet(labels) {
-    const score = tweakerSettingsLabelScore(labels);
-    return score.core >= 2 && score.total >= 3;
+function nativeSettingsPanelSlugCount(root) {
+    const slugs = new Set();
+    for (const element of Array.from(root.querySelectorAll("[data-settings-panel-slug]"))) {
+        if (element.closest("[data-tweaker]"))
+            continue;
+        const slug = element.dataset.settingsPanelSlug?.trim();
+        if (slug)
+            slugs.add(slug);
+    }
+    return slugs.size;
 }
 function tweakerVisibleBox(el) {
     if (!el.isConnected)
@@ -4725,18 +4739,20 @@ function isSettingsSidebarCandidate(el) {
     const rect = tweakerVisibleBox(el);
     if (!rect)
         return false;
-    // Current Codex Settings sidebar: left column, not the main content panel.
-    if (rect.width < 120 || rect.width > 620)
-        return false;
-    if (rect.height < 80)
-        return false;
-    if (rect.left > window.innerWidth * 0.65)
-        return false;
     const labels = tweakerSettingsLabelsFrom(el);
-    if (hasMainAppSidebarSignals(labels) && !hasTweakerSettingsOnlySignal(labels)) {
-        return false;
-    }
-    return isTweakerSettingsLabelSet(labels);
+    const score = tweakerSettingsLabelScore(labels);
+    return (0, settings_page_model_1.isNativeSettingsSidebarEvidence)({
+        width: rect.width,
+        height: rect.height,
+        left: rect.left,
+        viewportWidth: window.innerWidth,
+        forbiddenSurface: isForbiddenSettingsSidebarSurface(el),
+        nativePanelSlugCount: nativeSettingsPanelSlugCount(el),
+        coreLabelCount: score.core,
+        totalLabelCount: score.total,
+        mainAppLabelCount: tweakerMarkerCount(labels, TWEAKER_MAIN_APP_NAV_LABELS),
+        settingsOnlyLabelCount: tweakerMarkerCount(labels, TWEAKER_SETTINGS_ONLY_LABELS),
+    });
 }
 function removeMisplacedSettingsGroups() {
     const groups = document.querySelectorAll("[data-tweaker='nav-group'], [data-tweaker='pages-group'], [data-tweaker='native-nav-header']");
@@ -4750,14 +4766,16 @@ function removeMisplacedSettingsGroups() {
 function isTweakerInjectedSettingsGroupPlacementValid(group) {
     if (isForbiddenSettingsSidebarSurface(group))
         return false;
-    // Trust the injection-time placement while that exact sidebar node is
-    // alive. isSettingsSidebarCandidate is layout-dependent (visible box), so
-    // re-judging mid React re-render intermittently fails, strips the group,
-    // and re-triggers the observer — an inject/remove loop at render speed.
+    // Keep the injection-time placement only while the connected root still
+    // owns native Settings rows. This avoids layout-dependent re-judging while
+    // ensuring a false-positive thread or side panel cannot retain the group.
     if (state.sidebarRoot &&
         state.sidebarRoot.isConnected &&
         (group.parentElement === state.sidebarRoot || state.sidebarRoot.contains(group))) {
-        return true;
+        return (0, settings_page_model_1.hasNativeSettingsSidebarOwnership)({
+            forbiddenSurface: isForbiddenSettingsSidebarSurface(state.sidebarRoot),
+            nativePanelSlugCount: nativeSettingsPanelSlugCount(state.sidebarRoot),
+        });
     }
     let node = group.parentElement;
     for (let depth = 0; node && depth < 4; depth++) {

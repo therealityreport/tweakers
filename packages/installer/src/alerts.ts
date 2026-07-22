@@ -74,7 +74,9 @@ function showAppManagementPatchFailedAlert(errorMessage: string): void {
 
 export const AUTOMATION_PERMISSION_GUIDANCE =
   "Open System Settings > Privacy & Security > Automation, then allow the app running Tweakers " +
-  "(ChatGPT, Menu Bar, or Terminal) to control System Events.";
+  "(ChatGPT, Menu Bar, or Terminal) to control System Events. If Automation is already allowed, " +
+  "also check Privacy & Security > Accessibility: reading another app's menus needs assistive access, " +
+  "which macOS grants separately.";
 
 export type NativeUpdateHandoffFailureKind =
   | "unsupported_platform"
@@ -173,6 +175,10 @@ export function requestCodexNativeUpdate(
     "set frontmost of targetProcess to true",
     `set candidateNames to {${candidateNames.map(appleScriptString).join(", ")}}`,
     "set appMenu to menu 1 of menu bar item 2 of menu bar 1 of targetProcess",
+    // Deliberately outside any try block: reading menu items requires assistive
+    // access, and a swallowed -1719 here would masquerade as "menu item not
+    // found" instead of surfacing the real permission failure.
+    "set menuItemCount to count of menu items of appMenu",
     "set updateItem to missing value",
     // Bulk name enumeration is reliable even when the menu has never been
     // opened; a `whose name is` filter against the same lazily-populated AX

@@ -2,9 +2,11 @@ export interface ResolveTerminalCodexBinaryOptions {
     home: string;
     pathValue?: string | null;
     preferredPath?: string | null;
+    loginShellPath?: string | null;
     excludedPaths?: readonly string[];
     isExecutable: (path: string) => boolean;
 }
+export declare function terminalCodexPathFromShellOutput(output: string, isExecutable: (path: string) => boolean): string | null;
 /**
  * Resolve the independently installed Terminal CLI without confusing it with
  * the Codex binary embedded in the desktop app. PATH order is authoritative:

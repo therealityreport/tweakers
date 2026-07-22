@@ -50,6 +50,14 @@ export async function updateCodex(
   opts: UpdateCodexOptions = {},
   deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
 ): Promise<DesktopUpdateReceipt> {
+  // A durable desktop update always originates from an explicit user action
+  // (CLI invocation or a Menu Bar button); record that authorization before
+  // the transaction takes its first side effect.
+  appendLifecycleAuditRecord(ensureUserPaths().desktopUpdateLogFile, {
+    event: "user_approval",
+    action: "update-chatgpt",
+    detail: "Desktop Update and Reload initiated by explicit user command",
+  });
   const receipt = await deps.createTransaction(opts).start();
   printReceipt(receipt, opts, deps);
   return receipt;
@@ -66,11 +74,62 @@ export function codexUpdateStatus(
   return receipt;
 }
 
+export interface DesktopUpdateStatusProgress {
+  heartbeat: {
+    beatAt: string;
+    beatAgeMs: number | null;
+    phase: string;
+    observed: { marketingVersion: string | null; build: string | null } | null;
+  } | null;
+  phaseUpdatedAt: string;
+  phaseAgeMs: number | null;
+}
+
+/** Live progress block for status readers (Menu Bar dialog, Config tab):
+ * heartbeat beats every 30s during the native wait and carries the sampled
+ * disk version, so pollers can render movement without new phases. */
+function statusProgress(
+  receipt: DesktopUpdateReceipt,
+  heartbeat: ReturnType<DesktopUpdateTransaction["heartbeat"]>,
+  nowMs: number = Date.now(),
+): DesktopUpdateStatusProgress {
+  const matches = heartbeat !== null && heartbeat.transactionId === receipt.transactionId;
+  const beatMs = matches ? Date.parse(heartbeat.beatAt) : Number.NaN;
+  const updatedMs = Date.parse(receipt.updatedAt);
+  return {
+    heartbeat: matches
+      ? {
+          beatAt: heartbeat.beatAt,
+          beatAgeMs: Number.isFinite(beatMs) ? Math.max(0, nowMs - beatMs) : null,
+          phase: heartbeat.phase,
+          observed: heartbeat.observed ?? null,
+        }
+      : null,
+    phaseUpdatedAt: receipt.updatedAt,
+    phaseAgeMs: Number.isFinite(updatedMs) ? Math.max(0, nowMs - updatedMs) : null,
+  };
+}
+
 export async function resumeCodexUpdate(
   opts: UpdateCodexOptions = {},
   deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
 ): Promise<DesktopUpdateReceipt> {
-  const receipt = await deps.createTransaction(opts).resume();
+  const transaction = deps.createTransaction(opts);
+  let receipt: DesktopUpdateReceipt;
+  try {
+    receipt = await transaction.resume();
+  } catch (error) {
+    // A live owner already driving this transaction means the update is
+    // progressing — report its receipt instead of failing the resume request,
+    // so UI callers do not render a red error over a healthy run.
+    const active = transaction.status();
+    const message = error instanceof Error ? error.message : String(error);
+    if (active !== null && /owner PID \d+ is still active/i.test(message)) {
+      printReceipt(active, opts, deps);
+      return active;
+    }
+    throw error;
+  }
   printReceipt(receipt, opts, deps);
   return receipt;
 }

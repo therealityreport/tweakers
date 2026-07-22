@@ -1184,6 +1184,12 @@ interface AppBundleReplacementAdapters {
   validateDestination?: (appRoot: string) => boolean;
   onCleanupFailure?: (path: string, error: unknown) => void;
   /**
+   * The stable incoming Contents path was populated and verified before the
+   * live app was stopped. Cutover must consume that exact staging copy rather
+   * than opening a long copy window after shutdown.
+   */
+  preStagedIncoming?: boolean;
+  /**
    * When set, the swapped-out Contents are renamed to this path instead of
    * being removed — but only after the promoted destination validated. A
    * failed validation still removes the incoming copy (it holds the rejected
@@ -1191,6 +1197,37 @@ interface AppBundleReplacementAdapters {
    * preserves the incoming copy as evidence exactly as before.
    */
   preserveOutgoing?: string;
+}
+
+interface AppBundleStagingAdapters {
+  removeDirectory?: (path: string) => void;
+  copyDirectory?: (source: string, destination: string) => void;
+}
+
+/**
+ * Populate the stable incoming Contents path while the current app may still
+ * be running. The later replacement then consists only of the atomic swap and
+ * destination validation, so an automatic reopen cannot bind the outgoing
+ * Contents during a multi-gigabyte copy.
+ */
+export function stageAppBundleReplacement(
+  source: string,
+  destination: string,
+  adapters: AppBundleStagingAdapters = {},
+): string {
+  const sourceContents = join(source, "Contents");
+  const destinationContents = join(destination, "Contents");
+  if (!existsSync(sourceContents) || !existsSync(destinationContents)) {
+    throw new Error("App bundle replacement requires source and destination Contents directories");
+  }
+  const incoming = `${destination}.tweakers-contents-swap`;
+  const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
+  const copy = adapters.copyDirectory
+    ?? ((from: string, to: string) => cpSync(from, to, { recursive: true, verbatimSymlinks: true }));
+  remove(incoming);
+  copy(sourceContents, incoming);
+  if (!existsSync(incoming)) throw new Error("Prepared app Contents staging copy is missing");
+  return incoming;
 }
 
 export function replaceAppBundlePreservingIdentity(

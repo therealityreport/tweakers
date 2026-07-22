@@ -1829,6 +1829,30 @@ function readJsonDocument(file: string): unknown {
   }
 }
 
+function terminalCodexFromLoginShell(): string | null {
+  const shellPath = process.env.SHELL;
+  if (!shellPath || !isAbsolute(shellPath)) return null;
+  try {
+    if (!existsSync(shellPath) || !statSync(shellPath).isFile()) return null;
+    const result = spawnSync(shellPath, ["-lic", "command -v codex"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+    });
+    if (result.status !== 0) return null;
+    return terminalCodexPathFromShellOutput(result.stdout ?? "", (path) => {
+      try {
+        return existsSync(path) && statSync(path).isFile();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSnapshot> {
   const selectedLane = selectedCodexLane();
   const desktopTarget = selectedCodexDesktopUpdateTarget();

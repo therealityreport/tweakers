@@ -261,15 +261,18 @@ function paint(mount, view) {
 }
 
 function findSummaryPanels(root) {
-  const matched = Array.from(root?.querySelectorAll?.("[data-thread-summary], [data-summary-panel], aside, section") || []).filter((panel) => {
+  // Only mount into host-owned summary surfaces. Generic `aside` and `section`
+  // elements are used throughout Codex settings and navigation; matching them
+  // by descendant text caused Profiles to be injected into the Subagents
+  // header when that screen happened to contain two summary marker words.
+  const matched = Array.from(root?.querySelectorAll?.("[data-thread-summary], [data-summary-panel]") || []).filter((panel) => {
     if (panel.hasAttribute?.(MOUNT_ATTR)) return false;
     const text = String(panel.textContent || "");
     const markers = ["Environment", "Sources", "Progress", "Subagents"].filter((marker) => text.includes(marker));
     return markers.length >= 2;
   });
-  // The text heuristic matches nested `aside`/`section` pairs, so keep only the
-  // innermost — drop any panel that contains another matched panel — to avoid
-  // injecting duplicate Profiles mounts into a parent and its child.
+  // Hosts may still nest explicit summary surfaces, so keep only the innermost
+  // to avoid injecting duplicate Profiles mounts into a parent and its child.
   return matched.filter((panel) => !matched.some((other) => other !== panel && panel.contains?.(other)));
 }
 

@@ -311,6 +311,9 @@ test("commit records the exact old PID, retries once, and proves a different vis
         calls.push(`prepare:${selection.selectedDesktopPath}`);
         return preparedEvidence(current, requested);
       },
+      stagePreparedEnvironment: ({ direction }) => {
+        calls.push(`stage:${direction}`);
+      },
       observeDesktop: async (path) => {
         calls.push(`observe:${path}`);
         return observations.shift() ?? null;
@@ -364,6 +367,7 @@ test("commit records the exact old PID, retries once, and proves a different vis
     assert.deepEqual(calls, [
       "observe:/Applications/ChatGPT.app",
       "prepare:/Applications/ChatGPT (Beta).app",
+      "stage:requested",
       "quit:/Applications/ChatGPT.app:101",
       "cleanup:/Applications/ChatGPT.app:101",
       "apply:requested",
@@ -1234,6 +1238,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     managedRuntimeTreeDigest: prepared.managedRuntime.requested.artifactDigest,
     mcpMode: true,
   };
+  let appFingerprintCalls = 0;
   try {
     mkdirSync(join(root, "backend"), { recursive: true });
     writeFileSync(backendPath, "backend", { flag: "a" });
@@ -1259,7 +1264,10 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
         build: mutable.build,
       }),
       readMarker: () => "present",
-      appFingerprint: () => mutable.desktopDigest,
+      appFingerprint: () => {
+        appFingerprintCalls += 1;
+        return mutable.desktopDigest;
+      },
       fileFingerprint: () => mutable.backendDigest,
       directoryFingerprint: (path) => path === prepared.runtime!.targetPath
         ? mutable.runtimeTreeDigest
@@ -1332,8 +1340,10 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     });
 
     assert.notEqual(await prove(), null);
+    assert.equal(appFingerprintCalls, 1);
     mutable.bundleId = "com.openai.codex";
     assert.equal(await prove(), null, "wrong bundle must fail");
+    assert.equal(appFingerprintCalls, 1, "cheap identity drift must not hash the app");
     mutable.bundleId = requested.selectedDesktopBundleId;
     mutable.appRoot = "/Applications/Wrong.app";
     assert.equal(await prove(), null, "wrong exact path must fail");
@@ -1355,6 +1365,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     mutable.runtimeBinaryPath = backendPath;
     mutable.runtimePid = 999;
     assert.equal(await prove(), null, "runtime proof from another PID must fail");
+    assert.equal(appFingerprintCalls, 1, "stale runtime proof must not hash the app");
     mutable.runtimePid = 202;
     mutable.runtimeFingerprint = "0".repeat(64);
     assert.equal(await prove(), null, "wrong active runtime fingerprint must fail");
@@ -1370,6 +1381,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     mutable.managedSourceRuntimeHash = prepared.managedRuntime.requested.sourceRuntimeHash;
     mutable.mcpMode = false;
     assert.equal(await prove(), null, "unapplied MCP mode ownership must fail");
+    assert.equal(appFingerprintCalls, 1, "unapplied MCP ownership must not hash the app");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

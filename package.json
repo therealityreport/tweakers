@@ -18,6 +18,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
+    "browser": "tsx packages/installer/src/cli.ts browser",
     "lint": "eslint packages/*/src --ext .ts --no-error-on-unmatched-pattern",
     "check:tweak-catalog": "node scripts/check-tweak-catalog.mjs store/index.json",
     "sync:tweaks": "node scripts/sync-tweaks.mjs",

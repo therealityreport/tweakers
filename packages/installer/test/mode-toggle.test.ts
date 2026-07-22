@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { mode, type ModeCommandDeps } from "../src/commands/mode";
-import { replaceAppBundlePreservingIdentity, type AsarMarker } from "../src/commands/install";
+import {
+  replaceAppBundlePreservingIdentity,
+  stageAppBundleReplacement,
+  type AsarMarker,
+} from "../src/commands/install";
 import { readState, resolveMode, writeState, type InstallerState } from "../src/state";
 import {
   modeTransitionFile,
@@ -350,6 +354,32 @@ test("preserveOutgoing parks the swapped-out Contents after a validated swap", a
     assert.equal(readFileSync(appAsar(parked), "utf8"), "patched-asar");
     assert.equal(existsSync(`${destination}.tweakers-contents-swap`), false);
   });
+});
+
+test("a pre-staged replacement cuts over without copying source Contents after shutdown", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-prestaged-swap-"));
+  try {
+    const source = join(root, "Source.app");
+    const destination = join(root, "ChatGPT.app");
+    makeApp(source, { version: "26.1.0", asar: "prepared-patched" });
+    makeApp(destination, { version: "26.1.0", asar: "running-official" });
+
+    const incoming = stageAppBundleReplacement(source, destination);
+    assert.equal(readFileSync(join(incoming, "Resources", "app.asar"), "utf8"), "prepared-patched");
+
+    // Mutating the original fixture after staging proves cutover consumes the
+    // already-staged bytes instead of opening another copy window.
+    writeFileSync(appAsar(source), "changed-after-staging");
+    replaceAppBundlePreservingIdentity(source, destination, {
+      preStagedIncoming: true,
+      swapDirectories: jsSwapDirectories,
+    });
+
+    assert.equal(readFileSync(appAsar(destination), "utf8"), "prepared-patched");
+    assert.equal(existsSync(incoming), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("preserveOutgoing never parks rejected bytes when validation fails and rolls back", async () => {

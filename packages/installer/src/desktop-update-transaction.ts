@@ -58,6 +58,7 @@ import {
   openCodex,
   requestCodexNativeUpdate,
   showUpdateModePausedAlert,
+  type NativeUpdateHandoffFailureKind,
   type NativeUpdateHandoffResult,
 } from "./alerts.js";
 import { isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
@@ -167,7 +168,18 @@ export interface DesktopUpdateDependencies {
   inspectLiveOfficialDesktop(
     selection: EnvironmentSelection,
   ): LiveOfficialDesktopObservation | Promise<LiveOfficialDesktopObservation>;
-  initiateNativeUpdate(input: InitiateNativeDesktopUpdateInput): void | Promise<void>;
+  /** Open the exact selected official app so a resume does not dead-end when
+   * the user closed ChatGPT after a failed handoff. */
+  launchOfficialDesktop(selection: EnvironmentSelection): void;
+  /**
+   * Ask the live official ChatGPT to open its native updater. Returning a
+   * failed result (or void for legacy adapters that throw instead) does not
+   * necessarily abort the update: click-level failures are recoverable
+   * because ChatGPT also checks for updates on its own at launch.
+   */
+  initiateNativeUpdate(
+    input: InitiateNativeDesktopUpdateInput,
+  ): NativeUpdateHandoffResult | void | Promise<NativeUpdateHandoffResult | void>;
   waitForVersionChange(input: WaitForDesktopVersionChangeInput): Promise<DesktopVersionIdentity | null>;
   /** Test/adapter seam after the native wait settles but before its atomic receipt transition. */
   beforeNativeWaitTransition?(): void | Promise<void>;
@@ -202,6 +214,9 @@ export interface DesktopUpdateTransactionOptions {
   lockFile?: string;
   timeoutMs?: number;
   pollIntervalMs?: number;
+  /** Bounded wait for the official app to present a visible window after a
+   * resume-triggered relaunch. */
+  resumeLaunchWaitMs?: number;
   appPath?: string;
 }
 
@@ -210,7 +225,24 @@ export interface DesktopUpdateTransaction {
   resume(): Promise<DesktopUpdateReceipt>;
   cancel(): Promise<DesktopUpdateReceipt>;
   status(): DesktopUpdateReceipt | null;
+  /** Latest owner heartbeat, if one exists — live progress for status readers. */
+  heartbeat(): DesktopUpdateHeartbeat | null;
 }
+
+/** Handoff failures that do not disprove the update itself. ChatGPT checks
+ * for updates on its own at launch, so a failed menu click never aborts the
+ * transaction — the version wait continues. process_not_proven is usually the
+ * SUCCESS signature: Sparkle installed the update and relaunched the app,
+ * killing the recorded PID; the version wait then returns immediately. Only
+ * unsupported_platform is fatal. */
+const RECOVERABLE_NATIVE_HANDOFF_KINDS: ReadonlySet<NativeUpdateHandoffFailureKind> = new Set([
+  "menu_item_not_found",
+  "menu_item_disabled",
+  "script_failed",
+  "automation_permission_denied",
+  "process_not_proven",
+  "window_not_visible",
+]);
 
 export function createDesktopUpdateTransaction(
   options: DesktopUpdateTransactionOptions = {},
@@ -230,6 +262,7 @@ export function createDesktopUpdateTransaction(
   const installerStateFile = join(root, "state.json");
   const timeoutMs = Math.max(1, options.timeoutMs ?? 30 * 60 * 1_000);
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 2_000);
+  const resumeLaunchWaitMs = Math.max(0, options.resumeLaunchWaitMs ?? 30_000);
   const now = overrides.now ?? (() => new Date().toISOString());
   const environment = overrides.environment ?? createEnvironmentCoordinator({
     environmentRoot: root,
@@ -279,11 +312,10 @@ export function createDesktopUpdateTransaction(
       }
       if (!result.ok) {
         showUpdateModePausedAlert(selection.selectedDesktopPath, baseline.marketingVersion, result);
-        throw new Error(
-          `${result.message}${result.permissionGuidance ? ` ${result.permissionGuidance}` : ""}`,
-        );
+        return result;
       }
       showUpdateModePausedAlert(selection.selectedDesktopPath, baseline.marketingVersion);
+      return result;
     }),
     waitForVersionChange: overrides.waitForVersionChange ?? ((input) => waitForVersionChange(
       input,
@@ -498,7 +530,7 @@ export function createDesktopUpdateTransaction(
 
   async function handoffAndAwaitNativeUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
     try {
-      await deps.initiateNativeUpdate({
+      const result = await deps.initiateNativeUpdate({
         transactionId: initial.transactionId,
         selection: initial.official,
         baseline: initial.baseline,
@@ -538,7 +570,8 @@ export function createDesktopUpdateTransaction(
             phase: "failed",
             safeOfficialMode: true,
             resumable: true,
-            error: "The official update did not complete before the timeout. ChatGPT remains safely in official mode.",
+            error: "The official update did not complete before the timeout. ChatGPT remains safely in official mode."
+              + (latest.error ? ` Earlier: ${latest.error}` : ""),
           }, true),
           shouldContinue: false,
         };
@@ -559,6 +592,7 @@ export function createDesktopUpdateTransaction(
           phase: latest.source.appExperience === "chatgpt" ? "verifying" : "returning_to_tweakers",
           observed,
           resumable: false,
+          error: null,
         }),
         shouldContinue: true,
       };
@@ -708,6 +742,39 @@ export function createDesktopUpdateTransaction(
 
   async function resume(): Promise<DesktopUpdateReceipt> {
     return withLifecycleLock(lifecycleLockFile, "desktop update resume", resumeUnlocked);
+  }
+
+  /**
+   * Resume can arrive with the official app quit (the user closed ChatGPT
+   * after a failed handoff, or clicked Resume the next day). When the only
+   * obstacle is a missing or windowless process — the disk proofs (pristine
+   * asar, official profile) all passed — launch the exact selected app and
+   * re-observe within a bounded window instead of dead-ending the resume.
+   */
+  async function inspectLiveOfficialDesktopRelaunchingIfNeeded(
+    official: EnvironmentSelection,
+  ): Promise<LiveOfficialDesktopObservation> {
+    let lastError: unknown;
+    try {
+      return await deps.inspectLiveOfficialDesktop(official);
+    } catch (error) {
+      if (resumeLaunchWaitMs === 0 || !isRecoverableLiveProcessError(error)) throw error;
+      lastError = error;
+    }
+    deps.launchOfficialDesktop(official);
+    const deadline = Date.now() + resumeLaunchWaitMs;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, pollIntervalMs);
+      });
+      try {
+        return await deps.inspectLiveOfficialDesktop(official);
+      } catch (error) {
+        if (!isRecoverableLiveProcessError(error)) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
   }
 
   async function resumeUnlocked(): Promise<DesktopUpdateReceipt> {
@@ -1548,6 +1615,13 @@ function readDesktopVersion(appPath: string): DesktopVersionIdentity {
   } catch {
     return { marketingVersion: null, build: null };
   }
+}
+
+/** Process-level failures from inspectLiveOfficialDesktop that a relaunch of
+ * the exact selected app can cure. Disk-level proofs (pristine asar, official
+ * profile, readable version) rethrow immediately. */
+function isRecoverableLiveProcessError(error: unknown): boolean {
+  return /process could not be proven|has no visible window/i.test(errorMessage(error));
 }
 
 function inspectLiveOfficialDesktop(

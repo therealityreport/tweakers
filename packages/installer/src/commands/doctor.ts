@@ -61,6 +61,28 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     return;
   }
 
+  // Selection/registry drift breaks every environment command while leaving
+  // the app itself healthy, so doctor must surface it explicitly.
+  try {
+    loadEnvironmentState({
+      legacyStateFile: paths.stateFile,
+      registryFile: paths.environmentRegistryFile,
+      selectionFile: paths.environmentSelectionFile,
+      environmentRoot: paths.root,
+    }, { recoverCommit: false });
+    checks.push({
+      name: "environment consistency",
+      ok: true,
+      detail: "selection matches the profile registry",
+    });
+  } catch (e) {
+    checks.push({
+      name: "environment consistency",
+      ok: false,
+      detail: `${(e as Error).message} — run \`tweaker environment status\``,
+    });
+  }
+
   let codex;
   try {
     codex = locateCodex(state.appRoot);

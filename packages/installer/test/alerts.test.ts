@@ -289,6 +289,28 @@ test("native-update handoff refuses a process that is not the exact committed ap
   assert.equal(executed, false);
 });
 
+test("native-update handoff gives up immediately when the exact PID is gone (Sparkle relaunch)", { skip: process.platform !== "darwin" }, async () => {
+  const clock = fakeClock();
+  let observations = 0;
+  const requested = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => {
+      observations += 1;
+      return null;
+    },
+    exec: (() => "") as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 60_000,
+    pollIntervalMs: 2_000,
+  });
+
+  assert.equal(requested.ok, false);
+  if (!requested.ok) assert.equal(requested.kind, "process_not_proven");
+  // The expected PID is fixed; a dead PID never returns. No retries.
+  assert.equal(observations, 1);
+  assert.equal(clock.sleeps.length, 0);
+});
+
 test("native-update handoff includes localized labels and a structural app-menu fallback", { skip: process.platform !== "darwin" }, async () => {
   const calls: RecordedExecCall[] = [];
   const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
@@ -338,6 +360,67 @@ test("native-update handoff reports Automation denial with exact System Settings
   assert.match(result.permissionGuidance ?? "", /control System Events/);
   assert.equal(execCalls, 1);
   assert.equal(clock.sleeps.length, 0);
+});
+
+test("native-update handoff surfaces denied assistive access instead of reporting a missing menu item", { skip: process.platform !== "darwin" }, async () => {
+  const assistiveDenied = Object.assign(new Error("osascript failed"), {
+    stderr: "execution error: System Events got an error: osascript is not allowed assistive access. (-1719)",
+    status: 1,
+  });
+  const clock = fakeClock();
+  let execCalls = 0;
+  let script = "";
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: ((command: string, args: readonly string[]) => {
+      execCalls += 1;
+      script = String(args[1]);
+      throw assistiveDenied;
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 60_000,
+  });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.kind, "automation_permission_denied");
+  assert.match(result.permissionGuidance ?? "", /Accessibility/);
+  // The menu-count probe must sit outside every try block so an assistive
+  // access denial fails the script with its real error text.
+  assert.match(script, /set menuItemCount to count of menu items of appMenu/);
+  // Permission denials never improve by waiting; no retries.
+  assert.equal(execCalls, 1);
+  assert.equal(clock.sleeps.length, 0);
+});
+
+test("native-update handoff records why the menu snapshot was unavailable", { skip: process.platform !== "darwin" }, async () => {
+  const missing = Object.assign(new Error("osascript failed"), {
+    stderr: "execution error: TWEAKERS_MENU_NOT_FOUND (1708)",
+    status: 1,
+  });
+  const snapshotDenied = Object.assign(new Error("snapshot exec failed"), {
+    stderr: "execution error: System Events got an error: osascript is not allowed assistive access. (-1719)",
+    status: 1,
+  });
+  const clock = fakeClock();
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: ((command: string, args: readonly string[]) => {
+      if (String(args[1]).includes("click updateItem")) throw missing;
+      throw snapshotDenied;
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 1,
+  });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.kind, "menu_item_not_found");
+  assert.match(result.message, /Observed app menu items: unavailable \(snapshot exec failed/);
 });
 
 test("native-update handoff reports a missing updater menu instead of swallowing it", { skip: process.platform !== "darwin" }, async () => {

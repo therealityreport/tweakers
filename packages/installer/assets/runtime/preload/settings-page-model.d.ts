@@ -29,4 +29,18 @@ export interface SettingsNavigationItem {
     lifecycle: SettingsNavigationLifecycle;
     warning: string | null;
 }
+export interface SettingsSidebarEvidence {
+    width: number;
+    height: number;
+    left: number;
+    viewportWidth: number;
+    forbiddenSurface: boolean;
+    nativePanelSlugCount: number;
+    coreLabelCount: number;
+    totalLabelCount: number;
+    mainAppLabelCount: number;
+    settingsOnlyLabelCount: number;
+}
+export declare function hasNativeSettingsSidebarOwnership(evidence: Pick<SettingsSidebarEvidence, "forbiddenSurface" | "nativePanelSlugCount">): boolean;
+export declare function isNativeSettingsSidebarEvidence(evidence: SettingsSidebarEvidence): boolean;
 export declare function buildSettingsNavigationModel(tweaks: SettingsNavigationTweak[], registrations: SettingsPageRegistrationSummary[]): SettingsNavigationItem[];

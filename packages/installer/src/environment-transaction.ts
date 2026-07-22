@@ -359,6 +359,11 @@ export interface EnvironmentCoordinatorDeps {
     requested: EnvironmentSelection;
     oldMainPid: number | null;
   }) => PreparedEnvironmentEvidence | Promise<PreparedEnvironmentEvidence>;
+  stagePreparedEnvironment?: (input: {
+    direction: "requested" | "rollback";
+    receipt: EnvironmentTransactionReceipt;
+    prepared: PreparedEnvironmentEvidence;
+  }) => void | Promise<void>;
   applyPreparedEnvironment?: (input: {
     direction: "requested" | "rollback";
     receipt: EnvironmentTransactionReceipt;
@@ -2798,6 +2803,34 @@ function proveAppliedRuntimeArtifact(
   return { ok: true, artifactDigest };
 }
 
+function stagePreparedEnvironment(
+  input: { direction: "requested" | "rollback"; receipt: EnvironmentTransactionReceipt; prepared: PreparedEnvironmentEvidence },
+  _options: DefaultEnvironmentAdapterOptions,
+  deps: ResolvedDefaultEnvironmentAdapterDeps,
+): void {
+  const requestedDirection = input.direction === "requested";
+  const selection = requestedDirection ? input.receipt.requested : input.prepared.rollback.selection;
+  const artifactPath = requestedDirection
+    ? input.prepared.candidate.artifactPath
+    : input.prepared.rollback.desktopArtifactPath;
+  const expectedDigest = requestedDirection
+    ? input.prepared.candidate.artifactDigest
+    : input.prepared.rollback.desktopArtifactDigest;
+  if (!existsSync(artifactPath) || deps.appFingerprint(artifactPath) !== expectedDigest) {
+    throw new Error(`Prepared ${input.direction} desktop artifact is missing or changed`);
+  }
+  const backendArtifact = requestedDirection
+    ? input.prepared.backend.artifactPath
+    : input.prepared.rollback.backendArtifactPath;
+  const backendDigest = requestedDirection
+    ? input.prepared.backend.artifactDigest
+    : input.prepared.rollback.backendArtifactDigest;
+  if (!existsSync(backendArtifact) || deps.fileFingerprint(backendArtifact) !== backendDigest) {
+    throw new Error(`Prepared ${input.direction} backend artifact is missing or changed`);
+  }
+  deps.stageAppReplacement(artifactPath, selection.selectedDesktopPath);
+}
+
 function proveAppliedEnvironment(
   input: {
     direction: "requested" | "rollback";
@@ -2849,7 +2882,6 @@ function proveAppliedEnvironment(
     || identity.version !== desktopVersion
     || identity.build !== desktopBuild
     || observedAppExperience(expected.selectedDesktopPath, deps) !== expected.appExperience
-    || deps.appFingerprint(expected.selectedDesktopPath) !== desktopDigest
     || state?.appExperience !== expected.appExperience
     || state.appRoot !== expected.selectedDesktopPath
     || state.bundleId !== expected.selectedDesktopBundleId
@@ -2886,7 +2918,11 @@ function proveAppliedEnvironment(
       input.prepared.managedRuntime?.targetPath,
       input.receipt.createdAt,
     ))
-    || !deps.proveMcpMode(expected.appExperience)) {
+    || !deps.proveMcpMode(expected.appExperience)
+    // Full artifact hashes are intentionally last. Missing/stale live proof is
+    // polled cheaply instead of re-reading a multi-gigabyte app on every tick.
+    || deps.appFingerprint(expected.selectedDesktopPath) !== desktopDigest
+    || deps.fileFingerprint(backendPath) !== backendDigest) {
     return null;
   }
   const observedAt = deps.now();
@@ -3607,6 +3643,11 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     let sourceObservedAfterStopFailure = false;
     const reopenFailures: string[] = [];
     try {
+      await this.deps.stagePreparedEnvironment({
+        direction: "requested",
+        receipt,
+        prepared,
+      });
       if (receipt.oldMainPid === null) {
         // The app was closed at preparation. Re-observe immediately before
         // cutover: if it appeared, bind only a process that proves the exact

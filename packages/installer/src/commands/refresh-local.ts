@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { ensureUserPaths } from "../paths.js";
+import { ensureModeCoordinatorConfigured } from "../switcher-setup.js";
 import { readConfigFile, updateConfigFile } from "../config.js";
 import { findSourceRoot } from "../source-root.js";
 import { installManagedRuntime, managedCliPath, managedSourceRoot, writeDevelopmentProvenanceHash } from "../managed-runtime.js";
@@ -144,6 +145,7 @@ export async function refreshLocal(opts: { source?: "smart" | "development" | "s
           const managed = installManagedRuntime(sourceRoot, paths.root);
           writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
         }
+        await restoreModeCoordinatorMetadata();
       },
       reopen: () => openCodex(appRoot, { detached: true, delayMs: 750 }),
     });
@@ -238,7 +240,37 @@ function runChecked(command: string, args: string[], cwd: string, env: NodeJS.Pr
   }
 }
 
-function npmCommand(): string { return process.platform === "win32" ? "npm.cmd" : "npm"; }
+/**
+ * launchd-spawned refreshes run with a minimal PATH that lacks version-manager
+ * bin dirs (nvm/asdf/volta), but they invoke the CLI with an absolute node
+ * path — npm sits next to that running node binary, so prefer the sibling
+ * before falling back to the bare PATH lookup.
+ */
+export function npmCommand(platform = process.platform, execPath = process.execPath): string {
+  const name = platform === "win32" ? "npm.cmd" : "npm";
+  const sibling = join(dirname(execPath), name);
+  return existsSync(sibling) ? sibling : name;
+}
+
+/**
+ * A promoted live root must keep the Menu Bar restart coordinator usable:
+ * coordinator.json / switcher.json can be missing from the live root after a
+ * repair, and without them the Menu Bar Tweakers pane reports "Tweakers
+ * Unavailable" and blocks the mode/reload controls. Never fail the refresh
+ * for this — warn instead.
+ */
+export async function restoreModeCoordinatorMetadata(
+  ensure: typeof ensureModeCoordinatorConfigured = ensureModeCoordinatorConfigured,
+): Promise<void> {
+  try {
+    const coordinator = await ensure();
+    if (!coordinator.configured) {
+      console.warn(`Restart coordinator metadata was not restored: ${coordinator.reason ?? "unknown reason"}`);
+    }
+  } catch (error) {
+    console.warn(`Restart coordinator metadata was not restored: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 interface RefreshHandoffAdapters {
   platform: NodeJS.Platform;

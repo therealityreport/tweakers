@@ -86,6 +86,12 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - For [@Chrome](plugin://chrome@openai-bundled), use the friendly Chrome profile `codex` for this project.
 - Require exactly one extension backend whose `metadata.profileName` is `codex`; stop on zero or multiple matches instead of falling back to another profile.
 
+## Portless browser host
+
+- Use `https://tweakers.localhost/` as the only operator- and browser-facing URL for experimental browser host mode. The app-owned backend remains internal on `127.0.0.1:8765`.
+- Start the source checkout with `npm run browser -- --port 8765`. This command may restart Codex, so follow the no-mid-plan-restarts rule and obtain explicit user confirmation before running it.
+- Never open the raw loopback URL in browser automation and never use `portless alias --force`; a conflicting route must fail before Codex is interrupted.
+
 ## Completion
 
 - Report the selected feature route, files/behavior changed, focused and full

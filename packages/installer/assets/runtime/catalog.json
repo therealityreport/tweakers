@@ -193,7 +193,7 @@
       "manifest": {
         "id": "co.tweakers.thread-summary-profiles",
         "name": "Thread Summary Profiles",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "githubRepo": "therealityreport/tweakers",
         "description": "Show read-only connection profiles for the active thread project.",
         "author": "hulibrands",

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { getLocalRefreshStatus, handoffRefreshLocalToLaunchd, hashTree, refreshCliPath, registerDevelopmentCheckout, runRefreshWorkflow } from "../src/commands/refresh-local";
+import { getLocalRefreshStatus, handoffRefreshLocalToLaunchd, hashTree, npmCommand, refreshCliPath, registerDevelopmentCheckout, restoreModeCoordinatorMetadata, runRefreshWorkflow } from "../src/commands/refresh-local";
 import { managedSourceRoot, writeDevelopmentProvenanceHash } from "../src/managed-runtime";
+import { modeCoordinatorConfigFile, modeCoordinatorStatus } from "../src/switcher-setup";
 
 test("smart refresh selects a changed registered development checkout", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-"));
@@ -184,6 +185,65 @@ test("refresh launchd shell cleans its label and preserves a non-zero refresh ex
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("npm resolves next to the running node binary before falling back to PATH", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-npm-"));
+  try {
+    const bin = join(root, "bin");
+    mkdirSync(bin, { recursive: true });
+    const execPath = join(bin, "node");
+    // launchd jobs carry a minimal PATH without nvm/asdf/volta, but they spawn
+    // the CLI with an absolute node path whose directory also holds npm.
+    writeFileSync(join(bin, "npm"), "#!/bin/sh\n");
+    assert.equal(npmCommand("darwin", execPath), join(bin, "npm"));
+    // win32 layouts ship npm.cmd next to node.exe.
+    writeFileSync(join(bin, "npm.cmd"), "@echo off\n");
+    assert.equal(npmCommand("win32", execPath), join(bin, "npm.cmd"));
+    // No sibling npm: keep the bare PATH lookup (current behavior).
+    assert.equal(npmCommand("darwin", join(root, "elsewhere", "node")), "npm");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("refresh promote restores restart-coordinator metadata in the live root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-coordinator-"));
+  const previous = process.env.TWEAKERS_HOME;
+  process.env.TWEAKERS_HOME = root;
+  try {
+    assert.equal(modeCoordinatorStatus(root).configured, false);
+    await restoreModeCoordinatorMetadata();
+    assert.equal(existsSync(modeCoordinatorConfigFile(root)), true);
+    assert.deepEqual(modeCoordinatorStatus(root), { configured: true, source: "coordinator" });
+  } finally {
+    if (previous === undefined) delete process.env.TWEAKERS_HOME;
+    else process.env.TWEAKERS_HOME = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("both promote branches restore coordinator metadata after the runtime install", () => {
+  const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
+  assert.match(source, new RegExp([
+    /promote: async \(\) => \{/.source,
+    /[\s\S]*?installManagedRuntime\(preparedStableSource, paths\.root\);/.source,
+    /[\s\S]*?writeDevelopmentProvenanceHash\(managed, hashTree\(sourceRoot, false\)\);/.source,
+    /\s*\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
+  ].join("")));
+});
+
+test("coordinator metadata restore never fails the refresh", async () => {
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await restoreModeCoordinatorMetadata(async () => ({ configured: false, reason: "disk full" }));
+    await restoreModeCoordinatorMetadata(async () => { throw new Error("boom"); });
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0] ?? "", /disk full/);
+  assert.match(warnings[1] ?? "", /boom/);
 });
 
 test("refresh validates before quitting and always reopens after promotion starts", async () => {

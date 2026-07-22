@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   appendDesktopUpdateLog,
+  appendLifecycleAuditRecord,
   DESKTOP_UPDATE_LOG_SCHEMA_VERSION,
 } from "../src/desktop-update-log";
 
@@ -93,6 +94,44 @@ test("desktop update log rotation retains a bounded tail and a complete newest e
       ownerGeneration: null,
       event: "owner_completed",
     });
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle audit records persist approvals outside a live transaction and never throw", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-desktop-update-log-"));
+  const logPath = join(fixture, "log", "desktop-update.log");
+
+  try {
+    appendLifecycleAuditRecord(logPath, {
+      event: "user_approval",
+      action: "mode-switch:tweakers",
+      detail: "Mode switch to tweakers approved via confirmation dialog",
+    }, { now: () => NOW, homeDir: fixture });
+
+    const record = JSON.parse(readFileSync(logPath, "utf8").trimEnd());
+    assert.equal(record.event, "user_approval");
+    assert.equal(record.phase, "none");
+    assert.equal(record.transactionId, "mode-switch:tweakers");
+    assert.equal(record.detail, "Mode switch to tweakers approved via confirmation dialog");
+
+    appendLifecycleAuditRecord(logPath, {
+      event: "manual_recovery",
+      action: "manual-finalize",
+      transactionId: "env-1",
+      detail: "Environment receipt finalized manually",
+    }, { now: () => NOW, homeDir: fixture });
+    const lines = readFileSync(logPath, "utf8").trimEnd().split("\n");
+    assert.equal(JSON.parse(lines.at(-1)!).event, "manual_recovery");
+    assert.equal(JSON.parse(lines.at(-1)!).transactionId, "env-1");
+
+    // A denied log path must not fail the action being audited.
+    assert.doesNotThrow(() => appendLifecycleAuditRecord("/dev/null/impossible/audit.log", {
+      event: "user_approval",
+      action: "mode-switch:chatgpt",
+      detail: "unwritable log path",
+    }));
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
