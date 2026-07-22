@@ -154,25 +154,18 @@ function schedulePromotionRendererProof(nonce: string): void {
     fileLog("promotion renderer mount proof sent", { rendererStorageSelfTest });
   };
 
-  queueMicrotask(() => {
-    const observationRoot = document.documentElement;
-    if (!observationRoot) {
-      fileLog("promotion renderer mount proof incomplete", { reason: "document root unavailable" });
-      return;
-    }
-    observer = new MutationObserver(inspect);
-    observer.observe(observationRoot, { childList: true, subtree: true });
-    timeout = window.setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      fileLog("promotion renderer mount proof incomplete", {
-        reason: "startup loader was not replaced by renderer content",
-        timeoutMs: PROMOTION_RENDERER_MOUNT_TIMEOUT_MS,
-      });
-    }, PROMOTION_RENDERER_MOUNT_TIMEOUT_MS);
-    inspect();
-  });
+  observer = new MutationObserver(inspect);
+  observer.observe(document, { childList: true, subtree: true });
+  timeout = window.setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    fileLog("promotion renderer mount proof incomplete", {
+      reason: "startup loader was not replaced by renderer content",
+      timeoutMs: PROMOTION_RENDERER_MOUNT_TIMEOUT_MS,
+    });
+  }, PROMOTION_RENDERER_MOUNT_TIMEOUT_MS);
+  inspect();
 }
 
 function promotionRendererStorageSelfTest(nonce: string): "pass" | "fail" {

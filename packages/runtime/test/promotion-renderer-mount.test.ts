@@ -56,6 +56,11 @@ test("promotion renderer mount proves startup loader replacement with real conte
   const tracker = createPromotionRendererMountTracker();
 
   assert.equal(tracker.observe({
+    rootPresent: false,
+    startupLoaderPresent: false,
+    elementChildCount: 0,
+  }), "waiting");
+  assert.equal(tracker.observe({
     rootPresent: true,
     startupLoaderPresent: true,
     elementChildCount: 1,
