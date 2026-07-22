@@ -55,6 +55,7 @@ import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
 import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import { fingerprintPromotionPolicyPath } from "../promotion-policy.js";
 import {
   fingerprintPath,
   inspectUserQuestionsSource,
@@ -1499,6 +1500,13 @@ export function buildPromotionHealthExpectation(input: {
   const before = "appHash" in input.before ? fingerprintPromotionSurfaces(input.before) : input.before;
   const after = "appHash" in input.after ? fingerprintPromotionSurfaces(input.after) : input.after;
   if (after.app !== input.app.hash) throw new Error("Promotion app surface does not match the app fingerprint");
+  if (
+    !/^[a-f0-9]{64}$/.test(before.policy)
+    || !/^[a-f0-9]{64}$/.test(after.policy)
+    || before.policy !== after.policy
+  ) {
+    throw new Error("Promotion policy surface must remain present and semantically unchanged");
+  }
   const userQuestions = inspectUserQuestionsSource(input.userQuestionsRoot);
   return {
     schemaVersion: 2,
@@ -1532,7 +1540,7 @@ function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSu
     codexConfig: fingerprintPromotionPath(roots.codexConfigPath),
     namespaceData: fingerprintPromotionPath(roots.namespaceDataPath),
     mainStorage: fingerprintPromotionPath(roots.mainStoragePath),
-    policy: fingerprintPromotionPath(roots.policyPath),
+    policy: fingerprintPromotionPolicyPath(roots.policyPath),
   };
 }
 

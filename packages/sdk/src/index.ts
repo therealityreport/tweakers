@@ -6,6 +6,8 @@
  * `stop()` when the tweak is disabled or the app is shutting down.
  */
 
+export * from "./promotion-policy.js";
+
 export interface TweakManifest {
   /** Reverse-DNS-ish unique id, e.g. "com.you.my-tweak". */
   id: string;

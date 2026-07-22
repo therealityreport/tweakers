@@ -219,6 +219,14 @@ test("promotion health binds the pending managed snapshot, not the old live User
     mkdirSync(runtimeRoot, { recursive: true });
     mkdirSync(codexHome, { recursive: true });
     writeFileSync(join(runtimeRoot, "main.js"), "// candidate runtime\n");
+    writeFileSync(join(codexHome, ".codex-global-state.json"), `${JSON.stringify({
+      "electron-openai-mcp-form-elicitations-enabled": false,
+      "electron-persisted-atom-state": {
+        "agent-mode-by-host-id": { local: "custom" },
+        "heartbeat-thread-permissions-by-id": {},
+      },
+    })}\n`, { mode: 0o600 });
+    chmodSync(join(codexHome, ".codex-global-state.json"), 0o600);
 
     const oldUserQuestions = writeUserQuestions(liveTweaks, "0.4.10", "old-live");
     const oldPayloadHash = fingerprintPath(oldUserQuestions).hash;

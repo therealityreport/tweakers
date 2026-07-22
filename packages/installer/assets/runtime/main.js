@@ -1756,10 +1756,10 @@ var require_chokidar = __commonJS({
 
 // src/main.ts
 var import_electron4 = require("electron");
-var import_node_fs22 = require("node:fs");
+var import_node_fs23 = require("node:fs");
 var originalFs = __toESM(require("original-fs"));
 var import_node_child_process4 = require("node:child_process");
-var import_node_crypto10 = require("node:crypto");
+var import_node_crypto11 = require("node:crypto");
 var import_node_path26 = require("node:path");
 var import_node_os3 = require("node:os");
 var import_node_stream3 = require("node:stream");
@@ -6543,14 +6543,253 @@ function hashRawAsarHeader(archivePath, fileSystem = nodeFs) {
   }
 }
 
-// src/mcp-reconciliation.ts
+// src/promotion-policy.ts
 var import_node_crypto3 = require("node:crypto");
-var import_node_fs10 = require("node:fs");
+var import_node_fs9 = require("node:fs");
+var PROMOTION_POLICY_FILE_MAX_BYTES = 10 * 1024 * 1024;
+var PROMOTION_POLICY_CANONICAL_MAX_CHARS = 12 * 1024 * 1024;
+var PROMOTION_POLICY_MAX_DEPTH = 128;
+var PROMOTION_POLICY_MAX_NODES = 25e4;
+var PROMOTION_POLICY_HASH_DOMAIN = "tweakers-promotion-policy-v1\0";
+var PERSISTED_ATOMS_KEY = "electron-persisted-atom-state";
+var AGENT_MODES_KEY = "agent-mode-by-host-id";
+var THREAD_PERMISSIONS_KEY = "heartbeat-thread-permissions-by-id";
+var MCP_FORM_KEY = "electron-openai-mcp-form-elicitations-enabled";
+function fingerprintPromotionPolicyPath(path) {
+  const fd = (0, import_node_fs9.openSync)(path, import_node_fs9.constants.O_RDONLY | import_node_fs9.constants.O_NOFOLLOW);
+  try {
+    const before = (0, import_node_fs9.fstatSync)(fd);
+    const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (!before.isFile() || before.size <= 0 || before.size > PROMOTION_POLICY_FILE_MAX_BYTES || (before.mode & 511) !== 384 || currentUid !== null && before.uid !== currentUid) {
+      throw new Error("Promotion policy state must be an owner-only bounded regular file");
+    }
+    const bytes = (0, import_node_fs9.readFileSync)(fd);
+    const after = (0, import_node_fs9.fstatSync)(fd);
+    if (bytes.byteLength !== before.size || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new Error("Promotion policy state changed while being read");
+    }
+    let raw;
+    try {
+      raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error("Promotion policy state must be valid UTF-8");
+    }
+    const canonical = canonicalPromotionPolicyText(raw);
+    return (0, import_node_crypto3.createHash)("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
+  } finally {
+    (0, import_node_fs9.closeSync)(fd);
+  }
+}
+function canonicalPromotionPolicyText(raw) {
+  if (raw.length === 0 || raw.length > PROMOTION_POLICY_FILE_MAX_BYTES) {
+    throw new Error("Promotion policy state must be non-empty and bounded");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Promotion policy state must be valid JSON");
+  }
+  assertNoDuplicateJsonKeys(raw);
+  const root = requireRecord(parsed, "Promotion policy state root");
+  const atomsSlot = policySlot(root, PERSISTED_ATOMS_KEY);
+  const atoms = atomsSlot.present ? requireRecord(atomsSlot.value, "Promotion persisted atom state") : null;
+  const modesSlot = atoms === null ? { present: false } : policyRecordSlot(atoms, AGENT_MODES_KEY, "Promotion agent-mode state");
+  const localAgentMode = !modesSlot.present ? { present: false } : policySlot(modesSlot.value, "local");
+  validatePolicySlot(localAgentMode, "Promotion local agent mode", isString);
+  const threadPermissions = atoms === null ? { present: false } : projectThreadPermissions(atoms);
+  const mcpFormElicitationsEnabled = policySlot(root, MCP_FORM_KEY);
+  validatePolicySlot(mcpFormElicitationsEnabled, "Promotion MCP-form control", isBoolean);
+  const projection = {
+    schemaVersion: 1,
+    mcpFormElicitationsEnabled,
+    persistedAtoms: {
+      present: atomsSlot.present,
+      agentModes: {
+        present: modesSlot.present,
+        local: localAgentMode
+      },
+      threadPermissions
+    }
+  };
+  const canonical = canonicalJson(projection, 0, { nodes: 0 });
+  if (canonical.length > PROMOTION_POLICY_CANONICAL_MAX_CHARS) {
+    throw new Error("Promotion policy projection is oversized");
+  }
+  return canonical;
+}
+function projectThreadPermissions(atoms) {
+  const slot = policyRecordSlot(atoms, THREAD_PERMISSIONS_KEY, "Promotion thread-permission state");
+  if (!slot.present) return slot;
+  const projected = [];
+  for (const threadId of Object.keys(slot.value).sort()) {
+    const record2 = requireRecord(slot.value[threadId], "Promotion thread-permission record");
+    const activePermissionProfile = policySlot(record2, "activePermissionProfile");
+    const approvalPolicy = policySlot(record2, "approvalPolicy");
+    const sandboxPolicy = policySlot(record2, "sandboxPolicy");
+    const approvalsReviewer = policySlot(record2, "approvalsReviewer");
+    const runtimeWorkspaceRoots = policySlot(record2, "runtimeWorkspaceRoots");
+    validatePolicySlot(activePermissionProfile, "Promotion active permission profile", isNullOrRecord);
+    validatePolicySlot(approvalPolicy, "Promotion approval policy", isStringOrRecord);
+    validatePolicySlot(sandboxPolicy, "Promotion sandbox policy", isRecord);
+    validatePolicySlot(approvalsReviewer, "Promotion approvals reviewer", isString);
+    validatePolicySlot(runtimeWorkspaceRoots, "Promotion runtime workspace roots", isStringArray);
+    projected.push([threadId, {
+      activePermissionProfile,
+      approvalPolicy,
+      sandboxPolicy,
+      approvalsReviewer,
+      runtimeWorkspaceRoots
+    }]);
+  }
+  return { present: true, value: projected };
+}
+function validatePolicySlot(slot, label, predicate) {
+  if (slot.present && !predicate(slot.value)) throw new Error(`${label} has an invalid value type`);
+}
+function isString(value) {
+  return typeof value === "string";
+}
+function isBoolean(value) {
+  return typeof value === "boolean";
+}
+function isRecord(value) {
+  return isPlainRecord(value);
+}
+function isNullOrRecord(value) {
+  return value === null || isPlainRecord(value);
+}
+function isStringOrRecord(value) {
+  return typeof value === "string" || isPlainRecord(value);
+}
+function isStringArray(value) {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+function policyRecordSlot(value, key, label) {
+  const slot = policySlot(value, key);
+  if (!slot.present) return slot;
+  return { present: true, value: requireRecord(slot.value, label) };
+}
+function policySlot(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key) ? { present: true, value: value[key] } : { present: false };
+}
+function requireRecord(value, label) {
+  if (!isPlainRecord(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value;
+}
+function isPlainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+function assertNoDuplicateJsonKeys(raw) {
+  let offset = 0;
+  let nodes = 0;
+  const skipWhitespace = () => {
+    while (offset < raw.length && /\s/.test(raw[offset])) offset += 1;
+  };
+  const parseString = () => {
+    const start = offset;
+    offset += 1;
+    while (offset < raw.length) {
+      const character = raw[offset];
+      if (character === "\\") {
+        offset += 2;
+        continue;
+      }
+      offset += 1;
+      if (character === '"') return JSON.parse(raw.slice(start, offset));
+    }
+    throw new Error("Promotion policy state contains an unterminated string");
+  };
+  const parseValue = (depth) => {
+    nodes += 1;
+    if (nodes > PROMOTION_POLICY_MAX_NODES) throw new Error("Promotion policy state has too many values");
+    if (depth > PROMOTION_POLICY_MAX_DEPTH) throw new Error("Promotion policy state is too deeply nested");
+    skipWhitespace();
+    const character = raw[offset];
+    if (character === "{") {
+      offset += 1;
+      skipWhitespace();
+      const keys = /* @__PURE__ */ new Set();
+      if (raw[offset] === "}") {
+        offset += 1;
+        return;
+      }
+      while (offset < raw.length) {
+        if (raw[offset] !== '"') throw new Error("Promotion policy object key is invalid");
+        const key = parseString();
+        if (keys.has(key)) throw new Error("Promotion policy state contains a duplicate JSON key");
+        keys.add(key);
+        skipWhitespace();
+        if (raw[offset] !== ":") throw new Error("Promotion policy object separator is invalid");
+        offset += 1;
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (raw[offset] === "}") {
+          offset += 1;
+          return;
+        }
+        if (raw[offset] !== ",") throw new Error("Promotion policy object delimiter is invalid");
+        offset += 1;
+        skipWhitespace();
+      }
+      throw new Error("Promotion policy object is incomplete");
+    }
+    if (character === "[") {
+      offset += 1;
+      skipWhitespace();
+      if (raw[offset] === "]") {
+        offset += 1;
+        return;
+      }
+      while (offset < raw.length) {
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (raw[offset] === "]") {
+          offset += 1;
+          return;
+        }
+        if (raw[offset] !== ",") throw new Error("Promotion policy array delimiter is invalid");
+        offset += 1;
+      }
+      throw new Error("Promotion policy array is incomplete");
+    }
+    if (character === '"') {
+      parseString();
+      return;
+    }
+    while (offset < raw.length && !/[\s,}\]]/.test(raw[offset])) offset += 1;
+  };
+  parseValue(0);
+  skipWhitespace();
+  if (offset !== raw.length) throw new Error("Promotion policy state has trailing content");
+}
+function canonicalJson(value, depth, budget) {
+  budget.nodes += 1;
+  if (budget.nodes > PROMOTION_POLICY_MAX_NODES) throw new Error("Promotion policy state has too many values");
+  if (depth > PROMOTION_POLICY_MAX_DEPTH) throw new Error("Promotion policy state is too deeply nested");
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Promotion policy state contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry, depth + 1, budget)).join(",")}]`;
+  }
+  const record2 = requireRecord(value, "Promotion policy value");
+  const fields = Object.keys(record2).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record2[key], depth + 1, budget)}`);
+  return `{${fields.join(",")}}`;
+}
+
+// src/mcp-reconciliation.ts
+var import_node_crypto4 = require("node:crypto");
+var import_node_fs11 = require("node:fs");
 var import_node_path14 = require("node:path");
 var import_node_util = require("node:util");
 
 // src/mcp-sync.ts
-var import_node_fs9 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_node_path13 = require("node:path");
 var MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 var MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
@@ -7333,7 +7572,7 @@ function resolveCommand(tweakDir, command) {
 function resolveArg(tweakDir, arg) {
   if ((0, import_node_path13.isAbsolute)(arg) || arg.startsWith("-")) return arg;
   const candidate = (0, import_node_path13.resolve)(tweakDir, arg);
-  return (0, import_node_fs9.existsSync)(candidate) ? candidate : arg;
+  return (0, import_node_fs10.existsSync)(candidate) ? candidate : arg;
 }
 function looksLikeRelativePath(value) {
   return value.startsWith("./") || value.startsWith("../") || value.includes("/");
@@ -7404,7 +7643,7 @@ function resolveMcpRuntimePaths(options) {
   if (resolvedCandidateHome === resolvedOrdinaryHome || isStrictDescendant(resolvedOrdinaryHome, resolvedCandidateHome) || isStrictDescendant(resolvedCandidateHome, resolvedOrdinaryHome)) {
     throw new Error("Candidate CODEX_HOME must not resolve to or contain the real ~/.codex directory");
   }
-  if ((0, import_node_fs10.existsSync)(candidateCodexHome) && !(0, import_node_fs10.lstatSync)(candidateCodexHome).isDirectory()) {
+  if ((0, import_node_fs11.existsSync)(candidateCodexHome) && !(0, import_node_fs11.lstatSync)(candidateCodexHome).isDirectory()) {
     throw new Error("Candidate CODEX_HOME must be a directory when it already exists");
   }
   const configPath = (0, import_node_path14.join)(candidateCodexHome, "config.toml");
@@ -7425,10 +7664,10 @@ function assertExactAbsolutePath(path, label) {
   }
 }
 function assertExistingDirectoryWithoutSymlinks(path, label) {
-  if (!(0, import_node_fs10.existsSync)(path) || !(0, import_node_fs10.lstatSync)(path).isDirectory()) {
+  if (!(0, import_node_fs11.existsSync)(path) || !(0, import_node_fs11.lstatSync)(path).isDirectory()) {
     throw new Error(`${label} must already exist as a directory`);
   }
-  if ((0, import_node_fs10.lstatSync)(path).isSymbolicLink() || resolveThroughExistingAncestor(path) !== path) {
+  if ((0, import_node_fs11.lstatSync)(path).isSymbolicLink() || resolveThroughExistingAncestor(path) !== path) {
     throw new Error(`${label} must not contain symbolic-link components`);
   }
 }
@@ -7449,7 +7688,7 @@ function assertRegularFileWhenPresent(path, label) {
 }
 function lstatIfPresent(path) {
   try {
-    return (0, import_node_fs10.lstatSync)(path);
+    return (0, import_node_fs11.lstatSync)(path);
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -7458,13 +7697,13 @@ function lstatIfPresent(path) {
 function resolveThroughExistingAncestor(path) {
   let ancestor = path;
   const missing = [];
-  while (!(0, import_node_fs10.existsSync)(ancestor)) {
+  while (!(0, import_node_fs11.existsSync)(ancestor)) {
     const parent = (0, import_node_path14.dirname)(ancestor);
     if (parent === ancestor) break;
     missing.unshift((0, import_node_path14.basename)(ancestor));
     ancestor = parent;
   }
-  return (0, import_node_path14.resolve)((0, import_node_fs10.realpathSync)(ancestor), ...missing);
+  return (0, import_node_path14.resolve)((0, import_node_fs11.realpathSync)(ancestor), ...missing);
 }
 function isStrictDescendant(root, candidate) {
   const remainder = (0, import_node_path14.relative)(root, candidate);
@@ -7489,7 +7728,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
     durablePreservedApprovalPolicy
   );
   const now = dependencies.now ?? (() => /* @__PURE__ */ new Date());
-  const transactionId = dependencies.transactionId?.() ?? (0, import_node_crypto3.randomUUID)();
+  const transactionId = dependencies.transactionId?.() ?? (0, import_node_crypto4.randomUUID)();
   const startedAt = now().toISOString();
   let beforeBytes = readBytesIfExists(options.configPath);
   let beforeFingerprint = fingerprint(beforeBytes);
@@ -7528,7 +7767,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
               restartRequired: false
             });
           }
-          const mode = (0, import_node_fs10.existsSync)(options.configPath) ? (0, import_node_fs10.statSync)(options.configPath).mode & 511 : 384;
+          const mode = (0, import_node_fs11.existsSync)(options.configPath) ? (0, import_node_fs11.statSync)(options.configPath).mode & 511 : 384;
           const tempPath = writeDurableTemp(options.configPath, plan.nextToml, mode);
           try {
             dependencies.beforeCommit?.(attempt, options.configPath);
@@ -7591,7 +7830,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
             dependencies.afterCommit?.(options.configPath);
             break;
           } finally {
-            (0, import_node_fs10.rmSync)(tempPath, { force: true });
+            (0, import_node_fs11.rmSync)(tempPath, { force: true });
           }
         }
     }
@@ -7658,9 +7897,9 @@ function retiredBaselinePath(retiredPath) {
 function listRetiredConfigs(configPath) {
   const directory = (0, import_node_path14.dirname)(configPath);
   const prefix = retiredConfigPrefix(configPath);
-  if (!(0, import_node_fs10.existsSync)(directory)) return [];
+  if (!(0, import_node_fs11.existsSync)(directory)) return [];
   const retired = [];
-  for (const name of (0, import_node_fs10.readdirSync)(directory)) {
+  for (const name of (0, import_node_fs11.readdirSync)(directory)) {
     if (!name.startsWith(prefix)) continue;
     const remainder = name.slice(prefix.length);
     const separator = remainder.lastIndexOf(".");
@@ -7674,8 +7913,8 @@ function listRetiredConfigs(configPath) {
         path,
         id,
         expectedFingerprint,
-        currentFingerprint: fingerprint((0, import_node_fs10.readFileSync)(path)),
-        mtimeMs: (0, import_node_fs10.statSync)(path).mtimeMs
+        currentFingerprint: fingerprint((0, import_node_fs11.readFileSync)(path)),
+        mtimeMs: (0, import_node_fs11.statSync)(path).mtimeMs
       });
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -7685,8 +7924,8 @@ function listRetiredConfigs(configPath) {
 }
 function sameInode(left, right) {
   try {
-    const leftStat = (0, import_node_fs10.statSync)(left);
-    const rightStat = (0, import_node_fs10.statSync)(right);
+    const leftStat = (0, import_node_fs11.statSync)(left);
+    const rightStat = (0, import_node_fs11.statSync)(right);
     return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
   } catch (error) {
     if (error.code === "ENOENT") return false;
@@ -7698,24 +7937,24 @@ function retireCurrentConfig(configPath, expectedFingerprint) {
   if (existingLink) {
     const retiredPath2 = existingLink.expectedFingerprint === expectedFingerprint ? existingLink.path : markRetiredConfigObserved(configPath, existingLink);
     ensureRetiredBaseline(retiredPath2, expectedFingerprint);
-    (0, import_node_fs10.rmSync)(configPath, { force: true });
+    (0, import_node_fs11.rmSync)(configPath, { force: true });
     fsyncDirectory((0, import_node_path14.dirname)(configPath));
     return retiredPath2;
   }
-  const retiredPath = retiredConfigPath(configPath, (0, import_node_crypto3.randomUUID)(), expectedFingerprint);
-  const baseline = (0, import_node_fs10.readFileSync)(configPath);
+  const retiredPath = retiredConfigPath(configPath, (0, import_node_crypto4.randomUUID)(), expectedFingerprint);
+  const baseline = (0, import_node_fs11.readFileSync)(configPath);
   if (fingerprint(baseline) !== expectedFingerprint) {
     throw new Error("MCP config changed while its retained-inode baseline was captured");
   }
-  (0, import_node_fs10.renameSync)(configPath, retiredPath);
+  (0, import_node_fs11.renameSync)(configPath, retiredPath);
   writeRetiredBaseline(retiredPath, baseline);
   fsyncDirectory((0, import_node_path14.dirname)(configPath));
   return retiredPath;
 }
 function ensureRetiredBaseline(retiredPath, expectedFingerprint) {
   const baselinePath = retiredBaselinePath(retiredPath);
-  if ((0, import_node_fs10.existsSync)(baselinePath)) return;
-  const current = (0, import_node_fs10.readFileSync)(retiredPath);
+  if ((0, import_node_fs11.existsSync)(baselinePath)) return;
+  const current = (0, import_node_fs11.readFileSync)(retiredPath);
   if (fingerprint(current) !== expectedFingerprint) {
     throw new Error(
       `Cannot safely recover retained MCP config edit without its baseline: ${retiredPath}`
@@ -7727,20 +7966,20 @@ function writeRetiredBaseline(retiredPath, content) {
   const baselinePath = retiredBaselinePath(retiredPath);
   const tempPath = writeDurableTemp(baselinePath, content, 384);
   try {
-    (0, import_node_fs10.renameSync)(tempPath, baselinePath);
+    (0, import_node_fs11.renameSync)(tempPath, baselinePath);
     fsyncDirectory((0, import_node_path14.dirname)(baselinePath));
   } finally {
-    (0, import_node_fs10.rmSync)(tempPath, { force: true });
+    (0, import_node_fs11.rmSync)(tempPath, { force: true });
   }
 }
 function captureActiveConfig(configPath) {
   const activePath = casBackupPath(configPath);
-  (0, import_node_fs10.rmSync)(activePath, { force: true });
-  (0, import_node_fs10.linkSync)(configPath, activePath);
+  (0, import_node_fs11.rmSync)(activePath, { force: true });
+  (0, import_node_fs11.linkSync)(configPath, activePath);
   fsyncDirectory((0, import_node_path14.dirname)(configPath));
 }
 function releaseActiveConfig(configPath) {
-  (0, import_node_fs10.rmSync)(casBackupPath(configPath), { force: true });
+  (0, import_node_fs11.rmSync)(casBackupPath(configPath), { force: true });
   fsyncDirectory((0, import_node_path14.dirname)(configPath));
 }
 function markRetiredConfigObserved(configPath, retired) {
@@ -7748,29 +7987,29 @@ function markRetiredConfigObserved(configPath, retired) {
   const observedFingerprint = fingerprint(observed);
   const observedPath = retiredConfigPath(configPath, retired.id, observedFingerprint);
   const previousBaselinePath = retiredBaselinePath(retired.path);
-  if (observedPath !== retired.path) (0, import_node_fs10.renameSync)(retired.path, observedPath);
+  if (observedPath !== retired.path) (0, import_node_fs11.renameSync)(retired.path, observedPath);
   writeRetiredBaseline(observedPath, observed);
   if (previousBaselinePath !== retiredBaselinePath(observedPath)) {
-    (0, import_node_fs10.rmSync)(previousBaselinePath, { force: true });
+    (0, import_node_fs11.rmSync)(previousBaselinePath, { force: true });
   }
   return observedPath;
 }
 function recoverRetiredConfigEdits(configPath, tweaks, ownedTweaks, preservedOptions, preservedApprovalPolicy) {
   let retired = listRetiredConfigs(configPath);
-  if (!(0, import_node_fs10.existsSync)(configPath) && retired.length > 0) {
+  if (!(0, import_node_fs11.existsSync)(configPath) && retired.length > 0) {
     const latest = [...retired].sort(
       (left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path)
     )[0];
-    (0, import_node_fs10.linkSync)(latest.path, configPath);
+    (0, import_node_fs11.linkSync)(latest.path, configPath);
     fsyncDirectory((0, import_node_path14.dirname)(configPath));
   }
   retired = listRetiredConfigs(configPath);
   const changed = retired.filter((entry) => entry.currentFingerprint !== entry.expectedFingerprint).sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
   for (const entry of changed) {
-    if (!(0, import_node_fs10.existsSync)(entry.path)) continue;
+    if (!(0, import_node_fs11.existsSync)(entry.path)) continue;
     let mergedRetiredFingerprint;
     if (!sameInode(entry.path, configPath)) {
-      if ((0, import_node_fs10.existsSync)(configPath)) {
+      if ((0, import_node_fs11.existsSync)(configPath)) {
         mergedRetiredFingerprint = mergeRetiredConfigEdit(
           configPath,
           entry,
@@ -7780,7 +8019,7 @@ function recoverRetiredConfigEdits(configPath, tweaks, ownedTweaks, preservedOpt
           preservedApprovalPolicy
         );
       } else {
-        (0, import_node_fs10.linkSync)(entry.path, configPath);
+        (0, import_node_fs11.linkSync)(entry.path, configPath);
       }
     }
     if (mergedRetiredFingerprint && fingerprint(readBytesIfExists(entry.path)) !== mergedRetiredFingerprint) {
@@ -7793,7 +8032,7 @@ function recoverRetiredConfigEdits(configPath, tweaks, ownedTweaks, preservedOpt
 }
 function mergeRetiredConfigEdit(configPath, retired, tweaks, ownedTweaks, preservedOptions, preservedApprovalPolicy) {
   const baselinePath = retiredBaselinePath(retired.path);
-  if (!(0, import_node_fs10.existsSync)(baselinePath)) {
+  if (!(0, import_node_fs11.existsSync)(baselinePath)) {
     throw new Error(
       `Cannot safely merge retained MCP config edit without its baseline: ${retired.path}`
     );
@@ -7815,7 +8054,7 @@ function mergeRetiredConfigEdit(configPath, retired, tweaks, ownedTweaks, preser
       preservedOptions,
       preservedApprovalPolicy
     }).nextToml;
-    const mode = (0, import_node_fs10.statSync)(configPath).mode & 511;
+    const mode = (0, import_node_fs11.statSync)(configPath).mode & 511;
     const tempPath = writeDurableTemp(configPath, next, mode);
     try {
       if (promoteConfigWithCas(
@@ -7829,7 +8068,7 @@ function mergeRetiredConfigEdit(configPath, retired, tweaks, ownedTweaks, preser
         return fingerprint(retiredBytes);
       }
     } finally {
-      (0, import_node_fs10.rmSync)(tempPath, { force: true });
+      (0, import_node_fs11.rmSync)(tempPath, { force: true });
     }
     if (attempt === 2) {
       throw new Error(
@@ -7841,22 +8080,22 @@ function mergeRetiredConfigEdit(configPath, retired, tweaks, ownedTweaks, preser
 }
 function recoverInterruptedCas(configPath) {
   const backup = casBackupPath(configPath);
-  if (!(0, import_node_fs10.existsSync)(backup)) return;
-  if (!(0, import_node_fs10.existsSync)(configPath)) {
+  if (!(0, import_node_fs11.existsSync)(backup)) return;
+  if (!(0, import_node_fs11.existsSync)(configPath)) {
     try {
-      (0, import_node_fs10.linkSync)(backup, configPath);
+      (0, import_node_fs11.linkSync)(backup, configPath);
       fsyncDirectory((0, import_node_path14.dirname)(configPath));
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
     }
   }
-  (0, import_node_fs10.rmSync)(backup, { force: true });
+  (0, import_node_fs11.rmSync)(backup, { force: true });
 }
 function promoteConfigWithCas(configPath, tempPath, expectedFingerprint, afterCapture, beforeBackupRelease, afterFinalCheck) {
   let backup;
   let captured = false;
   try {
-    if ((0, import_node_fs10.existsSync)(configPath)) {
+    if ((0, import_node_fs11.existsSync)(configPath)) {
       captureActiveConfig(configPath);
       backup = retireCurrentConfig(configPath, expectedFingerprint);
       captured = true;
@@ -7869,7 +8108,7 @@ function promoteConfigWithCas(configPath, tempPath, expectedFingerprint, afterCa
       afterCapture();
     }
     try {
-      (0, import_node_fs10.linkSync)(tempPath, configPath);
+      (0, import_node_fs11.linkSync)(tempPath, configPath);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       releaseActiveConfig(configPath);
@@ -7889,10 +8128,10 @@ function promoteConfigWithCas(configPath, tempPath, expectedFingerprint, afterCa
     return true;
   } catch (error) {
     if (captured && backup) {
-      if ((0, import_node_fs10.existsSync)(configPath) && fingerprint(readBytesIfExists(configPath)) === fingerprint(readBytesIfExists(tempPath))) {
-        (0, import_node_fs10.rmSync)(configPath, { force: true });
+      if ((0, import_node_fs11.existsSync)(configPath) && fingerprint(readBytesIfExists(configPath)) === fingerprint(readBytesIfExists(tempPath))) {
+        (0, import_node_fs11.rmSync)(configPath, { force: true });
       }
-      if (!(0, import_node_fs10.existsSync)(configPath)) restoreCapturedConfig(backup, configPath);
+      if (!(0, import_node_fs11.existsSync)(configPath)) restoreCapturedConfig(backup, configPath);
     }
     releaseActiveConfig(configPath);
     throw error;
@@ -7901,7 +8140,7 @@ function promoteConfigWithCas(configPath, tempPath, expectedFingerprint, afterCa
 function restoreCapturedEditIfChanged(backup, configPath, tempPath, expectedFingerprint) {
   if (fingerprint(readBytesIfExists(backup)) === expectedFingerprint) return false;
   if (fingerprint(readBytesIfExists(configPath)) === fingerprint(readBytesIfExists(tempPath))) {
-    (0, import_node_fs10.rmSync)(configPath, { force: true });
+    (0, import_node_fs11.rmSync)(configPath, { force: true });
   }
   restoreCapturedConfig(backup, configPath);
   return true;
@@ -7909,13 +8148,13 @@ function restoreCapturedEditIfChanged(backup, configPath, tempPath, expectedFing
 function restoreCapturedConfig(backup, configPath) {
   let restored = false;
   try {
-    (0, import_node_fs10.linkSync)(backup, configPath);
+    (0, import_node_fs11.linkSync)(backup, configPath);
     restored = true;
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     restored = sameInode(backup, configPath);
   } finally {
-    if (restored) (0, import_node_fs10.rmSync)(backup, { force: true });
+    if (restored) (0, import_node_fs11.rmSync)(backup, { force: true });
     releaseActiveConfig(configPath);
     fsyncDirectory((0, import_node_path14.dirname)(configPath));
   }
@@ -8009,9 +8248,9 @@ function createMcpReconciler(options, dependencies = {}) {
   };
 }
 function readMcpSyncState(statePath) {
-  if (!(0, import_node_fs10.existsSync)(statePath)) return null;
+  if (!(0, import_node_fs11.existsSync)(statePath)) return null;
   try {
-    const parsed = JSON.parse((0, import_node_fs10.readFileSync)(statePath, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs11.readFileSync)(statePath, "utf8"));
     if (parsed?.schemaVersion !== 1 && parsed?.schemaVersion !== 2) return null;
     const rawOptions = parsed.preservedOptions;
     const optionNames = rawOptions && typeof rawOptions === "object" && !Array.isArray(rawOptions) ? Object.keys(rawOptions) : [];
@@ -8050,7 +8289,7 @@ function readPreservedOptions(statePath, ownedTweaks) {
   );
 }
 function fingerprint(value) {
-  return (0, import_node_crypto3.createHash)("sha256").update(value).digest("hex");
+  return (0, import_node_crypto4.createHash)("sha256").update(value).digest("hex");
 }
 function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
   const mcpPlan = planManagedMcpReconciliation(tweaks, currentToml, options);
@@ -8124,7 +8363,7 @@ function rootAwareGeneratedLineMatches(observedLine, expectedLine, expectedTweak
     const suffix = expectedValue.slice(expectedTweakDir.length);
     if (!observedValue.endsWith(suffix)) return false;
     const alternateDir = observedValue.slice(0, -suffix.length);
-    if (!(0, import_node_path14.isAbsolute)(alternateDir) || !(0, import_node_fs10.existsSync)(alternateDir) || !(0, import_node_fs10.existsSync)(expectedValue) || !(0, import_node_fs10.existsSync)(observedValue) || !exactFileContentsMatch(expectedValue, observedValue) || !acceptAlternateDir(alternateDir)) {
+    if (!(0, import_node_path14.isAbsolute)(alternateDir) || !(0, import_node_fs11.existsSync)(alternateDir) || !(0, import_node_fs11.existsSync)(expectedValue) || !(0, import_node_fs11.existsSync)(observedValue) || !exactFileContentsMatch(expectedValue, observedValue) || !acceptAlternateDir(alternateDir)) {
       return false;
     }
   }
@@ -8132,11 +8371,11 @@ function rootAwareGeneratedLineMatches(observedLine, expectedLine, expectedTweak
 }
 function alternateTweakMatches(expected, alternateDir) {
   try {
-    const expectedManifestBytes = (0, import_node_fs10.readFileSync)((0, import_node_path14.join)(expected.dir, "manifest.json"));
-    const alternateManifestBytes = (0, import_node_fs10.readFileSync)((0, import_node_path14.join)(alternateDir, "manifest.json"));
+    const expectedManifestBytes = (0, import_node_fs11.readFileSync)((0, import_node_path14.join)(expected.dir, "manifest.json"));
+    const alternateManifestBytes = (0, import_node_fs11.readFileSync)((0, import_node_path14.join)(alternateDir, "manifest.json"));
     if (!expectedManifestBytes.equals(alternateManifestBytes)) return false;
     const manifest = JSON.parse(alternateManifestBytes.toString("utf8"));
-    if (!isRecord(manifest) || manifest.id !== expected.manifest.id) return false;
+    if (!isRecord2(manifest) || manifest.id !== expected.manifest.id) return false;
     const expectedMcp = normalizeManifestMcp(expected.manifest.mcp);
     const alternateMcp = normalizeManifestMcp(manifest.mcp);
     return expectedMcp !== null && alternateMcp !== null && expectedMcp.command === alternateMcp.command && stringArraysEqual(expectedMcp.args, alternateMcp.args) && stringRecordsEqual(expectedMcp.env, alternateMcp.env);
@@ -8146,19 +8385,19 @@ function alternateTweakMatches(expected, alternateDir) {
 }
 function exactFileContentsMatch(expectedPath, observedPath) {
   try {
-    const expectedStat = (0, import_node_fs10.statSync)(expectedPath);
-    const observedStat = (0, import_node_fs10.statSync)(observedPath);
-    return expectedStat.isFile() && observedStat.isFile() && expectedStat.size === observedStat.size && (0, import_node_fs10.readFileSync)(expectedPath).equals((0, import_node_fs10.readFileSync)(observedPath));
+    const expectedStat = (0, import_node_fs11.statSync)(expectedPath);
+    const observedStat = (0, import_node_fs11.statSync)(observedPath);
+    return expectedStat.isFile() && observedStat.isFile() && expectedStat.size === observedStat.size && (0, import_node_fs11.readFileSync)(expectedPath).equals((0, import_node_fs11.readFileSync)(observedPath));
   } catch {
     return false;
   }
 }
 function normalizeManifestMcp(value) {
-  if (!isRecord(value) || typeof value.command !== "string" || value.command.length === 0) return null;
+  if (!isRecord2(value) || typeof value.command !== "string" || value.command.length === 0) return null;
   if (value.args !== void 0 && (!Array.isArray(value.args) || value.args.some((arg) => typeof arg !== "string"))) {
     return null;
   }
-  if (value.env !== void 0 && (!isRecord(value.env) || Object.values(value.env).some((envValue) => typeof envValue !== "string"))) {
+  if (value.env !== void 0 && (!isRecord2(value.env) || Object.values(value.env).some((envValue) => typeof envValue !== "string"))) {
     return null;
   }
   return {
@@ -8167,7 +8406,7 @@ function normalizeManifestMcp(value) {
     env: value.env === void 0 ? {} : value.env
   };
 }
-function isRecord(value) {
+function isRecord2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function stringArraysEqual(left, right) {
@@ -8417,7 +8656,7 @@ function hasPlanConflict(plan) {
   return plan.conflicts.length > 0 || plan.approvalPolicy.status === "conflict";
 }
 function readBytesIfExists(path) {
-  return (0, import_node_fs10.existsSync)(path) ? (0, import_node_fs10.readFileSync)(path) : Buffer.alloc(0);
+  return (0, import_node_fs11.existsSync)(path) ? (0, import_node_fs11.readFileSync)(path) : Buffer.alloc(0);
 }
 function decodeToml(value) {
   try {
@@ -8431,36 +8670,36 @@ function writeReceipt(statePath, receipt) {
 `;
   const tempPath = writeDurableTemp(statePath, content, 384);
   try {
-    (0, import_node_fs10.renameSync)(tempPath, statePath);
+    (0, import_node_fs11.renameSync)(tempPath, statePath);
     fsyncDirectory((0, import_node_path14.dirname)(statePath));
   } finally {
-    (0, import_node_fs10.rmSync)(tempPath, { force: true });
+    (0, import_node_fs11.rmSync)(tempPath, { force: true });
   }
 }
 function writeDurableTemp(destination, content, mode) {
   const directory = (0, import_node_path14.dirname)(destination);
-  (0, import_node_fs10.mkdirSync)(directory, { recursive: true });
-  const tempPath = (0, import_node_path14.join)(directory, `.${(0, import_node_path14.basename)(destination)}.${process.pid}.${(0, import_node_crypto3.randomUUID)()}.tmp`);
-  const descriptor = (0, import_node_fs10.openSync)(tempPath, "wx", mode);
+  (0, import_node_fs11.mkdirSync)(directory, { recursive: true });
+  const tempPath = (0, import_node_path14.join)(directory, `.${(0, import_node_path14.basename)(destination)}.${process.pid}.${(0, import_node_crypto4.randomUUID)()}.tmp`);
+  const descriptor = (0, import_node_fs11.openSync)(tempPath, "wx", mode);
   let completed = false;
   try {
-    (0, import_node_fs10.writeFileSync)(descriptor, content);
-    (0, import_node_fs10.fsyncSync)(descriptor);
+    (0, import_node_fs11.writeFileSync)(descriptor, content);
+    (0, import_node_fs11.fsyncSync)(descriptor);
     completed = true;
   } finally {
-    (0, import_node_fs10.closeSync)(descriptor);
-    if (!completed) (0, import_node_fs10.rmSync)(tempPath, { force: true });
+    (0, import_node_fs11.closeSync)(descriptor);
+    if (!completed) (0, import_node_fs11.rmSync)(tempPath, { force: true });
   }
   return tempPath;
 }
 function fsyncDirectory(directory) {
   let descriptor;
   try {
-    descriptor = (0, import_node_fs10.openSync)(directory, "r");
-    (0, import_node_fs10.fsyncSync)(descriptor);
+    descriptor = (0, import_node_fs11.openSync)(directory, "r");
+    (0, import_node_fs11.fsyncSync)(descriptor);
   } catch {
   } finally {
-    if (descriptor !== void 0) (0, import_node_fs10.closeSync)(descriptor);
+    if (descriptor !== void 0) (0, import_node_fs11.closeSync)(descriptor);
   }
 }
 function defaultConfigWatcher(configPath, onChange) {
@@ -8491,8 +8730,8 @@ function defaultConfigWatcher(configPath, onChange) {
 
 // src/watcher-health.ts
 var import_node_child_process = require("node:child_process");
-var import_node_crypto4 = require("node:crypto");
-var import_node_fs11 = require("node:fs");
+var import_node_crypto5 = require("node:crypto");
+var import_node_fs12 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_path15 = require("node:path");
 var LEGACY_CONFIG_KEY = ["codex", "Plus", "Plus"].join("");
@@ -8538,7 +8777,7 @@ function getWatcherHealth(userRoot2) {
   const appRoot = state.appRoot ?? "";
   checks.push({
     name: "Codex app",
-    status: appRoot && (0, import_node_fs11.existsSync)(appRoot) ? "ok" : "error",
+    status: appRoot && (0, import_node_fs12.existsSync)(appRoot) ? "ok" : "error",
     detail: appRoot || "missing appRoot in state"
   });
   switch ((0, import_node_os.platform)()) {
@@ -8612,7 +8851,7 @@ function selfUpdateCheck(state) {
 }
 function checkLaunchdWatcher(appRoot) {
   const plistPath = (0, import_node_path15.join)((0, import_node_os.homedir)(), "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
-  const plist = (0, import_node_fs11.existsSync)(plistPath) ? readFileSafe(plistPath) : "";
+  const plist = (0, import_node_fs12.existsSync)(plistPath) ? readFileSafe(plistPath) : "";
   return analyzeLaunchdWatcherDefinition({
     appRoot,
     plist,
@@ -8645,7 +8884,7 @@ function analyzeLaunchdWatcherDefinition(input) {
     });
     const cliPath = extractFirst(plist, /'([^']*packages\/installer\/dist\/cli\.js)'/);
     if (cliPath) {
-      checks.push({ name: "repair CLI", status: (0, import_node_fs11.existsSync)(cliPath) ? "ok" : "error", detail: cliPath });
+      checks.push({ name: "repair CLI", status: (0, import_node_fs12.existsSync)(cliPath) ? "ok" : "error", detail: cliPath });
     }
   }
   const loadedStatus = !loaded.loaded ? "error" : loaded.running || loaded.lastExitCode === 0 ? "ok" : "warn";
@@ -8666,16 +8905,16 @@ function checkSystemdWatcher(appRoot) {
   const timer = (0, import_node_path15.join)(dir, "tweaker-watcher.timer");
   const pathUnit = (0, import_node_path15.join)(dir, "tweaker-watcher.path");
   const expectedPath = appRoot ? (0, import_node_path15.join)(appRoot, "resources", "app.asar") : "";
-  const pathBody = (0, import_node_fs11.existsSync)(pathUnit) ? readFileSafe(pathUnit) : "";
+  const pathBody = (0, import_node_fs12.existsSync)(pathUnit) ? readFileSafe(pathUnit) : "";
   return [
     {
       name: "systemd service",
-      status: (0, import_node_fs11.existsSync)(service) ? "ok" : "error",
+      status: (0, import_node_fs12.existsSync)(service) ? "ok" : "error",
       detail: service
     },
     {
       name: "systemd timer",
-      status: (0, import_node_fs11.existsSync)(timer) ? "ok" : "error",
+      status: (0, import_node_fs12.existsSync)(timer) ? "ok" : "error",
       detail: timer
     },
     {
@@ -8717,7 +8956,7 @@ function analyzeScheduledTaskWatcher(taskExists) {
   ];
 }
 function watcherLogCheck() {
-  const path = (0, import_node_fs11.existsSync)(WATCHER_LOG) ? WATCHER_LOG : (0, import_node_fs11.existsSync)(LEGACY_WATCHER_LOG) ? LEGACY_WATCHER_LOG : null;
+  const path = (0, import_node_fs12.existsSync)(WATCHER_LOG) ? WATCHER_LOG : (0, import_node_fs12.existsSync)(LEGACY_WATCHER_LOG) ? LEGACY_WATCHER_LOG : null;
   if (!path) {
     return { name: "watcher log", status: "warn", detail: "no watcher log yet" };
   }
@@ -8850,10 +9089,10 @@ function readRuntimeFingerprint(root) {
   }
 }
 function computeRuntimeFingerprint(runtimeRoot) {
-  const hash = (0, import_node_crypto4.createHash)("sha256");
+  const hash = (0, import_node_crypto5.createHash)("sha256");
   let fileCount = 0;
   const walk = (directory) => {
-    for (const entry of (0, import_node_fs11.readdirSync)(directory, { withFileTypes: true }).sort((a, b2) => a.name.localeCompare(b2.name))) {
+    for (const entry of (0, import_node_fs12.readdirSync)(directory, { withFileTypes: true }).sort((a, b2) => a.name.localeCompare(b2.name))) {
       const path = (0, import_node_path15.join)(directory, entry.name);
       const name = (0, import_node_path15.relative)(runtimeRoot, path);
       if (name === RUNTIME_FINGERPRINT_FILE) continue;
@@ -8863,7 +9102,7 @@ function computeRuntimeFingerprint(runtimeRoot) {
         fileCount += 1;
         hash.update(name);
         hash.update("\0");
-        hash.update((0, import_node_fs11.readFileSync)(path));
+        hash.update((0, import_node_fs12.readFileSync)(path));
         hash.update("\0");
       }
     }
@@ -8880,14 +9119,14 @@ function extractFirst(source, pattern) {
 }
 function readJson(path) {
   try {
-    return JSON.parse((0, import_node_fs11.readFileSync)(path, "utf8"));
+    return JSON.parse((0, import_node_fs12.readFileSync)(path, "utf8"));
   } catch {
     return null;
   }
 }
 function readFileSafe(path) {
   try {
-    return (0, import_node_fs11.readFileSync)(path, "utf8");
+    return (0, import_node_fs12.readFileSync)(path, "utf8");
   } catch {
     return "";
   }
@@ -9006,32 +9245,32 @@ async function setTweakEnabledAndReload(id, enabled, deps) {
 }
 
 // src/logging.ts
-var import_node_fs12 = require("node:fs");
+var import_node_fs13 = require("node:fs");
 var MAX_LOG_BYTES = 10 * 1024 * 1024;
 function appendCappedLog(path, line, maxBytes = MAX_LOG_BYTES) {
   const incoming = Buffer.from(line);
   if (incoming.byteLength >= maxBytes) {
     try {
-      (0, import_node_fs12.statSync)(path);
-      (0, import_node_fs12.renameSync)(path, `${path}.1`);
+      (0, import_node_fs13.statSync)(path);
+      (0, import_node_fs13.renameSync)(path, `${path}.1`);
     } catch {
     }
-    (0, import_node_fs12.writeFileSync)(path, incoming.subarray(incoming.byteLength - maxBytes));
+    (0, import_node_fs13.writeFileSync)(path, incoming.subarray(incoming.byteLength - maxBytes));
     return;
   }
   try {
-    const size = (0, import_node_fs12.statSync)(path).size;
+    const size = (0, import_node_fs13.statSync)(path).size;
     if (size + incoming.byteLength > maxBytes) {
-      (0, import_node_fs12.renameSync)(path, `${path}.1`);
+      (0, import_node_fs13.renameSync)(path, `${path}.1`);
     }
   } catch {
   }
-  (0, import_node_fs12.appendFileSync)(path, incoming);
+  (0, import_node_fs13.appendFileSync)(path, incoming);
 }
 
 // src/codex-runtime-probe.ts
 var import_electron = require("electron");
-var import_node_fs13 = require("node:fs");
+var import_node_fs14 = require("node:fs");
 var import_node_path16 = require("node:path");
 function getRuntimeInfo(opts) {
   return {
@@ -9099,18 +9338,18 @@ async function listCdpTargets() {
 function detectRuntimeType() {
   if (process.platform === "darwin") {
     const appRoot = inferMacAppRoot();
-    if (appRoot && (0, import_node_fs13.existsSync)((0, import_node_path16.join)(appRoot, "Contents", "Frameworks", "Codex Framework.framework"))) {
+    if (appRoot && (0, import_node_fs14.existsSync)((0, import_node_path16.join)(appRoot, "Contents", "Frameworks", "Codex Framework.framework"))) {
       return "owl";
     }
-    if (appRoot && (0, import_node_fs13.existsSync)((0, import_node_path16.join)(appRoot, "Contents", "Frameworks", "Electron Framework.framework"))) {
+    if (appRoot && (0, import_node_fs14.existsSync)((0, import_node_path16.join)(appRoot, "Contents", "Frameworks", "Electron Framework.framework"))) {
       return "electron";
     }
-    if (process.resourcesPath && (0, import_node_fs13.existsSync)((0, import_node_path16.join)(process.resourcesPath, "app.asar"))) {
+    if (process.resourcesPath && (0, import_node_fs14.existsSync)((0, import_node_path16.join)(process.resourcesPath, "app.asar"))) {
       return "electron";
     }
     return "unknown";
   }
-  return process.resourcesPath && (0, import_node_fs13.existsSync)((0, import_node_path16.join)(process.resourcesPath, "app.asar")) ? "electron" : "unknown";
+  return process.resourcesPath && (0, import_node_fs14.existsSync)((0, import_node_path16.join)(process.resourcesPath, "app.asar")) ? "electron" : "unknown";
 }
 function inferMacAppRoot() {
   const marker = ".app/Contents/MacOS/";
@@ -9182,20 +9421,20 @@ function asRecord(value) {
 // src/native-bridge.ts
 var import_electron2 = require("electron");
 var import_node_child_process2 = require("node:child_process");
-var import_node_crypto5 = require("node:crypto");
-var import_node_fs15 = require("node:fs");
+var import_node_crypto6 = require("node:crypto");
+var import_node_fs16 = require("node:fs");
 var import_node_readline = require("node:readline");
 
 // src/native-paths.ts
-var import_node_fs14 = require("node:fs");
+var import_node_fs15 = require("node:fs");
 var import_node_path17 = require("node:path");
 function resolveNativeTweakPath(tweakDir, path) {
   if (typeof path !== "string" || path.trim() === "") throw new Error("native path is required");
-  const root = (0, import_node_fs14.realpathSync)(tweakDir);
+  const root = (0, import_node_fs15.realpathSync)(tweakDir);
   const full = (0, import_node_path17.resolve)(tweakDir, path);
   let target;
   try {
-    target = (0, import_node_fs14.realpathSync)(full);
+    target = (0, import_node_fs15.realpathSync)(full);
   } catch {
     throw new Error("native path does not exist");
   }
@@ -9438,7 +9677,7 @@ var NativeBridge = class {
       parentWebContentsId: webContentsIdFor(parentWindow),
       parentNativeHandle
     });
-    const id = typeof asRecord2(value)?.id === "string" ? String(asRecord2(value)?.id) : (0, import_node_crypto5.randomUUID)();
+    const id = typeof asRecord2(value)?.id === "string" ? String(asRecord2(value)?.id) : (0, import_node_crypto6.randomUUID)();
     const windowId = typeof asRecord2(value)?.windowId === "number" ? Number(asRecord2(value)?.windowId) : null;
     const instance = {
       key: instanceKey(ctx.id, id),
@@ -9467,7 +9706,7 @@ var NativeBridge = class {
     if (this.nativeHostExports) return this.nativeHostExports;
     if (this.nativeHostLoadError && !required) return null;
     const nativeHostPath = this.options.nativeHostPath;
-    if (!nativeHostPath || !(0, import_node_fs15.existsSync)(nativeHostPath)) {
+    if (!nativeHostPath || !(0, import_node_fs16.existsSync)(nativeHostPath)) {
       const error = new Error("Tweakers native host is not installed");
       this.nativeHostLoadError = error;
       if (required) throw error;
@@ -9601,7 +9840,7 @@ var NativeBridge = class {
   }
   async requestHelper(tweakId, id, message, timeoutMs = 1e4) {
     const helper = this.helperFor(tweakId, id);
-    const requestId = (0, import_node_crypto5.randomUUID)();
+    const requestId = (0, import_node_crypto6.randomUUID)();
     const payload = { id: requestId, message };
     return await new Promise((resolve8, reject) => {
       const timer = setTimeout(() => {
@@ -9761,7 +10000,7 @@ function callWindowMethod(parentWindow, method) {
 }
 
 // src/native-host-path.ts
-var import_node_fs16 = require("node:fs");
+var import_node_fs17 = require("node:fs");
 var import_node_path18 = require("node:path");
 var APP_STAGED_NATIVE_HOST_RELATIVE_PATH = (0, import_node_path18.join)(
   "tweakers",
@@ -9770,7 +10009,7 @@ var APP_STAGED_NATIVE_HOST_RELATIVE_PATH = (0, import_node_path18.join)(
 );
 function resolveRuntimeNativeHostPath(input) {
   const staged = (0, import_node_path18.join)(input.resourcesPath, APP_STAGED_NATIVE_HOST_RELATIVE_PATH);
-  const exists = input.exists ?? import_node_fs16.existsSync;
+  const exists = input.exists ?? import_node_fs17.existsSync;
   if (exists(staged)) return staged;
   if (!input.packaged && input.allowExternalDevelopmentFallback) {
     return (0, import_node_path18.join)(input.runtimeDir, "native", "tweaker_native_host.node");
@@ -9964,8 +10203,8 @@ function optionalGithubUrl(value) {
 
 // src/browser-ui.ts
 var import_electron3 = require("electron");
-var import_node_crypto6 = require("node:crypto");
-var import_node_fs17 = require("node:fs");
+var import_node_crypto7 = require("node:crypto");
+var import_node_fs18 = require("node:fs");
 var import_node_http = require("node:http");
 var import_node_path19 = require("node:path");
 var CONNECT_PORT_CHANNEL = "tweaker:browser-ui-connect-app-host";
@@ -10137,7 +10376,7 @@ async function handleHttpRequest(req, res) {
     sendText(res, 404, "Not Found\n", "text/plain; charset=utf-8");
     return;
   }
-  const content = (0, import_node_fs17.readFileSync)(file);
+  const content = (0, import_node_fs18.readFileSync)(file);
   sendBuffer(res, 200, content, mimeType(file), req.method === "HEAD");
 }
 async function handleUpgrade(req, socket, head) {
@@ -10168,7 +10407,7 @@ function normalizeLegacyBrowserUiPath(url) {
 }
 async function browserIndexHtml(options) {
   const indexPath = (0, import_node_path19.join)(webviewRoot(), "index.html");
-  let html = relaxBrowserUiCsp((0, import_node_fs17.readFileSync)(indexPath, "utf8"));
+  let html = relaxBrowserUiCsp((0, import_node_fs18.readFileSync)(indexPath, "utf8"));
   const shim = `<script src="/tweaker/browser-ui/bridge.js"></script>`;
   if (html.includes("</head>")) {
     html = html.replace("</head>", `${shim}
@@ -10274,7 +10513,7 @@ async function waitForWindowServices(options) {
 function callHiddenBridge(method, args) {
   assertBridgeMethod(method);
   return ensureBrowserUiHost().then((host) => {
-    const id = (0, import_node_crypto6.randomUUID)();
+    const id = (0, import_node_crypto7.randomUUID)();
     return new Promise((resolve8, reject) => {
       const timer = setTimeout(() => {
         bridgeRequests.delete(id);
@@ -10866,7 +11105,7 @@ function makeWindowLikeForView(view) {
 function acceptWebSocket(req, socket, head) {
   const key = req.headers["sec-websocket-key"];
   if (typeof key !== "string") throw new Error("missing Sec-WebSocket-Key");
-  const accept = (0, import_node_crypto6.createHash)("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+  const accept = (0, import_node_crypto7.createHash)("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
   socket.write(
     [
       "HTTP/1.1 101 Switching Protocols",
@@ -11048,7 +11287,7 @@ function webviewFile(pathname) {
   const file = (0, import_node_path19.normalize)((0, import_node_path19.join)(root, cleanPath));
   const rel = (0, import_node_path19.relative)(root, file);
   if (rel.startsWith("..") || rel === "") return null;
-  if (!(0, import_node_fs17.existsSync)(file) || !(0, import_node_fs17.statSync)(file).isFile()) return null;
+  if (!(0, import_node_fs18.existsSync)(file) || !(0, import_node_fs18.statSync)(file).isFile()) return null;
   return file;
 }
 function mimeType(file) {
@@ -11088,7 +11327,7 @@ function delay(ms2) {
 }
 
 // src/local-cli-runtime.ts
-var import_node_fs18 = require("node:fs");
+var import_node_fs19 = require("node:fs");
 var import_node_path20 = require("node:path");
 function nodeExecutableFromCliShim(source) {
   const match = source.match(/^exec\s+"([^"]+)"\s+"[^"]+"\s+"\$@"\s*$/m);
@@ -11097,14 +11336,14 @@ function nodeExecutableFromCliShim(source) {
 function resolveLocalCliRuntime(input) {
   const shim = (0, import_node_path20.join)(input.userRoot, "bin", "tweaker");
   try {
-    const shimNode = nodeExecutableFromCliShim((0, import_node_fs18.readFileSync)(shim, "utf8"));
-    if (shimNode && (0, import_node_fs18.existsSync)(shimNode)) {
+    const shimNode = nodeExecutableFromCliShim((0, import_node_fs19.readFileSync)(shim, "utf8"));
+    if (shimNode && (0, import_node_fs19.existsSync)(shimNode)) {
       return { command: shimNode, args: [input.cli, ...input.args], env: input.env };
     }
   } catch {
   }
   const bundledNode = (0, import_node_path20.join)(input.resourcesPath, "cua_node", "bin", "node");
-  if ((0, import_node_fs18.existsSync)(bundledNode)) {
+  if ((0, import_node_fs19.existsSync)(bundledNode)) {
     return { command: bundledNode, args: [input.cli, ...input.args], env: input.env };
   }
   return {
@@ -11407,8 +11646,8 @@ async function dispatchCrossTweakRead(requester, target, action, message, lookup
 }
 
 // src/promotion-health.ts
-var import_node_fs19 = require("node:fs");
-var import_node_crypto7 = require("node:crypto");
+var import_node_fs20 = require("node:fs");
+var import_node_crypto8 = require("node:crypto");
 var import_node_os2 = require("node:os");
 var import_node_path22 = require("node:path");
 var PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
@@ -11773,7 +12012,7 @@ function promotionRendererAssetMimeType(relativePath) {
       return "application/octet-stream";
   }
 }
-function createPromotionRendererProtocolResponder(webviewRoot2, readFile = import_node_fs19.readFileSync) {
+function createPromotionRendererProtocolResponder(webviewRoot2, readFile = import_node_fs20.readFileSync) {
   return (request) => {
     const relativePath = promotionRendererAssetRoute(request.url);
     if (!relativePath) return new Response(null, { status: 404 });
@@ -11889,7 +12128,7 @@ function hasAuthenticatedCodexToken(auth) {
 function readCodexAuth(codexHome) {
   try {
     const home = codexHome || process.env.CODEX_HOME || (0, import_node_path22.join)((0, import_node_os2.homedir)(), ".codex");
-    return JSON.parse((0, import_node_fs19.readFileSync)((0, import_node_path22.join)(home, "auth.json"), "utf8"));
+    return JSON.parse((0, import_node_fs20.readFileSync)((0, import_node_path22.join)(home, "auth.json"), "utf8"));
   } catch {
     return null;
   }
@@ -11899,10 +12138,10 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
   const receiptFile = (0, import_node_path22.join)(userRoot2, "health", "promotion.json");
   let request;
   try {
-    const stat4 = (0, import_node_fs19.lstatSync)(requestFile);
+    const stat4 = (0, import_node_fs20.lstatSync)(requestFile);
     if (stat4.isSymbolicLink() || !stat4.isFile() || (stat4.mode & 511) !== 384 || stat4.size > 256 * 1024) return false;
     if (typeof process.getuid === "function" && stat4.uid !== process.getuid()) return false;
-    request = JSON.parse((0, import_node_fs19.readFileSync)(requestFile, "utf8"));
+    request = JSON.parse((0, import_node_fs20.readFileSync)(requestFile, "utf8"));
     const now = (options.now ?? /* @__PURE__ */ new Date()).getTime();
     const requestedAt = Date.parse(request.requestedAt);
     if (!Number.isFinite(requestedAt) || requestedAt > now + 5e3 || now - requestedAt > (options.maxAgeMs ?? 6e4)) return false;
@@ -11932,21 +12171,21 @@ async function answerPromotionHealthRequest(userRoot2, probes, options = {}) {
     authenticatedSession,
     declaredPermissions: permissions
   } : await buildV2Receipt(request, probes, permissions, authenticatedSession, options.now ?? /* @__PURE__ */ new Date(), safe);
-  (0, import_node_fs19.mkdirSync)((0, import_node_path22.dirname)(receiptFile), { recursive: true, mode: 448 });
-  const temporary = `${receiptFile}.${process.pid}.${(0, import_node_crypto7.randomUUID)()}.tmp`;
-  const fd = (0, import_node_fs19.openSync)(temporary, "wx", 384);
+  (0, import_node_fs20.mkdirSync)((0, import_node_path22.dirname)(receiptFile), { recursive: true, mode: 448 });
+  const temporary = `${receiptFile}.${process.pid}.${(0, import_node_crypto8.randomUUID)()}.tmp`;
+  const fd = (0, import_node_fs20.openSync)(temporary, "wx", 384);
   try {
-    (0, import_node_fs19.writeFileSync)(fd, `${JSON.stringify(receipt, null, 2)}
+    (0, import_node_fs20.writeFileSync)(fd, `${JSON.stringify(receipt, null, 2)}
 `);
-    (0, import_node_fs19.fsyncSync)(fd);
+    (0, import_node_fs20.fsyncSync)(fd);
   } finally {
-    (0, import_node_fs19.closeSync)(fd);
+    (0, import_node_fs20.closeSync)(fd);
   }
-  (0, import_node_fs19.chmodSync)(temporary, 384);
-  (0, import_node_fs19.renameSync)(temporary, receiptFile);
-  (0, import_node_fs19.chmodSync)(receiptFile, 384);
+  (0, import_node_fs20.chmodSync)(temporary, 384);
+  (0, import_node_fs20.renameSync)(temporary, receiptFile);
+  (0, import_node_fs20.chmodSync)(receiptFile, 384);
   try {
-    (0, import_node_fs19.unlinkSync)(requestFile);
+    (0, import_node_fs20.unlinkSync)(requestFile);
   } catch {
   }
   return true;
@@ -12122,8 +12361,8 @@ function exactKeys(value, keys) {
 
 // src/codex-cli-manager.ts
 var import_node_child_process3 = require("node:child_process");
-var import_node_crypto8 = require("node:crypto");
-var import_node_fs20 = require("node:fs");
+var import_node_crypto9 = require("node:crypto");
+var import_node_fs21 = require("node:fs");
 var import_node_path23 = require("node:path");
 var EMPTY_STATE = { schemaVersion: 1, current: null, previous: null, updatedAt: "" };
 var MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
@@ -12158,7 +12397,7 @@ function createCodexCliManager(input) {
         const operationDir = safeChild(paths.staging, operationId);
         const archive = (0, import_node_path23.join)(operationDir, "download.tar.gz");
         const extracted = (0, import_node_path23.join)(operationDir, "extracted");
-        (0, import_node_fs20.mkdirSync)(operationDir, { recursive: false, mode: 448 });
+        (0, import_node_fs21.mkdirSync)(operationDir, { recursive: false, mode: 448 });
         try {
           setProgress("resolving");
           const release = await deps.resolveRelease();
@@ -12176,10 +12415,10 @@ function createCodexCliManager(input) {
           const entries = await deps.listArchive(archive);
           validateArchiveEntries(entries);
           setProgress("extracting");
-          (0, import_node_fs20.mkdirSync)(extracted, { recursive: false, mode: 448 });
+          (0, import_node_fs21.mkdirSync)(extracted, { recursive: false, mode: 448 });
           await deps.extractArchive(archive, extracted);
           const binary = locateBinary(extracted);
-          (0, import_node_fs20.chmodSync)(binary, 493);
+          (0, import_node_fs21.chmodSync)(binary, 493);
           setProgress("verifying-signature");
           if (!await deps.verifySignature(binary)) throw new Error("Signature verification failed");
           setProgress("probing");
@@ -12187,7 +12426,7 @@ function createCodexCliManager(input) {
           if (normalizeVersion(version) !== release.version) throw new Error(`Version validation failed (expected ${release.version})`);
           if (architecture !== release.architecture) throw new Error(`Architecture validation failed (expected ${release.architecture})`);
           const baseDirectoryName = `${release.version}-${release.architecture}`;
-          const directoryName = (0, import_node_fs20.existsSync)(safeChild(paths.releases, baseDirectoryName)) ? `${baseDirectoryName}-incoming-${safeOperationId(operationId)}` : baseDirectoryName;
+          const directoryName = (0, import_node_fs21.existsSync)(safeChild(paths.releases, baseDirectoryName)) ? `${baseDirectoryName}-incoming-${safeOperationId(operationId)}` : baseDirectoryName;
           const releaseDir = safeChild(paths.releases, directoryName);
           const binaryRelativePath = (0, import_node_path23.relative)(extracted, binary);
           const receipt = {
@@ -12195,7 +12434,7 @@ function createCodexCliManager(input) {
             version: release.version,
             releaseTag: release.tag,
             digest: release.digest.toLowerCase(),
-            binaryDigest: (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex"),
+            binaryDigest: (0, import_node_crypto9.createHash)("sha256").update((0, import_node_fs21.readFileSync)(binary)).digest("hex"),
             architecture: release.architecture,
             relativeDirectory: directoryName,
             binaryRelativePath,
@@ -12204,9 +12443,9 @@ function createCodexCliManager(input) {
           atomicJsonWrite((0, import_node_path23.join)(extracted, RECEIPT_FILE), receipt);
           syncTreeCritical(extracted, [binaryRelativePath, RECEIPT_FILE]);
           setProgress("promoting");
-          if ((0, import_node_fs20.existsSync)(releaseDir)) throw new Error("Unique incoming release directory already exists");
+          if ((0, import_node_fs21.existsSync)(releaseDir)) throw new Error("Unique incoming release directory already exists");
           deps.onCrashPoint?.("before-release-rename");
-          (0, import_node_fs20.renameSync)(extracted, releaseDir);
+          (0, import_node_fs21.renameSync)(extracted, releaseDir);
           fsyncDirectory2(paths.releases);
           deps.onCrashPoint?.("after-release-rename");
           const next = { schemaVersion: 1, current: receipt, previous: state.current, updatedAt: deps.now().toISOString() };
@@ -12217,7 +12456,7 @@ function createCodexCliManager(input) {
           pruneUnreferencedReleases(paths, state);
           return clone(state);
         } finally {
-          (0, import_node_fs20.rmSync)(operationDir, { recursive: true, force: true });
+          (0, import_node_fs21.rmSync)(operationDir, { recursive: true, force: true });
         }
       });
     },
@@ -12237,7 +12476,7 @@ function createCodexCliManager(input) {
     recover() {
       ensureDirectories(paths);
       removeDirectoryChildrenWithoutFollowing(paths.staging);
-      if (!lockBelongsToLiveOtherProcess(paths.lock)) (0, import_node_fs20.rmSync)(paths.lock, { force: true });
+      if (!lockBelongsToLiveOtherProcess(paths.lock)) (0, import_node_fs21.rmSync)(paths.lock, { force: true });
       state = readState(paths.state);
       state = reconcileStateSync(paths, state);
       atomicJsonWrite(paths.state, state);
@@ -12267,15 +12506,15 @@ function createCodexCliManager(input) {
     let ownsLock = false;
     try {
       try {
-        lockFd = (0, import_node_fs20.openSync)(paths.lock, "wx", 384);
+        lockFd = (0, import_node_fs21.openSync)(paths.lock, "wx", 384);
         ownsLock = true;
-        (0, import_node_fs20.writeFileSync)(lockFd, `${JSON.stringify({ schemaVersion: 1, pid: process.pid, operationId, kind, startedAt: progress.startedAt })}
+        (0, import_node_fs21.writeFileSync)(lockFd, `${JSON.stringify({ schemaVersion: 1, pid: process.pid, operationId, kind, startedAt: progress.startedAt })}
 `);
-        (0, import_node_fs20.fsyncSync)(lockFd);
+        (0, import_node_fs21.fsyncSync)(lockFd);
       } catch (error) {
-        if (lockFd !== null) (0, import_node_fs20.closeSync)(lockFd);
+        if (lockFd !== null) (0, import_node_fs21.closeSync)(lockFd);
         lockFd = null;
-        throw (0, import_node_fs20.existsSync)(paths.lock) ? new Error("A Codex CLI operation is already in progress") : error;
+        throw (0, import_node_fs21.existsSync)(paths.lock) ? new Error("A Codex CLI operation is already in progress") : error;
       }
       const result2 = await fn2(operationId);
       progress.phase = "complete";
@@ -12287,8 +12526,8 @@ function createCodexCliManager(input) {
       progress.completedAt = deps.now().toISOString();
       throw new Error(progress.error);
     } finally {
-      if (lockFd !== null) (0, import_node_fs20.closeSync)(lockFd);
-      if (ownsLock) (0, import_node_fs20.rmSync)(paths.lock, { force: true });
+      if (lockFd !== null) (0, import_node_fs21.closeSync)(lockFd);
+      if (ownsLock) (0, import_node_fs21.rmSync)(paths.lock, { force: true });
       busy = false;
     }
   }
@@ -12355,11 +12594,11 @@ function validateSelectedManagedBinarySync(selected) {
     if (!/^[a-f0-9]{64}$/i.test(selected.fingerprint)) {
       throw new Error("Selected managed Alpha fingerprint is invalid");
     }
-    const info = (0, import_node_fs20.lstatSync)(selected.binaryPath);
+    const info = (0, import_node_fs21.lstatSync)(selected.binaryPath);
     if (!info.isFile() || info.isSymbolicLink() || (info.mode & 73) === 0) {
       throw new Error("Selected managed Alpha binary is not a regular executable file");
     }
-    const actualFingerprint = (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(selected.binaryPath)).digest("hex");
+    const actualFingerprint = (0, import_node_crypto9.createHash)("sha256").update((0, import_node_fs21.readFileSync)(selected.binaryPath)).digest("hex");
     if (actualFingerprint !== selected.fingerprint.toLowerCase()) {
       throw new Error("Selected managed Alpha fingerprint does not match");
     }
@@ -12402,8 +12641,8 @@ async function mutateCodexFeature(input, deps) {
   return deps.inventory(input.lane);
 }
 function ensureDirectories(paths) {
-  (0, import_node_fs20.mkdirSync)(paths.releases, { recursive: true, mode: 448 });
-  (0, import_node_fs20.mkdirSync)(paths.staging, { recursive: true, mode: 448 });
+  (0, import_node_fs21.mkdirSync)(paths.releases, { recursive: true, mode: 448 });
+  (0, import_node_fs21.mkdirSync)(paths.staging, { recursive: true, mode: 448 });
 }
 function validateRelease(release) {
   if (!/^\d+\.\d+\.\d+-alpha\.\d+$/.test(release.version)) throw new Error("Resolved release is not an alpha prerelease");
@@ -12415,7 +12654,7 @@ function validateRelease(release) {
 function locateBinary(root) {
   const matches = [];
   const visit = (dir) => {
-    for (const entry of (0, import_node_fs20.readdirSync)(dir, { withFileTypes: true })) {
+    for (const entry of (0, import_node_fs21.readdirSync)(dir, { withFileTypes: true })) {
       const path = (0, import_node_path23.join)(dir, entry.name);
       if (entry.isSymbolicLink()) throw new Error("Extracted package contains an unsafe link");
       if (entry.isDirectory()) visit(path);
@@ -12463,9 +12702,9 @@ function validateReceiptFiles(paths, receipt, binary) {
   if (!diskReceipt || diskReceipt.version !== receipt.version || diskReceipt.digest !== receipt.digest || diskReceipt.binaryDigest !== receipt.binaryDigest || diskReceipt.relativeDirectory !== receipt.relativeDirectory || diskReceipt.binaryRelativePath !== receipt.binaryRelativePath) {
     throw new Error("Managed Beta receipt or digest does not agree with state");
   }
-  const info = (0, import_node_fs20.lstatSync)(binary);
+  const info = (0, import_node_fs21.lstatSync)(binary);
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 73) === 0) throw new Error("Managed Beta binary is not a regular executable file");
-  const binaryDigest = (0, import_node_crypto8.createHash)("sha256").update((0, import_node_fs20.readFileSync)(binary)).digest("hex");
+  const binaryDigest = (0, import_node_crypto9.createHash)("sha256").update((0, import_node_fs21.readFileSync)(binary)).digest("hex");
   if (binaryDigest !== receipt.binaryDigest) throw new Error("Managed Beta binary digest does not agree with its receipt");
 }
 function reconcileStateSync(paths, value) {
@@ -12484,7 +12723,7 @@ function reconcileStateSync(paths, value) {
 }
 function readState(path) {
   try {
-    const parsed = JSON.parse((0, import_node_fs20.readFileSync)(path, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs21.readFileSync)(path, "utf8"));
     if (parsed.schemaVersion !== 1) return clone(EMPTY_STATE);
     return { schemaVersion: 1, current: validReceipt(parsed.current) ? parsed.current : null, previous: validReceipt(parsed.previous) ? parsed.previous : null, updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "" };
   } catch {
@@ -12493,9 +12732,9 @@ function readState(path) {
 }
 function readReceipt(directory) {
   try {
-    const info = (0, import_node_fs20.lstatSync)((0, import_node_path23.join)(directory, RECEIPT_FILE));
+    const info = (0, import_node_fs21.lstatSync)((0, import_node_path23.join)(directory, RECEIPT_FILE));
     if (!info.isFile() || info.isSymbolicLink()) return null;
-    const value = JSON.parse((0, import_node_fs20.readFileSync)((0, import_node_path23.join)(directory, RECEIPT_FILE), "utf8"));
+    const value = JSON.parse((0, import_node_fs21.readFileSync)((0, import_node_path23.join)(directory, RECEIPT_FILE), "utf8"));
     return validReceipt(value) ? value : null;
   } catch {
     return null;
@@ -12511,11 +12750,11 @@ function binaryForReceipt(paths, receipt) {
 }
 function pruneUnreferencedReleases(paths, state) {
   const keep = new Set([state.current?.relativeDirectory, state.previous?.relativeDirectory].filter((value) => Boolean(value)));
-  for (const name of safeDirectoryNames(paths.releases)) if (!keep.has(name)) (0, import_node_fs20.rmSync)(safeChild(paths.releases, name), { recursive: true, force: true });
+  for (const name of safeDirectoryNames(paths.releases)) if (!keep.has(name)) (0, import_node_fs21.rmSync)(safeChild(paths.releases, name), { recursive: true, force: true });
 }
 function safeDirectoryNames(root) {
   try {
-    return (0, import_node_fs20.readdirSync)(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map((entry) => entry.name);
+    return (0, import_node_fs21.readdirSync)(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && !entry.isSymbolicLink()).map((entry) => entry.name);
   } catch {
     return [];
   }
@@ -12523,15 +12762,15 @@ function safeDirectoryNames(root) {
 function removeDirectoryChildrenWithoutFollowing(root) {
   let names;
   try {
-    names = (0, import_node_fs20.readdirSync)(root);
+    names = (0, import_node_fs21.readdirSync)(root);
   } catch {
     return;
   }
-  for (const name of names) (0, import_node_fs20.rmSync)(safeChild(root, name), { recursive: true, force: true });
+  for (const name of names) (0, import_node_fs21.rmSync)(safeChild(root, name), { recursive: true, force: true });
 }
 function lockBelongsToLiveOtherProcess(path) {
   try {
-    const value = JSON.parse((0, import_node_fs20.readFileSync)(path, "utf8"));
+    const value = JSON.parse((0, import_node_fs21.readFileSync)(path, "utf8"));
     if (!Number.isInteger(value.pid) || value.pid <= 0 || value.pid === process.pid) return false;
     process.kill(value.pid, 0);
     return true;
@@ -12548,36 +12787,36 @@ function isContained(root, candidate) {
   return candidate.startsWith(`${root}${import_node_path23.sep}`);
 }
 function atomicJsonWrite(path, value) {
-  (0, import_node_fs20.mkdirSync)((0, import_node_path23.dirname)(path), { recursive: true, mode: 448 });
+  (0, import_node_fs21.mkdirSync)((0, import_node_path23.dirname)(path), { recursive: true, mode: 448 });
   const temporary = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
-  const fd = (0, import_node_fs20.openSync)(temporary, "wx", 384);
+  const fd = (0, import_node_fs21.openSync)(temporary, "wx", 384);
   try {
-    (0, import_node_fs20.writeFileSync)(fd, `${JSON.stringify(value, null, 2)}
+    (0, import_node_fs21.writeFileSync)(fd, `${JSON.stringify(value, null, 2)}
 `);
-    (0, import_node_fs20.fsyncSync)(fd);
+    (0, import_node_fs21.fsyncSync)(fd);
   } finally {
-    (0, import_node_fs20.closeSync)(fd);
+    (0, import_node_fs21.closeSync)(fd);
   }
-  (0, import_node_fs20.renameSync)(temporary, path);
+  (0, import_node_fs21.renameSync)(temporary, path);
   fsyncDirectory2((0, import_node_path23.dirname)(path));
 }
 function syncTreeCritical(root, paths) {
   for (const relativePath of paths) {
-    const fd = (0, import_node_fs20.openSync)(safeChild(root, relativePath), "r");
+    const fd = (0, import_node_fs21.openSync)(safeChild(root, relativePath), "r");
     try {
-      (0, import_node_fs20.fsyncSync)(fd);
+      (0, import_node_fs21.fsyncSync)(fd);
     } finally {
-      (0, import_node_fs20.closeSync)(fd);
+      (0, import_node_fs21.closeSync)(fd);
     }
   }
   fsyncDirectory2(root);
 }
 function fsyncDirectory2(path) {
-  const fd = (0, import_node_fs20.openSync)(path, "r");
+  const fd = (0, import_node_fs21.openSync)(path, "r");
   try {
-    (0, import_node_fs20.fsyncSync)(fd);
+    (0, import_node_fs21.fsyncSync)(fd);
   } finally {
-    (0, import_node_fs20.closeSync)(fd);
+    (0, import_node_fs21.closeSync)(fd);
   }
 }
 function normalizeVersion(output) {
@@ -13589,7 +13828,7 @@ function redactedAppcastFailure(error) {
 }
 
 // src/codex-app-server-parent.ts
-var import_node_fs21 = require("node:fs");
+var import_node_fs22 = require("node:fs");
 var import_node_path24 = require("node:path");
 var INSTALL_MARKER = /* @__PURE__ */ Symbol.for("co.tweakers.codex-app-server-parent");
 var CODEX_APP_SERVER_PARENT_SOURCE = String.raw`
@@ -13665,7 +13904,7 @@ function installCodexAppServerParent(options = {}) {
   const childProcess = options.childProcess ?? require("node:child_process");
   const platform2 = options.platform ?? process.platform;
   const resourcesPath = options.resourcesPath ?? (typeof process.resourcesPath === "string" ? process.resourcesPath : "");
-  const pathExists = options.pathExists ?? import_node_fs21.existsSync;
+  const pathExists = options.pathExists ?? import_node_fs22.existsSync;
   const existing = childProcess[INSTALL_MARKER];
   if (existing) {
     return result(false, null, "already-installed", childProcess);
@@ -13999,15 +14238,15 @@ function findCodexDesktopUpdateMenuItem(menu) {
 }
 
 // src/codex-desktop-update-profile.ts
-var import_node_crypto9 = require("node:crypto");
+var import_node_crypto10 = require("node:crypto");
 var import_node_path25 = require("node:path");
 var OPENAI_DESKTOP_TEAM_IDENTIFIER = "2DC432GLL2";
 function verifiedCodexDesktopProfileIdentity(registryValue, profile) {
-  if (!isRecord2(registryValue)) return null;
+  if (!isRecord3(registryValue)) return null;
   const registry = registryValue;
-  if (registry.schemaVersion !== 1 || !isRecord2(registry.profiles)) return null;
+  if (registry.schemaVersion !== 1 || !isRecord3(registry.profiles)) return null;
   const candidate = registry.profiles[profile];
-  if (!isRecord2(candidate)) return null;
+  if (!isRecord3(candidate)) return null;
   const expectedBundleId = profile === "alpha" ? "com.openai.codex.beta" : "com.openai.codex";
   const appPath = exactAppPath(candidate.officialPath);
   if (!appPath || candidate.releaseProfile !== profile || candidate.selectedDesktopPath !== appPath || candidate.officialBundleId !== expectedBundleId || candidate.selectedDesktopBundleId !== expectedBundleId || candidate.strictSignature !== true || candidate.gatekeeper !== true || candidate.teamIdentifier !== OPENAI_DESKTOP_TEAM_IDENTIFIER || typeof candidate.designatedRequirement !== "string" || !candidate.designatedRequirement.trim() || typeof candidate.signatureCheckedAt !== "string" || !Number.isFinite(Date.parse(candidate.signatureCheckedAt))) return null;
@@ -14032,11 +14271,11 @@ function verifiedCodexDesktopProfileIdentity(registryValue, profile) {
     build,
     teamIdentifier: OPENAI_DESKTOP_TEAM_IDENTIFIER,
     designatedRequirement: candidate.designatedRequirement,
-    identityKey: (0, import_node_crypto9.createHash)("sha256").update(identityMaterial).digest("hex")
+    identityKey: (0, import_node_crypto10.createHash)("sha256").update(identityMaterial).digest("hex")
   };
 }
 function activeVerifiedCodexDesktopProfileIdentity(registryValue, selectionValue, activeAppPath) {
-  if (!isRecord2(selectionValue) || !activeAppPath) return null;
+  if (!isRecord3(selectionValue) || !activeAppPath) return null;
   const selection = selectionValue;
   const profile = selection.releaseProfile;
   if (profile !== "stable" && profile !== "alpha") return null;
@@ -14060,7 +14299,7 @@ function createCapturedCodexDesktopProfileFeed(identity, capture, capturedAt) {
   };
 }
 function readCapturedCodexDesktopProfileFeed(value, identity) {
-  if (!isRecord2(value)) return null;
+  if (!isRecord3(value)) return null;
   const candidate = value;
   const feedUrl = safePersistedAppcastUrl(candidate.feedUrl ?? null);
   const fallbackFeedUrl = safePersistedAppcastUrl(candidate.fallbackFeedUrl ?? null);
@@ -14141,7 +14380,7 @@ function optionalIdentityString(value) {
   if (value === null) return null;
   return typeof value === "string" && value.trim() ? value : void 0;
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -14249,8 +14488,8 @@ var TWEAKER_REPO = "therealityreport/tweakers";
 var TWEAK_STORE_INDEX_URL = process.env.TWEAKER_STORE_INDEX_URL ?? process.env[LEGACY_STORE_INDEX_ENV] ?? DEFAULT_TWEAK_STORE_INDEX_URL;
 var CODEX_WINDOW_SERVICES_KEY = "__tweaker_window_services__";
 var mainTweakReadHandlers = /* @__PURE__ */ new Map();
-(0, import_node_fs22.mkdirSync)(LOG_DIR, { recursive: true });
-(0, import_node_fs22.mkdirSync)(TWEAKS_DIR, { recursive: true });
+(0, import_node_fs23.mkdirSync)(LOG_DIR, { recursive: true });
+(0, import_node_fs23.mkdirSync)(TWEAKS_DIR, { recursive: true });
 if (!healthCheckOnly) removeLegacyModeSwitcherState(userRoot);
 var refreshStatusWatcher = esm_default.watch([
   SELF_UPDATE_STATE_FILE,
@@ -14270,7 +14509,7 @@ if (process.env.TWEAKER_REMOTE_DEBUG === "1" || process.env[LEGACY_REMOTE_DEBUG_
 }
 function readState2() {
   try {
-    const state = JSON.parse((0, import_node_fs22.readFileSync)(CONFIG_FILE, "utf8"));
+    const state = JSON.parse((0, import_node_fs23.readFileSync)(CONFIG_FILE, "utf8"));
     const record2 = state;
     const legacy = record2[LEGACY_CONFIG_KEY2];
     if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
@@ -14287,7 +14526,7 @@ function readState2() {
 }
 function writeState(s3) {
   try {
-    (0, import_node_fs22.writeFileSync)(CONFIG_FILE, JSON.stringify(s3, null, 2));
+    (0, import_node_fs23.writeFileSync)(CONFIG_FILE, JSON.stringify(s3, null, 2));
   } catch (e) {
     log("warn", "writeState failed:", String(e.message));
   }
@@ -14502,7 +14741,7 @@ async function runProactiveDesktopUpdateCheck() {
 function createCodexCliManagerDependencies() {
   return {
     now: () => /* @__PURE__ */ new Date(),
-    operationId: import_node_crypto10.randomUUID,
+    operationId: import_node_crypto11.randomUUID,
     resolveRelease: async () => {
       const lookup = await codexVersionService.fetchLatestRelease("beta", { force: true });
       const release = lookup.release;
@@ -14550,7 +14789,7 @@ async function downloadManagedCodexArchive(release, destination, onBytes) {
   if (!response.ok || !response.body) throw new Error(`Codex download returned ${response.status}`);
   const declaredLength = Number(response.headers.get("content-length") ?? "0");
   if (declaredLength > MAX_CODEX_DOWNLOAD_BYTES) throw new Error("Codex download exceeds maximum size");
-  const digest = (0, import_node_crypto10.createHash)("sha256");
+  const digest = (0, import_node_crypto11.createHash)("sha256");
   let bytes = 0;
   const meter = new import_node_stream3.Transform({
     transform(chunk, _encoding, callback) {
@@ -14564,7 +14803,7 @@ async function downloadManagedCodexArchive(release, destination, onBytes) {
       callback(null, chunk);
     }
   });
-  await (0, import_promises5.pipeline)(import_node_stream3.Readable.fromWeb(response.body), meter, (0, import_node_fs22.createWriteStream)(destination, { mode: 384 }));
+  await (0, import_promises5.pipeline)(import_node_stream3.Readable.fromWeb(response.body), meter, (0, import_node_fs23.createWriteStream)(destination, { mode: 384 }));
   if (declaredLength > 0 && bytes !== declaredLength) throw new Error("Codex download length did not match Content-Length");
   return { bytes, digest: digest.digest("hex") };
 }
@@ -14655,21 +14894,21 @@ function recoverTweak(id) {
 }
 function readInstallerState() {
   try {
-    return JSON.parse((0, import_node_fs22.readFileSync)(INSTALLER_STATE_FILE, "utf8"));
+    return JSON.parse((0, import_node_fs23.readFileSync)(INSTALLER_STATE_FILE, "utf8"));
   } catch {
     return null;
   }
 }
 function readSelfUpdateState() {
   try {
-    return JSON.parse((0, import_node_fs22.readFileSync)(SELF_UPDATE_STATE_FILE, "utf8"));
+    return JSON.parse((0, import_node_fs23.readFileSync)(SELF_UPDATE_STATE_FILE, "utf8"));
   } catch {
     return null;
   }
 }
 function writeSelfUpdateState(state) {
   try {
-    (0, import_node_fs22.writeFileSync)(SELF_UPDATE_STATE_FILE, JSON.stringify(state, null, 2));
+    (0, import_node_fs23.writeFileSync)(SELF_UPDATE_STATE_FILE, JSON.stringify(state, null, 2));
   } catch (e) {
     log("warn", "writeSelfUpdateState failed:", String(e.message));
   }
@@ -14692,11 +14931,11 @@ function log(level, ...args) {
   }
   if (level === "error") console.error("[tweaker]", ...args);
 }
-var lifecycleAttemptId = (0, import_node_crypto10.randomUUID)();
+var lifecycleAttemptId = (0, import_node_crypto11.randomUUID)();
 var lifecycleJournal;
 function readTweakLifecycleJournal() {
   try {
-    const parsed = JSON.parse((0, import_node_fs22.readFileSync)(TWEAK_LIFECYCLE_FILE, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs23.readFileSync)(TWEAK_LIFECYCLE_FILE, "utf8"));
     if (parsed.schemaVersion !== 1 || !parsed.records || typeof parsed.records !== "object") {
       throw new Error("unsupported tweak lifecycle journal");
     }
@@ -14711,7 +14950,7 @@ function readTweakLifecycleJournal() {
 }
 function writeTweakLifecycleJournal() {
   try {
-    (0, import_node_fs22.writeFileSync)(TWEAK_LIFECYCLE_FILE, JSON.stringify(lifecycleJournal, null, 2));
+    (0, import_node_fs23.writeFileSync)(TWEAK_LIFECYCLE_FILE, JSON.stringify(lifecycleJournal, null, 2));
   } catch (error) {
     log("warn", "failed to persist tweak lifecycle journal:", String(error));
   }
@@ -14803,17 +15042,17 @@ function installSparkleUpdateHook() {
 function restorePristineCodexApp(backup, appRoot) {
   const staged = `${appRoot}.tweakers-sparkle-restore`;
   try {
-    (0, import_node_fs22.rmSync)(staged, { recursive: true, force: true });
+    (0, import_node_fs23.rmSync)(staged, { recursive: true, force: true });
   } catch {
   }
   try {
     (0, import_node_child_process4.execFileSync)("/bin/cp", ["-Rc", backup, staged], { stdio: "ignore" });
-    (0, import_node_fs22.rmSync)(appRoot, { recursive: true, force: true });
-    (0, import_node_fs22.renameSync)(staged, appRoot);
+    (0, import_node_fs23.rmSync)(appRoot, { recursive: true, force: true });
+    (0, import_node_fs23.renameSync)(staged, appRoot);
     return;
   } catch {
     try {
-      (0, import_node_fs22.rmSync)(staged, { recursive: true, force: true });
+      (0, import_node_fs23.rmSync)(staged, { recursive: true, force: true });
     } catch {
     }
   }
@@ -14821,11 +15060,11 @@ function restorePristineCodexApp(backup, appRoot) {
 }
 function prepareSignedCodexForSparkleInstall() {
   if (process.platform !== "darwin") return false;
-  if ((0, import_node_fs22.existsSync)(UPDATE_MODE_FILE)) {
+  if ((0, import_node_fs23.existsSync)(UPDATE_MODE_FILE)) {
     log("info", "Sparkle update prep skipped; update mode already active");
     return true;
   }
-  if (!(0, import_node_fs22.existsSync)(SIGNED_CODEX_BACKUP)) {
+  if (!(0, import_node_fs23.existsSync)(SIGNED_CODEX_BACKUP)) {
     log("warn", "Sparkle update prep skipped; signed Codex.app backup is missing");
     return false;
   }
@@ -14850,12 +15089,12 @@ function prepareSignedCodexForSparkleInstall() {
       (0, import_node_child_process4.execFileSync)("xattr", ["-dr", "com.apple.quarantine", appRoot], { stdio: "ignore" });
     } catch {
     }
-    (0, import_node_fs22.writeFileSync)(UPDATE_MODE_FILE, JSON.stringify(mode, null, 2));
+    (0, import_node_fs23.writeFileSync)(UPDATE_MODE_FILE, JSON.stringify(mode, null, 2));
     log("info", "Restored signed Codex.app before Sparkle install", { appRoot });
     return true;
   } catch (e) {
     try {
-      (0, import_node_fs22.rmSync)(UPDATE_MODE_FILE, { force: true });
+      (0, import_node_fs23.rmSync)(UPDATE_MODE_FILE, { force: true });
     } catch {
     }
     log("error", "Failed to restore signed Codex.app before Sparkle install", {
@@ -14865,7 +15104,7 @@ function prepareSignedCodexForSparkleInstall() {
   }
 }
 function codexDesktopInstallPrerequisiteFailure() {
-  if (!(0, import_node_fs22.existsSync)(SIGNED_CODEX_BACKUP)) {
+  if (!(0, import_node_fs23.existsSync)(SIGNED_CODEX_BACKUP)) {
     return "The verified Developer ID signed Codex.app backup is missing. Refresh Tweakers before installing the desktop update.";
   }
   if (!isDeveloperIdSignedApp(SIGNED_CODEX_BACKUP)) {
@@ -14896,7 +15135,7 @@ function writeEnvironmentRuntimeProof() {
     const state = readInstallerState();
     const bundleId = state?.codexBundleId ?? null;
     const binaryPath = codexCliBootstrap.binary ?? (0, import_node_path26.join)(appRoot, "Contents", "Resources", "codex");
-    if (!(0, import_node_fs22.existsSync)(binaryPath)) throw new Error(`selected backend is missing at ${binaryPath}`);
+    if (!(0, import_node_fs23.existsSync)(binaryPath)) throw new Error(`selected backend is missing at ${binaryPath}`);
     const versionProbe = (0, import_node_child_process4.spawnSync)(binaryPath, ["--version"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -14917,13 +15156,13 @@ function writeEnvironmentRuntimeProof() {
       backendLane: codexCliBootstrap.effectiveLane === "beta" ? "managed-alpha" : "bundled",
       binaryPath,
       backendVersion: version,
-      backendFingerprint: (0, import_node_crypto10.createHash)("sha256").update((0, import_node_fs22.readFileSync)(binaryPath)).digest("hex"),
+      backendFingerprint: (0, import_node_crypto11.createHash)("sha256").update((0, import_node_fs23.readFileSync)(binaryPath)).digest("hex"),
       observedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
     const temporary = `${ENVIRONMENT_RUNTIME_PROOF_FILE}.${process.pid}.tmp`;
-    (0, import_node_fs22.writeFileSync)(temporary, `${JSON.stringify(proof, null, 2)}
+    (0, import_node_fs23.writeFileSync)(temporary, `${JSON.stringify(proof, null, 2)}
 `, { encoding: "utf8", mode: 384 });
-    (0, import_node_fs22.renameSync)(temporary, ENVIRONMENT_RUNTIME_PROOF_FILE);
+    (0, import_node_fs23.renameSync)(temporary, ENVIRONMENT_RUNTIME_PROOF_FILE);
   } catch (error) {
     log("error", "environment runtime proof failed", { message: error.message });
   }
@@ -16102,7 +16341,7 @@ import_electron4.app.whenReady().then(() => {
       userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest)
     }).then((answered) => {
       if (!answered) {
-        const requestPending = (0, import_node_fs22.existsSync)((0, import_node_path26.join)(userRoot, "health", "request.json"));
+        const requestPending = (0, import_node_fs23.existsSync)((0, import_node_path26.join)(userRoot, "health", "request.json"));
         log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
       }
       if (healthCheckOnly) import_electron4.app.exit(0);
@@ -16194,7 +16433,7 @@ import_electron4.ipcMain.handle("tweaker:list-tweaks", async () => {
       manifest,
       entry: local?.entry ?? "",
       dir: local?.dir ?? "",
-      entryExists: !!local && (0, import_node_fs22.existsSync)(local.entry),
+      entryExists: !!local && (0, import_node_fs23.existsSync)(local.entry),
       installed,
       enabled,
       status: deriveTweakStatus({ installed, enabled, health }),
@@ -16258,7 +16497,7 @@ function installedCodexDesktopVersion() {
   let plistBuild = null;
   try {
     if (root) {
-      const plist = (0, import_node_fs22.readFileSync)((0, import_node_path26.join)(root, "Contents", "Info.plist"), "utf8");
+      const plist = (0, import_node_fs23.readFileSync)((0, import_node_path26.join)(root, "Contents", "Info.plist"), "utf8");
       plistMarketingVersion = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1] ?? null;
       plistBuild = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1] ?? null;
     }
@@ -16279,7 +16518,7 @@ function installedCodexDesktopVersion() {
 function selectedCodexDesktopUpdateTarget() {
   let profile = "stable";
   try {
-    const selection = JSON.parse((0, import_node_fs22.readFileSync)(ENVIRONMENT_SELECTION_FILE, "utf8"));
+    const selection = JSON.parse((0, import_node_fs23.readFileSync)(ENVIRONMENT_SELECTION_FILE, "utf8"));
     if (selection.releaseProfile === "alpha") profile = "alpha";
   } catch {
   }
@@ -16419,7 +16658,7 @@ function persistCapturedCodexDesktopProfileFeed(capture) {
 }
 function readJsonDocument(file) {
   try {
-    return JSON.parse((0, import_node_fs22.readFileSync)(file, "utf8"));
+    return JSON.parse((0, import_node_fs23.readFileSync)(file, "utf8"));
   } catch {
     return null;
   }
@@ -16461,7 +16700,7 @@ async function getCodexVersionsSnapshot(force) {
     excludedPaths: [bundledPath, betaPath].filter((value) => !!value),
     isExecutable: (path) => {
       try {
-        return (0, import_node_fs22.existsSync)(path) && (0, import_node_fs22.statSync)(path).isFile();
+        return (0, import_node_fs23.existsSync)(path) && (0, import_node_fs23.statSync)(path).isFile();
       } catch {
         return false;
       }
@@ -16827,7 +17066,7 @@ import_electron4.ipcMain.handle("tweaker:run-tweaker-update", async () => {
     throw new Error("Tweakers source CLI was not found. Run the installer once, then try again.");
   }
   const cli = (0, import_node_path26.join)(sourceRoot, "packages", "installer", "dist", "cli.js");
-  if (!(0, import_node_fs22.existsSync)(cli)) {
+  if (!(0, import_node_fs23.existsSync)(cli)) {
     throw new Error("Tweakers source CLI was not found. Run the installer once, then try again.");
   }
   const pending = markSelfUpdateStarted(sourceRoot);
@@ -16840,7 +17079,7 @@ import_electron4.ipcMain.handle("tweaker:get-watcher-health", () => getWatcherHe
 import_electron4.ipcMain.handle("tweaker:repair-auto-maintenance", async (_e2, ...args) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
   const cli = localRefreshCli();
-  if (!(0, import_node_fs22.existsSync)(cli)) throw new Error("Tweakers maintenance CLI is unavailable");
+  if (!(0, import_node_fs23.existsSync)(cli)) throw new Error("Tweakers maintenance CLI is unavailable");
   startInstalledCli(cli, ["watcher-run"]);
   return { started: true, checkedAt: (/* @__PURE__ */ new Date()).toISOString() };
 });
@@ -16854,7 +17093,7 @@ import_electron4.ipcMain.handle("tweaker:get-tweak-store", async () => {
   const store = await fetchTweakStoreRegistry();
   const registry = store.registry;
   const installed = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
-  const entries = shuffleStoreEntries(registry.entries, import_node_crypto10.randomInt);
+  const entries = shuffleStoreEntries(registry.entries, import_node_crypto11.randomInt);
   return {
     ...registry,
     sourceUrl: TWEAK_STORE_INDEX_URL,
@@ -16941,7 +17180,7 @@ import_electron4.ipcMain.on("tweaker:preload-log", (_e2, level, msg) => {
 import_electron4.ipcMain.handle("tweaker:tweak-fs", (_e2, op, id, p2, c) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("bad tweak id");
   const dir = (0, import_node_path26.join)(userRoot, "tweak-data", id);
-  (0, import_node_fs22.mkdirSync)(dir, { recursive: true });
+  (0, import_node_fs23.mkdirSync)(dir, { recursive: true });
   const full = (0, import_node_path26.resolve)(dir, p2);
   if (!isPathInside2(dir, full) || full === dir) throw new Error("path traversal");
   const fs2 = require("node:fs");
@@ -17089,7 +17328,7 @@ function scheduleReload(reason) {
 }
 function devPublicationInProgress() {
   try {
-    return Date.now() - (0, import_node_fs22.statSync)(DEV_PUBLISH_LOCK).mtimeMs < DEV_PUBLISH_LOCK_MAX_AGE_MS;
+    return Date.now() - (0, import_node_fs23.statSync)(DEV_PUBLISH_LOCK).mtimeMs < DEV_PUBLISH_LOCK_MAX_AGE_MS;
   } catch {
     return false;
   }
@@ -17229,7 +17468,7 @@ function clearTweakModuleCache() {
 }
 function safeRealpath(filePath) {
   try {
-    return (0, import_node_fs22.realpathSync)(filePath);
+    return (0, import_node_fs23.realpathSync)(filePath);
   } catch {
     return filePath;
   }
@@ -17327,8 +17566,8 @@ async function fetchLatestRelease(repo, currentVersion, includePrerelease = fals
 }
 function readBundledTweakCatalog() {
   try {
-    if (!(0, import_node_fs22.existsSync)(TWEAK_CATALOG_FILE)) return null;
-    return normalizeStoreRegistry(JSON.parse((0, import_node_fs22.readFileSync)(TWEAK_CATALOG_FILE, "utf8")));
+    if (!(0, import_node_fs23.existsSync)(TWEAK_CATALOG_FILE)) return null;
+    return normalizeStoreRegistry(JSON.parse((0, import_node_fs23.readFileSync)(TWEAK_CATALOG_FILE, "utf8")));
   } catch (error) {
     log("warn", "failed to read bundled Tweakers catalog:", String(error));
     return null;
@@ -17435,7 +17674,7 @@ async function fetchTweakStoreRegistry() {
 }
 var warnedStoreRegistryFetch = false;
 async function installStoreTweak(entry) {
-  const work = (0, import_node_fs22.mkdtempSync)((0, import_node_path26.join)((0, import_node_os3.tmpdir)(), "tweaker-store-tweak-"));
+  const work = (0, import_node_fs23.mkdtempSync)((0, import_node_path26.join)((0, import_node_os3.tmpdir)(), "tweaker-store-tweak-"));
   const archive = (0, import_node_path26.join)(work, "source.tar.gz");
   const extractDir = (0, import_node_path26.join)(work, "extract");
   const target = (0, import_node_path26.join)(TWEAKS_DIR, entry.id);
@@ -17446,7 +17685,7 @@ async function installStoreTweak(entry) {
       const bundledPath = entry.source.path;
       if (typeof bundledPath !== "string") throw new Error(`bundled source for ${entry.id} is missing a path`);
       source = resolveBundledTweakPath(runtimeDir, { ...entry, source: { kind: "bundled", path: bundledPath } });
-      if (!(0, import_node_fs22.existsSync)(source) || !(0, import_node_fs22.statSync)(source).isDirectory()) {
+      if (!(0, import_node_fs23.existsSync)(source) || !(0, import_node_fs23.statSync)(source).isDirectory()) {
         throw new Error(`bundled source for ${entry.id} is missing from the installer runtime`);
       }
       log("info", `installing bundled tweak ${entry.id} from ${source}`);
@@ -17459,17 +17698,17 @@ async function installStoreTweak(entry) {
       });
       if (!res.ok) throw new Error(`download failed: ${res.status}`);
       const bytes = Buffer.from(await res.arrayBuffer());
-      (0, import_node_fs22.writeFileSync)(archive, bytes);
-      (0, import_node_fs22.mkdirSync)(extractDir, { recursive: true });
+      (0, import_node_fs23.writeFileSync)(archive, bytes);
+      (0, import_node_fs23.mkdirSync)(extractDir, { recursive: true });
       extractTarArchive(archive, extractDir);
       source = findTweakRoot(extractDir) ?? "";
       if (!source) throw new Error("downloaded archive did not contain manifest.json");
     }
     validateStoreTweakSource(entry, source);
-    (0, import_node_fs22.rmSync)(stagedTarget, { recursive: true, force: true });
+    (0, import_node_fs23.rmSync)(stagedTarget, { recursive: true, force: true });
     copyTweakSource(source, stagedTarget);
     const stagedFiles = hashTweakSource(stagedTarget);
-    (0, import_node_fs22.writeFileSync)(
+    (0, import_node_fs23.writeFileSync)(
       (0, import_node_path26.join)(stagedTarget, ".tweaker-store.json"),
       JSON.stringify(
         {
@@ -17485,10 +17724,10 @@ async function installStoreTweak(entry) {
       )
     );
     await assertStoreTweakCleanForAutoUpdate(entry, target, work);
-    (0, import_node_fs22.rmSync)(target, { recursive: true, force: true });
-    (0, import_node_fs22.cpSync)(stagedTarget, target, { recursive: true });
+    (0, import_node_fs23.rmSync)(target, { recursive: true, force: true });
+    (0, import_node_fs23.cpSync)(stagedTarget, target, { recursive: true });
   } finally {
-    (0, import_node_fs22.rmSync)(work, { recursive: true, force: true });
+    (0, import_node_fs23.rmSync)(work, { recursive: true, force: true });
   }
 }
 async function prepareTweakStoreSubmission(repoInput) {
@@ -17554,7 +17793,7 @@ function extractTarArchive(archive, targetDir) {
 }
 function validateStoreTweakSource(entry, source) {
   const manifestPath = (0, import_node_path26.join)(source, "manifest.json");
-  const manifest = JSON.parse((0, import_node_fs22.readFileSync)(manifestPath, "utf8"));
+  const manifest = JSON.parse((0, import_node_fs23.readFileSync)(manifestPath, "utf8"));
   if (manifest.id !== entry.manifest.id) {
     throw new Error(`downloaded tweak id ${manifest.id} does not match approved id ${entry.manifest.id}`);
   }
@@ -17567,12 +17806,12 @@ function validateStoreTweakSource(entry, source) {
   }
 }
 function findTweakRoot(dir) {
-  if (!(0, import_node_fs22.existsSync)(dir)) return null;
-  if ((0, import_node_fs22.existsSync)((0, import_node_path26.join)(dir, "manifest.json"))) return dir;
-  for (const name of (0, import_node_fs22.readdirSync)(dir)) {
+  if (!(0, import_node_fs23.existsSync)(dir)) return null;
+  if ((0, import_node_fs23.existsSync)((0, import_node_path26.join)(dir, "manifest.json"))) return dir;
+  for (const name of (0, import_node_fs23.readdirSync)(dir)) {
     const child = (0, import_node_path26.join)(dir, name);
     try {
-      if (!(0, import_node_fs22.statSync)(child).isDirectory()) continue;
+      if (!(0, import_node_fs23.statSync)(child).isDirectory()) continue;
     } catch {
       continue;
     }
@@ -17582,13 +17821,13 @@ function findTweakRoot(dir) {
   return null;
 }
 function copyTweakSource(source, target) {
-  (0, import_node_fs22.cpSync)(source, target, {
+  (0, import_node_fs23.cpSync)(source, target, {
     recursive: true,
     filter: (src) => !/(^|[/\\])(?:\.git|node_modules)(?:[/\\]|$)/.test(src)
   });
 }
 async function assertStoreTweakCleanForAutoUpdate(entry, target, work) {
-  if (!(0, import_node_fs22.existsSync)(target)) return;
+  if (!(0, import_node_fs23.existsSync)(target)) return;
   const metadata = readStoreInstallMetadata(target);
   if (!metadata) return;
   if (metadata.repo !== entry.repo) {
@@ -17603,10 +17842,10 @@ async function assertStoreTweakCleanForAutoUpdate(entry, target, work) {
 function readStoreInstallMetadata(target) {
   const currentPath = (0, import_node_path26.join)(target, ".tweaker-store.json");
   const legacyPath = (0, import_node_path26.join)(target, LEGACY_STORE_METADATA);
-  const metadataPath = (0, import_node_fs22.existsSync)(currentPath) ? currentPath : legacyPath;
-  if (!(0, import_node_fs22.existsSync)(metadataPath)) return null;
+  const metadataPath = (0, import_node_fs23.existsSync)(currentPath) ? currentPath : legacyPath;
+  if (!(0, import_node_fs23.existsSync)(metadataPath)) return null;
   try {
-    const parsed = JSON.parse((0, import_node_fs22.readFileSync)(metadataPath, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs23.readFileSync)(metadataPath, "utf8"));
     const bundled = parsed.source?.kind === "bundled";
     if (!bundled && (typeof parsed.repo !== "string" || typeof parsed.approvedCommitSha !== "string")) return null;
     return {
@@ -17632,8 +17871,8 @@ async function fetchBaselineStoreTweakHashes(metadata, work) {
     redirect: "follow"
   });
   if (!res.ok) throw new Error(`Could not verify local tweak changes before update: ${res.status}`);
-  (0, import_node_fs22.writeFileSync)(archive, Buffer.from(await res.arrayBuffer()));
-  (0, import_node_fs22.mkdirSync)(baselineDir, { recursive: true });
+  (0, import_node_fs23.writeFileSync)(archive, Buffer.from(await res.arrayBuffer()));
+  (0, import_node_fs23.mkdirSync)(baselineDir, { recursive: true });
   extractTarArchive(archive, baselineDir);
   const source = findTweakRoot(baselineDir);
   if (!source) throw new Error("Could not verify local tweak changes before update: baseline manifest missing");
@@ -17645,17 +17884,17 @@ function hashTweakSource(root) {
   return out;
 }
 function collectTweakFileHashes(root, dir, out) {
-  for (const name of (0, import_node_fs22.readdirSync)(dir).sort()) {
+  for (const name of (0, import_node_fs23.readdirSync)(dir).sort()) {
     if (name === ".git" || name === "node_modules" || name === ".tweaker-store.json" || name === LEGACY_STORE_METADATA) continue;
     const full = (0, import_node_path26.join)(dir, name);
     const rel = (0, import_node_path26.relative)(root, full).split("\\").join("/");
-    const stat4 = (0, import_node_fs22.statSync)(full);
+    const stat4 = (0, import_node_fs23.statSync)(full);
     if (stat4.isDirectory()) {
       collectTweakFileHashes(root, full, out);
       continue;
     }
     if (!stat4.isFile()) continue;
-    out[rel] = (0, import_node_crypto10.createHash)("sha256").update((0, import_node_fs22.readFileSync)(full)).digest("hex");
+    out[rel] = (0, import_node_crypto11.createHash)("sha256").update((0, import_node_fs23.readFileSync)(full)).digest("hex");
   }
 }
 function sameFileHashes(a, b2) {
@@ -17692,7 +17931,7 @@ function fallbackSourceRoot() {
     (0, import_node_path26.join)(userRoot, "source")
   ];
   for (const candidate of candidates) {
-    if ((0, import_node_fs22.existsSync)((0, import_node_path26.join)(candidate, "packages", "installer", "dist", "cli.js"))) return candidate;
+    if ((0, import_node_fs23.existsSync)((0, import_node_path26.join)(candidate, "packages", "installer", "dist", "cli.js"))) return candidate;
   }
   return null;
 }
@@ -17708,13 +17947,13 @@ function describeInstallationSource(sourceRoot) {
   if (/\/(?:Homebrew|homebrew)\/Cellar\/tweaker\//.test(normalized) || normalized.includes(`/${LEGACY_DATA_DIR.replace("-", "")}/`)) {
     return { kind: "homebrew", label: "Homebrew", detail: sourceRoot };
   }
-  if ((0, import_node_fs22.existsSync)((0, import_node_path26.join)(sourceRoot, ".git"))) {
+  if ((0, import_node_fs23.existsSync)((0, import_node_path26.join)(sourceRoot, ".git"))) {
     return { kind: "local-dev", label: "Local development checkout", detail: sourceRoot };
   }
   if (normalized.endsWith("/.tweaker/source") || normalized.includes("/.tweaker/source/") || normalized.endsWith(`/.${LEGACY_DATA_DIR}/source`) || normalized.includes(`/.${LEGACY_DATA_DIR}/source/`)) {
     return { kind: "github-source", label: "GitHub source installer", detail: sourceRoot };
   }
-  if ((0, import_node_fs22.existsSync)((0, import_node_path26.join)(sourceRoot, "package.json"))) {
+  if ((0, import_node_fs23.existsSync)((0, import_node_path26.join)(sourceRoot, "package.json"))) {
     return { kind: "source-archive", label: "Source archive", detail: sourceRoot };
   }
   return { kind: "unknown", label: "Unknown", detail: sourceRoot };
@@ -17738,7 +17977,7 @@ function startCodexDesktopUpdateTransaction() {
 }
 function desktopUpdateCli() {
   const cli = localRefreshCli();
-  if (!(0, import_node_fs22.existsSync)(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
+  if (!(0, import_node_fs23.existsSync)(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
   return cli;
 }
 function runInstalledCliJson(args, timeoutMs = 1e4) {
@@ -17800,14 +18039,14 @@ function attachEnvironmentHelperDiagnostics(value) {
   const label = `co.tweakers.environment.${transactionId}`;
   const readJson2 = (file) => {
     try {
-      return JSON.parse((0, import_node_fs22.readFileSync)(file, "utf8"));
+      return JSON.parse((0, import_node_fs23.readFileSync)(file, "utf8"));
     } catch {
       return null;
     }
   };
   const readLogTail = (file) => {
     try {
-      const contents = (0, import_node_fs22.readFileSync)(file, "utf8");
+      const contents = (0, import_node_fs23.readFileSync)(file, "utf8");
       return contents.slice(-16 * 1024);
     } catch {
       return "";
@@ -17857,7 +18096,7 @@ function localRefreshStatus() {
 }
 function probeLocalRefreshStatus() {
   const cli = localRefreshCli();
-  if (!(0, import_node_fs22.existsSync)(cli)) return Promise.resolve({
+  if (!(0, import_node_fs23.existsSync)(cli)) return Promise.resolve({
     available: false,
     source: "current",
     phase: "failed",
@@ -17908,7 +18147,7 @@ function resolveLocalRefreshSourceBinding() {
   }
   let exactRoot;
   try {
-    exactRoot = (0, import_node_fs22.realpathSync)(frozenRoot);
+    exactRoot = (0, import_node_fs23.realpathSync)(frozenRoot);
   } catch {
     return {
       cli: managedCli,
@@ -17925,7 +18164,7 @@ function resolveLocalRefreshSourceBinding() {
   }
   const sourceCli = (0, import_node_path26.join)(exactRoot, "packages", "installer", "dist", "cli.js");
   if (describeInstallationSource(exactRoot).kind === "local-dev") {
-    if (!(0, import_node_fs22.existsSync)(sourceCli)) {
+    if (!(0, import_node_fs23.existsSync)(sourceCli)) {
       return {
         cli: managedCli,
         developmentRoot: null,
@@ -17934,8 +18173,8 @@ function resolveLocalRefreshSourceBinding() {
     }
     return { cli: sourceCli, developmentRoot: exactRoot, unsafeReason: null };
   }
-  if ((0, import_node_fs22.existsSync)(managedCli)) return { cli: managedCli, developmentRoot: null, unsafeReason: null };
-  if ((0, import_node_fs22.existsSync)(sourceCli)) return { cli: sourceCli, developmentRoot: null, unsafeReason: null };
+  if ((0, import_node_fs23.existsSync)(managedCli)) return { cli: managedCli, developmentRoot: null, unsafeReason: null };
+  if ((0, import_node_fs23.existsSync)(sourceCli)) return { cli: sourceCli, developmentRoot: null, unsafeReason: null };
   return {
     cli: managedCli,
     developmentRoot: null,
@@ -17992,7 +18231,7 @@ async function startLocalRefresh(requested) {
   const appRoot = readInstallerState()?.appRoot;
   if (!appRoot) throw new Error("Tweakers refresh app root is unavailable");
   const dispatch = buildLocalRefreshDispatch(status, requested, appRoot);
-  if (!(0, import_node_fs22.existsSync)(dispatch.cli)) throw new Error("Tweakers refresh CLI is unavailable");
+  if (!(0, import_node_fs23.existsSync)(dispatch.cli)) throw new Error("Tweakers refresh CLI is unavailable");
   if (dispatch.args[0] !== "refresh-local") throw new Error("Tweakers refresh dispatch is invalid");
   startInstalledCli(dispatch.cli, ["refresh-local", ...dispatch.args.slice(1)]);
   return { started: true, status: { ...status, phase: "preparing" } };
@@ -18207,7 +18446,7 @@ function ownedCodexRenderer(webContentsId) {
 }
 function makeMainFs(id) {
   const dir = (0, import_node_path26.join)(userRoot, "tweak-data", id);
-  (0, import_node_fs22.mkdirSync)(dir, { recursive: true });
+  (0, import_node_fs23.mkdirSync)(dir, { recursive: true });
   const fs2 = require("node:fs/promises");
   return {
     dataDir: dir,
@@ -18349,7 +18588,7 @@ async function captureFrontmostWindow(options = {}) {
   const size = source.thumbnail.getSize();
   if (size.width * size.height > MAX_APPSHOT_PIXELS) throw new Error("frontmost window capture exceeded the AppShots pixel limit");
   return {
-    captureId: (0, import_node_crypto10.randomUUID)(),
+    captureId: (0, import_node_crypto11.randomUUID)(),
     capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
     app: {
       name: frontmost.appName || "Unknown",
@@ -18494,7 +18733,7 @@ function getOwlViewCapabilities() {
   };
 }
 async function createOwlView(ctx, opts) {
-  const id = assertBridgeId2(opts.id ?? (0, import_node_crypto10.randomUUID)(), "Codex view id");
+  const id = assertBridgeId2(opts.id ?? (0, import_node_crypto11.randomUUID)(), "Codex view id");
   const key = owlViewKey(ctx.id, id);
   if (owlViews.has(key)) throw new Error(`Codex view already exists: ${ctx.id}:${id}`);
   const parent = typeof opts.parentWindowId === "number" ? import_electron4.BrowserWindow.fromId(opts.parentWindowId) : getPrimaryCodexWindow();
