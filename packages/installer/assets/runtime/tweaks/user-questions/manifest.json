@@ -1,7 +1,7 @@
 {
   "id": "co.tweakers.user-questions",
   "name": "User Questions",
-  "version": "0.6.3",
+  "version": "0.6.0",
   "githubRepo": "therealityreport/tweakers",
   "description": "Task-scoped preference rounds with rich tradeoffs, explicit Skip and Other choices, resumable drafts, and safe generic fallback.",
   "author": "hulibrands",

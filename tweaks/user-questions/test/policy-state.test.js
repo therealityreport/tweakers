@@ -13,8 +13,8 @@ const {
   createPolicyCommandInterface,
   getPolicyTransactionStatus,
   maximumAccessApprovalPolicy,
-  migrateGlobalState: migrateGlobalStateForProfile,
-  previewPolicyChange: previewPolicyChangeForProfile,
+  migrateGlobalState,
+  previewPolicyChange,
   questionOnlyApprovalPolicy,
   repairGlobalStateFile,
   restorePolicyChange,
@@ -23,22 +23,7 @@ const {
 const SOURCE_NAME = ".codex-global-state.json";
 const TRANSACTIONS_NAME = ".user-questions-policy-transactions";
 
-// The original transaction-safety suite freezes the restrictive profile.
-// Candidate 0.6.3 keeps the separate maximum-access profile as the UI
-// default, so each legacy fixture now selects its intended profile explicitly.
-function migrateGlobalState(value, profile = "questions-only") {
-  return migrateGlobalStateForProfile(value, profile);
-}
-
-function previewPolicyChange(options = {}) {
-  return previewPolicyChangeForProfile({ ...options, profile: options.profile ?? "questions-only" });
-}
-
-function applyPolicyChange(options = {}) {
-  return applyPolicyChangeForProfile({ ...options, profile: options.profile ?? "questions-only" });
-}
-
-test("pure migration targets Custom mode and question-only policy without changing unrelated preferences", () => {
+test("pure migration defaults to Custom mode and maximum-access policy without changing unrelated preferences", () => {
   const source = fixtureValue();
   const result = migrateGlobalState(source);
 
@@ -49,23 +34,28 @@ test("pure migration targets Custom mode and question-only policy without changi
   assert.deepEqual(result.state["electron-persisted-atom-state"]["agent-mode-by-host-id"], { local: "custom", remote: "auto" });
   assert.deepEqual(result.state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"], {
     activePermissionProfile: null,
-    approvalPolicy: questionOnlyApprovalPolicy(),
+    approvalPolicy: maximumAccessApprovalPolicy(),
     approvalsReviewer: "user",
     sandboxPolicy: { type: "dangerFullAccess", networkAccess: true },
     runtimeWorkspaceRoots: ["/private/alpha-workspace"],
   });
 });
 
-test("0.6.3 policy profiles keep maximum access as the explicit default and preserve questions-only", () => {
-  const maximum = migrateGlobalStateForProfile(fixtureValue());
-  const restrictive = migrateGlobalStateForProfile(fixtureValue(), "questions-only");
-  const maximumTask = maximum.state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"];
-  const restrictiveTask = restrictive.state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"];
+test("permission profiles select exact granular values and can switch an already-managed Full Access task", () => {
+  const source = fixtureValue();
+  const questionsOnly = migrateGlobalState(source, "questions-only");
+  assert.deepEqual(
+    questionsOnly.state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"].approvalPolicy,
+    questionOnlyApprovalPolicy(),
+  );
 
-  assert.deepEqual(maximumTask.approvalPolicy, maximumAccessApprovalPolicy());
-  assert.deepEqual(restrictiveTask.approvalPolicy, questionOnlyApprovalPolicy());
-  assert.equal(POLICY_SETTINGS_VIEW_MODEL.defaultProfile, "maximum-access");
-  assert.deepEqual(Object.keys(POLICY_SETTINGS_VIEW_MODEL.profiles), ["maximum-access", "questions-only"]);
+  const maximum = migrateGlobalState(questionsOnly.state, "maximum-access");
+  assert.equal(maximum.changed, true);
+  assert.equal(maximum.repairedThreads, 1);
+  assert.deepEqual(
+    maximum.state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"].approvalPolicy,
+    maximumAccessApprovalPolicy(),
+  );
 });
 
 test("pure migration leaves non-Full-Access and semantically current task policies unchanged", () => {
@@ -88,7 +78,7 @@ test("pure migration leaves non-Full-Access and semantically current task polici
     },
   };
 
-  const result = migrateGlobalState(current);
+  const result = migrateGlobalState(current, "questions-only");
   assert.deepEqual(result, { changed: false, state: current, repairedThreads: 0 });
 });
 
@@ -105,7 +95,7 @@ test("Preview is byte-read-only, mode-bound, and content-redacted", (t) => {
     "profile",
     "sourceFingerprint",
   ]);
-  assert.equal(preview.profile, "questions-only");
+  assert.equal(preview.profile, "maximum-access");
   assert.equal(preview.affectedFieldCount, 3);
   assert.equal(preview.affectedTaskCount, 1);
   assert.deepEqual(preview.affectedFields, [
@@ -131,6 +121,8 @@ test("settings command interface freezes explicit consequences and never exposes
 
   assert.equal(commands.viewModel, POLICY_SETTINGS_VIEW_MODEL);
   assert.equal(Object.isFrozen(commands.viewModel), true);
+  assert.equal(commands.viewModel.defaultProfile, "maximum-access");
+  assert.deepEqual(Object.keys(commands.viewModel.profiles), ["maximum-access", "questions-only"]);
   assert.deepEqual(commands.viewModel.consequences, [
     "Moves the local Codex mode to Custom.",
     "Enables MCP question forms for matching Full Access tasks.",
@@ -144,7 +136,25 @@ test("settings command interface freezes explicit consequences and never exposes
 
   const before = snapshotTree(fixture.home);
   assert.match(commands.preview().previewToken, /^[a-f0-9]{64}$/);
+  assert.equal(commands.preview("questions-only").profile, "questions-only");
   assert.deepEqual(snapshotTree(fixture.home), before, "Preview followed by Cancel/no Apply writes nothing");
+});
+
+test("Apply binds the selected profile into its Preview token", (t) => {
+  const fixture = makeFixture(t);
+  const preview = previewPolicyChange({ codexHome: fixture.home, profile: "maximum-access" });
+  assert.throws(
+    () => applyPolicyChange({
+      codexHome: fixture.home,
+      previewToken: preview.previewToken,
+      profile: "questions-only",
+    }),
+    hasCode("POLICY_PREVIEW_STALE"),
+  );
+  assert.throws(
+    () => previewPolicyChange({ codexHome: fixture.home, profile: "unknown" }),
+    hasCode("POLICY_PROFILE_INVALID"),
+  );
 });
 
 test("deprecated repair compatibility is Preview-only and cannot approve automatic startup mutation", (t) => {
@@ -546,7 +556,7 @@ test("Apply creates a unique private raw backup and durable receipt, verifies ha
   const task = state["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"];
   assert.equal(state["electron-persisted-atom-state"]["agent-mode-by-host-id"].local, "custom");
   assert.equal(task.activePermissionProfile, null);
-  assert.deepEqual(task.approvalPolicy, questionOnlyApprovalPolicy());
+  assert.deepEqual(task.approvalPolicy, maximumAccessApprovalPolicy());
   assert.deepEqual(task.runtimeWorkspaceRoots, ["/private/alpha-workspace"]);
   assert.deepEqual(task.sandboxPolicy, { type: "dangerFullAccess", networkAccess: true });
 
@@ -670,7 +680,7 @@ test("Apply of an already-current Preview is a no-write idempotent result", (t) 
     transactionId: null,
     restartRequired: false,
     restarted: false,
-    profile: "questions-only",
+    profile: "maximum-access",
   });
   assert.deepEqual(snapshotTree(fixture.home), before);
 });
@@ -1278,7 +1288,7 @@ function currentFixtureValue() {
   value["electron-persisted-atom-state"]["agent-mode-by-host-id"].local = "custom";
   const task = value["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["private-task-alpha"];
   task.activePermissionProfile = null;
-  task.approvalPolicy = questionOnlyApprovalPolicy();
+  task.approvalPolicy = maximumAccessApprovalPolicy();
   return value;
 }
 

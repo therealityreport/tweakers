@@ -10,6 +10,7 @@ const { CARRIER_NONCE_PREFIX } = require("../broker-protocol");
 const { createDraftStore } = require("../draft-store");
 const { createMainBroker } = require("../main-broker");
 const manifest = require("../manifest.json");
+const { serializeToolResult } = require("../mcp-server");
 
 const MODERN = "2025-11-25";
 const LEGACY = "2025-06-18";
@@ -28,9 +29,8 @@ test("modern MCP keeps generic fallback to one real question per form without ca
   send(child, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   const tool = (await messages.next()).value.result.tools[0];
   assert.equal(tool.name, "ask");
-  assert.match(tool.description, /one question at a time/);
+  assert.match(tool.description, /single standard form/);
   assert.match(tool.description, /Cancellation and display failure are explicit terminal statuses/);
-  assert.match(tool.description, /validated answers for every question/);
   assert.equal(tool.description.includes("request_user_input"), false);
   assert.equal(tool.inputSchema.properties.resume_token.type, "string");
   assert.deepEqual(tool.inputSchema.properties.questions.items.properties.options.items.properties.recommended, {
@@ -81,32 +81,14 @@ test("modern MCP keeps generic fallback to one real question per form without ca
   await closeServer(child);
 });
 
-test("the nonce carrier is a single real first question and never a visible marker", async (t) => {
-  const harness = await startBrokerHarness(t);
-  const { child, messages } = await startServer(t, { env: harness.env });
-  sendAsk(child, 2, oneQuestionRound());
-  const form = (await messages.next()).value;
-  const carrier = carrierField(form);
-  const properties = form.params.requestedSchema.properties;
-  assert.deepEqual(Object.keys(properties).sort(), [
-    "__tweakers_carrier_other_" + carrier.slice(CARRIER_NONCE_PREFIX.length),
-    carrier,
-  ].sort());
-  assert.equal(properties[carrier].title, "Delivery");
-  assert.equal(properties[carrier].type, "string");
-  assert.match(properties[carrier].description, /How should scanning be delivered/);
-  assertNoInternalCarrierCopy(form);
-  accept(child, form, {
-    [carrier]: "__other__",
-    [`__tweakers_carrier_other_${carrier.slice(CARRIER_NONCE_PREFIX.length)}`]: "Carrier-specific answer",
+test("MCP serialization rejects an empty submitted result instead of returning success", () => {
+  const response = serializeToolResult(richRound(), {
+    status: "submitted",
+    cancelled: false,
+    answers: {},
   });
-  const result = (await messages.next()).value.result.structuredContent;
-  assert.deepEqual(result.answers.delivery, {
-    status: "answered",
-    selected_option_ids: [],
-    other_text: "Carrier-specific answer",
-  });
-  await closeServer(child);
+  assert.equal(response.isError, true);
+  assert.match(response.content[0].text, /needs at least [12] answers?/);
 });
 
 test("generic validation retains parsed values for exactly one bounded correction", async (t) => {

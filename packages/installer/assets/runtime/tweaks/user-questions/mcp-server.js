@@ -786,7 +786,7 @@ function serializeToolResult(input, result) {
 function toolDefinition() {
   return {
     name: "ask",
-    description: "Ask one task-scoped structured round of 1-6 questions. Prefer 4-6 currently answerable questions. The enhanced card and every compatible host fallback present one question at a time; no generic form combines a whole round. Every question supports explicit Skip; Other is available when enabled. Rich plain-text details and tradeoffs remain available in both paths. Submitted choices are current-task preferences, not permanent rules: explain conflicts and ask before materially changing direction. A submitted result must contain validated answers for every question. Cancellation and display failure are explicit terminal statuses, never defaults or empty success. Question and answer content is not written to diagnostic logs.",
+    description: "Ask one task-scoped structured round of 1-6 questions in a single standard form. Prefer 4-6 currently answerable questions. Every question supports explicit Skip; Other is available when enabled. Rich plain-text details and tradeoffs remain available in both the enhanced and generic form paths. Submitted choices are current-task preferences, not permanent rules: explain conflicts and ask before materially changing direction. A submitted result must contain validated answers for every question. Cancellation and display failure are explicit terminal statuses, never defaults or empty success. Question and answer content is not written to diagnostic logs.",
     inputSchema: {
       type: "object",
       additionalProperties: false,

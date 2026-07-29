@@ -63,6 +63,15 @@ Both profiles preserve `dangerFullAccess`; they replace the task-level
 `approvalPolicy: "never"` override with an explicit granular policy. The page
 then offers Preview, Apply, and Restore commands:
 
+- **Maximum access** permits every granular approval category, including MCP
+  question forms. This is the default selection.
+- **Questions only** permits MCP question forms and rejects sandbox, rules,
+  skill, and permission-request approval categories.
+
+Both profiles preserve `dangerFullAccess`; they replace the task-level
+`approvalPolicy: "never"` override with an explicit granular policy. The page
+then offers Preview, Apply, and Restore commands:
+
 - A profile row is a proposed Preview choice, not an active-state indicator.
 - The page marks a profile as saved only while every transaction target still
   matches the applied policy.

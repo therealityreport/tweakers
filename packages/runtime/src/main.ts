@@ -1409,6 +1409,1139 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+type PromotionProbeValue = "pass" | "fail" | "unknown";
+const USER_QUESTIONS_TWEAK_ID = "co.tweakers.user-questions";
+const USER_QUESTIONS_FOLDER = "user-questions";
+const SANITIZED_PROMOTION_POLICY_FAILURES = new WeakSet<object>();
+
+function assertPromotionProbeIsolation(): void {
+  if (!healthCheckOnly) throw new Error("promotion probes require a one-shot health process");
+  const candidateRequested = process.env.TWEAKERS_CANDIDATE_MCP_RECONCILIATION !== undefined;
+  if (candidateRequested && !MCP_RUNTIME_PATHS.candidateIsolated) {
+    throw new Error("candidate promotion probe did not resolve contained MCP paths");
+  }
+}
+
+function promotionSurfaceHash(surface: PromotionSurfaceName): string {
+  assertPromotionProbeIsolation();
+  switch (surface) {
+    case "app": return promotionAppHeaderHash();
+    case "runtime": return fingerprintPromotionPath(runtimeDir!);
+    case "tweakTree": return fingerprintPromotionPath(TWEAKS_DIR);
+    case "tweakersConfig": return fingerprintPromotionPath(CONFIG_FILE);
+    case "codexConfig": return fingerprintPromotionPath(CODEX_CONFIG_FILE);
+    case "namespaceData": return fingerprintPromotionPath(join(userRoot!, "tweak-data", USER_QUESTIONS_TWEAK_ID));
+    case "mainStorage": return fingerprintPromotionPath(join(userRoot!, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`));
+    case "policy": return promotionPolicySurfaceHash();
+  }
+}
+
+function promotionPolicySurfaceHash(): string {
+  try {
+    return fingerprintPromotionPolicyPath(join(MCP_RUNTIME_PATHS.codexHome, ".codex-global-state.json"));
+  } catch (error) {
+    if (error !== null && (typeof error === "object" || typeof error === "function")) {
+      SANITIZED_PROMOTION_POLICY_FAILURES.add(error);
+    }
+    log("error", "promotion policy fingerprint failed", {
+      surface: "policy",
+      reason: promotionPolicyFingerprintFailureReason(error),
+    });
+    throw error;
+  }
+}
+
+/** Parse only the bounded ASAR pickle header and hash the decoded JSON string. */
+function promotionAppHeaderHash(): string {
+  const archivePath = join(process.resourcesPath, "app.asar");
+  // Electron's ordinary fs facade treats app.asar as a virtual directory.
+  // Promotion proof needs the sealed archive bytes, so use the raw fs module.
+  return hashRawAsarHeader(archivePath, originalFs);
+}
+
+/** Mode- and link-aware deterministic hash paired with install.ts. */
+function fingerprintPromotionPath(path: string): string {
+  if (!existsSync(path)) return "missing";
+  const digest = createHash("sha256");
+  const visit = (entryPath: string, name: string): void => {
+    const stat = lstatSync(entryPath);
+    digest.update(name).update("\0").update(String(stat.mode & 0o777)).update("\0");
+    if (stat.isDirectory()) {
+      digest.update("directory\0");
+      for (const child of readdirSync(entryPath).sort()) {
+        visit(join(entryPath, child), name ? `${name}/${child}` : child);
+      }
+      return;
+    }
+    if (stat.isFile()) {
+      digest.update("file\0").update(readFileSync(entryPath));
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      digest.update("symlink\0").update(readlinkSync(entryPath));
+      return;
+    }
+    throw new Error(`unsupported promotion surface entry: ${entryPath}`);
+  };
+  visit(path, "");
+  return digest.digest("hex");
+}
+
+/** Exact payload hash paired with user-questions-source.ts (symlinks fail). */
+function fingerprintUserQuestionsPath(path: string): string {
+  const rootStat = lstatSync(path);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("User Questions source must be a real directory");
+  }
+  const digest = createHash("sha256");
+  digest.update("directory\0").update(String(rootStat.mode & 0o777)).update("\0");
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const entryPath = join(directory, entry.name);
+      const entryStat = lstatSync(entryPath);
+      if (entryStat.isSymbolicLink()) throw new Error(`User Questions source contains a symbolic link: ${entryPath}`);
+      const name = relative(path, entryPath);
+      digest.update(name).update("\0").update(String(entryStat.mode & 0o777)).update("\0");
+      if (entryStat.isDirectory()) {
+        digest.update("directory\0");
+        visit(entryPath);
+      } else if (entryStat.isFile()) {
+        digest.update("file\0").update(readFileSync(entryPath));
+      } else {
+        throw new Error(`unsupported User Questions source entry: ${entryPath}`);
+      }
+    }
+  };
+  visit(path);
+  return digest.digest("hex");
+}
+
+function requirePromotionModule(root: string, entrypoint: string): unknown {
+  if (basename(entrypoint) !== entrypoint || !entrypoint.endsWith(".js")) {
+    throw new Error("User Questions entrypoints must be direct JavaScript children");
+  }
+  const path = join(root, entrypoint);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
+    throw new Error(`User Questions entrypoint is unsafe: ${entrypoint}`);
+  }
+  return require(path) as unknown;
+}
+
+function promotionSelfTest(run: () => boolean): PromotionProbeValue {
+  try {
+    return run() ? "pass" : "fail";
+  } catch {
+    return "fail";
+  }
+}
+
+function userQuestionsMcpConflictCount(): number {
+  const stat = lstatSync(MCP_SYNC_STATE_FILE);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o777) !== 0o600
+    || stat.size > 256 * 1024
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+  ) throw new Error("MCP reconciliation receipt is not owner-only");
+  const receipt = readMcpSyncState(MCP_SYNC_STATE_FILE);
+  if (!receipt || receipt.schemaVersion !== 2 || receipt.phase !== "complete") {
+    throw new Error("MCP reconciliation receipt is incomplete");
+  }
+  const configBytes = existsSync(CODEX_CONFIG_FILE) ? readFileSync(CODEX_CONFIG_FILE) : Buffer.alloc(0);
+  if (receipt.afterFingerprint !== createHash("sha256").update(configBytes).digest("hex")) {
+    throw new Error("MCP reconciliation receipt does not bind the observed Codex config");
+  }
+  if (!userQuestionsMcpReceiptMatchesEnabledState(receipt, isTweakEnabled(USER_QUESTIONS_TWEAK_ID))) {
+    throw new Error("MCP receipt does not prove the expected User Questions enabled state and policy");
+  }
+  return receipt.conflicts.length;
+}
+
+function promotionUserQuestionsHealth(rendererStorageSelfTest: HealthValue): UserQuestionsHealthObservation {
+  assertPromotionProbeIsolation();
+  const root = join(TWEAKS_DIR, USER_QUESTIONS_FOLDER);
+  const manifestPath = join(root, "manifest.json");
+  const manifestStat = lstatSync(manifestPath);
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 64 * 1024) {
+    throw new Error("User Questions manifest is unsafe");
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  if (manifest.id !== USER_QUESTIONS_TWEAK_ID) throw new Error("User Questions canonical identity is missing");
+  if (typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+    throw new Error("User Questions version is invalid");
+  }
+  if (manifest.scope !== "main" && manifest.scope !== "both") throw new Error("User Questions main lifecycle is missing");
+  const permissions = Array.isArray(manifest.permissions) ? manifest.permissions : [];
+  if (!permissions.includes("ipc") || !permissions.includes("network")) {
+    throw new Error("User Questions broker permissions are missing");
+  }
+  const mainEntrypoint = typeof manifest.main === "string" ? manifest.main : "index.js";
+  const mcp = manifest.mcp && typeof manifest.mcp === "object" && !Array.isArray(manifest.mcp)
+    ? manifest.mcp as Record<string, unknown>
+    : null;
+  const mcpArgs = mcp && Array.isArray(mcp.args) ? mcp.args : [];
+  const mcpEntrypoint = mcpArgs.find((value): value is string => typeof value === "string" && value.endsWith(".js"));
+  if (mcp?.command !== "node" || !mcpEntrypoint) throw new Error("User Questions MCP entrypoint is invalid");
+  requirePromotionModule(root, mcpEntrypoint);
+
+  const mainLifecycle = promotionSelfTest(() => {
+    const lifecycle = requirePromotionModule(root, mainEntrypoint) as { start?: unknown; stop?: unknown };
+    return typeof lifecycle.start === "function" && typeof lifecycle.stop === "function";
+  });
+  const brokerSelfTest = promotionSelfTest(() => {
+    const broker = requirePromotionModule(root, "broker-protocol.js") as {
+      requestFrame(id: string, method: string, payload: object): unknown;
+      encodeFrame(frame: unknown): Buffer;
+      decodeFrame(frame: Buffer): Record<string, unknown>;
+    };
+    const request = broker.requestFrame("promotion-health", "ping", { probe: true });
+    const decoded = broker.decodeFrame(broker.encodeFrame(request));
+    let rejectedMalformed = false;
+    try { broker.decodeFrame(Buffer.from("{}\n")); } catch { rejectedMalformed = true; }
+    return decoded.version === 1 && decoded.kind === "request" && decoded.id === "promotion-health"
+      && decoded.method === "ping" && rejectedMalformed;
+  });
+  const schemaSelfTest = promotionSelfTest(() => {
+    const schema = requirePromotionModule(root, "core.js") as {
+      validateAskInput(value: unknown): { ok: boolean };
+    };
+    const valid = schema.validateAskInput({
+      round_id: "promotion-health",
+      questions: [{
+        id: "choice",
+        header: "Promotion health",
+        question: "Does the native decision schema accept this round?",
+        selection_mode: "single",
+        options: [
+          { id: "yes", label: "Yes (Recommended)", description: "Accept the canonical schema.", recommended: true },
+          { id: "no", label: "No", description: "Reject the canonical schema." },
+        ],
+        allow_other: true,
+      }],
+    });
+    const invalid = schema.validateAskInput({ round_id: "promotion-health", questions: [] });
+    return valid.ok === true && invalid.ok === false;
+  });
+  return {
+    id: USER_QUESTIONS_TWEAK_ID,
+    version: manifest.version,
+    payloadHash: fingerprintUserQuestionsPath(root),
+    mainLifecycle,
+    brokerSelfTest,
+    schemaSelfTest,
+    rendererStorageSelfTest,
+    mcpConflictCount: userQuestionsMcpConflictCount(),
+  };
+}
+
+async function runPromotionRendererProof(): Promise<PromotionRendererProofResult> {
+  assertPromotionProbeIsolation();
+  const nonce = randomUUID();
+  const url = promotionRendererDocumentUrl(nonce);
+  const tracker = createPromotionRendererProofTracker({ nonce, url, preloadPath: PRELOAD_PATH });
+  const healthProtocol = session.defaultSession.protocol;
+  let protocolHandlerInstalled = false;
+  let proofWindow: Electron.BrowserWindow | null = null;
+  let authorizationConsumed = false;
+  let handshakeConsumed = false;
+  let settleHandshake: (() => void) | null = null;
+  let handshakeSettled = false;
+  const handshake = new Promise<void>((resolvePromise) => {
+    settleHandshake = () => {
+      if (handshakeSettled) return;
+      handshakeSettled = true;
+      resolvePromise();
+    };
+  });
+  const onHandshake = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const windowAlive = proofWindow !== null && !proofWindow.isDestroyed() && !proofWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === proofWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === proofWindow!.webContents.mainFrame;
+    const decision = validatePromotionRendererHandshake({
+      windowAlive,
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      expectedUrl: url,
+      authorizationConsumed,
+      handshakeConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      log("warn", "promotion renderer lifecycle handshake rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    handshakeConsumed = true;
+    tracker.rendererHandshake({
+      webContentsId: event.sender.id,
+      ...decision.observation,
+    });
+    log("info", "promotion renderer lifecycle handshake accepted", {
+      webContentsId: event.sender.id,
+      lifecycle: decision.observation.lifecycle,
+      rendererStorageSelfTest: decision.observation.rendererStorageSelfTest,
+    });
+    settleHandshake?.();
+  };
+  const onAuthorization = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    let decision: ReturnType<typeof authorizePromotionRenderer>;
+    let serializedResponse: string | null = null;
+    try {
+      const windowAlive = proofWindow !== null && !proofWindow.isDestroyed() && !proofWindow.webContents.isDestroyed();
+      const senderMatches = windowAlive && event.sender.id === proofWindow!.webContents.id;
+      const frameMatches = senderMatches
+        && event.senderFrame !== null
+        && event.senderFrame === proofWindow!.webContents.mainFrame;
+      decision = authorizePromotionRenderer({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: url,
+        consumed: authorizationConsumed,
+      }, payload, nonce);
+      if (decision.accepted) serializedResponse = JSON.stringify(decision.response);
+    } catch {
+      event.returnValue = null;
+      log("warn", "promotion renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: "authorization exception",
+      });
+      return;
+    }
+    if (!decision.accepted) {
+      event.returnValue = null;
+      log("warn", "promotion renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    authorizationConsumed = true;
+    event.returnValue = serializedResponse!;
+    log("info", "promotion renderer authorization accepted", {
+      webContentsId: event.sender.id,
+    });
+  };
+  ipcMain.on(PROMOTION_RENDERER_AUTH_CHANNEL, onAuthorization);
+  ipcMain.on(PROMOTION_RENDERER_IPC_CHANNEL, onHandshake);
+  try {
+    if (healthProtocol.isProtocolHandled(PROMOTION_RENDERER_SCHEME)) {
+      throw new Error("health-only app protocol already has a handler");
+    }
+    healthProtocol.handle(
+      PROMOTION_RENDERER_SCHEME,
+      createPromotionRendererProtocolResponder(join(process.resourcesPath, "app.asar", "webview")),
+    );
+    protocolHandlerInstalled = true;
+    log("info", "promotion renderer protocol handler installed", {
+      scheme: PROMOTION_RENDERER_SCHEME,
+      sessionIsDefault: true,
+    });
+    proofWindow = new BrowserWindow({
+      width: 1,
+      height: 1,
+      show: false,
+      skipTaskbar: true,
+      webPreferences: {
+        preload: PRELOAD_PATH,
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        devTools: false,
+      },
+    });
+    const proofWebContents = proofWindow.webContents;
+    const preferences = (proofWebContents as unknown as {
+      getLastWebPreferences?: () => { preload?: string };
+    }).getLastWebPreferences?.();
+    tracker.windowCreated({
+      webContentsId: proofWebContents.id,
+      url,
+      preloadPath: preferences?.preload ?? null,
+    });
+    log("info", "promotion renderer load started", {
+      webContentsId: proofWebContents.id,
+      url,
+      preloadRegistered: preferences?.preload === PRELOAD_PATH,
+    });
+    proofWebContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+      tracker.didFailLoad({
+        webContentsId: proofWebContents.id,
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      });
+      log("warn", "promotion renderer did-fail-load", {
+        webContentsId: proofWebContents.id,
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      });
+      settleHandshake?.();
+    });
+    proofWebContents.on("render-process-gone", (_event, details) => {
+      tracker.renderProcessGone({
+        webContentsId: proofWebContents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      log("warn", "promotion renderer process exited", {
+        webContentsId: proofWebContents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      settleHandshake?.();
+    });
+    const load = proofWindow.loadURL(url).then(() => {
+      tracker.didFinishLoad({ webContentsId: proofWebContents.id, url: proofWebContents.getURL() });
+      log("info", "promotion renderer load completed", {
+        webContentsId: proofWebContents.id,
+        url: proofWebContents.getURL(),
+      });
+    }).catch((error) => {
+      const rejection = promotionRendererLoadRejection(error, url);
+      tracker.didFailLoad({
+        webContentsId: proofWebContents.id,
+        ...rejection,
+      });
+      log("warn", "promotion renderer loadURL rejected", {
+        webContentsId: proofWebContents.id,
+        ...rejection,
+      });
+      settleHandshake?.();
+    });
+    await withTimeout(Promise.all([load, handshake]).then(() => undefined), 5_000).catch(() => undefined);
+    const result = tracker.result();
+    if (result.hostReady === "pass" && result.rendererStorageSelfTest === "pass") {
+      log("info", "promotion renderer mount/handshake succeeded", {
+        webContentsId: proofWebContents.id,
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+      });
+    } else {
+      log("warn", "promotion renderer mount/handshake incomplete", {
+        webContentsId: proofWebContents.id,
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+      });
+    }
+    return result;
+  } catch (error) {
+    log("warn", "promotion renderer proof could not create its hidden window", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return tracker.result();
+  } finally {
+    ipcMain.removeListener(PROMOTION_RENDERER_AUTH_CHANNEL, onAuthorization);
+    ipcMain.removeListener(PROMOTION_RENDERER_IPC_CHANNEL, onHandshake);
+    if (proofWindow && !proofWindow.isDestroyed()) proofWindow.destroy();
+    if (protocolHandlerInstalled) {
+      try {
+        healthProtocol.unhandle(PROMOTION_RENDERER_SCHEME);
+        log("info", "promotion renderer protocol handler removed", { scheme: PROMOTION_RENDERER_SCHEME });
+      } catch (error) {
+        log("warn", "promotion renderer protocol handler cleanup failed", {
+          scheme: PROMOTION_RENDERER_SCHEME,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+}
+
+interface PromotionOriginalMainProbe {
+  registerSession(targetSession: Electron.Session, label: string): void;
+  run(): Promise<PromotionRendererProofResult>;
+}
+
+function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
+  const nonce = randomUUID();
+  const tracker = createPromotionOriginalRendererProofTracker(nonce);
+  const capturedWindows = new Set<Electron.BrowserWindow>();
+  const registeredSessions = new Set<Electron.Session>();
+  const preloadErrorWebContentsIds = new Set<number>();
+  const windowCleanup = new Map<Electron.BrowserWindow, Array<() => void>>();
+  let canonicalWindow: Electron.BrowserWindow | null = null;
+  let canonicalBackgroundThrottlingPrevious: boolean | null = null;
+  let authorizationConsumed = false;
+  let loadObservedConsumed = false;
+  let handshakeConsumed = false;
+  let cleaningUp = false;
+  let cleanupFinished = false;
+  let lateWindowDuringCleanup = false;
+  let settled = false;
+  let deadlineController: ReturnType<typeof createPromotionOriginalRendererDeadlineController> | null = null;
+  let settleProof: (() => void) | null = null;
+  const proofSettled = new Promise<void>((resolvePromise) => {
+    settleProof = resolvePromise;
+  });
+  const originalOpacitySetters = new WeakMap<
+    Electron.BrowserWindow,
+    (opacity: number) => void
+  >();
+
+  const settleIfComplete = (): void => {
+    if (settled || !tracker.complete()) return;
+    settled = true;
+    deadlineController?.settle();
+    settleProof?.();
+  };
+  const fail = (reason: string, webContentsId?: number): void => {
+    tracker.fail(reason, webContentsId);
+    log("warn", "promotion original renderer proof failed", {
+      reason,
+      webContentsId: webContentsId ?? null,
+    });
+    settleIfComplete();
+  };
+  const requireBackgroundThrottlingDisabled = (
+    contents: Electron.WebContents,
+    phase: string,
+    configure = false,
+  ): boolean => {
+    const configured = configure
+      ? disablePromotionOriginalRendererBackgroundThrottling(contents)
+      : null;
+    if (configured) canonicalBackgroundThrottlingPrevious = configured.previous;
+    const checked = configured ?? verifyPromotionOriginalRendererBackgroundThrottlingDisabled(contents);
+    log(checked.ok ? "info" : "warn", "promotion original renderer background throttling checked", {
+      webContentsId: contents.id,
+      previous: canonicalBackgroundThrottlingPrevious,
+      observed: checked.observed,
+      phase,
+    });
+    if (!checked.ok) {
+      fail(configure
+        ? "canonical renderer background throttling could not be disabled"
+        : "canonical renderer background throttling was not disabled", contents.id);
+    }
+    return checked.ok;
+  };
+  deadlineController = createPromotionOriginalRendererDeadlineController({
+    onTimeout: (phase) => {
+      fail(phase === "startup"
+        ? "promotion original renderer startup timed out"
+        : phase === "load"
+          ? "promotion original renderer load timed out"
+          : "promotion original renderer mount timed out");
+    },
+  });
+  const forceWindowTransparent = (window: Electron.BrowserWindow): boolean => {
+    if (window.isDestroyed()) return false;
+    try {
+      const setOpacity = originalOpacitySetters.get(window)
+        ?? ((opacity: number) => window.setOpacity(opacity));
+      setOpacity(0);
+      return window.getOpacity() === 0;
+    } catch {
+      return false;
+    }
+  };
+  const hideWindow = (window: Electron.BrowserWindow): void => {
+    if (window.isDestroyed()) return;
+    forceWindowTransparent(window);
+    try { window.setFocusable(false); } catch { /* Best effort; visibility is checked below. */ }
+    try { window.hide(); } catch { /* Best effort; visibility is checked below. */ }
+    try { window.blur(); } catch { /* Best effort; visibility is checked below. */ }
+  };
+  const suppressWindowOpacity = (
+    window: Electron.BrowserWindow,
+    removers: Array<() => void>,
+  ): void => {
+    const mutableWindow = window as unknown as {
+      setOpacity: (opacity: number) => void;
+    };
+    const original = mutableWindow.setOpacity;
+    if (typeof original !== "function") {
+      fail("captured window opacity interception unavailable");
+      return;
+    }
+    const setOriginalOpacity = (opacity: number): void => {
+      original.call(window, opacity);
+    };
+    originalOpacitySetters.set(window, setOriginalOpacity);
+    const suppressed = (_opacity: number): void => {
+      setOriginalOpacity(0);
+      log("info", "promotion original BrowserWindow opacity suppressed", {
+        webContentsId: window.webContents.id,
+      });
+    };
+    try {
+      setOriginalOpacity(0);
+      mutableWindow.setOpacity = suppressed;
+    } catch {
+      originalOpacitySetters.delete(window);
+      fail("captured window opacity interception failed");
+      return;
+    }
+    if (mutableWindow.setOpacity !== suppressed || !forceWindowTransparent(window)) {
+      fail("captured window opacity interception did not stick");
+      return;
+    }
+    removers.push(() => {
+      if (mutableWindow.setOpacity === suppressed) mutableWindow.setOpacity = original;
+      originalOpacitySetters.delete(window);
+    });
+  };
+  type SuppressedWindowActivationMethod = "show" | "showInactive" | "focus" | "restore";
+  const suppressWindowActivationMethod = (
+    window: Electron.BrowserWindow,
+    method: SuppressedWindowActivationMethod,
+    removers: Array<() => void>,
+  ): void => {
+    const mutableWindow = window as unknown as Record<
+      SuppressedWindowActivationMethod,
+      (...args: unknown[]) => void
+    >;
+    const original = mutableWindow[method];
+    if (typeof original !== "function") {
+      fail(`captured window ${method} interception unavailable`);
+      return;
+    }
+    const suppressed = (..._args: unknown[]): void => {
+      log("info", "promotion original BrowserWindow activation suppressed", {
+        webContentsId: window.webContents.id,
+        method,
+      });
+      hideWindow(window);
+    };
+    try {
+      mutableWindow[method] = suppressed;
+    } catch {
+      fail(`captured window ${method} interception failed`);
+      return;
+    }
+    if (mutableWindow[method] !== suppressed) {
+      fail(`captured window ${method} interception did not stick`);
+      return;
+    }
+    removers.push(() => {
+      // Do not overwrite an original-main replacement installed after ours.
+      if (mutableWindow[method] === suppressed) mutableWindow[method] = original;
+    });
+  };
+  const originalPreloadIsValid = (preloadPath: unknown): preloadPath is string => {
+    if (typeof preloadPath !== "string" || !isAbsolute(preloadPath)) return false;
+    const exactPath = resolve(preloadPath);
+    if (preloadPath !== exactPath || exactPath === resolve(PROMOTION_HEALTH_PRELOAD_PATH)) return false;
+    const originalAsarRoot = resolve(process.resourcesPath, "app.asar");
+    const containedPath = relative(originalAsarRoot, exactPath);
+    if (!containedPath || containedPath.startsWith("..") || isAbsolute(containedPath)) return false;
+    try {
+      return existsSync(exactPath) && lstatSync(exactPath).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const considerEligible = (
+    window: Electron.BrowserWindow,
+    url: string,
+    isMainFrame: boolean,
+  ): void => {
+    const canonicalUrl = canonicalPromotionOriginalRendererUrl(url);
+    if (!isMainFrame || canonicalUrl === null || window.isDestroyed()) return;
+    const contents = window.webContents;
+    const preferences = (contents as unknown as {
+      getLastWebPreferences?: () => {
+        sandbox?: boolean;
+        contextIsolation?: boolean;
+        nodeIntegration?: boolean;
+        preload?: string;
+      };
+    }).getLastWebPreferences?.() ?? {};
+    const originalPreloadValid = originalPreloadIsValid(preferences.preload);
+    tracker.eligibleWindow({
+      webContentsId: contents.id,
+      url: canonicalUrl,
+      isDefaultSession: contents.session === session.defaultSession,
+      sandbox: preferences.sandbox,
+      contextIsolation: preferences.contextIsolation === true,
+      nodeIntegration: preferences.nodeIntegration === true,
+      originalPreloadValid,
+    });
+    const selectedId = tracker.summary().canonicalWebContentsId;
+    if (selectedId === contents.id && canonicalWindow === null) {
+      canonicalWindow = window;
+      if (requireBackgroundThrottlingDisabled(contents, "selection", true)) {
+        deadlineController.canonicalSelected();
+      }
+    }
+    if (preloadErrorWebContentsIds.has(contents.id)) {
+      tracker.preloadError(contents.id);
+    }
+    log("info", "promotion original renderer eligible window observed", {
+      webContentsId: contents.id,
+      url: promotionOriginalRendererLogUrl(canonicalUrl),
+      sessionIsDefault: contents.session === session.defaultSession,
+      sandbox: preferences.sandbox,
+      contextIsolation: preferences.contextIsolation,
+      nodeIntegration: preferences.nodeIntegration,
+      originalPreloadPath: preferences.preload ?? null,
+      originalPreloadValid,
+      selected: selectedId === contents.id,
+    });
+    settleIfComplete();
+  };
+  const onBrowserWindowCreated = (_event: Electron.Event, window: Electron.BrowserWindow): void => {
+    tracker.windowCaptured();
+    capturedWindows.add(window);
+    const contents = window.webContents;
+    const initiallyVisible = window.isVisible();
+    const removers: Array<() => void> = [];
+    const listen = (
+      emitter: NodeJS.EventEmitter,
+      event: string,
+      listener: (...args: any[]) => void,
+    ): void => {
+      emitter.on(event, listener);
+      removers.push(() => emitter.removeListener(event, listener));
+    };
+    suppressWindowOpacity(window, removers);
+    for (const method of ["show", "showInactive", "focus", "restore"] as const) {
+      suppressWindowActivationMethod(window, method, removers);
+    }
+    if (cleaningUp) {
+      lateWindowDuringCleanup = true;
+      fail("BrowserWindow was created during promotion cleanup");
+      hideWindow(window);
+      try { window.destroy(); } catch { /* Cleanup fails below. */ }
+      if (!window.isDestroyed()) fail("late promotion cleanup window could not be destroyed");
+      windowCleanup.set(window, removers);
+      if (cleanupFinished) app.exit(1);
+      return;
+    }
+    listen(window, "show", () => {
+      hideWindow(window);
+      if (!cleaningUp) fail(`captured window ${contents.id} emitted show`);
+    });
+    listen(window, "ready-to-show", () => hideWindow(window));
+    listen(window, "focus", () => {
+      hideWindow(window);
+      if (!cleaningUp) fail(`captured window ${contents.id} emitted focus`);
+    });
+    listen(window, "closed", () => {
+      log("info", "promotion original BrowserWindow destroyed", {
+        webContentsId: contents.id,
+        cleanup: cleaningUp,
+      });
+      if (!cleaningUp && canonicalWindow === window) fail("canonical window was destroyed", contents.id);
+    });
+    listen(contents, "did-start-navigation", (
+      _navigationEvent: Electron.Event,
+      url: string,
+      _isInPlace: boolean,
+      isMainFrame: boolean,
+    ) => {
+      log("info", "promotion original renderer navigation started", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+        isMainFrame,
+      });
+      considerEligible(window, url, isMainFrame);
+    });
+    listen(contents, "did-navigate", (_navigationEvent: Electron.Event, url: string) => {
+      log("info", "promotion original renderer navigation completed", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+      });
+      considerEligible(window, url, true);
+    });
+    listen(contents, "did-finish-load", () => {
+      const url = contents.getURL();
+      considerEligible(window, url, true);
+      if (
+        canonicalWindow === window
+        && canonicalPromotionOriginalRendererUrl(url) !== null
+        && !requireBackgroundThrottlingDisabled(contents, "did-finish-load")
+      ) return;
+      tracker.didFinishLoad(contents.id, url);
+      if (canonicalWindow === window && canonicalPromotionOriginalRendererUrl(url) !== null) {
+        deadlineController?.canonicalLoaded();
+      }
+      log("info", "promotion original renderer load completed", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+      });
+      settleIfComplete();
+    });
+    listen(contents, "dom-ready", () => {
+      log("info", "promotion original renderer DOM ready", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(contents.getURL()),
+        selected: canonicalWindow === window,
+      });
+    });
+    listen(contents, "did-stop-loading", () => {
+      log("info", "promotion original renderer stopped loading", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(contents.getURL()),
+        selected: canonicalWindow === window,
+      });
+    });
+    listen(contents, "preload-error", (
+      _preloadEvent: Electron.Event,
+      preloadPath: string,
+      error: Error,
+    ) => {
+      preloadErrorWebContentsIds.add(contents.id);
+      tracker.preloadError(contents.id);
+      log("warn", "promotion original renderer preload failed", {
+        webContentsId: contents.id,
+        preloadPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      settleIfComplete();
+    });
+    listen(contents, "did-fail-load", (
+      _loadEvent: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      validatedURL: string,
+      isMainFrame: boolean,
+    ) => {
+      if (isMainFrame) considerEligible(window, validatedURL, true);
+      log("warn", "promotion original renderer did-fail-load", {
+        webContentsId: contents.id,
+        errorCode,
+        errorDescription,
+        url: promotionOriginalRendererLogUrl(validatedURL),
+        isMainFrame,
+      });
+      if (isMainFrame && canonicalWindow === window) fail("canonical renderer load failed", contents.id);
+    });
+    listen(contents, "did-fail-provisional-load", (
+      _loadEvent: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      validatedURL: string,
+      isMainFrame: boolean,
+    ) => {
+      log("warn", "promotion original renderer did-fail-provisional-load", {
+        webContentsId: contents.id,
+        errorCode,
+        errorDescription,
+        url: promotionOriginalRendererLogUrl(validatedURL),
+        isMainFrame,
+        selected: canonicalWindow === window,
+      });
+      if (canonicalWindow === window && shouldFailPromotionOriginalRendererProvisionalLoad({
+        isMainFrame,
+        webContentsId: contents.id,
+        canonicalWebContentsId: tracker.summary().canonicalWebContentsId,
+      })) {
+        fail("canonical renderer provisional load failed", contents.id);
+      }
+    });
+    listen(contents, "render-process-gone", (_goneEvent: Electron.Event, details: Electron.RenderProcessGoneDetails) => {
+      log("warn", "promotion original renderer process exited", {
+        webContentsId: contents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      if (canonicalWindow === window) fail("canonical renderer process exited", contents.id);
+    });
+    windowCleanup.set(window, removers);
+    if (initiallyVisible) fail(`captured window ${contents.id} was initially visible`);
+    hideWindow(window);
+    if (window.isVisible()) fail("captured window could not be hidden");
+    log("info", "promotion original BrowserWindow captured and hidden", {
+      webContentsId: contents.id,
+      capturedWindowCount: tracker.summary().capturedWindowCount,
+      initiallyVisible,
+    });
+  };
+  const onAuthorization = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (owner) considerEligible(owner, event.senderFrame?.url ?? "", event.senderFrame === event.sender.mainFrame);
+    const windowAlive = canonicalWindow !== null
+      && !canonicalWindow.isDestroyed()
+      && !canonicalWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === canonicalWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === canonicalWindow!.webContents.mainFrame;
+    const decision = authorizePromotionOriginalRenderer({
+      windowAlive,
+      windowHidden: windowAlive && !canonicalWindow!.isVisible(),
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      consumed: authorizationConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      event.returnValue = null;
+      log("warn", "promotion original renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    if (process.platform === "darwin") {
+      let rendererProcessId: number | null = null;
+      let sandboxProcessVerified = false;
+      try {
+        rendererProcessId = event.sender.getOSProcessId();
+        sandboxProcessVerified = hasUniqueSandboxedPromotionRendererProcess(
+          app.getAppMetrics(),
+          rendererProcessId,
+        );
+      } catch {
+        sandboxProcessVerified = false;
+      }
+      if (!sandboxProcessVerified) {
+        event.returnValue = null;
+        log("warn", "promotion original renderer authorization rejected", {
+          webContentsId: event.sender.id,
+          reason: "sandbox process metric was not uniquely verified",
+          rendererProcessId,
+        });
+        fail("canonical renderer sandbox process proof failed", event.sender.id);
+        return;
+      }
+    }
+    authorizationConsumed = true;
+    tracker.authorization(event.sender.id);
+    event.returnValue = JSON.stringify(decision.response);
+    log("info", "promotion original renderer authorization accepted", {
+      webContentsId: event.sender.id,
+    });
+    settleIfComplete();
+  };
+  const onHandshake = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const windowAlive = canonicalWindow !== null
+      && !canonicalWindow.isDestroyed()
+      && !canonicalWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === canonicalWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === canonicalWindow!.webContents.mainFrame;
+    if (windowAlive && canonicalWindow!.isVisible()) {
+      hideWindow(canonicalWindow!);
+      if (canonicalWindow!.isVisible()) {
+        fail("canonical renderer became visible and could not be re-hidden", event.sender.id);
+        return;
+      }
+      log("info", "promotion original BrowserWindow delayed activation re-hidden", {
+        webContentsId: event.sender.id,
+      });
+    }
+    if (windowAlive && !forceWindowTransparent(canonicalWindow!)) {
+      fail("canonical renderer transparency guard failed", event.sender.id);
+      return;
+    }
+    const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).lifecycle
+      : null;
+    if (lifecycle === "renderer-load-observed") {
+      const loadDecision = validatePromotionOriginalRendererLoadObserved({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!loadDecision.accepted) {
+        log("warn", "promotion original renderer load observation rejected", {
+          webContentsId: event.sender.id,
+          reason: loadDecision.reason,
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-load-observed")) return;
+      loadObservedConsumed = true;
+      log("info", "promotion original renderer load observation accepted", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(loadDecision.observation.url),
+        rendererSandboxed: loadDecision.observation.rendererSandboxed,
+      });
+      return;
+    }
+    if (lifecycle === "renderer-mount-timeout") {
+      const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!timeoutDecision.accepted) {
+        log("warn", "promotion original renderer mount-timeout rejected", {
+          webContentsId: event.sender.id,
+          reason: timeoutDecision.reason,
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mount-timeout")) return;
+      handshakeConsumed = true;
+      log("warn", "promotion original renderer mount timed out", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(timeoutDecision.observation.url),
+        rendererSandboxed: timeoutDecision.observation.rendererSandboxed,
+      });
+      fail("canonical renderer mount timed out", event.sender.id);
+      return;
+    }
+    const decision = validatePromotionOriginalRendererHandshake({
+      windowAlive,
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      expectedUrl: tracker.summary().canonicalUrl ?? "",
+      authorizationConsumed,
+      loadObservedConsumed,
+      handshakeConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      log("warn", "promotion original renderer lifecycle handshake rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mounted")) return;
+    handshakeConsumed = true;
+    tracker.rendererHandshake({ webContentsId: event.sender.id, ...decision.observation });
+    log("info", "promotion original renderer mount handshake accepted", {
+      webContentsId: event.sender.id,
+      rendererSandboxed: decision.observation.rendererSandboxed,
+      rendererStorageSelfTest: decision.observation.rendererStorageSelfTest,
+    });
+    settleIfComplete();
+  };
+  const registerSession = (targetSession: Electron.Session, label: string): void => {
+    if (registeredSessions.has(targetSession)) return;
+    try {
+      targetSession.registerPreloadScript({
+        type: "frame",
+        id: "tweaker-promotion-health-original",
+        filePath: PROMOTION_HEALTH_PRELOAD_PATH,
+      });
+      registeredSessions.add(targetSession);
+      log("info", "promotion original preload registered", {
+        label,
+        path: PROMOTION_HEALTH_PRELOAD_PATH,
+      });
+    } catch (error) {
+      fail(`promotion original preload registration failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const onSessionCreated = (createdSession: Electron.Session): void => {
+    registerSession(createdSession, "session-created");
+  };
+  const onAppReady = (): void => {
+    registerSession(session.defaultSession, "defaultSession-ready");
+  };
+  ipcMain.on(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL, onAuthorization);
+  ipcMain.on(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, onHandshake);
+  app.on("session-created", onSessionCreated);
+  app.on("browser-window-created", onBrowserWindowCreated);
+  // This listener is installed while the injected runtime is still being
+  // evaluated, before the loader requires Codex's original main entry. Event
+  // ordering therefore registers the default-session preload before any later
+  // original-main ready listener can construct a BrowserWindow.
+  app.once("ready", onAppReady);
+
+  const cleanup = async (): Promise<boolean> => {
+    cleaningUp = true;
+    deadlineController.settle();
+    ipcMain.removeListener(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL, onAuthorization);
+    ipcMain.removeListener(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, onHandshake);
+    app.removeListener("session-created", onSessionCreated);
+    app.removeListener("ready", onAppReady);
+    let success = true;
+    // Destroy while activation methods are still suppressed. Restoring them
+    // first would leave a small teardown window in which original-main code
+    // could reveal or focus a probe window.
+    for (const window of capturedWindows) {
+      try {
+        if (!window.isDestroyed()) window.destroy();
+        if (!window.isDestroyed()) success = false;
+      } catch {
+        success = false;
+      }
+    }
+    for (const removers of windowCleanup.values()) {
+      for (const remove of removers) remove();
+    }
+    windowCleanup.clear();
+    for (const registeredSession of registeredSessions) {
+      try {
+        registeredSession.unregisterPreloadScript("tweaker-promotion-health-original");
+      } catch {
+        success = false;
+      }
+    }
+    const appServerCleanup = await codexAppServerParent.cleanupTrackedParents();
+    if (appServerCleanup.failed > 0 || lateWindowDuringCleanup) success = false;
+    log(success ? "info" : "warn", "promotion original renderer cleanup completed", {
+      destroyedWindowCount: capturedWindows.size,
+      registeredSessionCount: registeredSessions.size,
+      lateWindowDuringCleanup,
+      appServerCleanup,
+      success,
+    });
+    tracker.cleanup(success);
+    cleanupFinished = true;
+    return success;
+  };
+
+  return {
+    registerSession,
+    async run() {
+      await proofSettled;
+      await cleanup();
+      const result = tracker.result();
+      log(result.hostReady === "pass" ? "info" : "warn", "promotion original renderer proof completed", {
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+        proofSummary: result.proofSummary ? {
+          ...result.proofSummary,
+          ...promotionOriginalRendererEvidenceUrl(result.proofSummary.canonicalUrl),
+        } : undefined,
+      });
+      return result;
+    },
+  };
+}
+
+// Construct this controller during runtime evaluation, before the loader
+// requires Codex's original main entry. It registers every capture/listener
+// needed to observe the original protocol and original BrowserWindow.
+const originalMainPromotionProbe = healthOriginalMain
+  ? createPromotionOriginalMainProbe()
+  : null;
+
+const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
+  windowReady: () => BrowserWindow.getAllWindows().some((window) => (
+    !window.isDestroyed() && window.isVisible()
+  )),
+  launch: () => {
+    const cli = desktopUpdateCli();
+    startInstalledCli(cli, ["update-chatgpt-reconcile", "--json"]);
+  },
+  setTimer: (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  onEvent: (event) => {
+    log(event.result === "submitted" ? "info" : "warn", event.event, event);
+  },
+});
+
 app.whenReady().then(() => {
   log("info", "app ready fired");
   // A disposable health probe launches Codex's main process only far enough to

@@ -1,6 +1,6 @@
 {
   "name": "@therealityreport/user-questions-tweak",
-  "version": "0.6.3",
+  "version": "0.6.0",
   "private": true,
   "type": "commonjs",
   "scripts": {

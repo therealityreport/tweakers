@@ -74,7 +74,7 @@ async function startMain(api, state) {
   ));
 
   const policy = createPolicyCommandInterface();
-  registerMainHandler(state, api, "policy.status", () => sanitizePolicyStatus(policy.status()));
+  registerMainHandler(state, api, "policy.status", () => policy.status());
   registerMainHandler(state, api, "policy.preview", (_context, profile) => sanitizePolicyPreview(policy.preview(profile)));
   registerMainHandler(state, api, "policy.apply", (_context, previewToken, profile) => (
     sanitizePolicyResult(policy.apply(previewToken, profile))
@@ -108,20 +108,6 @@ function sanitizePolicyResult(result) {
     restartRequired: result.restartRequired,
     restarted: result.restarted,
     profile: result.profile,
-  };
-}
-
-function sanitizePolicyStatus(result) {
-  return {
-    status: result.status,
-    transactionId: result.transactionId,
-    profile: result.profile ?? null,
-    targetCount: Number.isInteger(result.targetCount) ? result.targetCount : 0,
-    appliedTargetCount: Number.isInteger(result.appliedTargetCount) ? result.appliedTargetCount : 0,
-    beforeTargetCount: Number.isInteger(result.beforeTargetCount) ? result.beforeTargetCount : 0,
-    otherTargetCount: Number.isInteger(result.otherTargetCount) ? result.otherTargetCount : 0,
-    restartRequired: result.restartRequired,
-    restarted: result.restarted,
   };
 }
 
@@ -895,13 +881,12 @@ function renderSettings(api, root) {
   let active = true;
   let preview = null;
   let transactionId = null;
-  let selectedProfile = null;
-  let savedProfile = null;
+  let selectedProfile = "maximum-access";
   root.replaceChildren();
   const title = element("div", "flex h-toolbar items-center justify-between gap-2");
   const copy = element("div", "flex min-w-0 flex-1 flex-col gap-1");
   copy.append(element("div", "text-base font-medium text-token-text-primary", "MCP question forms for Full Access tasks"));
-  copy.append(element("div", "text-sm text-token-text-secondary", "Choose a profile for Preview. A row is marked saved only after the current policy file is verified; existing tasks keep their loaded policy until a later restart."));
+  copy.append(element("div", "text-sm text-token-text-secondary", "Choose a permission profile, preview its exact task-level changes, then apply explicitly. Ordinary startup never changes policy, and Apply or Restore never restarts Codex."));
   title.append(copy);
   const profileCard = element("div", "border-token-border flex flex-col divide-y-[0.5px] divide-token-border rounded-lg border");
   profileCard.setAttribute("role", "radiogroup");
@@ -934,8 +919,7 @@ function renderSettings(api, root) {
       preview = null;
       updateProfileButtons();
       applyButton.disabled = true;
-      previewButton.disabled = false;
-      status.textContent = `${profile.label} selected for Preview. This selection alone does not change or activate policy.`;
+      status.textContent = `${profile.label} selected. Run Preview to inspect its changes.`;
     });
     profileButtons.set(profile.id, { button, marker });
     profileCard.append(button);
@@ -946,10 +930,7 @@ function renderSettings(api, root) {
       control.button.setAttribute("aria-checked", String(selected));
       control.button.className = "flex w-full items-center justify-between gap-4 p-3 text-left cursor-interaction "
         + (selected ? "bg-token-foreground/5" : "hover:bg-token-foreground/5");
-      const markers = [];
-      if (profile === savedProfile) markers.push("Saved for restart");
-      if (selected) markers.push("Selected for preview");
-      control.marker.textContent = markers.join(" · ");
+      control.marker.textContent = selected ? "Selected" : "";
     }
   };
   updateProfileButtons();
@@ -963,7 +944,6 @@ function renderSettings(api, root) {
   status.setAttribute("aria-live", "polite");
   const actions = element("div", "flex flex-wrap gap-2");
   const previewButton = actionButton("Preview", "secondary", async () => {
-    if (!selectedProfile) return;
     await settingsCommand("policy.preview", [selectedProfile], (result) => {
       preview = result;
       status.textContent = previewSummary(result);
@@ -973,8 +953,8 @@ function renderSettings(api, root) {
   previewButton.disabled = true;
   const applyButton = actionButton("Apply previewed change", "primary", async () => {
     if (!preview?.previewToken) return;
-    const result = await settingsCommand("policy.apply", [preview.previewToken, selectedProfile], (applied) => {
-      transactionId = applied.transactionId;
+    await settingsCommand("policy.apply", [preview.previewToken, selectedProfile], (result) => {
+      transactionId = result.transactionId;
       preview = null;
       applyButton.disabled = true;
       restoreButton.hidden = !transactionId;
@@ -995,19 +975,13 @@ function renderSettings(api, root) {
   restoreButton.hidden = true;
   actions.append(previewButton, applyButton, restoreButton);
   root.append(title, profileCard, consequences, status, actions);
-  void refreshPolicyStatus();
-
-  async function refreshPolicyStatus() {
-    return settingsCommand("policy.status", [], (result) => {
-      transactionId = ["restorable", "overwritten", "drifted", "recovery-required"].includes(result.status)
-        ? result.transactionId
-        : null;
-      savedProfile = result.status === "restorable" ? result.profile : null;
-      updateProfileButtons();
-      restoreButton.hidden = !transactionId;
-      status.textContent = policyStatusSummary(result);
-    });
-  }
+  void settingsCommand("policy.status", [], (result) => {
+    transactionId = result.status === "restorable" ? result.transactionId : null;
+    restoreButton.hidden = !transactionId;
+    status.textContent = transactionId
+      ? "A previously applied policy change can be restored. Restore will preserve unrelated later edits and refuse if a targeted field drifted."
+      : "No applied User Questions policy transaction is waiting to be restored.";
+  });
 
   async function settingsCommand(channel, args, onSuccess) {
     setSettingsBusy(true);
