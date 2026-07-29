@@ -19,6 +19,7 @@ const canonical = [
   ["co.tweakers.ui-improvements", "UI Improvements"],
   ["co.tweakers.usage-limit-resets-tracker", "Usage Limit Resets Tracker"],
   ["co.tweakers.user-questions", "User Questions"],
+  ["co.tweakers.browser-trust", "Browser Trust"],
 ] as const;
 
 function tweak(id: string, name: string, patch: Record<string, unknown> = {}) {
@@ -76,7 +77,7 @@ test("native Settings evidence keeps geometry and main-navigation guards", () =>
   })), false);
 });
 
-test("eleven enabled Tweakers produce eleven unique alphabetical settings rows", () => {
+test("twelve enabled Tweakers produce twelve unique alphabetical settings rows", () => {
   const tweaks = canonical.map(([id, name]) => tweak(id, name));
   const registrations = [
     { id: "developer", tweakId: canonical[1][0], title: "Developer Tools" },
@@ -84,8 +85,8 @@ test("eleven enabled Tweakers produce eleven unique alphabetical settings rows",
     { id: "projects", tweakId: canonical[2][0], title: "Projects" },
   ];
   const rows = buildSettingsNavigationModel(tweaks, registrations);
-  assert.equal(rows.length, 11);
-  assert.equal(new Set(rows.map((row) => row.tweakId)).size, 11);
+  assert.equal(rows.length, 12);
+  assert.equal(new Set(rows.map((row) => row.tweakId)).size, 12);
   assert.deepEqual(rows.map((row) => row.title), [...rows.map((row) => row.title)].sort((a, b) => a.localeCompare(b)));
   assert.equal(rows.find((row) => row.tweakId === canonical[0][0])?.fallback, false);
   assert.equal(rows.find((row) => row.tweakId === canonical[3][0])?.fallback, true);

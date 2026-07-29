@@ -67,6 +67,37 @@
       "approvedBy": "tweakers"
     },
     {
+      "id": "co.tweakers.browser-trust",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.browser-trust"
+      },
+      "manifest": {
+        "id": "co.tweakers.browser-trust",
+        "name": "Browser Trust",
+        "version": "0.1.0",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Explicit, reversible trust for exact browser inspection and built-in HTTP(S) browse routes while higher-risk browser actions remain gated.",
+        "author": "hulibrands",
+        "tags": [
+          "browser",
+          "trust",
+          "security",
+          "inspection"
+        ],
+        "scope": "both",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "settings",
+          "filesystem",
+          "ipc"
+        ]
+      },
+      "approvedAt": "2026-07-28T13:29:33.840Z",
+      "approvedBy": "tweakers"
+    },
+    {
       "id": "co.tweakers.developer-tools",
       "available": true,
       "source": {
