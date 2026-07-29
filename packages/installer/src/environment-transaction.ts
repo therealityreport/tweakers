@@ -55,8 +55,10 @@ import {
   STABLE_DESKTOP_PATH,
 } from "./environment-profile.js";
 import { readConfigFile } from "./config.js";
+import { readHeaderHash } from "./asar.js";
 import { signatureInfo, verifySignature } from "./codesign.js";
 import {
+  bundledDerivedBackendPath,
   buildPatchedCandidateOnly,
   loadVerifiedSwapHost,
   readAsarMarker,
@@ -72,10 +74,14 @@ import { readPlist } from "./plist.js";
 import { acquireProcessLock, processAlive } from "./process-lock.js";
 import { assertLifecycleReceiptsIdle, withLifecycleLock } from "./lifecycle-lock.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
+import { assertInternalStoragePath } from "./internal-storage.js";
 import { targetUserHome } from "./ownership.js";
 import { readState, writeState } from "./state.js";
 import { cloneAppTree } from "./transaction.js";
-import { installWatcher } from "./watcher.js";
+import {
+  beginWatcherPromotion,
+  finishWatcherPromotion,
+} from "./watcher-promotion.js";
 import { payloadMetadataFile, writePayloadMetadata } from "./mode-transition.js";
 import {
   fingerprintManagedRuntimeControlPlane,
@@ -165,6 +171,8 @@ export interface PreparedDesktopCandidateEvidence {
   version: string;
   build: string;
   artifactDigest: string;
+  /** Electron integrity hash for the exact app.asar carried by this candidate. */
+  asarHeaderHash: string;
   signature: PreparedCandidateSignatureEvidence;
 }
 
@@ -280,6 +288,8 @@ export interface EnvironmentAppliedEvidence {
   desktopBuild: string;
   backendVersion: string;
   desktopArtifactDigest: string;
+  /** Re-observed Electron integrity hash for the running app.asar. */
+  asarHeaderHash: string;
   backendArtifactDigest: string;
   runtimeArtifactDigest?: string;
   managedRuntimeArtifactDigest?: string;
@@ -346,6 +356,8 @@ export interface EnvironmentCoordinatorOptions {
   mcpConfigFile?: string;
   lockFile?: string;
   lifecycleLockFile?: string;
+  watcherPromotionFile?: string;
+  bundledDerivedReceiptFile?: string;
   verificationPolls?: number;
   verificationIntervalMs?: number;
 }
@@ -403,6 +415,18 @@ export interface EnvironmentCoordinatorDeps {
   processAlive?: (pid: number) => boolean;
   cleanupHelpers?: (path: string, stoppedMainPid: number) => void | Promise<void>;
   reopenDesktop?: (path: string) => void | Promise<void>;
+  pauseWatcher?: (input: {
+    transactionId: string;
+    sourceAppRoot: string;
+    requestedAppRoot: string;
+    sourceExpectedFingerprint: string;
+  }) => void | Promise<void>;
+  resumeWatcher?: (input: {
+    transactionId: string;
+    targetAppRoot: string;
+    targetExpectedFingerprint: string;
+  }) => void | Promise<void>;
+  /** Backward-compatible test seam; production uses the durable pause/resume receipt. */
   refreshWatcher?: (path: string) => void | Promise<void>;
   proveAppliedEnvironment?: (input: {
     direction: "requested" | "rollback";
@@ -412,6 +436,15 @@ export interface EnvironmentCoordinatorDeps {
     prepared: PreparedEnvironmentEvidence;
   }) => EnvironmentAppliedEvidence | null | Promise<EnvironmentAppliedEvidence | null>;
   publishSelection?: (selection: EnvironmentSelection) => void | Promise<void>;
+  /**
+   * Durably binds the watcher-facing installer state to the proven target
+   * before the watcher is allowed to resume.
+   */
+  bindWatcherTarget?: (input: {
+    direction: "requested" | "rollback";
+    applied: EnvironmentAppliedEvidence;
+    prepared: PreparedEnvironmentEvidence;
+  }) => void | Promise<void>;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -473,7 +506,9 @@ export interface DefaultEnvironmentAdapterDeps {
   directoryFingerprint?: (root: string) => string;
   readRuntimeFingerprintEvidence?: (root: string) => RuntimeTreeFingerprint | null;
   prepareManagedBackend?: (profile: EnvironmentProfileRecord, destination: string) => void | Promise<void>;
+  readBundledDerivedArtifact?: (receiptPath: string) => ValidatedBundledDerivedArtifact;
   readMarker?: (asarPath: string) => "present" | "absent" | "unreadable";
+  readAsarHeaderHash?: (appRoot: string) => string;
   appFingerprint?: (appRoot: string) => string;
   fileFingerprint?: (file: string) => string;
   readDesktopIdentity?: (appRoot: string) => { bundleId: string | null; version: string | null; build: string | null };
@@ -486,7 +521,12 @@ export interface DefaultEnvironmentAdapterDeps {
     lane: BackendLane,
     selected?: { binaryPath: string; version: string; fingerprint: string },
   ) => void;
-  readAppState?: (stateFile: string) => { appExperience: AppExperience; appRoot: string; bundleId: string | null } | null;
+  readAppState?: (stateFile: string) => {
+    appExperience: AppExperience;
+    appRoot: string;
+    bundleId: string | null;
+    patchedAsarHash: string;
+  } | null;
   readRuntimeProof?: (file: string) => EnvironmentRuntimeProof | null;
   /**
    * Proves the headless MCP mode helper is available before the desktop is
@@ -1237,6 +1277,7 @@ function resolvedDefaultEnvironmentAdapterDeps(
         destinationApp: destination,
         destinationRuntime: runtimeDestination,
         finalUserRoot: options.environmentRoot ?? userPaths().root,
+        ...(bundledDerivedBackend ? { bundledDerivedBackend } : {}),
       });
     }),
     prepareRuntimeAssets: deps.prepareRuntimeAssets ?? ((destination) => {
@@ -1262,7 +1303,10 @@ function resolvedDefaultEnvironmentAdapterDeps(
       }
       copyBackendAtomically(status.binaryPath, destination);
     }),
+    readBundledDerivedArtifact: deps.readBundledDerivedArtifact ?? readValidatedBundledDerivedArtifact,
     readMarker: deps.readMarker ?? readAsarMarker,
+    readAsarHeaderHash: deps.readAsarHeaderHash ?? ((appRoot) =>
+      readHeaderHash(join(appRoot, "Contents", "Resources", "app.asar")).headerHash),
     // Profiles record the canonical Contents fingerprint. Reuse the same
     // implementation here: hashDirectoryTree intentionally treats symlinks
     // differently for installer payloads and would reject a valid profile.
@@ -1281,6 +1325,7 @@ function resolvedDefaultEnvironmentAdapterDeps(
         appExperience: state.mode,
         appRoot: state.appRoot,
         bundleId: state.codexBundleId ?? null,
+        patchedAsarHash: state.patchedAsarHash,
       };
     }),
     readRuntimeProof: deps.readRuntimeProof ?? readEnvironmentRuntimeProof,
@@ -1668,6 +1713,8 @@ async function prepareEnvironmentPrerequisites(
   }
   const candidateDigest = deps.appFingerprint(candidateArtifactPath);
   const rollbackDigest = deps.appFingerprint(rollbackArtifactPath);
+  const candidateAsarHeaderHash = deps.readAsarHeaderHash(candidateArtifactPath);
+  const rollbackAsarHeaderHash = deps.readAsarHeaderHash(rollbackArtifactPath);
 
   // Stage the swap helper only after both payloads proved their signature
   // contract, so the receipt-owned copy inherits verified provenance. Exactly
@@ -1703,15 +1750,23 @@ async function prepareEnvironmentPrerequisites(
   const candidateBackendDigest = deps.fileFingerprint(candidateBackendArtifact);
   const expectedBackendFingerprint = input.requested.backendLane === "managed-alpha"
     ? requestedProfile.backendFingerprint
-    : requestedProfile.officialBackendFingerprint;
+    : bundledDerivedBackend?.fingerprint ?? requestedProfile.officialBackendFingerprint;
   if (expectedBackendFingerprint !== null && expectedBackendFingerprint !== candidateBackendDigest) {
-    throw new Error("Prepared backend fingerprint does not match the registry");
+    throw new Error(
+      `Prepared backend fingerprint ${candidateBackendDigest} does not match expected ${expectedBackendFingerprint}`,
+    );
   }
   const candidateBackendVersion = deps.readBackendVersion(candidateBackendArtifact)
     ?? (input.requested.backendLane === "managed-alpha"
       ? requestedProfile.backendVersion
-      : requestedProfile.officialBackendVersion);
+      : bundledDerivedBackend?.version ?? requestedProfile.officialBackendVersion);
   if (candidateBackendVersion === null) throw new Error("Prepared backend version is unknown");
+  const expectedBackendVersion = input.requested.backendLane === "managed-alpha"
+    ? requestedProfile.backendVersion
+    : bundledDerivedBackend?.version ?? requestedProfile.officialBackendVersion;
+  if (expectedBackendVersion !== null && candidateBackendVersion !== expectedBackendVersion) {
+    throw new Error("Prepared backend version does not match the requested bundled-derived artifact");
+  }
 
   const rollbackBackendRegistryPath = input.current.backendLane === "official-bundled"
     ? currentProfile.officialBackendPath
@@ -1760,6 +1815,7 @@ async function prepareEnvironmentPrerequisites(
       version: candidateIdentity.version!,
       build: candidateIdentity.build!,
       artifactDigest: candidateDigest,
+      asarHeaderHash: candidateAsarHeaderHash,
       signature: candidateSignature,
     },
     swapHost,
@@ -2855,6 +2911,9 @@ function proveAppliedEnvironment(
   const desktopDigest = requestedDirection
     ? input.prepared.candidate.artifactDigest
     : input.prepared.rollback.desktopArtifactDigest;
+  const asarHeaderHash = requestedDirection
+    ? input.prepared.candidate.asarHeaderHash
+    : input.prepared.rollback.desktopAsarHeaderHash;
   const backendPath = requestedDirection
     ? input.prepared.backend.binaryPath
     : input.prepared.rollback.backendBinaryPath;
@@ -2885,6 +2944,8 @@ function proveAppliedEnvironment(
     || state?.appExperience !== expected.appExperience
     || state.appRoot !== expected.selectedDesktopPath
     || state.bundleId !== expected.selectedDesktopBundleId
+    || state.patchedAsarHash !== asarHeaderHash
+    || deps.readAsarHeaderHash(expected.selectedDesktopPath) !== asarHeaderHash
     || !backendLanesProve(configuredLane, expected.backendLane)
     || !existsSync(backendPath)
     || deps.readBackendVersion(backendPath) !== backendVersion
@@ -2933,6 +2994,7 @@ function proveAppliedEnvironment(
     desktopBuild,
     backendVersion,
     desktopArtifactDigest: desktopDigest,
+    asarHeaderHash,
     backendArtifactDigest: backendDigest,
     ...(runtimeTreeProof.artifactDigest
       ? { runtimeArtifactDigest: runtimeTreeProof.artifactDigest }
@@ -2941,6 +3003,41 @@ function proveAppliedEnvironment(
       ? { managedRuntimeArtifactDigest: managedRuntimeTreeProof.artifactDigest }
       : {}),
   };
+}
+
+function bindWatcherTarget(
+  input: {
+    direction: "requested" | "rollback";
+    applied: EnvironmentAppliedEvidence;
+    prepared: PreparedEnvironmentEvidence;
+  },
+  options: DefaultEnvironmentAdapterOptions,
+  deps: ResolvedDefaultEnvironmentAdapterDeps,
+): void {
+  const expectedAsarHeaderHash = input.direction === "requested"
+    ? input.prepared.candidate.asarHeaderHash
+    : input.prepared.rollback.desktopAsarHeaderHash;
+  if (input.applied.asarHeaderHash !== expectedAsarHeaderHash) {
+    throw new Error("Proven target ASAR hash does not match prepared watcher evidence");
+  }
+  if (deps.readAsarHeaderHash(input.applied.selection.selectedDesktopPath) !== expectedAsarHeaderHash) {
+    throw new Error("Target app.asar changed before watcher expectation could be bound");
+  }
+  deps.writeAppState(
+    options.stateFile,
+    input.applied.selection,
+    input.applied.desktopVersion,
+    expectedAsarHeaderHash,
+  );
+  const state = deps.readAppState(options.stateFile);
+  if (state === null
+    || state.appExperience !== input.applied.selection.appExperience
+    || state.appRoot !== input.applied.selection.selectedDesktopPath
+    || state.bundleId !== input.applied.selection.selectedDesktopBundleId
+    || state.patchedAsarHash !== expectedAsarHeaderHash
+    || deps.readAsarHeaderHash(input.applied.selection.selectedDesktopPath) !== expectedAsarHeaderHash) {
+    throw new Error("Watcher target expectation did not persist exact proven app state");
+  }
 }
 
 export function readEnvironmentRuntimeProof(file: string): EnvironmentRuntimeProof | null {
@@ -3403,6 +3500,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
   readonly mcpConfigFile: string;
   readonly lockFile: string;
   readonly lifecycleLockFile: string;
+  readonly watcherPromotionFile: string;
   readonly verificationPolls: number;
   readonly verificationIntervalMs: number;
 
@@ -3490,10 +3588,19 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       processAlive: deps.processAlive ?? processAlive,
       cleanupHelpers: deps.cleanupHelpers ?? (() => {}),
       reopenDesktop: deps.reopenDesktop ?? ((path) => { openAndActivateCodex(path); }),
-      refreshWatcher: deps.refreshWatcher ?? (this.transactionFile === paths.environmentTransactionFile
-        ? ((path) => { installWatcher(path); })
-        : (() => {})),
+      pauseWatcher: deps.pauseWatcher ?? (this.transactionFile === paths.environmentTransactionFile
+        ? ((input) => { beginWatcherPromotion(this.watcherPromotionFile, input); })
+        : (() => undefined)),
+      resumeWatcher: deps.resumeWatcher ?? (deps.refreshWatcher
+        ? ((input) => deps.refreshWatcher!(input.targetAppRoot))
+        : this.transactionFile === paths.environmentTransactionFile
+          ? ((input) => { finishWatcherPromotion(this.watcherPromotionFile, input); })
+          : (() => undefined)),
+      refreshWatcher: deps.refreshWatcher ?? (() => undefined),
       proveAppliedEnvironment: deps.proveAppliedEnvironment ?? defaultAdapters.proveAppliedEnvironment,
+      bindWatcherTarget: deps.bindWatcherTarget ?? (deps.proveAppliedEnvironment
+        ? (() => undefined)
+        : defaultAdapters.bindWatcherTarget),
       publishSelection: deps.publishSelection ?? ((selection) => {
         if (existsSync(this.registryFile)) {
           publishEnvironmentSelection(this.registryFile, this.selectionFile, selection);
@@ -3707,8 +3814,18 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
           && lastVerification.appliedSelection !== null
           && lastVerification.appliedEvidence !== null
           && lastVerification.observedPid !== null) {
-          await this.deps.refreshWatcher(receipt.requested.selectedDesktopPath);
+          await this.deps.bindWatcherTarget({
+            direction: "requested",
+            applied: lastVerification.appliedEvidence,
+            prepared,
+          });
           await this.deps.publishSelection(lastVerification.appliedSelection);
+          await this.deps.resumeWatcher({
+            transactionId: receipt.transactionId,
+            targetAppRoot: receipt.requested.selectedDesktopPath,
+            targetExpectedFingerprint: lastVerification.appliedEvidence.desktopArtifactDigest,
+          });
+          watcherPaused = false;
           receipt = this.update(receipt, {
             phase: "committed",
             requested: lastVerification.appliedSelection,
@@ -3753,6 +3870,14 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
             : await this.deps.observeDesktop(receipt.source.selectedDesktopPath);
           if (current === null) {
             await this.deps.reopenDesktop(receipt.source.selectedDesktopPath);
+          }
+          if (watcherPaused) {
+            await this.deps.resumeWatcher({
+              transactionId: receipt.transactionId,
+              targetAppRoot: receipt.source.selectedDesktopPath,
+              targetExpectedFingerprint: prepared.rollback.desktopArtifactDigest,
+            });
+            watcherPaused = false;
           }
           return this.update(receipt, {
             phase: "cancelled",
@@ -3943,7 +4068,13 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     )) {
       return null;
     }
+    await this.deps.bindWatcherTarget({ direction: "rollback", applied, prepared: receipt.prepared });
     await this.deps.publishSelection(applied.selection);
+    await this.deps.resumeWatcher({
+      transactionId: receipt.transactionId,
+      targetAppRoot: receipt.source.selectedDesktopPath,
+      targetExpectedFingerprint: applied.desktopArtifactDigest,
+    });
     return this.update(receipt, {
       phase: "cancelled",
       ownerPid: process.pid,
@@ -4200,8 +4331,13 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         if (poll + 1 < this.verificationPolls) await this.deps.sleep(this.verificationIntervalMs);
       }
       if (restored === null || applied === null) throw new Error(rollbackError);
-      await this.deps.refreshWatcher(receipt.source.selectedDesktopPath);
+      await this.deps.bindWatcherTarget({ direction: "rollback", applied, prepared });
       await this.deps.publishSelection(applied.selection);
+      await this.deps.resumeWatcher({
+        transactionId: receipt.transactionId,
+        targetAppRoot: receipt.source.selectedDesktopPath,
+        targetExpectedFingerprint: applied.desktopArtifactDigest,
+      });
       receipt = this.update(receipt, {
         phase: "rolled-back",
         applied,
@@ -4595,6 +4731,7 @@ function isPreparedEnvironmentEvidence(value: unknown): value is PreparedEnviron
     || !nonEmpty(candidate.version)
     || !nonEmpty(candidate.build)
     || !nonEmpty(candidate.artifactDigest)
+    || !validDigest(candidate.asarHeaderHash)
     || !isPreparedSignatureEvidence(candidate.signature)) return false;
   if (!isRecord(backend)
     || !isBackendLane(backend.lane)
@@ -4735,6 +4872,7 @@ function appliedEvidenceProvesRequest(
       && applied.desktopBuild === prepared.candidate.build
       && applied.backendVersion === prepared.backend.version
       && applied.desktopArtifactDigest === prepared.candidate.artifactDigest
+      && applied.asarHeaderHash === prepared.candidate.asarHeaderHash
       && applied.backendArtifactDigest === prepared.backend.artifactDigest;
     return baseMatches
       && (!prepared.runtime
@@ -4746,6 +4884,7 @@ function appliedEvidenceProvesRequest(
     && applied.desktopBuild === prepared.rollback.desktopBuild
     && applied.backendVersion === prepared.rollback.backendVersion
     && applied.desktopArtifactDigest === prepared.rollback.desktopArtifactDigest
+    && applied.asarHeaderHash === prepared.rollback.desktopAsarHeaderHash
     && applied.backendArtifactDigest === prepared.rollback.backendArtifactDigest;
   const rollbackRuntimeDigest = prepared.runtime?.rollback.artifactDigest;
   const rollbackManagedRuntimeDigest = prepared.managedRuntime?.rollback.artifactDigest;

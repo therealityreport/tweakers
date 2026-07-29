@@ -104,6 +104,7 @@ function preparedEvidence(current: EnvironmentSelection, requested: EnvironmentS
       version: "26.717.1",
       build: "6001",
       artifactDigest: "candidate-sha256",
+      asarHeaderHash: "a".repeat(64),
       signature: {
         strict: true,
         gatekeeper: true,
@@ -127,6 +128,7 @@ function preparedEvidence(current: EnvironmentSelection, requested: EnvironmentS
       desktopVersion: "26.707.1",
       desktopBuild: "5900",
       desktopArtifactDigest: "rollback-desktop-sha256",
+      desktopAsarHeaderHash: "b".repeat(64),
       backendLane: current.backendLane,
       backendBinaryPath: "/Applications/ChatGPT.app/Contents/Resources/codex",
       backendArtifactPath: "/tmp/prepared/rollback/codex",
@@ -239,6 +241,7 @@ test("default preparation accepts the canonical profile fingerprint for a pristi
       cloneApp: (source, destination) => cpSync(source, destination, { recursive: true, verbatimSymlinks: true }),
       copyBackend: (source, destination) => cpSync(source, destination),
       readMarker: (asarPath) => asarPath.includes("candidate.app") || asarPath.includes("Codex.app") ? "absent" : "present",
+      readAsarHeaderHash: () => "a".repeat(64),
       fileFingerprint: () => "bundled-cli-digest",
       readDesktopIdentity: () => ({ bundleId: "com.openai.codex", version: "26.707.1", build: "5900" }),
       verifyOfficial: () => ({
@@ -280,6 +283,7 @@ function appliedEvidence(
     desktopBuild: rollback ? "5900" : "6001",
     backendVersion: rollback ? "0.144.0" : "0.145.0-alpha.3",
     desktopArtifactDigest: rollback ? "rollback-desktop-sha256" : "candidate-sha256",
+    asarHeaderHash: (rollback ? "b" : "a").repeat(64),
     backendArtifactDigest: rollback ? "rollback-backend-sha256" : "backend-sha256",
   };
 }
@@ -379,6 +383,148 @@ test("commit records the exact old PID, retries once, and proves a different vis
       "observe:/Applications/ChatGPT (Beta).app",
       "watcher:/Applications/ChatGPT (Beta).app",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion keeps the watcher paused through proof, publishes state, then resumes before terminal commit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-watcher-order-"));
+  const { current, requested } = selections();
+  const events: string[] = [];
+  let running: "source" | "requested" | null = "source";
+  try {
+    const coordinator = createEnvironmentCoordinator({
+      transactionFile: join(root, "transactions", "environment.json"),
+      receiptRoot: join(root, "receipts"),
+      selectionFile: join(root, "selection.json"),
+      verificationPolls: 1,
+      verificationIntervalMs: 0,
+    }, {
+      createId: () => "watcher-order",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: (path) => {
+        if (path === current.selectedDesktopPath && running === "source") return { pid: 101, visibleWindow: true };
+        if (path === requested.selectedDesktopPath && running === "requested") return { pid: 202, visibleWindow: true };
+        return null;
+      },
+      pauseWatcher: (input) => {
+        events.push("pause");
+        assert.equal(input.sourceExpectedFingerprint, "rollback-desktop-sha256");
+      },
+      quitDesktop: () => { events.push("quit"); running = null; },
+      processAlive: () => false,
+      cleanupHelpers: () => { events.push("cleanup"); },
+      applyPreparedEnvironment: () => { events.push("apply"); },
+      reopenDesktop: () => { events.push("reopen"); running = "requested"; },
+      proveAppliedEnvironment: () => { events.push("prove"); return appliedEvidence(requested); },
+      bindWatcherTarget: (input) => {
+        events.push("bind-watcher-target");
+        assert.equal(input.applied.asarHeaderHash, "a".repeat(64));
+      },
+      publishSelection: () => { events.push("publish"); },
+      resumeWatcher: (input) => {
+        events.push("resume");
+        assert.equal(input.targetExpectedFingerprint, "candidate-sha256");
+        assert.equal(events.includes("publish"), true);
+      },
+      sleep: async () => {},
+    });
+
+    const prepared = await coordinator.prepare({ current, requested });
+    const committed = await coordinator.commit(prepared.transactionId);
+    events.push(`terminal:${committed.phase}`);
+    assert.deepEqual(events, [
+      "pause",
+      "quit",
+      "cleanup",
+      "apply",
+      "reopen",
+      "prove",
+      "bind-watcher-target",
+      "publish",
+      "resume",
+      "terminal:committed",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale watcher-target state fails closed and rolls back before watcher resume", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-watcher-bind-fail-"));
+  const { current, requested } = selections();
+  let running: "source" | "requested" | null = "source";
+  let sourcePid = 101;
+  const resumes: string[] = [];
+  try {
+    const coordinator = createEnvironmentCoordinator({
+      transactionFile: join(root, "transactions", "environment.json"),
+      receiptRoot: join(root, "receipts"),
+      selectionFile: join(root, "selection.json"),
+      verificationPolls: 1,
+      verificationIntervalMs: 0,
+    }, {
+      createId: () => "watcher-bind-fail",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: (path) => {
+        if (path === current.selectedDesktopPath && running === "source") return { pid: sourcePid, visibleWindow: true };
+        if (path === requested.selectedDesktopPath && running === "requested") return { pid: 202, visibleWindow: true };
+        return null;
+      },
+      pauseWatcher: () => {},
+      quitDesktop: () => { running = null; },
+      processAlive: () => false,
+      cleanupHelpers: () => {},
+      applyPreparedEnvironment: () => {},
+      reopenDesktop: (path) => {
+        running = path === requested.selectedDesktopPath ? "requested" : "source";
+        if (running === "source") sourcePid = 303;
+      },
+      proveAppliedEnvironment: ({ direction }) => direction === "requested"
+        ? appliedEvidence(requested)
+        : appliedEvidence(current, "rollback"),
+      bindWatcherTarget: ({ direction }) => {
+        if (direction === "requested") throw new Error("persisted watcher ASAR hash is stale");
+      },
+      publishSelection: () => {},
+      resumeWatcher: ({ targetAppRoot }) => { resumes.push(targetAppRoot); },
+      sleep: async () => {},
+    });
+
+    const prepared = await coordinator.prepare({ current, requested });
+    const result = await coordinator.commit(prepared.transactionId);
+    assert.equal(result.phase, "rolled-back");
+    assert.deepEqual(resumes, [current.selectedDesktopPath]);
+    assert.match(result.error ?? "", /persisted watcher ASAR hash is stale/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed watcher pause prevents app shutdown and cutover", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-watcher-pause-fail-"));
+  const { current, requested } = selections();
+  const mutations: string[] = [];
+  try {
+    const coordinator = createEnvironmentCoordinator({
+      transactionFile: join(root, "environment.json"),
+      receiptRoot: join(root, "receipts"),
+      selectionFile: join(root, "selection.json"),
+    }, {
+      createId: () => "watcher-pause-fail",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: () => ({ pid: 101, visibleWindow: true }),
+      pauseWatcher: () => { throw new Error("watcher remained active"); },
+      quitDesktop: () => { mutations.push("quit"); },
+      applyPreparedEnvironment: () => { mutations.push("apply"); },
+      reopenDesktop: () => { mutations.push("reopen"); },
+    });
+    const prepared = await coordinator.prepare({ current, requested });
+    const cancelled = await coordinator.commit(prepared.transactionId);
+    assert.equal(cancelled.phase, "cancelled");
+    assert.match(cancelled.error ?? "", /watcher remained active/);
+    assert.deepEqual(mutations, []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1264,6 +1410,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
         build: mutable.build,
       }),
       readMarker: () => "present",
+      readAsarHeaderHash: () => "a".repeat(64),
       appFingerprint: () => {
         appFingerprintCalls += 1;
         return mutable.desktopDigest;
@@ -1281,6 +1428,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
         appExperience: requested.appExperience,
         appRoot: mutable.appRoot,
         bundleId: requested.selectedDesktopBundleId,
+        patchedAsarHash: "a".repeat(64),
       }),
       readRuntimeProof: () => ({
         schemaVersion: 1,
@@ -1511,6 +1659,7 @@ test("default preparation stages immutable app/backend/rollback evidence and def
         if (asarPath.startsWith(appPath)) return liveMode === "chatgpt" ? "absent" : "present";
         return "present";
       },
+      readAsarHeaderHash: () => "a".repeat(64),
       appFingerprint: (path) => {
         if (path === appPath) return liveDigest;
         if (path.includes("candidate.app") || path.includes("pristine")) return "pristine-digest";
@@ -1857,6 +2006,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
         writeFileSync(destination, "updated-backend");
       },
       readMarker: (path) => path.includes("candidate.app") || path.startsWith(patchedPath) ? "present" : "absent",
+      readAsarHeaderHash: () => "a".repeat(64),
       appFingerprint: (path) => path.includes("candidate.app") ? "rebuilt-patched-digest" : "official-app-digest",
       fileFingerprint: () => "updated-backend-digest",
       readDesktopIdentity: () => ({ bundleId: "com.openai.codex", version: "26.715.31925", build: "5551" }),
@@ -2096,6 +2246,179 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
   }
 });
 
+test("explicit bundled-derived receipt controls rebuild/reuse while the default bundled path is unchanged", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-bundled-derived-"));
+  const appPath = join(root, "Applications", "ChatGPT.app");
+  const alphaPath = join(root, "Applications", "ChatGPT (Beta).app");
+  const patchedPath = join(root, "mode", "patched-payload", "ChatGPT.app");
+  const registryFile = join(root, "environment-registry.json");
+  const receiptFile = join(root, "codex-source", "receipt.json");
+  const derivedBinary = join(root, "codex-source", "codex");
+  const derivedFingerprint = "d".repeat(64);
+  const derivedVersion = "0.145.0-alpha.18";
+  let buildCalls = 0;
+  try {
+    for (const path of [appPath, patchedPath]) {
+      mkdirSync(join(path, "Contents", "Resources"), { recursive: true });
+    }
+    mkdirSync(join(patchedPath, "Contents", "Resources", "tweakers", "native"), { recursive: true });
+    mkdirSync(join(receiptFile, ".."), { recursive: true });
+    writeFileSync(join(appPath, "Contents", "Resources", "codex"), "stock-backend");
+    writeFileSync(join(patchedPath, "Contents", "Resources", "codex"), "stale-derived-backend");
+    writeFileSync(
+      join(patchedPath, "Contents", "Resources", "tweakers", "native", "tweaker_native_host.node"),
+      "host",
+    );
+    writeFileSync(receiptFile, "{}\n");
+    writeFileSync(derivedBinary, "derived-backend");
+
+    const registry = createEnvironmentProfileRegistry({
+      stableDesktopPath: appPath,
+      alphaDesktopPath: alphaPath,
+      environmentRoot: root,
+      stableEvidence: {
+        officialVersion: "26.715.31925",
+        officialBuild: "5551",
+        strictSignature: true,
+        gatekeeper: true,
+        teamIdentifier: "2DC432GLL2",
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        signatureCheckedAt: "2026-07-19T17:00:00.000Z",
+        officialBackendVersion: derivedVersion,
+        officialBackendFingerprint: "stock-backend-digest",
+        patchedPayloadPath: patchedPath,
+        patchedPayloadFingerprint: "patched-payload-digest",
+        patchedPayloadBuildable: true,
+      },
+    });
+    const current = createEnvironmentSelection({
+      profile: registry.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-07-19T17:00:00.000Z",
+      appliedAt: "2026-07-19T17:00:01.000Z",
+    });
+    const requested = createEnvironmentSelection({
+      profile: registry.profiles.stable,
+      appExperience: "tweakers",
+      requestedAt: "2026-07-19T17:01:00.000Z",
+    });
+    const selectedRegistry = { ...registry, selected: current, lastKnownWorkingSelection: current };
+    writeEnvironmentProfileRegistry(registryFile, selectedRegistry);
+
+    const descriptor = (version = derivedVersion) => ({
+      binaryPath: derivedBinary,
+      version,
+      fingerprint: derivedFingerprint,
+      receiptPath: receiptFile,
+      transactionId: "bundled-derived-control",
+    });
+    const makeAdapters = (input: {
+      transactionRoot: string;
+      configuredReceipt: boolean;
+      descriptorVersion?: string;
+      candidateFingerprint: string;
+      candidateVersion: string;
+    }) => createDefaultEnvironmentAdapters({
+      registryFile,
+      receiptRoot: join(root, input.transactionRoot),
+      configFile: join(root, "config.json"),
+      stateFile: join(root, "state.json"),
+      ...(input.configuredReceipt ? { bundledDerivedReceiptFile: receiptFile } : {}),
+    }, {
+      assertMcpModeReady: () => {},
+      loadState: () => ({ registry: selectedRegistry, current, migratedFromLegacy: false }),
+      readBundledDerivedArtifact: () => descriptor(input.descriptorVersion),
+      preparePatchedPayload: (_profile, destination, bundledDerivedBackend) => {
+        buildCalls += 1;
+        assert.equal(bundledDerivedBackend?.fingerprint, derivedFingerprint);
+        mkdirSync(join(destination, "Contents", "Resources"), { recursive: true });
+        writeFileSync(join(destination, "Contents", "Resources", "codex"), "derived-backend");
+      },
+      cloneApp: (source, destination) => cpSync(source, destination, { recursive: true }),
+      copyBackend: (source, destination) => {
+        mkdirSync(join(destination, ".."), { recursive: true });
+        cpSync(source, destination);
+      },
+      readMarker: (path) => path.startsWith(patchedPath) || path.includes("candidate.app") ? "present" : "absent",
+      readAsarHeaderHash: () => "a".repeat(64),
+      appFingerprint: (path) => path === patchedPath
+        ? "patched-payload-digest"
+        : path.includes("candidate.app")
+          ? "prepared-payload-digest"
+          : "stock-payload-digest",
+      fileFingerprint: (path) => path.startsWith(patchedPath)
+        ? "stale-derived-digest"
+        : path.includes("candidate.app") || path.includes("requested-codex")
+          ? input.candidateFingerprint
+          : "stock-backend-digest",
+      readDesktopIdentity: () => ({ bundleId: "com.openai.codex", version: "26.715.31925", build: "5551" }),
+      verifyPatched: () => ({
+        strict: true,
+        gatekeeper: false,
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        teamIdentifier: null,
+      }),
+      readBackendVersion: (path) => path.startsWith(patchedPath)
+        ? "0.145.0-alpha.17"
+        : path.includes("candidate.app") || path.includes("requested-codex")
+          ? input.candidateVersion
+          : derivedVersion,
+      now: () => "2026-07-19T17:01:05.000Z",
+    });
+
+    const derivedAdapters = makeAdapters({
+      transactionRoot: "derived-receipts",
+      configuredReceipt: true,
+      candidateFingerprint: derivedFingerprint,
+      candidateVersion: derivedVersion,
+    });
+    const prepared = await derivedAdapters.preparePrerequisites({
+      transactionId: "derived-rebuild",
+      current,
+      requested,
+      oldMainPid: 101,
+    });
+    assert.equal(buildCalls, 1, "a stale reusable payload must rebuild for the configured derived fingerprint");
+    assert.equal(prepared.backend.artifactDigest, derivedFingerprint);
+    assert.equal(prepared.backend.version, derivedVersion);
+    assert.equal(prepared.backend.lane, "bundled", "the derived control must not become a managed lane");
+
+    const mismatchedVersionAdapters = makeAdapters({
+      transactionRoot: "mismatch-receipts",
+      configuredReceipt: true,
+      descriptorVersion: "0.144.6",
+      candidateFingerprint: derivedFingerprint,
+      candidateVersion: derivedVersion,
+    });
+    await assert.rejects(
+      () => mismatchedVersionAdapters.preparePrerequisites({
+        transactionId: "derived-version-mismatch",
+        current,
+        requested,
+        oldMainPid: 101,
+      }),
+      /does not match desktop control/,
+    );
+
+    const defaultAdapters = makeAdapters({
+      transactionRoot: "default-receipts",
+      configuredReceipt: false,
+      candidateFingerprint: "stock-backend-digest",
+      candidateVersion: derivedVersion,
+    });
+    const defaultPrepared = await defaultAdapters.preparePrerequisites({
+      transactionId: "default-reuse",
+      current,
+      requested,
+      oldMainPid: 101,
+    });
+    assert.equal(buildCalls, 1, "without an explicit receipt the existing bundled behavior must remain reusable");
+    assert.equal(defaultPrepared.backend.artifactDigest, "stock-backend-digest");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("prepare rebuilds a stale patched Alpha payload and installs its managed backend before confirmation", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-environment-alpha-prepare-"));
   const stablePath = join(root, "Applications", "ChatGPT.app");
@@ -2197,6 +2520,7 @@ test("prepare rebuilds a stale patched Alpha payload and installs its managed ba
       readMarker: (path) => path.includes("candidate.app") || path === join(stalePatchedAlpha, "Contents", "Resources", "app.asar")
         ? "present"
         : "absent",
+      readAsarHeaderHash: () => "a".repeat(64),
       appFingerprint: (path) => path.includes("candidate.app")
         ? "built-alpha-digest"
         : path === stalePatchedAlpha

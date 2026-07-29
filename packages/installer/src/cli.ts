@@ -30,6 +30,7 @@ import {
   environment,
   type EnvironmentCommandOptions,
 } from "./commands/environment.js";
+import { codexSource, type CodexSourceOptions } from "./commands/codex-source.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -246,6 +247,27 @@ prog
   .action(wrap(cancelCodexUpdate));
 
 prog
+  .command("codex-source <action>")
+  .describe("Inspect or prepare official Codex source for the bundled control lane or an explicit stable/edge lane")
+  .option("--app", "Exact ChatGPT.app path used to probe the bundled backend")
+  .option("--channel", "Source channel: bundled (default), stable, or edge")
+  .option("--force", "Bypass the daily advisory throttle (detect only)")
+  .option("--frontend-source-app", "Exact pristine internal ChatGPT.app source (build only)")
+  .option("--patch-series", "Comma-separated exact absolute patch files (build only)")
+  .option("--chrome-plugin-root", "Exact Chrome DevTools plugin release root (build only)")
+  .option("--playwright-plugin-root", "Exact Playwright plugin release root (build only)")
+  .option("--fleet-manifest", "Exact full-fleet lifecycle/catalog/artifact manifest (build only)")
+  .option("--transaction-id", "Durable source transaction ID")
+  .option("--restart-window-opens-at", "Approved restart-window opening timestamp (freeze only)")
+  .option("--restart-window-closes-at", "Approved restart-window closing timestamp (freeze only)")
+  .option("--live-codex-home", "Exact live CODEX_HOME (cutover/rollback only)")
+  .option("--live-config", "Exact live config.toml (cutover/rollback only)")
+  .option("--watcher-receipt", "Exact watcher handoff receipt path (cutover/rollback only)")
+  .option("--approval-file", "Exact restart approval file (cutover/rollback only)")
+  .option("--json", "Print machine-readable output", true)
+  .action(wrap((action: string, options: CodexSourceOptions) => codexSource(action, options)));
+
+prog
   .command("update")
   .describe("Install the latest published Tweakers release; keep the managed runtime when no release exists")
   .option("--repo", "GitHub repo to download (default: therealityreport/tweakers)")
@@ -280,6 +302,7 @@ prog
   .describe("Inspect, prepare, complete, and recover a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
   .option("--app-experience", "App experience: chatgpt or tweakers")
   .option("--release-profile", "Release profile: stable or alpha")
+  .option("--bundled-derived-receipt", "Validated bundled-derived Codex receipt (prepare only)")
   .option("--transaction", "Durable environment transaction ID")
   .option("--app-path", "Exact absolute path to a user-selected OpenAI Beta .app (register-alpha only)")
   .option("--app", "Alias for --app-path")

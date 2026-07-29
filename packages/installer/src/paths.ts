@@ -19,6 +19,8 @@ import { LEGACY_DATA_DIR, LEGACY_HOME_ENV, LEGACY_USER_ROOT_ENV } from "./legacy
 export interface UserPaths {
   root: string;
   runtime: string;
+  /** Versioned, installer-owned MCP package artifacts; optional only in legacy fixtures. */
+  managedMcpRoot?: string;
   tweaks: string;
   backup: string;
   configFile: string;
@@ -45,6 +47,7 @@ export interface UserPaths {
   desktopUpdateLockFile?: string;
   desktopUpdateHeartbeatFile?: string;
   desktopUpdateLogFile?: string;
+  environmentWatcherPromotionFile?: string;
 }
 
 export interface EnvironmentUserPaths {
@@ -57,6 +60,7 @@ export interface EnvironmentUserPaths {
   environmentReceiptRoot: string;
   environmentLockFile: string;
   environmentRuntimeProofFile: string;
+  environmentWatcherPromotionFile: string;
 }
 
 export interface DesktopUpdateUserPaths {
@@ -67,13 +71,17 @@ export interface DesktopUpdateUserPaths {
   desktopUpdateLogFile: string;
 }
 
-export type ResolvedUserPaths = UserPaths & EnvironmentUserPaths & DesktopUpdateUserPaths;
+export type ResolvedUserPaths = UserPaths
+  & EnvironmentUserPaths
+  & DesktopUpdateUserPaths
+  & { managedMcpRoot: string };
 
 export function userPaths(): ResolvedUserPaths {
   const root = userRoot();
   const paths: ResolvedUserPaths = {
     root,
     runtime: join(root, "runtime"),
+    managedMcpRoot: join(root, "managed-mcp"),
     tweaks: join(root, "tweaks"),
     backup: join(root, "backup"),
     configFile: join(root, "config.json"),
@@ -98,6 +106,7 @@ export function userPaths(): ResolvedUserPaths {
     desktopUpdateLockFile: join(root, "transactions", "desktop-update.lock"),
     desktopUpdateHeartbeatFile: join(root, "transactions", "desktop-update.heartbeat.json"),
     desktopUpdateLogFile: join(root, "log", "desktop-update.log"),
+    environmentWatcherPromotionFile: join(root, "transactions", "environment-watcher.json"),
   };
   return paths;
 }
@@ -107,6 +116,7 @@ export function ensureUserPaths(): ResolvedUserPaths {
   for (const dir of [
     p.root,
     p.runtime,
+    p.managedMcpRoot,
     p.tweaks,
     p.backup,
     p.binDir,

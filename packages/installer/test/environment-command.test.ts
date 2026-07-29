@@ -413,6 +413,38 @@ test("prepare normalizes Sade option keys, publishes only recomputed registry ev
   assert.equal(fixture.printed.length, 1);
 });
 
+test("prepare forwards only an explicit internal bundled-derived receipt to the production coordinator", async () => {
+  const coordinatorInputs: Parameters<EnvironmentCommandDependencies["createCoordinator"]>[0][] = [];
+  const fixture = dependencies({
+    createCoordinator: (options) => {
+      coordinatorInputs.push(options);
+      return fakeCoordinator();
+    },
+  });
+  const receiptFile = `${ROOT}/codex-source/receipts/bundled-derived.json`;
+
+  await environment("prepare", {
+    appExperience: "tweakers",
+    releaseProfile: "stable",
+    "bundled-derived-receipt": receiptFile,
+    json: true,
+  }, fixture.deps);
+
+  assert.equal(coordinatorInputs.length, 1);
+  assert.equal(coordinatorInputs[0]?.bundledDerivedReceiptFile, receiptFile);
+
+  const external = dependencies();
+  await assert.rejects(
+    environment("prepare", {
+      appExperience: "tweakers",
+      releaseProfile: "stable",
+      bundledDerivedReceipt: "/Volumes/HardDrive/receipt.json",
+    }, external.deps),
+    /internal filesystem/,
+  );
+  assert.equal(external.writes.length, 0);
+});
+
 test("prepare rejects invalid or conflicting enums before writing state", async () => {
   const invalid = dependencies();
   await assert.rejects(

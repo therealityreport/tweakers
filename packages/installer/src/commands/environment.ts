@@ -70,6 +70,8 @@ export interface EnvironmentCommandOptions {
   appPath?: string;
   "app-path"?: string;
   app?: string;
+  bundledDerivedReceipt?: string;
+  "bundled-derived-receipt"?: string;
   observe?: boolean;
   dryRun?: boolean;
   "dry-run"?: boolean;
@@ -233,8 +235,19 @@ async function runEnvironmentAction(
   paths: ResolvedUserPaths,
 ): Promise<EnvironmentCommandResult> {
   let coordinatorInstance: EnvironmentCoordinator | null = null;
+  const configuredBundledDerivedReceipt = optionValue(
+    options.bundledDerivedReceipt,
+    options["bundled-derived-receipt"],
+    "bundled-derived receipt",
+  );
+  if (configuredBundledDerivedReceipt !== undefined && action !== "prepare") {
+    throw new Error("Bundled-derived receipt may be configured only during environment prepare");
+  }
+  const bundledDerivedReceiptFile = configuredBundledDerivedReceipt === undefined
+    ? undefined
+    : parseBundledDerivedReceiptPath(configuredBundledDerivedReceipt);
   const coordinator = (): EnvironmentCoordinator => {
-    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(paths));
+    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(paths, bundledDerivedReceiptFile));
     return coordinatorInstance;
   };
 
@@ -517,7 +530,10 @@ function idleEnvironmentTransaction(): IdleEnvironmentTransaction {
   };
 }
 
-function coordinatorOptions(paths: ResolvedUserPaths): EnvironmentCoordinatorOptions {
+function coordinatorOptions(
+  paths: ResolvedUserPaths,
+  bundledDerivedReceiptFile?: string,
+): EnvironmentCoordinatorOptions {
   return {
     environmentRoot: paths.root,
     transactionFile: paths.environmentTransactionFile,
@@ -530,7 +546,18 @@ function coordinatorOptions(paths: ResolvedUserPaths): EnvironmentCoordinatorOpt
     mcpStateFile: join(paths.root, "mcp-sync-state.json"),
     tweaksRoot: paths.tweaks,
     lockFile: paths.environmentLockFile,
+    ...(bundledDerivedReceiptFile ? { bundledDerivedReceiptFile } : {}),
   };
+}
+
+function parseBundledDerivedReceiptPath(value: string): string {
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error("Bundled-derived receipt path must be exact and absolute");
+  }
+  if (value === "/Volumes" || value.startsWith("/Volumes/")) {
+    throw new Error("Bundled-derived receipt must remain on the internal filesystem");
+  }
+  return value;
 }
 
 function requireTransaction(

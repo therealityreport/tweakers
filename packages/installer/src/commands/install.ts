@@ -1,6 +1,6 @@
 import kleur from "kleur";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync, readdirSync, rmSync, copyFileSync, renameSync, lstatSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync, readdirSync, rmSync, copyFileSync, renameSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -12,6 +12,7 @@ import { backupOnce, patchAsar, readFileInAsar, readHeaderHash } from "../asar.j
 import { setIntegrity, getIntegrity } from "../integrity.js";
 import { writeFuse } from "../fuses.js";
 import { clearQuarantine, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
+import { assertInternalStoragePath } from "../internal-storage.js";
 
 // Re-export from its new home (codesign.ts) so existing importers keep working.
 export { isDeveloperIdSignedBackup };
@@ -73,7 +74,11 @@ interface Opts {
   /** macOS-only identity and user-data isolation for a separate Tweakers app. */
   macAppIdentity?: MacAppIdentity;
   /** Internal only: patch/sign a disposable candidate without global side effects. */
-  candidateContext?: { paths: UserPaths; finalUserRoot: string };
+  candidateContext?: {
+    paths: UserPaths;
+    finalUserRoot: string;
+    bundledDerivedBackend?: BundledDerivedBackendArtifact;
+  };
   /** Internal only: repair already reconciles shims before its fast paths. */
   reconcileCliShims?: boolean;
   /**
@@ -96,6 +101,98 @@ export const STAGED_NATIVE_HOST_RELATIVE_PATH = join(
 
 export function stagedNativeHostPath(appRoot: string): string {
   return join(appRoot, STAGED_NATIVE_HOST_RELATIVE_PATH);
+}
+
+export function bundledDerivedBackendPath(appRoot: string): string {
+  return join(appRoot, "Contents", "Resources", "codex");
+}
+
+/**
+ * Copy a receipt-validated, desktop-bundled-derived backend into a disposable
+ * app. Both source and destination must stay on the internal filesystem, and
+ * the copied bytes/version are re-probed before the caller signs the app.
+ */
+export function stageBundledDerivedBackendInsideApp(
+  appRoot: string,
+  artifact: BundledDerivedBackendArtifact,
+  deps: {
+    fingerprint?: (file: string) => string;
+    readVersion?: (file: string) => string | null;
+    copy?: (source: string, destination: string) => void;
+  } = {},
+): string {
+  requireInternalExactPath(appRoot, "Bundled-derived candidate app");
+  requireInternalExactFile(artifact.binaryPath, "Bundled-derived backend");
+  requireInternalExactFile(artifact.receiptPath, "Bundled-derived receipt");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(artifact.transactionId)) {
+    throw new Error("Bundled-derived transaction ID is invalid");
+  }
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(artifact.version)) {
+    throw new Error("Bundled-derived backend version is invalid");
+  }
+  const expectedFingerprint = artifact.fingerprint.toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(expectedFingerprint)) {
+    throw new Error("Bundled-derived backend fingerprint is invalid");
+  }
+  const fingerprint = deps.fingerprint ?? sha256RegularFile;
+  const readVersion = deps.readVersion ?? probeCodexCliVersion;
+  if (fingerprint(artifact.binaryPath).toLowerCase() !== expectedFingerprint) {
+    throw new Error("Bundled-derived backend fingerprint does not match its validated descriptor");
+  }
+  if (readVersion(artifact.binaryPath) !== artifact.version) {
+    throw new Error("Bundled-derived backend version does not match its validated descriptor");
+  }
+
+  const destination = bundledDerivedBackendPath(appRoot);
+  const temporary = `${destination}.bundled-derived-${process.pid}.tmp`;
+  mkdirSync(dirname(destination), { recursive: true });
+  try {
+    (deps.copy ?? copyFileSync)(artifact.binaryPath, temporary);
+    chmodSync(temporary, 0o755);
+    if (fingerprint(temporary).toLowerCase() !== expectedFingerprint
+      || readVersion(temporary) !== artifact.version) {
+      throw new Error("Staged bundled-derived backend does not match its validated descriptor");
+    }
+    renameSync(temporary, destination);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  if (fingerprint(destination).toLowerCase() !== expectedFingerprint
+    || readVersion(destination) !== artifact.version) {
+    throw new Error("Embedded bundled-derived backend failed final verification");
+  }
+  return destination;
+}
+
+function requireInternalExactPath(path: string, label: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path) {
+    throw new Error(`${label} path must be exact and absolute`);
+  }
+  assertInternalStoragePath(path, label);
+}
+
+function requireInternalExactFile(path: string, label: string): void {
+  requireInternalExactPath(path, label);
+  if (!existsSync(path)) throw new Error(`${label} is missing at ${path}`);
+  const status = lstatSync(path);
+  if (!status.isFile() || status.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-symlink file`);
+  }
+}
+
+function sha256RegularFile(file: string): string {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+function probeCodexCliVersion(file: string): string | null {
+  const result = spawnSync(file, ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+  });
+  if (result.status !== 0) return null;
+  return `${result.stdout ?? ""}${result.stderr ?? ""}`.trim().split(/\s+/).at(-1) ?? null;
 }
 
 /** Copy the native host into the app before the app's final inside-out sign. */
@@ -704,6 +801,20 @@ export interface BuildPatchedCandidateOnlyInput {
   /** Durable receipt-owned copy of the runtime validated inside the candidate. */
   destinationRuntime: string;
   finalUserRoot: string;
+  /**
+   * Exact receipt-validated backend derived from the installed desktop's
+   * bundled Codex tag. This remains the bundled lane; it is never exposed as a
+   * managed Stable/Beta selection.
+   */
+  bundledDerivedBackend?: BundledDerivedBackendArtifact;
+}
+
+export interface BundledDerivedBackendArtifact {
+  binaryPath: string;
+  version: string;
+  fingerprint: string;
+  receiptPath: string;
+  transactionId: string;
 }
 
 /**
@@ -758,6 +869,7 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
       candidateContext: {
         paths: transactionUserPaths(candidateUserRoot),
         finalUserRoot,
+        ...(input.bundledDerivedBackend ? { bundledDerivedBackend: input.bundledDerivedBackend } : {}),
       },
     });
     const candidate = locateCodex(destinationApp);
@@ -951,6 +1063,14 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     }
   }
   step("App patched");
+
+  // The desktop-bundled-derived backend must be inside the disposable app
+  // before the final inside-out signature. Staging it after this point would
+  // invalidate the app signature and make the receipt proof meaningless.
+  if (opts.candidateContext?.bundledDerivedBackend) {
+    stageBundledDerivedBackendInsideApp(codex.appRoot, opts.candidateContext.bundledDerivedBackend);
+    step.detail(`Staged desktop-bundled-derived Codex ${opts.candidateContext.bundledDerivedBackend.version}`);
+  }
 
   // 6. Re-sign on macOS.
   let resigned = false;
