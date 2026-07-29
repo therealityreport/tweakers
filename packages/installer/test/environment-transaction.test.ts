@@ -3147,11 +3147,16 @@ test("a host-less nonmatching desktop fails preflight before the app is stopped"
 test("validation refuses to replace a live desktop newer than its prepared payload", () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-environment-downgrade-"));
   const receiptRoot = join(root, "receipts");
+  // The live-payload guard returns early when nothing exists at the desktop
+  // path, so the "live" desktop must be a real directory — a hermetic stand-in
+  // under the temp root, never the machine's actual /Applications bundle.
+  const liveDesktopPath = join(root, "Applications", "ChatGPT.app");
+  mkdirSync(liveDesktopPath, { recursive: true });
   // Runtime evidence is only required when Tweakers is involved; this guard is
   // about desktop bytes, so an official-only transition keeps the test focused.
   const registry = createEnvironmentProfileRegistry({
-    stableDesktopPath: "/Applications/ChatGPT.app",
-    alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+    stableDesktopPath: liveDesktopPath,
+    alphaDesktopPath: join(root, "Applications", "ChatGPT (Beta).app"),
   });
   const current = createEnvironmentSelection({
     profile: registry.profiles.stable,
