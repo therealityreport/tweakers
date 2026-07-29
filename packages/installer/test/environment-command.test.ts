@@ -198,6 +198,14 @@ function dependencies(overrides: Partial<EnvironmentCommandDependencies> = {}) {
       loadInputs.push(input);
       return state;
     },
+    inspectProfile: () => trustedEvidence("stable"),
+    inspectManagedAlpha: () => ({
+      installed: true,
+      binaryPath: `${ROOT}/codex-cli/releases/alpha/codex`,
+      version: "0.145.0-alpha.19",
+      fingerprint: "alpha-managed",
+      error: null,
+    }),
     writeRegistry: (file) => { writes.push(file); },
     preparationCapabilities: () => ({ patchedPayloadBuildable: true, backendInstallable: true }),
     createRequestedSelection: createRequestedEnvironmentSelection,
@@ -305,6 +313,60 @@ test("status --observe remains available while the lifecycle lease is held", asy
   } finally {
     lock.release();
   }
+});
+
+test("status --observe never runs expensive profile or managed Alpha verification", async () => {
+  const observedState = loadedState();
+  const unverifiedRegistry = createEnvironmentProfileRegistry({
+    stableDesktopPath: "/Applications/ChatGPT.app",
+    alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+    environmentRoot: ROOT,
+  });
+  const expensiveCalls: string[] = [];
+  const cachedVersions: Array<string | null | undefined> = [];
+  const fixture = dependencies({
+    loadState: (_input, loadDependencies) => {
+      assert.ok(loadDependencies.inspectProfile);
+      cachedVersions.push(loadDependencies.inspectProfile(
+        unverifiedRegistry.profiles.stable,
+        observedState.current,
+        observedState.registry.profiles.stable,
+      ).officialVersion);
+      cachedVersions.push(loadDependencies.inspectProfile(
+        unverifiedRegistry.profiles.alpha,
+        observedState.current,
+        observedState.registry.profiles.alpha,
+      ).officialVersion);
+      return observedState;
+    },
+    inspectProfile: (profile) => {
+      expensiveCalls.push(`profile:${profile.releaseProfile}`);
+      return trustedEvidence(profile.releaseProfile);
+    },
+    inspectManagedAlpha: () => {
+      expensiveCalls.push("managed-alpha");
+      return {
+        installed: true,
+        binaryPath: `${ROOT}/codex-cli/releases/alpha/codex`,
+        version: "0.145.0-alpha.19",
+        fingerprint: "alpha-managed",
+        error: null,
+      };
+    },
+  });
+
+  await environment("status", { observe: true, json: true }, fixture.deps);
+
+  assert.deepEqual(expensiveCalls, []);
+  assert.deepEqual(cachedVersions, ["26.707.1", "26.717.1"]);
+
+  await environment("status", { json: true }, fixture.deps);
+
+  assert.deepEqual(expensiveCalls, [
+    "managed-alpha",
+    "profile:stable",
+    "profile:alpha",
+  ]);
 });
 
 test("register-alpha validates a native-selected absolute app path and preserves selection", async () => {

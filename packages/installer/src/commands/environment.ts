@@ -13,6 +13,7 @@ import {
   writeEnvironmentProfileRegistry,
   type AppExperience,
   type EnvironmentProfileRecord,
+  type EnvironmentProfileEvidenceInput,
   type EnvironmentProfileRegistry,
   type LoadedEnvironmentState,
   type ReleaseProfile,
@@ -158,6 +159,8 @@ export function assertEnvironmentCliSuccess(
 export interface EnvironmentCommandDependencies {
   paths(): ResolvedUserPaths;
   loadState: typeof loadEnvironmentState;
+  inspectProfile: typeof inspectEnvironmentProfile;
+  inspectManagedAlpha: typeof inspectManagedAlphaBackend;
   writeRegistry(file: string, registry: EnvironmentProfileRegistry): void;
   preparationCapabilities(): EnvironmentPreparationCapabilities;
   createRequestedSelection: typeof createRequestedEnvironmentSelection;
@@ -175,6 +178,8 @@ export interface EnvironmentCommandDependencies {
 const DEFAULT_DEPENDENCIES: EnvironmentCommandDependencies = {
   paths: userPaths,
   loadState: loadEnvironmentState,
+  inspectProfile: inspectEnvironmentProfile,
+  inspectManagedAlpha: inspectManagedAlphaBackend,
   writeRegistry: writeEnvironmentProfileRegistry,
   preparationCapabilities: environmentPreparationCapabilities,
   createRequestedSelection: createRequestedEnvironmentSelection,
@@ -373,8 +378,7 @@ function recomputeEnvironmentTruth(
   observe = false,
 ): LoadedEnvironmentState {
   const capabilities = dependencies.preparationCapabilities();
-  const managedAlpha = inspectManagedAlphaBackend(paths.root);
-  return dependencies.loadState({
+  const input = {
     legacyStateFile: paths.stateFile,
     registryFile: paths.environmentRegistryFile,
     selectionFile: paths.environmentSelectionFile,
@@ -388,10 +392,21 @@ function recomputeEnvironmentTruth(
       backendInstallable: capabilities.backendInstallable,
       patchedPayloadBuildable: capabilities.patchedPayloadBuildable,
     },
-  }, {
-    recoverCommit: !observe,
+  };
+  if (observe) {
+    return dependencies.loadState(input, {
+      recoverCommit: false,
+      inspectProfile: (profile, _current, persistedProfile) => (
+        cachedProfileEvidence(persistedProfile ?? profile)
+      ),
+    });
+  }
+
+  const managedAlpha = dependencies.inspectManagedAlpha(paths.root);
+  return dependencies.loadState(input, {
+    recoverCommit: true,
     inspectProfile: (profile, current) => {
-      const evidence = inspectEnvironmentProfile(profile, current);
+      const evidence = dependencies.inspectProfile(profile, current);
       if (profile.releaseProfile === "alpha") {
         evidence.backendVersion = managedAlpha.installed ? managedAlpha.version : null;
         evidence.backendFingerprint = managedAlpha.installed ? managedAlpha.fingerprint : null;
@@ -405,6 +420,38 @@ function recomputeEnvironmentTruth(
       return evidence;
     },
   });
+}
+
+/**
+ * Passive status readers consume the last evidence published by a verified
+ * lifecycle operation. This keeps menus and settings panels observational:
+ * they never hash app trees or launch codesign merely to render current state.
+ * Mutation paths still call the live inspectors above before publishing.
+ */
+function cachedProfileEvidence(profile: EnvironmentProfileRecord): EnvironmentProfileEvidenceInput {
+  return {
+    officialVersion: profile.officialVersion,
+    officialBuild: profile.officialBuild,
+    strictSignature: profile.strictSignature,
+    gatekeeper: profile.gatekeeper,
+    teamIdentifier: profile.teamIdentifier,
+    designatedRequirement: profile.designatedRequirement,
+    signatureCheckedAt: profile.signatureCheckedAt,
+    officialBackendPath: profile.officialBackendPath,
+    officialBackendVersion: profile.officialBackendVersion,
+    officialBackendFingerprint: profile.officialBackendFingerprint,
+    backendPath: profile.backendPath,
+    backendVersion: profile.backendVersion,
+    backendChannel: profile.backendChannel,
+    backendFingerprint: profile.backendFingerprint,
+    pristineBackupPath: profile.pristineBackupPath,
+    pristineBackupFingerprint: profile.pristineBackupFingerprint,
+    patchedPayloadPath: profile.patchedPayloadPath,
+    patchedPayloadFingerprint: profile.patchedPayloadFingerprint,
+    backendInstallable: profile.backendInstallable,
+    patchedPayloadBuildable: profile.patchedPayloadBuildable,
+    unavailableReasons: profile.unavailableReasons,
+  };
 }
 
 function environmentStatus(

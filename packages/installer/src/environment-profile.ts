@@ -149,6 +149,7 @@ export interface LoadEnvironmentStateDeps {
   inspectProfile?: (
     profile: EnvironmentProfileRecord,
     current: EnvironmentSelection,
+    persistedProfile: EnvironmentProfileRecord | null,
   ) => EnvironmentProfileEvidenceInput;
 }
 
@@ -752,11 +753,11 @@ export function loadEnvironmentState(
   const inspect = deps.inspectProfile ?? ((profile: EnvironmentProfileRecord) => inspectEnvironmentProfile(profile, current!));
   const stableEvidence = {
     ...profileArtifactLocations(base.profiles.stable),
-    ...inspect(base.profiles.stable, current),
+    ...inspect(base.profiles.stable, current, persistedRegistry?.profiles.stable ?? null),
   };
   const alphaEvidence = {
     ...profileArtifactLocations(base.profiles.alpha),
-    ...inspect(base.profiles.alpha, current),
+    ...inspect(base.profiles.alpha, current, persistedRegistry?.profiles.alpha ?? null),
   };
   const registry = createEnvironmentProfileRegistry({
     stableDesktopPath: effectiveStableDesktopPath,
