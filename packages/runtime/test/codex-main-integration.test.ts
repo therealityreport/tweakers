@@ -282,10 +282,11 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
   const launchdLaunch = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
   assert.match(mainSource, /function localCliRuntime[\s\S]*?resolveLocalCliRuntime\(\{/);
   assert.match(launchdLaunch, /localCliRuntime\(cli, args\)/);
-  assert.match(launchdLaunch, /command: runtime\.command/);
-  assert.match(launchdLaunch, /args: runtime\.args/);
+  assert.match(launchdLaunch, /\[runtime\.command, \.\.\.runtime\.args\]\.map\(shellQuote\)\.join\(" "\)/);
+  assert.match(launchdLaunch, /launchctl",\s*\["bootstrap"/);
+  assert.match(launchdLaunch, /<key>AbandonProcessGroup<\/key><true\/>/);
   assert.doesNotMatch(launchdLaunch, /process\.execPath, cli/);
-  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE: "1"/);
+  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE=1/);
   for (const exactRootVariable of [
     "TWEAKERS_HOME",
     "TWEAKER_HOME",
@@ -293,10 +294,10 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
     "TWEAKER_USER_ROOT",
   ]) {
     assert.match(localRuntime, new RegExp(`${exactRootVariable}: userRoot!`));
-    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}: userRoot!`));
+    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}=\\$\\{shellQuote\\(userRoot!\\)\\}`));
   }
   assert.match(localRuntime, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
-  assert.match(launchdLaunch, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
+  assert.match(launchdLaunch, /\$\{LEGACY_USER_ROOT_ENV\}=\$\{shellQuote\(userRoot!\)\}/);
 });
 
 test("Sparkle update mode is committed only after the signed app restore", () => {

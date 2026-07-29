@@ -1,6 +1,27 @@
 import kleur from "kleur";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync, readdirSync, rmSync, copyFileSync, renameSync, lstatSync } from "node:fs";
+import {
+  chmodSync,
+  constants as fsConstants,
+  cpSync,
+  existsSync,
+  fstatSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  closeSync,
+  unlinkSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  copyFileSync,
+  renameSync,
+  lstatSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -31,6 +52,7 @@ import {
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
+import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
@@ -407,6 +429,212 @@ export function loadVerifiedSwapHost(
   const require = createRequire(import.meta.url);
   const nativeHost = require(evidence.path) as NativeAppIdentityHost;
   return (first, second) => nativeHost.swapDirectories(first, second);
+}
+
+const HEALTH_PROBE_ENV_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+] as const;
+
+const HEALTH_PROBE_PLATFORM_ENV_KEYS: Partial<Record<NodeJS.Platform, readonly string[]>> = {
+  darwin: ["HOME", "USER", "LOGNAME", "__CF_USER_TEXT_ENCODING"],
+  linux: [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+  ],
+  win32: ["USERPROFILE", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"],
+};
+
+export const HEALTH_PROBE_TEMP_RELATIVE_PATH = "tmp";
+export const HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH = "codex-home";
+export const HEALTH_PROBE_USER_DATA_RELATIVE_PATH = "electron-user-data";
+export const HEALTH_PROBE_ROOT_PREFIX = "probe-";
+export const HEALTH_PROBE_PROCESS_TIMEOUT_MS = 170_000;
+export const HEALTH_PROBE_RECEIPT_TIMEOUT_MS = 170_000;
+
+function requireRealDirectory(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`${label} must be a real directory: ${path}`);
+  }
+}
+
+interface HealthProbeSandbox {
+  root: string;
+  tempRoot: string;
+  codexHome: string;
+  userDataRoot: string;
+}
+
+interface HealthProbeLaunchDependencies {
+  spawn?: typeof spawnSync;
+  /** Source-only Codex home. Its bounded config/policy files are copied into the fresh probe home. */
+  candidateCodexHome?: string;
+  /** Internal seam for proving that ambient authentication data is excluded. */
+  environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  /** Internal test seam; production always removes the exact disposable root recursively. */
+  removeProbeRoot?: (probeRoot: string) => void;
+}
+
+function isStrictDescendant(parent: string, child: string): boolean {
+  const childRelative = relative(parent, child);
+  return childRelative.length > 0
+    && !isAbsolute(childRelative)
+    && !/^\.\.(?:[\\/]|$)/.test(childRelative);
+}
+
+function prepareHealthProbeSandbox(userRoot: string): HealthProbeSandbox {
+  if (!isAbsolute(userRoot) || resolve(userRoot) !== userRoot) {
+    throw new Error(`Health probe user root must be an exact absolute path: ${userRoot}`);
+  }
+  requireRealDirectory(userRoot, "Health probe user root");
+
+  const healthRoot = join(userRoot, "health");
+  if (!existsSync(healthRoot)) mkdirSync(healthRoot, { mode: 0o700 });
+  requireRealDirectory(healthRoot, "Health probe receipt directory");
+  const realUserRoot = realpathSync(userRoot);
+  const realHealthRoot = realpathSync(healthRoot);
+  if (!isStrictDescendant(realUserRoot, realHealthRoot)) {
+    throw new Error(`Health probe receipt directory resolves outside its user root: ${healthRoot}`);
+  }
+  chmodSync(healthRoot, 0o700);
+
+  const probeRoot = mkdtempSync(join(healthRoot, HEALTH_PROBE_ROOT_PREFIX));
+  chmodSync(probeRoot, 0o700);
+  requireRealDirectory(probeRoot, "Health probe disposable root");
+  const realProbeRoot = realpathSync(probeRoot);
+  if (!isStrictDescendant(realHealthRoot, realProbeRoot)) {
+    rmSync(probeRoot, { recursive: true, force: true });
+    throw new Error(`Health probe disposable root resolves outside its receipt directory: ${probeRoot}`);
+  }
+
+  const makeContainedDirectory = (name: string, label: string): string => {
+    const path = join(probeRoot, name);
+    mkdirSync(path, { mode: 0o700 });
+    chmodSync(path, 0o700);
+    requireRealDirectory(path, label);
+    const realPath = realpathSync(path);
+    if (!isStrictDescendant(realProbeRoot, realPath)) {
+      throw new Error(`${label} resolves outside its disposable root: ${path}`);
+    }
+    return path;
+  };
+
+  try {
+    return {
+      root: probeRoot,
+      tempRoot: makeContainedDirectory(HEALTH_PROBE_TEMP_RELATIVE_PATH, "Health probe temp directory"),
+      codexHome: makeContainedDirectory(HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH, "Health probe Codex home"),
+      userDataRoot: makeContainedDirectory(HEALTH_PROBE_USER_DATA_RELATIVE_PATH, "Health probe Electron user-data directory"),
+    };
+  } catch (error) {
+    rmSync(probeRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function cleanupHealthProbeSandbox(
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  removeProbeRoot?: (probeRoot: string) => void,
+): void {
+  const expectedHealthRoot = join(userRoot, "health");
+  if (!isStrictDescendant(expectedHealthRoot, sandbox.root)) {
+    throw new Error(`Refusing to clean non-contained health probe root: ${sandbox.root}`);
+  }
+  if (existsSync(sandbox.root)) {
+    const stat = lstatSync(sandbox.root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      rmSync(sandbox.root, { force: true });
+      throw new Error(`Health probe disposable root changed type before cleanup: ${sandbox.root}`);
+    }
+    const realHealthRoot = realpathSync(expectedHealthRoot);
+    const realProbeRoot = realpathSync(sandbox.root);
+    if (!isStrictDescendant(realHealthRoot, realProbeRoot)) {
+      throw new Error(`Refusing to clean health probe root that resolves outside containment: ${sandbox.root}`);
+    }
+  }
+  (removeProbeRoot ?? ((probeRoot) => rmSync(probeRoot, { recursive: true, force: true })))(sandbox.root);
+  if (existsSync(sandbox.root)) {
+    throw new Error(`Health probe disposable root could not be removed: ${sandbox.root}`);
+  }
+}
+
+function withHealthProbeSandbox<T>(
+  userRoot: string,
+  deps: Pick<HealthProbeLaunchDependencies, "removeProbeRoot">,
+  operation: (sandbox: HealthProbeSandbox) => T,
+): T {
+  const sandbox = prepareHealthProbeSandbox(userRoot);
+  try {
+    return operation(sandbox);
+  } finally {
+    cleanupHealthProbeSandbox(userRoot, sandbox, deps.removeProbeRoot);
+  }
+}
+
+function requireCodexInputSource(path: string, label: string, containedBy?: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path) {
+    throw new Error(`${label} must be an exact absolute path: ${path}`);
+  }
+  requireRealDirectory(path, label);
+  if (containedBy !== undefined) {
+    if (!isStrictDescendant(containedBy, path)) {
+      throw new Error(`${label} must be contained by its user root: ${path}`);
+    }
+    const realParent = realpathSync(containedBy);
+    const realPath = realpathSync(path);
+    if (!isStrictDescendant(realParent, realPath)) {
+      throw new Error(`${label} resolves outside its user root: ${path}`);
+    }
+  }
+}
+
+function healthProbeEnvironment(
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  platform: NodeJS.Platform,
+  parentEnvironment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  const permittedKeys = [
+    ...HEALTH_PROBE_ENV_KEYS,
+    ...(HEALTH_PROBE_PLATFORM_ENV_KEYS[platform] ?? []),
+  ];
+  for (const key of permittedKeys) {
+    const value = parentEnvironment[key];
+    if (value !== undefined) environment[key] = value;
+  }
+
+  // Every health process gets contained home, Codex-home, temporary, and
+  // Chromium-profile roots. This keeps fallback reads away from the real
+  // account even when the original desktop bootstrap runs for renderer proof.
+  if (platform === "win32") environment.USERPROFILE = sandbox.root;
+  else environment.HOME = sandbox.root;
+
+  if (platform === "win32") {
+    environment.TEMP = sandbox.tempRoot;
+    environment.TMP = sandbox.tempRoot;
+  } else {
+    environment.TMPDIR = sandbox.tempRoot;
+  }
+
+  environment.TWEAKERS_HEALTH_CHECK_ONLY = "1";
+  environment.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN = "1";
+  environment.TWEAKERS_HEALTH_USER_ROOT = userRoot;
+  environment.TWEAKERS_HEALTH_BACKGROUND = "1";
+  environment.CODEX_HOME = sandbox.codexHome;
+  environment.TWEAKERS_CANDIDATE_MCP_RECONCILIATION = "1";
+  return environment;
 }
 
 function launchHealthProbe(
@@ -1904,7 +2132,7 @@ export function stageAppBundleReplacement(
   const incoming = `${destination}.tweakers-contents-swap`;
   const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   const copy = adapters.copyDirectory
-    ?? ((from: string, to: string) => cpSync(from, to, { recursive: true, verbatimSymlinks: true }));
+    ?? ((from: string, to: string) => copyDirectoryPreservingModes(from, to));
   remove(incoming);
   copy(sourceContents, incoming);
   if (!existsSync(incoming)) throw new Error("Prepared app Contents staging copy is missing");
@@ -1940,10 +2168,11 @@ export function replaceAppBundlePreservingIdentity(
   // A stable path makes cleanup debt recoverable: the next serialized
   // promotion removes any old payload left here before preparing its swap.
   const incoming = `${destination}.tweakers-contents-swap`;
-  remove(incoming);
-  // The swapped-in Contents becomes the live bundle, so its permission bits
-  // must come from the source payload and never from the caller's umask.
-  copyDirectoryPreservingModes(sourceContents, incoming);
+  if (adapters.preStagedIncoming) {
+    if (!existsSync(incoming)) throw new Error("Pre-staged app Contents are missing");
+  } else {
+    stageAppBundleReplacement(source, destination, { removeDirectory: remove });
+  }
   let preserveIncoming = false;
   // Only true while `incoming` holds the swapped-out (previous) Contents; a
   // rolled-back validation failure flips it back so we never park rejected bytes.

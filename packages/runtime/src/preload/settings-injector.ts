@@ -3072,6 +3072,7 @@ function renderCodexVersionsCard(
     ));
   }
 
+  card.appendChild(codexVersionSurfaceOverview(snapshot));
   card.appendChild(codexActiveCliRow(snapshot));
   card.appendChild(codexEmbeddedCliRow(bundled, snapshot));
   card.appendChild(codexLatestStableReleaseRow(bundled));
@@ -3095,6 +3096,56 @@ function renderCodexVersionsCard(
   const stateMessage = codexRuntimeMessage(snapshot);
   if (stateMessage) card.appendChild(rowSimple("Runtime status", stateMessage));
   card.appendChild(codexFeatureBrowser(snapshot, busy, reload));
+}
+
+function codexVersionSurfaceOverview(snapshot: CodexVersionsSnapshot): HTMLElement {
+  const stable = snapshot.cli.bundled.release?.version ?? "Not checked";
+  const prerelease = snapshot.cli.beta.release?.version ?? "Not checked";
+  const desktopPrerelease = snapshot.cli.bundled.versionChannel === "prerelease"
+    ? snapshot.cli.bundled.version ?? "Not checked"
+    : "Not included in this desktop release";
+  const overview = document.createElement("div");
+  overview.className = "grid grid-cols-1 gap-3 p-3 md:grid-cols-2";
+  overview.dataset.tweakerCodexVersionOverview = "true";
+  overview.append(
+    codexVersionSurfaceSummary("Terminal", [
+      ["Latest Release", stable],
+      ["Latest Pre-Release", prerelease],
+      ["Current", snapshot.terminalCli.version ?? "Not installed"],
+    ]),
+    codexVersionSurfaceSummary("Desktop macOS", [
+      ["Latest Release", stable],
+      ["Latest Pre-Release", desktopPrerelease],
+      ["Current", snapshot.activeCli.version ?? "Unavailable"],
+    ]),
+  );
+  return overview;
+}
+
+function codexVersionSurfaceSummary(
+  titleText: string,
+  metrics: ReadonlyArray<readonly [label: string, value: string]>,
+): HTMLElement {
+  const surface = document.createElement("div");
+  surface.className = "border-token-border flex min-w-0 flex-col gap-2 rounded-lg border p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm font-semibold text-token-text-primary";
+  title.textContent = titleText;
+  surface.appendChild(title);
+  for (const [label, value] of metrics) {
+    const metric = document.createElement("div");
+    metric.className = "flex min-w-0 items-baseline justify-between gap-3";
+    const key = document.createElement("span");
+    key.className = "text-token-text-secondary text-xs";
+    key.textContent = label;
+    const version = document.createElement("span");
+    version.className = "min-w-0 truncate text-right font-mono text-sm text-token-text-primary";
+    version.textContent = value;
+    version.title = value;
+    metric.append(key, version);
+    surface.appendChild(metric);
+  }
+  return surface;
 }
 
 function codexActiveCliRow(snapshot: CodexVersionsSnapshot): HTMLElement {

@@ -8,6 +8,9 @@ import {
   type DesktopUpdateTransaction,
 } from "../desktop-update-transaction.js";
 import { processAlive } from "../process-lock.js";
+import { desktopReceiptBlocksLifecycle } from "../desktop-update-state.js";
+import { appendLifecycleAuditRecord } from "../desktop-update-log.js";
+import { ensureUserPaths } from "../paths.js";
 
 export interface UpdateCodexOptions {
   app?: string;
@@ -67,10 +70,26 @@ export function codexUpdateStatus(
   opts: UpdateCodexOptions = {},
   deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
 ): DesktopUpdateReceipt | null {
-  const receipt = deps.createTransaction(opts).status();
-  if (receipt) printReceipt(receipt, opts, deps, { annotateOwner: true });
+  const transaction = deps.createTransaction(opts);
+  const receipt = transaction.status();
+  if (receipt) {
+    printReceipt(receipt, opts, deps, {
+      annotateOwner: true,
+      progress: statusProgress(receipt, transaction.heartbeat()),
+    });
+  }
   else if (opts.json) deps.print(JSON.stringify({ schemaVersion: 1, kind: "desktop-update", transactionId: null, phase: "idle" }));
   else deps.print(kleur.dim("No desktop Update and Reload transaction has started."));
+  return receipt;
+}
+
+export async function reconcileCodexUpdate(
+  opts: UpdateCodexOptions = {},
+  deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
+): Promise<DesktopUpdateReceipt | null> {
+  const receipt = await deps.createTransaction(opts).reconcile();
+  if (receipt) printReceipt(receipt, opts, deps);
+  else if (opts.json) deps.print(JSON.stringify({ transactionId: null, phase: "idle" }));
   return receipt;
 }
 
@@ -147,7 +166,7 @@ function printReceipt(
   receipt: DesktopUpdateReceipt,
   opts: UpdateCodexOptions,
   deps: UpdateCodexCommandDeps,
-  options: { annotateOwner?: boolean } = {},
+  options: { annotateOwner?: boolean; progress?: DesktopUpdateStatusProgress } = {},
 ): void {
   // Presentation-layer only: ownerAlive is never persisted into the receipt,
   // so durable evidence and receipt validators are untouched. Null for
@@ -156,7 +175,12 @@ function printReceipt(
     ? (isTerminalDesktopUpdatePhase(receipt.phase) ? null : processAlive(receipt.ownerPid))
     : undefined;
   if (opts.json) {
-    deps.print(JSON.stringify(ownerAlive === undefined ? receipt : { ...receipt, ownerAlive }));
+    deps.print(JSON.stringify({
+      ...receipt,
+      blocksLifecycle: desktopReceiptBlocksLifecycle(receipt),
+      ...(ownerAlive === undefined ? {} : { ownerAlive }),
+      ...(options.progress === undefined ? {} : { progress: options.progress }),
+    }));
     return;
   }
   const tone = receipt.phase === "completed" ? kleur.green
@@ -164,6 +188,14 @@ function printReceipt(
     : kleur.cyan;
   deps.print(tone(`Desktop Update and Reload: ${receipt.phase}`));
   deps.print(kleur.dim(`Transaction ${receipt.transactionId}`));
+  if (options.progress?.heartbeat) {
+    const beat = options.progress.heartbeat;
+    const observed = beat.observed
+      ? ` · disk ${beat.observed.marketingVersion ?? "?"} (${beat.observed.build ?? "?"})`
+      : "";
+    const age = beat.beatAgeMs === null ? "" : ` · last beat ${Math.round(beat.beatAgeMs / 1000)}s ago`;
+    deps.print(kleur.dim(`Owner live${age}${observed}`));
+  }
   if (ownerAlive === false) {
     deps.print(kleur.red(
       `Owner process ${receipt.ownerPid} exited before this update reached a terminal phase — `

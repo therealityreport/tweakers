@@ -9,7 +9,7 @@ const path = require("node:path");
 const {
   POLICY_SETTINGS_VIEW_MODEL,
   PolicyTransactionError,
-  applyPolicyChange: applyPolicyChangeForProfile,
+  applyPolicyChange,
   createPolicyCommandInterface,
   getPolicyTransactionStatus,
   maximumAccessApprovalPolicy,
@@ -576,7 +576,7 @@ test("Apply creates a unique private raw backup and durable receipt, verifies ha
   assert.deepEqual(getPolicyTransactionStatus({ codexHome: fixture.home }), {
     status: "restorable",
     transactionId: applied.transactionId,
-    profile: "questions-only",
+    profile: "maximum-access",
     targetCount: 3,
     appliedTargetCount: 3,
     beforeTargetCount: 0,
@@ -603,7 +603,7 @@ test("status detects a running host rewriting every applied target from cached t
   assert.deepEqual(getPolicyTransactionStatus({ codexHome: fixture.home }), {
     status: "overwritten",
     transactionId: applied.transactionId,
-    profile: "questions-only",
+    profile: "maximum-access",
     targetCount: 3,
     appliedTargetCount: 0,
     beforeTargetCount: 3,

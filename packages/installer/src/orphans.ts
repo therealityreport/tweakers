@@ -14,7 +14,25 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { sep } from "node:path";
+import { execFileSync } from "node:child_process";
 import { listProcesses, type ProcessInfo } from "./commands/debug.js";
+
+/** Stable process-start token used to reject PID reuse across transactions. */
+export function readProcessStartToken(pid: number): string | null {
+  try {
+    const output = execFileSync(
+      "ps",
+      ["-p", String(pid), "-o", "pid=,ppid=,lstart=,args="],
+      { encoding: "utf8" },
+    );
+    const line = output.split("\n").find((value) => value.trim().length > 0);
+    if (!line) return null;
+    const match = /^\s*(\d+)\s+\d+\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+/.exec(line);
+    return match && Number(match[1]) === pid ? match[2] ?? null : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface OrphanScanInput {
   /** Canonical (realpath) app root, e.g. /Applications/ChatGPT.app */

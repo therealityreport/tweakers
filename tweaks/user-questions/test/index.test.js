@@ -352,14 +352,9 @@ test("settings Preview, explicit Apply, persistent Restore, and redacted results
   harness.document.body.append(root);
   const cleanup = harness.page.render(root);
   await flushDom();
-  assert.match(root.textContent, /Ordinary startup never changes policy/);
-  assert.match(root.textContent, /previously applied policy change can be restored/);
-  const profiles = root.querySelectorAll('[role="radio"]');
-  assert.equal(profiles.length, 2);
-  assert.equal(profiles[0].getAttribute("aria-checked"), "true");
-  assert.match(profiles[0].textContent, /Maximum access/);
-  profiles[1].click();
-  assert.equal(profiles[1].getAttribute("aria-checked"), "true");
+  assert.match(root.textContent, /A row is marked saved only after the current policy file is verified/);
+  assert.match(root.textContent, /Maximum access is saved in the policy file/);
+  assert.match(root.textContent, /Saved for restart/);
   assert.equal(findByText(root, "button", "Restore").hidden, false);
   const maximum = root.querySelectorAll('[role="radio"]').find((button) => button.textContent.includes("Maximum access"));
   assert.equal(maximum.getAttribute("aria-checked"), "false", "saved state is distinct from a Preview selection");
@@ -370,7 +365,7 @@ test("settings Preview, explicit Apply, persistent Restore, and redacted results
   assert.match(maximum.textContent, /Selected for preview/);
   findByText(root, "button", "Preview").click();
   await flushDom();
-  assert.match(root.textContent, /Read-only Preview for Questions only: 2 field change/);
+  assert.match(root.textContent, /Read-only Preview for Maximum access: 2 field change/);
   assert.match(root.textContent, /source-fingerprint/);
   findByText(root, "button", "Apply previewed change").click();
   await flushDom();
@@ -646,8 +641,24 @@ function rendererHarness(options = {}) {
           previewToken: "preview-token",
           profile: args[0],
         };
-        if (channel === "policy.apply") return { status: "applied", changed: true, transactionId: "transaction-new", restartRequired: true, restarted: false, profile: args[1] };
-        if (channel === "policy.restore") return { status: "restored", changed: true, transactionId: "transaction-new", restartRequired: true, restarted: false };
+        if (channel === "policy.apply") {
+          policyStatus = {
+            status: "restorable",
+            transactionId: "transaction-new",
+            profile: args[1],
+            targetCount: 2,
+            appliedTargetCount: 2,
+            beforeTargetCount: 0,
+            otherTargetCount: 0,
+            restartRequired: true,
+            restarted: false,
+          };
+          return { status: "applied", changed: true, transactionId: "transaction-new", restartRequired: true, restarted: false, profile: args[1] };
+        }
+        if (channel === "policy.restore") {
+          policyStatus = { status: "none", transactionId: null, restartRequired: false, restarted: false };
+          return { status: "restored", changed: true, transactionId: "transaction-new", restartRequired: true, restarted: false };
+        }
         throw new Error(`unexpected IPC ${channel}`);
       },
     },

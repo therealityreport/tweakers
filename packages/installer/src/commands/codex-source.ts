@@ -740,6 +740,7 @@ async function recordCodexSourceCanaryPass(
     expectedRoutes,
     trustedRunnerExpectedSha256: trustedRunner.sha256,
     trustedAdapterExpectedSha256: trustedAdapter.sha256,
+    rustLifecycleTests: candidate.evidence.rustLifecycleTests!,
   };
   const createAdapter = production.createCanaryObservationAdapter;
   if (!createAdapter) {
@@ -1297,6 +1298,7 @@ export function createProductionCodexSourceBuildAdapter(
       await buildPatchedCandidateOnly({
         sourceApp: frontendSourceApp,
         destinationApp: paths.candidateApp,
+        destinationRuntime: join(paths.root, "candidate", "runtime"),
         finalUserRoot,
       });
       const candidate = locateCodex(paths.candidateApp);
@@ -1682,7 +1684,7 @@ export function managedMcpCanaryExpectedRoutes(
       throw new Error(`Managed MCP catalog lacks receipt-bound artifacts for ${entry.owner}/${entry.server}`);
     }
     const artifactKeys = new Set<string>();
-    const artifactSha256 = catalog.artifacts.map((artifact) => {
+    const artifactRows = catalog.artifacts.map((artifact) => {
       if (!isRecord(artifact) || typeof artifact.path !== "string" || typeof artifact.sha256 !== "string") return null;
       const artifactPath = isAbsolute(artifact.path) ? artifact.path : resolve(dirname(entry.catalog.path), artifact.path);
       const digest = artifact.sha256.startsWith("sha256:") ? artifact.sha256.slice("sha256:".length) : artifact.sha256;
@@ -1694,11 +1696,15 @@ export function managedMcpCanaryExpectedRoutes(
       if (sha256File(exactArtifact) !== digest) {
         throw new Error(`Managed MCP catalog artifact digest drift for ${entry.owner}/${entry.server}`);
       }
-      return digest;
+      return { path: exactArtifact, sha256: digest };
     });
-    if (!artifactSha256.every((value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value))) {
+    if (!artifactRows.every(
+      (artifact): artifact is { path: string; sha256: string } => artifact !== null,
+    )) {
       throw new Error(`Managed MCP catalog artifact digest is invalid for ${entry.owner}/${entry.server}`);
     }
+    const artifacts = artifactRows;
+    const artifactSha256 = artifacts.map((artifact) => artifact.sha256);
     const representativeArguments = isRecord(tool.representativeArguments)
       ? tool.representativeArguments
       : isRecord(tool.representative_arguments)
@@ -1712,6 +1718,7 @@ export function managedMcpCanaryExpectedRoutes(
       declarationFingerprint: entry.declarationFingerprint,
       catalogSha256: entry.catalog.sha256,
       artifactSha256: artifactSha256 as string[],
+      artifacts,
       representativeTool: tool.name,
       representativeArguments,
     };
@@ -2122,6 +2129,7 @@ function assertValidatedCanarySidecar(
     expectedRoutes: managedMcpCanaryExpectedRoutes(installedManagedMcp),
     trustedRunnerExpectedSha256: trustedRunner.sha256,
     trustedAdapterExpectedSha256: candidate.evidence.trustedCanaryAdapter?.sha256 ?? "",
+    rustLifecycleTests: candidate.evidence.rustLifecycleTests!,
   });
   const expectedCandidate = join(paths.candidateApp, "Contents", "Resources", "codex");
   const candidateSha256 = sha256File(requireInternalAbsoluteFile(expectedCandidate, "source-derived canary candidate"));

@@ -245,8 +245,10 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
     verifyFinal: async () => ({ ok: true, error: null }),
     recoverVerifiedOfficialUpdate: async () => null,
     processAlive: () => false,
+    readProcessStartToken: () => "test-owner-start",
     now: () => NOW,
     createId: () => "desktop-1",
+    createOwnerGeneration: () => "owner-generation-1",
     ...overrides,
   };
   return { calls, deps };

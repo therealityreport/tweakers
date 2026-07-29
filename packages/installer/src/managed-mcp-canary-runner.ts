@@ -196,15 +196,7 @@ export interface ManagedMcpCanaryEvidence {
   }[];
   trustedRunner: { identity: string; attestationSha256: string };
   trustedObservationAdapter: { identity: string; attestationSha256: string };
-  rustLifecycleTests: {
-    sourceCommit: string;
-    patchedTreeSha256: string;
-    cargoLockSha256: string;
-    candidateBinarySha256: string;
-    stdoutSha256: string;
-    stderrSha256: string;
-    passedTests: readonly string[];
-  };
+  rustLifecycleTests: CodexRustLifecycleTestEvidence;
   observations: {
     candidateStart: ManagedMcpCandidateStartObservation;
     discoveryBefore: ManagedMcpProcessSnapshot;
@@ -410,6 +402,7 @@ export async function runManagedMcpCanary(
         identity: adapter.attestation.identity,
         attestationSha256: adapter.attestation.sha256,
       },
+      rustLifecycleTests: { ...input.rustLifecycleTests },
       observations: {
         candidateStart,
         discoveryBefore,
@@ -440,7 +433,8 @@ export function assertManagedMcpCanaryEvidence(
   if (!isRecord(evidence)) throw new Error("Managed MCP canary evidence is not an object");
   assertExactKeys(evidence, [
     "schemaVersion", "kind", "status", "transactionId", "version", "candidate", "isolatedHome",
-    "managedMcp", "pluginBundles", "trustedRunner", "trustedObservationAdapter", "observations", "lifecycle", "startedAt", "completedAt",
+    "managedMcp", "pluginBundles", "trustedRunner", "trustedObservationAdapter", "rustLifecycleTests",
+    "observations", "lifecycle", "startedAt", "completedAt",
   ], "Managed MCP canary evidence");
   if (
     evidence.schemaVersion !== 1
@@ -510,6 +504,9 @@ function assertEvidenceBindings(
   const expectedPlugins = input.pluginBundles.map((plugin) => ({ ...plugin, routeOwnerProven: true as const }));
   if (JSON.stringify(actual.pluginBundles) !== JSON.stringify(expectedPlugins)) {
     throw new Error("Managed MCP canary plugin evidence is not receipt-bound");
+  }
+  if (JSON.stringify(actual.rustLifecycleTests) !== JSON.stringify(input.rustLifecycleTests)) {
+    throw new Error("Managed MCP canary Rust lifecycle evidence is not receipt-bound");
   }
   assertCandidateStart(actual.observations.candidateStart, input, {
     CODEX_HOME: input.codexHome,
@@ -768,6 +765,7 @@ function validateRunInput(input: ManagedMcpCanaryRunInput): void {
   }
   requireSha256(input.trustedRunnerExpectedSha256, "trusted runner digest");
   requireSha256(input.trustedAdapterExpectedSha256, "trusted adapter digest");
+  validateRustLifecycleTests(input.rustLifecycleTests, input.candidateSha256);
   if (input.cleanupDeadlineMs !== undefined
     && (!Number.isInteger(input.cleanupDeadlineMs) || input.cleanupDeadlineMs <= 0 || input.cleanupDeadlineMs > 10_000)) {
     throw new Error("Managed MCP cleanup deadline must be between 1 and 10000ms");
@@ -778,6 +776,38 @@ function validateRunInput(input: ManagedMcpCanaryRunInput): void {
     requireNonEmpty(plugin.owner, "plugin owner");
     requireAbsolutePath(plugin.installedPath, `plugin ${plugin.owner} path`);
     requireSha256(plugin.sha256, `plugin ${plugin.owner} digest`);
+  }
+}
+
+function validateRustLifecycleTests(
+  evidence: CodexRustLifecycleTestEvidence,
+  candidateSha256: string,
+): void {
+  if (!evidence || evidence.schemaVersion !== 1 || evidence.kind !== "codex-rust-lifecycle-tests") {
+    throw new Error("Managed MCP canary requires receipt-bound Rust lifecycle evidence");
+  }
+  requireNonEmpty(evidence.sourceCommit, "Rust lifecycle source commit");
+  requireSha256(evidence.patchedTreeSha256, "Rust lifecycle patched tree digest");
+  requireSha256(evidence.cargoLockSha256, "Rust lifecycle Cargo.lock digest");
+  if (!Array.isArray(evidence.command) || evidence.command.length === 0) {
+    throw new Error("Rust lifecycle test command is empty");
+  }
+  for (const argument of evidence.command) requireNonEmpty(argument, "Rust lifecycle command argument");
+  if (evidence.exitCode !== 0 || !Array.isArray(evidence.passedTests) || evidence.passedTests.length === 0) {
+    throw new Error("Rust lifecycle tests did not record a passing test set");
+  }
+  for (const passedTest of evidence.passedTests) requireNonEmpty(passedTest, "Rust lifecycle passed test");
+  requireAbsolutePath(evidence.stdoutFile, "Rust lifecycle stdout path");
+  requireSha256(evidence.stdoutSha256, "Rust lifecycle stdout digest");
+  requireAbsolutePath(evidence.stderrFile, "Rust lifecycle stderr path");
+  requireSha256(evidence.stderrSha256, "Rust lifecycle stderr digest");
+  requireSha256(evidence.candidateBinarySha256, "Rust lifecycle candidate digest");
+  if (evidence.candidateBinarySha256 !== candidateSha256) {
+    throw new Error("Rust lifecycle evidence does not match the prepared candidate");
+  }
+  if (!validTimestamp(evidence.startedAt) || !validTimestamp(evidence.completedAt)
+    || Date.parse(evidence.startedAt) > Date.parse(evidence.completedAt)) {
+    throw new Error("Rust lifecycle test timestamps are invalid");
   }
 }
 

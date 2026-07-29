@@ -55,7 +55,6 @@ import {
   STABLE_DESKTOP_PATH,
 } from "./environment-profile.js";
 import { readConfigFile } from "./config.js";
-import { readHeaderHash } from "./asar.js";
 import { signatureInfo, verifySignature } from "./codesign.js";
 import {
   bundledDerivedBackendPath,
@@ -68,6 +67,11 @@ import {
   stagedNativeHostPath,
   verifyStagedNativeHostForApp,
 } from "./commands/install.js";
+import {
+  readValidatedBundledDerivedArtifact,
+  type ValidatedBundledDerivedArtifact,
+} from "./commands/codex-source.js";
+import { terminateStaleHelperProcesses } from "./orphans.js";
 import { userPaths } from "./paths.js";
 import { LEGACY_USER_ROOT_ENV } from "./legacy-compat.js";
 import { readPlist } from "./plist.js";
@@ -193,6 +197,8 @@ export interface PreparedRollbackEvidence {
   desktopVersion: string;
   desktopBuild: string;
   desktopArtifactDigest: string;
+  /** Electron integrity hash for the exact rollback app.asar. */
+  desktopAsarHeaderHash: string;
   /** Additive schema-v1 trust evidence; newly prepared receipts always include it. */
   signature?: PreparedCandidateSignatureEvidence;
   backendLane: BackendLane;
@@ -461,6 +467,11 @@ export interface DefaultEnvironmentAdapterOptions {
   mcpStateFile?: string;
   tweaksRoot?: string;
   sourceRoot?: string;
+  /**
+   * Explicit opt-in receipt for a backend derived from the exact Codex tag
+   * bundled in the installed desktop. It remains on the bundled lane.
+   */
+  bundledDerivedReceiptFile?: string;
 }
 
 export interface DefaultEnvironmentAdapterDeps {
@@ -492,6 +503,7 @@ export interface DefaultEnvironmentAdapterDeps {
     profile: EnvironmentProfileRecord,
     destination: string,
     runtimeDestination: string,
+    bundledDerivedBackend?: ValidatedBundledDerivedArtifact,
   ) => void | Promise<void>;
   prepareRuntimeAssets?: (destination: string) => void | Promise<void>;
   prepareManagedRuntime?: (
@@ -525,6 +537,7 @@ export interface DefaultEnvironmentAdapterDeps {
     appExperience: AppExperience;
     appRoot: string;
     bundleId: string | null;
+    originalAsarHash: string;
     patchedAsarHash: string;
   } | null;
   readRuntimeProof?: (file: string) => EnvironmentRuntimeProof | null;
@@ -538,7 +551,6 @@ export interface DefaultEnvironmentAdapterDeps {
   reconcileMcpMode?: (appExperience: AppExperience) => void;
   /** Read-only proof that the selected app experience owns the live MCP set. */
   proveMcpMode?: (appExperience: AppExperience) => boolean;
-  readAsarHeaderHash?: (appRoot: string) => string;
   readPatchedAsarEvidence?: (appRoot: string) => EnvironmentPatchedAsarEvidence;
   writeAppState?: (
     stateFile: string,
@@ -1157,15 +1169,18 @@ export function createDefaultEnvironmentAdapters(
   deps: DefaultEnvironmentAdapterDeps = {},
 ): Pick<
   Required<EnvironmentCoordinatorDeps>,
-  "preparePrerequisites" | "validatePreparedEnvironment" | "applyPreparedEnvironment"
-  | "proveAppliedEnvironment" | "migrateSwapHost"
+  "preparePrerequisites" | "validatePreparedEnvironment" | "stagePreparedEnvironment"
+  | "applyPreparedEnvironment" | "proveAppliedEnvironment" | "bindWatcherTarget"
+  | "migrateSwapHost"
 > {
   const adapters = resolvedDefaultEnvironmentAdapterDeps(options, deps);
   return {
     preparePrerequisites: (input) => prepareEnvironmentPrerequisites(input, options, adapters),
     validatePreparedEnvironment: (input) => validatePreparedEnvironment(input, options, adapters),
+    stagePreparedEnvironment: (input) => stagePreparedEnvironment(input, options, adapters),
     applyPreparedEnvironment: (input) => applyPreparedEnvironment(input, options, adapters),
     proveAppliedEnvironment: (input) => proveAppliedEnvironment(input, options, adapters),
+    bindWatcherTarget: (input) => bindWatcherTarget(input, options, adapters),
     migrateSwapHost: (input) => migrateLegacySwapHost(input, options, adapters),
   };
 }
@@ -1264,7 +1279,12 @@ function resolvedDefaultEnvironmentAdapterDeps(
     }),
     loadSwapHost: deps.loadSwapHost ?? ((evidence) => loadVerifiedSwapHost(evidence)),
     copyBackend: deps.copyBackend ?? copyBackendAtomically,
-    preparePatchedPayload: deps.preparePatchedPayload ?? (async (profile, destination, runtimeDestination) => {
+    preparePatchedPayload: deps.preparePatchedPayload ?? (async (
+      profile,
+      destination,
+      runtimeDestination,
+      bundledDerivedBackend,
+    ) => {
       const officialAsar = join(profile.officialPath, "Contents", "Resources", "app.asar");
       const sourceApp = existsSync(profile.officialPath) && readAsarMarker(officialAsar) === "absent"
         ? profile.officialPath
@@ -1325,6 +1345,7 @@ function resolvedDefaultEnvironmentAdapterDeps(
         appExperience: state.mode,
         appRoot: state.appRoot,
         bundleId: state.codexBundleId ?? null,
+        originalAsarHash: state.originalAsarHash,
         patchedAsarHash: state.patchedAsarHash,
       };
     }),
@@ -1334,9 +1355,6 @@ function resolvedDefaultEnvironmentAdapterDeps(
       mcpModeBridge.reconcile(appExperience);
     }),
     proveMcpMode: deps.proveMcpMode ?? mcpModeBridge.prove,
-    readAsarHeaderHash: deps.readAsarHeaderHash ?? ((appRoot) => (
-      readHeaderHash(join(appRoot, "Contents", "Resources", "app.asar")).headerHash
-    )),
     readPatchedAsarEvidence: deps.readPatchedAsarEvidence ?? ((appRoot) => {
       const asarPath = join(appRoot, "Contents", "Resources", "app.asar");
       const asarStat = lstatSync(asarPath);
@@ -1568,6 +1586,12 @@ async function prepareEnvironmentPrerequisites(
   const expectedCandidateFingerprint = input.requested.appExperience === "chatgpt"
     ? officialPathIsPristine ? null : requestedProfile.pristineBackupFingerprint
     : requestedProfile.patchedPayloadFingerprint;
+  const bundledDerivedBackend = input.requested.appExperience === "tweakers"
+    && (input.requested.backendLane === "official-bundled"
+      || input.requested.backendLane === "bundled")
+    && options.bundledDerivedReceiptFile !== undefined
+    ? loadBundledDerivedBackend(options.bundledDerivedReceiptFile, requestedProfile, deps)
+    : undefined;
   if (input.requested.appExperience === "tweakers"
     && requestedProfile.patchedPayloadBuildable) {
     // A patched app is coupled to the external runtime it loads. Rebuild it
@@ -1576,6 +1600,7 @@ async function prepareEnvironmentPrerequisites(
       requestedProfile,
       candidateArtifactPath,
       requestedRuntimeArtifactPath,
+      bundledDerivedBackend,
     );
   } else {
     if (!existsSync(candidateSource)) throw new Error(`requested desktop artifact is missing at ${candidateSource}`);
@@ -1839,6 +1864,7 @@ async function prepareEnvironmentPrerequisites(
       desktopVersion: rollbackIdentity.version!,
       desktopBuild: rollbackIdentity.build!,
       desktopArtifactDigest: rollbackDigest,
+      desktopAsarHeaderHash: rollbackAsarHeaderHash,
       signature: rollbackSignature,
       backendLane: input.current.backendLane,
       backendBinaryPath: rollbackBackendTarget,
@@ -1852,6 +1878,41 @@ async function prepareEnvironmentPrerequisites(
 /** One stable receipt-owned path per transaction, so `require` caches once. */
 function preparedSwapHostPath(preparedRoot: string): string {
   return join(preparedRoot, "swap", "tweaker_native_host.node");
+}
+
+function loadBundledDerivedBackend(
+  receiptFile: string,
+  profile: EnvironmentProfileRecord,
+  deps: ResolvedDefaultEnvironmentAdapterDeps,
+): ValidatedBundledDerivedArtifact {
+  if (!exactAbsolutePath(receiptFile)) {
+    throw new Error("Bundled-derived receipt path must be exact and absolute");
+  }
+  assertInternalStoragePath(receiptFile, "Bundled-derived receipt");
+  const artifact = deps.readBundledDerivedArtifact(receiptFile);
+  for (const [label, path] of [
+    ["binary", artifact.binaryPath],
+    ["receipt", artifact.receiptPath],
+  ] as const) {
+    if (!exactAbsolutePath(path)) {
+      throw new Error(`Bundled-derived ${label} path must be exact and absolute`);
+    }
+    assertInternalStoragePath(path, `Bundled-derived ${label}`);
+  }
+  if (artifact.receiptPath !== receiptFile) {
+    throw new Error("Bundled-derived artifact receipt does not match the configured receipt");
+  }
+  if (!validDigest(artifact.fingerprint)) {
+    throw new Error("Bundled-derived artifact fingerprint is invalid");
+  }
+  if (profile.officialBackendVersion === null
+    || artifact.version !== profile.officialBackendVersion) {
+    throw new Error(
+      `Bundled-derived backend version ${artifact.version} does not match desktop control `
+      + `${profile.officialBackendVersion ?? "unknown"}`,
+    );
+  }
+  return artifact;
 }
 
 function requireRuntimeArtifact(
@@ -2865,7 +2926,6 @@ function stagePreparedEnvironment(
   deps: ResolvedDefaultEnvironmentAdapterDeps,
 ): void {
   const requestedDirection = input.direction === "requested";
-  const selection = requestedDirection ? input.receipt.requested : input.prepared.rollback.selection;
   const artifactPath = requestedDirection
     ? input.prepared.candidate.artifactPath
     : input.prepared.rollback.desktopArtifactPath;
@@ -2884,7 +2944,6 @@ function stagePreparedEnvironment(
   if (!existsSync(backendArtifact) || deps.fileFingerprint(backendArtifact) !== backendDigest) {
     throw new Error(`Prepared ${input.direction} backend artifact is missing or changed`);
   }
-  deps.stageAppReplacement(artifactPath, selection.selectedDesktopPath);
 }
 
 function proveAppliedEnvironment(
@@ -2930,6 +2989,9 @@ function proveAppliedEnvironment(
     ? input.prepared.managedRuntime?.requested
     : input.prepared.managedRuntime?.rollback;
   const state = deps.readAppState(options.stateFile);
+  const stateAsarHash = expected.appExperience === "tweakers"
+    ? state?.patchedAsarHash
+    : state?.originalAsarHash;
   const configuredLane = deps.readBackendLane(options.configFile);
   const runtimeProof = expected.appExperience === "tweakers"
     ? deps.readRuntimeProof(options.runtimeProofFile ?? join(dirname(options.configFile), "environment-runtime-proof.json"))
@@ -2944,7 +3006,7 @@ function proveAppliedEnvironment(
     || state?.appExperience !== expected.appExperience
     || state.appRoot !== expected.selectedDesktopPath
     || state.bundleId !== expected.selectedDesktopBundleId
-    || state.patchedAsarHash !== asarHeaderHash
+    || stateAsarHash !== asarHeaderHash
     || deps.readAsarHeaderHash(expected.selectedDesktopPath) !== asarHeaderHash
     || !backendLanesProve(configuredLane, expected.backendLane)
     || !existsSync(backendPath)
@@ -3023,18 +3085,28 @@ function bindWatcherTarget(
   if (deps.readAsarHeaderHash(input.applied.selection.selectedDesktopPath) !== expectedAsarHeaderHash) {
     throw new Error("Target app.asar changed before watcher expectation could be bound");
   }
+  const patchedAsarEvidence = input.applied.selection.appExperience === "tweakers"
+    ? deps.readPatchedAsarEvidence(input.applied.selection.selectedDesktopPath)
+    : null;
+  const originalAsarHash = input.applied.selection.appExperience === "chatgpt"
+    ? expectedAsarHeaderHash
+    : null;
   deps.writeAppState(
     options.stateFile,
     input.applied.selection,
     input.applied.desktopVersion,
-    expectedAsarHeaderHash,
+    patchedAsarEvidence,
+    originalAsarHash,
   );
   const state = deps.readAppState(options.stateFile);
+  const stateAsarHash = input.applied.selection.appExperience === "tweakers"
+    ? state?.patchedAsarHash
+    : state?.originalAsarHash;
   if (state === null
     || state.appExperience !== input.applied.selection.appExperience
     || state.appRoot !== input.applied.selection.selectedDesktopPath
     || state.bundleId !== input.applied.selection.selectedDesktopBundleId
-    || state.patchedAsarHash !== expectedAsarHeaderHash
+    || stateAsarHash !== expectedAsarHeaderHash
     || deps.readAsarHeaderHash(input.applied.selection.selectedDesktopPath) !== expectedAsarHeaderHash) {
     throw new Error("Watcher target expectation did not persist exact proven app state");
   }
@@ -3528,6 +3600,8 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       ?? join(this.environmentRoot, "transactions", "environment.lock");
     this.lifecycleLockFile = options.lifecycleLockFile
       ?? join(this.environmentRoot, "transactions", "lifecycle.lock");
+    this.watcherPromotionFile = options.watcherPromotionFile
+      ?? join(this.environmentRoot, "transactions", "environment-watcher.json");
     for (const [label, path] of [
       ["transaction file", this.transactionFile],
       ["receipt root", this.receiptRoot],
@@ -3540,6 +3614,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       ["tweaks root", this.tweaksRoot],
       ["environment lock file", this.lockFile],
       ["lifecycle lock file", this.lifecycleLockFile],
+      ["watcher promotion file", this.watcherPromotionFile],
     ] as const) {
       assertCoordinatorOwnedPath(this.environmentRoot, path, label);
     }
@@ -3562,6 +3637,9 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       mcpConfigFile: this.mcpConfigFile,
       mcpStateFile: this.mcpStateFile,
       tweaksRoot: this.tweaksRoot,
+      ...(options.bundledDerivedReceiptFile
+        ? { bundledDerivedReceiptFile: options.bundledDerivedReceiptFile }
+        : {}),
     });
     const defaultAdoptionIsScoped = this.environmentRoot === paths.root
       || options.mcpConfigFile !== undefined;
@@ -3578,6 +3656,8 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       preparePrerequisites: deps.preparePrerequisites ?? defaultAdapters.preparePrerequisites,
       validatePreparedEnvironment: deps.validatePreparedEnvironment
         ?? (deps.preparePrerequisites ? (() => {}) : defaultAdapters.validatePreparedEnvironment),
+      stagePreparedEnvironment: deps.stagePreparedEnvironment
+        ?? (deps.preparePrerequisites ? (() => {}) : defaultAdapters.stagePreparedEnvironment),
       applyPreparedEnvironment: deps.applyPreparedEnvironment ?? defaultAdapters.applyPreparedEnvironment,
       // Injected preparation seams own their own evidence shape, so migration
       // stays inert for them exactly like validation does.
@@ -3586,7 +3666,9 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       observeDesktop: deps.observeDesktop ?? observeCodexMainProcess,
       quitDesktop: deps.quitDesktop ?? quitCodexMainProcess,
       processAlive: deps.processAlive ?? processAlive,
-      cleanupHelpers: deps.cleanupHelpers ?? (() => {}),
+      cleanupHelpers: deps.cleanupHelpers ?? ((path, stoppedMainPid) => {
+        terminateStaleHelperProcesses(path, { excludePids: [stoppedMainPid] });
+      }),
       reopenDesktop: deps.reopenDesktop ?? ((path) => { openAndActivateCodex(path); }),
       pauseWatcher: deps.pauseWatcher ?? (this.transactionFile === paths.environmentTransactionFile
         ? ((input) => { beginWatcherPromotion(this.watcherPromotionFile, input); })
@@ -3748,8 +3830,16 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     }
     receipt = this.update(receipt, { phase: "committing", error: null, ownerPid: process.pid });
     let sourceObservedAfterStopFailure = false;
+    let watcherPaused = false;
     const reopenFailures: string[] = [];
     try {
+      await this.deps.pauseWatcher({
+        transactionId: receipt.transactionId,
+        sourceAppRoot: receipt.source.selectedDesktopPath,
+        requestedAppRoot: receipt.requested.selectedDesktopPath,
+        sourceExpectedFingerprint: prepared.rollback.desktopArtifactDigest,
+      });
+      watcherPaused = true;
       await this.deps.stagePreparedEnvironment({
         direction: "requested",
         receipt,
@@ -4926,6 +5016,10 @@ function nonEmpty(value: unknown): value is string {
 
 function sha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+
+function validDigest(value: unknown): value is string {
+  return sha256(value);
 }
 
 function nonNegativeInteger(value: unknown): value is number {

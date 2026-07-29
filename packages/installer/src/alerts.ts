@@ -130,24 +130,57 @@ export interface RequestCodexNativeUpdateDeps {
   exec?: typeof execFileSync;
   locale?: () => string;
   readLocaleMessages?: (appRoot: string, locale: string) => Record<string, unknown> | null;
+  sleep?: (ms: number) => Promise<void>;
+  nowMs?: () => number;
+  pollIntervalMs?: number;
+  deadlineMs?: number;
 }
+
+const NATIVE_UPDATE_POLL_INTERVAL_MS = 2_000;
+const NATIVE_UPDATE_DEADLINE_MS = 45_000;
+const NON_RETRYABLE_HANDOFF_KINDS: ReadonlySet<NativeUpdateHandoffFailureKind> = new Set([
+  "unsupported_platform",
+  "automation_permission_denied",
+  "process_not_proven",
+]);
 
 /**
  * Ask the exact, already-verified official ChatGPT process to open its native
  * updater. The environment transaction supplies the PID it just committed, so
  * this can never fall through to another installed ChatGPT channel.
  */
-export function requestCodexNativeUpdate(
+export async function requestCodexNativeUpdate(
   appRoot: string,
   expectedPid: number,
   deps: RequestCodexNativeUpdateDeps = {},
-): NativeUpdateHandoffResult {
+): Promise<NativeUpdateHandoffResult> {
   if (platform() !== "darwin") {
     return nativeUpdateHandoffFailure(
       "unsupported_platform",
       "OpenAI's native desktop updater is available only on macOS.",
     );
   }
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const nowMs = deps.nowMs ?? Date.now;
+  const pollIntervalMs = Math.max(1, deps.pollIntervalMs ?? NATIVE_UPDATE_POLL_INTERVAL_MS);
+  const deadline = nowMs() + Math.max(1, deps.deadlineMs ?? NATIVE_UPDATE_DEADLINE_MS);
+  let last = attemptCodexNativeUpdate(appRoot, expectedPid, deps);
+  while (!last.ok && !NON_RETRYABLE_HANDOFF_KINDS.has(last.kind) && nowMs() < deadline) {
+    await sleep(pollIntervalMs);
+    last = attemptCodexNativeUpdate(appRoot, expectedPid, deps);
+  }
+  if (!last.ok && (last.kind === "menu_item_not_found" || last.kind === "menu_item_disabled")) {
+    const snapshot = captureAppMenuSnapshot(expectedPid, deps.exec ?? alertExecFileSync);
+    last = { ...last, message: `${last.message} Observed app menu items: ${snapshot}` };
+  }
+  return last;
+}
+
+function attemptCodexNativeUpdate(
+  appRoot: string,
+  expectedPid: number,
+  deps: RequestCodexNativeUpdateDeps,
+): NativeUpdateHandoffResult {
   const observed = (deps.observe ?? observeCodexMainProcess)(appRoot);
   if (observed === null || observed.pid !== expectedPid) {
     return nativeUpdateHandoffFailure(
@@ -202,9 +235,13 @@ export function requestCodexNativeUpdate(
     "set beforeItem to menu item 2 of appMenu",
     "set orderedItem to menu item 4 of appMenu",
     "set afterItem to menu item 5 of appMenu",
-    "set beforeSubrole to value of attribute \"AXSubrole\" of beforeItem",
-    "set afterSubrole to value of attribute \"AXSubrole\" of afterItem",
-    "if beforeSubrole is \"AXSeparator\" and afterSubrole is \"AXSeparator\" then set updateItem to orderedItem",
+    "set beforeSeparator to (name of beforeItem is missing value)",
+    "set afterSeparator to (name of afterItem is missing value)",
+    "try",
+    "if beforeSeparator is false then set beforeSeparator to (value of attribute \"AXSubrole\" of beforeItem is \"AXSeparator\")",
+    "if afterSeparator is false then set afterSeparator to (value of attribute \"AXSubrole\" of afterItem is \"AXSeparator\")",
+    "end try",
+    "if beforeSeparator and afterSeparator then set updateItem to orderedItem",
     "end if",
     "end try",
     "end if",
@@ -254,6 +291,38 @@ function nativeUpdateHandoffFailure(
   permissionGuidance: string | null = null,
 ): Exclude<NativeUpdateHandoffResult, { ok: true }> {
   return { ok: false, kind, message, permissionGuidance };
+}
+
+const APP_MENU_SNAPSHOT_MAX_CHARS = 200;
+
+function captureAppMenuSnapshot(expectedPid: number, exec: typeof execFileSync): string {
+  const script = [
+    'tell application "System Events"',
+    `set targetProcesses to every application process whose unix id is ${expectedPid}`,
+    'if (count of targetProcesses) is not 1 then error "exact process not found"',
+    "set targetProcess to item 1 of targetProcesses",
+    "set itemNames to name of every menu item of menu 1 of menu bar item 2 of menu bar 1 of targetProcess",
+    'set snapshot to ""',
+    "repeat with itemName in itemNames",
+    "if (contents of itemName) is missing value then",
+    'set snapshot to snapshot & "| "',
+    "else",
+    'set snapshot to snapshot & "|" & (itemName as text)',
+    "end if",
+    "end repeat",
+    "return snapshot",
+    "end tell",
+  ].join("\n");
+  try {
+    const output = exec("osascript", ["-e", script], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const text = String(output ?? "").trim();
+    return text ? text.slice(0, APP_MENU_SNAPSHOT_MAX_CHARS) : "unavailable (empty snapshot)";
+  } catch (error) {
+    return `unavailable (${firstLine(childProcessErrorText(error)).slice(0, APP_MENU_SNAPSHOT_MAX_CHARS)})`;
+  }
 }
 
 function preferredNativeMenuLocale(): string {
@@ -414,18 +483,28 @@ export function openCodex(appRoot: string, opts: OpenCodexOptions = {}): void {
 
   reconcileLaunchServices(appRoot);
   try {
-    alertExecFileSync("open", [appRoot], { stdio: "ignore" });
+    alertExecFileSync("open", reopenShouldActivate() ? [appRoot] : ["-g", appRoot], {
+      stdio: "ignore",
+    });
   } catch {}
 }
 
-/** Open the exact app path and explicitly activate it before restart verification. */
+/** Open the exact app path, preserving user focus for unattended workflows. */
 export function openAndActivateCodex(appRoot: string): void {
   if (platform() !== "darwin") return;
   const bundleId = codexBundleId(appRoot);
-  alertExecFileSync("osascript", ["-e", codexReopenScript(appRoot, bundleId, 0)], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  alertExecFileSync(
+    "osascript",
+    ["-e", codexReopenScript(appRoot, bundleId, 0, reopenShouldActivate())],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+}
+
+function reopenShouldActivate(): boolean {
+  return !isRunningFromWatcher() && process.env.TWEAKER_REOPEN_BACKGROUND !== "1";
 }
 
 function reconcileLaunchServices(appRoot: string): void {
@@ -539,28 +618,43 @@ function waitForProcessExit(pid: number, timeoutMs: number): boolean {
 }
 
 function spawnDetachedReopen(appRoot: string, bundleId: string, delayMs: number): void {
-  const child = spawn("osascript", ["-e", codexReopenScript(appRoot, bundleId, delayMs)], {
+  const child = spawn("osascript", ["-e", codexReopenScript(
+    appRoot,
+    bundleId,
+    delayMs,
+    reopenShouldActivate(),
+  )], {
     detached: true,
     stdio: "ignore",
   });
   child.unref();
 }
 
-export function codexReopenScript(appRoot: string, bundleId: string, delayMs: number): string {
+export function codexReopenScript(
+  appRoot: string,
+  bundleId: string,
+  delayMs: number,
+  activate = true,
+): string {
   const delaySeconds = Math.max(0, delayMs) / 1000;
   const reconcileByPath = `${LSREGISTER} -f ${shellQuote(appRoot)}`;
-  const openByPath = `/usr/bin/open ${shellQuote(appRoot)}`;
-  return [
+  const openByPath = `/usr/bin/open ${activate ? "" : "-g "}${shellQuote(appRoot)}`;
+  const lines = [
     `delay ${delaySeconds.toFixed(2)}`,
     "try",
     `do shell script ${appleScriptString(reconcileByPath)}`,
     "end try",
     `do shell script ${appleScriptString(openByPath)}`,
-    "delay 0.50",
-    "try",
-    `tell application id ${appleScriptString(bundleId)} to activate`,
-    "end try",
-  ].join("\n");
+  ];
+  if (activate) {
+    lines.push(
+      "delay 0.50",
+      "try",
+      `tell application id ${appleScriptString(bundleId)} to activate`,
+      "end try",
+    );
+  }
+  return lines.join("\n");
 }
 
 interface AlertOptions {

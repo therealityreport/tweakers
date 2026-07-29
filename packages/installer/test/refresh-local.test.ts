@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { getLocalRefreshStatus, handoffRefreshLocalToLaunchd, hashTree, npmCommand, refreshCliPath, registerDevelopmentCheckout, restoreModeCoordinatorMetadata, runRefreshWorkflow } from "../src/commands/refresh-local";
+import {
+  getLocalRefreshStatus,
+  handoffRefreshLocalToLaunchd,
+  hashTree,
+  npmCommand,
+  refreshCliPath,
+  registerDevelopmentCheckout,
+  resolveExplicitDevelopmentRoot,
+  resolveRefreshSelection,
+  restoreModeCoordinatorMetadata,
+  runRefreshWorkflow,
+} from "../src/commands/refresh-local";
 import { managedSourceRoot, writeDevelopmentProvenanceHash } from "../src/managed-runtime";
 import { modeCoordinatorConfigFile, modeCoordinatorStatus } from "../src/switcher-setup";
 

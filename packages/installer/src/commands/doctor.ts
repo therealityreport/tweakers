@@ -16,6 +16,7 @@ import {
   inspectMcpLifecycleHealth,
   type McpLifecycleHealthReport,
 } from "../mcp-lifecycle-health.js";
+import { loadEnvironmentState } from "../environment-profile.js";
 
 interface Check {
   name: string;

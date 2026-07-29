@@ -324,10 +324,11 @@ function createFixture(): Fixture {
     representativeTool: `${entry.server}_tool`,
     representativeArguments: {},
   }));
+  const candidateSha256 = sha256File(candidatePath);
   return {
     input: () => ({
       transactionId: "tx-canary", version: "0.145.0-alpha.18", candidatePath,
-      candidateSha256: sha256File(candidatePath), codexHome, configPath, configSha256: sha256File(configPath),
+      candidateSha256, codexHome, configPath, configSha256: sha256File(configPath),
       managedRuntime: runtime,
       pluginBundles: pluginArtifacts.map((plugin) => ({
         owner: `plugin:${plugin.id.replace(/-plugin-bundle$/, "")}@${plugin.version}`,
@@ -337,6 +338,23 @@ function createFixture(): Fixture {
       expectedRoutes,
       trustedRunnerExpectedSha256: sha256TrustedManagedMcpCanaryRunnerSource(),
       trustedAdapterExpectedSha256: sha256TrustedManagedMcpCanaryRunnerSource(),
+      rustLifecycleTests: {
+        schemaVersion: 1,
+        kind: "codex-rust-lifecycle-tests",
+        sourceCommit: "a".repeat(40),
+        patchedTreeSha256: "b".repeat(64),
+        cargoLockSha256: "c".repeat(64),
+        command: ["cargo", "test", "--locked"],
+        exitCode: 0,
+        passedTests: ["managed_mcp_lifecycle"],
+        stdoutFile: join(root, "rust-lifecycle.stdout"),
+        stdoutSha256: "d".repeat(64),
+        stderrFile: join(root, "rust-lifecycle.stderr"),
+        stderrSha256: "e".repeat(64),
+        candidateBinarySha256: candidateSha256,
+        startedAt: "2026-07-20T11:58:00.000Z",
+        completedAt: "2026-07-20T11:58:30.000Z",
+      },
     }),
     remove: () => rmSync(root, { recursive: true, force: true }),
   };

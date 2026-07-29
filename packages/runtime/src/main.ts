@@ -20,11 +20,20 @@ import { extract as extractTar, list as listTar } from "tar";
 import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
+import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
+import { hashRawAsarHeader } from "./promotion-asar";
+import {
+  fingerprintPromotionPolicyPath,
+  promotionPolicyFingerprintFailureReason,
+} from "./promotion-policy";
 import {
   createMcpReconciler,
+  readMcpSyncState,
+  resolveMcpRuntimePaths,
   userQuestionsMcpReceiptMatchesEnabledState,
+  type McpSyncTrigger,
 } from "./mcp-reconciliation";
-import { getAndPublishWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
+import { getAndPublishWatcherHealth, getWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
 import {
   isMainProcessTweakScope,
   bindMainTweakStop,
@@ -83,6 +92,16 @@ import {
 } from "./tweak-store";
 import { maybeStartBrowserUiServer } from "./browser-ui";
 import { resolveLocalCliRuntime } from "./local-cli-runtime";
+import {
+  resolveTerminalCodexBinary,
+  terminalCodexPathFromShellOutput,
+} from "./codex-terminal-cli";
+import {
+  classifyInstalledCliCommand,
+  submitInstalledCliWithLaunchd,
+  type LaunchdSubmitOptions,
+} from "./installed-cli-launch";
+import { createDesktopUpdateStartupReconciler } from "./desktop-update-startup";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import {
   answerPromotionHealthRequest,
@@ -1431,16 +1450,6 @@ function mcpSyncTweaks(enabledOnly: boolean) {
     }));
 }
 
-function mcpSyncTweaks(enabledOnly: boolean) {
-  return tweakState.discovered
-    .filter((tweak) => !enabledOnly || isTweakEnabled(tweak.manifest.id))
-    .map((tweak) => ({
-      dir: tweak.dir,
-      dataDir: join(userRoot!, "tweak-data", tweak.manifest.id),
-      manifest: tweak.manifest,
-    }));
-}
-
 const nativeBridge = new NativeBridge(log, {
   nativeHostPath: resolveRuntimeNativeHostPath({
     resourcesPath: process.resourcesPath,
@@ -2502,64 +2511,6 @@ function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
       fail("canonical renderer mount timed out", event.sender.id);
       return;
     }
-    const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>).lifecycle
-      : null;
-    if (lifecycle === "renderer-load-observed") {
-      const loadDecision = validatePromotionOriginalRendererLoadObserved({
-        windowAlive,
-        senderMatches,
-        frameMatches,
-        senderUrl: event.senderFrame?.url ?? "",
-        expectedUrl: tracker.summary().canonicalUrl ?? "",
-        authorizationConsumed,
-        loadObservedConsumed,
-        handshakeConsumed,
-      }, payload, nonce);
-      if (!loadDecision.accepted) {
-        log("warn", "promotion original renderer load observation rejected", {
-          webContentsId: event.sender.id,
-          reason: loadDecision.reason,
-        });
-        return;
-      }
-      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-load-observed")) return;
-      loadObservedConsumed = true;
-      log("info", "promotion original renderer load observation accepted", {
-        webContentsId: event.sender.id,
-        url: promotionOriginalRendererLogUrl(loadDecision.observation.url),
-        rendererSandboxed: loadDecision.observation.rendererSandboxed,
-      });
-      return;
-    }
-    if (lifecycle === "renderer-mount-timeout") {
-      const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
-        windowAlive,
-        senderMatches,
-        frameMatches,
-        senderUrl: event.senderFrame?.url ?? "",
-        expectedUrl: tracker.summary().canonicalUrl ?? "",
-        authorizationConsumed,
-        loadObservedConsumed,
-        handshakeConsumed,
-      }, payload, nonce);
-      if (!timeoutDecision.accepted) {
-        log("warn", "promotion original renderer mount-timeout rejected", {
-          webContentsId: event.sender.id,
-          reason: timeoutDecision.reason,
-        });
-        return;
-      }
-      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mount-timeout")) return;
-      handshakeConsumed = true;
-      log("warn", "promotion original renderer mount timed out", {
-        webContentsId: event.sender.id,
-        url: promotionOriginalRendererLogUrl(timeoutDecision.observation.url),
-        rendererSandboxed: timeoutDecision.observation.rendererSandboxed,
-      });
-      fail("canonical renderer mount timed out", event.sender.id);
-      return;
-    }
     const decision = validatePromotionOriginalRendererHandshake({
       windowAlive,
       senderMatches,
@@ -2728,6 +2679,9 @@ app.whenReady().then(() => {
     // Raw Sparkle scheduling stays disabled in the locally signed app. This
     // bounded metadata-only loop restores proactive update notification safely.
     scheduleProactiveDesktopUpdateChecks();
+    if (process.platform === "darwin") {
+      desktopUpdateStartupReconciler.schedule();
+    }
   }
   void (async () => {
     const rendererProof = healthOriginalMain
@@ -3187,6 +3141,20 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
   const bundledPath = bundledCodexBinary();
   const betaPath = codexCliManager.getSelectedBinary();
   const activeCliPath = codexCliBootstrap.binary ?? bundledPath;
+  const terminalPath = resolveTerminalCodexBinary({
+    home: homedir(),
+    pathValue: process.env.PATH,
+    preferredPath: process.env.CODEX_TERMINAL_CLI_PATH,
+    loginShellPath: terminalCodexFromLoginShell(),
+    excludedPaths: [bundledPath, betaPath].filter((value): value is string => !!value),
+    isExecutable: (path) => {
+      try {
+        return existsSync(path) && statSync(path).isFile();
+      } catch {
+        return false;
+      }
+    },
+  });
   const installedDesktop = installedCodexDesktopVersion();
   const desktopCacheKey = installedDesktop.installedMarketingVersion
     ? `${installedDesktop.installedMarketingVersion}:${installedDesktop.installedBuild ?? ""}`
@@ -3200,9 +3168,10 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
   if (!codexAppcastMetadataByIdentity.has(desktopAppcastMemoryKey) && persistedAppcast) {
     codexAppcastMetadataByIdentity.set(desktopAppcastMemoryKey, persistedAppcast);
   }
-  const [bundledProbe, betaProbe, activeCliProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
+  const [bundledProbe, betaProbe, terminalProbe, activeCliProbe, bundledRelease, betaRelease, refreshedAppcast] = await Promise.all([
     codexVersionService.probeCli(bundledPath),
     betaPath ? codexVersionService.probeCli(betaPath) : Promise.resolve(null),
+    terminalPath ? codexVersionService.probeCli(terminalPath) : Promise.resolve(null),
     codexVersionService.probeCli(activeCliPath),
     force
       ? codexVersionService.fetchLatestRelease("bundled", { force: true })
@@ -3298,6 +3267,16 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
       nativeUpdateActionable: sparkle.canInstall,
       nativeUpdatePrerequisiteError: sparkle.installPrerequisiteFailure,
       updateAvailable: desktopUpdate,
+    },
+    terminalCli: {
+      path: terminalProbe?.path ?? terminalPath,
+      version: terminalProbe?.version ?? null,
+      versionChannel: codexVersionChannel(terminalProbe?.version),
+      available: terminalProbe?.available ?? false,
+      release: bundledRelease?.release ?? null,
+      error: terminalProbe?.error ?? (terminalPath ? null : "Terminal Codex CLI was not found"),
+      managedCurrentVersion: null,
+      managedPreviousVersion: null,
     },
     activeCli: {
       path: activeCliProbe.path,
@@ -3958,6 +3937,7 @@ async function loadAllMainTweaks(): Promise<void> {
     ? "startup"
     : nextReloadMcpTrigger;
   initialMcpReconciliationPending = false;
+  nextReloadMcpTrigger = "tweak-reload";
   let userQuestionsMcpReady = false;
   if (mcpReconciler) {
     try {
@@ -4790,7 +4770,8 @@ function startCodexDesktopUpdateTransaction(): void {
 }
 
 function desktopUpdateCli(status?: LocalRefreshStatusValue): string {
-  const cli = localRefreshCli(status);
+  void status;
+  const cli = localRefreshCli();
   if (!existsSync(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
   return cli;
 }

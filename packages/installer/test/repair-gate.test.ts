@@ -208,6 +208,17 @@ function makeRepairFixture(root: string): RepairFixture {
   return { appRoot, asarPath, asarStat: { size, mtimeMs } };
 }
 
+function completeRepairFingerprint(fixture: RepairFixture) {
+  const { dev, ino, ctimeMs } = statSync(fixture.asarPath);
+  return {
+    ...fixture.asarStat,
+    dev,
+    ino,
+    ctimeMs,
+    headerHash: "a".repeat(64),
+  };
+}
+
 function seedRepairState(
   root: string,
   fixture: RepairFixture,
@@ -338,11 +349,12 @@ test("unchanged asar without verified active runtime bytes enters repair instead
 test("unchanged asar plus equal runtime fingerprint preserves the zero-tree fast path", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
-    seedRepairState(root, fixture);
+    const fingerprint = completeRepairFingerprint(fixture);
+    seedRepairState(root, { ...fixture, asarStat: fingerprint });
     let treeChecks = 0;
 
     await repair({ watcher: true, quiet: true }, {
-      statAsar: () => fixture.asarStat,
+      statAsar: () => fingerprint,
       readExpectedRuntimeFingerprint: () => "same",
       readActiveRuntimeFingerprint: () => "same",
       isAppRunning: () => true,
@@ -360,7 +372,8 @@ test("unchanged asar plus equal runtime fingerprint preserves the zero-tree fast
 test("repair reconciles an adopted MCP lifecycle package inside the shared lifecycle lease", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
-    seedRepairState(root, fixture);
+    const fingerprint = completeRepairFingerprint(fixture);
+    seedRepairState(root, { ...fixture, asarStat: fingerprint });
     let lifecycleReconciliations = 0;
 
     await repair({ watcher: true, quiet: true }, {
@@ -369,7 +382,7 @@ test("repair reconciles an adopted MCP lifecycle package inside the shared lifec
         assert.equal(existsSync(lifecycleLockFile(root)), true);
         return null;
       },
-      statAsar: () => fixture.asarStat,
+      statAsar: () => fingerprint,
       readExpectedRuntimeFingerprint: () => "same",
       readActiveRuntimeFingerprint: () => "same",
       isAppRunning: () => true,
@@ -383,12 +396,13 @@ test("repair reconciles an adopted MCP lifecycle package inside the shared lifec
 test("unchanged asar plus runtime drift records pending while the app is running", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
-    seedRepairState(root, fixture);
+    const fingerprint = completeRepairFingerprint(fixture);
+    seedRepairState(root, { ...fixture, asarStat: fingerprint });
     let settles = 0;
     let installs = 0;
 
     const outcome = await repairWithOutcome({ watcher: true, quiet: true }, {
-      statAsar: () => fixture.asarStat,
+      statAsar: () => fingerprint,
       readExpectedRuntimeFingerprint: () => "new",
       readActiveRuntimeFingerprint: () => "old",
       isAppRunning: () => true,

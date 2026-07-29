@@ -19,6 +19,16 @@ import {
   captureTweakReloadFocus,
   restoreTweakReloadFocus,
 } from "./reload-focus";
+import {
+  commitRendererStorageMigration,
+  prepareRendererStorageMigration,
+  rollbackRendererStorageMigration,
+} from "../renderer-storage";
+import {
+  createPromotionRendererMountTracker,
+  promotionRendererAuthorizationAttempt,
+  promotionRendererAuthorizedNonce,
+} from "./promotion-renderer-mount";
 
 const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
 const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";

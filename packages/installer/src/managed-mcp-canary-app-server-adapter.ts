@@ -173,6 +173,12 @@ class AppServerObservationAdapter implements ManagedMcpCanaryObservationAdapterI
       // unrelated process during discovery or a route call.
       return {
         ...process,
+        commandLine: process.argv.join(" "),
+        artifactIdentities: [{
+          path: process.executable,
+          sha256: process.executableSha256,
+          source: "executable" as const,
+        }],
         routeKey: owner?.routeKey ?? "unknown-descendant",
         taskId: owner?.taskId ?? "unknown",
       };
@@ -497,6 +503,12 @@ function censusSnapshot(
     capturedAt,
     processes: raw.map((process) => ({
       ...process,
+      commandLine: process.argv.join(" "),
+      artifactIdentities: [{
+        path: process.executable,
+        sha256: process.executableSha256,
+        source: "executable" as const,
+      }],
       routeKey: owners.get(process.pid)?.routeKey ?? "unknown-descendant",
       taskId: owners.get(process.pid)?.taskId ?? "unknown",
     })),

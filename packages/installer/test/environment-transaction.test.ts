@@ -2246,7 +2246,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
   }
 });
 
-test("explicit bundled-derived receipt controls rebuild/reuse while the default bundled path is unchanged", async () => {
+test("explicit bundled-derived receipt controls backend selection while every patched payload rebuilds with its runtime", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-environment-bundled-derived-"));
   const appPath = join(root, "Applications", "ChatGPT.app");
   const alphaPath = join(root, "Applications", "ChatGPT (Beta).app");
@@ -2271,6 +2271,7 @@ test("explicit bundled-derived receipt controls rebuild/reuse while the default 
     );
     writeFileSync(receiptFile, "{}\n");
     writeFileSync(derivedBinary, "derived-backend");
+    writeManagedRuntimeFixture(root);
 
     const registry = createEnvironmentProfileRegistry({
       stableDesktopPath: appPath,
@@ -2323,16 +2324,24 @@ test("explicit bundled-derived receipt controls rebuild/reuse while the default 
       receiptRoot: join(root, input.transactionRoot),
       configFile: join(root, "config.json"),
       stateFile: join(root, "state.json"),
+      sourceRoot: root,
       ...(input.configuredReceipt ? { bundledDerivedReceiptFile: receiptFile } : {}),
     }, {
       assertMcpModeReady: () => {},
       loadState: () => ({ registry: selectedRegistry, current, migratedFromLegacy: false }),
       readBundledDerivedArtifact: () => descriptor(input.descriptorVersion),
-      preparePatchedPayload: (_profile, destination, bundledDerivedBackend) => {
+      preparePatchedPayload: (_profile, destination, runtimeDestination, bundledDerivedBackend) => {
         buildCalls += 1;
-        assert.equal(bundledDerivedBackend?.fingerprint, derivedFingerprint);
+        assert.equal(
+          bundledDerivedBackend?.fingerprint,
+          input.configuredReceipt ? derivedFingerprint : undefined,
+        );
         mkdirSync(join(destination, "Contents", "Resources"), { recursive: true });
         writeFileSync(join(destination, "Contents", "Resources", "codex"), "derived-backend");
+        writeRuntimeFixture(runtimeDestination);
+      },
+      prepareManagedRuntime: (_source, destination, provenance) => {
+        writeManagedRuntimeFixture(destination, "runtime\n", provenance.sourceRuntimeHash ?? undefined, provenance);
       },
       cloneApp: (source, destination) => cpSync(source, destination, { recursive: true }),
       copyBackend: (source, destination) => {
@@ -2357,6 +2366,12 @@ test("explicit bundled-derived receipt controls rebuild/reuse while the default 
         gatekeeper: false,
         designatedRequirement: 'designated => identifier "com.openai.codex"',
         teamIdentifier: null,
+      }),
+      verifyOfficial: () => ({
+        strict: true,
+        gatekeeper: true,
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        teamIdentifier: "2DC432GLL2",
       }),
       readBackendVersion: (path) => path.startsWith(patchedPath)
         ? "0.145.0-alpha.17"
@@ -2412,7 +2427,7 @@ test("explicit bundled-derived receipt controls rebuild/reuse while the default 
       requested,
       oldMainPid: 101,
     });
-    assert.equal(buildCalls, 1, "without an explicit receipt the existing bundled behavior must remain reusable");
+    assert.equal(buildCalls, 2, "the default bundled backend still rebuilds the coupled patched payload and runtime");
     assert.equal(defaultPrepared.backend.artifactDigest, "stock-backend-digest");
   } finally {
     rmSync(root, { recursive: true, force: true });

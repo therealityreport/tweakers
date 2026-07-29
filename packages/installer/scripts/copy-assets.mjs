@@ -90,7 +90,7 @@ export function writeRuntimeFingerprint(runtimeRoot) {
       else if (entry.isFile() && entry.name === ".DS_Store") rmSync(path);
     }
   };
-  sweepJunk(runtimeOut);
+  sweepJunk(runtimeRoot);
   const hash = createHash("sha256");
   let fileCount = 0;
   const visit = (directory) => {

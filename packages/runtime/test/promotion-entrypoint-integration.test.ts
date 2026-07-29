@@ -204,7 +204,7 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   assert.match(responder, /maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS/);
 });
 
-test("original-main health mode observes Codex's hidden real window without owning protocol or window creation", () => {
+test("original-main health mode retains cleanup and sandbox safeguards", () => {
   const controller = sourceBlock("function createPromotionOriginalMainProbe", "// Construct this controller");
   assert.doesNotMatch(controller, /new BrowserWindow/);
   assert.doesNotMatch(controller, /protocol\.(?:handle|registerSchemesAsPrivileged)/);
@@ -363,7 +363,8 @@ test("original-main health mode observes Codex's hidden real window without owni
   assert.match(controller, /PROMOTION_HEALTH_PRELOAD_PATH/);
   assert.match(controller, /createPromotionOriginalRendererDeadlineController/);
   assert.match(controller, /promotion original renderer startup timed out/);
-  assert.match(controller, /promotion original renderer completion timed out/);
+  assert.match(controller, /promotion original renderer load timed out/);
+  assert.match(controller, /promotion original renderer mount timed out/);
   assert.match(controller, /deadlineController\.canonicalSelected\(\)/);
   assert.doesNotMatch(controller, /promotion original renderer watchdog expired/);
   assert.match(controller, /window\.setFocusable\(false\)/);

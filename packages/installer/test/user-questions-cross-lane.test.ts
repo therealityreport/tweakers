@@ -82,7 +82,8 @@ test("rich schema, generic fallback, submitted delivery, and redaction use the f
 
   const carrier = "__tweakers_carrier_nonce_0123456789abcdef";
   const elicitation = mcp.buildRoundElicitation(validation.value, false, carrier);
-  const scanner = elicitation.requestedSchema.properties.scanner_setup;
+  const scanner = elicitation.requestedSchema.properties[carrier];
+  assert.equal(elicitation.requestedSchema.properties.scanner_setup, undefined);
   assert.match(scanner.description, /Details:/);
   assert.match(scanner.description, /Pros:/);
   assert.match(scanner.description, /Cons:/);
@@ -129,8 +130,8 @@ test("policy and Settings copy preserve explicit Preview/Apply/Restore with no a
   assert.equal(policy.POLICY_SETTINGS_VIEW_MODEL.restart.automatic, false);
 
   const rendererSource = readFileSync(join(tweakRoot, "index.js"), "utf8");
-  assert.match(rendererSource, /Choose a permission profile, preview its exact task-level changes/);
-  assert.match(rendererSource, /Ordinary startup never changes policy/);
+  assert.match(rendererSource, /Choose a profile for Preview\. A row is marked saved only after the current policy file is verified/);
+  assert.match(rendererSource, /Existing tasks retain their loaded policy; a later Codex restart and fresh task are required/);
   assert.match(rendererSource, /Maximum access/);
   assert.match(rendererSource, /Questions only/);
   assert.doesNotMatch(rendererSource, /repairGlobalStateFile\s*\(/);

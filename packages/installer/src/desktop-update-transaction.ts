@@ -65,6 +65,14 @@ import { isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
+import {
+  readDesktopUpdateHeartbeat,
+  removeDesktopUpdateHeartbeat,
+  writeDesktopUpdateHeartbeat,
+  type DesktopUpdateHeartbeat,
+} from "./desktop-update-heartbeat.js";
+import { appendDesktopUpdateLog, type DesktopUpdateLogEvent } from "./desktop-update-log.js";
+import { readProcessStartToken } from "./orphans.js";
 
 export const DESKTOP_UPDATE_SCHEMA_VERSION = 1 as const;
 
@@ -87,6 +95,10 @@ export interface DesktopUpdateReceipt {
   transactionId: string;
   phase: DesktopUpdatePhase;
   ownerPid: number;
+  /** Stable OS process-start identity. Missing on legacy receipts. */
+  ownerToken?: string | null;
+  /** Fresh fencing UUID for each explicit ownership claim. Missing on legacy receipts. */
+  ownerGeneration?: string | null;
   source: EnvironmentSelection;
   official: EnvironmentSelection;
   baseline: DesktopVersionIdentity;
@@ -203,8 +215,10 @@ export interface DesktopUpdateDependencies {
     environmentReceipt: EnvironmentTransactionReceipt;
   }): RecoveredOfficialUpdate | null | Promise<RecoveredOfficialUpdate | null>;
   processAlive(pid: number): boolean;
+  readProcessStartToken(pid: number): string | null;
   now(): string;
   createId(): string;
+  createOwnerGeneration(): string;
 }
 
 export interface DesktopUpdateTransactionOptions {
@@ -212,6 +226,9 @@ export interface DesktopUpdateTransactionOptions {
   stateFile?: string;
   receiptRoot?: string;
   lockFile?: string;
+  heartbeatFile?: string;
+  logFile?: string;
+  jobLabel?: string | null;
   timeoutMs?: number;
   pollIntervalMs?: number;
   /** Bounded wait for the official app to present a visible window after a
@@ -224,6 +241,7 @@ export interface DesktopUpdateTransaction {
   start(): Promise<DesktopUpdateReceipt>;
   resume(): Promise<DesktopUpdateReceipt>;
   cancel(): Promise<DesktopUpdateReceipt>;
+  reconcile(): Promise<DesktopUpdateReceipt | null>;
   status(): DesktopUpdateReceipt | null;
   /** Latest owner heartbeat, if one exists — live progress for status readers. */
   heartbeat(): DesktopUpdateHeartbeat | null;
@@ -253,6 +271,9 @@ export function createDesktopUpdateTransaction(
   const stateFile = options.stateFile ?? join(root, "transactions", "desktop-update.json");
   const receiptRoot = options.receiptRoot ?? join(root, "transactions", "desktop-update");
   const lockFile = options.lockFile ?? join(root, "transactions", "desktop-update.lock");
+  const heartbeatFile = options.heartbeatFile
+    ?? join(root, "transactions", "desktop-update.heartbeat.json");
+  const logFile = options.logFile ?? join(root, "log", "desktop-update.log");
   const environmentRegistryFile = join(root, "environment-registry.json");
   const environmentSelectionFile = join(root, "environment-selection.json");
   const environmentTransactionFile = join(root, "transactions", "environment.json");
@@ -291,6 +312,9 @@ export function createDesktopUpdateTransaction(
       readDesktopBundleIdentity(appPath).bundleId
     )),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
+    launchOfficialDesktop: overrides.launchOfficialDesktop ?? ((selection) => {
+      openCodex(selection.selectedDesktopPath);
+    }),
     initiateNativeUpdate: overrides.initiateNativeUpdate ?? (async ({ selection, baseline, officialMainPid }) => {
       let result: NativeUpdateHandoffResult = {
         ok: false,
@@ -299,16 +323,7 @@ export function createDesktopUpdateTransaction(
         permissionGuidance: null,
       };
       if (officialMainPid !== null) {
-        // A freshly reopened official app can take several seconds to build
-        // its full signed-in app menu, so a missing/disabled update item (or
-        // not-yet-visible window) right after cutover is usually transient.
-        // Retry briefly before treating the handoff as terminal.
-        const transientKinds = new Set(["menu_item_not_found", "menu_item_disabled", "window_not_visible"]);
-        for (let attempt = 1; attempt <= 5; attempt += 1) {
-          result = requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid);
-          if (result.ok || !transientKinds.has(result.kind)) break;
-          if (attempt < 5) await new Promise((resolvePause) => setTimeout(resolvePause, 3_000));
-        }
+        result = await requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid);
       }
       if (!result.ok) {
         showUpdateModePausedAlert(selection.selectedDesktopPath, baseline.marketingVersion, result);
@@ -386,13 +401,58 @@ export function createDesktopUpdateTransaction(
       })
     )),
     processAlive: overrides.processAlive ?? isProcessAlive,
+    readProcessStartToken: overrides.readProcessStartToken ?? readProcessStartToken,
     now,
     createId: overrides.createId ?? randomUUID,
+    createOwnerGeneration: overrides.createOwnerGeneration ?? randomUUID,
   };
 
-  const persist = (receipt: DesktopUpdateReceipt, terminal = false): DesktopUpdateReceipt => {
+  const persist = (
+    receipt: DesktopUpdateReceipt,
+    terminal = false,
+    event?: DesktopUpdateLogEvent,
+  ): DesktopUpdateReceipt => {
+    const previous = readDesktopUpdateReceipt(stateFile);
     writeDesktopUpdateReceipt(stateFile, receipt);
     if (terminal) writeDesktopUpdateReceipt(join(receiptRoot, `${receipt.transactionId}.json`), receipt);
+    if (receipt.phase === "awaiting_native_update"
+      && receipt.ownerToken
+      && receipt.ownerGeneration) {
+      writeDesktopUpdateHeartbeat(heartbeatFile, {
+        schemaVersion: 1,
+        transactionId: receipt.transactionId,
+        ownerPid: receipt.ownerPid,
+        ownerToken: receipt.ownerToken,
+        ownerGeneration: receipt.ownerGeneration,
+        phase: receipt.phase,
+        beatAt: deps.now(),
+      });
+    } else {
+      removeDesktopUpdateHeartbeat(heartbeatFile);
+    }
+    const transitionEvent = event
+      ?? (previous === null || previous.ownerGeneration !== receipt.ownerGeneration
+        ? "owner_started"
+        : terminal
+          ? receipt.phase === "completed" ? "owner_completed" : "handled_failure"
+          : previous.phase !== receipt.phase ? "phase_transition" : null);
+    if (transitionEvent !== null) {
+      appendDesktopUpdateLog(logFile, {
+        transactionId: receipt.transactionId,
+        phase: receipt.phase,
+        ownerPid: receipt.ownerPid,
+        ownerToken: receipt.ownerToken ?? null,
+        ownerGeneration: receipt.ownerGeneration ?? null,
+        event: transitionEvent,
+        ...(receipt.error === null ? {} : { error: receipt.error }),
+        jobLabel: options.jobLabel
+          ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL
+          ?? null,
+      }, {
+        now: deps.now,
+        userRoot: root,
+      });
+    }
     return receipt;
   };
 
@@ -460,12 +520,18 @@ export function createDesktopUpdateTransaction(
         requestedAt: deps.now(),
       });
       const now = deps.now();
+      const ownerToken = deps.readProcessStartToken(process.pid);
+      if (!ownerToken) {
+        throw new Error(`Cannot establish a stable process identity for desktop update owner PID ${process.pid}`);
+      }
       return persist({
         schemaVersion: DESKTOP_UPDATE_SCHEMA_VERSION,
         kind: "desktop-update",
         transactionId: deps.createId(),
         phase: "preparing",
         ownerPid: process.pid,
+        ownerToken,
+        ownerGeneration: deps.createOwnerGeneration(),
         source,
         official,
         baseline,
@@ -536,7 +602,26 @@ export function createDesktopUpdateTransaction(
         baseline: initial.baseline,
         officialMainPid: initial.officialMainPid ?? null,
       });
-      return awaitNativeUpdate(update(initial, { nativeUpdateHandoffAt: deps.now() }));
+      if (result && !result.ok && !RECOVERABLE_NATIVE_HANDOFF_KINDS.has(result.kind)) {
+        return update(initial, {
+          phase: "failed",
+          safeOfficialMode: true,
+          resumable: true,
+          error: `Native updater handoff failed: ${result.message}`,
+        }, true);
+      }
+      const handoff = result && !result.ok
+        ? persist({
+          ...initial,
+          error: `Native updater handoff warning: ${result.message}`,
+          updatedAt: deps.now(),
+        }, false, "handoff_result")
+        : persist({
+          ...initial,
+          nativeUpdateHandoffAt: deps.now(),
+          updatedAt: deps.now(),
+        }, false, "handoff_result");
+      return awaitNativeUpdate(handoff);
     } catch (error) {
       return update(initial, {
         phase: "failed",
@@ -805,7 +890,7 @@ export function createDesktopUpdateTransaction(
       };
       let liveOfficial: LiveOfficialDesktopObservation;
       try {
-        liveOfficial = await deps.inspectLiveOfficialDesktop(resumed.official);
+        liveOfficial = await inspectLiveOfficialDesktopRelaunchingIfNeeded(resumed.official);
       } catch (error) {
         return update(resumed, {
           phase: "failed",
@@ -1197,7 +1282,25 @@ export function createDesktopUpdateTransaction(
     }, true);
   }
 
-  return { start, resume, cancel, status };
+  async function reconcile(): Promise<DesktopUpdateReceipt | null> {
+    const observed = status();
+    if (!observed || isTerminalDesktopUpdatePhase(observed.phase)) return observed;
+    if (deps.processAlive(observed.ownerPid)) return observed;
+    return withLifecycleLock(
+      lifecycleLockFile,
+      "desktop update reconcile",
+      () => withDesktopUpdateLock(lockFile, async () => {
+        const existing = status();
+        if (!existing || isTerminalDesktopUpdatePhase(existing.phase)) return existing;
+        if (deps.processAlive(existing.ownerPid)) return existing;
+        return recoverExitedOwner(existing);
+      }),
+    );
+  }
+
+  const heartbeat = (): DesktopUpdateHeartbeat | null => readDesktopUpdateHeartbeat(heartbeatFile);
+
+  return { start, resume, cancel, reconcile, status, heartbeat };
 }
 
 async function assertRequestedDesktopApp(
@@ -1558,6 +1661,10 @@ function isDesktopUpdateReceipt(value: unknown): value is DesktopUpdateReceipt {
     && typeof receipt.transactionId === "string"
     && isDesktopUpdatePhase(receipt.phase)
     && typeof receipt.ownerPid === "number"
+    && (receipt.ownerToken === undefined || receipt.ownerToken === null
+      || typeof receipt.ownerToken === "string")
+    && (receipt.ownerGeneration === undefined || receipt.ownerGeneration === null
+      || typeof receipt.ownerGeneration === "string")
     && isEnvironmentSelection(receipt.source)
     && isEnvironmentSelection(receipt.official)
     && isDesktopVersion(receipt.baseline)
