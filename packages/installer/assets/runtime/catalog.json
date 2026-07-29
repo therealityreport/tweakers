@@ -67,6 +67,37 @@
       "approvedBy": "tweakers"
     },
     {
+      "id": "co.tweakers.browser-trust",
+      "available": true,
+      "source": {
+        "kind": "bundled",
+        "path": "tweaks/co.tweakers.browser-trust"
+      },
+      "manifest": {
+        "id": "co.tweakers.browser-trust",
+        "name": "Browser Trust",
+        "version": "0.1.0",
+        "githubRepo": "therealityreport/tweakers",
+        "description": "Explicit, reversible trust for exact browser inspection and built-in HTTP(S) browse routes while higher-risk browser actions remain gated.",
+        "author": "hulibrands",
+        "tags": [
+          "browser",
+          "trust",
+          "security",
+          "inspection"
+        ],
+        "scope": "both",
+        "minRuntime": ">=1.0.0",
+        "permissions": [
+          "settings",
+          "filesystem",
+          "ipc"
+        ]
+      },
+      "approvedAt": "2026-07-28T13:29:33.840Z",
+      "approvedBy": "tweakers"
+    },
+    {
       "id": "co.tweakers.developer-tools",
       "available": true,
       "source": {
@@ -134,7 +165,7 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.4.9",
+        "version": "0.4.19",
         "githubRepo": "therealityreport/tweakers",
         "description": "Nested projects with connection references and per-project GitHub identities.",
         "author": "hulibrands",
@@ -193,7 +224,7 @@
       "manifest": {
         "id": "co.tweakers.thread-summary-profiles",
         "name": "Thread Summary Profiles",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "githubRepo": "therealityreport/tweakers",
         "description": "Show read-only connection profiles for the active thread project.",
         "author": "hulibrands",
@@ -300,9 +331,9 @@
       "manifest": {
         "id": "co.tweakers.user-questions",
         "name": "User Questions",
-        "version": "0.4.10",
+        "version": "0.6.0",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Native task-scoped questions shown one at a time, with conditional inline Other input and rounded-square multi-select controls.",
+        "description": "Task-scoped preference rounds with rich tradeoffs, explicit Skip and Other choices, resumable drafts, and safe generic fallback.",
         "author": "hulibrands",
         "tags": [
           "questions",
@@ -313,7 +344,9 @@
         "minRuntime": ">=1.0.0",
         "permissions": [
           "settings",
-          "filesystem"
+          "filesystem",
+          "ipc",
+          "network"
         ],
         "mcp": {
           "command": "node",

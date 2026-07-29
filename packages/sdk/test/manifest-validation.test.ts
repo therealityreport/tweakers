@@ -68,6 +68,23 @@ test("validateTweakManifest accepts a manifest MCP server", () => {
   assert.deepEqual(result.errors, []);
 });
 
+test("validateTweakManifest rejects runtime-reserved managed MCP environment overrides", () => {
+  for (const reserved of ["TWEAKER_TWEAK_DATA_DIR", "TWEAKER_TWEAK_ID"]) {
+    const result = validateTweakManifest({
+      id: "com.example.tweak",
+      name: "Example Tweak",
+      version: "0.1.0",
+      githubRepo: "example/tweak",
+      mcp: {
+        command: "node",
+        env: { [reserved]: "caller-controlled" },
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.errors.map((issue) => issue.path), [`mcp.env.${reserved}`]);
+  }
+});
+
 test("validateTweakManifest rejects malformed MCP server config", () => {
   const result = validateTweakManifest({
     id: "com.example.tweak",

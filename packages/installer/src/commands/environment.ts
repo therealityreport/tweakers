@@ -1,5 +1,5 @@
-import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute, join, normalize, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { isAbsolute, join, normalize } from "node:path";
 import {
   ALPHA_DESKTOP_PATH,
   STABLE_DESKTOP_PATH,
@@ -13,6 +13,7 @@ import {
   writeEnvironmentProfileRegistry,
   type AppExperience,
   type EnvironmentProfileRecord,
+  type EnvironmentProfileEvidenceInput,
   type EnvironmentProfileRegistry,
   type LoadedEnvironmentState,
   type ReleaseProfile,
@@ -21,16 +22,20 @@ import {
   createEnvironmentCoordinator,
   environmentPreparationCapabilities,
   inspectManagedAlphaBackend,
+  resolvePreparedEnvironmentCommitCli,
   submitEnvironmentCommitHelper,
   type EnvironmentCommitHelperReceipt,
   type EnvironmentCoordinator,
   type EnvironmentCoordinatorOptions,
   type EnvironmentPreparationCapabilities,
+  type PreparedEnvironmentCommitCli,
   type EnvironmentTransactionReceipt,
   type EnvironmentVerification,
   type SubmitEnvironmentCommitHelperInput,
+  isTerminalEnvironmentPhase,
   readEnvironmentTransactionReceipt,
 } from "../environment-transaction.js";
+import { processAlive } from "../process-lock.js";
 import { userPaths, type ResolvedUserPaths } from "../paths.js";
 import { isLifecycleLockHeld, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { modeTransitionFile } from "../mode-transition.js";
@@ -49,6 +54,7 @@ export const ENVIRONMENT_ACTIONS = [
   "commit",
   "verify",
   "rollback",
+  "recover",
   "cancel",
   "gc",
 ] as const;
@@ -64,6 +70,8 @@ export interface EnvironmentCommandOptions {
   appPath?: string;
   "app-path"?: string;
   app?: string;
+  bundledDerivedReceipt?: string;
+  "bundled-derived-receipt"?: string;
   observe?: boolean;
   dryRun?: boolean;
   "dry-run"?: boolean;
@@ -104,47 +112,66 @@ export interface IdleEnvironmentTransaction {
   phase: "idle";
 }
 
+/** Receipt plus an output-only ownerPid liveness annotation (never persisted). */
+export type AnnotatedEnvironmentTransactionReceipt = EnvironmentTransactionReceipt & {
+  ownerAlive: boolean;
+};
+
 export type EnvironmentCommandResult =
   | EnvironmentStatusResult
   | IdleEnvironmentTransaction
   | EnvironmentTransactionReceipt
+  | AnnotatedEnvironmentTransactionReceipt
   | EnvironmentCommitHelperReceipt
   | EnvironmentVerification
   | EnvironmentGcResult;
 
 /**
- * The launchd commit helper trusts the CLI exit code. A coordinator commit can
- * return a durable rollback/failure receipt without throwing, so translate
- * every non-committed result into a non-zero CLI outcome while leaving the
- * receipt itself intact for recovery diagnostics.
+ * Callers trust the CLI exit code. A coordinator can return a durable failure
+ * receipt without throwing, so translate every result that did not reach its
+ * action's success phase into a non-zero outcome while leaving the receipt
+ * itself intact on stdout for recovery diagnostics.
  */
+const ENVIRONMENT_SUCCESS_PHASES: Partial<Record<EnvironmentAction, string[]>> = {
+  commit: ["committed"],
+  rollback: ["rolled-back", "cancelled"],
+  recover: ["committed", "rolled-back", "cancelled"],
+};
+
 export function assertEnvironmentCliSuccess(
   action: EnvironmentAction,
   result: EnvironmentCommandResult,
 ): void {
-  if (action !== "commit") return;
+  const expected = ENVIRONMENT_SUCCESS_PHASES[action];
+  if (!expected) return;
   if (!("kind" in result)
     || result.kind !== "environment"
     || !("transactionId" in result)
     || result.transactionId === null
     || !("phase" in result)
-    || result.phase !== "committed") {
+    || typeof result.phase !== "string"
+    || !expected.includes(result.phase)) {
     const phase = "phase" in result && typeof result.phase === "string"
       ? result.phase
       : "invalid";
-    throw new Error(`Environment commit did not succeed (phase ${phase})`);
+    throw new Error(`Environment ${action} did not succeed (phase ${phase})`);
   }
 }
 
 export interface EnvironmentCommandDependencies {
   paths(): ResolvedUserPaths;
   loadState: typeof loadEnvironmentState;
+  inspectProfile: typeof inspectEnvironmentProfile;
+  inspectManagedAlpha: typeof inspectManagedAlphaBackend;
   writeRegistry(file: string, registry: EnvironmentProfileRegistry): void;
   preparationCapabilities(): EnvironmentPreparationCapabilities;
   createRequestedSelection: typeof createRequestedEnvironmentSelection;
   createCoordinator(options: EnvironmentCoordinatorOptions): EnvironmentCoordinator;
   submitCommitHelper(input: SubmitEnvironmentCommitHelperInput): EnvironmentCommitHelperReceipt;
-  resolveCurrentCliPath(): string;
+  resolvePreparedCommitCli(
+    receipt: EnvironmentTransactionReceipt,
+    receiptRoot: string,
+  ): PreparedEnvironmentCommitCli;
   print(value: string): void;
   registerAlpha?: (registry: EnvironmentProfileRegistry, appPath: string) => EnvironmentProfileRegistry;
   readRegistry(file: string): EnvironmentProfileRegistry | null;
@@ -153,12 +180,14 @@ export interface EnvironmentCommandDependencies {
 const DEFAULT_DEPENDENCIES: EnvironmentCommandDependencies = {
   paths: userPaths,
   loadState: loadEnvironmentState,
+  inspectProfile: inspectEnvironmentProfile,
+  inspectManagedAlpha: inspectManagedAlphaBackend,
   writeRegistry: writeEnvironmentProfileRegistry,
   preparationCapabilities: environmentPreparationCapabilities,
   createRequestedSelection: createRequestedEnvironmentSelection,
   createCoordinator: createEnvironmentCoordinator,
   submitCommitHelper: submitEnvironmentCommitHelper,
-  resolveCurrentCliPath,
+  resolvePreparedCommitCli: resolvePreparedEnvironmentCommitCli,
   print: (value) => console.log(value),
   registerAlpha: registerAlphaDesktopProfile,
   readRegistry: readEnvironmentProfileRegistry,
@@ -189,7 +218,7 @@ export async function environment(
   // read-modify-write operation.
   if ((action === "status" && options.observe === true)
     || action === "transaction"
-    || ["commit", "verify", "rollback", "cancel"].includes(action)) {
+    || ["commit", "verify", "rollback", "recover", "cancel"].includes(action)) {
     return run();
   }
   return withLifecycleLock(
@@ -206,8 +235,19 @@ async function runEnvironmentAction(
   paths: ResolvedUserPaths,
 ): Promise<EnvironmentCommandResult> {
   let coordinatorInstance: EnvironmentCoordinator | null = null;
+  const configuredBundledDerivedReceipt = optionValue(
+    options.bundledDerivedReceipt,
+    options["bundled-derived-receipt"],
+    "bundled-derived receipt",
+  );
+  if (configuredBundledDerivedReceipt !== undefined && action !== "prepare") {
+    throw new Error("Bundled-derived receipt may be configured only during environment prepare");
+  }
+  const bundledDerivedReceiptFile = configuredBundledDerivedReceipt === undefined
+    ? undefined
+    : parseBundledDerivedReceiptPath(configuredBundledDerivedReceipt);
   const coordinator = (): EnvironmentCoordinator => {
-    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(paths));
+    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(paths, bundledDerivedReceiptFile));
     return coordinatorInstance;
   };
 
@@ -249,7 +289,14 @@ async function runEnvironmentAction(
       break;
     }
     case "transaction": {
-      result = coordinator().status() ?? idleEnvironmentTransaction();
+      const receipt = coordinator().status();
+      // Output-only owner-liveness annotation; the receipt file is never
+      // rewritten, so durable evidence and validators are untouched.
+      result = receipt === null
+        ? idleEnvironmentTransaction()
+        : isTerminalEnvironmentPhase(receipt.phase)
+          ? receipt
+          : { ...receipt, ownerAlive: receipt.ownerPid === process.pid || processAlive(receipt.ownerPid) };
       break;
     }
     case "prepare": {
@@ -284,9 +331,16 @@ async function runEnvironmentAction(
           `Environment transaction ${transactionId} cannot submit from phase ${receipt.phase}`,
         );
       }
+      const controlPlane = dependencies.resolvePreparedCommitCli(
+        receipt,
+        paths.environmentReceiptRoot,
+      );
       result = dependencies.submitCommitHelper({
         transactionId,
-        cliPath: dependencies.resolveCurrentCliPath(),
+        cliPath: controlPlane.cliPath,
+        cliArtifactDigest: controlPlane.cliArtifactDigest,
+        managedRuntimeArtifactPath: controlPlane.managedRuntimeArtifactPath,
+        managedRuntimeArtifactDigest: controlPlane.managedRuntimeArtifactDigest,
         userRoot: paths.root,
         receiptFile: join(paths.environmentReceiptRoot, transactionId, "commit-helper.json"),
       });
@@ -302,6 +356,10 @@ async function runEnvironmentAction(
     }
     case "rollback": {
       result = await coordinator().rollback(parseTransactionId(options.transaction));
+      break;
+    }
+    case "recover": {
+      result = await coordinator().recover(parseTransactionId(options.transaction));
       break;
     }
     case "cancel": {
@@ -333,8 +391,7 @@ function recomputeEnvironmentTruth(
   observe = false,
 ): LoadedEnvironmentState {
   const capabilities = dependencies.preparationCapabilities();
-  const managedAlpha = inspectManagedAlphaBackend(paths.root);
-  return dependencies.loadState({
+  const input = {
     legacyStateFile: paths.stateFile,
     registryFile: paths.environmentRegistryFile,
     selectionFile: paths.environmentSelectionFile,
@@ -348,10 +405,21 @@ function recomputeEnvironmentTruth(
       backendInstallable: capabilities.backendInstallable,
       patchedPayloadBuildable: capabilities.patchedPayloadBuildable,
     },
-  }, {
-    recoverCommit: !observe,
+  };
+  if (observe) {
+    return dependencies.loadState(input, {
+      recoverCommit: false,
+      inspectProfile: (profile, _current, persistedProfile) => (
+        cachedProfileEvidence(persistedProfile ?? profile)
+      ),
+    });
+  }
+
+  const managedAlpha = dependencies.inspectManagedAlpha(paths.root);
+  return dependencies.loadState(input, {
+    recoverCommit: true,
     inspectProfile: (profile, current) => {
-      const evidence = inspectEnvironmentProfile(profile, current);
+      const evidence = dependencies.inspectProfile(profile, current);
       if (profile.releaseProfile === "alpha") {
         evidence.backendVersion = managedAlpha.installed ? managedAlpha.version : null;
         evidence.backendFingerprint = managedAlpha.installed ? managedAlpha.fingerprint : null;
@@ -365,6 +433,38 @@ function recomputeEnvironmentTruth(
       return evidence;
     },
   });
+}
+
+/**
+ * Passive status readers consume the last evidence published by a verified
+ * lifecycle operation. This keeps menus and settings panels observational:
+ * they never hash app trees or launch codesign merely to render current state.
+ * Mutation paths still call the live inspectors above before publishing.
+ */
+function cachedProfileEvidence(profile: EnvironmentProfileRecord): EnvironmentProfileEvidenceInput {
+  return {
+    officialVersion: profile.officialVersion,
+    officialBuild: profile.officialBuild,
+    strictSignature: profile.strictSignature,
+    gatekeeper: profile.gatekeeper,
+    teamIdentifier: profile.teamIdentifier,
+    designatedRequirement: profile.designatedRequirement,
+    signatureCheckedAt: profile.signatureCheckedAt,
+    officialBackendPath: profile.officialBackendPath,
+    officialBackendVersion: profile.officialBackendVersion,
+    officialBackendFingerprint: profile.officialBackendFingerprint,
+    backendPath: profile.backendPath,
+    backendVersion: profile.backendVersion,
+    backendChannel: profile.backendChannel,
+    backendFingerprint: profile.backendFingerprint,
+    pristineBackupPath: profile.pristineBackupPath,
+    pristineBackupFingerprint: profile.pristineBackupFingerprint,
+    patchedPayloadPath: profile.patchedPayloadPath,
+    patchedPayloadFingerprint: profile.patchedPayloadFingerprint,
+    backendInstallable: profile.backendInstallable,
+    patchedPayloadBuildable: profile.patchedPayloadBuildable,
+    unavailableReasons: profile.unavailableReasons,
+  };
 }
 
 function environmentStatus(
@@ -430,16 +530,34 @@ function idleEnvironmentTransaction(): IdleEnvironmentTransaction {
   };
 }
 
-function coordinatorOptions(paths: ResolvedUserPaths): EnvironmentCoordinatorOptions {
+function coordinatorOptions(
+  paths: ResolvedUserPaths,
+  bundledDerivedReceiptFile?: string,
+): EnvironmentCoordinatorOptions {
   return {
+    environmentRoot: paths.root,
     transactionFile: paths.environmentTransactionFile,
     receiptRoot: paths.environmentReceiptRoot,
     selectionFile: paths.environmentSelectionFile,
     registryFile: paths.environmentRegistryFile,
     configFile: paths.configFile,
     stateFile: paths.stateFile,
+    runtimeProofFile: paths.environmentRuntimeProofFile,
+    mcpStateFile: join(paths.root, "mcp-sync-state.json"),
+    tweaksRoot: paths.tweaks,
     lockFile: paths.environmentLockFile,
+    ...(bundledDerivedReceiptFile ? { bundledDerivedReceiptFile } : {}),
   };
+}
+
+function parseBundledDerivedReceiptPath(value: string): string {
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error("Bundled-derived receipt path must be exact and absolute");
+  }
+  if (value === "/Volumes" || value.startsWith("/Volumes/")) {
+    throw new Error("Bundled-derived receipt must remain on the internal filesystem");
+  }
+  return value;
 }
 
 function requireTransaction(
@@ -487,16 +605,6 @@ function optionValue(
     throw new Error(`Conflicting ${label} options`);
   }
   return camelCase ?? hyphenated;
-}
-
-function resolveCurrentCliPath(): string {
-  const entry = process.argv[1];
-  if (!entry) throw new Error("The current Tweakers CLI path is unavailable");
-  const exact = realpathSync(resolve(entry));
-  if (!isAbsolute(exact) || normalize(exact) !== exact) {
-    throw new Error("The current Tweakers CLI path is not exact and absolute");
-  }
-  return exact;
 }
 
 function printResult(

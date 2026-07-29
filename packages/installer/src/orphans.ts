@@ -1,20 +1,38 @@
 /**
- * Stale-helper (orphan) cleanup for the Codex app bundle.
+ * Observation-only stale-helper (orphan) compatibility scan.
  *
  * When the Codex main process dies abnormally, helper processes (crashpad
  * handlers, bare-modifier-monitor, …) are reparented to launchd (PPID 1) and
  * keep sleeping. They previously made getOpenReport() report "background"
  * forever, deadlocking the watcher's promote-on-close wait.
  *
- * Selection is pure and fail-closed: a process is only ever a cleanup
- * candidate when its executable path can be parsed EXACTLY and resolves
- * inside the canonical app bundle. Never kill by process name alone.
+ * Selection remains pure and fail-closed so legacy diagnostics can report
+ * exact app-bundle descendants. This module intentionally performs no signal
+ * or termination action; the managed MCP lifecycle reaper is the sole signal
+ * owner.
  */
-import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { sep } from "node:path";
+import { execFileSync } from "node:child_process";
 import { listProcesses, type ProcessInfo } from "./commands/debug.js";
+
+/** Stable process-start token used to reject PID reuse across transactions. */
+export function readProcessStartToken(pid: number): string | null {
+  try {
+    const output = execFileSync(
+      "ps",
+      ["-p", String(pid), "-o", "pid=,ppid=,lstart=,args="],
+      { encoding: "utf8" },
+    );
+    const line = output.split("\n").find((value) => value.trim().length > 0);
+    if (!line) return null;
+    const match = /^\s*(\d+)\s+\d+\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+/.exec(line);
+    return match && Number(match[1]) === pid ? match[2] ?? null : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface OrphanScanInput {
   /** Canonical (realpath) app root, e.g. /Applications/ChatGPT.app */
@@ -29,7 +47,7 @@ export interface OrphanScanInput {
 export interface TerminateOrphansResult {
   scanned: number;
   terminated: number[];
-  skipped: Array<{ pid: number; reason: "recheck-mismatch" | "gone" | "signal-failed" }>;
+  skipped: Array<{ pid: number; reason: "observation-only" }>;
 }
 
 /**
@@ -146,51 +164,12 @@ export function findStaleHelperProcesses(
   });
 }
 
-interface PsSnapshot {
-  ppid: number | null;
-  startedAtRaw: string | null;
-  command: string;
-}
-
-/** Stable process-identity token used to reject PID reuse across transactions. */
-export function readProcessStartToken(pid: number): string | null {
-  const snapshot = readProcessSnapshot(pid);
-  return snapshot?.startedAtRaw ?? null;
-}
-
-/** Re-read one PID via ps. Returns null when the process is gone. */
-function readProcessSnapshot(pid: number): PsSnapshot | null {
-  let output: string;
-  try {
-    output = execFileSync("ps", ["-p", String(pid), "-o", "pid=,ppid=,lstart=,args="], {
-      encoding: "utf8",
-    });
-  } catch {
-    return null;
-  }
-  const line = output.split("\n").find((l) => l.trim().length > 0);
-  if (!line) return null;
-  // pid ppid lstart(5 tokens: Day Mon DD HH:MM:SS YYYY) args...
-  const match = /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/.exec(line);
-  if (!match) return null;
-  if (Number(match[1]) !== pid) return null;
-  return { ppid: Number(match[2]), startedAtRaw: match[3], command: match[4] };
-}
-
-/** Snapshot matches the originally-scanned process (PID-reuse guard). */
-function snapshotMatches(proc: ProcessInfo, snapshot: PsSnapshot): boolean {
-  if (snapshot.ppid !== 1) return false;
-  if (snapshot.command !== proc.command) return false;
-  if (proc.startedAtRaw !== null && snapshot.startedAtRaw !== proc.startedAtRaw) return false;
-  return true;
-}
-
 /**
- * SIDE EFFECTS. Darwin-only (no-op elsewhere). Finds stale bundle-owned
- * helpers, then for each candidate re-verifies pid/ppid/command/start-time via
- * a fresh `ps -p` IMMEDIATELY before signaling (PID-reuse guard). SIGTERM
- * first; after a 3s grace period, survivors that still pass the identical
- * re-check are SIGKILLed.
+ * Compatibility observation entrypoint.
+ *
+ * This function intentionally sends no signals. The MCP lifecycle reaper is
+ * the sole automatic process-signal owner; installer/watcher hygiene may
+ * report stale bundle-owned helpers but cannot terminate them.
  */
 export function terminateStaleHelperProcesses(
   appRoot: string,
@@ -215,43 +194,9 @@ export function terminateStaleHelperProcesses(
     excludePids,
   });
   result.scanned = candidates.length;
-  if (candidates.length === 0) return result;
-
-  const signaled: ProcessInfo[] = [];
-  for (const proc of candidates) {
-    const snapshot = readProcessSnapshot(proc.pid);
-    if (snapshot === null) {
-      result.skipped.push({ pid: proc.pid, reason: "gone" });
-      continue;
-    }
-    if (!snapshotMatches(proc, snapshot)) {
-      result.skipped.push({ pid: proc.pid, reason: "recheck-mismatch" });
-      continue;
-    }
-    try {
-      process.kill(proc.pid, "SIGTERM");
-      signaled.push(proc);
-      opts.log?.(`Terminated stale Codex helper ${proc.pid} (${snapshot.command.slice(0, 120)})`);
-    } catch {
-      result.skipped.push({ pid: proc.pid, reason: "signal-failed" });
-    }
+  result.skipped = candidates.map((proc) => ({ pid: proc.pid, reason: "observation-only" }));
+  if (candidates.length > 0) {
+    opts.log?.(`Observed ${candidates.length} stale bundle helper(s); lifecycle policy is observation-only.`);
   }
-
-  if (signaled.length > 0) {
-    try {
-      execFileSync("sleep", ["3"], { stdio: "ignore" });
-    } catch {}
-    for (const proc of signaled) {
-      const snapshot = readProcessSnapshot(proc.pid);
-      if (snapshot !== null && snapshotMatches(proc, snapshot)) {
-        try {
-          process.kill(proc.pid, "SIGKILL");
-          opts.log?.(`Stale Codex helper ${proc.pid} ignored SIGTERM; sent SIGKILL.`);
-        } catch {}
-      }
-      result.terminated.push(proc.pid);
-    }
-  }
-
   return result;
 }

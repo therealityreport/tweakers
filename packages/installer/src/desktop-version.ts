@@ -45,6 +45,14 @@ export function desktopVersionIdentityEqual(
   return marketingComparison === 0 && buildComparison === 0;
 }
 
+/** Backward-compatible boolean form used by transaction gates. */
+export function desktopVersionAdvanced(
+  baseline: DesktopVersionIdentity,
+  observed: DesktopVersionIdentity,
+): boolean {
+  return compareDesktopVersionIdentity(baseline, observed) === "newer";
+}
+
 function compareNumericDotted(leftValue: string | null, rightValue: string | null): number | null {
   if (!leftValue || !rightValue) return null;
   const left = leftValue.trim().split(".");

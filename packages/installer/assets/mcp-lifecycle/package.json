@@ -1,0 +1,20 @@
+{
+  "name": "@therealityreport/tweakers-mcp-lifecycle",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Canonical, source-verified Codex MCP lifecycle assets",
+  "type": "module",
+  "files": [
+    "assets",
+    "templates",
+    "tests",
+    "manifest.json",
+    "scripts"
+  ],
+  "scripts": {
+    "test": "python3 scripts/test_package.py"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

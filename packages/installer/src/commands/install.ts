@@ -1,8 +1,29 @@
 import kleur from "kleur";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync, readdirSync, rmSync, copyFileSync, renameSync, lstatSync } from "node:fs";
+import {
+  chmodSync,
+  constants as fsConstants,
+  cpSync,
+  existsSync,
+  fstatSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  closeSync,
+  unlinkSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  copyFileSync,
+  renameSync,
+  lstatSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -12,6 +33,7 @@ import { backupOnce, patchAsar, readFileInAsar, readHeaderHash } from "../asar.j
 import { setIntegrity, getIntegrity } from "../integrity.js";
 import { writeFuse } from "../fuses.js";
 import { clearQuarantine, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
+import { assertInternalStoragePath } from "../internal-storage.js";
 
 // Re-export from its new home (codesign.ts) so existing importers keep working.
 export { isDeveloperIdSignedBackup };
@@ -27,21 +49,23 @@ import {
   patchCodexWindowServicesSource,
   type CodexWindowServicesSourceDiagnostics,
 } from "../codex-window-services.js";
-import { chownForTargetUser, targetUserHome } from "../ownership.js";
+import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
+import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
-  generateProductionHealthReceipt,
+  PROMOTION_SURFACE_NAMES,
   runInstallTransaction,
   readProductionHealthReceipt,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
+  type ProductionHealthExpectationV2,
   type TransactionResult,
 } from "../transaction.js";
 import { migrateAutomatically } from "./migrate.js";
@@ -52,7 +76,25 @@ import { applyMacAppIdentity, type MacAppIdentity } from "../macos-variant.js";
 import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
-import { migrateLegacyTweakNamespaces, prepareLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
+import { fingerprintPromotionPolicyPath } from "../promotion-policy.js";
+import {
+  fingerprintPath,
+  inspectUserQuestionsSource,
+  LEGACY_USER_QUESTIONS_TWEAK_IDS,
+  USER_QUESTIONS_FOLDER,
+  USER_QUESTIONS_TWEAK_ID,
+} from "../user-questions-source.js";
+import {
+  commitUserQuestionsRollout,
+  defaultUserQuestionsRolloutOptions,
+  planUserQuestionsRollout,
+  prepareUserQuestionsRollout,
+  readUserQuestionsRolloutReceipt,
+  rollbackUserQuestionsRollout,
+  sealUserQuestionsRollout,
+  type UserQuestionsRolloutReceipt,
+} from "../user-questions-transaction.js";
 
 interface Opts {
   app?: string;
@@ -73,7 +115,11 @@ interface Opts {
   /** macOS-only identity and user-data isolation for a separate Tweakers app. */
   macAppIdentity?: MacAppIdentity;
   /** Internal only: patch/sign a disposable candidate without global side effects. */
-  candidateContext?: { paths: UserPaths; finalUserRoot: string };
+  candidateContext?: {
+    paths: UserPaths;
+    finalUserRoot: string;
+    bundledDerivedBackend?: BundledDerivedBackendArtifact;
+  };
   /** Internal only: repair already reconciles shims before its fast paths. */
   reconcileCliShims?: boolean;
   /**
@@ -96,6 +142,98 @@ export const STAGED_NATIVE_HOST_RELATIVE_PATH = join(
 
 export function stagedNativeHostPath(appRoot: string): string {
   return join(appRoot, STAGED_NATIVE_HOST_RELATIVE_PATH);
+}
+
+export function bundledDerivedBackendPath(appRoot: string): string {
+  return join(appRoot, "Contents", "Resources", "codex");
+}
+
+/**
+ * Copy a receipt-validated, desktop-bundled-derived backend into a disposable
+ * app. Both source and destination must stay on the internal filesystem, and
+ * the copied bytes/version are re-probed before the caller signs the app.
+ */
+export function stageBundledDerivedBackendInsideApp(
+  appRoot: string,
+  artifact: BundledDerivedBackendArtifact,
+  deps: {
+    fingerprint?: (file: string) => string;
+    readVersion?: (file: string) => string | null;
+    copy?: (source: string, destination: string) => void;
+  } = {},
+): string {
+  requireInternalExactPath(appRoot, "Bundled-derived candidate app");
+  requireInternalExactFile(artifact.binaryPath, "Bundled-derived backend");
+  requireInternalExactFile(artifact.receiptPath, "Bundled-derived receipt");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(artifact.transactionId)) {
+    throw new Error("Bundled-derived transaction ID is invalid");
+  }
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(artifact.version)) {
+    throw new Error("Bundled-derived backend version is invalid");
+  }
+  const expectedFingerprint = artifact.fingerprint.toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(expectedFingerprint)) {
+    throw new Error("Bundled-derived backend fingerprint is invalid");
+  }
+  const fingerprint = deps.fingerprint ?? sha256RegularFile;
+  const readVersion = deps.readVersion ?? probeCodexCliVersion;
+  if (fingerprint(artifact.binaryPath).toLowerCase() !== expectedFingerprint) {
+    throw new Error("Bundled-derived backend fingerprint does not match its validated descriptor");
+  }
+  if (readVersion(artifact.binaryPath) !== artifact.version) {
+    throw new Error("Bundled-derived backend version does not match its validated descriptor");
+  }
+
+  const destination = bundledDerivedBackendPath(appRoot);
+  const temporary = `${destination}.bundled-derived-${process.pid}.tmp`;
+  mkdirSync(dirname(destination), { recursive: true });
+  try {
+    (deps.copy ?? copyFileSync)(artifact.binaryPath, temporary);
+    chmodSync(temporary, 0o755);
+    if (fingerprint(temporary).toLowerCase() !== expectedFingerprint
+      || readVersion(temporary) !== artifact.version) {
+      throw new Error("Staged bundled-derived backend does not match its validated descriptor");
+    }
+    renameSync(temporary, destination);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  if (fingerprint(destination).toLowerCase() !== expectedFingerprint
+    || readVersion(destination) !== artifact.version) {
+    throw new Error("Embedded bundled-derived backend failed final verification");
+  }
+  return destination;
+}
+
+function requireInternalExactPath(path: string, label: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path) {
+    throw new Error(`${label} path must be exact and absolute`);
+  }
+  assertInternalStoragePath(path, label);
+}
+
+function requireInternalExactFile(path: string, label: string): void {
+  requireInternalExactPath(path, label);
+  if (!existsSync(path)) throw new Error(`${label} is missing at ${path}`);
+  const status = lstatSync(path);
+  if (!status.isFile() || status.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-symlink file`);
+  }
+}
+
+function sha256RegularFile(file: string): string {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+function probeCodexCliVersion(file: string): string | null {
+  const result = spawnSync(file, ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+  });
+  if (result.status !== 0) return null;
+  return `${result.stdout ?? ""}${result.stderr ?? ""}`.trim().split(/\s+/).at(-1) ?? null;
 }
 
 /** Copy the native host into the app before the app's final inside-out sign. */
@@ -149,6 +287,17 @@ export function verifyNativeHostMatchesApp(
   if (appIdentity.teamIdentifier === null) {
     const appAuthorities = appIdentity.authority.join("\n");
     const hostAuthorities = hostIdentity.authority.join("\n");
+    const appIsBareAdHoc = appIdentity.adHoc && appAuthorities.length === 0;
+    const hostIsBareAdHoc = hostIdentity.adHoc && hostAuthorities.length === 0;
+    if (appIsBareAdHoc || hostIsBareAdHoc) {
+      if (!appIsBareAdHoc || !hostIsBareAdHoc) {
+        throw new Error("Staged native host does not share the candidate's local signing identity");
+      }
+      // Strict verification above proves the host is sealed into this exact
+      // candidate. Bare ad-hoc signatures intentionally have no certificate
+      // authority or leaf hash to compare.
+      return;
+    }
     if (appIdentity.adHoc !== hostIdentity.adHoc
       || appAuthorities.length === 0
       || appAuthorities !== hostAuthorities) {
@@ -177,27 +326,392 @@ function certificateLeafHash(requirement: string): string | null {
   return /certificate leaf = H"([a-f0-9]+)"/i.exec(requirement)?.[1]?.toLowerCase() ?? null;
 }
 
+function sha256Of(file: string): string {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+export interface SwapHostIdentityEvidence {
+  digest: string;
+  strict: boolean;
+  designatedRequirement: string;
+  teamIdentifier: string | null;
+  authority: string[];
+  certificateLeafHash: string | null;
+}
+
+export interface SwapHostVerificationDeps {
+  verify?: typeof verifySignature;
+  signature?: typeof signatureInfo;
+  designatedRequirement?: (path: string) => string;
+}
+
+/**
+ * Describe a native host on its own terms, without reference to a containing
+ * app. A receipt-owned helper has no signing container, so its identity is
+ * pinned by digest plus the exact signing facts recorded when it was staged.
+ */
+export function readSwapHostIdentity(
+  hostPath: string,
+  deps: SwapHostVerificationDeps = {},
+): SwapHostIdentityEvidence {
+  const entry = lstatSync(hostPath);
+  if (!entry.isFile()) throw new Error(`Swap host must be a regular file: ${hostPath}`);
+  const verify = deps.verify ?? verifySignature;
+  const signature = deps.signature ?? signatureInfo;
+  const designatedRequirement = deps.designatedRequirement ?? readDesignatedRequirement;
+  const strict = verify(hostPath);
+  if (!strict.ok) throw new Error(`Swap host failed strict verification: ${strict.output}`);
+  const identity = signature(hostPath);
+  if (!identity.ok) throw new Error(`Swap host signing identity is unreadable at ${hostPath}`);
+  const requirement = designatedRequirement(hostPath);
+  if (requirement.trim().length === 0) {
+    throw new Error(`Swap host designated requirement is empty at ${hostPath}`);
+  }
+  return {
+    digest: sha256Of(hostPath),
+    strict: true,
+    designatedRequirement: requirement,
+    teamIdentifier: identity.teamIdentifier,
+    authority: identity.authority,
+    certificateLeafHash: certificateLeafHash(requirement),
+  };
+}
+
+/**
+ * Copy a signed native host out of a prepared app payload into the receipt's
+ * own directory. The source is whichever prepared payload actually carries a
+ * host — the Tweakers candidate on the way in, the Tweakers rollback clone on
+ * the way out — and it is verified against its containing bundle before the
+ * copy, so the receipt-owned file inherits proven provenance.
+ */
+export function stagePreparedSwapHost(
+  candidateAppPaths: string[],
+  destination: string,
+  deps: SwapHostVerificationDeps = {},
+): { sourceAppPath: string; identity: SwapHostIdentityEvidence } | null {
+  for (const appRoot of candidateAppPaths) {
+    const hostPath = stagedNativeHostPath(appRoot);
+    if (!existsSync(hostPath)) continue;
+    verifyNativeHostMatchesApp(appRoot, hostPath, deps);
+    mkdirSync(dirname(destination), { recursive: true });
+    rmSync(destination, { force: true });
+    copyFileSync(hostPath, destination);
+    const identity = readSwapHostIdentity(destination, deps);
+    if (identity.digest !== sha256Of(hostPath)) {
+      throw new Error(`Swap host changed while it was being staged from ${hostPath}`);
+    }
+    return { sourceAppPath: appRoot, identity };
+  }
+  // A transition between two host-less payloads needs no bundle exchange, so
+  // the absence of a host is not by itself an error. Callers that do need to
+  // swap still fail closed when they try to load the missing evidence.
+  return null;
+}
+
+/**
+ * `require` caches by resolved path, so a single stable helper path per
+ * process also guarantees the addon's Objective-C classes are registered once.
+ */
+export function loadVerifiedSwapHost(
+  evidence: SwapHostIdentityEvidence & { path: string },
+  deps: SwapHostVerificationDeps = {},
+): (first: string, second: string) => void {
+  if (process.platform !== "darwin") throw new Error("Atomic app bundle exchange is available only on macOS");
+  const observed = readSwapHostIdentity(evidence.path, deps);
+  if (observed.digest !== evidence.digest) {
+    throw new Error(`Swap host digest does not match its prepared evidence at ${evidence.path}`);
+  }
+  if (observed.teamIdentifier !== evidence.teamIdentifier
+    || observed.certificateLeafHash !== evidence.certificateLeafHash
+    || observed.authority.join("\n") !== evidence.authority.join("\n")) {
+    throw new Error(`Swap host signing identity does not match its prepared evidence at ${evidence.path}`);
+  }
+  const require = createRequire(import.meta.url);
+  const nativeHost = require(evidence.path) as NativeAppIdentityHost;
+  return (first, second) => nativeHost.swapDirectories(first, second);
+}
+
+const HEALTH_PROBE_ENV_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+] as const;
+
+const HEALTH_PROBE_PLATFORM_ENV_KEYS: Partial<Record<NodeJS.Platform, readonly string[]>> = {
+  darwin: ["HOME", "USER", "LOGNAME", "__CF_USER_TEXT_ENCODING"],
+  linux: [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+  ],
+  win32: ["USERPROFILE", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"],
+};
+
+export const HEALTH_PROBE_TEMP_RELATIVE_PATH = "tmp";
+export const HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH = "codex-home";
+export const HEALTH_PROBE_USER_DATA_RELATIVE_PATH = "electron-user-data";
+export const HEALTH_PROBE_ROOT_PREFIX = "probe-";
+export const HEALTH_PROBE_PROCESS_TIMEOUT_MS = 170_000;
+export const HEALTH_PROBE_RECEIPT_TIMEOUT_MS = 170_000;
+
+function requireRealDirectory(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`${label} must be a real directory: ${path}`);
+  }
+}
+
+interface HealthProbeSandbox {
+  root: string;
+  tempRoot: string;
+  codexHome: string;
+  userDataRoot: string;
+}
+
+interface HealthProbeLaunchDependencies {
+  spawn?: typeof spawnSync;
+  /** Source-only Codex home. Its bounded config/policy files are copied into the fresh probe home. */
+  candidateCodexHome?: string;
+  /** Internal seam for proving that ambient authentication data is excluded. */
+  environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  /** Internal test seam; production always removes the exact disposable root recursively. */
+  removeProbeRoot?: (probeRoot: string) => void;
+}
+
+function isStrictDescendant(parent: string, child: string): boolean {
+  const childRelative = relative(parent, child);
+  return childRelative.length > 0
+    && !isAbsolute(childRelative)
+    && !/^\.\.(?:[\\/]|$)/.test(childRelative);
+}
+
+function prepareHealthProbeSandbox(userRoot: string): HealthProbeSandbox {
+  if (!isAbsolute(userRoot) || resolve(userRoot) !== userRoot) {
+    throw new Error(`Health probe user root must be an exact absolute path: ${userRoot}`);
+  }
+  requireRealDirectory(userRoot, "Health probe user root");
+
+  const healthRoot = join(userRoot, "health");
+  if (!existsSync(healthRoot)) mkdirSync(healthRoot, { mode: 0o700 });
+  requireRealDirectory(healthRoot, "Health probe receipt directory");
+  const realUserRoot = realpathSync(userRoot);
+  const realHealthRoot = realpathSync(healthRoot);
+  if (!isStrictDescendant(realUserRoot, realHealthRoot)) {
+    throw new Error(`Health probe receipt directory resolves outside its user root: ${healthRoot}`);
+  }
+  chmodSync(healthRoot, 0o700);
+
+  const probeRoot = mkdtempSync(join(healthRoot, HEALTH_PROBE_ROOT_PREFIX));
+  chmodSync(probeRoot, 0o700);
+  requireRealDirectory(probeRoot, "Health probe disposable root");
+  const realProbeRoot = realpathSync(probeRoot);
+  if (!isStrictDescendant(realHealthRoot, realProbeRoot)) {
+    rmSync(probeRoot, { recursive: true, force: true });
+    throw new Error(`Health probe disposable root resolves outside its receipt directory: ${probeRoot}`);
+  }
+
+  const makeContainedDirectory = (name: string, label: string): string => {
+    const path = join(probeRoot, name);
+    mkdirSync(path, { mode: 0o700 });
+    chmodSync(path, 0o700);
+    requireRealDirectory(path, label);
+    const realPath = realpathSync(path);
+    if (!isStrictDescendant(realProbeRoot, realPath)) {
+      throw new Error(`${label} resolves outside its disposable root: ${path}`);
+    }
+    return path;
+  };
+
+  try {
+    return {
+      root: probeRoot,
+      tempRoot: makeContainedDirectory(HEALTH_PROBE_TEMP_RELATIVE_PATH, "Health probe temp directory"),
+      codexHome: makeContainedDirectory(HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH, "Health probe Codex home"),
+      userDataRoot: makeContainedDirectory(HEALTH_PROBE_USER_DATA_RELATIVE_PATH, "Health probe Electron user-data directory"),
+    };
+  } catch (error) {
+    rmSync(probeRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function cleanupHealthProbeSandbox(
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  removeProbeRoot?: (probeRoot: string) => void,
+): void {
+  const expectedHealthRoot = join(userRoot, "health");
+  if (!isStrictDescendant(expectedHealthRoot, sandbox.root)) {
+    throw new Error(`Refusing to clean non-contained health probe root: ${sandbox.root}`);
+  }
+  if (existsSync(sandbox.root)) {
+    const stat = lstatSync(sandbox.root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      rmSync(sandbox.root, { force: true });
+      throw new Error(`Health probe disposable root changed type before cleanup: ${sandbox.root}`);
+    }
+    const realHealthRoot = realpathSync(expectedHealthRoot);
+    const realProbeRoot = realpathSync(sandbox.root);
+    if (!isStrictDescendant(realHealthRoot, realProbeRoot)) {
+      throw new Error(`Refusing to clean health probe root that resolves outside containment: ${sandbox.root}`);
+    }
+  }
+  (removeProbeRoot ?? ((probeRoot) => rmSync(probeRoot, { recursive: true, force: true })))(sandbox.root);
+  if (existsSync(sandbox.root)) {
+    throw new Error(`Health probe disposable root could not be removed: ${sandbox.root}`);
+  }
+}
+
+function withHealthProbeSandbox<T>(
+  userRoot: string,
+  deps: Pick<HealthProbeLaunchDependencies, "removeProbeRoot">,
+  operation: (sandbox: HealthProbeSandbox) => T,
+): T {
+  const sandbox = prepareHealthProbeSandbox(userRoot);
+  try {
+    return operation(sandbox);
+  } finally {
+    cleanupHealthProbeSandbox(userRoot, sandbox, deps.removeProbeRoot);
+  }
+}
+
+function requireCodexInputSource(path: string, label: string, containedBy?: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path) {
+    throw new Error(`${label} must be an exact absolute path: ${path}`);
+  }
+  requireRealDirectory(path, label);
+  if (containedBy !== undefined) {
+    if (!isStrictDescendant(containedBy, path)) {
+      throw new Error(`${label} must be contained by its user root: ${path}`);
+    }
+    const realParent = realpathSync(containedBy);
+    const realPath = realpathSync(path);
+    if (!isStrictDescendant(realParent, realPath)) {
+      throw new Error(`${label} resolves outside its user root: ${path}`);
+    }
+  }
+}
+
+function healthProbeEnvironment(
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  platform: NodeJS.Platform,
+  parentEnvironment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  const permittedKeys = [
+    ...HEALTH_PROBE_ENV_KEYS,
+    ...(HEALTH_PROBE_PLATFORM_ENV_KEYS[platform] ?? []),
+  ];
+  for (const key of permittedKeys) {
+    const value = parentEnvironment[key];
+    if (value !== undefined) environment[key] = value;
+  }
+
+  // Every health process gets contained home, Codex-home, temporary, and
+  // Chromium-profile roots. This keeps fallback reads away from the real
+  // account even when the original desktop bootstrap runs for renderer proof.
+  if (platform === "win32") environment.USERPROFILE = sandbox.root;
+  else environment.HOME = sandbox.root;
+
+  if (platform === "win32") {
+    environment.TEMP = sandbox.tempRoot;
+    environment.TMP = sandbox.tempRoot;
+  } else {
+    environment.TMPDIR = sandbox.tempRoot;
+  }
+
+  environment.TWEAKERS_HEALTH_CHECK_ONLY = "1";
+  environment.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN = "1";
+  environment.TWEAKERS_HEALTH_USER_ROOT = userRoot;
+  environment.TWEAKERS_HEALTH_BACKGROUND = "1";
+  environment.CODEX_HOME = sandbox.codexHome;
+  environment.TWEAKERS_CANDIDATE_MCP_RECONCILIATION = "1";
+  return environment;
+}
+
+function launchHealthProbe(
+  executable: string,
+  userRoot: string,
+  sandbox: HealthProbeSandbox,
+  deps: HealthProbeLaunchDependencies,
+): ReturnType<typeof spawnSync> {
+  const platform = deps.platform ?? process.platform;
+  const chromiumArgs = [
+    `--user-data-dir=${sandbox.userDataRoot}`,
+    ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
+  ];
+  return (deps.spawn ?? spawnSync)(executable, chromiumArgs, {
+    env: healthProbeEnvironment(userRoot, sandbox, platform, deps.environment ?? process.env),
+    stdio: "ignore",
+    timeout: HEALTH_PROBE_PROCESS_TIMEOUT_MS,
+  });
+}
+
+function stageBoundedCodexInputs(sourceCodexHome: string, containedCodexHome: string): void {
+  for (const name of ["config.toml", ".codex-global-state.json"] as const) {
+    const source = join(sourceCodexHome, name);
+    if (!existsSync(source)) continue;
+    const sourceStat = lstatSync(source);
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile() || sourceStat.size > 10 * 1024 * 1024) {
+      throw new Error(`Health probe Codex input must be a bounded regular file: ${source}`);
+    }
+    copyCandidatePreimage(source, join(containedCodexHome, name));
+  }
+}
+
 export function spawnHiddenHealthProbe(
   executable: string,
   userRoot: string,
-  deps: { spawn?: typeof spawnSync } = {},
+  deps: HealthProbeLaunchDependencies = {},
 ): ReturnType<typeof spawnSync> {
-  const spawn = deps.spawn ?? spawnSync;
-  // The disposable probe must never attach to the real Electron profile: the
-  // owl fork resolves userData natively at startup, so a probe launched while
-  // the same-productName app is running hits Chromium's process singleton and
-  // is forwarded ("Opening in existing browser session.") before any JS —
-  // including the health-receipt path — can run. An explicit throwaway
-  // --user-data-dir sidesteps both the singleton and profile writes.
-  return spawn(executable, [`--user-data-dir=${join(userRoot, "electron-user-data")}`], {
-    env: {
-      ...process.env,
-      TWEAKERS_HEALTH_CHECK_ONLY: "1",
-      TWEAKERS_HEALTH_USER_ROOT: userRoot,
-      TWEAKERS_HEALTH_BACKGROUND: "1",
-    },
-    stdio: "ignore",
-    timeout: 15_000,
+  if (deps.candidateCodexHome !== undefined) {
+    requireCodexInputSource(deps.candidateCodexHome, "Health probe candidate Codex home", userRoot);
+  }
+  return withHealthProbeSandbox(userRoot, deps, (sandbox) => {
+    if (deps.candidateCodexHome !== undefined) {
+      stageBoundedCodexInputs(deps.candidateCodexHome, sandbox.codexHome);
+    }
+    return launchHealthProbe(executable, userRoot, sandbox, deps);
+  });
+}
+
+/**
+ * Run one contained health process with a private, short-lived copy of the
+ * durable Codex authentication proof. Candidate and post-promotion probes use
+ * this same seam so neither can fall back to an ambient home or retain auth.
+ */
+export function spawnAuthenticatedHiddenHealthProbe(
+  executable: string,
+  userRoot: string,
+  liveCodexHome: string,
+  deps: HealthProbeLaunchDependencies = {},
+): ReturnType<typeof spawnSync> {
+  requireCodexInputSource(liveCodexHome, "Live Codex home");
+  const sourceCodexHome = deps.candidateCodexHome ?? liveCodexHome;
+  requireCodexInputSource(
+    sourceCodexHome,
+    deps.candidateCodexHome === undefined ? "Live Codex home" : "Health probe candidate Codex home",
+    deps.candidateCodexHome === undefined ? undefined : userRoot,
+  );
+  return withHealthProbeSandbox(userRoot, deps, (sandbox) => {
+    stageBoundedCodexInputs(sourceCodexHome, sandbox.codexHome);
+    const removeAuth = stageCandidateCodexAuth(liveCodexHome, sandbox.codexHome);
+    try {
+      return launchHealthProbe(executable, userRoot, sandbox, deps);
+    } finally {
+      removeAuth();
+      if (existsSync(join(sandbox.codexHome, "auth.json"))) {
+        throw new Error("Contained Codex authentication proof was not removed after health probe");
+      }
+    }
   });
 }
 
@@ -231,6 +745,15 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const payloadHash = installerPayloadHash();
   const candidateUserRoot = join(paths.transactionRoot, "candidate-user");
   const candidatePaths = transactionUserPaths(candidateUserRoot);
+  const liveCodexHome = join(targetUserHome(), ".codex");
+  const candidateCodexHome = join(candidateUserRoot, "codex-home");
+  const rolloutKey = `${source.hash}-${payloadHash}`;
+  const liveUserQuestionsReceiptFile = join(paths.transactionRoot, "user-questions", `${rolloutKey}.json`);
+  const liveUserQuestionsArchiveRoot = join(paths.transactionRoot, "user-questions", rolloutKey);
+  let candidateHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let liveHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let liveUserQuestionsReceipt: UserQuestionsRolloutReceipt | null = null;
+  let liveMcpConflictCount: number | null = null;
   const candidateSignedBackup = join(candidatePaths.backup, "Codex.app");
   const liveSignedBackup = join(paths.backup, "Codex.app");
   const signedBackupSnapshot = join(paths.transactionRoot, "last-known-good-backup");
@@ -257,6 +780,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       bundleId: opts.macAppIdentity?.bundleId ?? codex.bundleId ?? "com.openai.codex",
       nonLiveAppRoots,
       garbageCollect: options.garbageCollect,
+      mutate: !candidateOnly,
     });
     if (launchServices.failed.length > 0 && !opts.quiet) {
       console.warn(kleur.yellow(`LaunchServices cleanup was incomplete: ${launchServices.failed.map((failure) => failure.path).join(", ")}`));
@@ -281,6 +805,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
       resetCandidateUserRootForBuild(candidateUserRoot);
+      stageCandidateRolloutInputs({
+        livePaths: paths,
+        candidatePaths,
+        liveCodexHome,
+        candidateCodexHome,
+      });
       await installCandidateInPlace({
         ...opts,
         app: candidateRoot,
@@ -288,6 +818,52 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         quiet: true,
         localSigning: signingMode === "local-identity",
         candidateContext: { paths: candidatePaths, finalUserRoot: paths.root },
+      });
+      stageBundledTweaks(candidatePaths.tweaks, candidatePaths.runtime);
+      const candidateRolloutOptions = defaultUserQuestionsRolloutOptions({
+        userRoot: candidateUserRoot,
+        liveTweaksRoot: candidatePaths.tweaks,
+        tweakersConfigPath: candidatePaths.configFile,
+        codexConfigPath: join(candidateCodexHome, "config.toml"),
+        receiptFile: join(candidateUserRoot, "transactions", "user-questions-rollout.json"),
+        archiveRoot: join(candidateUserRoot, "transactions", "user-questions-rollout"),
+        transactionId: `candidate-${payloadHash}`,
+      });
+      const candidatePrepared = prepareUserQuestionsRollout(planUserQuestionsRollout(candidateRolloutOptions));
+      if (candidatePrepared.phase !== "prepared") {
+        throw new Error("Candidate User Questions rollout held before health validation");
+      }
+      const candidateMcpReceipt = reconcilePromotionMcpConfig({
+        runtimeRoot: candidatePaths.runtime,
+        tweaksRoot: candidatePaths.tweaks,
+        userRoot: candidateUserRoot,
+        tweakersConfigPath: candidatePaths.configFile,
+        codexConfigPath: join(candidateCodexHome, "config.toml"),
+        statePath: join(candidateUserRoot, "mcp-sync-state.json"),
+      });
+      sealUserQuestionsRollout(candidatePrepared, { mcpConflictCount: candidateMcpReceipt.conflictCount });
+      assertPromotionMcpReceipt(candidateMcpReceipt, "candidate");
+      const candidate = locateCodex(candidateRoot);
+      candidateHealthExpectation = buildPromotionHealthExpectation({
+        app: fingerprintCodex(candidate),
+        before: promotionSurfaceRoots({
+          appHash: source.hash,
+          runtimeRoot: paths.runtime,
+          tweaksRoot: paths.tweaks,
+          userRoot: paths.root,
+          tweakersConfigPath: paths.configFile,
+          codexHome: liveCodexHome,
+        }),
+        after: promotionSurfaceRoots({
+          appHash: fingerprintCodex(candidate).hash,
+          runtimeRoot: candidatePaths.runtime,
+          tweaksRoot: candidatePaths.tweaks,
+          userRoot: candidateUserRoot,
+          tweakersConfigPath: candidatePaths.configFile,
+          codexHome: candidateCodexHome,
+        }),
+        requiredPermissions,
+        userQuestionsRoot: join(candidatePaths.tweaks, USER_QUESTIONS_FOLDER),
       });
     },
     validateCandidate: (candidateRoot) => {
@@ -301,6 +877,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         const marker = readAsarMarker(candidate.asarPath);
         if (marker === "unreadable") throw new Error("candidate app.asar could not be read (corrupt or locked)");
         if (marker === "absent") throw new Error("patch marker absent from candidate app.asar (asar not patched)");
+        validateMainRendererAsarEntrypoint(candidate.asarPath);
         return true;
       } finally {
         reconcileMacRegistrations({ garbageCollect: false });
@@ -319,22 +896,28 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     probeCandidateHealth: ({ candidateRoot }) => {
       try {
         const candidate = locateCodex(candidateRoot);
-        const expected = {
-          app: fingerprintCodex(candidate),
-          runtimeHash: hashDirectoryTree(candidatePaths.runtime),
-          requiredPermissions,
-        };
+        validateMainRendererAsarEntrypoint(candidate.asarPath);
+        const expected = candidateHealthExpectation;
+        if (!expected || !sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
+          return unknownPromotionHealth(requiredPermissions);
+        }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
         writeHealthRequest(join(candidateUserRoot, "health", "request.json"), {
-          schemaVersion: 1,
-          requestedAt: new Date().toISOString(),
           ...expected,
+          requestedAt: new Date().toISOString(),
         });
-        const launched = spawnHiddenHealthProbe(candidate.executable, candidateUserRoot);
+        const launched = spawnAuthenticatedHiddenHealthProbe(
+          candidate.executable,
+          candidateUserRoot,
+          liveCodexHome,
+          { candidateCodexHome },
+        );
         if (launched.error || launched.status !== 0) {
-          return { host: "unknown", session: "unknown", permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])) };
+          return unknownPromotionHealth(requiredPermissions);
         }
         return readProductionHealthReceipt(receiptFile, expected);
+      } catch {
+        return unknownPromotionHealth(requiredPermissions);
       } finally {
         reconcileMacRegistrations({ garbageCollect: false });
       }
@@ -344,16 +927,56 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       rmSync(destination, { recursive: true, force: true });
       if (existsSync(runtimeRoot)) {
         mkdirSync(dirname(destination), { recursive: true });
-        cpSync(runtimeRoot, destination, { recursive: true, verbatimSymlinks: true });
+        copyDirectoryPreservingModes(runtimeRoot, destination);
       }
       signedBackupWiring.snapshotLive();
     },
-    promoteCandidate: (candidateRoot, appRoot) => {
-      // Verify and promote the pristine Developer-ID backup before mutating
-      // the app. If a later app/runtime swap fails, restore backup continuity
-      // immediately; the outer transaction owns app/runtime recovery.
-      signedBackupWiring.promoteCandidate();
+    promoteCandidate: async (candidateRoot, appRoot) => {
+      // dev-sync already owns the schema-v2 managed-tree transaction. Load its
+      // public seam lazily to avoid an eager install.ts <-> dev-sync.ts cycle.
+      const {
+        prepareDevSnapshot,
+        readDevSnapshotReceipt,
+        rollbackDevSnapshot,
+      } = await import("./dev-sync.js");
       try {
+        prepareDevSnapshot(candidatePaths.tweaks, paths.tweaks);
+        const existingRollout = readUserQuestionsRolloutReceipt(liveUserQuestionsReceiptFile);
+        liveUserQuestionsReceipt = existingRollout ?? planUserQuestionsRollout(defaultUserQuestionsRolloutOptions({
+          userRoot: paths.root,
+          liveTweaksRoot: paths.tweaks,
+          tweakersConfigPath: paths.configFile,
+          codexConfigPath: join(liveCodexHome, "config.toml"),
+          receiptFile: liveUserQuestionsReceiptFile,
+          archiveRoot: liveUserQuestionsArchiveRoot,
+          transactionId: rolloutKey,
+        }));
+        if (liveUserQuestionsReceipt.phase === "planned" || liveUserQuestionsReceipt.phase === "held") {
+          liveUserQuestionsReceipt = prepareUserQuestionsRollout(liveUserQuestionsReceipt);
+        }
+        if (liveUserQuestionsReceipt.phase !== "prepared" && liveUserQuestionsReceipt.phase !== "sealed") {
+          throw new Error(`User Questions promotion transaction is not preparable: ${liveUserQuestionsReceipt.phase}`);
+        }
+        const mcpReceipt = reconcilePromotionMcpConfig({
+          runtimeRoot: candidatePaths.runtime,
+          tweaksRoot: paths.tweaks,
+          userRoot: paths.root,
+          tweakersConfigPath: paths.configFile,
+          codexConfigPath: join(liveCodexHome, "config.toml"),
+          statePath: join(paths.root, "mcp-sync-state.json"),
+        });
+        liveMcpConflictCount = mcpReceipt.conflictCount;
+        if (liveUserQuestionsReceipt.phase === "prepared") {
+          liveUserQuestionsReceipt = sealUserQuestionsRollout(liveUserQuestionsReceipt, {
+            mcpConflictCount: mcpReceipt.conflictCount,
+          });
+        }
+        assertPromotionMcpReceipt(mcpReceipt, "live");
+
+        // Verify and promote the pristine Developer-ID backup before mutating
+        // the app. If a later app/runtime swap fails, restore backup continuity
+        // immediately; the outer transaction owns app/runtime recovery.
+        signedBackupWiring.promoteCandidate();
         replaceAppBundlePreservingIdentity(candidateRoot, appRoot, {
           validateDestination: (promotedRoot) => verifySignature(promotedRoot).ok,
           onCleanupFailure: (path, error) => {
@@ -362,8 +985,31 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         });
         replaceDirectory(candidatePaths.runtime, paths.runtime);
         reconcileMacIdentityAfterPromotion();
+        const promoted = locateCodex(appRoot);
+        if (!candidateHealthExpectation) throw new Error("Candidate promotion preimages are unavailable");
+        liveHealthExpectation = buildPromotionHealthExpectation({
+          app: fingerprintCodex(promoted),
+          before: promotionPreimageHashes(candidateHealthExpectation),
+          after: promotionSurfaceRoots({
+            appHash: fingerprintCodex(promoted).hash,
+            runtimeRoot: paths.runtime,
+            tweaksRoot: paths.tweaks,
+            userRoot: paths.root,
+            tweakersConfigPath: paths.configFile,
+            codexHome: liveCodexHome,
+          }),
+          requiredPermissions,
+          userQuestionsRoot: join(paths.tweaks, USER_QUESTIONS_FOLDER),
+        });
       } catch (error) {
         signedBackupWiring.restoreLive();
+        if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
+          try { liveUserQuestionsReceipt = rollbackUserQuestionsRollout(liveUserQuestionsReceipt); } catch { /* outer recovery reports any persistent drift */ }
+        }
+        const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+        if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+          try { rollbackDevSnapshot(paths.tweaks); } catch { /* outer recovery reports any persistent drift */ }
+        }
         throw error;
       }
     },
@@ -382,41 +1028,49 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       signedBackupWiring.restoreLive();
     },
     probeHealth: async () => {
-      const expected = {
-        app: fingerprintCodex(locateCodex(codex.appRoot)),
-        runtimeHash: hashDirectoryTree(paths.runtime),
-        requiredPermissions,
-      };
+      const expected = liveHealthExpectation;
+      if (!expected) return unknownPromotionHealth(requiredPermissions);
+      try {
+        validateMainRendererAsarEntrypoint(locateCodex(codex.appRoot).asarPath);
+      } catch {
+        return unknownPromotionHealth(requiredPermissions);
+      }
       const receiptFile = join(paths.root, "health", "promotion.json");
-      if (opts.nativeHealthProbe) {
-        await generateProductionHealthReceipt(receiptFile, expected, opts.nativeHealthProbe);
-      } else {
-        // A separately identified variant may be unable to complete a normal
-        // foreground launch while the official app owns OpenAI's shared
-        // session. Validate the exact promoted bytes/runtime through the same
-        // isolated one-shot probe used for the disposable candidate.
-        if (opts.macAppIdentity) {
-          spawnHiddenHealthProbe(locateCodex(codex.appRoot).executable, paths.root);
-        }
-        const deadline = Date.now() + 15_000;
-        while (Date.now() < deadline) {
-          const observed = readProductionHealthReceipt(receiptFile, expected);
-          if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
+      const deadline = Date.now() + HEALTH_PROBE_RECEIPT_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const observed = readProductionHealthReceipt(receiptFile, expected);
+        if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
       return readProductionHealthReceipt(receiptFile, expected);
     },
+    acceptPromotion: async () => {
+      if (!liveUserQuestionsReceipt || liveUserQuestionsReceipt.phase !== "sealed" || liveMcpConflictCount !== 0) {
+        throw new Error("User Questions rollout is not sealed with zero MCP conflicts");
+      }
+      liveUserQuestionsReceipt = commitUserQuestionsRollout(liveUserQuestionsReceipt);
+      const { acceptDevSnapshot, readDevSnapshotReceipt } = await import("./dev-sync.js");
+      const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+      if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+        acceptDevSnapshot(paths.tweaks);
+      }
+    },
+    rollbackPromotion: async () => {
+      if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
+        liveUserQuestionsReceipt = rollbackUserQuestionsRollout(liveUserQuestionsReceipt);
+      }
+      const { readDevSnapshotReceipt, rollbackDevSnapshot } = await import("./dev-sync.js");
+      const snapshotPath = join(paths.tweaks, ".tweaker-dev-snapshot.json");
+      if (readDevSnapshotReceipt(snapshotPath)?.phase === "pending_acceptance") {
+        rollbackDevSnapshot(paths.tweaks);
+      }
+    },
     openApp: (appRoot) => {
-      // Promotion has committed and the visible app is still closed. Migrate
-      // persistent IDs before the new runtime's health probe can read config.
-      prepareLegacyTweakNamespaces(paths.root, paths.configFile);
+      const expected = liveHealthExpectation;
+      if (!expected) throw new Error("Schema-v2 live health expectation is unavailable");
       writeHealthRequest(join(paths.root, "health", "request.json"), {
-        schemaVersion: 1,
+        ...expected,
         requestedAt: new Date().toISOString(),
-        app: fingerprintCodex(locateCodex(appRoot)),
-        runtimeHash: hashDirectoryTree(paths.runtime),
-        requiredPermissions,
       });
       // Generate the promotion-health receipt with the hidden health-check
       // probe rather than a plain `open`. A normal launch of an app whose
@@ -427,7 +1081,14 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       // gets a distinct singleton and always runs far enough to answer. The
       // user-visible relaunch is handled separately by the reopen-after-patch
       // path; this launch is only for the receipt.
-      spawnHiddenHealthProbe(locateCodex(appRoot).executable, paths.root);
+      const launched = spawnAuthenticatedHiddenHealthProbe(
+        locateCodex(appRoot).executable,
+        paths.root,
+        liveCodexHome,
+      );
+      if (launched.error || launched.status !== 0 || launched.signal !== null) {
+        throw new Error("Post-promotion health process did not exit cleanly");
+      }
     },
   });
 
@@ -439,6 +1100,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     source,
     payloadHash,
     requiredPermissions,
+    requirePromotionHealthV2: true,
     candidateOnly,
     candidateOnlyReason: opts.candidateOnlyReason ?? "explicit",
     signingMode,
@@ -560,12 +1222,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
               return readState(paths.stateFile)?.mode !== "chatgpt";
             },
             quitApp: () => quitCodex(liveAppRoot),
-            cleanupOrphans: () => {
-              terminateStaleHelperProcesses(liveAppRoot, {
-                mainStartedAt: null,
-                log: (line) => console.log(`  ${line}`),
-              });
-            },
+            cleanupOrphans: () => {},
             notifyUpdateQuit: () => showCodexUpdateDetectedNotification(),
             // Re-entry always drops coordinatedQuit so a relaunch race yields a
             // plain held + passive wait, never a second forced quit.
@@ -601,7 +1258,23 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
 export interface BuildPatchedCandidateOnlyInput {
   sourceApp: string;
   destinationApp: string;
+  /** Durable receipt-owned copy of the runtime validated inside the candidate. */
+  destinationRuntime: string;
   finalUserRoot: string;
+  /**
+   * Exact receipt-validated backend derived from the installed desktop's
+   * bundled Codex tag. This remains the bundled lane; it is never exposed as a
+   * managed Stable/Beta selection.
+   */
+  bundledDerivedBackend?: BundledDerivedBackendArtifact;
+}
+
+export interface BundledDerivedBackendArtifact {
+  binaryPath: string;
+  version: string;
+  fingerprint: string;
+  receiptPath: string;
+  transactionId: string;
 }
 
 /**
@@ -612,6 +1285,7 @@ export interface BuildPatchedCandidateOnlyInput {
 export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnlyInput): Promise<void> {
   const sourceApp = resolve(input.sourceApp);
   const destinationApp = resolve(input.destinationApp);
+  const destinationRuntime = resolve(input.destinationRuntime);
   const finalUserRoot = resolve(input.finalUserRoot);
   if (!isAbsolute(input.sourceApp) || sourceApp !== input.sourceApp) {
     throw new Error("Patched candidate source must be an exact absolute path");
@@ -619,15 +1293,13 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
   if (!isAbsolute(input.destinationApp) || destinationApp !== input.destinationApp) {
     throw new Error("Patched candidate destination must be an exact absolute path");
   }
+  if (!isAbsolute(input.destinationRuntime) || destinationRuntime !== input.destinationRuntime) {
+    throw new Error("Patched candidate runtime destination must be an exact absolute path");
+  }
   if (!isAbsolute(input.finalUserRoot) || finalUserRoot !== input.finalUserRoot) {
     throw new Error("Patched candidate user root must be an exact absolute path");
   }
-  const sourceToDestination = relative(sourceApp, destinationApp);
-  const destinationToSource = relative(destinationApp, sourceApp);
-  const contains = (value: string): boolean => value === "" || (!value.startsWith("../") && value !== "..");
-  if (contains(sourceToDestination) || contains(destinationToSource)) {
-    throw new Error("Patched candidate source and destination must be disjoint paths");
-  }
+  assertDisjointPatchedCandidatePaths([sourceApp, destinationApp, destinationRuntime]);
   const source = locateCodex(sourceApp);
   if (source.platform !== "darwin") throw new Error("Environment candidates are supported only for macOS app bundles");
   if (source.bundleId !== "com.openai.codex" && source.bundleId !== "com.openai.codex.beta") {
@@ -657,6 +1329,7 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
       candidateContext: {
         paths: transactionUserPaths(candidateUserRoot),
         finalUserRoot,
+        ...(input.bundledDerivedBackend ? { bundledDerivedBackend: input.bundledDerivedBackend } : {}),
       },
     });
     const candidate = locateCodex(destinationApp);
@@ -664,11 +1337,46 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
     if (readAsarMarker(candidate.asarPath) !== "present") throw new Error("Patched candidate marker is absent");
     const candidateSignature = verifySignature(destinationApp);
     if (!candidateSignature.ok) throw new Error(`Patched candidate signature is invalid: ${candidateSignature.output}`);
+    stagePatchedCandidateRuntimeArtifact(join(candidateUserRoot, "runtime"), destinationRuntime);
   } catch (error) {
     rmSync(destinationApp, { recursive: true, force: true });
     throw error;
   } finally {
     rmSync(candidateUserRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Persist the runtime that was built and validated with a disposable app
+ * candidate. The replacement is atomic at the destination boundary, so a
+ * failed staged-copy never exposes partial runtime bytes to a later promotion.
+ */
+export function stagePatchedCandidateRuntimeArtifact(candidateRuntime: string, destinationRuntime: string): void {
+  const source = resolve(candidateRuntime);
+  const destination = resolve(destinationRuntime);
+  if (!isAbsolute(candidateRuntime) || source !== candidateRuntime) {
+    throw new Error("Patched candidate runtime source must be an exact absolute path");
+  }
+  if (!isAbsolute(destinationRuntime) || destination !== destinationRuntime) {
+    throw new Error("Patched candidate runtime destination must be an exact absolute path");
+  }
+  assertDisjointPatchedCandidatePaths([source, destination]);
+  if (!existsSync(source)) {
+    throw new Error(`Patched candidate runtime is missing: ${source}`);
+  }
+  replaceDirectory(source, destination);
+}
+
+function assertDisjointPatchedCandidatePaths(paths: string[]): void {
+  const contains = (value: string): boolean => value === "" || (!value.startsWith("../") && value !== "..");
+  for (let index = 0; index < paths.length; index += 1) {
+    for (let other = index + 1; other < paths.length; other += 1) {
+      const first = paths[index]!;
+      const second = paths[other]!;
+      if (contains(relative(first, second)) || contains(relative(second, first))) {
+        throw new Error("Patched candidate app and runtime destinations must be disjoint paths");
+      }
+    }
   }
 }
 
@@ -815,6 +1523,14 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     }
   }
   step("App patched");
+
+  // The desktop-bundled-derived backend must be inside the disposable app
+  // before the final inside-out signature. Staging it after this point would
+  // invalidate the app signature and make the receipt proof meaningless.
+  if (opts.candidateContext?.bundledDerivedBackend) {
+    stageBundledDerivedBackendInsideApp(codex.appRoot, opts.candidateContext.bundledDerivedBackend);
+    step.detail(`Staged desktop-bundled-derived Codex ${opts.candidateContext.bundledDerivedBackend.version}`);
+  }
 
   // 6. Re-sign on macOS.
   let resigned = false;
@@ -969,6 +1685,335 @@ function transactionUserPaths(root: string): UserPaths {
   };
 }
 
+interface PromotionSurfaceRoots {
+  appHash: string;
+  runtimeRoot: string;
+  tweaksRoot: string;
+  tweakersConfigPath: string;
+  codexConfigPath: string;
+  namespaceDataPath: string;
+  mainStoragePath: string;
+  policyPath: string;
+}
+
+type PromotionSurfaceHashes = Record<(typeof PROMOTION_SURFACE_NAMES)[number], string>;
+
+export function promotionSurfaceRoots(input: {
+  appHash: string;
+  runtimeRoot: string;
+  tweaksRoot: string;
+  userRoot: string;
+  tweakersConfigPath: string;
+  codexHome: string;
+}): PromotionSurfaceRoots {
+  return {
+    appHash: input.appHash,
+    runtimeRoot: input.runtimeRoot,
+    tweaksRoot: input.tweaksRoot,
+    tweakersConfigPath: input.tweakersConfigPath,
+    codexConfigPath: join(input.codexHome, "config.toml"),
+    namespaceDataPath: join(input.userRoot, "tweak-data", USER_QUESTIONS_TWEAK_ID),
+    mainStoragePath: join(input.userRoot, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`),
+    policyPath: join(input.codexHome, ".codex-global-state.json"),
+  };
+}
+
+export function buildPromotionHealthExpectation(input: {
+  app: AppFingerprint;
+  before: PromotionSurfaceRoots | PromotionSurfaceHashes;
+  after: PromotionSurfaceRoots | PromotionSurfaceHashes;
+  requiredPermissions: string[];
+  userQuestionsRoot: string;
+}): ProductionHealthExpectationV2 {
+  const before = "appHash" in input.before ? fingerprintPromotionSurfaces(input.before) : input.before;
+  const after = "appHash" in input.after ? fingerprintPromotionSurfaces(input.after) : input.after;
+  if (after.app !== input.app.hash) throw new Error("Promotion app surface does not match the app fingerprint");
+  if (
+    !/^[a-f0-9]{64}$/.test(before.policy)
+    || !/^[a-f0-9]{64}$/.test(after.policy)
+    || before.policy !== after.policy
+  ) {
+    throw new Error("Promotion policy surface must remain present and semantically unchanged");
+  }
+  const userQuestions = inspectUserQuestionsSource(input.userQuestionsRoot);
+  return {
+    schemaVersion: 2,
+    app: { ...input.app },
+    requiredPermissions: [...input.requiredPermissions],
+    surfaces: Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [name, {
+      preimageHash: before[name],
+      afterHash: after[name],
+    }])) as ProductionHealthExpectationV2["surfaces"],
+    userQuestions: {
+      id: userQuestions.id,
+      version: userQuestions.version,
+      payloadHash: userQuestions.payloadHash,
+    },
+  };
+}
+
+function promotionPreimageHashes(expectation: ProductionHealthExpectationV2): PromotionSurfaceHashes {
+  return Object.fromEntries(PROMOTION_SURFACE_NAMES.map((name) => [
+    name,
+    expectation.surfaces[name].preimageHash,
+  ])) as PromotionSurfaceHashes;
+}
+
+function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSurfaceHashes {
+  return {
+    app: roots.appHash,
+    runtime: fingerprintPromotionPath(roots.runtimeRoot),
+    tweakTree: fingerprintPromotionPath(roots.tweaksRoot),
+    tweakersConfig: fingerprintPromotionPath(roots.tweakersConfigPath),
+    codexConfig: fingerprintPromotionPath(roots.codexConfigPath),
+    namespaceData: fingerprintPromotionPath(roots.namespaceDataPath),
+    mainStorage: fingerprintPromotionPath(roots.mainStoragePath),
+    policy: fingerprintPromotionPolicyPath(roots.policyPath),
+  };
+}
+
+/** Mode- and link-aware deterministic fingerprint shared with the runtime responder. */
+export function fingerprintPromotionPath(path: string): string {
+  if (!existsSync(path)) return "missing";
+  const digest = createHash("sha256");
+  const visit = (entryPath: string, name: string): void => {
+    const stat = lstatSync(entryPath);
+    digest.update(name).update("\0").update(String(stat.mode & 0o777)).update("\0");
+    if (stat.isDirectory()) {
+      digest.update("directory\0");
+      for (const child of readdirSync(entryPath).sort()) {
+        visit(join(entryPath, child), name ? `${name}/${child}` : child);
+      }
+      return;
+    }
+    if (stat.isFile()) {
+      digest.update("file\0").update(readFileSync(entryPath));
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      digest.update("symlink\0").update(readlinkSync(entryPath));
+      return;
+    }
+    throw new Error(`Unsupported promotion surface entry: ${entryPath}`);
+  };
+  visit(path, "");
+  return digest.digest("hex");
+}
+
+export function stageCandidateRolloutInputs(input: {
+  livePaths: UserPaths;
+  candidatePaths: UserPaths;
+  liveCodexHome: string;
+  candidateCodexHome: string;
+}): void {
+  mkdirSync(input.candidatePaths.root, { recursive: true, mode: 0o700 });
+  mkdirSync(input.candidateCodexHome, { recursive: true, mode: 0o700 });
+  const copies: Array<[string, string]> = [
+    [input.livePaths.configFile, input.candidatePaths.configFile],
+    [join(input.liveCodexHome, "config.toml"), join(input.candidateCodexHome, "config.toml")],
+    [join(input.liveCodexHome, ".codex-global-state.json"), join(input.candidateCodexHome, ".codex-global-state.json")],
+  ];
+  for (const id of [USER_QUESTIONS_TWEAK_ID, ...LEGACY_USER_QUESTIONS_TWEAK_IDS]) {
+    copies.push(
+      [join(input.livePaths.root, "tweak-data", id), join(input.candidatePaths.root, "tweak-data", id)],
+      [join(input.livePaths.root, "storage", `${id}.json`), join(input.candidatePaths.root, "storage", `${id}.json`)],
+    );
+  }
+  for (const [source, destination] of copies) copyCandidatePreimage(source, destination);
+}
+
+/**
+ * Stage only the durable Codex authentication proof into the contained
+ * candidate home immediately before its synchronous one-shot probe. The
+ * returned cleanup must run after the probe so credentials never persist in a
+ * held candidate transaction.
+ */
+export function stageCandidateCodexAuth(liveCodexHome: string, candidateCodexHome: string): () => void {
+  if (!isAbsolute(liveCodexHome) || resolve(liveCodexHome) !== liveCodexHome) {
+    throw new Error("Live Codex home must be an exact absolute path");
+  }
+  if (!isAbsolute(candidateCodexHome) || resolve(candidateCodexHome) !== candidateCodexHome) {
+    throw new Error("Candidate Codex home must be an exact absolute path");
+  }
+  const candidateHomeStat = lstatSync(candidateCodexHome);
+  if (!candidateHomeStat.isDirectory() || candidateHomeStat.isSymbolicLink()) {
+    throw new Error("Candidate Codex home must be a real directory");
+  }
+
+  const source = join(liveCodexHome, "auth.json");
+  const destination = join(candidateCodexHome, "auth.json");
+  const sourceFd = openSync(source, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let bytes: Buffer;
+  try {
+    const stat = fstatSync(sourceFd);
+    const owner = targetUserOwnership();
+    if (
+      !stat.isFile()
+      || (stat.mode & 0o777) !== 0o600
+      || stat.size <= 0
+      || stat.size > 1024 * 1024
+      || (owner !== null && stat.uid !== owner.uid)
+    ) {
+      throw new Error("Codex authentication proof must be a bounded owner-only regular file");
+    }
+    bytes = readFileSync(sourceFd);
+    if (bytes.byteLength !== stat.size) throw new Error("Codex authentication proof changed while being read");
+  } finally {
+    closeSync(sourceFd);
+  }
+
+  const temporary = `${destination}.${process.pid}.tmp`;
+  rmSync(temporary, { force: true });
+  try {
+    writeFileSync(temporary, bytes, { flag: "wx", mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    chownForTargetUser(temporary);
+    const staged = lstatSync(temporary);
+    const owner = targetUserOwnership();
+    if (
+      !staged.isFile()
+      || staged.isSymbolicLink()
+      || (staged.mode & 0o777) !== 0o600
+      || staged.size !== bytes.byteLength
+      || (owner !== null && staged.uid !== owner.uid)
+    ) {
+      throw new Error("Contained Codex authentication proof failed verification");
+    }
+    renameSync(temporary, destination);
+  } finally {
+    bytes.fill(0);
+    rmSync(temporary, { force: true });
+  }
+  return () => {
+    rmSync(destination, { force: true });
+  };
+}
+
+function copyCandidatePreimage(source: string, destination: string): void {
+  const before = fingerprintPath(source);
+  if (before.kind === "missing") return;
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+  cpSync(source, destination, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+  const after = fingerprintPath(destination);
+  if (before.kind !== after.kind || before.mode !== after.mode || before.hash !== after.hash) {
+    throw new Error(`Candidate rollout preimage copy failed verification: ${source}`);
+  }
+}
+
+interface PromotionMcpReceiptSummary {
+  status: "updated" | "unchanged" | "conflict" | "error";
+  conflictCount: number;
+  userQuestionsStateConsistent: boolean;
+}
+
+export function reconcilePromotionMcpConfig(input: {
+  runtimeRoot: string;
+  tweaksRoot: string;
+  userRoot: string;
+  tweakersConfigPath: string;
+  codexConfigPath: string;
+  statePath: string;
+}): PromotionMcpReceiptSummary {
+  const runtimeModulePath = join(input.runtimeRoot, "mcp-reconciliation.js");
+  const stat = lstatSync(runtimeModulePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Candidate MCP reconciler is not a regular runtime file");
+  const runtime = createRequire(import.meta.url)(runtimeModulePath) as {
+    reconcileMcpConfig(options: Record<string, unknown>): Record<string, unknown>;
+    userQuestionsMcpReceiptMatchesEnabledState(receipt: Record<string, unknown>, enabled: boolean): boolean;
+  };
+  if (typeof runtime.reconcileMcpConfig !== "function") throw new Error("Candidate runtime does not expose MCP reconciliation");
+  if (typeof runtime.userQuestionsMcpReceiptMatchesEnabledState !== "function") {
+    throw new Error("Candidate runtime does not expose User Questions MCP state validation");
+  }
+  const config = readJsonRecord(input.tweakersConfigPath);
+  const ownedTweaks = readdirSync(input.tweaksRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .map((entry) => {
+      const dir = join(input.tweaksRoot, entry.name);
+      const manifestPath = join(dir, "manifest.json");
+      const manifestStat = lstatSync(manifestPath);
+      if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 64 * 1024) {
+        throw new Error(`Promotion tweak manifest is unsafe: ${entry.name}`);
+      }
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+      if (typeof manifest.id !== "string" || !manifest.mcp || typeof manifest.mcp !== "object") return null;
+      return {
+        dir,
+        dataDir: join(input.userRoot, "tweak-data", manifest.id),
+        manifest,
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  if (!ownedTweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID)) {
+    throw new Error("Canonical User Questions MCP source is missing from the promotion tree");
+  }
+  const tweaks = ownedTweaks.filter((tweak) => tweakEnabledInConfig(config, String(tweak.manifest.id)));
+  const userQuestionsEnabled = tweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID);
+  mkdirSync(dirname(input.codexConfigPath), { recursive: true, mode: 0o700 });
+  const receipt = runtime.reconcileMcpConfig({
+    configPath: input.codexConfigPath,
+    statePath: input.statePath,
+    tweaks,
+    ownedTweaks,
+    trigger: "startup",
+  });
+  const status = receipt.status;
+  const conflicts = receipt.conflicts;
+  const appliedNames = receipt.appliedNames;
+  const approvalPolicy = receipt.approvalPolicy;
+  if (
+    !["updated", "unchanged", "conflict", "error"].includes(String(status))
+    || !Array.isArray(conflicts)
+    || !Array.isArray(appliedNames)
+    || !approvalPolicy
+    || typeof approvalPolicy !== "object"
+  ) throw new Error("Candidate MCP reconciliation returned an invalid receipt");
+  return {
+    status: status as PromotionMcpReceiptSummary["status"],
+    conflictCount: conflicts.length,
+    userQuestionsStateConsistent: runtime.userQuestionsMcpReceiptMatchesEnabledState(receipt, userQuestionsEnabled),
+  };
+}
+
+function assertPromotionMcpReceipt(receipt: PromotionMcpReceiptSummary, scope: string): void {
+  if (receipt.status === "conflict" || receipt.status === "error" || receipt.conflictCount !== 0 || !receipt.userQuestionsStateConsistent) {
+    throw new Error(`${scope} MCP reconciliation did not prove the expected User Questions enabled state`);
+  }
+}
+
+function tweakEnabledInConfig(config: Record<string, unknown>, id: string): boolean {
+  const tweaker = recordValue(config.tweaker);
+  if (tweaker?.safeMode === true) return false;
+  const health = recordValue(recordValue(config.tweakHealth)?.[id]);
+  if (health?.status === "quarantined") return false;
+  const tweak = recordValue(recordValue(config.tweaks)?.[id]);
+  return tweak?.enabled !== false;
+}
+
+function readJsonRecord(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Expected a JSON object: ${path}`);
+  return value as Record<string, unknown>;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function unknownPromotionHealth(requiredPermissions: string[]) {
+  return {
+    host: "unknown" as const,
+    session: "unknown" as const,
+    permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])),
+    promotionReady: "unknown" as const,
+  };
+}
+
+function sameAppFingerprint(left: AppFingerprint, right: AppFingerprint): boolean {
+  return left.version === right.version && left.build === right.build && left.hash === right.hash;
+}
+
 function fingerprintCodex(codex: CodexInstall): AppFingerprint {
   const plist = codex.metaPath ? readPlist(codex.metaPath) : {};
   return {
@@ -1002,6 +2047,8 @@ export function hashDirectoryTree(root: string): string {
   const hash = createHash("sha256");
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      // Finder junk must not perturb payload/runtime hashes.
+      if (isMacOsJunkName(entry.name)) continue;
       const path = join(directory, entry.name);
       const name = relative(root, path);
       hash.update(name);
@@ -1028,7 +2075,7 @@ function replaceDirectory(source: string, destination: string): void {
   const previous = `${destination}.tweakers-previous-${process.pid}`;
   rmSync(temporary, { recursive: true, force: true });
   rmSync(previous, { recursive: true, force: true });
-  cpSync(source, temporary, { recursive: true, verbatimSymlinks: true });
+  copyDirectoryPreservingModes(source, temporary);
   if (existsSync(destination)) renameDirectory(destination, previous);
   try {
     renameDirectory(temporary, destination);
@@ -1046,6 +2093,12 @@ interface AppBundleReplacementAdapters {
   validateDestination?: (appRoot: string) => boolean;
   onCleanupFailure?: (path: string, error: unknown) => void;
   /**
+   * The stable incoming Contents path was populated and verified before the
+   * live app was stopped. Cutover must consume that exact staging copy rather
+   * than opening a long copy window after shutdown.
+   */
+  preStagedIncoming?: boolean;
+  /**
    * When set, the swapped-out Contents are renamed to this path instead of
    * being removed — but only after the promoted destination validated. A
    * failed validation still removes the incoming copy (it holds the rejected
@@ -1053,6 +2106,37 @@ interface AppBundleReplacementAdapters {
    * preserves the incoming copy as evidence exactly as before.
    */
   preserveOutgoing?: string;
+}
+
+interface AppBundleStagingAdapters {
+  removeDirectory?: (path: string) => void;
+  copyDirectory?: (source: string, destination: string) => void;
+}
+
+/**
+ * Populate the stable incoming Contents path while the current app may still
+ * be running. The later replacement then consists only of the atomic swap and
+ * destination validation, so an automatic reopen cannot bind the outgoing
+ * Contents during a multi-gigabyte copy.
+ */
+export function stageAppBundleReplacement(
+  source: string,
+  destination: string,
+  adapters: AppBundleStagingAdapters = {},
+): string {
+  const sourceContents = join(source, "Contents");
+  const destinationContents = join(destination, "Contents");
+  if (!existsSync(sourceContents) || !existsSync(destinationContents)) {
+    throw new Error("App bundle replacement requires source and destination Contents directories");
+  }
+  const incoming = `${destination}.tweakers-contents-swap`;
+  const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
+  const copy = adapters.copyDirectory
+    ?? ((from: string, to: string) => copyDirectoryPreservingModes(from, to));
+  remove(incoming);
+  copy(sourceContents, incoming);
+  if (!existsSync(incoming)) throw new Error("Prepared app Contents staging copy is missing");
+  return incoming;
 }
 
 export function replaceAppBundlePreservingIdentity(
@@ -1084,8 +2168,11 @@ export function replaceAppBundlePreservingIdentity(
   // A stable path makes cleanup debt recoverable: the next serialized
   // promotion removes any old payload left here before preparing its swap.
   const incoming = `${destination}.tweakers-contents-swap`;
-  remove(incoming);
-  cpSync(sourceContents, incoming, { recursive: true, verbatimSymlinks: true });
+  if (adapters.preStagedIncoming) {
+    if (!existsSync(incoming)) throw new Error("Pre-staged app Contents are missing");
+  } else {
+    stageAppBundleReplacement(source, destination, { removeDirectory: remove });
+  }
   let preserveIncoming = false;
   // Only true while `incoming` holds the swapped-out (previous) Contents; a
   // rolled-back validation failure flips it back so we never park rejected bytes.
@@ -1150,7 +2237,7 @@ function moveDirectoryAcrossVolumes(source: string, destination: string): void {
     renameSync(source, destination);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
+    copyDirectoryPreservingModes(source, destination);
     rmSync(source, { recursive: true, force: true });
   }
 }
@@ -1350,7 +2437,7 @@ export function snapshotSignedBackup(liveBackup: string, snapshot: string, marke
   // transaction's marker before copying so an interruption cannot replay it.
   rmSync(marker, { force: true });
   const existed = existsSync(liveBackup);
-  if (existed) cpSync(liveBackup, snapshot, { recursive: true, verbatimSymlinks: true });
+  if (existed) copyDirectoryPreservingModes(liveBackup, snapshot);
   const temporary = `${marker}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, existed })}\n`, { mode: 0o600 });
   renameSync(temporary, marker);
@@ -1419,6 +2506,201 @@ export function readAsarPatchSchema(asarPath: string): AsarPatchSchema {
   } catch {
     return "unreadable";
   }
+}
+
+const MAIN_RENDERER_ASAR_ENTRY = "webview/index.html";
+const MAX_ASAR_PACKAGE_BYTES = 1024 * 1024;
+const MAX_MAIN_PROCESS_ENTRY_BYTES = 128 * 1024 * 1024;
+const MAX_MAIN_RENDERER_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_MAIN_RENDERER_ASSET_BYTES = 128 * 1024 * 1024;
+
+interface AsarFileEntry {
+  files?: Record<string, unknown>;
+  integrity?: unknown;
+  link?: unknown;
+  offset?: unknown;
+  size?: unknown;
+  unpacked?: unknown;
+}
+
+/**
+ * Prove the patched archive still contains the real application bootstrap and
+ * a complete main renderer document. The one-shot runtime health process does
+ * not execute OpenAI's original main module, so its receipt cannot substitute
+ * for this sealed-ASAR validation.
+ */
+export function validateMainRendererAsarEntrypoint(asarPath: string): void {
+  const header = readHeaderHash(asarPath).header;
+  const readEntry = (entryPath: string, maxBytes: number): Buffer => (
+    readVerifiedInlineAsarEntry(asarPath, header, entryPath, maxBytes)
+  );
+  const packageBytes = readEntry("package.json", MAX_ASAR_PACKAGE_BYTES);
+  let pkg: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(packageBytes)) as unknown;
+    const record = recordValue(parsed);
+    if (!record) throw new Error("package root is not an object");
+    pkg = record;
+  } catch (error) {
+    throw new Error(`candidate app.asar package.json is corrupt: ${errorMessage(error)}`);
+  }
+
+  const current = recordValue(pkg.__tweaker);
+  const legacy = recordValue(pkg[LEGACY_ASAR_META_KEY]);
+  const metadata = current ?? legacy;
+  const loaderEntry = current ? "tweaker-loader.cjs" : legacy ? LEGACY_LOADER_FILE : null;
+  const originalMain = metadata?.originalMain;
+  if (!loaderEntry || pkg.main !== loaderEntry || typeof originalMain !== "string") {
+    throw new Error("candidate app.asar loader metadata is incomplete");
+  }
+  const normalizedOriginalMain = normalizeContainedAsarPath(originalMain, "original main entry");
+  readEntry(loaderEntry, MAX_ASAR_PACKAGE_BYTES);
+  readEntry(normalizedOriginalMain, MAX_MAIN_PROCESS_ENTRY_BYTES);
+
+  const rendererBytes = readEntry(MAIN_RENDERER_ASAR_ENTRY, MAX_MAIN_RENDERER_ENTRY_BYTES);
+  let html: string;
+  try {
+    html = new TextDecoder("utf-8", { fatal: true }).decode(rendererBytes);
+  } catch {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} is not valid UTF-8`);
+  }
+  if (!completeMainRendererDocument(html)) {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} is corrupt or truncated`);
+  }
+
+  const moduleEntries = moduleScriptSources(html).map((source) => {
+    const withoutQuery = source.split(/[?#]/, 1)[0] ?? "";
+    if (!withoutQuery || withoutQuery.startsWith("/") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(withoutQuery)) {
+      throw new Error(`candidate main renderer module source is not contained in app.asar: ${source}`);
+    }
+    const resolved = posix.normalize(posix.join(posix.dirname(MAIN_RENDERER_ASAR_ENTRY), withoutQuery));
+    if (!resolved.startsWith("webview/") || resolved === "webview") {
+      throw new Error(`candidate main renderer module source escapes its ASAR root: ${source}`);
+    }
+    return normalizeContainedAsarPath(resolved, "main renderer module entry");
+  });
+  if (moduleEntries.length === 0) {
+    throw new Error(`candidate main renderer entry ${MAIN_RENDERER_ASAR_ENTRY} has no module bootstrap`);
+  }
+  for (const moduleEntry of new Set(moduleEntries)) {
+    readEntry(moduleEntry, MAX_MAIN_RENDERER_ASSET_BYTES);
+  }
+}
+
+function readVerifiedInlineAsarEntry(
+  asarPath: string,
+  header: unknown,
+  entryPath: string,
+  maxBytes: number,
+): Buffer {
+  const entry = asarHeaderFileEntry(header, entryPath);
+  if (entry.files || entry.link !== undefined || entry.unpacked === true) {
+    throw new Error(`candidate app.asar entry is not a sealed inline file: ${entryPath}`);
+  }
+  if (!Number.isSafeInteger(entry.size) || Number(entry.size) <= 0 || Number(entry.size) > maxBytes) {
+    throw new Error(`candidate app.asar entry has an invalid size: ${entryPath}`);
+  }
+  if (typeof entry.offset !== "string" || !/^\d+$/.test(entry.offset)) {
+    throw new Error(`candidate app.asar entry has an invalid offset: ${entryPath}`);
+  }
+  const bytes = readInlineAsarBytes(asarPath, entryPath, Number(entry.offset), Number(entry.size));
+  if (bytes.length !== entry.size) {
+    throw new Error(`candidate app.asar entry is truncated: ${entryPath}`);
+  }
+  const integrity = recordValue(entry.integrity);
+  const expectedHash = integrity?.hash;
+  if (integrity?.algorithm !== "SHA256" || typeof expectedHash !== "string" || !/^[a-f0-9]{64}$/i.test(expectedHash)) {
+    throw new Error(`candidate app.asar entry has no valid SHA-256 integrity proof: ${entryPath}`);
+  }
+  const observedHash = createHash("sha256").update(bytes).digest("hex");
+  if (observedHash !== expectedHash.toLowerCase()) {
+    throw new Error(`candidate app.asar entry failed its SHA-256 integrity proof: ${entryPath}`);
+  }
+  return bytes;
+}
+
+function readInlineAsarBytes(
+  asarPath: string,
+  entryPath: string,
+  entryOffset: number,
+  entrySize: number,
+): Buffer {
+  const descriptor = openSync(asarPath, "r");
+  try {
+    const archiveStat = fstatSync(descriptor);
+    const sizePickle = Buffer.alloc(8);
+    if (!readExactly(descriptor, sizePickle, 0) || sizePickle.readUInt32LE(0) !== 4) {
+      throw new Error(`candidate app.asar header is unreadable while reading: ${entryPath}`);
+    }
+    const headerSize = sizePickle.readUInt32LE(4);
+    const position = 8 + headerSize + entryOffset;
+    if (!Number.isSafeInteger(position) || position < 8 || position + entrySize > archiveStat.size) {
+      throw new Error(`candidate app.asar entry exceeds the archive bounds: ${entryPath}`);
+    }
+    const bytes = Buffer.alloc(entrySize);
+    if (!readExactly(descriptor, bytes, position)) {
+      throw new Error(`candidate app.asar entry is truncated: ${entryPath}`);
+    }
+    return bytes;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readExactly(descriptor: number, buffer: Buffer, position: number): boolean {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const bytesRead = readSync(descriptor, buffer, offset, buffer.length - offset, position + offset);
+    if (bytesRead <= 0) return false;
+    offset += bytesRead;
+  }
+  return true;
+}
+
+function asarHeaderFileEntry(header: unknown, entryPath: string): AsarFileEntry {
+  let node = recordValue(header);
+  for (const segment of entryPath.split("/")) {
+    const files = recordValue(node?.files);
+    if (!files || !Object.prototype.hasOwnProperty.call(files, segment)) {
+      throw new Error(`candidate app.asar is missing required entry: ${entryPath}`);
+    }
+    node = recordValue(files[segment]);
+    if (!node) throw new Error(`candidate app.asar has an invalid header entry: ${entryPath}`);
+  }
+  return node as AsarFileEntry;
+}
+
+function normalizeContainedAsarPath(entryPath: string, label: string): string {
+  if (!entryPath || entryPath.includes("\\") || entryPath.startsWith("/") || entryPath.includes("\0")) {
+    throw new Error(`candidate app.asar ${label} is unsafe`);
+  }
+  const normalized = posix.normalize(entryPath.replace(/^\.\//, ""));
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error(`candidate app.asar ${label} escapes the archive root`);
+  }
+  return normalized;
+}
+
+function completeMainRendererDocument(html: string): boolean {
+  const document = html.trim();
+  return /^<!doctype\s+html\b/i.test(document)
+    && /<html\b/i.test(document)
+    && /<head\b/i.test(document)
+    && /<\/head\s*>/i.test(document)
+    && /<body\b/i.test(document)
+    && /<\/body\s*>/i.test(document)
+    && /<\/html\s*>\s*$/i.test(document);
+}
+
+function moduleScriptSources(html: string): string[] {
+  const sources: string[] = [];
+  for (const match of html.matchAll(/<script\b[^>]*>/gi)) {
+    const tag = match[0];
+    if (!/\btype\s*=\s*["']module["']/i.test(tag)) continue;
+    const source = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag)?.[1];
+    if (source) sources.push(source);
+  }
+  return sources;
 }
 
 export function formatInvalidatedInstallError(liveAppRoot: string, failure?: string, pendingReason?: string): string {

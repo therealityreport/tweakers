@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  codeSigningKeychainArgs,
   codeSigningWalkRoots,
   containedSigningKeychainPath,
   createPkcs12Password,
@@ -10,6 +11,8 @@ import {
   portableEntitlements,
   resolveSigningPosture,
   stableDesignatedRequirement,
+  withRestoredUserKeychainPreferences,
+  type SecurityCommandRunner,
 } from "../src/codesign";
 
 test("parseCodeSigningIdentities extracts valid code signing identities", () => {
@@ -54,6 +57,7 @@ test("strict portable signing keeps privacy entitlements with library validation
     "com.apple.developer.team-identifier": "TEAM",
     "com.apple.security.application-groups": ["TEAM.group"],
     "keychain-access-groups": ["TEAM.com.openai.codex"],
+    "com.apple.developer.aps-environment": "production",
     "com.apple.security.cs.disable-library-validation": true,
   };
   const strictByDefault = portableEntitlements(original);
@@ -71,6 +75,7 @@ test("contained portable signing keeps library validation disabled", () => {
   assert.deepEqual(portableEntitlements({
     "com.apple.security.automation.apple-events": true,
     "com.apple.application-identifier": "TEAM.com.openai.codex",
+    "com.apple.developer.aps-environment": "production",
   }, "contained"), {
     "com.apple.security.automation.apple-events": true,
     "com.apple.security.cs.disable-library-validation": true,
@@ -111,4 +116,113 @@ test("contained signing uses a dedicated non-login keychain", () => {
   assert.equal(path, "/Users/x/Library/Keychains/tweakers-signing.keychain-db");
   assert.ok(path.endsWith("tweakers-signing.keychain-db"));
   assert.ok(!path.includes("login.keychain"));
+});
+
+function mockUserKeychainPreferences(
+  initialSearchList: string[],
+  initialDefault: string | null,
+): {
+  calls: string[][];
+  run: SecurityCommandRunner;
+  state: { searchList: string[]; defaultKeychain: string | null };
+} {
+  const calls: string[][] = [];
+  const state = {
+    searchList: [...initialSearchList],
+    defaultKeychain: initialDefault,
+  };
+  const run: SecurityCommandRunner = (command, args) => {
+    assert.equal(command, "security");
+    calls.push([...args]);
+    if (args[0] === "list-keychains") {
+      const setAt = args.indexOf("-s");
+      if (setAt >= 0) state.searchList = args.slice(setAt + 1);
+      return {
+        status: 0,
+        stdout: state.searchList.map((path) => `    "${path}"`).join("\n"),
+        stderr: "",
+      };
+    }
+    if (args[0] === "default-keychain") {
+      const setAt = args.indexOf("-s");
+      if (setAt >= 0) state.defaultKeychain = args[setAt + 1] ?? null;
+      return {
+        status: 0,
+        stdout: state.defaultKeychain ? `"${state.defaultKeychain}"\n` : "",
+        stderr: "",
+      };
+    }
+    return { status: 1, stdout: "", stderr: `unexpected security command: ${args[0]}` };
+  };
+  return { calls, run, state };
+}
+
+test("contained signing restores and verifies user Keychain preferences after success", () => {
+  const login = "/Users/x/Library/Keychains/login.keychain-db";
+  const secondary = "/Users/x/Library/Keychains/secondary.keychain-db";
+  const contained = "/Users/x/Library/Keychains/tweakers-signing.keychain-db";
+  const mock = mockUserKeychainPreferences([login, secondary], login);
+
+  const result = withRestoredUserKeychainPreferences(() => {
+    mock.state.searchList = [login, secondary, contained];
+    mock.state.defaultKeychain = contained;
+    return "signed";
+  }, { run: mock.run });
+
+  assert.equal(result, "signed");
+  assert.deepEqual(mock.state.searchList, [login, secondary]);
+  assert.equal(mock.state.defaultKeychain, login);
+  assert.ok(mock.calls.some((args) =>
+    args[0] === "list-keychains" && args.includes("-s") && args.at(-1) === secondary));
+  assert.ok(mock.calls.some((args) =>
+    args[0] === "default-keychain" && args.includes("-s") && args.at(-1) === login));
+});
+
+test("contained signing restores exact default and duplicate search entries after failure", () => {
+  const login = "/Users/x/Library/Keychains/login.keychain-db";
+  const secondary = "/Users/x/Library/Keychains/secondary.keychain-db";
+  const contained = "/Users/x/Library/Keychains/tweakers-signing.keychain-db";
+  const originalSearchList = [login, secondary, login];
+  const mock = mockUserKeychainPreferences(originalSearchList, secondary);
+
+  assert.throws(
+    () => withRestoredUserKeychainPreferences(() => {
+      mock.state.searchList = [contained];
+      mock.state.defaultKeychain = contained;
+      throw new Error("candidate signing failed");
+    }, { run: mock.run }),
+    /candidate signing failed/,
+  );
+
+  assert.deepEqual(mock.state.searchList, originalSearchList);
+  assert.equal(mock.state.defaultKeychain, secondary);
+});
+
+test("contained signing fails closed without mutating a null default", () => {
+  const login = "/Users/x/Library/Keychains/login.keychain-db";
+  const secondary = "/Users/x/Library/Keychains/secondary.keychain-db";
+  const originalSearchList = [login, secondary, login];
+  const mock = mockUserKeychainPreferences(originalSearchList, null);
+  let actionCalled = false;
+
+  assert.throws(
+    () => withRestoredUserKeychainPreferences(() => {
+      actionCalled = true;
+    }, { run: mock.run }),
+    /default keychain is null.*separate user authorization/,
+  );
+
+  assert.equal(actionCalled, false);
+  assert.deepEqual(mock.state.searchList, originalSearchList);
+  assert.equal(mock.state.defaultKeychain, null);
+  assert.deepEqual(mock.calls.map((args) => args[0]), ["list-keychains", "default-keychain"]);
+  assert.ok(mock.calls.every((args) => !args.includes("-s")));
+});
+
+test("contained signing identity is passed to codesign with an explicit keychain", () => {
+  assert.deepEqual(codeSigningKeychainArgs({ keychainPath: "/tmp/contained.keychain-db" }), [
+    "--keychain",
+    "/tmp/contained.keychain-db",
+  ]);
+  assert.deepEqual(codeSigningKeychainArgs(undefined), []);
 });

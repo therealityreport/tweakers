@@ -59,6 +59,7 @@ function prepared(root: string, id: string, source: EnvironmentSelection, reques
       version: "26.717.1",
       build: "6001",
       artifactDigest: "candidate-digest",
+      asarHeaderHash: "a".repeat(64),
       signature: {
         strict: true,
         gatekeeper: false,
@@ -82,6 +83,7 @@ function prepared(root: string, id: string, source: EnvironmentSelection, reques
       desktopVersion: "26.707.1",
       desktopBuild: "5900",
       desktopArtifactDigest: "rollback-digest",
+      desktopAsarHeaderHash: "b".repeat(64),
       backendLane: source.backendLane,
       backendBinaryPath: "/Applications/ChatGPT.app/Contents/Resources/codex",
       backendArtifactPath: join(preparedRoot, "backend", "rollback-codex"),
@@ -117,6 +119,7 @@ function receipt(
       desktopBuild: evidence.candidate.build,
       backendVersion: evidence.backend.version,
       desktopArtifactDigest: evidence.candidate.artifactDigest,
+      asarHeaderHash: evidence.candidate.asarHeaderHash,
       backendArtifactDigest: evidence.backend.artifactDigest,
     } : null,
     oldMainPid: 100,

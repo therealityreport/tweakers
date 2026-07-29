@@ -23,6 +23,12 @@ export interface DesktopUpdateHeartbeat {
   ownerGeneration: string;
   phase: string;
   beatAt: string;
+  /** Disk version sampled at this beat during the native update wait; lets
+   * status readers show live progress without touching the receipt. */
+  observed?: {
+    marketingVersion: string | null;
+    build: string | null;
+  };
 }
 
 export interface DesktopUpdateOwnerReceipt {
@@ -156,5 +162,14 @@ function isDesktopUpdateHeartbeat(value: unknown): value is DesktopUpdateHeartbe
     && heartbeat.ownerGeneration.length > 0
     && typeof heartbeat.phase === "string"
     && typeof heartbeat.beatAt === "string"
-    && Number.isFinite(Date.parse(heartbeat.beatAt));
+    && Number.isFinite(Date.parse(heartbeat.beatAt))
+    && isOptionalObservedVersion(heartbeat.observed);
+}
+
+function isOptionalObservedVersion(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const observed = value as { marketingVersion?: unknown; build?: unknown };
+  return (observed.marketingVersion === null || typeof observed.marketingVersion === "string")
+    && (observed.build === null || typeof observed.build === "string");
 }

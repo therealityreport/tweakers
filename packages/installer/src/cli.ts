@@ -16,6 +16,7 @@ import { status } from "./commands/status.js";
 import { debug } from "./commands/debug.js";
 import { browserUi } from "./commands/browser-ui.js";
 import { doctor } from "./commands/doctor.js";
+import { mcpLifecycle } from "./commands/mcp-lifecycle.js";
 import { safeMode } from "./commands/safe-mode.js";
 import { migrate } from "./commands/migrate.js";
 import { TWEAKER_VERSION } from "./version.js";
@@ -29,6 +30,7 @@ import {
   environment,
   type EnvironmentCommandOptions,
 } from "./commands/environment.js";
+import { codexSource, type CodexSourceOptions } from "./commands/codex-source.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -124,9 +126,18 @@ async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolea
   return devSync(opts);
 }
 
-async function runRefreshLocal(opts: { source?: "smart" | "development" | "stable"; app?: string }): Promise<void> {
+async function runRefreshLocal(opts: {
+  source?: "smart" | "development" | "stable";
+  app?: string;
+  developmentRoot?: string;
+  "development-root"?: string;
+}): Promise<void> {
   const { refreshLocal } = await import("./commands/refresh-local.js");
-  return refreshLocal(opts);
+  return refreshLocal({
+    source: opts.source,
+    app: opts.app,
+    developmentRoot: opts.developmentRoot ?? opts["development-root"],
+  });
 }
 
 async function runMode(target: string, opts: { json?: boolean; yes?: boolean; app?: string }): Promise<void> {
@@ -136,7 +147,9 @@ async function runMode(target: string, opts: { json?: boolean; yes?: boolean; ap
 
 async function runEnvironment(action: string, opts: EnvironmentCommandOptions): Promise<void> {
   const result = await environment(action, opts);
-  if (action === "commit") assertEnvironmentCliSuccess("commit", result);
+  // The receipt has already been printed, so callers still get the durable
+  // diagnosis alongside a truthful exit code.
+  assertEnvironmentCliSuccess(action as Parameters<typeof assertEnvironmentCliSuccess>[0], result);
 }
 
 async function runRefreshStatus(): Promise<void> {
@@ -243,6 +256,27 @@ prog
   .action(wrap(cancelCodexUpdate));
 
 prog
+  .command("codex-source <action>")
+  .describe("Inspect or prepare official Codex source for the bundled control lane or an explicit stable/edge lane")
+  .option("--app", "Exact ChatGPT.app path used to probe the bundled backend")
+  .option("--channel", "Source channel: bundled (default), stable, or edge")
+  .option("--force", "Bypass the daily advisory throttle (detect only)")
+  .option("--frontend-source-app", "Exact pristine internal ChatGPT.app source (build only)")
+  .option("--patch-series", "Comma-separated exact absolute patch files (build only)")
+  .option("--chrome-plugin-root", "Exact Chrome DevTools plugin release root (build only)")
+  .option("--playwright-plugin-root", "Exact Playwright plugin release root (build only)")
+  .option("--fleet-manifest", "Exact full-fleet lifecycle/catalog/artifact manifest (build only)")
+  .option("--transaction-id", "Durable source transaction ID")
+  .option("--restart-window-opens-at", "Approved restart-window opening timestamp (freeze only)")
+  .option("--restart-window-closes-at", "Approved restart-window closing timestamp (freeze only)")
+  .option("--live-codex-home", "Exact live CODEX_HOME (cutover/rollback only)")
+  .option("--live-config", "Exact live config.toml (cutover/rollback only)")
+  .option("--watcher-receipt", "Exact watcher handoff receipt path (cutover/rollback only)")
+  .option("--approval-file", "Exact restart approval file (cutover/rollback only)")
+  .option("--json", "Print machine-readable output", true)
+  .action(wrap((action: string, options: CodexSourceOptions) => codexSource(action, options)));
+
+prog
   .command("update")
   .describe("Install the latest published Tweakers release; keep the managed runtime when no release exists")
   .option("--repo", "GitHub repo to download (default: therealityreport/tweakers)")
@@ -274,9 +308,10 @@ prog
 
 prog
   .command("environment <action>")
-  .describe("Inspect, prepare, and complete a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
+  .describe("Inspect, prepare, complete, and recover a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
   .option("--app-experience", "App experience: chatgpt or tweakers")
   .option("--release-profile", "Release profile: stable or alpha")
+  .option("--bundled-derived-receipt", "Validated bundled-derived Codex receipt (prepare only)")
   .option("--transaction", "Durable environment transaction ID")
   .option("--app-path", "Exact absolute path to a user-selected OpenAI Beta .app (register-alpha only)")
   .option("--app", "Alias for --app-path")
@@ -294,7 +329,18 @@ prog
 prog
   .command("doctor")
   .describe("Diagnose common issues (signature, fuses, asar integrity, perms)")
-  .action(doctor);
+  .option("--deep", "Verify lifecycle asset bytes, modes, and action receipts")
+  .option("--json", "Print exactly one machine-readable JSON value")
+  .action(wrap(doctor));
+
+prog
+  .command("mcp-lifecycle <action>")
+  .describe("Inspect, preview, repair current managed services, or explicitly adopt the exact recognized predecessor")
+  .option("--apply", "Apply the selected verified repair or explicit predecessor adoption and reload the exact existing labels")
+  .option("--deep", "Verify installed asset bytes, modes, status, and receipts")
+  .option("--json", "Print exactly one machine-readable JSON value")
+  .option("--source", "Explicit canonical package root")
+  .action(wrap(mcpLifecycle));
 
 prog
   .command("debug")
@@ -346,6 +392,7 @@ prog
   .command("refresh-local")
   .describe("Validate, quit, refresh, and reopen the local ChatGPT app")
   .option("--source", "Refresh source: smart, development, or stable", "smart")
+  .option("--development-root", "Exact absolute Tweakers Git worktree root; requires --source development")
   .option("--app", "Path to ChatGPT.app / install dir")
   .action(wrap(runRefreshLocal));
 

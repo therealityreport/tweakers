@@ -59,7 +59,7 @@ test("startup timeout is bounded and allows the caller to continue", async () =>
 test("catalog entries point to exact bundled source folders", () => {
   const catalog = JSON.parse(readFileSync(resolve(root, "store/index.json"), "utf8"));
   const registry = normalizeStoreRegistry(catalog);
-  assert.equal(registry.entries.length, 11);
+  assert.equal(registry.entries.length, 12);
   for (const entry of registry.entries) {
     assert.equal(entry.source?.kind, "bundled");
     assert.equal(entry.source?.kind === "bundled" && entry.source.path.startsWith("tweaks/"), true);
@@ -70,12 +70,12 @@ test("catalog entries point to exact bundled source folders", () => {
   }
 });
 
-test("installer assets contain the same eleven canonical tweak folders", () => {
+test("installer assets contain the same twelve canonical tweak folders", () => {
   const catalog = JSON.parse(readFileSync(resolve(root, "store/index.json"), "utf8"));
   const packagedRoot = resolve(root, "packages/installer/assets/runtime/tweaks");
   const sourceIds = catalog.entries.map((entry: { source: { path: string } }) => entry.source.path.split("/").at(-1)).sort();
   const packagedIds = readdirSync(packagedRoot).filter((id) => statSync(resolve(packagedRoot, id)).isDirectory()).sort();
-  assert.equal(sourceIds.length, 11);
+  assert.equal(sourceIds.length, 12);
   assert.deepEqual(packagedIds, sourceIds);
 });
 

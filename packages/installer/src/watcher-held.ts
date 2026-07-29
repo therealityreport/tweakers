@@ -31,7 +31,7 @@ export interface HeldPromotionDeps {
   guardModeAllowsPromotion?(): boolean;
   /** Wraps quitCodex: graceful quit → 8s wait → SIGTERM main only → 3s wait. */
   quitApp(): void;
-  /** Wraps terminateStaleHelperProcesses(liveAppRoot, { mainStartedAt: null }). */
+  /** Compatibility callback; production is observation-only and sends no signals. */
   cleanupOrphans(): void;
   /** Wraps showCodexUpdateDetectedNotification. */
   notifyUpdateQuit(): void;

@@ -347,6 +347,7 @@ test("Config follows the native structure and keeps operational sections separat
   const calls = [
     "renderEnvironmentSection(sectionsWrap, cardUpdates)",
     "renderDesktopUpdateSection(sectionsWrap, cardUpdates)",
+    "renderTweaksHealthSection(sectionsWrap, cardUpdates)",
     "renderMcpIntegrationSection(sectionsWrap, cardUpdates)",
     "renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates)",
     'sectionTitle("Tweakers Updates")',
@@ -358,6 +359,21 @@ test("Config follows the native structure and keeps operational sections separat
   assert.doesNotMatch(source, /function renderModeSection/);
   assert.doesNotMatch(source, /sectionTitle\("App Mode"\)/);
   assert.doesNotMatch(source, /tweaker:switch-app-mode/);
+});
+
+test("Tweaks Health summarizes version drift and expands only stale tweak rows", () => {
+  const body = functionBody("renderTweaksHealthSection", "tweakHealthDriftRow");
+  const row = functionBody("tweakHealthDriftRow", "renderMcpIntegrationSection");
+  assert.match(body, /sectionTitle\("Tweaks Health"\)/);
+  assert.match(body, /tweaker:get-tweaks-health/);
+  assert.match(body, /All installed live copies and bundled runtime copies match the latest stored catalog versions/);
+  assert.match(body, /candidate\.status !== "current"/);
+  assert.match(body, /MCP restart required/);
+  assert.match(row, /Live:/);
+  assert.match(row, /Runtime:/);
+  assert.match(row, /Latest stored:/);
+  assert.match(row, /Enabled/);
+  assert.match(row, /MCP/);
 });
 
 test("Environment stages independent selections, prepares before one confirmation, then commits", () => {
@@ -415,13 +431,22 @@ test("Environment offers durable resume, cancel, and safe state-aware recovery a
   const body = functionBody("renderEnvironmentSection", "environmentChoiceRow");
   assert.match(body, /openEnvironmentConfirmModal\(requested, receipt/);
   assert.match(body, /tweaker:cancel-environment/);
-  assert.match(body, /tweaker:rollback-environment/);
+  // Recovery resolves the receipt from live proof instead of restoring the
+  // recorded payload, which can be older than the live desktop.
+  assert.match(body, /tweaker:recover-environment/);
+  assert.doesNotMatch(body, /tweaker:rollback-environment/);
   assert.match(body, /environmentTransactionCanRecover\(receipt\)/);
   assert.match(body, /void loadEnvironmentTransaction\(\)/);
   const row = functionBody("environmentTransactionRow", "environmentTransactionLabel");
   assert.match(row, /Resume\/Confirm/);
   assert.match(row, /Cancel/);
   assert.match(row, /Recover Safely/);
+});
+
+test("Environment recovery surfaces a receipt that is still failed as an error", () => {
+  const body = functionBody("recoverEnvironmentTransaction", "appendEnvironmentTransactionRow");
+  assert.match(body, /next\.phase === "failed"/);
+  assert.match(body, /Could not recover the app mode safely/);
 });
 
 test("Environment transaction status surfaces durable helper failure and log detail", () => {
@@ -464,6 +489,8 @@ test("Desktop Update uses the shared check and durable Update and Reload transac
   assert.match(body, /transactionPollFailures = 0/);
   assert.match(body, /awaitingTransactionReceiptUntil = Date\.now\(\) \+ 10_000/);
   assert.match(body, /did not create a transaction receipt/);
+  assert.match(body, /const idleWithoutReceipt = observed\?\.phase === "idle" && observed\.transactionId === null/);
+  assert.match(body, /transaction = idleWithoutReceipt \? null : observed/);
   assert.doesNotMatch(source, /tweaker:install-codex-desktop-update/);
 });
 

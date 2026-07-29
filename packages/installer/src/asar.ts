@@ -8,9 +8,21 @@
  */
 import asar from "@electron/asar";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, cpSync, existsSync, renameSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
 export interface AsarHeaderInfo {
@@ -22,6 +34,32 @@ export interface AsarHeaderInfo {
 
 export interface PatchAsarDependencies {
   copyFile?: (from: string, to: string) => void;
+  createPackage?: typeof asar.createPackageWithOptions;
+}
+
+interface CompleteAsarInfo extends AsarHeaderInfo {
+  archiveSize: bigint;
+}
+
+interface AsarIntegrity {
+  algorithm?: unknown;
+  hash?: unknown;
+}
+
+interface AsarEntry {
+  files?: Record<string, AsarEntry>;
+  integrity?: AsarIntegrity;
+  link?: unknown;
+  offset?: unknown;
+  size?: unknown;
+  unpacked?: unknown;
+}
+
+interface PackedAsarEntry {
+  integrity: AsarIntegrity;
+  offset: bigint;
+  path: string;
+  size: number;
 }
 
 /**
@@ -77,10 +115,16 @@ export async function patchAsar(
     asar.extractAll(asarPath, extractDir);
     await mutate(extractDir);
 
-    await asar.createPackageWithOptions(extractDir, outAsar, {
+    const output = await (dependencies.createPackage ?? asar.createPackageWithOptions)(extractDir, outAsar, {
       globOptions: { dot: true },
       ...originalUnpackOptions,
     });
+    // @electron/asar 3.4.1 resolves createPackageWithOptions() with its output
+    // stream immediately after calling end(), before the stream necessarily
+    // emits finish. Do not read or copy the archive until every queued byte has
+    // reached the file and late stream errors can no longer surface.
+    await finished(output);
+    const packedArchive = validateCompleteAsar(outAsar);
 
     // Atomic-ish replace: write next to the target, then rename. This prevents
     // a denied write (e.g. macOS App Management TCC) from leaving the bundle
@@ -89,10 +133,17 @@ export async function patchAsar(
     const stagingPath = `${asarPath}.tweaker-new`;
     try {
       (dependencies.copyFile ?? cpSync)(outAsar, stagingPath);
+      const stagedArchive = validateCompleteAsar(stagingPath);
+      if (
+        stagedArchive.archiveSize !== packedArchive.archiveSize
+        || stagedArchive.headerHash !== packedArchive.headerHash
+      ) {
+        throw new Error(`Incomplete ASAR archive at ${stagingPath}: staged copy does not match packed output`);
+      }
       renameSync(stagingPath, asarPath);
       // The on-disk asar just changed underneath any cached header for this path.
       uncacheAsar(asarPath);
-      return readHeaderHash(asarPath);
+      return { headerHash: stagedArchive.headerHash, header: stagedArchive.header };
     } catch (e) {
       throw annotatePermError(e, asarPath);
     } finally {
@@ -102,6 +153,112 @@ export async function patchAsar(
     }
   } finally {
     await cleanupTempTree(work);
+  }
+}
+
+/**
+ * Reject archives whose declared packed payload does not reach the physical
+ * EOF, then verify the integrity hash of the packed entry that reaches EOF.
+ * The EOF check catches a short pack/copy without reading the whole archive;
+ * hashing the final entry also proves that the tail is readable and complete.
+ */
+function validateCompleteAsar(asarPath: string): CompleteAsarInfo {
+  uncacheAsar(asarPath);
+  const raw = (asar as unknown as {
+    getRawHeader: (p: string) => { header: AsarEntry; headerString: string; headerSize: number };
+  }).getRawHeader(asarPath);
+  const headerHash = createHash("sha256").update(raw.headerString).digest("hex");
+  const packedEntries: PackedAsarEntry[] = [];
+  collectPackedEntries(raw.header, "", packedEntries);
+
+  let payloadSize = 0n;
+  let finalEntry: PackedAsarEntry | undefined;
+  for (const entry of packedEntries) {
+    const end = entry.offset + BigInt(entry.size);
+    if (
+      end > payloadSize
+      || (end === payloadSize && entry.size > (finalEntry?.size ?? -1))
+    ) {
+      payloadSize = end;
+      finalEntry = entry;
+    }
+  }
+
+  const archiveSize = statSync(asarPath, { bigint: true }).size;
+  const expectedSize = 8n + BigInt(raw.headerSize) + payloadSize;
+  if (archiveSize !== expectedSize) {
+    throw new Error(
+      `Incomplete ASAR archive at ${asarPath}: expected EOF at ${expectedSize}, found ${archiveSize}`,
+    );
+  }
+
+  if (finalEntry) verifyPackedEntryIntegrity(asarPath, raw.headerSize, finalEntry);
+  return { archiveSize, headerHash, header: raw.header };
+}
+
+function collectPackedEntries(
+  entry: AsarEntry,
+  parentPath: string,
+  packedEntries: PackedAsarEntry[],
+): void {
+  if (entry.files) {
+    for (const [name, child] of Object.entries(entry.files)) {
+      collectPackedEntries(child, parentPath ? `${parentPath}/${name}` : name, packedEntries);
+    }
+    return;
+  }
+  if (entry.unpacked || typeof entry.link === "string") return;
+
+  if (!Number.isSafeInteger(entry.size) || (entry.size as number) < 0) {
+    throw new Error(`Invalid packed ASAR entry size for ${parentPath}`);
+  }
+  if (typeof entry.offset !== "string" || !/^\d+$/.test(entry.offset)) {
+    throw new Error(`Invalid packed ASAR entry offset for ${parentPath}`);
+  }
+  if (!entry.integrity || entry.integrity.algorithm !== "SHA256") {
+    throw new Error(`Missing SHA256 integrity for packed ASAR entry ${parentPath}`);
+  }
+  if (typeof entry.integrity.hash !== "string" || !/^[a-f0-9]{64}$/i.test(entry.integrity.hash)) {
+    throw new Error(`Invalid SHA256 integrity for packed ASAR entry ${parentPath}`);
+  }
+
+  packedEntries.push({
+    integrity: entry.integrity,
+    offset: BigInt(entry.offset),
+    path: parentPath,
+    size: entry.size as number,
+  });
+}
+
+function verifyPackedEntryIntegrity(asarPath: string, headerSize: number, entry: PackedAsarEntry): void {
+  const absoluteOffset = 8n + BigInt(headerSize) + entry.offset;
+  if (absoluteOffset > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Packed ASAR entry offset exceeds the safe read range for ${entry.path}`);
+  }
+
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(Math.min(entry.size, 1024 * 1024));
+  const fd = openSync(asarPath, "r");
+  let bytesRead = 0;
+  try {
+    while (bytesRead < entry.size) {
+      const length = Math.min(buffer.length, entry.size - bytesRead);
+      const count = readSync(fd, buffer, 0, length, Number(absoluteOffset) + bytesRead);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      bytesRead += count;
+    }
+  } finally {
+    closeSync(fd);
+  }
+
+  if (bytesRead !== entry.size) {
+    throw new Error(
+      `Incomplete ASAR archive at ${asarPath}: could not read ${entry.path} through its declared EOF`,
+    );
+  }
+  if (hash.digest("hex") !== entry.integrity.hash) {
+    throw new Error(`Corrupt ASAR archive at ${asarPath}: integrity mismatch for ${entry.path}`);
   }
 }
 

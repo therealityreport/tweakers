@@ -1,0 +1,10 @@
+{
+  "answers": {
+    "scanner_setup": { "status": "answered", "selected_option_ids": ["separate"], "other_text": null },
+    "proof": { "status": "answered", "selected_option_ids": ["tests", "review"], "other_text": null }
+  },
+  "normalized": {
+    "scanner_setup": { "status": "answered", "selected_option_ids": ["separate"], "other_text": null },
+    "proof": { "status": "answered", "selected_option_ids": ["tests", "review"], "other_text": null }
+  }
+}

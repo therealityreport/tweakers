@@ -5,8 +5,9 @@
  * NOT a modal dialog. The sidebar lives inside a `<div class="flex flex-col
  * gap-1 gap-0">` wrapper that holds one or more `<div class="flex flex-col
  * gap-px">` groups of buttons. There are no stable `role` / `aria-label` /
- * `data-testid` hooks on the shell so we identify the sidebar by text-content
- * match against known item labels (General, Appearance, Configuration, …).
+ * `data-testid` hook on the shell. Native settings rows do expose stable
+ * `data-settings-panel-slug` markers, so those own the surface and localized
+ * item labels only rank candidates inside that surface.
  *
  * Layout we inject:
  *
@@ -38,6 +39,8 @@ import {
 } from "../tweak-store";
 import {
   buildSettingsNavigationModel,
+  hasNativeSettingsSidebarOwnership,
+  isNativeSettingsSidebarEvidence,
   type SettingsNavigationItem,
 } from "./settings-page-model";
 import {
@@ -49,11 +52,8 @@ import {
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
-  desktopUpdatePresentation,
   desktopUpdateStatusPresentation,
-  humanizeCodexPhase,
   restoreEnvironmentFocus,
-  type DesktopUpdatePresentation,
   type EnvironmentConfirmationDecision,
 } from "./environment-config-controller";
 import type {
@@ -91,6 +91,31 @@ interface TweakUpdateCheck {
   releaseUrl: string | null;
   updateAvailable: boolean;
   error?: string;
+}
+
+interface TweakVersionDriftRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  hasMcp: boolean;
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  status: "current" | "drift" | "missing";
+  reason: string;
+}
+
+interface TweakHealthSnapshot {
+  checkedAt: string;
+  catalogCount: number;
+  installedCount: number;
+  enabledCount: number;
+  liveDriftCount: number;
+  runtimeDriftCount: number;
+  missingLiveCount: number;
+  missingRuntimeCount: number;
+  mcpRestartRequired: boolean;
+  rows: TweakVersionDriftRow[];
 }
 
 interface TweakerConfig {
@@ -224,6 +249,8 @@ interface EnvironmentTransaction {
   } | null;
   helper?: EnvironmentHelperStatus | null;
   updatedAt?: string;
+  /** Output-only annotation from the CLI: liveness of the recorded owner PID. */
+  ownerAlive?: boolean;
 }
 
 interface McpSyncState {
@@ -268,10 +295,11 @@ interface DesktopUpdateTransactionState {
   resumable?: boolean;
   nativeUpdateHandoffAt?: string | null;
   refreshSource?: "development" | "stable" | null;
-  environmentTransactionId?: string | null;
   error?: string | null;
   updatedAt?: string;
-  blocksLifecycle?: boolean;
+  terminalAt?: string | null;
+  /** Output-only annotation from the CLI: liveness of the recorded owner PID. */
+  ownerAlive?: boolean | null;
 }
 
 type CodexUiReload = (mode?: "operation-start" | "operation-stop") => void;
@@ -378,6 +406,8 @@ interface InjectorState {
   sidebarRestoreHandler: ((e: Event) => void) | null;
   settingsSurfaceVisible: boolean;
   settingsSurfaceHideTimer: ReturnType<typeof setTimeout> | null;
+  /** Last tryInject sidebar probe outcome so repeated misses log once per transition. */
+  sidebarProbeStatus: "found" | "missing" | "rejected" | null;
   tweakStore: TweakStoreRegistryView | null;
   tweakStorePromise: Promise<TweakStoreRegistryView> | null;
   tweakStoreError: unknown;
@@ -407,6 +437,7 @@ const state: InjectorState = {
   sidebarRestoreHandler: null,
   settingsSurfaceVisible: false,
   settingsSurfaceHideTimer: null,
+  sidebarProbeStatus: null,
   tweakStore: null,
   tweakStorePromise: null,
   tweakStoreError: null,
@@ -634,7 +665,12 @@ function tryInject(): void {
   const itemsGroup = findSidebarItemsGroup();
   if (!itemsGroup) {
     scheduleSettingsSurfaceHidden();
-    plog("sidebar not found");
+    // tryInject polls every 500ms; log only on the transition into this state
+    // so repeated misses don't flood preload.log.
+    if (state.sidebarProbeStatus !== "missing") {
+      state.sidebarProbeStatus = "missing";
+      plog("sidebar not found");
+    }
     return;
   }
   if (state.settingsSurfaceHideTimer) {
@@ -647,12 +683,18 @@ function tryInject(): void {
   const outer = itemsGroup;
   if (!isSettingsSidebarCandidate(itemsGroup)) {
     scheduleSettingsSurfaceHidden();
-    plog("rejected non-settings sidebar candidate", {
-      itemsGroup: describe(itemsGroup),
-      outer: describe(outer),
-    });
+    // Same transition-only throttling as the "sidebar not found" branch.
+    if (state.sidebarProbeStatus !== "rejected") {
+      state.sidebarProbeStatus = "rejected";
+      plog("rejected non-settings sidebar candidate", {
+        itemsGroup: describe(itemsGroup),
+        outer: describe(outer),
+      });
+    }
     return;
   }
+  // Success transition already logs via setSettingsSurfaceVisible("sidebar-found").
+  state.sidebarProbeStatus = "found";
   state.sidebarRoot = outer;
   syncNativeSettingsHeader(itemsGroup, outer);
   bindSettingsSearch(outer);
@@ -814,7 +856,7 @@ function scheduleSettingsSurfaceHidden(): void {
 }
 
 function isSettingsTextVisible(): boolean {
-  return isTweakerSettingsLabelSet(tweakerSettingsLabelsFrom(document));
+  return nativeSettingsPanelSlugCount(document) >= 2;
 }
 
 function compactSettingsText(value: string): string {
@@ -979,17 +1021,14 @@ function tweakerMarkerCount(labels: string[], markers: string[]): number {
   return matched.size;
 }
 
-function hasTweakerSettingsOnlySignal(labels: string[]): boolean {
-  return tweakerMarkerCount(labels, TWEAKER_SETTINGS_ONLY_LABELS) > 0;
-}
-
-function hasMainAppSidebarSignals(labels: string[]): boolean {
-  return tweakerMarkerCount(labels, TWEAKER_MAIN_APP_NAV_LABELS) >= 2;
-}
-
-function isTweakerSettingsLabelSet(labels: string[]): boolean {
-  const score = tweakerSettingsLabelScore(labels);
-  return score.core >= 2 && score.total >= 3;
+function nativeSettingsPanelSlugCount(root: ParentNode): number {
+  const slugs = new Set<string>();
+  for (const element of Array.from(root.querySelectorAll<HTMLElement>("[data-settings-panel-slug]"))) {
+    if (element.closest("[data-tweaker]")) continue;
+    const slug = element.dataset.settingsPanelSlug?.trim();
+    if (slug) slugs.add(slug);
+  }
+  return slugs.size;
 }
 
 function tweakerVisibleBox(el: HTMLElement): DOMRect | null {
@@ -1442,6 +1481,7 @@ function renderConfigPage(
   const cardUpdates = new ConfigCardUpdateCoordinator<unknown>();
   cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
   cleanups.push(renderDesktopUpdateSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderTweaksHealthSection(sectionsWrap, cardUpdates));
   cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
   cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
 
@@ -1510,6 +1550,7 @@ function renderEnvironmentSection(
   let externalBusy = false;
   let environmentActionError: string | null = null;
   let transactionPolling: ReturnType<typeof setTimeout> | null = null;
+  let lastTransactionFetchFailed = false;
 
   const currentSelection = (): EnvironmentSelection | null => environment?.selected ?? null;
   const hasPendingChanges = (): boolean => environment !== null && environmentController.snapshot.hasPendingChanges;
@@ -1524,15 +1565,16 @@ function renderEnvironmentSection(
   const scheduleEnvironmentTransactionPoll = (): void => {
     if (transactionPolling) clearTimeout(transactionPolling);
     transactionPolling = null;
-    if (
-      !card.isConnected
-      || !transaction
-      || environmentTransactionIsTerminal(transaction.phase)
-    ) return;
+    if (!card.isConnected) return;
+    // A null transaction after a FAILED fetch must not end polling: a
+    // transiently failing `environment transaction --json` would otherwise
+    // hide an in-flight or stranded receipt until the tab is re-mounted.
+    if (!transaction && !lastTransactionFetchFailed) return;
+    if (transaction && environmentTransactionIsTerminal(transaction.phase)) return;
     transactionPolling = setTimeout(() => {
       transactionPolling = null;
       void loadEnvironmentTransaction();
-    }, 900);
+    }, lastTransactionFetchFailed ? 5_000 : 900);
   };
 
   async function prepareEnvironmentSelection(
@@ -1650,10 +1692,16 @@ function renderEnvironmentSection(
     externalBusy = true;
     draw();
     void ipcRenderer
-      .invoke("tweaker:rollback-environment", { transactionId: receipt.transactionId })
+      .invoke("tweaker:recover-environment", { transactionId: receipt.transactionId })
       .then((result) => {
-        transaction = normalizeEnvironmentTransaction(result) ?? receipt;
-        environmentActionError = null;
+        const next = normalizeEnvironmentTransaction(result) ?? receipt;
+        transaction = next;
+        // The CLI returns its durable receipt whether or not recovery
+        // succeeded. A receipt still sitting in `failed` is a failure, not a
+        // result to render silently.
+        environmentActionError = next.phase === "failed"
+          ? `Could not recover the app mode safely: ${next.error ?? "the transaction is still failed"}`
+          : null;
         externalBusy = false;
         draw();
         scheduleEnvironmentTransactionPoll();
@@ -1871,6 +1919,7 @@ function renderEnvironmentSection(
     try {
       const result = await ipcRenderer.invoke("tweaker:get-environment-transaction");
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      lastTransactionFetchFailed = false;
       const previous = transaction;
       transaction = normalizeEnvironmentTransaction(result);
       if (
@@ -1906,6 +1955,7 @@ function renderEnvironmentSection(
       }
     } catch (error) {
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      lastTransactionFetchFailed = true;
       if (transaction) {
         transaction = {
           ...transaction,
@@ -1935,6 +1985,7 @@ function renderEnvironmentSection(
         if (environment?.selected) environmentController.setSelected(environment.selected);
       }
       if (transactionIsCurrent) {
+        lastTransactionFetchFailed = false;
         transaction = normalizeEnvironmentTransaction(transactionResult);
         restorePersistedRequest();
       }
@@ -1944,6 +1995,14 @@ function renderEnvironmentSection(
       if ((!cardUpdates.isCurrent(statusUpdate) && !cardUpdates.isCurrent(transactionUpdate)) || !card.isConnected) return;
       card.textContent = "";
       card.appendChild(rowSimple("Could not load environment", safeUiError(error)));
+      // Never latch on a failed initial load: an in-flight or stranded
+      // receipt would stay invisible until the tab was re-mounted (this is
+      // exactly how a Recover banner once hid for ~40 minutes). Retry slowly
+      // while the card stays mounted.
+      lastTransactionFetchFailed = true;
+      setTimeout(() => {
+        if (card.isConnected) void load();
+      }, 5_000);
     }
   };
 
@@ -2146,7 +2205,10 @@ function environmentTransactionRow(
   actionsConfig?: EnvironmentTransactionRowActions,
 ): HTMLElement {
   const helperFailure = environmentHelperFailureDetail(transaction);
+  const ownerExited = transaction.ownerAlive === false
+    && !environmentTransactionIsTerminal(transaction.phase);
   const details = [
+    ownerExited ? "Owner process exited — recovery required." : null,
     environmentTransactionLabel(transaction.phase),
     transaction.error,
     helperFailure,
@@ -2156,7 +2218,12 @@ function environmentTransactionRow(
     [...new Set(details)].join(" · "),
   );
   const left = row.firstElementChild as HTMLElement | null;
-  if (left) left.prepend(statusBadge(environmentTransactionTone(transaction.phase), environmentTransactionLabel(transaction.phase)));
+  if (left) {
+    left.prepend(statusBadge(
+      ownerExited ? "error" : environmentTransactionTone(transaction.phase),
+      environmentTransactionLabel(transaction.phase),
+    ));
+  }
   const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   if (actionsConfig?.onResume) {
     const resume = compactButton("Resume/Confirm", actionsConfig.onResume);
@@ -2334,8 +2401,9 @@ function renderDesktopUpdateSection(
   let transactionPollFailures = 0;
   let awaitingTransactionReceiptUntil = 0;
   let initialResultSuperseded = false;
+  let transactionFetchFailed = false;
 
-  const transactionIsActive = (): boolean => {
+  const transactionIsNonTerminal = (): boolean => {
     if (!transaction?.transactionId) {
       return transaction?.phase === "preparing" && Date.now() < awaitingTransactionReceiptUntil;
     }
@@ -2343,7 +2411,12 @@ function renderDesktopUpdateSection(
   };
   const scheduleTransactionPoll = (delayMs = 2_000): void => {
     if (polling) clearTimeout(polling);
-    if (!card.isConnected || (!transactionIsActive() && transaction?.resumable !== true)) return;
+    // A failed fetch must keep polling even with no known transaction: a
+    // stranded receipt would otherwise stay invisible until tab re-mount.
+    if (!card.isConnected
+      || (!transactionIsNonTerminal()
+        && transaction?.resumable !== true
+        && !transactionFetchFailed)) return;
     polling = setTimeout(() => {
       polling = null;
       void loadTransaction();
@@ -2354,6 +2427,7 @@ function renderDesktopUpdateSection(
     try {
       const value = await ipcRenderer.invoke("tweaker:get-codex-desktop-update-transaction");
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      transactionFetchFailed = false;
       const observed = normalizeDesktopUpdateTransaction(value);
       if (observed?.phase === "idle"
         && observed.transactionId === null
@@ -2367,7 +2441,8 @@ function renderDesktopUpdateSection(
           };
         }
       } else {
-        transaction = observed;
+        const idleWithoutReceipt = observed?.phase === "idle" && observed.transactionId === null;
+        transaction = idleWithoutReceipt ? null : observed;
         if (transaction?.transactionId) awaitingTransactionReceiptUntil = 0;
       }
       transactionPollFailures = 0;
@@ -2375,11 +2450,16 @@ function renderDesktopUpdateSection(
       scheduleTransactionPoll();
     } catch (error) {
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
-      transaction = {
-        transactionId: transaction?.transactionId ?? null,
-        phase: transaction?.phase ?? "preparing",
-        error: safeUiError(error),
-      };
+      transactionFetchFailed = true;
+      // With no known transaction, keep it null: fabricating a phantom
+      // "preparing" row both misinforms and used to satisfy no poll gate,
+      // permanently hiding any real stranded receipt on disk.
+      if (transaction) {
+        transaction = {
+          ...transaction,
+          error: safeUiError(error),
+        };
+      }
       draw();
       transactionPollFailures += 1;
       const backoff = Math.min(30_000, 1_000 * (2 ** Math.min(transactionPollFailures - 1, 5)));
@@ -2393,11 +2473,6 @@ function renderDesktopUpdateSection(
     const installed = result?.installed?.marketingVersion ?? "Unavailable";
     const latest = result?.latest?.marketingVersion ?? "Unavailable";
     const status = desktopUpdateStatusPresentation(result?.status);
-    const presentation = desktopUpdatePresentation({
-      busy,
-      status: result?.status,
-      transaction,
-    });
     const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
     const left = row.firstElementChild as HTMLElement | null;
     left?.prepend(statusBadge(status.tone, status.label));
@@ -2434,7 +2509,12 @@ function renderDesktopUpdateSection(
         .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
         .finally(() => { busy = false; draw(); });
     });
-    update.disabled = presentation.updateDisabled;
+    // Gate on non-terminal (not "active"): a stranded dead-owner receipt still
+    // blocks start() on disk, so the button must stay disabled until recovery.
+    update.disabled = busy
+      || result?.status !== "update-available"
+      || transactionIsNonTerminal()
+      || transaction?.resumable === true;
     actions?.appendChild(update);
     card.appendChild(row);
     if (result?.setupRequired) {
@@ -2447,7 +2527,7 @@ function renderDesktopUpdateSection(
       ));
     }
     if (result?.checkedAt) card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
-    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, presentation, {
+    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, {
       busy,
       onResume: () => {
         if (busy) return;
@@ -2533,29 +2613,142 @@ function normalizeDesktopUpdateTransaction(value: unknown): DesktopUpdateTransac
 
 function desktopUpdateTransactionRow(
   transaction: DesktopUpdateTransactionState,
-  presentation: DesktopUpdatePresentation,
   actions: { busy: boolean; onResume: () => void; onCancel: () => void },
 ): HTMLElement {
+  const phase = humanizeCodexPhase(transaction.phase);
+  const nonTerminal = !["completed", "failed", "rolled_back"].includes(transaction.phase);
+  // ownerAlive === false on a non-terminal receipt means the coordinator died
+  // mid-flight: the receipt is stranded, not progressing.
+  const ownerExited = nonTerminal && transaction.ownerAlive === false;
   const detail = [
+    ownerExited ? "Owner process exited — recovery required." : null,
     transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
     transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
     transaction.refreshSource ? `${transaction.refreshSource} Tweakers refresh` : null,
+    typeof transaction.terminalAt === "string"
+      ? `Terminal at ${new Date(transaction.terminalAt).toLocaleString()}`
+      : transaction.updatedAt
+        ? `Last update at ${new Date(transaction.updatedAt).toLocaleString()}`
+        : null,
     transaction.error ?? null,
   ].filter(Boolean).join(" · ") || "Waiting for the durable updater receipt.";
   const row = actionRow("Update and Reload", detail);
   row.setAttribute("role", "status");
   row.setAttribute("aria-live", "polite");
   const left = row.firstElementChild as HTMLElement | null;
-  if (presentation.tone && presentation.phaseLabel) {
-    left?.prepend(statusBadge(presentation.tone, presentation.phaseLabel));
-  }
+  const tone = transaction.phase === "completed"
+    ? "ok"
+    : ownerExited || (transaction.phase === "failed" && !transaction.resumable)
+      ? "error"
+      : "warn";
+  left?.prepend(statusBadge(tone, phase));
   const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
-  for (const action of presentation.actions) {
-    const handler = action.kind === "resume" ? actions.onResume : actions.onCancel;
-    const button = compactButton(action.label, handler);
-    button.disabled = action.disabled;
-    controls?.appendChild(button);
+  const canResume = transaction.resumable === true
+    && (transaction.phase === "failed" || transaction.phase === "rolled_back");
+  // cancelUnlocked handles exited owners for these stranded phases via
+  // recoverExitedOwner, so a dead-owner receipt gets a safe-recovery Cancel.
+  const deadOwnerRecoverable = ownerExited
+    && ["switching_to_chatgpt", "returning_to_tweakers", "refreshing_runtime", "verifying", "preparing"]
+      .includes(transaction.phase);
+  const canCancel = transaction.phase === "awaiting_native_update"
+    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase))
+    || deadOwnerRecoverable;
+  if (canResume) {
+    const resume = compactButton("Resume", actions.onResume);
+    resume.disabled = actions.busy;
+    controls?.appendChild(resume);
   }
+  if (canCancel) {
+    const cancel = compactButton("Cancel", actions.onCancel);
+    cancel.disabled = actions.busy;
+    controls?.appendChild(cancel);
+  }
+  return row;
+}
+
+function renderTweaksHealthSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Tweaks Health"));
+  const card = roundedCard();
+  card.dataset.tweakerTweaksHealthCard = "true";
+  card.appendChild(rowSimple("Checking tweaks", "Comparing live copies, bundled runtime copies, and latest stored catalog versions."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  const render = (snapshot: TweakHealthSnapshot): void => {
+    card.textContent = "";
+    const missingCount = snapshot.missingLiveCount + snapshot.missingRuntimeCount;
+    const totalProblems = snapshot.liveDriftCount
+      + snapshot.runtimeDriftCount
+      + missingCount
+      + (snapshot.mcpRestartRequired ? 1 : 0);
+    const summary = actionRow(
+      "Installed Tweaks",
+      `${snapshot.installedCount} installed · ${snapshot.enabledCount} enabled · ${snapshot.catalogCount} latest stored catalog entries.`,
+    );
+    summary.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
+      statusBadge(totalProblems === 0 ? "ok" : "warn", totalProblems === 0 ? "Current" : "Review"),
+    );
+    card.appendChild(summary);
+
+    if (totalProblems === 0) {
+      card.appendChild(rowSimple(
+        "Version Drift",
+        "All installed live copies and bundled runtime copies match the latest stored catalog versions.",
+      ));
+    } else {
+      card.appendChild(rowSimple(
+        "Version Drift",
+        [
+          `${snapshot.liveDriftCount} outdated live ${snapshot.liveDriftCount === 1 ? "copy" : "copies"}`,
+          `${snapshot.runtimeDriftCount} outdated runtime ${snapshot.runtimeDriftCount === 1 ? "copy" : "copies"}`,
+          `${missingCount} missing ${missingCount === 1 ? "copy" : "copies"}`,
+          snapshot.mcpRestartRequired ? "MCP restart required" : null,
+        ].filter(Boolean).join(" · "),
+      ));
+      for (const row of snapshot.rows.filter((candidate) => candidate.status !== "current")) {
+        card.appendChild(tweakHealthDriftRow(row));
+      }
+    }
+    if (snapshot.mcpRestartRequired) {
+      card.appendChild(rowSimple(
+        "MCP Process State",
+        "The managed MCP config changed. Start a new task or restart Codex to replace already-running MCP processes.",
+      ));
+    }
+    card.appendChild(rowSimple("Last checked", new Date(snapshot.checkedAt).toLocaleString()));
+  };
+
+  const update = cardUpdates.begin("tweaks-health");
+  void ipcRenderer.invoke("tweaker:get-tweaks-health")
+    .then((value) => {
+      if (!card.isConnected || !cardUpdates.complete(update, value)) return;
+      render(value as TweakHealthSnapshot);
+    })
+    .catch((error) => {
+      if (!card.isConnected || !cardUpdates.complete(update, error)) return;
+      card.textContent = "";
+      card.appendChild(rowSimple("Tweaks health unavailable", safeUiError(error)));
+    });
+  return () => {
+    cardUpdates.invalidate("tweaks-health");
+  };
+}
+
+function tweakHealthDriftRow(drift: TweakVersionDriftRow): HTMLElement {
+  const row = actionRow(
+    drift.name,
+    `${drift.reason} Live: ${drift.liveVersion ?? "missing"} · Runtime: ${drift.runtimeVersion ?? "missing"} · Latest stored: ${drift.catalogVersion ?? "missing"}.`,
+  );
+  makeCodexRowResponsive(row);
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  actions?.appendChild(statusBadge(drift.status === "missing" ? "error" : "warn", drift.status === "missing" ? "Missing" : "Outdated"));
+  if (drift.enabled) actions?.appendChild(codexNeutralBadge("Enabled"));
+  if (drift.hasMcp) actions?.appendChild(codexNeutralBadge("MCP"));
   return row;
 }
 
@@ -3305,6 +3498,10 @@ function runCodexAction(
 
 function safeUiError(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "Unknown error");
+}
+
+function humanizeCodexPhase(value: string): string {
+  return value.replace(/[-_]/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatBytes(value: number): string {
@@ -5434,17 +5631,20 @@ function isSettingsSidebarCandidate(el: HTMLElement): boolean {
   const rect = tweakerVisibleBox(el);
   if (!rect) return false;
 
-  // Current Codex Settings sidebar: left column, not the main content panel.
-  if (rect.width < 120 || rect.width > 620) return false;
-  if (rect.height < 80) return false;
-  if (rect.left > window.innerWidth * 0.65) return false;
-
   const labels = tweakerSettingsLabelsFrom(el);
-  if (hasMainAppSidebarSignals(labels) && !hasTweakerSettingsOnlySignal(labels)) {
-    return false;
-  }
-
-  return isTweakerSettingsLabelSet(labels);
+  const score = tweakerSettingsLabelScore(labels);
+  return isNativeSettingsSidebarEvidence({
+    width: rect.width,
+    height: rect.height,
+    left: rect.left,
+    viewportWidth: window.innerWidth,
+    forbiddenSurface: isForbiddenSettingsSidebarSurface(el),
+    nativePanelSlugCount: nativeSettingsPanelSlugCount(el),
+    coreLabelCount: score.core,
+    totalLabelCount: score.total,
+    mainAppLabelCount: tweakerMarkerCount(labels, TWEAKER_MAIN_APP_NAV_LABELS),
+    settingsOnlyLabelCount: tweakerMarkerCount(labels, TWEAKER_SETTINGS_ONLY_LABELS),
+  });
 }
 
 function removeMisplacedSettingsGroups(): void {
@@ -5461,16 +5661,18 @@ function removeMisplacedSettingsGroups(): void {
 function isTweakerInjectedSettingsGroupPlacementValid(group: HTMLElement): boolean {
   if (isForbiddenSettingsSidebarSurface(group)) return false;
 
-  // Trust the injection-time placement while that exact sidebar node is
-  // alive. isSettingsSidebarCandidate is layout-dependent (visible box), so
-  // re-judging mid React re-render intermittently fails, strips the group,
-  // and re-triggers the observer — an inject/remove loop at render speed.
+  // Keep the injection-time placement only while the connected root still
+  // owns native Settings rows. This avoids layout-dependent re-judging while
+  // ensuring a false-positive thread or side panel cannot retain the group.
   if (
     state.sidebarRoot &&
     state.sidebarRoot.isConnected &&
     (group.parentElement === state.sidebarRoot || state.sidebarRoot.contains(group))
   ) {
-    return true;
+    return hasNativeSettingsSidebarOwnership({
+      forbiddenSurface: isForbiddenSettingsSidebarSurface(state.sidebarRoot),
+      nativePanelSlugCount: nativeSettingsPanelSlugCount(state.sidebarRoot),
+    });
   }
 
   let node = group.parentElement;

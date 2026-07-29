@@ -24,14 +24,72 @@ import {
   type McpReconciler,
   readMcpSyncState,
   reconcileMcpConfig,
+  userQuestionsMcpReceiptMatchesEnabledState,
 } from "../src/mcp-reconciliation";
-import { sanitizePreservedApprovalPolicy } from "../src/mcp-sync";
+import {
+  USER_QUESTIONS_MCP_SERVER_NAME,
+  sanitizePreservedApprovalPolicy,
+} from "../src/mcp-sync";
 
 const MALFORMED_TOML_FIXTURE = Buffer.from([
   ...Buffer.from('[mcp_servers.manual]\ncommand = "manual"\n\n[unrelated]\nvalue = "unterminated\n'),
 ]);
 
-const QUESTION_ONLY_APPROVAL_POLICY = "approval_policy = { granular = { sandbox_approval = false, rules = false, skill_approval = false, request_permissions = false, mcp_elicitations = true } }";
+test("promotion MCP receipt matches canonical registration without requiring a policy mutation", () => {
+  const enabled = {
+    status: "updated" as const,
+    desiredNames: [USER_QUESTIONS_MCP_SERVER_NAME],
+    appliedNames: [USER_QUESTIONS_MCP_SERVER_NAME],
+    conflicts: [],
+    approvalPolicy: {
+      status: "unchanged" as const,
+      beforeRaw: 'approval_policy = "never"',
+      afterRaw: 'approval_policy = "never"',
+      preservedOriginalRaw: null,
+      preservedOriginalPresent: false,
+      sandboxModeBeforeRaw: 'sandbox_mode = "workspace-write"',
+      sandboxModeAfterRaw: 'sandbox_mode = "workspace-write"',
+      restartRequired: false,
+    },
+  };
+  const disabled = {
+    ...enabled,
+    status: "unchanged" as const,
+    desiredNames: [],
+    appliedNames: [],
+    approvalPolicy: {
+      ...enabled.approvalPolicy,
+      status: "unchanged" as const,
+      afterRaw: 'approval_policy = "never"',
+      restartRequired: false,
+    },
+  };
+
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(enabled, true), true);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(enabled, false), false);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(disabled, false), true);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(disabled, true), false);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
+    ...enabled,
+    approvalPolicy: { ...enabled.approvalPolicy, status: "managed" as const },
+  }, true), false);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
+    ...enabled,
+    approvalPolicy: { ...enabled.approvalPolicy, afterRaw: 'approval_policy = "on-request"' },
+  }, true), false);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
+    ...enabled,
+    approvalPolicy: { ...enabled.approvalPolicy, sandboxModeAfterRaw: 'sandbox_mode = "danger-full-access"' },
+  }, true), false);
+  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
+    ...disabled,
+    conflicts: [{
+      observedName: USER_QUESTIONS_MCP_SERVER_NAME,
+      canonicalName: USER_QUESTIONS_MCP_SERVER_NAME,
+      reason: "canonical-collision" as const,
+    }],
+  }, false), false);
+});
 
 test("sanitizePreservedApprovalPolicy accepts one assignment and rejects injected statements", () => {
   assert.deepEqual(sanitizePreservedApprovalPolicy({
@@ -76,10 +134,60 @@ test("reconcileMcpConfig atomically preserves config mode and writes a private r
   });
 });
 
-test("reconcileMcpConfig manages and restores the User Questions approval policy", () => {
+test("a no-op reconciliation preserves the last managed MCP change watermark", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
+    const firstChangeAt = new Date("2026-07-24T20:00:00.000Z");
+    const laterNoOpAt = new Date("2026-07-24T20:05:00.000Z");
+    const tweaks = [{
+      dir: root,
+      manifest: {
+        id: "co.tweakers.example",
+        mcp: { command: "node" },
+      },
+    }];
+    writeFileSync(configPath, "# user config\n", { mode: 0o600 });
+
+    const changed = reconcileMcpConfig({
+      configPath,
+      statePath,
+      trigger: "startup",
+      tweaks,
+    }, {
+      now: () => firstChangeAt,
+    });
+    assert.equal(changed.restartRequired, true);
+    assert.equal(changed.managedConfigurationChangedAt, firstChangeAt.toISOString());
+
+    const unchanged = reconcileMcpConfig({
+      configPath,
+      statePath,
+      trigger: "config-change",
+      tweaks,
+    }, {
+      now: () => laterNoOpAt,
+    });
+
+    assert.equal(unchanged.status, "unchanged");
+    assert.equal(unchanged.restartRequired, false);
+    assert.equal(unchanged.completedAt, laterNoOpAt.toISOString());
+    assert.equal(unchanged.managedConfigurationChangedAt, firstChangeAt.toISOString());
+    assert.equal(
+      readMcpSyncState(statePath)?.managedConfigurationChangedAt,
+      firstChangeAt.toISOString(),
+    );
+  });
+});
+
+test("ordinary User Questions reconciliation preserves policy bytes while registering and removing MCP", () => {
+  withTempDir((root) => {
+    const configPath = join(root, "config.toml");
+    const statePath = join(root, "mcp-sync-state.json");
+    const globalPolicyPath = join(root, ".codex-global-state.json");
+    const globalPolicyBytes = Buffer.from('{"private":"policy bytes"}\n');
+    writeFileSync(globalPolicyPath, globalPolicyBytes, { mode: 0o600 });
+    const globalPolicyFingerprint = fingerprint(globalPolicyBytes);
     const serverPath = join(root, "mcp-server.js");
     writeFileSync(serverPath, "");
     const userQuestions = [{
@@ -109,11 +217,16 @@ test("reconcileMcpConfig manages and restores the User Questions approval policy
 
     const enabledToml = readFileSync(configPath, "utf8");
     assert.equal(enabled.schemaVersion, 2);
-    assert.equal(enabled.approvalPolicy.status, "managed");
-    assert.equal(enabled.approvalPolicy.preservedOriginalRaw, 'approval_policy = "never" # preserve this exact original');
-    assert.match(enabledToml, new RegExp(QUESTION_ONLY_APPROVAL_POLICY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(enabled.approvalPolicy.status, "unchanged");
+    assert.equal(enabled.approvalPolicy.beforeRaw, 'approval_policy = "never" # preserve this exact original');
+    assert.equal(enabled.approvalPolicy.afterRaw, enabled.approvalPolicy.beforeRaw);
+    assert.equal(enabled.approvalPolicy.sandboxModeBeforeRaw, 'sandbox_mode = "danger-full-access"');
+    assert.equal(enabled.approvalPolicy.sandboxModeAfterRaw, enabled.approvalPolicy.sandboxModeBeforeRaw);
+    assert.match(enabledToml, /^approval_policy = "never" # preserve this exact original$/m);
     assert.match(enabledToml, /sandbox_mode = "danger-full-access"/);
     assert.match(enabledToml, /\[features\]\nhooks = true/);
+    assert.match(enabledToml, /\[mcp_servers\.co-tweakers-user-questions\]/);
+    assert.equal(fingerprint(readFileSync(globalPolicyPath)), globalPolicyFingerprint);
 
     const idempotent = reconcileMcpConfig({
       configPath,
@@ -124,7 +237,7 @@ test("reconcileMcpConfig manages and restores the User Questions approval policy
     });
     assert.equal(idempotent.status, "unchanged");
     assert.equal(idempotent.approvalPolicy.status, "unchanged");
-    assert.equal(idempotent.approvalPolicy.preservedOriginalRaw, 'approval_policy = "never" # preserve this exact original');
+    assert.equal(idempotent.approvalPolicy.preservedOriginalRaw, null);
 
     const disabled = reconcileMcpConfig({
       configPath,
@@ -134,15 +247,17 @@ test("reconcileMcpConfig manages and restores the User Questions approval policy
       ownedTweaks: userQuestions,
     });
     const disabledToml = readFileSync(configPath, "utf8");
-    assert.equal(disabled.approvalPolicy.status, "restored");
+    assert.equal(disabled.approvalPolicy.status, "unchanged");
     assert.match(disabledToml, /^approval_policy = "never" # preserve this exact original$/m);
     assert.doesNotMatch(disabledToml, /mcp_elicitations/);
     assert.match(disabledToml, /sandbox_mode = "danger-full-access"/);
+    assert.doesNotMatch(disabledToml, /mcp_servers\.co-tweakers-user-questions/);
     assert.equal(disabled.preservedApprovalPolicy, null);
+    assert.equal(fingerprint(readFileSync(globalPolicyPath)), globalPolicyFingerprint);
   });
 });
 
-test("reconcileMcpConfig removes a managed approval policy that was originally absent", () => {
+test("reconcileMcpConfig leaves an absent approval policy absent across enable and disable", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
@@ -159,8 +274,9 @@ test("reconcileMcpConfig removes a managed approval policy that was originally a
       tweaks: userQuestions,
       ownedTweaks: userQuestions,
     });
-    assert.deepEqual(enabled.preservedApprovalPolicy, { present: false, rawAssignment: null });
-    assert.match(readFileSync(configPath, "utf8"), /mcp_elicitations = true/);
+    assert.equal(enabled.preservedApprovalPolicy, null);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /approval_policy/);
+    assert.match(readFileSync(configPath, "utf8"), /mcp_servers\.co-tweakers-user-questions/);
 
     reconcileMcpConfig({
       configPath,
@@ -175,7 +291,7 @@ test("reconcileMcpConfig removes a managed approval policy that was originally a
   });
 });
 
-test("reconcileMcpConfig installs and repairs Full Access while User Questions is enabled", () => {
+test("reconcileMcpConfig preserves sandbox policy edits while User Questions is enabled", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
@@ -193,8 +309,8 @@ test("reconcileMcpConfig installs and repairs Full Access while User Questions i
       ownedTweaks: userQuestions,
     });
     assert.equal(enabled.approvalPolicy.sandboxModeBeforeRaw, 'sandbox_mode = "workspace-write"');
-    assert.equal(enabled.approvalPolicy.sandboxModeAfterRaw, 'sandbox_mode = "danger-full-access"');
-    assert.match(readFileSync(configPath, "utf8"), /^sandbox_mode = "danger-full-access"$/m);
+    assert.equal(enabled.approvalPolicy.sandboxModeAfterRaw, 'sandbox_mode = "workspace-write"');
+    assert.match(readFileSync(configPath, "utf8"), /^sandbox_mode = "workspace-write"$/m);
 
     writeFileSync(configPath, readFileSync(configPath, "utf8").replace(/^sandbox_mode.*$/m, 'sandbox_mode = "read-only"'));
     const repaired = reconcileMcpConfig({
@@ -204,8 +320,8 @@ test("reconcileMcpConfig installs and repairs Full Access while User Questions i
       tweaks: userQuestions,
       ownedTweaks: userQuestions,
     });
-    assert.equal(repaired.approvalPolicy.status, "managed");
-    assert.match(readFileSync(configPath, "utf8"), /^sandbox_mode = "danger-full-access"$/m);
+    assert.equal(repaired.approvalPolicy.status, "unchanged");
+    assert.match(readFileSync(configPath, "utf8"), /^sandbox_mode = "read-only"$/m);
   });
 });
 
@@ -285,7 +401,7 @@ test("reconcileMcpConfig recognizes quoted approval_policy keys when detecting d
   });
 });
 
-test("createMcpReconciler repairs approval policy drift back to question-only", async () => {
+test("createMcpReconciler observes approval policy edits without reverting them", async () => {
   await withTempDirAsync(async (root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
@@ -311,11 +427,11 @@ test("createMcpReconciler repairs approval policy drift back to question-only", 
     try {
       await reconciler.reconcileNow("startup");
       const managed = readFileSync(configPath, "utf8");
-      writeFileSync(configPath, managed.replace(QUESTION_ONLY_APPROVAL_POLICY, 'approval_policy = "never"'));
+      writeFileSync(configPath, managed.replace('approval_policy = "never"', 'approval_policy = "on-request"'));
       notifyConfigChange?.(configPath);
       await delay(30);
-      assert.match(readFileSync(configPath, "utf8"), /mcp_elicitations = true/);
-      assert.equal(reconciler.readState()?.approvalPolicy.status, "managed");
+      assert.match(readFileSync(configPath, "utf8"), /^approval_policy = "on-request"$/m);
+      assert.equal(reconciler.readState()?.approvalPolicy.status, "unchanged");
     } finally {
       await reconciler.close();
     }
@@ -417,6 +533,76 @@ test("reconcileMcpConfig applies no partial mutation when any owned MCP conflict
   });
 });
 
+test("reconcileMcpConfig preserves every canonical or legacy ownership ambiguity without suffixing", () => {
+  withTempDir((root) => {
+    const tweakId = "co.tweakers.example";
+    const serverPath = join(root, "server.js");
+    const dataDir = join(root, "tweak-data", tweakId);
+    writeFileSync(serverPath, "");
+    const exactLegacyLines = [
+      "[mcp_servers.co-thomashulihan-example]",
+      'command = "node"',
+      `args = [${JSON.stringify(serverPath)}]`,
+      `env = { TWEAKER_TWEAK_DATA_DIR = ${JSON.stringify(dataDir)}, TWEAKER_TWEAK_ID = ${JSON.stringify(tweakId)} }`,
+      "enabled = true",
+    ];
+    const exactLegacy = `${exactLegacyLines.join("\n")}\n`;
+    const cases = [{
+      name: "canonical-collision",
+      reason: "canonical-collision",
+      toml: `[mcp_servers.co-tweakers-example]\ncommand = "manual"\n${exactLegacy}`,
+    }, {
+      name: "duplicate-legacy",
+      reason: "ambiguous-legacy",
+      toml: `${exactLegacy}${exactLegacy}`,
+    }, {
+      name: "nested-legacy",
+      reason: "legacy-shape-mismatch",
+      toml: `${exactLegacy}[mcp_servers.co-thomashulihan-example.env]\nTOKEN = "manual"\n`,
+    }, {
+      name: "extended-legacy",
+      reason: "legacy-shape-mismatch",
+      toml: `${[...exactLegacyLines, "timeout_sec = 30"].join("\n")}\n`,
+    }, {
+      name: "legacy-shape-mismatch",
+      reason: "legacy-shape-mismatch",
+      toml: exactLegacy.replace('command = "node"', 'command = "manual"'),
+    }] as const;
+    const tweak = {
+      dir: root,
+      dataDir,
+      manifest: {
+        id: tweakId,
+        mcp: { command: "node", args: ["server.js"] },
+      },
+    };
+
+    for (const conflictCase of cases) {
+      const caseRoot = join(root, conflictCase.name);
+      mkdirSync(caseRoot);
+      const configPath = join(caseRoot, "config.toml");
+      const statePath = join(caseRoot, "mcp-sync-state.json");
+      const original = `# ${conflictCase.name} must remain byte-identical\n${conflictCase.toml}`;
+      writeFileSync(configPath, original);
+
+      const receipt = reconcileMcpConfig({
+        configPath,
+        statePath,
+        trigger: "manual-repair",
+        tweaks: [tweak],
+        ownedTweaks: [tweak],
+      });
+
+      assert.equal(receipt.status, "conflict", conflictCase.name);
+      assert.equal(receipt.restartRequired, false, conflictCase.name);
+      assert.equal(receipt.conflicts[0]?.reason, conflictCase.reason, conflictCase.name);
+      assert.equal(readFileSync(configPath, "utf8"), original, conflictCase.name);
+      assert.equal(receipt.beforeFingerprint, receipt.afterFingerprint, conflictCase.name);
+      assert.doesNotMatch(readFileSync(configPath, "utf8"), /co-tweakers-example-2/);
+    }
+  });
+});
+
 test("reconcileMcpConfig does not persist a tentative policy capture when an MCP conflict blocks the transition", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
@@ -459,7 +645,7 @@ test("reconcileMcpConfig does not persist a tentative policy capture when an MCP
       ownedTweaks,
     });
     assert.equal(enabled.status, "updated");
-    assert.equal(enabled.preservedApprovalPolicy?.rawAssignment, 'approval_policy = "on-request"');
+    assert.equal(enabled.preservedApprovalPolicy, null);
 
     reconcileMcpConfig({
       configPath,
@@ -472,7 +658,7 @@ test("reconcileMcpConfig does not persist a tentative policy capture when an MCP
   });
 });
 
-test("reconcileMcpConfig durably preserves the original policy before a committed config can outlive final receipt failure", () => {
+test("reconcileMcpConfig failure after MCP commit still leaves policy bytes unchanged", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
@@ -494,10 +680,11 @@ test("reconcileMcpConfig durably preserves the original policy before a committe
       },
     }), /simulated failure/);
 
-    assert.match(readFileSync(configPath, "utf8"), /mcp_elicitations = true/);
+    assert.match(readFileSync(configPath, "utf8"), /^approval_policy = "never"$/m);
+    assert.match(readFileSync(configPath, "utf8"), /mcp_servers\.co-tweakers-user-questions/);
     const failedReceipt = readMcpSyncState(statePath);
     assert.equal(failedReceipt?.status, "error");
-    assert.equal(failedReceipt?.preservedApprovalPolicy?.rawAssignment, 'approval_policy = "never"');
+    assert.equal(failedReceipt?.preservedApprovalPolicy, null);
 
     reconcileMcpConfig({
       configPath,
@@ -510,7 +697,7 @@ test("reconcileMcpConfig durably preserves the original policy before a committe
   });
 });
 
-test("reconcileMcpConfig trusts a prepared policy capture only when the planned config fingerprint is live", () => {
+test("legacy prepared policy metadata never authorizes ordinary policy mutation", () => {
   withTempDir((root) => {
     const configPath = join(root, "config.toml");
     const statePath = join(root, "mcp-sync-state.json");
@@ -546,7 +733,8 @@ test("reconcileMcpConfig trusts a prepared policy capture only when the planned 
       tweaks: userQuestions,
       ownedTweaks: userQuestions,
     });
-    assert.equal(provedCommit.preservedApprovalPolicy?.rawAssignment, 'approval_policy = "never"');
+    assert.equal(provedCommit.preservedApprovalPolicy, null);
+    assert.match(readFileSync(configPath, "utf8"), /^approval_policy = "never"$/m);
 
     writeFileSync(statePath, `${JSON.stringify(prepared, null, 2)}\n`);
     writeFileSync(configPath, 'approval_policy = "on-request"\nsandbox_mode = "danger-full-access"\n');
@@ -557,7 +745,8 @@ test("reconcileMcpConfig trusts a prepared policy capture only when the planned 
       tweaks: userQuestions,
       ownedTweaks: userQuestions,
     });
-    assert.equal(recaptured.preservedApprovalPolicy?.rawAssignment, 'approval_policy = "on-request"');
+    assert.equal(recaptured.preservedApprovalPolicy, null);
+    assert.match(readFileSync(configPath, "utf8"), /^approval_policy = "on-request"$/m);
 
     reconcileMcpConfig({
       configPath,
@@ -1019,8 +1208,10 @@ test("two live-root chokidar reconcilers converge and still observe external edi
     writeFileSync(configPath, "# shared manual config\n", "utf8");
     const receipts = [0, 0];
     const errors: unknown[] = [];
+    const canonicalDataDir = join(root, "tweak-data", "co.tweakers.example");
     const makeTweaks = (dir: string) => [{
       dir,
+      dataDir: canonicalDataDir,
       manifest: {
         id: "co.tweakers.example",
         mcp: { command: "node", args: ["server.js"] },

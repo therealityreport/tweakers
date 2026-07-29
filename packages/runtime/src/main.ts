@@ -7,11 +7,12 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
-import { cpSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, protocol, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
+import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import * as originalFs from "original-fs";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Transform, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -19,9 +20,20 @@ import { extract as extractTar, list as listTar } from "tar";
 import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
-import { createMcpReconciler } from "./mcp-reconciliation";
-import { USER_QUESTIONS_APPROVAL_POLICY, USER_QUESTIONS_SANDBOX_MODE } from "./mcp-sync";
-import { getWatcherHealth } from "./watcher-health";
+import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
+import { hashRawAsarHeader } from "./promotion-asar";
+import {
+  fingerprintPromotionPolicyPath,
+  promotionPolicyFingerprintFailureReason,
+} from "./promotion-policy";
+import {
+  createMcpReconciler,
+  readMcpSyncState,
+  resolveMcpRuntimePaths,
+  userQuestionsMcpReceiptMatchesEnabledState,
+  type McpSyncTrigger,
+} from "./mcp-reconciliation";
+import { getAndPublishWatcherHealth, getWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
 import {
   isMainProcessTweakScope,
   bindMainTweakStop,
@@ -80,7 +92,10 @@ import {
 } from "./tweak-store";
 import { maybeStartBrowserUiServer } from "./browser-ui";
 import { resolveLocalCliRuntime } from "./local-cli-runtime";
-import { resolveTerminalCodexBinary } from "./codex-terminal-cli";
+import {
+  resolveTerminalCodexBinary,
+  terminalCodexPathFromShellOutput,
+} from "./codex-terminal-cli";
 import {
   classifyInstalledCliCommand,
   submitInstalledCliWithLaunchd,
@@ -88,7 +103,42 @@ import {
 } from "./installed-cli-launch";
 import { createDesktopUpdateStartupReconciler } from "./desktop-update-startup";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
-import { answerPromotionHealthRequest, hasAuthenticatedSessionCookie, hasAuthenticatedCodexToken, readCodexAuth } from "./promotion-health";
+import {
+  answerPromotionHealthRequest,
+  authorizePromotionOriginalRenderer,
+  authorizePromotionRenderer,
+  canonicalPromotionOriginalRendererUrl,
+  createPromotionOriginalRendererDeadlineController,
+  createPromotionOriginalRendererProofTracker,
+  createPromotionRendererProtocolResponder,
+  createPromotionRendererProofTracker,
+  disablePromotionOriginalRendererBackgroundThrottling,
+  hasUniqueSandboxedPromotionRendererProcess,
+  hasAuthenticatedSessionCookie,
+  hasAuthenticatedCodexToken,
+  PROMOTION_RENDERER_AUTH_CHANNEL,
+  PROMOTION_RENDERER_IPC_CHANNEL,
+  PROMOTION_RENDERER_SCHEME,
+  PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL,
+  PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL,
+  PROMOTION_ORIGINAL_RENDERER_URL,
+  PROMOTION_HEALTH_REQUEST_MAX_AGE_MS,
+  promotionOriginalRendererEvidenceUrl,
+  promotionOriginalRendererLogUrl,
+  promotionRendererDocumentUrl,
+  promotionRendererLoadRejection,
+  readCodexAuth,
+  shouldFailPromotionOriginalRendererProvisionalLoad,
+  validatePromotionOriginalRendererLoadObserved,
+  validatePromotionOriginalRendererHandshake,
+  validatePromotionOriginalRendererMountTimeout,
+  validatePromotionRendererHandshake,
+  verifyPromotionOriginalRendererBackgroundThrottlingDisabled,
+  type HealthValue,
+  type PromotionRendererProofResult,
+  type PromotionSurfaceName,
+  type UserQuestionsHealthObservation,
+} from "./promotion-health";
 import {
   applyManagedCodexCliLaneAtBootstrap,
   createCodexCliManager,
@@ -113,6 +163,7 @@ import {
 } from "./codex-version-service";
 import {
   configureCodexSparkleBridge,
+  createHealthProbeCodexSparkleBridgeOptions,
   getCodexSparkleBridge,
   type SparkleAppcastMetadata,
 } from "./codex-sparkle-bridge";
@@ -163,18 +214,24 @@ if (!userRoot || !runtimeDir) {
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
-installCodexAppServerParent();
+const codexAppServerParent = installCodexAppServerParent();
 
 const PRELOAD_PATH = resolve(runtimeDir, "preload.js");
+const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-preload.js");
 const TWEAKS_DIR = join(userRoot, "tweaks");
 const LOG_DIR = join(userRoot, "log");
 const LOG_FILE = join(LOG_DIR, "main.log");
 const CONFIG_FILE = join(userRoot, "config.json");
-const CODEX_CONFIG_FILE = join(homedir(), ".codex", "config.toml");
+const MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({
+  userRoot,
+  homeDirectory: homedir(),
+  env: process.env,
+});
+const CODEX_CONFIG_FILE = MCP_RUNTIME_PATHS.configPath;
 const INSTALLER_STATE_FILE = join(userRoot, "state.json");
 const UPDATE_MODE_FILE = join(userRoot, "update-mode.json");
 const SELF_UPDATE_STATE_FILE = join(userRoot, "self-update-state.json");
-const MCP_SYNC_STATE_FILE = join(userRoot, "mcp-sync-state.json");
+const MCP_SYNC_STATE_FILE = MCP_RUNTIME_PATHS.statePath;
 const ENVIRONMENT_SELECTION_FILE = join(userRoot, "environment-selection.json");
 const ENVIRONMENT_REGISTRY_FILE = join(userRoot, "environment-registry.json");
 const ENVIRONMENT_RUNTIME_PROOF_FILE = join(userRoot, "environment-runtime-proof.json");
@@ -187,6 +244,38 @@ const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+const healthOriginalMain = healthCheckOnly
+  && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
+
+if (healthOriginalMain && process.platform === "darwin" && !codexAppServerParent.installed) {
+  throw new Error("original-main health requires the owned signed Codex app-server parent tracker");
+}
+
+// The health-only process skips Codex's bootstrap, so register the production
+// renderer scheme during module evaluation, before Electron becomes ready.
+// The request handler itself remains scoped to the one renderer proof below.
+if (healthCheckOnly && !healthOriginalMain) {
+  protocol.registerSchemesAsPrivileged([{
+    scheme: PROMOTION_RENDERER_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+      codeCache: true,
+    },
+  }]);
+}
+
+// Defense in depth for one-shot macOS health processes. The installer passes
+// --use-mock-keychain from process start; assert the Chromium switch again at
+// the earliest runtime point and fail closed if Electron cannot retain it.
+applyHealthProbeKeychainIsolation({
+  commandLine: app.commandLine,
+  healthCheckOnly,
+  platform: process.platform,
+});
 
 // Candidate validation is a background bootstrap, not a second user-facing
 // ChatGPT launch. Suppress LaunchServices/Dock activation before Electron is
@@ -238,7 +327,7 @@ mkdirSync(TWEAKS_DIR, { recursive: true });
 // One-time migration: the retired mode-switcher tweak persisted a soft
 // vanilla mode; app modes are now real bundle swaps owned by the installer
 // (`tweaker mode`). Drop the stale key so it can never gate tweaks again.
-removeLegacyModeSwitcherState(userRoot);
+if (!healthCheckOnly) removeLegacyModeSwitcherState(userRoot);
 const refreshStatusWatcher = chokidar.watch([
   SELF_UPDATE_STATE_FILE,
   join(userRoot, "refresh-state.json"),
@@ -365,6 +454,31 @@ interface TweakUpdateCheck {
   error?: string;
 }
 
+interface TweakVersionDriftRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  hasMcp: boolean;
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  status: "current" | "drift" | "missing";
+  reason: string;
+}
+
+interface TweakHealthSnapshot {
+  checkedAt: string;
+  catalogCount: number;
+  installedCount: number;
+  enabledCount: number;
+  liveDriftCount: number;
+  runtimeDriftCount: number;
+  missingLiveCount: number;
+  missingRuntimeCount: number;
+  mcpRestartRequired: boolean;
+  rows: TweakVersionDriftRow[];
+}
+
 function readState(): PersistedState {
   try {
     const state = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as PersistedState;
@@ -409,7 +523,7 @@ const codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
   userRoot,
   env: process.env,
   selectedManagedCli,
-  persistFailure: (message) => {
+  persistFailure: healthCheckOnly ? undefined : (message) => {
     const state = readState();
     state.tweaker ??= {};
     state.tweaker.codexCliBootstrapFailure = message;
@@ -455,7 +569,7 @@ const codexCliManager = createCodexCliManager({
   userRoot,
   deps: createCodexCliManagerDependencies(),
 });
-codexCliManager.recover();
+if (!healthCheckOnly) codexCliManager.recover();
 
 const CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
 let lastPublishedCodexDesktopUpdate: CodexDesktopUpdateCheckResult | null = null;
@@ -1096,6 +1210,8 @@ function inferMacAppRoot(): string | null {
 
 function writeEnvironmentRuntimeProof(): void {
   try {
+    const proofUserRoot = userRoot;
+    if (!proofUserRoot) throw new Error("could not determine the Tweakers user root");
     const appRoot = inferMacAppRoot();
     if (!appRoot) throw new Error("could not infer the exact running app path");
     const state = readInstallerState();
@@ -1112,6 +1228,21 @@ function writeEnvironmentRuntimeProof(): void {
     if (versionProbe.status !== 0) throw new Error("selected backend version probe failed");
     const version = `${versionProbe.stdout ?? ""}${versionProbe.stderr ?? ""}`.trim().split(/\s+/).at(-1) ?? null;
     if (!version) throw new Error("selected backend version is empty");
+    const activeRuntimePath = join(proofUserRoot, "runtime");
+    const activeRuntime = readRuntimeFingerprintEvidence(activeRuntimePath);
+    if (!activeRuntime) throw new Error(`active runtime fingerprint is invalid at ${activeRuntimePath}`);
+    const managedRuntimePath = join(
+      proofUserRoot,
+      "managed-runtime",
+      "current",
+      "packages",
+      "installer",
+      "assets",
+      "runtime",
+    );
+    const managedRuntime = readRuntimeFingerprintEvidence(managedRuntimePath);
+    if (!managedRuntime) throw new Error(`managed runtime fingerprint is invalid at ${managedRuntimePath}`);
+    const managedSourceRuntimeHash = readManagedRuntimeSourceHash(proofUserRoot);
     const proof = {
       schemaVersion: 1,
       kind: "environment-runtime-proof",
@@ -1124,13 +1255,38 @@ function writeEnvironmentRuntimeProof(): void {
       binaryPath,
       backendVersion: version,
       backendFingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"),
+      runtimePath: activeRuntimePath,
+      runtimeFingerprint: activeRuntime.fingerprint,
+      runtimeFileCount: activeRuntime.fileCount,
+      managedRuntimePath,
+      managedRuntimeFingerprint: managedRuntime.fingerprint,
+      managedRuntimeFileCount: managedRuntime.fileCount,
+      managedSourceRuntimeHash,
       observedAt: new Date().toISOString(),
     };
     const temporary = `${ENVIRONMENT_RUNTIME_PROOF_FILE}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(proof, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, ENVIRONMENT_RUNTIME_PROOF_FILE);
   } catch (error) {
+    // A failed startup must never leave a previous process's runtime proof
+    // available for a transaction to mistake as current evidence.
+    try { rmSync(ENVIRONMENT_RUNTIME_PROOF_FILE, { force: true }); } catch {}
     log("error", "environment runtime proof failed", { message: (error as Error).message });
+  }
+}
+
+function readManagedRuntimeSourceHash(root: string): string | null {
+  try {
+    const provenance = JSON.parse(readFileSync(
+      join(root, "managed-runtime", "current", ".tweakers-provenance.json"),
+      "utf8",
+    )) as { sourceRuntimeHash?: unknown };
+    return typeof provenance.sourceRuntimeHash === "string"
+      && /^[a-f0-9]{64}$/i.test(provenance.sourceRuntimeHash)
+      ? provenance.sourceRuntimeHash
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1142,25 +1298,38 @@ process.on("unhandledRejection", (e) => {
   log("error", "unhandledRejection", { value: String(e) });
 });
 
-configureCodexSparkleBridge({
-  requestManualCheck: async () => {
-    await requestCodexDesktopManualCheck("native-sparkle");
-  },
-  requestBackgroundCheck: runProactiveDesktopUpdateCheck,
-  requestInstall: startCodexDesktopUpdateTransaction,
-  prepareForInstall: prepareSignedCodexForSparkleInstall,
-  getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
-  onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
-  onNativeControlActivityChanged: () => {
-    queueMicrotask(() => {
-      if (!lastPublishedCodexDesktopUpdate) return;
-      const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
-      if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
-      lastPublishedCodexDesktopUpdate = published;
-      broadcastCodexDesktopUpdateResult(published);
-    });
-  },
-});
+function configureCodexSparkleForProcess(): void {
+  if (healthCheckOnly) {
+    // The original main initializes and may invoke its updater while the
+    // renderer proof is running. Keep the native methods wrapped/inert, but do
+    // not connect any health-only invocation to networking, dialogs,
+    // notifications, transactions, signed-app preparation, or persistence.
+    configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
+    return;
+  }
+
+  configureCodexSparkleBridge({
+    requestManualCheck: async () => {
+      await requestCodexDesktopManualCheck("native-sparkle");
+    },
+    requestBackgroundCheck: runProactiveDesktopUpdateCheck,
+    requestInstall: startCodexDesktopUpdateTransaction,
+    prepareForInstall: prepareSignedCodexForSparkleInstall,
+    getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
+    onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
+    onNativeControlActivityChanged: () => {
+      queueMicrotask(() => {
+        if (!lastPublishedCodexDesktopUpdate) return;
+        const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
+        if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
+        lastPublishedCodexDesktopUpdate = published;
+        broadcastCodexDesktopUpdateResult(published);
+      });
+    },
+  });
+}
+
+configureCodexSparkleForProcess();
 installSparkleUpdateHook();
 
 interface LoadedMainTweak {
@@ -1245,6 +1414,7 @@ const tweakState = {
   discovered: [] as DiscoveredTweak[],
   loadedMain: new Map<string, LoadedMainTweak>(),
 };
+const mainIpcHandlerRegistrations = new Map<string, symbol>();
 
 // Candidate health probes run from a disposable user root and must remain
 // observational. In particular, they must never watch or reconcile the real
@@ -1252,8 +1422,8 @@ const tweakState = {
 const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   configPath: CODEX_CONFIG_FILE,
   statePath: MCP_SYNC_STATE_FILE,
-  getTweaks: () => tweakState.discovered.filter((tweak) => isTweakEnabled(tweak.manifest.id)),
-  getOwnedTweaks: () => tweakState.discovered,
+  getTweaks: () => mcpSyncTweaks(true),
+  getOwnedTweaks: () => mcpSyncTweaks(false),
   onReceipt: (receipt) => {
     const summary = receipt.conflicts.length > 0
       ? receipt.conflicts.map((conflict) => (
@@ -1268,6 +1438,17 @@ const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   onError: (error) => log("warn", "failed to reconcile Codex MCP config:", error),
 });
 let initialMcpReconciliationPending = true;
+let nextReloadMcpTrigger: McpSyncTrigger = "tweak-reload";
+
+function mcpSyncTweaks(enabledOnly: boolean) {
+  return tweakState.discovered
+    .filter((tweak) => !enabledOnly || isTweakEnabled(tweak.manifest.id))
+    .map((tweak) => ({
+      dir: tweak.dir,
+      dataDir: join(userRoot!, "tweak-data", tweak.manifest.id),
+      manifest: tweak.manifest,
+    }));
+}
 
 const nativeBridge = new NativeBridge(log, {
   nativeHostPath: resolveRuntimeNativeHostPath({
@@ -1281,7 +1462,16 @@ const nativeBridge = new NativeBridge(log, {
 const owlViews = new Map<string, ManagedOwlView>();
 
 const tweakLifecycleDeps = {
-  logInfo: (message: string) => log("info", message),
+  logInfo: (message: string) => {
+    // reloadTweaks emits this inside its serialized operation immediately
+    // before discovery/load, so overlapping reloads cannot steal the trigger.
+    if (message.startsWith("reloading tweaks (")) {
+      nextReloadMcpTrigger = message === "reloading tweaks (enabled-toggle)"
+        ? "enabled-state"
+        : "tweak-reload";
+    }
+    log("info", message);
+  },
   setTweakEnabled,
   stopAllMainTweaks,
   clearTweakModuleCache,
@@ -1336,6 +1526,1121 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+type PromotionProbeValue = "pass" | "fail" | "unknown";
+const USER_QUESTIONS_TWEAK_ID = "co.tweakers.user-questions";
+const USER_QUESTIONS_FOLDER = "user-questions";
+const SANITIZED_PROMOTION_POLICY_FAILURES = new WeakSet<object>();
+
+function assertPromotionProbeIsolation(): void {
+  if (!healthCheckOnly) throw new Error("promotion probes require a one-shot health process");
+  const candidateRequested = process.env.TWEAKERS_CANDIDATE_MCP_RECONCILIATION !== undefined;
+  if (candidateRequested && !MCP_RUNTIME_PATHS.candidateIsolated) {
+    throw new Error("candidate promotion probe did not resolve contained MCP paths");
+  }
+}
+
+function promotionSurfaceHash(surface: PromotionSurfaceName): string {
+  assertPromotionProbeIsolation();
+  switch (surface) {
+    case "app": return promotionAppHeaderHash();
+    case "runtime": return fingerprintPromotionPath(runtimeDir!);
+    case "tweakTree": return fingerprintPromotionPath(TWEAKS_DIR);
+    case "tweakersConfig": return fingerprintPromotionPath(CONFIG_FILE);
+    case "codexConfig": return fingerprintPromotionPath(CODEX_CONFIG_FILE);
+    case "namespaceData": return fingerprintPromotionPath(join(userRoot!, "tweak-data", USER_QUESTIONS_TWEAK_ID));
+    case "mainStorage": return fingerprintPromotionPath(join(userRoot!, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`));
+    case "policy": return promotionPolicySurfaceHash();
+  }
+}
+
+function promotionPolicySurfaceHash(): string {
+  try {
+    return fingerprintPromotionPolicyPath(join(MCP_RUNTIME_PATHS.codexHome, ".codex-global-state.json"));
+  } catch (error) {
+    if (error !== null && (typeof error === "object" || typeof error === "function")) {
+      SANITIZED_PROMOTION_POLICY_FAILURES.add(error);
+    }
+    log("error", "promotion policy fingerprint failed", {
+      surface: "policy",
+      reason: promotionPolicyFingerprintFailureReason(error),
+    });
+    throw error;
+  }
+}
+
+/** Parse only the bounded ASAR pickle header and hash the decoded JSON string. */
+function promotionAppHeaderHash(): string {
+  const archivePath = join(process.resourcesPath, "app.asar");
+  // Electron's ordinary fs facade treats app.asar as a virtual directory.
+  // Promotion proof needs the sealed archive bytes, so use the raw fs module.
+  return hashRawAsarHeader(archivePath, originalFs);
+}
+
+/** Mode- and link-aware deterministic hash paired with install.ts. */
+function fingerprintPromotionPath(path: string): string {
+  if (!existsSync(path)) return "missing";
+  const digest = createHash("sha256");
+  const visit = (entryPath: string, name: string): void => {
+    const stat = lstatSync(entryPath);
+    digest.update(name).update("\0").update(String(stat.mode & 0o777)).update("\0");
+    if (stat.isDirectory()) {
+      digest.update("directory\0");
+      for (const child of readdirSync(entryPath).sort()) {
+        visit(join(entryPath, child), name ? `${name}/${child}` : child);
+      }
+      return;
+    }
+    if (stat.isFile()) {
+      digest.update("file\0").update(readFileSync(entryPath));
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      digest.update("symlink\0").update(readlinkSync(entryPath));
+      return;
+    }
+    throw new Error(`unsupported promotion surface entry: ${entryPath}`);
+  };
+  visit(path, "");
+  return digest.digest("hex");
+}
+
+/** Exact payload hash paired with user-questions-source.ts (symlinks fail). */
+function fingerprintUserQuestionsPath(path: string): string {
+  const rootStat = lstatSync(path);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("User Questions source must be a real directory");
+  }
+  const digest = createHash("sha256");
+  digest.update("directory\0").update(String(rootStat.mode & 0o777)).update("\0");
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const entryPath = join(directory, entry.name);
+      const entryStat = lstatSync(entryPath);
+      if (entryStat.isSymbolicLink()) throw new Error(`User Questions source contains a symbolic link: ${entryPath}`);
+      const name = relative(path, entryPath);
+      digest.update(name).update("\0").update(String(entryStat.mode & 0o777)).update("\0");
+      if (entryStat.isDirectory()) {
+        digest.update("directory\0");
+        visit(entryPath);
+      } else if (entryStat.isFile()) {
+        digest.update("file\0").update(readFileSync(entryPath));
+      } else {
+        throw new Error(`unsupported User Questions source entry: ${entryPath}`);
+      }
+    }
+  };
+  visit(path);
+  return digest.digest("hex");
+}
+
+function requirePromotionModule(root: string, entrypoint: string): unknown {
+  if (basename(entrypoint) !== entrypoint || !entrypoint.endsWith(".js")) {
+    throw new Error("User Questions entrypoints must be direct JavaScript children");
+  }
+  const path = join(root, entrypoint);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
+    throw new Error(`User Questions entrypoint is unsafe: ${entrypoint}`);
+  }
+  return require(path) as unknown;
+}
+
+function promotionSelfTest(run: () => boolean): PromotionProbeValue {
+  try {
+    return run() ? "pass" : "fail";
+  } catch {
+    return "fail";
+  }
+}
+
+function userQuestionsMcpConflictCount(): number {
+  const stat = lstatSync(MCP_SYNC_STATE_FILE);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o777) !== 0o600
+    || stat.size > 256 * 1024
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+  ) throw new Error("MCP reconciliation receipt is not owner-only");
+  const receipt = readMcpSyncState(MCP_SYNC_STATE_FILE);
+  if (!receipt || receipt.schemaVersion !== 2 || receipt.phase !== "complete") {
+    throw new Error("MCP reconciliation receipt is incomplete");
+  }
+  const configBytes = existsSync(CODEX_CONFIG_FILE) ? readFileSync(CODEX_CONFIG_FILE) : Buffer.alloc(0);
+  if (receipt.afterFingerprint !== createHash("sha256").update(configBytes).digest("hex")) {
+    throw new Error("MCP reconciliation receipt does not bind the observed Codex config");
+  }
+  if (!userQuestionsMcpReceiptMatchesEnabledState(receipt, isTweakEnabled(USER_QUESTIONS_TWEAK_ID))) {
+    throw new Error("MCP receipt does not prove the expected User Questions enabled state and policy");
+  }
+  return receipt.conflicts.length;
+}
+
+function promotionUserQuestionsHealth(rendererStorageSelfTest: HealthValue): UserQuestionsHealthObservation {
+  assertPromotionProbeIsolation();
+  const root = join(TWEAKS_DIR, USER_QUESTIONS_FOLDER);
+  const manifestPath = join(root, "manifest.json");
+  const manifestStat = lstatSync(manifestPath);
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 64 * 1024) {
+    throw new Error("User Questions manifest is unsafe");
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  if (manifest.id !== USER_QUESTIONS_TWEAK_ID) throw new Error("User Questions canonical identity is missing");
+  if (typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+    throw new Error("User Questions version is invalid");
+  }
+  if (manifest.scope !== "main" && manifest.scope !== "both") throw new Error("User Questions main lifecycle is missing");
+  const permissions = Array.isArray(manifest.permissions) ? manifest.permissions : [];
+  if (!permissions.includes("ipc") || !permissions.includes("network")) {
+    throw new Error("User Questions broker permissions are missing");
+  }
+  const mainEntrypoint = typeof manifest.main === "string" ? manifest.main : "index.js";
+  const mcp = manifest.mcp && typeof manifest.mcp === "object" && !Array.isArray(manifest.mcp)
+    ? manifest.mcp as Record<string, unknown>
+    : null;
+  const mcpArgs = mcp && Array.isArray(mcp.args) ? mcp.args : [];
+  const mcpEntrypoint = mcpArgs.find((value): value is string => typeof value === "string" && value.endsWith(".js"));
+  if (mcp?.command !== "node" || !mcpEntrypoint) throw new Error("User Questions MCP entrypoint is invalid");
+  requirePromotionModule(root, mcpEntrypoint);
+
+  const mainLifecycle = promotionSelfTest(() => {
+    const lifecycle = requirePromotionModule(root, mainEntrypoint) as { start?: unknown; stop?: unknown };
+    return typeof lifecycle.start === "function" && typeof lifecycle.stop === "function";
+  });
+  const brokerSelfTest = promotionSelfTest(() => {
+    const broker = requirePromotionModule(root, "broker-protocol.js") as {
+      requestFrame(id: string, method: string, payload: object): unknown;
+      encodeFrame(frame: unknown): Buffer;
+      decodeFrame(frame: Buffer): Record<string, unknown>;
+    };
+    const request = broker.requestFrame("promotion-health", "ping", { probe: true });
+    const decoded = broker.decodeFrame(broker.encodeFrame(request));
+    let rejectedMalformed = false;
+    try { broker.decodeFrame(Buffer.from("{}\n")); } catch { rejectedMalformed = true; }
+    return decoded.version === 1 && decoded.kind === "request" && decoded.id === "promotion-health"
+      && decoded.method === "ping" && rejectedMalformed;
+  });
+  const schemaSelfTest = promotionSelfTest(() => {
+    const schema = requirePromotionModule(root, "core.js") as {
+      validateAskInput(value: unknown): { ok: boolean };
+    };
+    const valid = schema.validateAskInput({
+      round_id: "promotion-health",
+      questions: [{
+        id: "choice",
+        header: "Promotion health",
+        question: "Does the native decision schema accept this round?",
+        selection_mode: "single",
+        options: [
+          { id: "yes", label: "Yes (Recommended)", description: "Accept the canonical schema.", recommended: true },
+          { id: "no", label: "No", description: "Reject the canonical schema." },
+        ],
+        allow_other: true,
+      }],
+    });
+    const invalid = schema.validateAskInput({ round_id: "promotion-health", questions: [] });
+    return valid.ok === true && invalid.ok === false;
+  });
+  return {
+    id: USER_QUESTIONS_TWEAK_ID,
+    version: manifest.version,
+    payloadHash: fingerprintUserQuestionsPath(root),
+    mainLifecycle,
+    brokerSelfTest,
+    schemaSelfTest,
+    rendererStorageSelfTest,
+    mcpConflictCount: userQuestionsMcpConflictCount(),
+  };
+}
+
+async function runPromotionRendererProof(): Promise<PromotionRendererProofResult> {
+  assertPromotionProbeIsolation();
+  const nonce = randomUUID();
+  const url = promotionRendererDocumentUrl(nonce);
+  const tracker = createPromotionRendererProofTracker({ nonce, url, preloadPath: PRELOAD_PATH });
+  const healthProtocol = session.defaultSession.protocol;
+  let protocolHandlerInstalled = false;
+  let proofWindow: Electron.BrowserWindow | null = null;
+  let authorizationConsumed = false;
+  let handshakeConsumed = false;
+  let settleHandshake: (() => void) | null = null;
+  let handshakeSettled = false;
+  const handshake = new Promise<void>((resolvePromise) => {
+    settleHandshake = () => {
+      if (handshakeSettled) return;
+      handshakeSettled = true;
+      resolvePromise();
+    };
+  });
+  const onHandshake = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const windowAlive = proofWindow !== null && !proofWindow.isDestroyed() && !proofWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === proofWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === proofWindow!.webContents.mainFrame;
+    const decision = validatePromotionRendererHandshake({
+      windowAlive,
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      expectedUrl: url,
+      authorizationConsumed,
+      handshakeConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      log("warn", "promotion renderer lifecycle handshake rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    handshakeConsumed = true;
+    tracker.rendererHandshake({
+      webContentsId: event.sender.id,
+      ...decision.observation,
+    });
+    log("info", "promotion renderer lifecycle handshake accepted", {
+      webContentsId: event.sender.id,
+      lifecycle: decision.observation.lifecycle,
+      rendererStorageSelfTest: decision.observation.rendererStorageSelfTest,
+    });
+    settleHandshake?.();
+  };
+  const onAuthorization = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    let decision: ReturnType<typeof authorizePromotionRenderer>;
+    let serializedResponse: string | null = null;
+    try {
+      const windowAlive = proofWindow !== null && !proofWindow.isDestroyed() && !proofWindow.webContents.isDestroyed();
+      const senderMatches = windowAlive && event.sender.id === proofWindow!.webContents.id;
+      const frameMatches = senderMatches
+        && event.senderFrame !== null
+        && event.senderFrame === proofWindow!.webContents.mainFrame;
+      decision = authorizePromotionRenderer({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: url,
+        consumed: authorizationConsumed,
+      }, payload, nonce);
+      if (decision.accepted) serializedResponse = JSON.stringify(decision.response);
+    } catch {
+      event.returnValue = null;
+      log("warn", "promotion renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: "authorization exception",
+      });
+      return;
+    }
+    if (!decision.accepted) {
+      event.returnValue = null;
+      log("warn", "promotion renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    authorizationConsumed = true;
+    event.returnValue = serializedResponse!;
+    log("info", "promotion renderer authorization accepted", {
+      webContentsId: event.sender.id,
+    });
+  };
+  ipcMain.on(PROMOTION_RENDERER_AUTH_CHANNEL, onAuthorization);
+  ipcMain.on(PROMOTION_RENDERER_IPC_CHANNEL, onHandshake);
+  try {
+    if (healthProtocol.isProtocolHandled(PROMOTION_RENDERER_SCHEME)) {
+      throw new Error("health-only app protocol already has a handler");
+    }
+    healthProtocol.handle(
+      PROMOTION_RENDERER_SCHEME,
+      createPromotionRendererProtocolResponder(join(process.resourcesPath, "app.asar", "webview")),
+    );
+    protocolHandlerInstalled = true;
+    log("info", "promotion renderer protocol handler installed", {
+      scheme: PROMOTION_RENDERER_SCHEME,
+      sessionIsDefault: true,
+    });
+    proofWindow = new BrowserWindow({
+      width: 1,
+      height: 1,
+      show: false,
+      skipTaskbar: true,
+      webPreferences: {
+        preload: PRELOAD_PATH,
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        devTools: false,
+      },
+    });
+    const proofWebContents = proofWindow.webContents;
+    const preferences = (proofWebContents as unknown as {
+      getLastWebPreferences?: () => { preload?: string };
+    }).getLastWebPreferences?.();
+    tracker.windowCreated({
+      webContentsId: proofWebContents.id,
+      url,
+      preloadPath: preferences?.preload ?? null,
+    });
+    log("info", "promotion renderer load started", {
+      webContentsId: proofWebContents.id,
+      url,
+      preloadRegistered: preferences?.preload === PRELOAD_PATH,
+    });
+    proofWebContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+      tracker.didFailLoad({
+        webContentsId: proofWebContents.id,
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      });
+      log("warn", "promotion renderer did-fail-load", {
+        webContentsId: proofWebContents.id,
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      });
+      settleHandshake?.();
+    });
+    proofWebContents.on("render-process-gone", (_event, details) => {
+      tracker.renderProcessGone({
+        webContentsId: proofWebContents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      log("warn", "promotion renderer process exited", {
+        webContentsId: proofWebContents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      settleHandshake?.();
+    });
+    const load = proofWindow.loadURL(url).then(() => {
+      tracker.didFinishLoad({ webContentsId: proofWebContents.id, url: proofWebContents.getURL() });
+      log("info", "promotion renderer load completed", {
+        webContentsId: proofWebContents.id,
+        url: proofWebContents.getURL(),
+      });
+    }).catch((error) => {
+      const rejection = promotionRendererLoadRejection(error, url);
+      tracker.didFailLoad({
+        webContentsId: proofWebContents.id,
+        ...rejection,
+      });
+      log("warn", "promotion renderer loadURL rejected", {
+        webContentsId: proofWebContents.id,
+        ...rejection,
+      });
+      settleHandshake?.();
+    });
+    await withTimeout(Promise.all([load, handshake]).then(() => undefined), 5_000).catch(() => undefined);
+    const result = tracker.result();
+    if (result.hostReady === "pass" && result.rendererStorageSelfTest === "pass") {
+      log("info", "promotion renderer mount/handshake succeeded", {
+        webContentsId: proofWebContents.id,
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+      });
+    } else {
+      log("warn", "promotion renderer mount/handshake incomplete", {
+        webContentsId: proofWebContents.id,
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+      });
+    }
+    return result;
+  } catch (error) {
+    log("warn", "promotion renderer proof could not create its hidden window", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return tracker.result();
+  } finally {
+    ipcMain.removeListener(PROMOTION_RENDERER_AUTH_CHANNEL, onAuthorization);
+    ipcMain.removeListener(PROMOTION_RENDERER_IPC_CHANNEL, onHandshake);
+    if (proofWindow && !proofWindow.isDestroyed()) proofWindow.destroy();
+    if (protocolHandlerInstalled) {
+      try {
+        healthProtocol.unhandle(PROMOTION_RENDERER_SCHEME);
+        log("info", "promotion renderer protocol handler removed", { scheme: PROMOTION_RENDERER_SCHEME });
+      } catch (error) {
+        log("warn", "promotion renderer protocol handler cleanup failed", {
+          scheme: PROMOTION_RENDERER_SCHEME,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+}
+
+interface PromotionOriginalMainProbe {
+  registerSession(targetSession: Electron.Session, label: string): void;
+  run(): Promise<PromotionRendererProofResult>;
+}
+
+function createPromotionOriginalMainProbe(): PromotionOriginalMainProbe {
+  const nonce = randomUUID();
+  const tracker = createPromotionOriginalRendererProofTracker(nonce);
+  const capturedWindows = new Set<Electron.BrowserWindow>();
+  const registeredSessions = new Set<Electron.Session>();
+  const preloadErrorWebContentsIds = new Set<number>();
+  const windowCleanup = new Map<Electron.BrowserWindow, Array<() => void>>();
+  let canonicalWindow: Electron.BrowserWindow | null = null;
+  let canonicalBackgroundThrottlingPrevious: boolean | null = null;
+  let authorizationConsumed = false;
+  let loadObservedConsumed = false;
+  let handshakeConsumed = false;
+  let cleaningUp = false;
+  let cleanupFinished = false;
+  let lateWindowDuringCleanup = false;
+  let settled = false;
+  let deadlineController: ReturnType<typeof createPromotionOriginalRendererDeadlineController> | null = null;
+  let settleProof: (() => void) | null = null;
+  const proofSettled = new Promise<void>((resolvePromise) => {
+    settleProof = resolvePromise;
+  });
+  const originalOpacitySetters = new WeakMap<
+    Electron.BrowserWindow,
+    (opacity: number) => void
+  >();
+
+  const settleIfComplete = (): void => {
+    if (settled || !tracker.complete()) return;
+    settled = true;
+    deadlineController?.settle();
+    settleProof?.();
+  };
+  const fail = (reason: string, webContentsId?: number): void => {
+    tracker.fail(reason, webContentsId);
+    log("warn", "promotion original renderer proof failed", {
+      reason,
+      webContentsId: webContentsId ?? null,
+    });
+    settleIfComplete();
+  };
+  const requireBackgroundThrottlingDisabled = (
+    contents: Electron.WebContents,
+    phase: string,
+    configure = false,
+  ): boolean => {
+    const configured = configure
+      ? disablePromotionOriginalRendererBackgroundThrottling(contents)
+      : null;
+    if (configured) canonicalBackgroundThrottlingPrevious = configured.previous;
+    const checked = configured ?? verifyPromotionOriginalRendererBackgroundThrottlingDisabled(contents);
+    log(checked.ok ? "info" : "warn", "promotion original renderer background throttling checked", {
+      webContentsId: contents.id,
+      previous: canonicalBackgroundThrottlingPrevious,
+      observed: checked.observed,
+      phase,
+    });
+    if (!checked.ok) {
+      fail(configure
+        ? "canonical renderer background throttling could not be disabled"
+        : "canonical renderer background throttling was not disabled", contents.id);
+    }
+    return checked.ok;
+  };
+  deadlineController = createPromotionOriginalRendererDeadlineController({
+    onTimeout: (phase) => {
+      fail(phase === "startup"
+        ? "promotion original renderer startup timed out"
+        : phase === "load"
+          ? "promotion original renderer load timed out"
+          : "promotion original renderer mount timed out");
+    },
+  });
+  const forceWindowTransparent = (window: Electron.BrowserWindow): boolean => {
+    if (window.isDestroyed()) return false;
+    try {
+      const setOpacity = originalOpacitySetters.get(window)
+        ?? ((opacity: number) => window.setOpacity(opacity));
+      setOpacity(0);
+      return window.getOpacity() === 0;
+    } catch {
+      return false;
+    }
+  };
+  const hideWindow = (window: Electron.BrowserWindow): void => {
+    if (window.isDestroyed()) return;
+    forceWindowTransparent(window);
+    try { window.setFocusable(false); } catch { /* Best effort; visibility is checked below. */ }
+    try { window.hide(); } catch { /* Best effort; visibility is checked below. */ }
+    try { window.blur(); } catch { /* Best effort; visibility is checked below. */ }
+  };
+  const suppressWindowOpacity = (
+    window: Electron.BrowserWindow,
+    removers: Array<() => void>,
+  ): void => {
+    const mutableWindow = window as unknown as {
+      setOpacity: (opacity: number) => void;
+    };
+    const original = mutableWindow.setOpacity;
+    if (typeof original !== "function") {
+      fail("captured window opacity interception unavailable");
+      return;
+    }
+    const setOriginalOpacity = (opacity: number): void => {
+      original.call(window, opacity);
+    };
+    originalOpacitySetters.set(window, setOriginalOpacity);
+    const suppressed = (_opacity: number): void => {
+      setOriginalOpacity(0);
+      log("info", "promotion original BrowserWindow opacity suppressed", {
+        webContentsId: window.webContents.id,
+      });
+    };
+    try {
+      setOriginalOpacity(0);
+      mutableWindow.setOpacity = suppressed;
+    } catch {
+      originalOpacitySetters.delete(window);
+      fail("captured window opacity interception failed");
+      return;
+    }
+    if (mutableWindow.setOpacity !== suppressed || !forceWindowTransparent(window)) {
+      fail("captured window opacity interception did not stick");
+      return;
+    }
+    removers.push(() => {
+      if (mutableWindow.setOpacity === suppressed) mutableWindow.setOpacity = original;
+      originalOpacitySetters.delete(window);
+    });
+  };
+  type SuppressedWindowActivationMethod = "show" | "showInactive" | "focus" | "restore";
+  const suppressWindowActivationMethod = (
+    window: Electron.BrowserWindow,
+    method: SuppressedWindowActivationMethod,
+    removers: Array<() => void>,
+  ): void => {
+    const mutableWindow = window as unknown as Record<
+      SuppressedWindowActivationMethod,
+      (...args: unknown[]) => void
+    >;
+    const original = mutableWindow[method];
+    if (typeof original !== "function") {
+      fail(`captured window ${method} interception unavailable`);
+      return;
+    }
+    const suppressed = (..._args: unknown[]): void => {
+      log("info", "promotion original BrowserWindow activation suppressed", {
+        webContentsId: window.webContents.id,
+        method,
+      });
+      hideWindow(window);
+    };
+    try {
+      mutableWindow[method] = suppressed;
+    } catch {
+      fail(`captured window ${method} interception failed`);
+      return;
+    }
+    if (mutableWindow[method] !== suppressed) {
+      fail(`captured window ${method} interception did not stick`);
+      return;
+    }
+    removers.push(() => {
+      // Do not overwrite an original-main replacement installed after ours.
+      if (mutableWindow[method] === suppressed) mutableWindow[method] = original;
+    });
+  };
+  const originalPreloadIsValid = (preloadPath: unknown): preloadPath is string => {
+    if (typeof preloadPath !== "string" || !isAbsolute(preloadPath)) return false;
+    const exactPath = resolve(preloadPath);
+    if (preloadPath !== exactPath || exactPath === resolve(PROMOTION_HEALTH_PRELOAD_PATH)) return false;
+    const originalAsarRoot = resolve(process.resourcesPath, "app.asar");
+    const containedPath = relative(originalAsarRoot, exactPath);
+    if (!containedPath || containedPath.startsWith("..") || isAbsolute(containedPath)) return false;
+    try {
+      return existsSync(exactPath) && lstatSync(exactPath).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const considerEligible = (
+    window: Electron.BrowserWindow,
+    url: string,
+    isMainFrame: boolean,
+  ): void => {
+    const canonicalUrl = canonicalPromotionOriginalRendererUrl(url);
+    if (!isMainFrame || canonicalUrl === null || window.isDestroyed()) return;
+    const contents = window.webContents;
+    const preferences = (contents as unknown as {
+      getLastWebPreferences?: () => {
+        sandbox?: boolean;
+        contextIsolation?: boolean;
+        nodeIntegration?: boolean;
+        preload?: string;
+      };
+    }).getLastWebPreferences?.() ?? {};
+    const originalPreloadValid = originalPreloadIsValid(preferences.preload);
+    tracker.eligibleWindow({
+      webContentsId: contents.id,
+      url: canonicalUrl,
+      isDefaultSession: contents.session === session.defaultSession,
+      sandbox: preferences.sandbox,
+      contextIsolation: preferences.contextIsolation === true,
+      nodeIntegration: preferences.nodeIntegration === true,
+      originalPreloadValid,
+    });
+    const selectedId = tracker.summary().canonicalWebContentsId;
+    if (selectedId === contents.id && canonicalWindow === null) {
+      canonicalWindow = window;
+      if (requireBackgroundThrottlingDisabled(contents, "selection", true)) {
+        deadlineController.canonicalSelected();
+      }
+    }
+    if (preloadErrorWebContentsIds.has(contents.id)) {
+      tracker.preloadError(contents.id);
+    }
+    log("info", "promotion original renderer eligible window observed", {
+      webContentsId: contents.id,
+      url: promotionOriginalRendererLogUrl(canonicalUrl),
+      sessionIsDefault: contents.session === session.defaultSession,
+      sandbox: preferences.sandbox,
+      contextIsolation: preferences.contextIsolation,
+      nodeIntegration: preferences.nodeIntegration,
+      originalPreloadPath: preferences.preload ?? null,
+      originalPreloadValid,
+      selected: selectedId === contents.id,
+    });
+    settleIfComplete();
+  };
+  const onBrowserWindowCreated = (_event: Electron.Event, window: Electron.BrowserWindow): void => {
+    tracker.windowCaptured();
+    capturedWindows.add(window);
+    const contents = window.webContents;
+    const initiallyVisible = window.isVisible();
+    const removers: Array<() => void> = [];
+    const listen = (
+      emitter: NodeJS.EventEmitter,
+      event: string,
+      listener: (...args: any[]) => void,
+    ): void => {
+      emitter.on(event, listener);
+      removers.push(() => emitter.removeListener(event, listener));
+    };
+    suppressWindowOpacity(window, removers);
+    for (const method of ["show", "showInactive", "focus", "restore"] as const) {
+      suppressWindowActivationMethod(window, method, removers);
+    }
+    if (cleaningUp) {
+      lateWindowDuringCleanup = true;
+      fail("BrowserWindow was created during promotion cleanup");
+      hideWindow(window);
+      try { window.destroy(); } catch { /* Cleanup fails below. */ }
+      if (!window.isDestroyed()) fail("late promotion cleanup window could not be destroyed");
+      windowCleanup.set(window, removers);
+      if (cleanupFinished) app.exit(1);
+      return;
+    }
+    listen(window, "show", () => {
+      hideWindow(window);
+      if (!cleaningUp) fail(`captured window ${contents.id} emitted show`);
+    });
+    listen(window, "ready-to-show", () => hideWindow(window));
+    listen(window, "focus", () => {
+      hideWindow(window);
+      if (!cleaningUp) fail(`captured window ${contents.id} emitted focus`);
+    });
+    listen(window, "closed", () => {
+      log("info", "promotion original BrowserWindow destroyed", {
+        webContentsId: contents.id,
+        cleanup: cleaningUp,
+      });
+      if (!cleaningUp && canonicalWindow === window) fail("canonical window was destroyed", contents.id);
+    });
+    listen(contents, "did-start-navigation", (
+      _navigationEvent: Electron.Event,
+      url: string,
+      _isInPlace: boolean,
+      isMainFrame: boolean,
+    ) => {
+      log("info", "promotion original renderer navigation started", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+        isMainFrame,
+      });
+      considerEligible(window, url, isMainFrame);
+    });
+    listen(contents, "did-navigate", (_navigationEvent: Electron.Event, url: string) => {
+      log("info", "promotion original renderer navigation completed", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+      });
+      considerEligible(window, url, true);
+    });
+    listen(contents, "did-finish-load", () => {
+      const url = contents.getURL();
+      considerEligible(window, url, true);
+      if (
+        canonicalWindow === window
+        && canonicalPromotionOriginalRendererUrl(url) !== null
+        && !requireBackgroundThrottlingDisabled(contents, "did-finish-load")
+      ) return;
+      tracker.didFinishLoad(contents.id, url);
+      if (canonicalWindow === window && canonicalPromotionOriginalRendererUrl(url) !== null) {
+        deadlineController?.canonicalLoaded();
+      }
+      log("info", "promotion original renderer load completed", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(url),
+      });
+      settleIfComplete();
+    });
+    listen(contents, "dom-ready", () => {
+      log("info", "promotion original renderer DOM ready", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(contents.getURL()),
+        selected: canonicalWindow === window,
+      });
+    });
+    listen(contents, "did-stop-loading", () => {
+      log("info", "promotion original renderer stopped loading", {
+        webContentsId: contents.id,
+        url: promotionOriginalRendererLogUrl(contents.getURL()),
+        selected: canonicalWindow === window,
+      });
+    });
+    listen(contents, "preload-error", (
+      _preloadEvent: Electron.Event,
+      preloadPath: string,
+      error: Error,
+    ) => {
+      preloadErrorWebContentsIds.add(contents.id);
+      tracker.preloadError(contents.id);
+      log("warn", "promotion original renderer preload failed", {
+        webContentsId: contents.id,
+        preloadPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      settleIfComplete();
+    });
+    listen(contents, "did-fail-load", (
+      _loadEvent: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      validatedURL: string,
+      isMainFrame: boolean,
+    ) => {
+      if (isMainFrame) considerEligible(window, validatedURL, true);
+      log("warn", "promotion original renderer did-fail-load", {
+        webContentsId: contents.id,
+        errorCode,
+        errorDescription,
+        url: promotionOriginalRendererLogUrl(validatedURL),
+        isMainFrame,
+      });
+      if (isMainFrame && canonicalWindow === window) fail("canonical renderer load failed", contents.id);
+    });
+    listen(contents, "did-fail-provisional-load", (
+      _loadEvent: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      validatedURL: string,
+      isMainFrame: boolean,
+    ) => {
+      log("warn", "promotion original renderer did-fail-provisional-load", {
+        webContentsId: contents.id,
+        errorCode,
+        errorDescription,
+        url: promotionOriginalRendererLogUrl(validatedURL),
+        isMainFrame,
+        selected: canonicalWindow === window,
+      });
+      if (canonicalWindow === window && shouldFailPromotionOriginalRendererProvisionalLoad({
+        isMainFrame,
+        webContentsId: contents.id,
+        canonicalWebContentsId: tracker.summary().canonicalWebContentsId,
+      })) {
+        fail("canonical renderer provisional load failed", contents.id);
+      }
+    });
+    listen(contents, "render-process-gone", (_goneEvent: Electron.Event, details: Electron.RenderProcessGoneDetails) => {
+      log("warn", "promotion original renderer process exited", {
+        webContentsId: contents.id,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      if (canonicalWindow === window) fail("canonical renderer process exited", contents.id);
+    });
+    windowCleanup.set(window, removers);
+    if (initiallyVisible) fail(`captured window ${contents.id} was initially visible`);
+    hideWindow(window);
+    if (window.isVisible()) fail("captured window could not be hidden");
+    log("info", "promotion original BrowserWindow captured and hidden", {
+      webContentsId: contents.id,
+      capturedWindowCount: tracker.summary().capturedWindowCount,
+      initiallyVisible,
+    });
+  };
+  const onAuthorization = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (owner) considerEligible(owner, event.senderFrame?.url ?? "", event.senderFrame === event.sender.mainFrame);
+    const windowAlive = canonicalWindow !== null
+      && !canonicalWindow.isDestroyed()
+      && !canonicalWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === canonicalWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === canonicalWindow!.webContents.mainFrame;
+    const decision = authorizePromotionOriginalRenderer({
+      windowAlive,
+      windowHidden: windowAlive && !canonicalWindow!.isVisible(),
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      consumed: authorizationConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      event.returnValue = null;
+      log("warn", "promotion original renderer authorization rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    if (process.platform === "darwin") {
+      let rendererProcessId: number | null = null;
+      let sandboxProcessVerified = false;
+      try {
+        rendererProcessId = event.sender.getOSProcessId();
+        sandboxProcessVerified = hasUniqueSandboxedPromotionRendererProcess(
+          app.getAppMetrics(),
+          rendererProcessId,
+        );
+      } catch {
+        sandboxProcessVerified = false;
+      }
+      if (!sandboxProcessVerified) {
+        event.returnValue = null;
+        log("warn", "promotion original renderer authorization rejected", {
+          webContentsId: event.sender.id,
+          reason: "sandbox process metric was not uniquely verified",
+          rendererProcessId,
+        });
+        fail("canonical renderer sandbox process proof failed", event.sender.id);
+        return;
+      }
+    }
+    authorizationConsumed = true;
+    tracker.authorization(event.sender.id);
+    event.returnValue = JSON.stringify(decision.response);
+    log("info", "promotion original renderer authorization accepted", {
+      webContentsId: event.sender.id,
+    });
+    settleIfComplete();
+  };
+  const onHandshake = (event: Electron.IpcMainEvent, payload: unknown): void => {
+    const windowAlive = canonicalWindow !== null
+      && !canonicalWindow.isDestroyed()
+      && !canonicalWindow.webContents.isDestroyed();
+    const senderMatches = windowAlive && event.sender.id === canonicalWindow!.webContents.id;
+    const frameMatches = senderMatches
+      && event.senderFrame !== null
+      && event.senderFrame === canonicalWindow!.webContents.mainFrame;
+    if (windowAlive && canonicalWindow!.isVisible()) {
+      hideWindow(canonicalWindow!);
+      if (canonicalWindow!.isVisible()) {
+        fail("canonical renderer became visible and could not be re-hidden", event.sender.id);
+        return;
+      }
+      log("info", "promotion original BrowserWindow delayed activation re-hidden", {
+        webContentsId: event.sender.id,
+      });
+    }
+    if (windowAlive && !forceWindowTransparent(canonicalWindow!)) {
+      fail("canonical renderer transparency guard failed", event.sender.id);
+      return;
+    }
+    const lifecycle = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).lifecycle
+      : null;
+    if (lifecycle === "renderer-load-observed") {
+      const loadDecision = validatePromotionOriginalRendererLoadObserved({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!loadDecision.accepted) {
+        log("warn", "promotion original renderer load observation rejected", {
+          webContentsId: event.sender.id,
+          reason: loadDecision.reason,
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-load-observed")) return;
+      loadObservedConsumed = true;
+      log("info", "promotion original renderer load observation accepted", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(loadDecision.observation.url),
+        rendererSandboxed: loadDecision.observation.rendererSandboxed,
+      });
+      return;
+    }
+    if (lifecycle === "renderer-mount-timeout") {
+      const timeoutDecision = validatePromotionOriginalRendererMountTimeout({
+        windowAlive,
+        senderMatches,
+        frameMatches,
+        senderUrl: event.senderFrame?.url ?? "",
+        expectedUrl: tracker.summary().canonicalUrl ?? "",
+        authorizationConsumed,
+        loadObservedConsumed,
+        handshakeConsumed,
+      }, payload, nonce);
+      if (!timeoutDecision.accepted) {
+        log("warn", "promotion original renderer mount-timeout rejected", {
+          webContentsId: event.sender.id,
+          reason: timeoutDecision.reason,
+        });
+        return;
+      }
+      if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mount-timeout")) return;
+      handshakeConsumed = true;
+      log("warn", "promotion original renderer mount timed out", {
+        webContentsId: event.sender.id,
+        url: promotionOriginalRendererLogUrl(timeoutDecision.observation.url),
+        rendererSandboxed: timeoutDecision.observation.rendererSandboxed,
+      });
+      fail("canonical renderer mount timed out", event.sender.id);
+      return;
+    }
+    const decision = validatePromotionOriginalRendererHandshake({
+      windowAlive,
+      senderMatches,
+      frameMatches,
+      senderUrl: event.senderFrame?.url ?? "",
+      expectedUrl: tracker.summary().canonicalUrl ?? "",
+      authorizationConsumed,
+      loadObservedConsumed,
+      handshakeConsumed,
+    }, payload, nonce);
+    if (!decision.accepted) {
+      log("warn", "promotion original renderer lifecycle handshake rejected", {
+        webContentsId: event.sender.id,
+        reason: decision.reason,
+      });
+      return;
+    }
+    if (!requireBackgroundThrottlingDisabled(event.sender, "renderer-mounted")) return;
+    handshakeConsumed = true;
+    tracker.rendererHandshake({ webContentsId: event.sender.id, ...decision.observation });
+    log("info", "promotion original renderer mount handshake accepted", {
+      webContentsId: event.sender.id,
+      rendererSandboxed: decision.observation.rendererSandboxed,
+      rendererStorageSelfTest: decision.observation.rendererStorageSelfTest,
+    });
+    settleIfComplete();
+  };
+  const registerSession = (targetSession: Electron.Session, label: string): void => {
+    if (registeredSessions.has(targetSession)) return;
+    try {
+      targetSession.registerPreloadScript({
+        type: "frame",
+        id: "tweaker-promotion-health-original",
+        filePath: PROMOTION_HEALTH_PRELOAD_PATH,
+      });
+      registeredSessions.add(targetSession);
+      log("info", "promotion original preload registered", {
+        label,
+        path: PROMOTION_HEALTH_PRELOAD_PATH,
+      });
+    } catch (error) {
+      fail(`promotion original preload registration failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const onSessionCreated = (createdSession: Electron.Session): void => {
+    registerSession(createdSession, "session-created");
+  };
+  const onAppReady = (): void => {
+    registerSession(session.defaultSession, "defaultSession-ready");
+  };
+  ipcMain.on(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL, onAuthorization);
+  ipcMain.on(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, onHandshake);
+  app.on("session-created", onSessionCreated);
+  app.on("browser-window-created", onBrowserWindowCreated);
+  // This listener is installed while the injected runtime is still being
+  // evaluated, before the loader requires Codex's original main entry. Event
+  // ordering therefore registers the default-session preload before any later
+  // original-main ready listener can construct a BrowserWindow.
+  app.once("ready", onAppReady);
+
+  const cleanup = async (): Promise<boolean> => {
+    cleaningUp = true;
+    deadlineController.settle();
+    ipcMain.removeListener(PROMOTION_ORIGINAL_RENDERER_AUTH_CHANNEL, onAuthorization);
+    ipcMain.removeListener(PROMOTION_ORIGINAL_RENDERER_IPC_CHANNEL, onHandshake);
+    app.removeListener("session-created", onSessionCreated);
+    app.removeListener("ready", onAppReady);
+    let success = true;
+    // Destroy while activation methods are still suppressed. Restoring them
+    // first would leave a small teardown window in which original-main code
+    // could reveal or focus a probe window.
+    for (const window of capturedWindows) {
+      try {
+        if (!window.isDestroyed()) window.destroy();
+        if (!window.isDestroyed()) success = false;
+      } catch {
+        success = false;
+      }
+    }
+    for (const removers of windowCleanup.values()) {
+      for (const remove of removers) remove();
+    }
+    windowCleanup.clear();
+    for (const registeredSession of registeredSessions) {
+      try {
+        registeredSession.unregisterPreloadScript("tweaker-promotion-health-original");
+      } catch {
+        success = false;
+      }
+    }
+    const appServerCleanup = await codexAppServerParent.cleanupTrackedParents();
+    if (appServerCleanup.failed > 0 || lateWindowDuringCleanup) success = false;
+    log(success ? "info" : "warn", "promotion original renderer cleanup completed", {
+      destroyedWindowCount: capturedWindows.size,
+      registeredSessionCount: registeredSessions.size,
+      lateWindowDuringCleanup,
+      appServerCleanup,
+      success,
+    });
+    tracker.cleanup(success);
+    cleanupFinished = true;
+    return success;
+  };
+
+  return {
+    registerSession,
+    async run() {
+      await proofSettled;
+      await cleanup();
+      const result = tracker.result();
+      log(result.hostReady === "pass" ? "info" : "warn", "promotion original renderer proof completed", {
+        hostReady: result.hostReady,
+        rendererStorageSelfTest: result.rendererStorageSelfTest,
+        proofSummary: result.proofSummary ? {
+          ...result.proofSummary,
+          ...promotionOriginalRendererEvidenceUrl(result.proofSummary.canonicalUrl),
+        } : undefined,
+      });
+      return result;
+    },
+  };
+}
+
+// Construct this controller during runtime evaluation, before the loader
+// requires Codex's original main entry. It registers every capture/listener
+// needed to observe the original protocol and original BrowserWindow.
+const originalMainPromotionProbe = healthOriginalMain
+  ? createPromotionOriginalMainProbe()
+  : null;
+
 const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
   windowReady: () => BrowserWindow.getAllWindows().some((window) => (
     !window.isDestroyed() && window.isVisible()
@@ -1356,30 +2661,41 @@ const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
 
 app.whenReady().then(() => {
   log("info", "app ready fired");
+  originalMainPromotionProbe?.registerSession(session.defaultSession, "defaultSession-whenReady");
   // A disposable health probe launches Codex's main process only far enough to
   // reach app.whenReady — the real Codex bootstrap never runs, so services the
   // normal session cookie read depends on may never settle and could hang. Bound
   // the whole receipt path and force-exit so the installer's probe can never
   // hang on us; a missing receipt fails safe (promotion is blocked, app intact).
   if (healthCheckOnly) {
-    const watchdog = setTimeout(() => {
-      log("warn", "health-check watchdog fired; exiting");
-      app.exit(0);
-    }, 8_000);
-    watchdog.unref?.();
+    if (!healthOriginalMain) {
+      const watchdog = setTimeout(() => {
+        log("warn", "health-check watchdog fired; exiting");
+        app.exit(0);
+      }, 12_000);
+      watchdog.unref?.();
+    }
   } else {
     // Raw Sparkle scheduling stays disabled in the locally signed app. This
     // bounded metadata-only loop restores proactive update notification safely.
     scheduleProactiveDesktopUpdateChecks();
-    if (process.platform === "darwin") desktopUpdateStartupReconciler.schedule();
+    if (process.platform === "darwin") {
+      desktopUpdateStartupReconciler.schedule();
+    }
   }
-  void answerPromotionHealthRequest(userRoot!, {
+  void (async () => {
+    const rendererProof = healthOriginalMain
+      ? await originalMainPromotionProbe!.run()
+      : healthCheckOnly
+        ? await runPromotionRendererProof()
+      : { hostReady: "unknown", rendererStorageSelfTest: "unknown" } satisfies PromotionRendererProofResult;
+    void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
       // Check the Codex account token FIRST: it is a fast, synchronous file read
       // and is the real sign-in signal for the desktop app. The web session
       // cookie read below can stall in a bare health-probe launch, so only reach
       // for it (with a timeout) when no durable token is present.
-      if (hasAuthenticatedCodexToken(readCodexAuth())) return "pass";
+      if (hasAuthenticatedCodexToken(readCodexAuth(MCP_RUNTIME_PATHS.codexHome))) return "pass";
       try {
         const cookies = await withTimeout(session.defaultSession.cookies.get({}), 3_000);
         if (cookies && hasAuthenticatedSessionCookie(cookies)) return "pass";
@@ -1396,16 +2712,30 @@ app.whenReady().then(() => {
       if (permission === "global-shortcut") return "pass";
       return "unknown";
     },
-  }).then((answered) => {
-    if (!answered) {
-      // No pending request file is the normal case on an ordinary launch;
-      // only a request that exists but fails validation deserves a warn.
-      const requestPending = existsSync(join(userRoot!, "health", "request.json"));
-      log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
-    }
-    if (healthCheckOnly) app.exit(0);
-  }).catch((error) => {
-    log("warn", "promotion health receipt failed", error);
+    rendererReady: () => rendererProof.hostReady,
+    rendererProof: () => rendererProof.proofSummary ?? null,
+    promotionSurface: promotionSurfaceHash,
+    userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
+    }, { maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS }).then((answered) => {
+      if (!answered) {
+        // No pending request file is the normal case on an ordinary launch;
+        // only a request that exists but fails validation deserves a warn.
+        const requestPending = existsSync(join(userRoot!, "health", "request.json"));
+        log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
+      }
+      if (healthCheckOnly) app.exit(0);
+    }).catch((error) => {
+      if (
+        error === null
+        || (typeof error !== "object" && typeof error !== "function")
+        || !SANITIZED_PROMOTION_POLICY_FAILURES.has(error)
+      ) {
+        log("warn", "promotion health receipt failed", error);
+      }
+      if (healthCheckOnly) app.exit(0);
+    });
+  })().catch((error) => {
+    log("warn", "promotion renderer bootstrap failed", error);
     if (healthCheckOnly) app.exit(0);
   });
   if (!healthCheckOnly) {
@@ -1516,6 +2846,7 @@ ipcMain.handle("tweaker:list-tweaks", async () => {
     };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 });
+ipcMain.handle("tweaker:get-tweaks-health", () => buildTweakHealthSnapshot());
 ipcMain.on("tweaker:tweak-lifecycle", (_event, payload: unknown) => {
   if (!payload || typeof payload !== "object") return;
   const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown };
@@ -1711,6 +3042,12 @@ function persistCodexAppcast(
   desktopVersion: string | null,
   metadata: SparkleAppcastMetadata,
 ): void {
+  // OpenAI's original main invokes its background updater during the one-shot
+  // renderer probe. The redirected check may refresh this bounded cache, but
+  // a health probe must remain observational: its expected promotion surfaces
+  // were sealed before launch. Suppress only this cache writer so every other
+  // unexpected config mutation still fails the exact surface comparison.
+  if (healthCheckOnly) return;
   if (!desktopVersion || metadata.error || metadata.stale) return;
   const feedUrl = safeAppcastCacheUrl(metadata.feedUrl);
   const releaseUrl = metadata.releaseUrl === null ? null : safeAppcastCacheUrl(metadata.releaseUrl);
@@ -1774,6 +3111,30 @@ function readJsonDocument(file: string): unknown {
   }
 }
 
+function terminalCodexFromLoginShell(): string | null {
+  const shellPath = process.env.SHELL;
+  if (!shellPath || !isAbsolute(shellPath)) return null;
+  try {
+    if (!existsSync(shellPath) || !statSync(shellPath).isFile()) return null;
+    const result = spawnSync(shellPath, ["-lic", "command -v codex"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+    });
+    if (result.status !== 0) return null;
+    return terminalCodexPathFromShellOutput(result.stdout ?? "", (path) => {
+      try {
+        return existsSync(path) && statSync(path).isFile();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSnapshot> {
   const selectedLane = selectedCodexLane();
   const desktopTarget = selectedCodexDesktopUpdateTarget();
@@ -1784,6 +3145,7 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
     home: homedir(),
     pathValue: process.env.PATH,
     preferredPath: process.env.CODEX_TERMINAL_CLI_PATH,
+    loginShellPath: terminalCodexFromLoginShell(),
     excludedPaths: [bundledPath, betaPath].filter((value): value is string => !!value),
     isExecutable: (path) => {
       try {
@@ -2126,6 +3488,7 @@ ipcMain.handle("tweaker:get-environment-transaction", async (_e, ...args: unknow
 
 ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
   assertEnvironmentRequest(payload);
+  await buildDevelopmentEnvironmentControlPlane();
   if (payload.appExperience === "tweakers" && payload.releaseProfile === "alpha") {
     await ensureManagedAlphaEnvironmentBackend();
   }
@@ -2167,6 +3530,20 @@ ipcMain.handle("tweaker:rollback-environment", async (_e, payload: unknown) => {
   return runInstalledCliJson([
     "environment",
     "rollback",
+    "--transaction",
+    payload.transactionId,
+    "--json",
+  ], ENVIRONMENT_PREPARE_TIMEOUT_MS);
+});
+
+// Recovery resolves a stranded receipt from live proof without replacing any
+// bytes, so it is the safe action to offer in the UI; rollback stays available
+// for callers that specifically want the recorded payload restored.
+ipcMain.handle("tweaker:recover-environment", async (_e, payload: unknown) => {
+  assertEnvironmentTransactionRequest(payload);
+  return runInstalledCliJson([
+    "environment",
+    "recover",
     "--transaction",
     payload.transactionId,
     "--json",
@@ -2228,17 +3605,11 @@ ipcMain.handle("tweaker:run-tweaker-update", async () => {
 });
 
 ipcMain.handle("tweaker:get-refresh-status", () => localRefreshStatus());
-ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => {
-  const status = await localRefreshStatus();
-  if (!status.available) return { started: false, status };
-  const cli = localRefreshCli(status);
-  const appRoot = readInstallerState()?.appRoot;
-  if (!appRoot || !existsSync(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-  startInstalledCli(cli, ["refresh-local", "--source", requested ?? "smart", "--app", appRoot]);
-  return { started: true, status: { ...status, phase: "preparing" } };
-});
+ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "development" | "stable") => (
+  startLocalRefresh(requested)
+));
 
-ipcMain.handle("tweaker:get-watcher-health", () => getWatcherHealth(userRoot!));
+ipcMain.handle("tweaker:get-watcher-health", () => getAndPublishWatcherHealth(userRoot!));
 ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
   const cli = localRefreshCli();
@@ -2562,17 +3933,16 @@ async function loadAllMainTweaks(): Promise<void> {
     tweakState.discovered = [];
   }
 
-  const mcpTrigger = initialMcpReconciliationPending ? "startup" : "tweak-reload";
+  const mcpTrigger: McpSyncTrigger = initialMcpReconciliationPending
+    ? "startup"
+    : nextReloadMcpTrigger;
   initialMcpReconciliationPending = false;
-  let userQuestionsPolicyReady = false;
+  nextReloadMcpTrigger = "tweak-reload";
+  let userQuestionsMcpReady = false;
   if (mcpReconciler) {
     try {
       const receipt = await mcpReconciler.reconcileNow(mcpTrigger);
-      userQuestionsPolicyReady = receipt.status !== "conflict"
-        && receipt.status !== "error"
-        && receipt.approvalPolicy.status !== "conflict"
-        && receipt.approvalPolicy.afterRaw === USER_QUESTIONS_APPROVAL_POLICY
-        && receipt.approvalPolicy.sandboxModeAfterRaw === USER_QUESTIONS_SANDBOX_MODE;
+      userQuestionsMcpReady = userQuestionsMcpReceiptMatchesEnabledState(receipt, true);
     } catch (error) {
       log("error", "MCP reconciliation failed before main tweak startup:", error);
     }
@@ -2585,8 +3955,8 @@ async function loadAllMainTweaks(): Promise<void> {
       log("info", `skipping disabled main tweak: ${t.manifest.id}`);
       continue;
     }
-    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsPolicyReady) {
-      const error = "authoritative approval policy reconciliation did not complete";
+    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsMcpReady) {
+      const error = "canonical User Questions MCP reconciliation did not complete";
       recordTweakLifecycle(t.manifest.id, "main", "failed", error);
       recordTweakHealth(t.manifest.id, "failed", error);
       log("error", `skipping User Questions main migration: ${error}`);
@@ -2603,7 +3973,7 @@ async function loadAllMainTweaks(): Promise<void> {
           process: "main",
           log: makeLogger(t.manifest.id),
           storage,
-          ipc: makeMainIpc(t.manifest.id),
+          ipc: makeMainIpc(t),
           fs: makeMainFs(t.manifest.id),
           codex: makeCodexApi(t),
         });
@@ -2814,6 +4184,106 @@ function readBundledTweakCatalog(): TweakStoreRegistry | null {
     log("warn", "failed to read bundled Tweakers catalog:", String(error));
     return null;
   }
+}
+
+function buildTweakHealthSnapshot(): TweakHealthSnapshot {
+  const catalog = readBundledTweakCatalog();
+  const catalogEntries = catalog?.entries ?? [];
+  const discoveredById = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
+  const mcpState = mcpReconciler?.readState() as { restartRequired?: boolean } | null | undefined;
+  const rows = catalogEntries.map((entry) => {
+    const local = discoveredById.get(entry.id);
+    const liveVersion = local?.manifest.version ?? readManifestVersion(join(TWEAKS_DIR, liveTweakFolder(entry), "manifest.json"));
+    const runtimeVersion = readRuntimeTweakVersion(entry);
+    const catalogVersion = entry.manifest.version ?? null;
+    const liveMatches = liveVersion !== null && catalogVersion !== null && normalizeVersion(liveVersion) === normalizeVersion(catalogVersion);
+    const runtimeMatches = runtimeVersion !== null && catalogVersion !== null && normalizeVersion(runtimeVersion) === normalizeVersion(catalogVersion);
+    const hasMcp = Boolean((entry.manifest as TweakManifest & { mcp?: unknown }).mcp);
+    const enabled = local ? isTweakEnabled(entry.id) : false;
+    const status: TweakVersionDriftRow["status"] =
+      liveVersion === null || runtimeVersion === null ? "missing" :
+        liveMatches && runtimeMatches ? "current" : "drift";
+    return {
+      id: entry.id,
+      name: entry.manifest.name,
+      enabled,
+      hasMcp,
+      liveVersion,
+      runtimeVersion,
+      catalogVersion,
+      status,
+      reason: tweakVersionDriftReason({
+        liveVersion,
+        runtimeVersion,
+        catalogVersion,
+        liveMatches,
+        runtimeMatches,
+      }),
+    };
+  });
+  const liveDriftCount = rows.filter((row) =>
+    row.liveVersion !== null &&
+    row.catalogVersion !== null &&
+    normalizeVersion(row.liveVersion) !== normalizeVersion(row.catalogVersion)
+  ).length;
+  const runtimeDriftCount = rows.filter((row) =>
+    row.runtimeVersion !== null &&
+    row.catalogVersion !== null &&
+    normalizeVersion(row.runtimeVersion) !== normalizeVersion(row.catalogVersion)
+  ).length;
+  return {
+    checkedAt: new Date().toISOString(),
+    catalogCount: catalogEntries.length,
+    installedCount: tweakState.discovered.length,
+    enabledCount: tweakState.discovered.filter((t) => isTweakEnabled(t.manifest.id)).length,
+    liveDriftCount,
+    runtimeDriftCount,
+    missingLiveCount: rows.filter((row) => row.liveVersion === null).length,
+    missingRuntimeCount: rows.filter((row) => row.runtimeVersion === null).length,
+    mcpRestartRequired: mcpState?.restartRequired === true,
+    rows,
+  };
+}
+
+function liveTweakFolder(entry: TweakStoreEntry): string {
+  if (entry.source?.kind === "bundled") return entry.source.path.split("/").pop() ?? entry.id;
+  return entry.id;
+}
+
+function readRuntimeTweakVersion(entry: TweakStoreEntry): string | null {
+  if (entry.source?.kind !== "bundled") return null;
+  try {
+    return readManifestVersion(join(resolveBundledTweakPath(runtimeDir!, entry), "manifest.json"));
+  } catch {
+    return null;
+  }
+}
+
+function readManifestVersion(manifestPath: string): string | null {
+  try {
+    if (!existsSync(manifestPath)) return null;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Partial<TweakManifest>;
+    return typeof manifest.version === "string" ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function tweakVersionDriftReason(input: {
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  liveMatches: boolean;
+  runtimeMatches: boolean;
+}): string {
+  if (!input.catalogVersion) return "No catalog version is available.";
+  if (!input.liveVersion) return "Live installed copy is missing.";
+  if (!input.runtimeVersion) return "Bundled runtime copy is missing.";
+  const stale: string[] = [];
+  if (!input.liveMatches) stale.push(`live ${input.liveVersion}`);
+  if (!input.runtimeMatches) stale.push(`runtime ${input.runtimeVersion}`);
+  if (stale.length) return `${stale.join(" and ")} differs from latest stored ${input.catalogVersion}.`;
+  return "Live and runtime copies match the latest stored version.";
 }
 
 function restrictRegistryToBundledCatalog(registry: TweakStoreRegistry): TweakStoreRegistry {
@@ -3299,14 +4769,80 @@ function startCodexDesktopUpdateTransaction(): void {
   startInstalledCli(cli, ["update-chatgpt", "--json"]);
 }
 
-function desktopUpdateCli(): string {
+function desktopUpdateCli(status?: LocalRefreshStatusValue): string {
+  void status;
   const cli = localRefreshCli();
   if (!existsSync(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
   return cli;
 }
 
-function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
-  const cli = desktopUpdateCli();
+let environmentDevelopmentBuildInFlight: Promise<void> | null = null;
+
+async function buildDevelopmentEnvironmentControlPlane(): Promise<void> {
+  const status = await localRefreshStatus();
+  if (status.source !== "development" || !status.developmentSourceRoot) return;
+  if (environmentDevelopmentBuildInFlight) return environmentDevelopmentBuildInFlight;
+  const sourceRoot = realpathSync(status.developmentSourceRoot);
+  const packageFile = join(sourceRoot, "package.json");
+  if (!existsSync(packageFile)) {
+    throw new Error("The registered Tweakers development checkout is unavailable");
+  }
+  environmentDevelopmentBuildInFlight = new Promise<void>((resolvePromise, rejectPromise) => {
+    const command = process.platform === "win32" ? "npm.cmd" : "npm";
+    const child = spawn(command, ["run", "build"], {
+      cwd: sourceRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let outputBytes = 0;
+    let settled = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      operation();
+    };
+    const capture = (chunk: Buffer): void => {
+      if (settled) return;
+      outputBytes += chunk.byteLength;
+      output = `${output}${chunk.toString()}`.slice(-8_000);
+      if (outputBytes > 16 * 1024 * 1024) {
+        child.kill("SIGTERM");
+        finish(() => rejectPromise(new Error("Tweakers development build output exceeded the limit")));
+      }
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.once("error", (error) => finish(() => rejectPromise(error)));
+    child.once("close", (code, signal) => finish(() => {
+      if (code !== 0) {
+        rejectPromise(new Error(
+          `Tweakers development build failed with ${signal ? `signal ${signal}` : `status ${code ?? "unknown"}`}`
+          + `${output.trim() ? `: ${output.trim()}` : ""}`,
+        ));
+        return;
+      }
+      const cli = join(sourceRoot, "packages", "installer", "dist", "cli.js");
+      if (!existsSync(cli)) {
+        rejectPromise(new Error("Tweakers development build did not produce its installer CLI"));
+        return;
+      }
+      resolvePromise();
+    }));
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => rejectPromise(new Error("Tweakers development build timed out")));
+    }, 10 * 60_000);
+  }).finally(() => {
+    environmentDevelopmentBuildInFlight = null;
+  });
+  return environmentDevelopmentBuildInFlight;
+}
+
+async function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
+  const status = await localRefreshStatus();
+  const cli = desktopUpdateCli(status);
   const runtime = localCliRuntime(cli, args);
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(runtime.command, runtime.args, {
@@ -3343,15 +4879,29 @@ function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknow
     child.stderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
     child.once("error", (error) => finish(() => rejectPromise(error)));
     child.once("close", (code) => finish(() => {
+      let parsed: unknown;
+      let parseFailed = false;
+      try {
+        parsed = JSON.parse(stdout.trim());
+      } catch {
+        parseFailed = true;
+      }
       if (code !== 0) {
+        // A durable receipt on stdout is the diagnosis; the non-zero exit only
+        // says the action did not reach its success phase. Keep the receipt so
+        // the renderer can surface why, rather than a generic failure.
+        if (!parseFailed) {
+          resolvePromise(parsed);
+          return;
+        }
         rejectPromise(new Error(stderr.trim() || `Tweakers CLI exited with status ${code ?? "unknown"}`));
         return;
       }
-      try {
-        resolvePromise(JSON.parse(stdout.trim()));
-      } catch {
+      if (parseFailed) {
         rejectPromise(new Error(`Tweakers CLI returned invalid JSON for ${args[0] ?? "command"}`));
+        return;
       }
+      resolvePromise(parsed);
     }));
   });
 }
@@ -3412,6 +4962,24 @@ interface LocalRefreshStatusValue {
   checkedAt: string;
 }
 
+interface LocalRefreshSourceBinding {
+  /** Exact CLI selected once for this runtime process. */
+  cli: string;
+  /** Exact real Git worktree root allowed to promote development bytes. */
+  developmentRoot: string | null;
+  unsafeReason: string | null;
+}
+
+interface LocalRefreshDispatch {
+  cli: string;
+  args: string[];
+}
+
+interface LocalRefreshStartResult {
+  started: boolean;
+  status: LocalRefreshStatusValue;
+}
+
 // Renderer tweaks poll refresh status on DOM mutations, so this must never
 // block the main process (a synchronous CLI spawn here froze the UI on
 // hover) and must never spawn the Electron binary as a full second app —
@@ -3419,6 +4987,7 @@ interface LocalRefreshStatusValue {
 let refreshStatusCache: { value: LocalRefreshStatusValue; at: number } | null = null;
 let refreshStatusInFlight: Promise<LocalRefreshStatusValue> | null = null;
 const REFRESH_STATUS_TTL_MS = 4_000;
+const LOCAL_REFRESH_SOURCE_BINDING = resolveLocalRefreshSourceBinding();
 
 function localRefreshStatus(): Promise<LocalRefreshStatusValue> {
   if (refreshStatusCache && Date.now() - refreshStatusCache.at < REFRESH_STATUS_TTL_MS) {
@@ -3436,7 +5005,9 @@ function probeLocalRefreshStatus(): Promise<LocalRefreshStatusValue> {
   const cli = localRefreshCli();
   if (!existsSync(cli)) return Promise.resolve({
     available: false, source: "current", phase: "failed", developmentSourceRoot: null,
-    detail: "Tweakers refresh CLI is unavailable", error: "refresh CLI missing", checkedAt: new Date().toISOString(),
+    detail: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ?? "Tweakers refresh CLI is unavailable",
+    error: LOCAL_REFRESH_SOURCE_BINDING.unsafeReason ? `unsafe-source: ${LOCAL_REFRESH_SOURCE_BINDING.unsafeReason}` : "refresh CLI missing",
+    checkedAt: new Date().toISOString(),
   });
   return new Promise((resolvePromise, rejectPromise) => {
     const runtime = localCliRuntime(cli, ["refresh-status"]);
@@ -3453,10 +5024,124 @@ function probeLocalRefreshStatus(): Promise<LocalRefreshStatusValue> {
     child.once("close", (code) => {
       clearTimeout(timer);
       if (code !== 0) return rejectPromise(new Error(stderr.trim() || "Could not read Tweakers refresh status"));
-      try { resolvePromise(JSON.parse(stdout.trim()) as LocalRefreshStatusValue); }
+      try { resolvePromise(normalizeLocalRefreshStatus(JSON.parse(stdout.trim()) as LocalRefreshStatusValue)); }
       catch (error) { rejectPromise(error as Error); }
     });
   });
+}
+
+function resolveLocalRefreshSourceBinding(): LocalRefreshSourceBinding {
+  const managedCli = join(userRoot!, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+  const frozenRoot = readInstallerState()?.sourceRoot ?? null;
+  if (!frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "No frozen Tweakers installation source is recorded; development refresh is disabled.",
+    };
+  }
+  let exactRoot: string;
+  try {
+    exactRoot = realpathSync(frozenRoot);
+  } catch {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source no longer exists; development refresh is disabled.",
+    };
+  }
+  if (!isAbsolute(frozenRoot) || exactRoot !== frozenRoot) {
+    return {
+      cli: managedCli,
+      developmentRoot: null,
+      unsafeReason: "The frozen Tweakers installation source is not an exact real path; development refresh is disabled.",
+    };
+  }
+  const sourceCli = join(exactRoot, "packages", "installer", "dist", "cli.js");
+  if (describeInstallationSource(exactRoot).kind === "local-dev") {
+    if (!existsSync(sourceCli)) {
+      return {
+        cli: managedCli,
+        developmentRoot: null,
+        unsafeReason: "The frozen development checkout has no built Tweakers CLI; development refresh is disabled.",
+      };
+    }
+    return { cli: sourceCli, developmentRoot: exactRoot, unsafeReason: null };
+  }
+  if (existsSync(managedCli)) return { cli: managedCli, developmentRoot: null, unsafeReason: null };
+  if (existsSync(sourceCli)) return { cli: sourceCli, developmentRoot: null, unsafeReason: null };
+  return {
+    cli: managedCli,
+    developmentRoot: null,
+    unsafeReason: "No exact Tweakers refresh CLI is available; refresh is disabled.",
+  };
+}
+
+function normalizeLocalRefreshStatus(status: LocalRefreshStatusValue): LocalRefreshStatusValue {
+  if (status.source !== "development") return status;
+  const frozenRoot = LOCAL_REFRESH_SOURCE_BINDING.developmentRoot;
+  const mismatch = frozenRoot === null || status.developmentSourceRoot !== frozenRoot;
+  if (!mismatch && LOCAL_REFRESH_SOURCE_BINDING.unsafeReason === null) return status;
+  const reason = LOCAL_REFRESH_SOURCE_BINDING.unsafeReason
+    ?? "The registered dirty development checkout does not match this runtime's frozen source; refresh is disabled.";
+  return {
+    ...status,
+    available: false,
+    source: "current",
+    phase: "failed",
+    detail: `Unsafe refresh source: ${reason}`,
+    error: `unsafe-source: ${reason}`,
+  };
+}
+
+function buildLocalRefreshDispatch(
+  status: LocalRefreshStatusValue,
+  requested: "smart" | "development" | "stable" | undefined,
+  appRoot: string,
+  binding: LocalRefreshSourceBinding = LOCAL_REFRESH_SOURCE_BINDING,
+): LocalRefreshDispatch {
+  if (!status.available || status.error?.startsWith("unsafe-source:")) {
+    throw new Error(status.detail || "Tweakers refresh is unavailable");
+  }
+  const selected = requested === undefined || requested === "smart" ? status.source : requested;
+  if (selected !== status.source || (selected !== "development" && selected !== "stable")) {
+    throw new Error("The requested refresh source is not the currently verified source");
+  }
+  if (selected === "development") {
+    const developmentRoot = binding.developmentRoot;
+    if (
+      !developmentRoot
+      || binding.unsafeReason !== null
+      || status.developmentSourceRoot !== developmentRoot
+    ) throw new Error("Unsafe refresh source: the development worktree is not frozen to this runtime");
+    return {
+      cli: binding.cli,
+      args: [
+        "refresh-local",
+        "--source", "development",
+        "--development-root", developmentRoot,
+        "--app", appRoot,
+      ],
+    };
+  }
+  return {
+    cli: binding.cli,
+    args: ["refresh-local", "--source", "stable", "--app", appRoot],
+  };
+}
+
+async function startLocalRefresh(
+  requested?: "smart" | "development" | "stable",
+): Promise<LocalRefreshStartResult> {
+  const status = await localRefreshStatus();
+  if (!status.available) return { started: false, status };
+  const appRoot = readInstallerState()?.appRoot;
+  if (!appRoot) throw new Error("Tweakers refresh app root is unavailable");
+  const dispatch = buildLocalRefreshDispatch(status, requested, appRoot);
+  if (!existsSync(dispatch.cli)) throw new Error("Tweakers refresh CLI is unavailable");
+  if (dispatch.args[0] !== "refresh-local") throw new Error("Tweakers refresh dispatch is invalid");
+  startInstalledCli(dispatch.cli, ["refresh-local", ...dispatch.args.slice(1)]);
+  return { started: true, status: { ...status, phase: "preparing" } };
 }
 
 // The OpenAI-bundled renderer Node enforces Team-ID library validation and
@@ -3482,64 +5167,84 @@ function localCliRuntime(cli: string, args: string[]): { command: string; args: 
   });
 }
 
-function localRefreshCli(status?: { source?: string; developmentSourceRoot?: string | null }): string {
-  let developmentSourceRoot = status?.developmentSourceRoot ?? null;
-  if (!developmentSourceRoot) {
-    try {
-      const section = readState().tweaker as { developmentSourceRoot?: unknown } | undefined;
-      if (typeof section?.developmentSourceRoot === "string") developmentSourceRoot = section.developmentSourceRoot;
-    } catch {}
-  }
-  if ((status?.source === "development" || !status) && developmentSourceRoot) {
-    const cli = join(developmentSourceRoot, "packages", "installer", "dist", "cli.js");
-    if (existsSync(cli)) return cli;
-  }
-  return join(userRoot!, "managed-runtime", "current", "packages", "installer", "dist", "cli.js");
+function localRefreshCli(): string {
+  return LOCAL_REFRESH_SOURCE_BINDING.cli;
 }
 
 // This launchd helper runs the installer CLI, which must outlive the app's own
-// bundle swap. It deliberately uses launchctl submit instead of app.relaunch(),
-// which cannot outlive replacing the running executable; the per-PID label and
-// EXIT trap's launchctl remove/bootout make the transient job self-remove.
+// bundle swap AND the app's own termination. It deliberately avoids both
+// app.relaunch() (cannot outlive replacing the running executable) and
+// `launchctl submit` from the app process: LaunchServices records submitted
+// jobs as the submitting application's "one-shot jobs" and the Dock's quit
+// support UNLOADS them when that app terminates — which killed a coordinator
+// mid-commit the moment it quit the app for cutover (observed 2026-07-29:
+// `_LSForceQuitApplication: Unloading one-shot jobs for application "ChatGPT"`).
+// A plist bootstrapped into the gui domain is a plain domain service with no
+// application attribution, so it survives the app quitting; the per-PID label
+// and EXIT trap's bootout + plist removal make the transient job self-remove.
 function startInstalledCliWithLaunchd(cli: string, args: string[]): boolean {
   const label = `com.therealityreport.tweakers.patch-helper.${process.pid}.${Date.now()}`;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null) return false;
+  const plistPath = join(tmpdir(), `${label}.plist`);
+  // rm BEFORE bootout: booting out a running service SIGTERMs the very shell
+  // executing this trap, so anything after bootout races signal delivery.
+  const cleanup = `rm -f ${shellQuote(plistPath)}; launchctl bootout gui/${uid}/${label} >/dev/null 2>&1; true`;
   const runtime = localCliRuntime(cli, args);
-  return submitInstalledCliWithLaunchd({
-    classification: classifyInstalledCliCommand(args),
-    label,
-    cwd: resolve(dirname(cli), "..", "..", ".."),
-    command: runtime.command,
-    args: runtime.args,
-    environment: {
-      TWEAKERS_HOME: userRoot!,
-      TWEAKER_HOME: userRoot!,
-      TWEAKERS_USER_ROOT: userRoot!,
-      TWEAKER_USER_ROOT: userRoot!,
-      [LEGACY_USER_ROOT_ENV]: userRoot!,
-      TWEAKER_MANUAL_UPDATE: "1",
-      [LEGACY_MANUAL_UPDATE_ENV]: "1",
-      ELECTRON_RUN_AS_NODE: "1",
-      TWEAKERS_DESKTOP_UPDATE_JOB_LABEL: label,
+  const command = [
+    `trap ${shellQuote(cleanup)} EXIT`,
+    `cd ${shellQuote(resolve(dirname(cli), "..", "..", ".."))}`,
+    `TWEAKERS_HOME=${shellQuote(userRoot!)} TWEAKER_HOME=${shellQuote(userRoot!)} TWEAKERS_USER_ROOT=${shellQuote(userRoot!)} TWEAKER_USER_ROOT=${shellQuote(userRoot!)} ${LEGACY_USER_ROOT_ENV}=${shellQuote(userRoot!)} TWEAKER_MANUAL_UPDATE=1 ${LEGACY_MANUAL_UPDATE_ENV}=1 ELECTRON_RUN_AS_NODE=1 ${[runtime.command, ...runtime.args].map(shellQuote).join(" ")}`,
+  ].join(" && ");
+  const plist = [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
+    `<plist version="1.0"><dict>`,
+    `  <key>Label</key><string>${label}</string>`,
+    `  <key>ProgramArguments</key><array>`,
+    `    <string>/bin/sh</string>`,
+    `    <string>-c</string>`,
+    `    <string>${xmlEscape(`${command} || true`)}</string>`,
+    `  </array>`,
+    `  <key>RunAtLoad</key><true/>`,
+    `  <key>AbandonProcessGroup</key><true/>`,
+    `</dict></plist>`,
+  ].join("\n");
+  try {
+    writeFileSync(plistPath, plist, { mode: 0o600 });
+  } catch (error) {
+    log("warn", `could not stage Tweakers patch helper plist: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  const result = spawnSync(
+    "launchctl",
+    ["bootstrap", `gui/${uid}`, plistPath],
+    {
+      encoding: "utf8",
+      stdio: "ignore",
     },
-  }, {
-    submit: (command, submitArgs, options: LaunchdSubmitOptions) => {
-      const result = spawnSync(command, [...submitArgs], options);
-      return {
-        status: result.status,
-        signal: result.signal,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        error: result.error,
-      };
-    },
-    onEvent: (event) => {
-      log(
-        event.submitResult === "submitted" ? "info" : "warn",
-        "desktop-update-launch",
-        event,
-      );
-    },
-  });
+  );
+  if (result.status === 0) return true;
+  try {
+    rmSync(plistPath, { force: true });
+  } catch {
+    // Best effort — a stale tmp plist is inert without its bootstrap.
+  }
+  log("warn", `launchctl bootstrap failed for Tweakers patch helper: ${result.error?.message ?? result.status}`);
+  return false;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function markSelfUpdateStarted(sourceRoot: string): SelfUpdateState {
@@ -3584,20 +5289,25 @@ function makeLogger(scope: string) {
   };
 }
 
-function makeMainIpc(id: string) {
+function makeMainIpc(tweak: DiscoveredTweak) {
+  const id = tweak.manifest.id;
   const ch = (c: string) => `tweaker:${id}:${c}`;
+  const requireIpc = () => assertTweakPermission(tweak, "ipc");
   return {
     on: (c: string, h: (...args: unknown[]) => void) => {
+      requireIpc();
       const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
       ipcMain.on(ch(c), wrapped);
       return () => ipcMain.removeListener(ch(c), wrapped as never);
     },
     send: (c: string, ...args: unknown[]) => {
+      requireIpc();
       for (const wc of webContents.getAllWebContents()) {
         try { wc.send(ch(c), ...args); } catch {}
       }
     },
     sendToPrimary: (c: string, ...args: unknown[]) => {
+      requireIpc();
       const win = getPrimaryCodexWindow();
       if (!win || win.isDestroyed()) return false;
       try {
@@ -3607,26 +5317,80 @@ function makeMainIpc(id: string) {
         return false;
       }
     },
+    sendToRenderer: (webContentsId: number, c: string, ...args: unknown[]) => {
+      requireIpc();
+      const target = ownedCodexRenderer(webContentsId);
+      if (!target) return false;
+      try {
+        target.send(ch(c), ...args);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     invoke: (_c: string) => {
       throw new Error("ipc.invoke is renderer→main; main side uses handle");
     },
     handle: (c: string, handler: (...args: unknown[]) => unknown) => {
+      requireIpc();
       const channel = ch(c);
+      const registration = Symbol(channel);
       // Main tweaks are stopped and reloaded in place. Remove an old handler
       // before registering its replacement so a settings reload cannot fail
       // with Electron's "handler already registered" error.
       try { ipcMain.removeHandler(channel); } catch {}
+      mainIpcHandlerRegistrations.set(channel, registration);
       const invokeHandler = async (...args: unknown[]) => handler(...args);
       ipcMain.handle(channel, async (_e: unknown, ...args: unknown[]) => invokeHandler(...args));
       if (id === "co.tweakers.projects" && c === "projects") {
         mainTweakReadHandlers.set(`${id}:${c}`, invokeHandler);
       }
       return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
         if (mainTweakReadHandlers.get(`${id}:${c}`) === invokeHandler) mainTweakReadHandlers.delete(`${id}:${c}`);
         try { ipcMain.removeHandler(channel); } catch {}
       };
     },
+    handleWithContext: (
+      c: string,
+      handler: (
+        context: Readonly<{ sender: Readonly<{ webContentsId: number }> }>,
+        ...args: unknown[]
+      ) => unknown,
+    ) => {
+      requireIpc();
+      const channel = ch(c);
+      const registration = Symbol(channel);
+      try { ipcMain.removeHandler(channel); } catch {}
+      mainIpcHandlerRegistrations.set(channel, registration);
+      mainTweakReadHandlers.delete(`${id}:${c}`);
+      ipcMain.handle(channel, async (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => {
+        const sender = ownedCodexRenderer(event.sender.id);
+        if (!sender || sender !== event.sender) {
+          throw new Error("IPC invoke sender is not an owned Codex renderer");
+        }
+        const context = Object.freeze({
+          sender: Object.freeze({ webContentsId: sender.id }),
+        });
+        return handler(context, ...args);
+      });
+      return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
+        try { ipcMain.removeHandler(channel); } catch {}
+      };
+    },
   };
+}
+
+function ownedCodexRenderer(webContentsId: number): Electron.WebContents | null {
+  if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) return null;
+  const target = webContents.fromId(webContentsId);
+  if (!target || target.isDestroyed()) return null;
+  const owner = BrowserWindow.fromWebContents(target);
+  if (!owner || owner.isDestroyed() || owner.webContents !== target) return null;
+  return BrowserWindow.getAllWindows().some((window) => window === owner) ? target : null;
 }
 
 function makeMainFs(id: string) {
@@ -4367,15 +6131,7 @@ function makeCodexApi(tweak: DiscoveredTweak) {
     },
     refresh: {
       getStatus: async () => localRefreshStatus(),
-      start: async (source?: "smart" | "development" | "stable") => {
-        const status = await localRefreshStatus();
-        if (!status.available) return { started: false, status };
-        const cli = localRefreshCli(status);
-        const appRoot = readInstallerState()?.appRoot;
-        if (!appRoot || !existsSync(cli)) throw new Error("Tweakers refresh CLI is unavailable");
-        startInstalledCli(cli, ["refresh-local", "--source", source ?? "smart", "--app", appRoot]);
-        return { started: true, status: { ...status, phase: "preparing" } };
-      },
+      start: async (source?: "smart" | "development" | "stable") => startLocalRefresh(source),
       onStatusChanged: () => () => {},
     },
     capture: {

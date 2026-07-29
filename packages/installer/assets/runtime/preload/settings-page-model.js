@@ -1,6 +1,28 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.hasNativeSettingsSidebarOwnership = hasNativeSettingsSidebarOwnership;
+exports.isNativeSettingsSidebarEvidence = isNativeSettingsSidebarEvidence;
 exports.buildSettingsNavigationModel = buildSettingsNavigationModel;
+function hasNativeSettingsSidebarOwnership(evidence) {
+    return !evidence.forbiddenSurface && evidence.nativePanelSlugCount >= 1;
+}
+function isNativeSettingsSidebarEvidence(evidence) {
+    if (!hasNativeSettingsSidebarOwnership(evidence))
+        return false;
+    // Establish ownership from multiple independent native rows. Once mounted,
+    // the injector may retain the verified root with one row while search filters.
+    if (evidence.nativePanelSlugCount < 2)
+        return false;
+    if (evidence.width < 120 || evidence.width > 620)
+        return false;
+    if (evidence.height < 80)
+        return false;
+    if (evidence.left > evidence.viewportWidth * 0.65)
+        return false;
+    if (evidence.mainAppLabelCount >= 2 && evidence.settingsOnlyLabelCount === 0)
+        return false;
+    return evidence.coreLabelCount >= 2 && evidence.totalLabelCount >= 3;
+}
 function buildSettingsNavigationModel(tweaks, registrations) {
     const registrationsByTweak = new Map();
     for (const registration of registrations) {

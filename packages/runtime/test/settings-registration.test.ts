@@ -48,3 +48,23 @@ test("Tweakers navigation shares native scrolling, hides Store, and joins settin
   assert.match(source, /bindSettingsSearch\(outer\)/);
   assert.doesNotMatch(source, /makeSidebarItem\("Tweak Store"/);
 });
+
+test("Tweakers navigation mounts only in native Settings and revalidates connected ownership", () => {
+  assert.match(source, /\[data-settings-panel-slug\]/);
+
+  const candidateStart = source.indexOf("function isSettingsSidebarCandidate");
+  const candidateEnd = source.indexOf("function removeMisplacedSettingsGroups", candidateStart);
+  assert.ok(candidateStart >= 0 && candidateEnd > candidateStart);
+  const candidate = source.slice(candidateStart, candidateEnd);
+  assert.match(candidate, /isNativeSettingsSidebarEvidence/);
+  assert.match(candidate, /nativePanelSlugCount: nativeSettingsPanelSlugCount\(el\)/);
+  assert.match(candidate, /forbiddenSurface: isForbiddenSettingsSidebarSurface\(el\)/);
+
+  const placementStart = source.indexOf("function isTweakerInjectedSettingsGroupPlacementValid");
+  const placementEnd = source.indexOf("function resetTweakerInjectedSettingsGroupState", placementStart);
+  assert.ok(placementStart >= 0 && placementEnd > placementStart);
+  const placement = source.slice(placementStart, placementEnd);
+  assert.match(placement, /hasNativeSettingsSidebarOwnership/);
+  assert.match(placement, /nativeSettingsPanelSlugCount\(state\.sidebarRoot\)/);
+  assert.doesNotMatch(placement, /\) \{\s*return true;\s*\}/);
+});

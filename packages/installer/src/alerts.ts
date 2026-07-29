@@ -74,7 +74,9 @@ function showAppManagementPatchFailedAlert(errorMessage: string): void {
 
 export const AUTOMATION_PERMISSION_GUIDANCE =
   "Open System Settings > Privacy & Security > Automation, then allow the app running Tweakers " +
-  "(ChatGPT, Menu Bar, or Terminal) to control System Events.";
+  "(ChatGPT, Menu Bar, or Terminal) to control System Events. If Automation is already allowed, " +
+  "also check Privacy & Security > Accessibility: reading another app's menus needs assistive access, " +
+  "which macOS grants separately.";
 
 export type NativeUpdateHandoffFailureKind =
   | "unsupported_platform"
@@ -130,30 +132,22 @@ export interface RequestCodexNativeUpdateDeps {
   readLocaleMessages?: (appRoot: string, locale: string) => Record<string, unknown> | null;
   sleep?: (ms: number) => Promise<void>;
   nowMs?: () => number;
-  /** Delay between handoff attempts while ChatGPT finishes building its menu. */
   pollIntervalMs?: number;
-  /** Total budget for retryable handoff failures before giving up. */
   deadlineMs?: number;
 }
 
 const NATIVE_UPDATE_POLL_INTERVAL_MS = 2_000;
 const NATIVE_UPDATE_DEADLINE_MS = 45_000;
-
-/** Failure kinds that cannot improve by waiting; everything else is retried
- * because a freshly launched ChatGPT populates its app menu asynchronously. */
 const NON_RETRYABLE_HANDOFF_KINDS: ReadonlySet<NativeUpdateHandoffFailureKind> = new Set([
   "unsupported_platform",
   "automation_permission_denied",
+  "process_not_proven",
 ]);
 
 /**
  * Ask the exact, already-verified official ChatGPT process to open its native
  * updater. The environment transaction supplies the PID it just committed, so
  * this can never fall through to another installed ChatGPT channel.
- *
- * A freshly launched ChatGPT builds its app menu asynchronously, so a single
- * lookup right after launch races the menu population. Retry retryable
- * failures on a poll interval until the deadline elapses.
  */
 export async function requestCodexNativeUpdate(
   appRoot: string,
@@ -170,7 +164,6 @@ export async function requestCodexNativeUpdate(
   const nowMs = deps.nowMs ?? Date.now;
   const pollIntervalMs = Math.max(1, deps.pollIntervalMs ?? NATIVE_UPDATE_POLL_INTERVAL_MS);
   const deadline = nowMs() + Math.max(1, deps.deadlineMs ?? NATIVE_UPDATE_DEADLINE_MS);
-
   let last = attemptCodexNativeUpdate(appRoot, expectedPid, deps);
   while (!last.ok && !NON_RETRYABLE_HANDOFF_KINDS.has(last.kind) && nowMs() < deadline) {
     await sleep(pollIntervalMs);
@@ -178,9 +171,7 @@ export async function requestCodexNativeUpdate(
   }
   if (!last.ok && (last.kind === "menu_item_not_found" || last.kind === "menu_item_disabled")) {
     const snapshot = captureAppMenuSnapshot(expectedPid, deps.exec ?? alertExecFileSync);
-    if (snapshot) {
-      last = { ...last, message: `${last.message} Observed app menu items: ${snapshot}` };
-    }
+    last = { ...last, message: `${last.message} Observed app menu items: ${snapshot}` };
   }
   return last;
 }
@@ -217,12 +208,26 @@ function attemptCodexNativeUpdate(
     "set frontmost of targetProcess to true",
     `set candidateNames to {${candidateNames.map(appleScriptString).join(", ")}}`,
     "set appMenu to menu 1 of menu bar item 2 of menu bar 1 of targetProcess",
+    // Deliberately outside any try block: reading menu items requires assistive
+    // access, and a swallowed -1719 here would masquerade as "menu item not
+    // found" instead of surfacing the real permission failure.
+    "set menuItemCount to count of menu items of appMenu",
     "set updateItem to missing value",
+    // Bulk name enumeration is reliable even when the menu has never been
+    // opened; a `whose name is` filter against the same lazily-populated AX
+    // tree is nondeterministic and produced false MENU_NOT_FOUND failures.
+    "set itemNames to name of every menu item of appMenu",
+    "repeat with itemIndex from 1 to count of itemNames",
+    "set itemName to item itemIndex of itemNames",
+    "if itemName is not missing value then",
     "repeat with candidateName in candidateNames",
-    "try",
-    "set updateItem to first menu item of appMenu whose name is (candidateName as text)",
+    "if (itemName as text) is equal to (candidateName as text) then",
+    "set updateItem to menu item itemIndex of appMenu",
     "exit repeat",
-    "end try",
+    "end if",
+    "end repeat",
+    "end if",
+    "if updateItem is not missing value then exit repeat",
     "end repeat",
     "if updateItem is missing value then",
     "try",
@@ -230,8 +235,6 @@ function attemptCodexNativeUpdate(
     "set beforeItem to menu item 2 of appMenu",
     "set orderedItem to menu item 4 of appMenu",
     "set afterItem to menu item 5 of appMenu",
-    // Separators report their name as missing value; AXSubrole is unreliable
-    // (recent macOS returns missing value for it), so check the name first.
     "set beforeSeparator to (name of beforeItem is missing value)",
     "set afterSeparator to (name of afterItem is missing value)",
     "try",
@@ -292,9 +295,7 @@ function nativeUpdateHandoffFailure(
 
 const APP_MENU_SNAPSHOT_MAX_CHARS = 200;
 
-/** Best-effort, read-only capture of the app menu's item names so a final
- * menu-lookup failure records what the menu actually contained. */
-function captureAppMenuSnapshot(expectedPid: number, exec: typeof execFileSync): string | null {
+function captureAppMenuSnapshot(expectedPid: number, exec: typeof execFileSync): string {
   const script = [
     'tell application "System Events"',
     `set targetProcesses to every application process whose unix id is ${expectedPid}`,
@@ -318,9 +319,9 @@ function captureAppMenuSnapshot(expectedPid: number, exec: typeof execFileSync):
       stdio: ["ignore", "pipe", "pipe"],
     });
     const text = String(output ?? "").trim();
-    return text ? text.slice(0, APP_MENU_SNAPSHOT_MAX_CHARS) : null;
-  } catch {
-    return null;
+    return text ? text.slice(0, APP_MENU_SNAPSHOT_MAX_CHARS) : "unavailable (empty snapshot)";
+  } catch (error) {
+    return `unavailable (${firstLine(childProcessErrorText(error)).slice(0, APP_MENU_SNAPSHOT_MAX_CHARS)})`;
   }
 }
 
@@ -488,26 +489,20 @@ export function openCodex(appRoot: string, opts: OpenCodexOptions = {}): void {
   } catch {}
 }
 
-/**
- * Open the exact app path before restart verification. Interactive runs also
- * activate the app; unattended runs open it in the background because restart
- * verification only requires a visible window, never frontmost — activating
- * would steal focus from whatever the user is typing in.
- */
+/** Open the exact app path, preserving user focus for unattended workflows. */
 export function openAndActivateCodex(appRoot: string): void {
   if (platform() !== "darwin") return;
   const bundleId = codexBundleId(appRoot);
   alertExecFileSync(
     "osascript",
     ["-e", codexReopenScript(appRoot, bundleId, 0, reopenShouldActivate())],
-    { stdio: "ignore" },
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
   );
 }
 
-/**
- * Unattended reopens (watcher cycles, or any caller opting in via
- * TWEAKER_REOPEN_BACKGROUND=1) must never take focus from the user.
- */
 function reopenShouldActivate(): boolean {
   return !isRunningFromWatcher() && process.env.TWEAKER_REOPEN_BACKGROUND !== "1";
 }
@@ -623,14 +618,15 @@ function waitForProcessExit(pid: number, timeoutMs: number): boolean {
 }
 
 function spawnDetachedReopen(appRoot: string, bundleId: string, delayMs: number): void {
-  const child = spawn(
-    "osascript",
-    ["-e", codexReopenScript(appRoot, bundleId, delayMs, reopenShouldActivate())],
-    {
-      detached: true,
-      stdio: "ignore",
-    },
-  );
+  const child = spawn("osascript", ["-e", codexReopenScript(
+    appRoot,
+    bundleId,
+    delayMs,
+    reopenShouldActivate(),
+  )], {
+    detached: true,
+    stdio: "ignore",
+  });
   child.unref();
 }
 

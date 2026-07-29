@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, relative } from "node:path";
 import { signatureInfo, verifySignature, type SignatureInfo } from "./codesign.js";
+import { isMacOsJunkName } from "./fs-copy.js";
 import { userPaths } from "./paths.js";
 import { locateCodexAtExactPath, type CodexInstall } from "./platform.js";
 import { readPlist } from "./plist.js";
@@ -148,6 +149,7 @@ export interface LoadEnvironmentStateDeps {
   inspectProfile?: (
     profile: EnvironmentProfileRecord,
     current: EnvironmentSelection,
+    persistedProfile: EnvironmentProfileRecord | null,
   ) => EnvironmentProfileEvidenceInput;
 }
 
@@ -525,6 +527,10 @@ export function fingerprintAppContents(appRoot: string): string {
   const hash = createHash("sha256");
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      // Finder junk is excluded: Apple's sealed-resource rules already omit
+      // .DS_Store from code signatures, so hashing it would make this digest
+      // stricter than codesign while adding no tamper evidence.
+      if (isMacOsJunkName(entry.name)) continue;
       const path = join(directory, entry.name);
       hash.update(relative(root, path));
       if (entry.isDirectory()) visit(path);
@@ -747,11 +753,11 @@ export function loadEnvironmentState(
   const inspect = deps.inspectProfile ?? ((profile: EnvironmentProfileRecord) => inspectEnvironmentProfile(profile, current!));
   const stableEvidence = {
     ...profileArtifactLocations(base.profiles.stable),
-    ...inspect(base.profiles.stable, current),
+    ...inspect(base.profiles.stable, current, persistedRegistry?.profiles.stable ?? null),
   };
   const alphaEvidence = {
     ...profileArtifactLocations(base.profiles.alpha),
-    ...inspect(base.profiles.alpha, current),
+    ...inspect(base.profiles.alpha, current, persistedRegistry?.profiles.alpha ?? null),
   };
   const registry = createEnvironmentProfileRegistry({
     stableDesktopPath: effectiveStableDesktopPath,
@@ -1210,6 +1216,30 @@ export function writeEnvironmentSelection(file: string, selection: EnvironmentSe
     }
     rmSync(temporary, { force: true });
   }
+}
+
+/**
+ * Publish a pre-verified schema-1 registry and selection as one journaled,
+ * rollback-safe document pair.  Callers that have already assembled both
+ * documents must not independently rewrite either file afterwards.
+ */
+export function publishEnvironmentSnapshot(
+  registryFile: string,
+  selectionFile: string,
+  registry: EnvironmentProfileRegistry,
+  selection: EnvironmentSelection,
+): void {
+  if (!isEnvironmentProfileRegistry(registry) || !isEnvironmentSelection(selection)) {
+    throw new Error("Refusing to publish an invalid environment snapshot");
+  }
+  if (registry.selected === null || !environmentSelectionsMatch(registry.selected, selection)) {
+    throw new Error("Environment registry selected value does not match the environment snapshot selection");
+  }
+  if (registry.lastKnownWorkingSelection === null
+    || !environmentSelectionsMatch(registry.lastKnownWorkingSelection, selection)) {
+    throw new Error("Environment registry last-known-working selection does not match the environment snapshot selection");
+  }
+  commitEnvironmentDocumentsAtomically(registryFile, registry, selectionFile, selection, {});
 }
 
 /** Publish one verified selection to both schema-1 documents as one rollback-safe pair. */

@@ -10,8 +10,7 @@ import { readState, resolveMode, writeState, type InstallerState } from "../stat
 import { reconcileModeTransition } from "../mode-transition.js";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { signatureInfo, signingAvailable, verifySignature } from "../codesign.js";
-import { listProcesses, type ProcessInfo } from "./debug.js";
-import { terminateStaleHelperProcesses } from "../orphans.js";
+import { listProcesses } from "./debug.js";
 import { readConfigFile, readDevTweaksRoot } from "../config.js";
 import { reconcileDevTweaks } from "./dev-sync.js";
 import { readHeaderHash } from "../asar.js";
@@ -32,19 +31,28 @@ import {
 } from "../transaction.js";
 import { fileURLToPath } from "node:url";
 import { clearDeferredRepair, readDeferredRepair, writeDeferredRepair } from "../deferred-repair.js";
-import { isLockHeldByLiveOwner } from "../process-lock.js";
+import { isLockHeldByLiveOwner, processAlive } from "../process-lock.js";
 import {
   assertLifecycleReceiptsIdle,
+  desktopReceiptBlocksLifecycle,
+  environmentReceiptBlocksLifecycle,
   isLifecycleLockHeld,
   lifecycleLockFile,
   withLifecycleLock,
 } from "../lifecycle-lock.js";
+import { readDesktopUpdateReceipt } from "../desktop-update-transaction.js";
+import { readEnvironmentTransactionReceipt } from "../environment-transaction.js";
 import { formatCliShimResult, type CliShimResult } from "../cli-shim.js";
 import { reconcileManagedCliShims } from "../managed-runtime.js";
 import { LEGACY_WATCHER_ENV } from "../legacy-compat.js";
 import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
 import { decideRuntimeFingerprintRepair, readRuntimeFingerprint } from "../runtime-fingerprint.js";
 import { updateAutoRepairState, type RuntimeRepairState } from "../auto-repair-state.js";
+import {
+  reconcileAdoptedMcpLifecycle,
+  type McpLifecycleRepairResult,
+} from "./mcp-lifecycle.js";
+import { targetUserHome } from "../ownership.js";
 
 interface Opts {
   app?: string;
@@ -88,6 +96,8 @@ export interface RepairDependencies {
   stageAssets?: typeof stageAssets;
   stageBundledTweaks?: typeof stageBundledTweaks;
   now?: () => Date;
+  /** Reconcile only after an explicit managed-adoption receipt exists. */
+  reconcileMcpLifecycle?: () => McpLifecycleRepairResult | null;
 }
 
 export type RepairOutcome =
@@ -121,14 +131,28 @@ export async function repairWithOutcome(
 ): Promise<RepairOutcome> {
   const preliminaryPaths = userPaths();
   const watcherRepair = isWatcherRepair(opts);
-  if (watcherRepair && isRepairBlockedByActiveTransaction(
-    preliminaryPaths.root,
-    preliminaryPaths.transactionStateFile,
-  )) {
-    if (!opts.quiet) {
-      console.log(kleur.yellow("Another Tweakers lifecycle operation is active; skipping this repair pass."));
+  if (watcherRepair) {
+    const block = classifyRepairTransactionBlock(
+      preliminaryPaths.root,
+      preliminaryPaths.transactionStateFile,
+    );
+    if (block.kind === "orphaned") {
+      if (!opts.quiet) {
+        console.log(kleur.yellow(
+          `${block.receiptKind === "environment" ? "Environment transaction" : "Desktop update"} ${block.transactionId} `
+          + `was left behind by exited PID ${block.ownerPid} (phase ${block.phase}); `
+          + "check `tweaker update-chatgpt-status`, then `tweaker update-chatgpt-resume` if it is resumable, "
+          + "or `tweaker update-chatgpt-cancel` (`tweaker environment recover` for an environment-only orphan) to recover.",
+        ));
+      }
+      return { status: "deferred", reason: "orphaned-transaction" };
     }
-    return { status: "deferred", reason: "active-transaction" };
+    if (block.kind === "active") {
+      if (!opts.quiet) {
+        console.log(kleur.yellow("Another Tweakers lifecycle operation is active; skipping this repair pass."));
+      }
+      return { status: "deferred", reason: "active-transaction" };
+    }
   }
 
   try {
@@ -137,6 +161,14 @@ export async function repairWithOutcome(
       "repair",
       async () => {
         assertLifecycleReceiptsIdle(preliminaryPaths.root);
+        const lifecycle = (dependencies.reconcileMcpLifecycle
+          ?? (() => reconcileAdoptedMcpLifecycle({
+            targetHome: targetUserHome(),
+            userRoot: preliminaryPaths.root,
+          })))();
+        if (lifecycle?.status === "deferred" && !opts.quiet) {
+          console.log(kleur.yellow(`MCP lifecycle repair deferred: ${lifecycle.reason ?? "status is not safely reloadable"}.`));
+        }
         return repairWithLifecycle(opts, dependencies);
       },
     );
@@ -217,8 +249,8 @@ async function repairWithLifecycle(
   // Watcher steady-state fast path: if the live app.asar stat is byte-identical
   // to the stat recorded at the last confirmed-intact repair, nothing changed —
   // skip the settle-wait, header parse, runtime tree-hash, and process sweeps.
-  // Run cleanup hygiene (stale-helper sweep + watcher refresh) only every Nth
-  // pass so orphans are still reaped without paying ~8s every 5 minutes.
+  // Run bounded watcher/tweak hygiene only every Nth pass. Process cleanup is
+  // owned exclusively by the managed MCP lifecycle reaper.
   const statAsar = dependencies.statAsar ?? statAsarFile;
   if (watcherRepair && !opts.force && state?.patchedAsarStat) {
     const appRoot = opts.app ?? state.appRoot;
@@ -255,7 +287,6 @@ async function repairWithLifecycle(
         if (!opts.quiet) console.log(kleur.yellow("Runtime fingerprint requires a full repair verification."));
       } else if (passes % STAT_GUARD_HYGIENE_EVERY_N === 0) {
         const watcher = refreshWatcher(state.watcher, appRoot, opts.quiet);
-        cleanupStaleHelperGeneration(appRoot, opts, dependencies);
         syncDevTweaks(paths.tweaks, paths.configFile, opts);
         writeState(paths.stateFile, {
           ...state,
@@ -317,7 +348,6 @@ async function repairWithLifecycle(
       }
       const patchedAsarStat = statAsar(codex.asarPath) ?? state.patchedAsarStat;
       const watcher = refreshWatcher(state.watcher, codex.appRoot, opts.quiet);
-      cleanupStaleHelperGeneration(codex.appRoot, opts, dependencies);
       syncDevTweaks(paths.tweaks, paths.configFile, opts);
       // Always complete the existing full-tree verification after the cheap
       // fingerprint gate requests repair. Do not let a version comparison
@@ -676,83 +706,77 @@ function isWatcherRepair(opts: Opts): boolean {
     || process.env[LEGACY_WATCHER_ENV] === "1";
 }
 
+type RepairTransactionBlock =
+  | { kind: "none" }
+  | { kind: "active" }
+  | {
+    kind: "orphaned";
+    receiptKind: "environment" | "desktop-update";
+    transactionId: string;
+    ownerPid: number;
+    phase: string;
+  };
+
 /**
- * True when a live process holds the coordinated-refresh lock or the install
- * transaction lock. Stale locks (dead owners) do not block; the transaction
- * lock acquirer also reclaims stale locks itself.
+ * Classify what blocks a watcher repair pass. Short-lived locks are already
+ * owner-liveness-aware; durable receipts are not, so a receipt whose blocking
+ * predicate fires is further split by whether its recorded owner is alive:
+ * a live owner is genuine contention ("active"), a dead one is an orphan the
+ * watcher can name so the user (or UI) can run explicit recovery. Receipts
+ * are read via the same exported predicates the lifecycle gate uses, so the
+ * classifier can never drift from the gate. Unreadable receipts classify as
+ * "active" — the conservative direction.
  */
-function isRepairBlockedByActiveTransaction(userRoot: string, transactionStateFile: string): boolean {
+function classifyRepairTransactionBlock(
+  userRoot: string,
+  transactionStateFile: string,
+): RepairTransactionBlock {
   const refreshLock = join(userRoot, "refresh-local.lock");
-  let receiptBlocked = false;
-  try {
-    assertLifecycleReceiptsIdle(userRoot, { contextOwned: false });
-  } catch {
-    receiptBlocked = true;
-  }
-  return receiptBlocked
-    || isLifecycleLockHeld(userRoot)
+  if (isLifecycleLockHeld(userRoot)
     || isLockHeldByLiveOwner(refreshLock)
-    || isTransactionLockHeld(transactionLockFile(transactionStateFile));
+    || isTransactionLockHeld(transactionLockFile(transactionStateFile))) {
+    return { kind: "active" };
+  }
+  let orphan: RepairTransactionBlock | null = null;
+  try {
+    const environment = readEnvironmentTransactionReceipt(join(userRoot, "transactions", "environment.json"));
+    if (environment && environmentReceiptBlocksLifecycle(environment) !== null) {
+      if (environment.ownerPid === process.pid || processAlive(environment.ownerPid)) {
+        return { kind: "active" };
+      }
+      orphan = {
+        kind: "orphaned",
+        receiptKind: "environment",
+        transactionId: environment.transactionId,
+        ownerPid: environment.ownerPid,
+        phase: environment.phase,
+      };
+    }
+    const desktop = readDesktopUpdateReceipt(join(userRoot, "transactions", "desktop-update.json"));
+    if (desktop && desktopReceiptBlocksLifecycle(desktop) !== null) {
+      if (desktop.ownerPid === process.pid || processAlive(desktop.ownerPid)) {
+        return { kind: "active" };
+      }
+      orphan = {
+        kind: "orphaned",
+        receiptKind: "desktop-update",
+        transactionId: desktop.transactionId,
+        ownerPid: desktop.ownerPid,
+        phase: desktop.phase,
+      };
+    }
+  } catch {
+    return { kind: "active" };
+  }
+  return orphan ?? { kind: "none" };
 }
 
 function isLifecycleContentionError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /Another Tweakers lifecycle operation is active/i.test(message)
     || /Environment transaction .*finish or cancel/i.test(message)
-    || /Desktop update .*resume or cancel/i.test(message);
-}
-
-/**
- * Normal-startup hygiene: on a watcher pass where the patch is intact, sweep
- * only STALE helper generations — bundle-owned PPID-1 processes that predate
- * the current main process (or all of them when no main process is running).
- * Active current-generation helpers are never touched.
- */
-function cleanupStaleHelperGeneration(appRoot: string, opts: Opts, deps: RepairDependencies = {}): void {
-  if (!isWatcherRepair(opts) || platform() !== "darwin") return;
-  let mainStartedAt: string | null;
-  try {
-    const codex = locateCodex(appRoot);
-    const scan = deps.listProcesses ?? listProcesses;
-    const processes = scan();
-    const main = mainCodexProcesses(codex.executable, processes);
-    if (main.length === 0) {
-      mainStartedAt = null;
-    } else {
-      const earliest = earliestByStart(main);
-      // A running main whose start time we cannot read gives no generation
-      // boundary — current-generation crashpad helpers also reparent to PPID 1,
-      // so sweeping with null here could kill live helpers. Skip instead.
-      if (!earliest.startedAt) return;
-      mainStartedAt = earliest.startedAt;
-    }
-  } catch {
-    // Unknown process state: fail safe, sweep nothing this cycle.
-    return;
-  }
-  try {
-    terminateStaleHelperProcesses(appRoot, {
-      mainStartedAt,
-      log: opts.quiet ? undefined : (line) => console.log(kleur.dim(line)),
-    });
-  } catch {
-    // Cleanup is hygiene, never a repair blocker.
-  }
-}
-
-function mainCodexProcesses(executable: string, processes: ProcessInfo[]): ProcessInfo[] {
-  return processes.filter(
-    (p) => p.command === executable || p.command.startsWith(`${executable} `),
-  );
-}
-
-function earliestByStart(processes: ProcessInfo[]): ProcessInfo {
-  return [...processes].sort((a, b) => {
-    const at = a.startedAt ? Date.parse(a.startedAt) : Number.POSITIVE_INFINITY;
-    const bt = b.startedAt ? Date.parse(b.startedAt) : Number.POSITIVE_INFINITY;
-    if (at !== bt) return at - bt;
-    return a.pid - b.pid;
-  })[0];
+    || /Desktop update .*resume or cancel/i.test(message)
+    || /Desktop update .*recover it explicitly/i.test(message);
 }
 
 export async function waitForMacAppUpdateToSettle(appRoot: string | undefined, opts: SettleOptions = {}): Promise<void> {

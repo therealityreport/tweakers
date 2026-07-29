@@ -35,6 +35,7 @@ import {
 } from "./install.js";
 import { waitForMacAppUpdateToSettle } from "./repair.js";
 import { confirmModeSwitch, isCodexRunning, openCodex, quitCodex } from "../alerts.js";
+import { appendLifecycleAuditRecord } from "../desktop-update-log.js";
 import { signatureInfo, verifySignature } from "../codesign.js";
 import { OPENAI_TEAM_ID } from "../macos-variant.js";
 import { acquireProcessLock, isLockHeldByLiveOwner, processAlive } from "../process-lock.js";
@@ -246,6 +247,12 @@ async function switchEnvironmentExperience(
     console.log(kleur.yellow("Mode switch cancelled."));
     return;
   }
+  appendLifecycleAuditRecord(ensureUserPaths().desktopUpdateLogFile, {
+    event: "user_approval",
+    action: `mode-switch:${target}`,
+    transactionId: receipt.transactionId,
+    detail: `Mode switch to ${target} approved via ${opts.yes === true ? "--yes flag" : "confirmation dialog"}`,
+  });
 
   const committed = await runEnvironment("commit", {
     transaction: receipt.transactionId,
@@ -479,6 +486,11 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
       console.log(kleur.yellow("Mode switch cancelled."));
       return;
     }
+    appendLifecycleAuditRecord(paths.desktopUpdateLogFile, {
+      event: "user_approval",
+      action: "mode-switch:chatgpt",
+      detail: `Legacy mode switch to chatgpt approved via ${opts.yes === true ? "--yes flag" : "confirmation dialog"}`,
+    });
 
     const staged = join(modeDirectory(paths.root), "staged-pristine.app");
     const parkedApp = parkedPayloadApp(paths.root);
@@ -683,6 +695,11 @@ async function switchToTweakers(opts: ModeCommandOptions, deps: ModeCommandDeps)
       console.log(kleur.yellow("Mode switch cancelled."));
       return;
     }
+    appendLifecycleAuditRecord(paths.desktopUpdateLogFile, {
+      event: "user_approval",
+      action: "mode-switch:tweakers",
+      detail: `Legacy mode switch to tweakers approved via ${opts.yes === true ? "--yes flag" : "confirmation dialog"}`,
+    });
 
     const parkedApp = parkedPayloadApp(paths.root);
     const outgoing = join(modeDirectory(paths.root), "outgoing-pristine.app");

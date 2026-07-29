@@ -1,9 +1,31 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CodexSparkleBridge = exports.CODEX_PUBLIC_PRODUCTION_APPCAST = void 0;
+exports.createHealthProbeCodexSparkleBridgeOptions = createHealthProbeCodexSparkleBridgeOptions;
 exports.getCodexSparkleBridge = getCodexSparkleBridge;
 exports.configureCodexSparkleBridge = configureCodexSparkleBridge;
 exports.resetCodexSparkleBridgeForTests = resetCodexSparkleBridgeForTests;
+const HEALTH_PROBE_UPDATE_DISABLED_REASON = "Desktop updates are disabled during health probes.";
+/**
+ * Keeps OpenAI's native updater entry points wrapped but observational during
+ * one-shot health execution. No returned callback reaches networking, UI,
+ * persistence, app replacement, or signed-app preparation.
+ */
+function createHealthProbeCodexSparkleBridgeOptions() {
+    return Object.freeze({
+        suppressNativeSideEffects: true,
+        requestManualCheck: () => undefined,
+        requestBackgroundCheck: () => undefined,
+        requestInstall: () => undefined,
+        prepareForInstall: () => false,
+        getInstallPrerequisite: () => ({
+            ok: false,
+            reason: HEALTH_PROBE_UPDATE_DISABLED_REASON,
+        }),
+        onFeedCaptured: () => undefined,
+        onNativeControlActivityChanged: () => undefined,
+    });
+}
 const SAFE_LIFECYCLE = new Set([
     "idle",
     "checking",
@@ -224,6 +246,19 @@ class CodexSparkleBridge {
             return;
         const bridge = this;
         addon.init = function tweakerSparkleInit(...args) {
+            if (bridge.options.suppressNativeSideEffects) {
+                bridge.headers = undefined;
+                bridge.state.available = false;
+                bridge.state.lifecycle = "idle";
+                bridge.state.downloadProgressPercent = null;
+                bridge.state.installProgressPercent = null;
+                bridge.state.ready = false;
+                bridge.state.feedUrl = null;
+                bridge.state.fallbackFeedUrl = null;
+                bridge.state.lastError = null;
+                bridge.refreshActionability();
+                return undefined;
+            }
             bridge.captureInit(args);
             try {
                 const result = Reflect.apply(original, this, args);
@@ -296,6 +331,53 @@ class CodexSparkleBridge {
         }
     }
     disableNativeScheduler(addon) {
+        if (this.options.suppressNativeSideEffects) {
+            let acted = false;
+            for (const name of [
+                "setAutomaticallyChecksForUpdates",
+                "setUpdateCheckInterval",
+                "scheduleNextUpdateCheck",
+                "resetUpdateCycle",
+            ]) {
+                try {
+                    if (typeof addon[name] !== "function")
+                        continue;
+                    addon[name] = function tweakerInertHealthScheduler() { return undefined; };
+                    acted = true;
+                }
+                catch {
+                    // A missing optional seam remains harmless because native init and
+                    // both native check methods are also inert in health mode.
+                }
+            }
+            for (const [name, value] of [
+                ["automaticallyChecksForUpdates", false],
+                ["updateCheckInterval", 0],
+            ]) {
+                try {
+                    const descriptor = Object.getOwnPropertyDescriptor(addon, name);
+                    if (!descriptor || descriptor.configurable) {
+                        Object.defineProperty(addon, name, {
+                            configurable: true,
+                            enumerable: descriptor?.enumerable ?? true,
+                            get: () => value,
+                            set: () => undefined,
+                        });
+                        acted = true;
+                    }
+                    else if ("value" in descriptor && descriptor.writable) {
+                        addon[name] = value;
+                        acted = true;
+                    }
+                }
+                catch {
+                    // Never invoke a native accessor merely to adjust optional health
+                    // metadata. Check and init entry points remain independently inert.
+                }
+            }
+            this.nativeSchedulerDisabled ||= acted;
+            return;
+        }
         let acted = false;
         try {
             if (typeof addon.setAutomaticallyChecksForUpdates === "function") {
@@ -341,6 +423,10 @@ class CodexSparkleBridge {
         const original = addon[name];
         if (typeof original !== "function")
             return;
+        if (this.options.suppressNativeSideEffects) {
+            addon[name] = function tweakerInertHealthSinkSetter() { return undefined; };
+            return;
+        }
         const bridge = this;
         addon[name] = function tweakerSparkleSinkSetter(sink) {
             const wasActive = bridge.nativeUpdateControlActive();

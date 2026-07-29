@@ -16,6 +16,15 @@ export interface MutableChildProcessModule {
 interface InstalledParent {
     originalSpawn: SpawnFunction;
     wrappedSpawn: SpawnFunction;
+    children: Set<ChildProcess>;
+    cleanupStarted: boolean;
+    cleanupInFlight?: Promise<CodexAppServerParentCleanupResult>;
+}
+export interface CodexAppServerParentCleanupResult {
+    tracked: number;
+    terminated: number;
+    forced: number;
+    failed: number;
 }
 export interface CodexAppServerParentInstallOptions {
     childProcess?: MutableChildProcessModule;
@@ -27,6 +36,10 @@ export interface CodexAppServerParentInstallResult {
     installed: boolean;
     bundledNodePath: string | null;
     reason: "installed" | "already-installed" | "unsupported-platform" | "missing-bundled-node";
+    cleanupTrackedParents(options?: {
+        termTimeoutMs?: number;
+        killTimeoutMs?: number;
+    }): Promise<CodexAppServerParentCleanupResult>;
     uninstall(): void;
 }
 export declare function isCodexAppServerSpawn(command: unknown, args: unknown, options?: SpawnOptions): command is string;

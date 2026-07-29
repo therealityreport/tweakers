@@ -1,11 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.USER_QUESTIONS_SANDBOX_MODE = exports.USER_QUESTIONS_APPROVAL_POLICY = exports.USER_QUESTIONS_MCP_SERVER_NAME = exports.MCP_MANAGED_END = exports.MCP_MANAGED_START = void 0;
+exports.RESERVED_MANAGED_MCP_ENV_KEYS = exports.USER_QUESTIONS_MCP_SERVER_NAME = exports.MCP_MANAGED_END = exports.MCP_MANAGED_START = void 0;
 exports.withMcpConfigMutationLock = withMcpConfigMutationLock;
 exports.syncManagedMcpServers = syncManagedMcpServers;
 exports.buildManagedMcpBlock = buildManagedMcpBlock;
 exports.planManagedMcpReconciliation = planManagedMcpReconciliation;
-exports.planUserQuestionsApprovalPolicy = planUserQuestionsApprovalPolicy;
+exports.observeUserQuestionsApprovalPolicy = observeUserQuestionsApprovalPolicy;
 exports.sanitizePreservedApprovalPolicy = sanitizePreservedApprovalPolicy;
 exports.sanitizePreservedMcpOptions = sanitizePreservedMcpOptions;
 exports.mergeManagedMcpBlock = mergeManagedMcpBlock;
@@ -17,8 +17,10 @@ const node_path_1 = require("node:path");
 exports.MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 exports.MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
 exports.USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
-exports.USER_QUESTIONS_APPROVAL_POLICY = "approval_policy = { granular = { sandbox_approval = false, rules = false, skill_approval = false, request_permissions = false, mcp_elicitations = true } }";
-exports.USER_QUESTIONS_SANDBOX_MODE = 'sandbox_mode = "danger-full-access"';
+exports.RESERVED_MANAGED_MCP_ENV_KEYS = [
+    "TWEAKER_TWEAK_DATA_DIR",
+    "TWEAKER_TWEAK_ID",
+];
 const LEGACY_MCP_MANAGED_START = ["# BEGIN CODEX", "++ MANAGED MCP SERVERS"].join("");
 const LEGACY_MCP_MANAGED_END = ["# END CODEX", "++ MANAGED MCP SERVERS"].join("");
 const activeMcpConfigMutations = new Set();
@@ -66,7 +68,7 @@ function buildManagedMcpBlock(tweaks, existingToml = "") {
         }
         const serverName = reserveUniqueName(baseName, usedNames);
         serverNames.push(serverName);
-        entries.push(formatMcpServer(serverName, tweak.dir, mcp));
+        entries.push(formatMcpServer(serverName, tweak.manifest.id, tweak.dir, mcp, {}, tweak.dataDir));
     }
     if (entries.length === 0) {
         return { block: "", serverNames, skippedServerNames };
@@ -110,7 +112,7 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
             : [];
         const ownedLegacySpec = legacyTables.length === 1
             && nestedLegacyTables.length === 0
-            ? matchingMcpTableSpec(legacyTables[0], tweak.dir, mcp)
+            ? matchingMcpTableSpec(legacyTables[0], tweak.manifest.id, tweak.dir, mcp, true, tweak.dataDir)
             : null;
         const exactlyOwnedLegacy = ownedLegacySpec !== null;
         // Canonical entries inside the old managed block are stripped before
@@ -121,11 +123,11 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
             ? allTables.filter((table) => table.name === canonicalName)
             : [];
         const priorManagedCanonicalSpec = priorManagedCanonicalTables.length === 1
-            ? matchingMcpTableSpec(priorManagedCanonicalTables[0], tweak.dir, mcp)
+            ? matchingMcpTableSpec(priorManagedCanonicalTables[0], tweak.manifest.id, tweak.dir, mcp, false, tweak.dataDir)
             : null;
         const ownedCanonicalSpec = canonicalTables.length === 1
             && nestedCanonicalTables.length === 0
-            ? matchingMcpTableSpec(canonicalTables[0], tweak.dir, mcp)
+            ? matchingMcpTableSpec(canonicalTables[0], tweak.manifest.id, tweak.dir, mcp, false, tweak.dataDir)
             : null;
         const exactlyOwnedCanonical = ownedCanonicalSpec !== null;
         const observedOptions = ownedLegacySpec ?? ownedCanonicalSpec ?? priorManagedCanonicalSpec;
@@ -191,7 +193,7 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
         if (!desired)
             continue;
         appliedNames.push(canonicalName);
-        entries.push(formatMcpServer(canonicalName, tweak.dir, mcp, preservedOptions[canonicalName]));
+        entries.push(formatMcpServer(canonicalName, tweak.manifest.id, tweak.dir, mcp, preservedOptions[canonicalName], tweak.dataDir));
     }
     for (const range of [...rangesToRemove].sort((left, right) => right.start - left.start)) {
         manualToml = `${manualToml.slice(0, range.start)}${manualToml.slice(range.end)}`;
@@ -219,81 +221,28 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
 }
 const TOP_LEVEL_APPROVAL_POLICY_ASSIGNMENT = /^\s*(?:approval_policy|"approval_policy"|'approval_policy')\s*=/;
 const TOP_LEVEL_SANDBOX_MODE_ASSIGNMENT = /^\s*(?:sandbox_mode|"sandbox_mode"|'sandbox_mode')\s*=/;
-function planUserQuestionsApprovalPolicy({ currentToml, candidateToml, owned, enabled, preserved, }) {
-    const currentAssignments = findTopLevelApprovalPolicies(currentToml);
-    const currentSandboxAssignments = findTopLevelSandboxModes(currentToml);
-    const beforeRaw = currentAssignments[0]?.raw ?? null;
-    const beforeSandboxModeRaw = currentSandboxAssignments[0]?.raw ?? null;
-    if (!owned) {
+/**
+ * Observe policy fields for reconciliation receipts without changing them.
+ * Policy mutation belongs exclusively to the User Questions Preview/Apply/
+ * Restore transaction; ordinary MCP startup and enable/disable reconciliation
+ * may only register or remove the server block.
+ */
+function observeUserQuestionsApprovalPolicy(currentToml, preserved = null) {
+    const approvalAssignments = findTopLevelApprovalPolicies(currentToml);
+    const sandboxAssignments = findTopLevelSandboxModes(currentToml);
+    const beforeRaw = approvalAssignments[0]?.raw ?? null;
+    const sandboxModeRaw = sandboxAssignments[0]?.raw ?? null;
+    const receipt = unchangedApprovalPolicy(beforeRaw, preserved, sandboxModeRaw);
+    if (approvalAssignments.length > 1 || sandboxAssignments.length > 1) {
         return {
-            nextToml: candidateToml,
-            preserved: null,
-            receipt: unchangedApprovalPolicy(beforeRaw, null, beforeSandboxModeRaw),
+            ...receipt,
+            status: "conflict",
+            error: approvalAssignments.length > 1
+                ? "Duplicate top-level approval_policy assignments"
+                : "Duplicate top-level sandbox_mode assignments",
         };
     }
-    if (currentAssignments.length > 1 || (enabled && currentSandboxAssignments.length > 1)) {
-        return {
-            nextToml: currentToml,
-            preserved,
-            receipt: {
-                ...unchangedApprovalPolicy(beforeRaw, preserved, beforeSandboxModeRaw),
-                status: "conflict",
-                error: currentAssignments.length > 1
-                    ? "Duplicate top-level approval_policy assignments"
-                    : "Duplicate top-level sandbox_mode assignments",
-            },
-        };
-    }
-    if (enabled) {
-        const captured = preserved ?? {
-            present: currentAssignments.length === 1,
-            rawAssignment: beforeRaw,
-        };
-        const withApprovalPolicy = replaceTopLevelApprovalPolicy(candidateToml, exports.USER_QUESTIONS_APPROVAL_POLICY);
-        const nextToml = replaceTopLevelSandboxMode(withApprovalPolicy, exports.USER_QUESTIONS_SANDBOX_MODE);
-        const afterRaw = findTopLevelApprovalPolicies(nextToml)[0]?.raw ?? null;
-        const afterSandboxModeRaw = findTopLevelSandboxModes(nextToml)[0]?.raw ?? null;
-        return {
-            nextToml,
-            preserved: captured,
-            receipt: {
-                status: nextToml === candidateToml ? "unchanged" : "managed",
-                beforeRaw,
-                afterRaw,
-                preservedOriginalRaw: captured.rawAssignment,
-                preservedOriginalPresent: captured.present,
-                sandboxModeBeforeRaw: beforeSandboxModeRaw,
-                sandboxModeAfterRaw: afterSandboxModeRaw,
-                restartRequired: nextToml !== candidateToml,
-            },
-        };
-    }
-    if (!preserved) {
-        return {
-            nextToml: candidateToml,
-            preserved: null,
-            receipt: unchangedApprovalPolicy(beforeRaw, null, beforeSandboxModeRaw),
-        };
-    }
-    const nextToml = preserved.present && preserved.rawAssignment !== null
-        ? replaceTopLevelApprovalPolicy(candidateToml, preserved.rawAssignment)
-        : removeTopLevelApprovalPolicy(candidateToml);
-    const afterRaw = findTopLevelApprovalPolicies(nextToml)[0]?.raw ?? null;
-    const afterSandboxModeRaw = findTopLevelSandboxModes(nextToml)[0]?.raw ?? null;
-    return {
-        nextToml,
-        preserved: null,
-        receipt: {
-            status: nextToml === candidateToml ? "unchanged" : "restored",
-            beforeRaw,
-            afterRaw,
-            preservedOriginalRaw: preserved.rawAssignment,
-            preservedOriginalPresent: preserved.present,
-            sandboxModeBeforeRaw: beforeSandboxModeRaw,
-            sandboxModeAfterRaw: afterSandboxModeRaw,
-            restartRequired: nextToml !== candidateToml,
-        },
-    };
+    return receipt;
 }
 function unchangedApprovalPolicy(raw, preserved, sandboxModeRaw = null) {
     return {
@@ -357,40 +306,6 @@ function findTopLevelAssignments(toml, assignmentPattern) {
         });
     }
     return assignments;
-}
-function replaceTopLevelApprovalPolicy(toml, raw) {
-    return replaceTopLevelAssignment(toml, raw, findTopLevelApprovalPolicies(toml));
-}
-function replaceTopLevelSandboxMode(toml, raw) {
-    return replaceTopLevelAssignment(toml, raw, findTopLevelSandboxModes(toml));
-}
-function replaceTopLevelAssignment(toml, raw, assignments) {
-    if (assignments.length > 1)
-        return toml;
-    const existing = assignments[0];
-    if (existing) {
-        return `${toml.slice(0, existing.start)}${raw}${existing.lineEnding}${toml.slice(existing.end)}`;
-    }
-    const firstTableOrManagedBlock = classifyTomlLines(toml)
-        .find((line) => line.structural && (/^\s*\[/.test(line.text)
-        || line.text.trim() === exports.MCP_MANAGED_START
-        || line.text.trim() === LEGACY_MCP_MANAGED_START));
-    // Top-level assignments must remain outside the managed MCP block. Inserting
-    // immediately before its first table places the assignment between the
-    // markers, so the next reconciliation strips it and reports a false change.
-    const insertion = firstTableOrManagedBlock?.start ?? toml.length;
-    const prefix = toml.slice(0, insertion);
-    const separator = prefix && !/[\r\n]$/.test(prefix) ? "\n" : "";
-    const beforeManagedBlock = firstTableOrManagedBlock !== undefined
-        && [exports.MCP_MANAGED_START, LEGACY_MCP_MANAGED_START].includes(firstTableOrManagedBlock.text.trim());
-    return `${prefix}${separator}${raw}\n${beforeManagedBlock ? "\n" : ""}${toml.slice(insertion)}`;
-}
-function removeTopLevelApprovalPolicy(toml) {
-    const assignments = findTopLevelApprovalPolicies(toml);
-    if (assignments.length !== 1)
-        return toml;
-    const existing = assignments[0];
-    return `${toml.slice(0, existing.start)}${toml.slice(existing.end)}`;
 }
 function indexOwnedMcpTweaks(tweaks) {
     const indexed = new Map();
@@ -930,18 +845,26 @@ function legacyMcpServerName(tweakId) {
         .toLowerCase();
     return suffix ? `co-thomashulihan-${suffix}` : null;
 }
-function matchingMcpTableSpec(table, tweakDir, mcp) {
+function matchingMcpTableSpec(table, tweakId, tweakDir, mcp, legacyComparison = false, dataDir) {
     const observed = parseMcpTableBody(table.body);
     if (!observed)
+        return null;
+    const injectedEnv = managedMcpEnvironment(tweakId, tweakDir, {}, dataDir);
+    const observedEnv = legacyComparison
+        ? withoutExactReservedManagedEnv(observed.env, injectedEnv)
+        : observed.env;
+    if (!observedEnv)
         return null;
     const expected = {
         command: resolveCommand(tweakDir, mcp.command),
         args: (mcp.args ?? []).map((arg) => resolveArg(tweakDir, arg)),
-        env: mcp.env ?? {},
+        env: legacyComparison
+            ? mcp.env ?? {}
+            : managedMcpEnvironment(tweakId, tweakDir, mcp.env ?? {}, dataDir),
     };
     return observed.command === expected.command
         && arraysEqual(observed.args, expected.args)
-        && recordsEqual(observed.env, expected.env)
+        && recordsEqual(observedEnv, expected.env)
         ? observed
         : null;
 }
@@ -1052,10 +975,13 @@ function normalizeMcpServer(value) {
             return null;
         if (Object.values(value.env).some((envValue) => typeof envValue !== "string"))
             return null;
+        const reserved = exports.RESERVED_MANAGED_MCP_ENV_KEYS.find((key) => Object.hasOwn(value.env, key));
+        if (reserved)
+            throw new Error(`MCP environment variable ${reserved} is reserved for Tweakers`);
     }
     return value;
 }
-function formatMcpServer(serverName, tweakDir, mcp, preserved = {}) {
+function formatMcpServer(serverName, tweakId, tweakDir, mcp, preserved = {}, dataDir) {
     const lines = [
         `[mcp_servers.${formatTomlKey(serverName)}]`,
         `command = ${formatTomlString(resolveCommand(tweakDir, mcp.command))}`,
@@ -1063,13 +989,41 @@ function formatMcpServer(serverName, tweakDir, mcp, preserved = {}) {
     if (mcp.args && mcp.args.length > 0) {
         lines.push(`args = ${formatTomlStringArray(mcp.args.map((arg) => resolveArg(tweakDir, arg)))}`);
     }
-    if (mcp.env && Object.keys(mcp.env).length > 0) {
-        lines.push(`env = ${formatTomlInlineTable(mcp.env)}`);
-    }
+    lines.push(`env = ${formatTomlInlineTable(managedMcpEnvironment(tweakId, tweakDir, mcp.env ?? {}, dataDir))}`);
     if (preserved.defaultToolsApprovalMode === "approve") {
         lines.push('default_tools_approval_mode = "approve"');
     }
     return lines.join("\n");
+}
+function managedMcpEnvironment(tweakId, tweakDir, declared, dataDir) {
+    if (exports.RESERVED_MANAGED_MCP_ENV_KEYS.some((key) => Object.hasOwn(declared, key))) {
+        throw new Error(`Tweak ${tweakId} may not override reserved managed MCP environment variables`);
+    }
+    return {
+        ...declared,
+        TWEAKER_TWEAK_DATA_DIR: managedMcpDataDir(tweakId, tweakDir, dataDir),
+        TWEAKER_TWEAK_ID: tweakId,
+    };
+}
+function managedMcpDataDir(tweakId, tweakDir, explicit) {
+    if (explicit !== undefined) {
+        if (!(0, node_path_1.isAbsolute)(explicit) || explicit.includes("\0")) {
+            throw new Error(`Tweak ${tweakId} has an invalid managed MCP data directory`);
+        }
+        return (0, node_path_1.resolve)(explicit);
+    }
+    return (0, node_path_1.resolve)(tweakDir, "..", "..", "tweak-data", tweakId);
+}
+function withoutExactReservedManagedEnv(observed, injected) {
+    const comparable = { ...observed };
+    for (const key of exports.RESERVED_MANAGED_MCP_ENV_KEYS) {
+        if (!Object.hasOwn(comparable, key))
+            continue;
+        if (comparable[key] !== injected[key])
+            return null;
+        delete comparable[key];
+    }
+    return comparable;
 }
 function resolveCommand(tweakDir, command) {
     if ((0, node_path_1.isAbsolute)(command) || !looksLikeRelativePath(command))

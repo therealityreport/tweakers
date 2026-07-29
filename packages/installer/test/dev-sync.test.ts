@@ -13,7 +13,17 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { clearLegacyDevMode, reconcileDevTweaks, resolveDevSyncSourceRoot, runDevSyncCycle, shouldIgnoreDevWatchPath } from "../src/commands/dev-sync";
+import {
+  acceptDevSnapshot,
+  clearLegacyDevMode,
+  prepareDevSnapshot,
+  readDevSnapshotReceipt,
+  reconcileDevTweaks,
+  resolveDevSyncSourceRoot,
+  rollbackDevSnapshot,
+  runDevSyncCycle,
+  shouldIgnoreDevWatchPath,
+} from "../src/commands/dev-sync";
 import { readConfigFile, readDevTweaksRoot, updateConfigFile } from "../src/config";
 import { isSymlinkInto } from "../src/symlinks";
 
@@ -202,9 +212,8 @@ test("validated dev sync publishes built tweaks without symlinking the checkout"
       sourceRoot: join(f.root, "repo"),
       liveTweaks: f.liveTweaks,
       build: async (sourceRoot) => {
-        const built = join(sourceRoot, "packages", "installer", "assets", "runtime", "tweaks", "followup");
-        mkdirSync(built, { recursive: true });
-        writeFileSync(join(built, "manifest.json"), JSON.stringify({ id: "co.tweakers.followup" }));
+        const builtRoot = join(sourceRoot, "packages", "installer", "assets", "runtime", "tweaks");
+        const built = writeTweak(builtRoot, "followup", "co.tweakers.followup");
         writeFileSync(join(built, "index.js"), "module.exports = { built: true };\n");
       },
     });
@@ -213,6 +222,51 @@ test("validated dev sync publishes built tweaks without symlinking the checkout"
     assert.equal(lstatSync(live).isSymbolicLink(), false);
     assert.match(readFileSync(join(live, "index.js"), "utf8"), /built: true/);
     assert.ok(existsSync(join(f.liveTweaks, ".tweaker-dev-reload")));
+    const receipt = readDevSnapshotReceipt(join(f.liveTweaks, ".tweaker-dev-snapshot.json"));
+    assert.ok(receipt);
+    assert.equal(receipt.schemaVersion, 2);
+    assert.equal(receipt.phase, "pending_acceptance");
+    assert.match(receipt.sourcePayloadHash, /^[a-f0-9]{64}$/);
+    assert.deepEqual(receipt.folders, ["followup"]);
+    assert.equal(receipt.folderProofs[0]?.folder, "followup");
+    assert.equal(receipt.folderProofs[0]?.id, "co.tweakers.followup");
+    assert.equal(receipt.folderProofs[0]?.version, "0.1.0");
+    assert.match(receipt.folderProofs[0]?.hash ?? "", /^[a-f0-9]{64}$/);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("prepareDevSnapshot directly publishes an already-built complete sibling tree", () => {
+  const f = fixture();
+  try {
+    const builtRoot = join(f.root, "candidate", "tweaks");
+    writeTweak(builtRoot, "alpha", "co.example.alpha");
+    writeTweak(builtRoot, "beta", "co.example.beta");
+    const prior = writeTweak(f.liveTweaks, "retired", "co.example.retired");
+    writeFileSync(join(prior, "index.js"), "module.exports = { prior: true };\n");
+    writeTweak(f.liveTweaks, "custom", "com.user.custom");
+    writeFileSync(join(f.liveTweaks, ".tweaker-dev-snapshot.json"), JSON.stringify({ folders: ["retired"] }));
+
+    const receipt = prepareDevSnapshot(builtRoot, f.liveTweaks);
+
+    assert.equal(receipt.phase, "pending_acceptance");
+    assert.deepEqual(receipt.folders, ["alpha", "beta"]);
+    assert.deepEqual(receipt.folderProofs.map(({ folder, id }) => ({ folder, id })), [
+      { folder: "alpha", id: "co.example.alpha" },
+      { folder: "beta", id: "co.example.beta" },
+    ]);
+    assert.equal(existsSync(join(f.liveTweaks, "alpha")), true);
+    assert.equal(existsSync(join(f.liveTweaks, "beta")), true);
+    assert.equal(existsSync(join(f.liveTweaks, "retired")), false);
+    assert.equal(existsSync(join(f.liveTweaks, "custom")), true);
+    assert.deepEqual(readDevSnapshotReceipt(join(f.liveTweaks, ".tweaker-dev-snapshot.json")), receipt);
+
+    rollbackDevSnapshot(f.liveTweaks);
+    assert.match(readFileSync(join(f.liveTweaks, "retired", "index.js"), "utf8"), /prior/);
+    assert.equal(existsSync(join(f.liveTweaks, "alpha")), false);
+    assert.equal(existsSync(join(f.liveTweaks, "beta")), false);
+    assert.equal(existsSync(join(f.liveTweaks, "custom")), true);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -272,6 +326,7 @@ test("dev snapshot removes stale managed tweaks and preserves unrelated user twe
       },
     });
     writeTweak(f.liveTweaks, "user-owned", "com.user.owned");
+    acceptDevSnapshot(f.liveTweaks);
 
     await runDevSyncCycle({
       sourceRoot: join(f.root, "repo"),
@@ -285,6 +340,88 @@ test("dev snapshot removes stale managed tweaks and preserves unrelated user twe
     assert.equal(existsSync(join(f.liveTweaks, "stale")), false);
     assert.equal(existsSync(join(f.liveTweaks, "current")), true);
     assert.equal(existsSync(join(f.liveTweaks, "user-owned")), true);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy name-only snapshot is archived and replaced with a rollbackable schema-v2 tree", async () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "current", "co.example.current");
+    const stale = writeTweak(f.liveTweaks, "stale", "co.example.stale");
+    writeFileSync(join(stale, "index.js"), "module.exports = { legacy: '0.4.7' };\n");
+    writeTweak(f.liveTweaks, "custom", "com.user.custom");
+    writeFileSync(join(f.liveTweaks, ".tweaker-dev-snapshot.json"), JSON.stringify({ folders: ["stale"] }));
+
+    await runDevSyncCycle({
+      sourceRoot: join(f.root, "repo"),
+      liveTweaks: f.liveTweaks,
+      build: async () => {
+        const built = join(f.root, "repo", "packages", "installer", "assets", "runtime", "tweaks");
+        writeTweak(built, "current", "co.example.current");
+      },
+    });
+
+    const receipt = readDevSnapshotReceipt(join(f.liveTweaks, ".tweaker-dev-snapshot.json"));
+    assert.ok(receipt);
+    assert.equal(receipt.archivedLegacySnapshots.length, 1);
+    assert.equal(existsSync(receipt.archivedLegacySnapshots[0]!), true);
+    assert.equal(existsSync(join(f.liveTweaks, "stale")), false);
+    assert.equal(existsSync(join(f.liveTweaks, "current")), true);
+    assert.equal(existsSync(join(f.liveTweaks, "custom")), true);
+    assert.equal(existsSync(join(receipt.priorTreeRoot, "stale")), true);
+
+    const rolledBack = rollbackDevSnapshot(f.liveTweaks);
+    assert.equal(rolledBack.phase, "rolled_back");
+    assert.match(readFileSync(join(f.liveTweaks, "stale", "index.js"), "utf8"), /0\.4\.7/);
+    assert.equal(existsSync(join(f.liveTweaks, "current")), false);
+    assert.equal(existsSync(join(f.liveTweaks, "custom")), true);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot accept and rollback fail closed after live or preimage hash drift", async () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "current", "co.example.current");
+    const old = writeTweak(f.liveTweaks, "current", "co.example.current");
+    writeFileSync(join(old, "index.js"), "module.exports = { old: true };\n");
+    writeFileSync(join(f.liveTweaks, ".tweaker-dev-snapshot.json"), JSON.stringify({ folders: ["current"] }));
+    await runDevSyncCycle({
+      sourceRoot: join(f.root, "repo"),
+      liveTweaks: f.liveTweaks,
+      build: async () => {
+        const built = join(f.root, "repo", "packages", "installer", "assets", "runtime", "tweaks");
+        const current = writeTweak(built, "current", "co.example.current");
+        writeFileSync(join(current, "index.js"), "module.exports = { next: true };\n");
+      },
+    });
+    writeFileSync(join(f.liveTweaks, "current", "index.js"), "module.exports = { concurrent: true };\n");
+    assert.throws(() => acceptDevSnapshot(f.liveTweaks), /changed before accept\/rollback/);
+    assert.throws(() => rollbackDevSnapshot(f.liveTweaks), /changed before accept\/rollback/);
+    assert.match(readFileSync(join(f.liveTweaks, "current", "index.js"), "utf8"), /concurrent/);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot refuses to overwrite an untracked custom folder with a built sibling", async () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "collision", "co.example.collision");
+    const custom = writeTweak(f.liveTweaks, "collision", "com.user.collision");
+    writeFileSync(join(custom, "index.js"), "module.exports = { custom: true };\n");
+    await assert.rejects(runDevSyncCycle({
+      sourceRoot: join(f.root, "repo"),
+      liveTweaks: f.liveTweaks,
+      build: async () => {
+        const built = join(f.root, "repo", "packages", "installer", "assets", "runtime", "tweaks");
+        writeTweak(built, "collision", "co.example.collision");
+      },
+    }), /untracked custom tweak folder/);
+    assert.match(readFileSync(join(custom, "index.js"), "utf8"), /custom/);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

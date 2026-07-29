@@ -13,12 +13,16 @@ import {
 } from "../src/commands/install";
 import type { SignatureInfo } from "../src/codesign";
 
-function signature(teamIdentifier: string | null, authority = "Tweakers Local Signing"): SignatureInfo {
+function signature(
+  teamIdentifier: string | null,
+  authority: string | null = "Tweakers Local Signing",
+  adHoc = false,
+): SignatureInfo {
   return {
     ok: true,
-    adHoc: false,
+    adHoc,
     teamIdentifier,
-    authority: [authority],
+    authority: authority === null ? [] : [authority],
     output: "fixture",
   };
 }
@@ -148,6 +152,42 @@ test("teamless local candidates require the exact same signing authority", () =>
       designatedRequirement: (path) => `designated => certificate leaf = H"${path === app ? "aaaa" : "bbbb"}"`,
     }), /does not share the candidate's exact local signing certificate/);
     assert.equal(existsSync(host), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("strictly verified bare ad-hoc candidates accept only a bare ad-hoc staged host", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-native-adhoc-signature-"));
+  try {
+    const app = join(root, "candidate.app");
+    const host = stagedNativeHostPath(app);
+    mkdirSync(join(host, ".."), { recursive: true });
+    writeFileSync(host, "host");
+    const verify = () => ({ ok: true, output: "ok" });
+    let requirementReads = 0;
+
+    assert.doesNotThrow(() => verifyNativeHostMatchesApp(app, host, {
+      verify,
+      signature: () => signature(null, null, true),
+      designatedRequirement: () => {
+        requirementReads += 1;
+        throw new Error("bare ad-hoc verification must not request a certificate leaf");
+      },
+    }));
+    assert.equal(requirementReads, 0);
+
+    assert.throws(() => verifyNativeHostMatchesApp(app, host, {
+      verify,
+      signature: (path) => path === app
+        ? signature(null, null, true)
+        : signature(null, "Tweakers Local Signing", true),
+    }), /does not share the candidate's local signing identity/);
+
+    assert.throws(() => verifyNativeHostMatchesApp(app, host, {
+      verify: (path) => ({ ok: path !== host, output: "strict failure" }),
+      signature: () => signature(null, null, true),
+    }), /Staged native host failed strict verification/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

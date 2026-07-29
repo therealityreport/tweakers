@@ -102,6 +102,25 @@ test("findSummaryPanels keeps only the innermost of nested matches (no duplicate
   assert.equal(panels[0], inner, "the parent that contains another match is dropped");
 });
 
+test("findSummaryPanels never scans generic sections or asides", () => {
+  let requestedSelector = "";
+  const explicitSummary = {
+    hasAttribute: () => false,
+    textContent: "Environment Sources Progress Subagents",
+    contains: () => false,
+  };
+  const root = {
+    querySelectorAll(selector) {
+      requestedSelector = selector;
+      return [explicitSummary];
+    },
+  };
+
+  assert.deepEqual(tweak.findSummaryPanels(root), [explicitSummary]);
+  assert.equal(requestedSelector, "[data-thread-summary], [data-summary-panel]");
+  assert.doesNotMatch(requestedSelector, /aside|section/);
+});
+
 test("malformed profiles without a real type/id are dropped, not rendered as Unknown", () => {
   const projection = tweak.normalizeProfilesProjection({
     ok: true,

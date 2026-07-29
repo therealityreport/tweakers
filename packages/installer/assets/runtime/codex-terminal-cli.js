@@ -1,7 +1,16 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.terminalCodexPathFromShellOutput = terminalCodexPathFromShellOutput;
 exports.resolveTerminalCodexBinary = resolveTerminalCodexBinary;
 const node_path_1 = require("node:path");
+function terminalCodexPathFromShellOutput(output, isExecutable) {
+    const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (const candidate of lines.reverse()) {
+        if ((0, node_path_1.isAbsolute)(candidate) && isExecutable(candidate))
+            return candidate;
+    }
+    return null;
+}
 /**
  * Resolve the independently installed Terminal CLI without confusing it with
  * the Codex binary embedded in the desktop app. PATH order is authoritative:
@@ -12,6 +21,7 @@ function resolveTerminalCodexBinary(options) {
     const excluded = new Set(options.excludedPaths ?? []);
     const candidates = [
         options.preferredPath,
+        options.loginShellPath,
         ...(options.pathValue ?? "")
             .split(node_path_1.delimiter)
             .filter(Boolean)

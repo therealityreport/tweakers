@@ -4,33 +4,44 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const manifest = require("../manifest.json");
 
 const PROTOCOL_VERSION = "2025-11-25";
 const INITIALIZE_ID = 1;
 const ASK_ID = 2;
 const RESPONSE_TIMEOUT_MS = 5_000;
+const CARRIER_PREFIX = "__tweakers_carrier_nonce_";
 const input = JSON.parse(fs.readFileSync(path.join(__dirname, "variation-round.json"), "utf8"));
-const scriptedAnswers = {
-  improvements: {
-    selection: ["faster", "accessible", "__other__"],
-    otherText: "Clearer progress indicators",
-  },
-  release_style: { selection: ["preview"], otherText: null },
-  notifications: { selection: [], otherText: null },
-  proof: { selection: ["automated_tests", "visual_check"], otherText: null },
+const scriptedContent = {
+  improvements: ["faster", "accessible", "__other__"],
+  improvements__other_text: "Clearer progress indicators",
+  release_style: "preview",
+  notifications: "__skip__",
+  proof: ["automated_tests", "visual_check"],
 };
 const expectedResult = {
+  round_id: input.round_id,
+  status: "submitted",
   cancelled: false,
   cancel_reason: null,
   answers: {
     improvements: {
+      status: "answered",
       selected_option_ids: ["faster", "accessible"],
       other_text: "Clearer progress indicators",
     },
-    release_style: { selected_option_ids: ["preview"], other_text: null },
-    notifications: { selected_option_ids: [], other_text: null },
-    proof: { selected_option_ids: ["automated_tests", "visual_check"], other_text: null },
+    release_style: { status: "answered", selected_option_ids: ["preview"], other_text: null },
+    notifications: { status: "skipped", selected_option_ids: [], other_text: null },
+    proof: { status: "answered", selected_option_ids: ["automated_tests", "visual_check"], other_text: null },
   },
+  skipped_question_ids: ["notifications"],
+  decision_guidance: {
+    scope: "current_task",
+    authority: "preference",
+    semantics: "preference-not-policy",
+    on_conflict: "Explain the conflict, the pros and cons, and what must be given up. Ask before materially changing the selected direction.",
+  },
+  draft: { resumable: false, resume_token: null },
 };
 
 void run().catch((error) => {
@@ -45,7 +56,7 @@ async function run() {
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
   const messages = jsonLines(child.stdout);
-  const state = { questionIndex: 0, elicitationCount: 0 };
+  let elicitationCount = 0;
 
   try {
     send(child, {
@@ -55,7 +66,7 @@ async function run() {
       params: {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { elicitation: { form: {} } },
-        clientInfo: { name: "user-questions-variation-harness", version: "1.0.0" },
+        clientInfo: { name: "user-questions-rich-round-harness", version: "2.0.0" },
       },
     });
 
@@ -63,6 +74,7 @@ async function run() {
     assert.equal(initialized.id, INITIALIZE_ID);
     assert.equal(initialized.error, undefined);
     assert.equal(initialized.result?.protocolVersion, PROTOCOL_VERSION);
+    assert.equal(initialized.result?.serverInfo?.version, manifest.version);
     send(child, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
     send(child, {
       jsonrpc: "2.0",
@@ -74,12 +86,11 @@ async function run() {
     while (true) {
       const message = await nextMessage(messages, "elicitation or ask result");
       if (message.method === "elicitation/create") {
-        const content = answerElicitation(message, state);
-        state.elicitationCount += 1;
+        elicitationCount += 1;
         send(child, {
           jsonrpc: "2.0",
           id: message.id,
-          result: { action: "accept", content },
+          result: { action: "accept", content: answerElicitation(message, elicitationCount - 1) },
         });
         continue;
       }
@@ -87,8 +98,7 @@ async function run() {
       assert.equal(message.id, ASK_ID, `unexpected server message: ${JSON.stringify(message)}`);
       assert.equal(message.error, undefined);
       assert.equal(message.result?.isError, false);
-      assert.equal(state.questionIndex, input.questions.length, "ask completed before every question was elicited");
-      assert.equal(state.elicitationCount, input.questions.length, "inline Other unexpectedly required a second elicitation");
+      assert.equal(elicitationCount, input.questions.length, "generic fallback should ask one question per form");
       assert.deepEqual(message.result?.structuredContent, expectedResult);
       assert.deepEqual(JSON.parse(message.result.content[0].text), expectedResult);
       process.stdout.write(`${JSON.stringify(message.result.structuredContent, null, 2)}\n`);
@@ -103,46 +113,33 @@ async function run() {
   }
 }
 
-function answerElicitation(message, state) {
+function answerElicitation(message, questionIndex) {
   assert.ok(message.id, "elicitation request is missing an id");
   assert.equal(message.params?.mode, "form");
-  const question = input.questions[state.questionIndex];
-  assert.ok(question, "received an elicitation after the final question");
-  assert.match(message.params.message, new RegExp(`Question ${state.questionIndex + 1} of ${input.questions.length}`));
-  const properties = message.params.requestedSchema?.properties;
+  const question = input.questions[questionIndex];
+  assert.ok(question, "generic fallback emitted too many question forms");
+  assert.match(message.params.message, new RegExp(`Question ${questionIndex + 1} of ${input.questions.length}`));
+  const schema = message.params.requestedSchema;
+  const properties = schema?.properties;
   assert.ok(properties && typeof properties === "object" && !Array.isArray(properties));
-  const answer = scriptedAnswers[question.id];
-  assert.ok(answer, `missing scripted answer for ${question.id}`);
-
-  const otherField = `${question.id}__other_text`;
-  assert.deepEqual(
-    Object.keys(properties),
-    question.allow_other ? [question.id, otherField] : [question.id],
-  );
-  if (question.selection_mode === "multiple") {
-    assert.equal(properties[question.id].type, "array");
-  } else {
-    assert.equal(properties[question.id].type, "string");
+  const expectedFields = [question.id];
+  if (question.allow_other) expectedFields.push(`${question.id}__other_text`);
+  assert.deepEqual(Object.keys(properties).sort(), expectedFields.sort(), "one host form must expose only its real question");
+  assert.equal(properties[question.id].type, question.selection_mode === "multiple" ? "array" : "string");
+  assert.match(properties[question.id].description, /Skip this question/);
+  if (question.allow_other) assert.equal(properties[`${question.id}__other_text`].maxLength, 4000);
+  if (questionIndex === 0) {
+    assert.match(properties[question.id].description, /Details:/);
+    assert.match(properties[question.id].description, /Pros:/);
+    assert.match(properties[question.id].description, /Cons:/);
+    assert.match(properties[question.id].description, /What you give up:/);
   }
-  if (question.allow_other) {
-    assert.equal(properties[otherField].type, "string");
-    assert.equal(properties[otherField].maxLength, 4000);
-    assert.equal(message.params.requestedSchema.required?.includes(otherField) || false, false);
+  assert.ok(schema.required.includes(question.id), "generic form requires an explicit answer or Skip");
+  const response = { [question.id]: scriptedContent[question.id] };
+  if (question.allow_other && scriptedContent[`${question.id}__other_text`]) {
+    response[`${question.id}__other_text`] = scriptedContent[`${question.id}__other_text`];
   }
-
-  const choseOther = answer.selection.includes("__other__");
-  state.questionIndex += 1;
-  if (answer.selection.length === 0) return {};
-  const content = {
-    [question.id]: question.selection_mode === "multiple"
-      ? answer.selection
-      : answer.selection[0],
-  };
-  if (choseOther) {
-    assert.ok(answer.otherText, `missing scripted Other text for ${question.id}`);
-    content[otherField] = answer.otherText;
-  }
-  return content;
+  return response;
 }
 
 function send(child, message) {

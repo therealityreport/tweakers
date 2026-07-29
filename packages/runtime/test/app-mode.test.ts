@@ -105,6 +105,7 @@ test("main removes legacy mode/lane IPC and routes restarts through Environment"
   assert.match(mainSource, /ipcMain\.handle\("tweaker:prepare-environment"/);
   assert.match(mainSource, /ipcMain\.handle\("tweaker:commit-environment"/);
   assert.match(mainSource, /ipcMain\.handle\("tweaker:rollback-environment"/);
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:recover-environment"/);
 });
 
 test("the runtime carries no soft vanilla mode or mode-switcher special cases", () => {

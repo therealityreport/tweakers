@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import { parsePsOutput, type ProcessInfo } from "./commands/debug.js";
 
@@ -16,6 +16,12 @@ export interface RegularChatGptMcpRuntimeProofInput {
   configPath: string;
   tweaksRoot: string;
   configurationChanged: boolean;
+  /**
+   * Timestamp of the last validated Tweakers-owned MCP configuration change.
+   * Whole-file config mtimes can advance during ChatGPT's startup plugin
+   * marketplace reconciliation even when the managed MCP state is unchanged.
+   */
+  managedConfigurationChangedAt?: string | null;
 }
 
 export interface RegularChatGptMcpRuntimeProofDependencies {
@@ -36,10 +42,14 @@ export function proveRegularChatGptMcpRuntime(
   const processes = (dependencies.listProcesses ?? listProcessesStrict)();
   const main = processes.find((candidate) => candidate.pid === input.mainPid) ?? null;
   const configMtimeMs = (dependencies.configMtimeMs ?? readConfigMtimeMs)(input.configPath);
+  const managedConfigurationMtimeMs = parseTimestamp(input.managedConfigurationChangedAt);
+  const effectiveConfigurationMtimeMs = managedConfigurationMtimeMs ?? configMtimeMs;
   const mainStartedMs = main?.startedAt === null || main?.startedAt === undefined
     ? null
     : Date.parse(main.startedAt);
-  const configModifiedAt = configMtimeMs === null ? null : new Date(configMtimeMs).toISOString();
+  const configModifiedAt = effectiveConfigurationMtimeMs === null
+    ? null
+    : new Date(effectiveConfigurationMtimeMs).toISOString();
   const mainStartedAt = mainStartedMs === null || !Number.isFinite(mainStartedMs)
     ? null
     : new Date(mainStartedMs).toISOString();
@@ -77,7 +87,8 @@ export function proveRegularChatGptMcpRuntime(
   // `ps lstart` has one-second precision while stat has sub-second precision.
   // A one-second tolerance accepts a config written immediately before launch,
   // but never a write from a later wall-clock second.
-  if (configMtimeMs !== null && mainStartedMs + 1_000 < configMtimeMs) {
+  if (effectiveConfigurationMtimeMs !== null
+    && mainStartedMs + 1_000 < effectiveConfigurationMtimeMs) {
     return {
       ok: false,
       mainStartedAt,
@@ -102,6 +113,46 @@ export function proveRegularChatGptMcpRuntime(
     ownedProcessPids: [],
     error: null,
   };
+}
+
+/**
+ * Read legacy/current MCP sync evidence only when it proves that the last
+ * Tweakers-owned change produced regular ChatGPT's empty managed server set.
+ * Invalid, conflicting, unchanged, or non-terminal receipts intentionally
+ * return null so callers retain the whole-config mtime fail-closed fallback.
+ */
+export function readRegularChatGptMcpConfigurationChangedAt(
+  statePath: string,
+): string | null {
+  if (!existsSync(statePath)) return null;
+  try {
+    const value = JSON.parse(readFileSync(statePath, "utf8")) as unknown;
+    if (!isRecord(value)
+      || (value.schemaVersion !== 1 && value.schemaVersion !== 2)
+      || (value.schemaVersion === 2 && value.phase !== "complete")
+      || value.status === "conflict"
+      || value.status === "error"
+      || !Array.isArray(value.desiredNames)
+      || value.desiredNames.length !== 0
+      || !Array.isArray(value.appliedNames)
+      || value.appliedNames.length !== 0
+      || !Array.isArray(value.conflicts)
+      || value.conflicts.length !== 0
+      ) {
+      return null;
+    }
+    const durableWatermark = typeof value.managedConfigurationChangedAt === "string"
+      ? value.managedConfigurationChangedAt
+      : null;
+    const legacyWatermark = value.status === "updated" && value.restartRequired === true
+      && typeof value.completedAt === "string"
+      ? value.completedAt
+      : null;
+    const timestamp = parseTimestamp(durableWatermark ?? legacyWatermark);
+    return timestamp === null ? null : new Date(timestamp).toISOString();
+  } catch {
+    return null;
+  }
 }
 
 function processDescendsFrom(
@@ -129,4 +180,14 @@ function listProcessesStrict(): ProcessInfo[] {
 
 function readConfigMtimeMs(path: string): number | null {
   return existsSync(path) ? statSync(path).mtimeMs : null;
+}
+
+function parseTimestamp(value: string | null | undefined): number | null {
+  if (typeof value !== "string") return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

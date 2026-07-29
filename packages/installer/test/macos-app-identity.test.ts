@@ -228,6 +228,26 @@ test("LaunchServices cleanup is idempotent when a non-live bundle is already unr
   assert.equal(result.registeredCanonical, true);
 });
 
+test("candidate-only validation performs no LaunchServices mutation", () => {
+  const calls: string[][] = [];
+  const candidate = "/tmp/candidate.app";
+  const result = reconcileLaunchServices({
+    appRoot: "/tmp/pristine-source.app",
+    bundleId: BUNDLE_ID,
+    nonLiveAppRoots: [candidate],
+    mutate: false,
+  }, {
+    platform: "darwin",
+    exists: () => true,
+    bundleIdentifier: () => BUNDLE_ID,
+    run: (_command, args) => { calls.push(args); },
+  });
+
+  assert.deepEqual(calls, []);
+  assert.deepEqual(result.unregistered, []);
+  assert.equal(result.registeredCanonical, false);
+});
+
 test("LaunchServices performs garbage collection only when the final promotion requests it", () => {
   const calls: string[][] = [];
   const result = reconcileLaunchServices({

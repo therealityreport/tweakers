@@ -16,12 +16,18 @@ const settings_injector_1 = require("./settings-injector");
 const tweak_host_1 = require("./tweak-host");
 const manager_1 = require("./manager");
 const desktop_update_indicator_1 = require("./desktop-update-indicator");
+const reload_focus_1 = require("./reload-focus");
+const renderer_storage_1 = require("../renderer-storage");
+const promotion_renderer_mount_1 = require("./promotion-renderer-mount");
 const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
 const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
 const BROWSER_UI_BRIDGE_RESPONSE = "tweaker:browser-ui-bridge-response";
 const BROWSER_UI_MESSAGE_FOR_VIEW = "tweaker:browser-ui-message-for-view";
 const BROWSER_UI_WORKER_MESSAGE = "tweaker:browser-ui-worker-message";
 const BROWSER_UI_SYSTEM_THEME = "tweaker:browser-ui-system-theme";
+const PROMOTION_RENDERER_IPC_CHANNEL = "tweaker:promotion-renderer-proof";
+const PROMOTION_RENDERER_AUTH_CHANNEL = "tweaker:promotion-renderer-authorize";
+const PROMOTION_RENDERER_MOUNT_TIMEOUT_MS = 4_000;
 const DESKTOP_MESSAGE_FROM_VIEW = "codex_desktop:message-from-view";
 const DESKTOP_MESSAGE_FOR_VIEW = "codex_desktop:message-for-view";
 const DESKTOP_SHOW_CONTEXT_MENU = "codex_desktop:show-context-menu";
@@ -65,6 +71,25 @@ function safeStringify(v) {
     }
 }
 fileLog("preload entry", { url: location.href });
+const promotionAttempt = (0, promotion_renderer_mount_1.promotionRendererAuthorizationAttempt)(location.href);
+let promotionNonce = null;
+if (promotionAttempt.kind === "candidate") {
+    let response = null;
+    let rejectionReason = "main authorization rejected";
+    try {
+        response = electron_1.ipcRenderer.sendSync(PROMOTION_RENDERER_AUTH_CHANNEL, promotionAttempt.request);
+    }
+    catch {
+        rejectionReason = "synchronous authorization failed";
+    }
+    promotionNonce = (0, promotion_renderer_mount_1.promotionRendererAuthorizedNonce)(promotionAttempt, response);
+    if (promotionNonce === null) {
+        fileLog("promotion renderer authorization incomplete", { reason: rejectionReason });
+    }
+}
+else if (promotionAttempt.kind === "invalid-candidate") {
+    fileLog("promotion renderer authorization incomplete", { reason: promotionAttempt.reason });
+}
 try {
     installBrowserUiHostBridge();
     fileLog("browser UI host bridge installed");
@@ -80,14 +105,117 @@ try {
 catch (e) {
     fileLog("react hook FAILED", String(e));
 }
-queueMicrotask(() => {
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", boot, { once: true });
+if (promotionNonce) {
+    schedulePromotionRendererProof(promotionNonce);
+}
+else if (promotionAttempt.kind === "ordinary") {
+    queueMicrotask(() => {
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", boot, { once: true });
+        }
+        else {
+            boot();
+        }
+    });
+}
+function schedulePromotionRendererProof(nonce) {
+    const mount = (0, promotion_renderer_mount_1.createPromotionRendererMountTracker)();
+    let observer = null;
+    let timeout = null;
+    let settled = false;
+    const cleanup = () => {
+        observer?.disconnect();
+        observer = null;
+        if (timeout !== null)
+            window.clearTimeout(timeout);
+        timeout = null;
+    };
+    const inspect = () => {
+        if (settled)
+            return;
+        const root = document.getElementById("root");
+        const state = mount.observe({
+            rootPresent: root !== null,
+            startupLoaderPresent: root !== null && root.querySelector(":scope > .startup-loader") !== null,
+            elementChildCount: root?.children.length ?? 0,
+        });
+        if (state !== "mounted")
+            return;
+        settled = true;
+        cleanup();
+        const rendererStorageSelfTest = promotionRendererStorageSelfTest(nonce);
+        electron_1.ipcRenderer.send(PROMOTION_RENDERER_IPC_CHANNEL, {
+            nonce,
+            url: location.href,
+            lifecycle: "renderer-mounted",
+            rendererStorageSelfTest,
+        });
+        fileLog("promotion renderer mount proof sent", { rendererStorageSelfTest });
+    };
+    observer = new MutationObserver(inspect);
+    observer.observe(document, { childList: true, subtree: true });
+    timeout = window.setTimeout(() => {
+        if (settled)
+            return;
+        settled = true;
+        cleanup();
+        fileLog("promotion renderer mount proof incomplete", {
+            reason: "startup loader was not replaced by renderer content",
+            timeoutMs: PROMOTION_RENDERER_MOUNT_TIMEOUT_MS,
+        });
+    }, PROMOTION_RENDERER_MOUNT_TIMEOUT_MS);
+    inspect();
+}
+function promotionRendererStorageSelfTest(nonce) {
+    const suffix = `promotion-health-${nonce}`;
+    const currentId = `co.tweakers.${suffix}`;
+    const currentKey = `tweaker:storage:${currentId}`;
+    const legacyKey = `${["codex", "pp"].join("")}:storage:co.promotion-probe.${suffix}`;
+    const raw = JSON.stringify({ retained: true, nonce });
+    let archiveKey = null;
+    let ownsProbeKeys = false;
+    try {
+        if (localStorage.getItem(currentKey) !== null || localStorage.getItem(legacyKey) !== null)
+            return "fail";
+        ownsProbeKeys = true;
+        localStorage.setItem(legacyKey, raw);
+        const prepared = (0, renderer_storage_1.prepareRendererStorageMigration)(currentId, localStorage, nonce);
+        if (prepared.status !== "prepared" || prepared.holdPromotion || localStorage.getItem(currentKey) !== raw)
+            return "fail";
+        const committed = (0, renderer_storage_1.commitRendererStorageMigration)(prepared, localStorage);
+        archiveKey = committed.archiveKey;
+        if (committed.phase !== "committed" || !archiveKey || localStorage.getItem(legacyKey) !== null)
+            return "fail";
+        const rolledBack = (0, renderer_storage_1.rollbackRendererStorageMigration)(committed, localStorage);
+        return rolledBack.phase === "rolled_back"
+            && localStorage.getItem(legacyKey) === raw
+            && localStorage.getItem(currentKey) === null
+            && localStorage.getItem(archiveKey) === null
+            ? "pass"
+            : "fail";
     }
-    else {
-        boot();
+    catch {
+        return "fail";
     }
-});
+    finally {
+        if (ownsProbeKeys) {
+            try {
+                localStorage.removeItem(currentKey);
+            }
+            catch { }
+            try {
+                localStorage.removeItem(legacyKey);
+            }
+            catch { }
+            if (archiveKey) {
+                try {
+                    localStorage.removeItem(archiveKey);
+                }
+                catch { }
+            }
+        }
+    }
+}
 async function boot() {
     fileLog("boot start", { readyState: document.readyState });
     try {
@@ -115,6 +243,7 @@ function subscribeReload() {
         if (reloading)
             return;
         reloading = (async () => {
+            const focusSnapshot = (0, reload_focus_1.captureTweakReloadFocus)(document);
             try {
                 console.info("[tweaker] hot-reloading tweaks");
                 (0, tweak_host_1.teardownTweakHost)();
@@ -125,6 +254,9 @@ function subscribeReload() {
                 console.error("[tweaker] hot reload failed:", e);
             }
             finally {
+                window.requestAnimationFrame(() => {
+                    (0, reload_focus_1.restoreTweakReloadFocus)(focusSnapshot);
+                });
                 reloading = null;
             }
         })();

@@ -21,16 +21,24 @@ export type DesktopUpdateLogEvent =
   | "owner_started"
   | "phase_transition"
   | "owner_completed"
-  | "handled_failure";
+  | "handled_failure"
+  | "handoff_attempt"
+  | "handoff_result"
+  | "native_wait_progress"
+  | "user_approval"
+  | "manual_recovery";
 
 export interface DesktopUpdateLogInput {
   transactionId: string;
-  phase: DesktopUpdatePhase;
+  /** "none" is reserved for audit events recorded outside a live transaction. */
+  phase: DesktopUpdatePhase | "none";
   ownerPid: number;
   ownerToken: string | null;
   ownerGeneration: string | null;
   event: DesktopUpdateLogEvent;
   error?: unknown;
+  /** Human-readable checkpoint context (redacted and bounded like error). */
+  detail?: string;
   jobLabel?: string | null;
 }
 
@@ -38,12 +46,13 @@ export interface DesktopUpdateLogRecord {
   schemaVersion: typeof DESKTOP_UPDATE_LOG_SCHEMA_VERSION;
   ts: string;
   transactionId: string;
-  phase: DesktopUpdatePhase;
+  phase: DesktopUpdatePhase | "none";
   ownerPid: number;
   ownerToken: string | null;
   ownerGeneration: string | null;
   event: DesktopUpdateLogEvent;
   error?: string;
+  detail?: string;
   jobLabel?: string;
 }
 
@@ -78,6 +87,14 @@ export function appendDesktopUpdateLog(
             options.maxErrorChars ?? MAX_DESKTOP_UPDATE_ERROR_CHARS,
           ),
         }),
+    ...(input.detail === undefined
+      ? {}
+      : {
+          detail: bound(
+            redact(input.detail, roots),
+            options.maxErrorChars ?? MAX_DESKTOP_UPDATE_ERROR_CHARS,
+          ),
+        }),
     ...(input.jobLabel === null || input.jobLabel === undefined
       ? {}
       : { jobLabel: redact(input.jobLabel, roots) }),
@@ -98,6 +115,37 @@ export function appendDesktopUpdateLog(
     closeSync(fd);
   }
   return record;
+}
+
+/**
+ * Append a lifecycle audit record (user approval or manual recovery) that is
+ * not tied to a live desktop-update owner. Never throws: audit logging must
+ * not fail the action it documents.
+ */
+export function appendLifecycleAuditRecord(
+  logPath: string,
+  input: {
+    event: "user_approval" | "manual_recovery";
+    /** Short action slug, e.g. "mode-switch:chatgpt" or "update-chatgpt". */
+    action: string;
+    detail: string;
+    transactionId?: string;
+  },
+  options: DesktopUpdateLogOptions = {},
+): void {
+  try {
+    appendDesktopUpdateLog(logPath, {
+      transactionId: input.transactionId ?? input.action,
+      phase: "none",
+      ownerPid: process.pid,
+      ownerToken: null,
+      ownerGeneration: null,
+      event: input.event,
+      detail: input.detail,
+    }, options);
+  } catch {
+    // Best-effort audit trail.
+  }
 }
 
 function rotateBeforeAppend(logPath: string, incomingBytes: number, maxBytes: number): void {

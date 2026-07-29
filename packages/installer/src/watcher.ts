@@ -14,7 +14,8 @@
  * is "run at login" + "run when Codex.app is modified" (FSEvents/inotify on
  * unix, but launchd's WatchPaths handles it on mac).
  */
-import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -24,6 +25,166 @@ import { managedCliPath } from "./managed-runtime.js";
 import { LEGACY_LAUNCHD_LABEL, LEGACY_WATCHER_ENV, LEGACY_WATCHER_STEM } from "./legacy-compat.js";
 
 export type WatcherKind = "launchd" | "login-item" | "scheduled-task" | "systemd" | "none";
+
+export interface WatcherPromotionSnapshot {
+  schemaVersion: 1;
+  kind: "watcher-promotion-snapshot";
+  watcherKind: WatcherKind;
+  configured: boolean;
+  loaded: boolean;
+  enabled: boolean;
+  definitionPath: string | null;
+  definitionDigest: string | null;
+  capturedAt: string;
+}
+
+/** Capture the service state before a promotion mutates any live app bytes. */
+export function captureWatcherPromotionSnapshot(): WatcherPromotionSnapshot {
+  const capturedAt = new Date().toISOString();
+  switch (platform()) {
+    case "darwin": {
+      const definitionPath = launchdPath();
+      const configured = existsSync(definitionPath);
+      return {
+        schemaVersion: 1,
+        kind: "watcher-promotion-snapshot",
+        watcherKind: configured ? "launchd" : "none",
+        configured,
+        loaded: configured && launchdServiceLoaded(),
+        enabled: configured && launchdServiceEnabled(),
+        definitionPath: configured ? definitionPath : null,
+        definitionDigest: configured ? fileDigest(definitionPath) : null,
+        capturedAt,
+      };
+    }
+    case "linux": {
+      const definitionPath = systemdWatcherPath();
+      const configured = existsSync(definitionPath);
+      return {
+        schemaVersion: 1,
+        kind: "watcher-promotion-snapshot",
+        watcherKind: configured ? "systemd" : "none",
+        configured,
+        loaded: configured && systemdUnitActive("tweaker-watcher.path"),
+        enabled: configured && systemdUnitEnabled("tweaker-watcher.path"),
+        definitionPath: configured ? definitionPath : null,
+        definitionDigest: configured ? fileDigest(definitionPath) : null,
+        capturedAt,
+      };
+    }
+    case "win32": {
+      const configured = windowsTaskExists(WINDOWS_WATCHER_LOGON_TASK_NAME)
+        || windowsTaskExists(WINDOWS_WATCHER_INTERVAL_TASK_NAME);
+      return {
+        schemaVersion: 1,
+        kind: "watcher-promotion-snapshot",
+        watcherKind: configured ? "scheduled-task" : "none",
+        configured,
+        loaded: configured,
+        enabled: configured,
+        definitionPath: null,
+        definitionDigest: null,
+        capturedAt,
+      };
+    }
+    default:
+      return {
+        schemaVersion: 1,
+        kind: "watcher-promotion-snapshot",
+        watcherKind: "none",
+        configured: false,
+        loaded: false,
+        enabled: false,
+        definitionPath: null,
+        definitionDigest: null,
+        capturedAt,
+      };
+  }
+}
+
+/** Stop triggers without deleting their definitions. Safe to repeat after a crash. */
+export function pauseWatcherForPromotion(snapshot: WatcherPromotionSnapshot): void {
+  if (!snapshot.configured) return;
+  switch (snapshot.watcherKind) {
+    case "launchd": {
+      const path = snapshot.definitionPath ?? launchdPath();
+      bootoutLaunchd(path);
+      try { execLaunchctlForTargetUser(["unload", path]); } catch {}
+      if (launchdServiceLoaded()) throw new Error("Watcher launchd service remained loaded after promotion pause");
+      return;
+    }
+    case "systemd":
+      for (const unit of ["tweaker-watcher.path", "tweaker-watcher.timer", "tweaker-watcher.service"]) {
+        try { execFileSync("systemctl", ["--user", "stop", unit], { stdio: "ignore" }); } catch {}
+      }
+      if (systemdUnitActive("tweaker-watcher.path")) {
+        throw new Error("Watcher systemd path remained active after promotion pause");
+      }
+      return;
+    case "scheduled-task":
+      for (const name of currentWindowsWatcherTaskNames()) {
+        try { execFileSync("schtasks.exe", ["/End", "/TN", name], { stdio: "ignore" }); } catch {}
+        try { execFileSync("schtasks.exe", ["/Change", "/Disable", "/TN", name], { stdio: "ignore" }); } catch {}
+      }
+      return;
+    case "login-item":
+    case "none":
+      return;
+  }
+}
+
+/** Rebind triggers to the promoted app, restoring the prior loaded/enabled state. */
+export function resumeWatcherAfterPromotion(
+  appRoot: string,
+  snapshot: WatcherPromotionSnapshot,
+): WatcherKind {
+  if (!snapshot.configured) return "none";
+  switch (snapshot.watcherKind) {
+    case "launchd": {
+      const path = writeLaunchdDefinition(appRoot);
+      const domain = launchdGuiDomain();
+      if (snapshot.loaded) {
+        if (!bootstrapLaunchd(path)) throw new Error("Could not reload watcher launchd service after promotion");
+        if (!launchdServiceLoaded()) throw new Error("Watcher launchd service was not loaded after promotion resume");
+      }
+      if (domain && snapshot.enabled) {
+        try { execFileSync("launchctl", ["enable", `${domain}/${LABEL}`], { stdio: "ignore" }); } catch {}
+      } else if (domain) {
+        try { execFileSync("launchctl", ["disable", `${domain}/${LABEL}`], { stdio: "ignore" }); } catch {}
+      }
+      return "launchd";
+    }
+    case "systemd": {
+      writeSystemdDefinitions(appRoot);
+      try { execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" }); } catch {}
+      if (snapshot.enabled) {
+        for (const unit of ["tweaker-watcher.service", "tweaker-watcher.timer", "tweaker-watcher.path"]) {
+          try { execFileSync("systemctl", ["--user", "enable", unit], { stdio: "ignore" }); } catch {}
+        }
+      }
+      if (snapshot.loaded) {
+        for (const unit of ["tweaker-watcher.timer", "tweaker-watcher.path"]) {
+          try { execFileSync("systemctl", ["--user", "start", unit], { stdio: "ignore" }); } catch {}
+        }
+        if (!systemdUnitActive("tweaker-watcher.path")) {
+          throw new Error("Watcher systemd path was not active after promotion resume");
+        }
+      }
+      return "systemd";
+    }
+    case "scheduled-task":
+      installScheduledTask(appRoot);
+      if (!snapshot.enabled) {
+        for (const name of currentWindowsWatcherTaskNames()) {
+          try { execFileSync("schtasks.exe", ["/Change", "/Disable", "/TN", name], { stdio: "ignore" }); } catch {}
+        }
+      }
+      return "scheduled-task";
+    case "login-item":
+    case "none":
+      return snapshot.watcherKind;
+  }
+}
 
 export function installWatcher(appRoot: string): WatcherKind {
   switch (platform()) {
@@ -75,6 +236,21 @@ function installLaunchd(appRoot: string): WatcherKind {
   const deferReload = isRunningFromWatcher();
   if (!deferReload) removeLegacyLaunchdWatcher();
 
+  const plPath = writeLaunchdDefinition(appRoot);
+  // A running watcher may refresh its plist on disk, but must never boot out
+  // the service that owns the current cycle. The next non-watcher repair (or
+  // login) loads the new definition; health reports this transition as pending.
+  if (deferReload) return "launchd";
+  if (!bootstrapLaunchd(plPath)) {
+    try {
+      execLaunchctlForTargetUser(["unload", plPath]);
+    } catch {}
+    execLaunchctlForTargetUser(["load", plPath]);
+  }
+  return "launchd";
+}
+
+function writeLaunchdDefinition(appRoot: string): string {
   const plPath = launchdPath();
   mkdirSync(dirname(plPath), { recursive: true });
   const logPath = launchdLogPath();
@@ -115,17 +291,7 @@ function installLaunchd(appRoot: string): WatcherKind {
   writeFileSync(logPath, "", { flag: "a" });
   chownForTargetUser(plPath);
   chownForTargetUser(logPath);
-  // A running watcher may refresh its plist on disk, but must never boot out
-  // the service that owns the current cycle. The next non-watcher repair (or
-  // login) loads the new definition; health reports this transition as pending.
-  if (deferReload) return "launchd";
-  if (!bootstrapLaunchd(plPath)) {
-    try {
-      execLaunchctlForTargetUser(["unload", plPath]);
-    } catch {}
-    execLaunchctlForTargetUser(["load", plPath]);
-  }
-  return "launchd";
+  return plPath;
 }
 
 export function isRunningFromWatcher(): boolean {
@@ -179,6 +345,30 @@ function launchdGuiDomain(): string | null {
   return typeof uid === "number" ? `gui/${uid}` : null;
 }
 
+function launchdServiceLoaded(): boolean {
+  const domain = launchdGuiDomain();
+  if (!domain) return false;
+  try {
+    execFileSync("launchctl", ["print", `${domain}/${LABEL}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function launchdServiceEnabled(): boolean {
+  const domain = launchdGuiDomain();
+  if (!domain) return false;
+  try {
+    const output = execFileSync("launchctl", ["print-disabled", domain], { encoding: "utf8" });
+    const escaped = LABEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = output.match(new RegExp(`[\"']?${escaped}[\"']?\\s*=>\\s*(true|false)`));
+    return match?.[1] !== "true";
+  } catch {
+    return true;
+  }
+}
+
 function execLaunchctlForTargetUser(args: string[]): void {
   const owner = targetUserOwnership();
   const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
@@ -192,9 +382,36 @@ function execLaunchctlForTargetUser(args: string[]): void {
 }
 
 function installSystemd(appRoot: string): WatcherKind {
-  const dir = join(homedir(), ".config", "systemd", "user");
-  mkdirSync(dir, { recursive: true });
+  const dir = writeSystemdDefinitions(appRoot);
   removeSystemdWatcherUnits(dir, LEGACY_WATCHER_STEM);
+  try {
+    execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+    execFileSync("systemctl", ["--user", "enable", "tweaker-watcher.service"], {
+      stdio: "ignore",
+    });
+    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.timer"], {
+      stdio: "ignore",
+    });
+    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.path"], {
+      stdio: "ignore",
+    });
+  } catch {
+    /* systemd may not be available */
+  }
+  return "systemd";
+}
+
+function systemdWatcherDir(): string {
+  return join(homedir(), ".config", "systemd", "user");
+}
+
+function systemdWatcherPath(): string {
+  return join(systemdWatcherDir(), "tweaker-watcher.path");
+}
+
+function writeSystemdDefinitions(appRoot: string): string {
+  const dir = systemdWatcherDir();
+  mkdirSync(dir, { recursive: true });
   const repair = shellSingleQuote(watcherShellScript());
   const unit = `[Unit]
 Description=tweaker repair watcher
@@ -227,21 +444,25 @@ PathChanged=${appRoot}/resources/app.asar
 [Install]
 WantedBy=default.target
 `);
+  return dir;
+}
+
+function systemdUnitActive(unit: string): boolean {
   try {
-    execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
-    execFileSync("systemctl", ["--user", "enable", "tweaker-watcher.service"], {
-      stdio: "ignore",
-    });
-    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.timer"], {
-      stdio: "ignore",
-    });
-    execFileSync("systemctl", ["--user", "enable", "--now", "tweaker-watcher.path"], {
-      stdio: "ignore",
-    });
+    execFileSync("systemctl", ["--user", "is-active", "--quiet", unit], { stdio: "ignore" });
+    return true;
   } catch {
-    /* systemd may not be available */
+    return false;
   }
-  return "systemd";
+}
+
+function systemdUnitEnabled(unit: string): boolean {
+  try {
+    execFileSync("systemctl", ["--user", "is-enabled", "--quiet", unit], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function uninstallSystemd(): void {
@@ -406,4 +627,17 @@ function deleteScheduledTask(name: string): void {
       });
     } catch {}
   }
+}
+
+function windowsTaskExists(name: string): boolean {
+  try {
+    execFileSync("schtasks.exe", ["/Query", "/TN", name], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function fileDigest(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }

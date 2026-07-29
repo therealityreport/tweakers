@@ -25,10 +25,42 @@ const pkg = require("./package.json");
 const meta = pkg.__tweaker || {};
 const originalMain = meta.originalMain;
 const appUserDataRoot = meta.appUserDataRoot;
-const userRoot = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1" && process.env.TWEAKERS_HEALTH_USER_ROOT
-  ? process.env.TWEAKERS_HEALTH_USER_ROOT
+const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+const runOriginalMainDuringHealth = process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
+const configuredHealthUserRoot = process.env.TWEAKERS_HEALTH_USER_ROOT;
+const validHealthUserRoot = healthCheckOnly
+  && typeof configuredHealthUserRoot === "string"
+  && isContainedHealthUserRoot(configuredHealthUserRoot);
+// Health launches never fall back to the live metadata root. The paired
+// original-main probe is allowed only when the installer supplied an exact,
+// absolute root whose runtime paths remain contained below that root.
+const userRoot = healthCheckOnly
+  ? (validHealthUserRoot ? configuredHealthUserRoot : undefined)
   : meta.userRoot;
+const normalLaunch = !healthCheckOnly && !runOriginalMainDuringHealth;
+const pairedOriginalMainHealthLaunch = healthCheckOnly
+  && runOriginalMainDuringHealth
+  && validHealthUserRoot;
+let runtimeInitialized = false;
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
+
+function isContainedHealthUserRoot(root) {
+  if (!path.isAbsolute(root) || path.resolve(root) !== root) return false;
+  try {
+    const rootStat = fs.lstatSync(root);
+    const runtimeDir = path.join(root, "runtime");
+    const runtimeStat = fs.lstatSync(runtimeDir);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return false;
+    if (runtimeStat.isSymbolicLink() || !runtimeStat.isDirectory()) return false;
+    const relativeRuntime = path.relative(fs.realpathSync(root), fs.realpathSync(runtimeDir));
+    return relativeRuntime !== ""
+      && !path.isAbsolute(relativeRuntime)
+      && relativeRuntime !== ".."
+      && !relativeRuntime.startsWith(`..${path.sep}`);
+  } catch {
+    return false;
+  }
+}
 
 function appendCappedLog(file, line) {
   const incoming = Buffer.from(line);
@@ -52,7 +84,8 @@ function safe(label, fn) {
     fn();
   } catch (e) {
     try {
-      const logDir = path.join(userRoot || "", "log");
+      if (!userRoot) throw e;
+      const logDir = path.join(userRoot, "log");
       fs.mkdirSync(logDir, { recursive: true });
       const line = `[${new Date().toISOString()}] ${label}: ${(e && e.stack) || e}\n`;
       appendCappedLog(path.join(logDir, "loader.log"), line);
@@ -63,7 +96,7 @@ function safe(label, fn) {
   }
 }
 
-if (appUserDataRoot && process.env.TWEAKERS_HEALTH_CHECK_ONLY !== "1") {
+if (appUserDataRoot && normalLaunch) {
   safe("app-user-data", () => {
     fs.mkdirSync(appUserDataRoot, { recursive: true });
     require("electron").app.setPath("userData", appUserDataRoot);
@@ -91,7 +124,10 @@ safe("init", () => {
     process.env[["CODEX", "PLUSPLUS", "RUNTIME"].join("_")] = runtimeDir;
     // Load the runtime main-process bootstrap. It will hook BrowserWindow
     // before Codex creates any windows.
-    safe("runtime", () => require(path.join(runtimeDir, "main.js")));
+    safe("runtime", () => {
+      require(path.join(runtimeDir, "main.js"));
+      runtimeInitialized = true;
+    });
   } else {
     process.stderr.write(
       `[tweaker] runtime missing at ${runtimeDir}; loading Codex untweaked.\n`,
@@ -99,8 +135,9 @@ safe("init", () => {
   }
 });
 
-// A disposable promotion probe must never initialize the normal Codex main
-// process. The runtime owns this one-shot mode and exits after writing health.
-if (process.env.TWEAKERS_HEALTH_CHECK_ONLY !== "1") {
+// Normal launches always start Codex. A disposable health launch starts it
+// only through the exact paired opt-in above; a bare health flag, a run flag
+// on its own, or a non-absolute health root all fail closed.
+if (normalLaunch || (pairedOriginalMainHealthLaunch && runtimeInitialized)) {
   require("./" + originalMain);
 }

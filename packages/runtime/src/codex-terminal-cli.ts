@@ -1,11 +1,23 @@
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 
 export interface ResolveTerminalCodexBinaryOptions {
   home: string;
   pathValue?: string | null;
   preferredPath?: string | null;
+  loginShellPath?: string | null;
   excludedPaths?: readonly string[];
   isExecutable: (path: string) => boolean;
+}
+
+export function terminalCodexPathFromShellOutput(
+  output: string,
+  isExecutable: (path: string) => boolean,
+): string | null {
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const candidate of lines.reverse()) {
+    if (isAbsolute(candidate) && isExecutable(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -20,6 +32,7 @@ export function resolveTerminalCodexBinary(
   const excluded = new Set(options.excludedPaths ?? []);
   const candidates = [
     options.preferredPath,
+    options.loginShellPath,
     ...(options.pathValue ?? "")
       .split(delimiter)
       .filter(Boolean)

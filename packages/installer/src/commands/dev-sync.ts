@@ -1,6 +1,7 @@
 /** Validate and build a checkout, then publish a rollback-safe live snapshot. */
 import kleur from "kleur";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   watch as watchFs,
@@ -14,6 +15,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -44,6 +46,42 @@ export interface DevSyncCycleOptions {
   sourceRoot: string;
   liveTweaks: string;
   build?: (sourceRoot: string) => void | Promise<void>;
+}
+
+type SnapshotPathKind = "missing" | "file" | "directory" | "symlink";
+
+export interface DevSnapshotFolderProof {
+  folder: string;
+  id: string;
+  version: string;
+  hash: string;
+}
+
+interface DevSnapshotPathProof {
+  kind: SnapshotPathKind;
+  hash: string;
+}
+
+interface DevSnapshotSurface {
+  folder: string;
+  before: DevSnapshotPathProof;
+  after: DevSnapshotPathProof;
+  preimagePath: string | null;
+}
+
+export interface DevSnapshotReceipt {
+  schemaVersion: 2;
+  transactionId: string;
+  phase: "pending_acceptance" | "accepted" | "rolled_back";
+  createdAt: string;
+  updatedAt: string;
+  sourcePayloadHash: string;
+  /** Kept as names for older bundled-staging readers; folderProofs is authoritative. */
+  folders: string[];
+  folderProofs: DevSnapshotFolderProof[];
+  surfaces: DevSnapshotSurface[];
+  priorTreeRoot: string;
+  archivedLegacySnapshots: string[];
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -122,7 +160,7 @@ export async function runDevSyncCycle(options: DevSyncCycleOptions): Promise<voi
   }
   if (options.build) await options.build(options.sourceRoot);
   else runDevelopmentBuild(options.sourceRoot);
-  publishBuiltTweaks(
+  prepareDevSnapshot(
     join(options.sourceRoot, "packages", "installer", "assets", "runtime", "tweaks"),
     options.liveTweaks,
   );
@@ -146,27 +184,60 @@ function runDevelopmentBuild(sourceRoot: string): void {
   }
 }
 
-function publishBuiltTweaks(builtTweaks: string, liveTweaks: string): void {
+/**
+ * Publish an already-built complete tweak tree as a rollback-safe pending
+ * snapshot. This seam intentionally performs no build or source checkout work.
+ */
+export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): DevSnapshotReceipt {
   if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
   mkdirSync(liveTweaks, { recursive: true });
-  const nextRoot = join(liveTweaks, `.dev-sync-next-${process.pid}`);
-  const previousRoot = join(liveTweaks, `.dev-sync-previous-${process.pid}`);
   const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
   const legacyManifestPath = join(liveTweaks, LEGACY_DEV_SNAPSHOT_FILE);
   const publishLock = join(liveTweaks, ".tweaker-dev-publishing");
-  const nextFolders = listDirectories(builtTweaks);
-  const priorFolders = [...new Set([
-    ...readSnapshotFolders(manifestPath),
-    ...readSnapshotFolders(legacyManifestPath),
-  ])];
-  const affected = [...new Set([...priorFolders, ...nextFolders])].sort();
+  const existing = readDevSnapshotReceipt(manifestPath);
+  const pending = existing?.phase === "pending_acceptance" ? existing : null;
+  if (pending) assertDevSnapshotCas(pending, liveTweaks);
+  const legacySources = [manifestPath, legacyManifestPath].filter((path) => {
+    if (!existsSync(path)) return false;
+    return path !== manifestPath || existing === null;
+  });
+  const priorFolders = existing?.folders ?? readLegacySnapshotFolders(...legacySources);
+  const transactionId = pending?.transactionId ?? randomUUID();
+  const transactionRoot = join(liveTweaks, ".tweaker-dev-history", transactionId);
+  const nextRoot = join(transactionRoot, "next");
+  const previousRoot = pending?.priorTreeRoot ?? join(transactionRoot, "previous");
+  const replacedRoot = join(transactionRoot, "replaced");
+  const archiveRoot = join(transactionRoot, "legacy-snapshots");
+  const folderProofs = inspectBuiltTweakTree(builtTweaks);
+  const nextFolders = folderProofs.map((proof) => proof.folder);
+  const affected = [...new Set([...(pending?.surfaces.map((surface) => surface.folder) ?? priorFolders), ...nextFolders])].sort();
+  const priorManaged = new Set(priorFolders);
+  for (const folder of nextFolders) {
+    if (!priorManaged.has(folder) && pathPresent(join(liveTweaks, folder))) {
+      throw new Error(`Refusing to replace untracked custom tweak folder: ${folder}`);
+    }
+  }
   rmSync(nextRoot, { recursive: true, force: true });
-  rmSync(previousRoot, { recursive: true, force: true });
+  rmSync(replacedRoot, { recursive: true, force: true });
   mkdirSync(nextRoot, { recursive: true });
   mkdirSync(previousRoot, { recursive: true });
+  if (pending) mkdirSync(replacedRoot, { recursive: true });
   for (const folder of nextFolders) {
     cpSync(join(builtTweaks, folder), join(nextRoot, folder), { recursive: true, verbatimSymlinks: true });
+    const expected = folderProofs.find((proof) => proof.folder === folder)!;
+    if (fingerprintSnapshotPath(join(nextRoot, folder)).hash !== expected.hash) {
+      throw new Error(`Staged development tweak hash mismatch: ${folder}`);
+    }
   }
+  const archivedLegacySnapshots = pending?.archivedLegacySnapshots ?? archiveLegacySnapshots(legacySources, archiveRoot);
+  const pendingSurfaces = new Map(pending?.surfaces.map((surface) => [surface.folder, surface]) ?? []);
+  const surfaces: DevSnapshotSurface[] = affected.map((folder) => ({
+    folder,
+    before: pendingSurfaces.get(folder)?.before ?? fingerprintSnapshotPath(join(liveTweaks, folder)),
+    after: fingerprintSnapshotPath(join(nextRoot, folder)),
+    preimagePath: pendingSurfaces.get(folder)?.preimagePath ??
+      (pathPresent(join(liveTweaks, folder)) ? join(previousRoot, folder) : null),
+  }));
   const moved: string[] = [];
   const promoted: string[] = [];
   writeFileSync(publishLock, String(Date.now()), "utf8");
@@ -174,7 +245,7 @@ function publishBuiltTweaks(builtTweaks: string, liveTweaks: string): void {
     for (const folder of affected) {
       const destination = join(liveTweaks, folder);
       if (existsSync(destination) || symlinkTargetIsPresent(destination)) {
-        renameSync(destination, join(previousRoot, folder));
+        renameSync(destination, join(pending ? replacedRoot : previousRoot, folder));
         moved.push(folder);
       }
     }
@@ -182,24 +253,250 @@ function publishBuiltTweaks(builtTweaks: string, liveTweaks: string): void {
       renameSync(join(nextRoot, folder), join(liveTweaks, folder));
       promoted.push(folder);
     }
-    writeFileSync(manifestPath, JSON.stringify({ folders: nextFolders }, null, 2) + "\n", "utf8");
+    for (const surface of surfaces) {
+      if (!sameSnapshotProof(fingerprintSnapshotPath(join(liveTweaks, surface.folder)), surface.after)) {
+        throw new Error(`Published development tweak failed verification: ${surface.folder}`);
+      }
+      if (surface.preimagePath && !sameSnapshotProof(fingerprintSnapshotPath(surface.preimagePath), surface.before)) {
+        throw new Error(`Development tweak preimage failed verification: ${surface.folder}`);
+      }
+    }
+    const now = new Date().toISOString();
+    const receipt: DevSnapshotReceipt = {
+      schemaVersion: 2,
+      transactionId,
+      phase: "pending_acceptance",
+      createdAt: pending?.createdAt ?? now,
+      updatedAt: now,
+      sourcePayloadHash: fingerprintSnapshotPath(builtTweaks).hash,
+      folders: nextFolders,
+      folderProofs,
+      surfaces,
+      priorTreeRoot: previousRoot,
+      archivedLegacySnapshots,
+    };
+    writeJsonAtomic(manifestPath, receipt);
     rmSync(legacyManifestPath, { force: true });
+    return receipt;
   } catch (error) {
     for (const folder of promoted) rmSync(join(liveTweaks, folder), { recursive: true, force: true });
-    for (const folder of moved) renameSync(join(previousRoot, folder), join(liveTweaks, folder));
+    for (const folder of moved) renameSync(join(pending ? replacedRoot : previousRoot, folder), join(liveTweaks, folder));
     throw error;
   } finally {
     rmSync(nextRoot, { recursive: true, force: true });
-    rmSync(previousRoot, { recursive: true, force: true });
+    rmSync(replacedRoot, { recursive: true, force: true });
     rmSync(publishLock, { force: true });
   }
 }
 
-function readSnapshotFolders(path: string): string[] {
+export function acceptDevSnapshot(liveTweaks: string): DevSnapshotReceipt {
+  const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
+  const receipt = requirePendingDevSnapshot(manifestPath);
+  assertDevSnapshotCas(receipt, liveTweaks);
+  const accepted = { ...receipt, phase: "accepted" as const, updatedAt: new Date().toISOString() };
+  writeJsonAtomic(manifestPath, accepted);
+  rmSync(receipt.priorTreeRoot, { recursive: true, force: true });
+  return accepted;
+}
+
+export function rollbackDevSnapshot(liveTweaks: string): DevSnapshotReceipt {
+  const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
+  const receipt = requirePendingDevSnapshot(manifestPath);
+  assertDevSnapshotCas(receipt, liveTweaks);
+  const rollbackRoot = join(dirname(receipt.priorTreeRoot), `rollback-${process.pid}`);
+  mkdirSync(rollbackRoot, { recursive: true });
+  const retired: string[] = [];
+  const restored: string[] = [];
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as { folders?: unknown };
-    return Array.isArray(parsed.folders) ? parsed.folders.filter((value): value is string => typeof value === "string") : [];
-  } catch { return []; }
+    for (const surface of receipt.surfaces) {
+      const live = join(liveTweaks, surface.folder);
+      if (pathPresent(live)) {
+        renameSync(live, join(rollbackRoot, surface.folder));
+        retired.push(surface.folder);
+      }
+      if (surface.preimagePath) {
+        renameSync(surface.preimagePath, live);
+        restored.push(surface.folder);
+      }
+    }
+  } catch (error) {
+    for (const folder of restored.reverse()) renameSync(join(liveTweaks, folder), join(receipt.priorTreeRoot, folder));
+    for (const folder of retired.reverse()) renameSync(join(rollbackRoot, folder), join(liveTweaks, folder));
+    throw error;
+  }
+  const rolledBack = { ...receipt, phase: "rolled_back" as const, updatedAt: new Date().toISOString() };
+  writeJsonAtomic(manifestPath, rolledBack);
+  rmSync(rollbackRoot, { recursive: true, force: true });
+  rmSync(receipt.priorTreeRoot, { recursive: true, force: true });
+  return rolledBack;
+}
+
+export function readDevSnapshotReceipt(path: string): DevSnapshotReceipt | null {
+  try {
+    const stat = lstatSync(path);
+    if (
+      stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size > 256 * 1024 ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) return null;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<DevSnapshotReceipt>;
+    if (
+      parsed.schemaVersion !== 2 ||
+      typeof parsed.transactionId !== "string" ||
+      !["pending_acceptance", "accepted", "rolled_back"].includes(String(parsed.phase)) ||
+      typeof parsed.sourcePayloadHash !== "string" ||
+      !Array.isArray(parsed.folders) ||
+      !Array.isArray(parsed.folderProofs) ||
+      !Array.isArray(parsed.surfaces) ||
+      typeof parsed.priorTreeRoot !== "string" ||
+      !Array.isArray(parsed.archivedLegacySnapshots)
+    ) return null;
+    const receipt = parsed as DevSnapshotReceipt;
+    if (!/^[0-9a-f-]{36}$/.test(receipt.transactionId)) return null;
+    if (!receipt.folders.every(isSafeFolder) || new Set(receipt.folders).size !== receipt.folders.length || receipt.folderProofs.length !== receipt.folders.length) return null;
+    if (!receipt.folderProofs.every((proof) => (
+      isSafeFolder(proof.folder) &&
+      typeof proof.id === "string" && proof.id.length > 0 &&
+      typeof proof.version === "string" && proof.version.length > 0 &&
+      isHash(proof.hash)
+    ))) return null;
+    if (receipt.folderProofs.some((proof, index) => proof.folder !== receipt.folders[index])) return null;
+    if (!isHash(receipt.sourcePayloadHash)) return null;
+    const expectedTransactionRoot = join(dirname(path), ".tweaker-dev-history", receipt.transactionId);
+    if (receipt.priorTreeRoot !== join(expectedTransactionRoot, "previous")) return null;
+    if (new Set(receipt.surfaces.map((surface) => surface.folder)).size !== receipt.surfaces.length) return null;
+    if (!receipt.surfaces.every((surface) => (
+      isSafeFolder(surface.folder) &&
+      validSnapshotProof(surface.before) &&
+      validSnapshotProof(surface.after) &&
+      (surface.before.kind === "missing"
+        ? surface.preimagePath === null
+        : surface.preimagePath === join(receipt.priorTreeRoot, surface.folder))
+    ))) return null;
+    if (!receipt.archivedLegacySnapshots.every((archive) => (
+      typeof archive === "string" && dirname(archive) === join(expectedTransactionRoot, "legacy-snapshots")
+    ))) return null;
+    return receipt;
+  } catch { return null; }
+}
+
+function requirePendingDevSnapshot(path: string): DevSnapshotReceipt {
+  const receipt = readDevSnapshotReceipt(path);
+  if (!receipt) throw new Error("Development snapshot provenance is missing or unverifiable.");
+  if (receipt.phase !== "pending_acceptance") throw new Error(`Development snapshot is not pending acceptance: ${receipt.phase}`);
+  return receipt;
+}
+
+function assertDevSnapshotCas(receipt: DevSnapshotReceipt, liveTweaks: string): void {
+  for (const surface of receipt.surfaces) {
+    if (!sameSnapshotProof(fingerprintSnapshotPath(join(liveTweaks, surface.folder)), surface.after)) {
+      throw new Error(`Development snapshot changed before accept/rollback: ${surface.folder}`);
+    }
+    if (surface.preimagePath && !sameSnapshotProof(fingerprintSnapshotPath(surface.preimagePath), surface.before)) {
+      throw new Error(`Development snapshot preimage changed before accept/rollback: ${surface.folder}`);
+    }
+  }
+}
+
+function inspectBuiltTweakTree(root: string): DevSnapshotFolderProof[] {
+  return listDirectories(root).map((folder) => {
+    if (!isSafeFolder(folder)) throw new Error(`Unsafe built tweak folder: ${folder}`);
+    const manifest = readValidManifest(join(root, folder, "manifest.json"));
+    return {
+      folder,
+      id: manifest.id,
+      version: manifest.version,
+      hash: fingerprintSnapshotPath(join(root, folder)).hash,
+    };
+  });
+}
+
+function readLegacySnapshotFolders(...paths: string[]): string[] {
+  const folders = new Set<string>();
+  for (const path of paths) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { folders?: unknown };
+      if (!Array.isArray(parsed.folders)) throw new Error("folders missing");
+      for (const value of parsed.folders) {
+        const folder = typeof value === "string" ? value : null;
+        if (!folder || !isSafeFolder(folder)) throw new Error(`unsafe folder in legacy snapshot: ${String(value)}`);
+        folders.add(folder);
+      }
+    } catch (error) {
+      throw new Error(`Unverifiable legacy development snapshot ${path}: ${errorMessage(error)}`);
+    }
+  }
+  return [...folders].sort();
+}
+
+function archiveLegacySnapshots(paths: string[], archiveRoot: string): string[] {
+  const archived: string[] = [];
+  for (const [index, path] of paths.entries()) {
+    mkdirSync(archiveRoot, { recursive: true });
+    const destination = join(archiveRoot, `${index}-${path.endsWith(LEGACY_DEV_SNAPSHOT_FILE) ? "legacy" : "snapshot"}.json`);
+    cpSync(path, destination);
+    if (fingerprintSnapshotPath(destination).hash !== fingerprintSnapshotPath(path).hash) {
+      throw new Error(`Legacy snapshot archive verification failed: ${path}`);
+    }
+    archived.push(destination);
+  }
+  return archived;
+}
+
+function fingerprintSnapshotPath(path: string): DevSnapshotPathProof {
+  if (!pathPresent(path)) return { kind: "missing", hash: "missing" };
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) {
+    return { kind: "symlink", hash: createHash("sha256").update("symlink\0").update(readlinkSync(path)).digest("hex") };
+  }
+  const hash = createHash("sha256");
+  const visit = (entryPath: string, relativeName: string): void => {
+    const entryStat = lstatSync(entryPath);
+    const mode = entryStat.mode & 0o777;
+    hash.update(relativeName).update("\0").update(String(mode)).update("\0");
+    if (entryStat.isDirectory()) {
+      hash.update("directory\0");
+      for (const name of readdirSync(entryPath).sort()) visit(join(entryPath, name), relativeName ? `${relativeName}/${name}` : name);
+    } else if (entryStat.isFile()) {
+      hash.update("file\0").update(readFileSync(entryPath));
+    } else if (entryStat.isSymbolicLink()) {
+      hash.update("symlink\0").update(readlinkSync(entryPath));
+    } else {
+      throw new Error(`Unsupported development snapshot entry: ${entryPath}`);
+    }
+  };
+  visit(path, "");
+  return { kind: stat.isDirectory() ? "directory" : "file", hash: hash.digest("hex") };
+}
+
+function validSnapshotProof(value: unknown): value is DevSnapshotPathProof {
+  if (!value || typeof value !== "object") return false;
+  const proof = value as Partial<DevSnapshotPathProof>;
+  return ["missing", "file", "directory", "symlink"].includes(String(proof.kind)) &&
+    (proof.kind === "missing" ? proof.hash === "missing" : isHash(proof.hash));
+}
+
+function sameSnapshotProof(a: DevSnapshotPathProof, b: DevSnapshotPathProof): boolean {
+  return a.kind === b.kind && a.hash === b.hash;
+}
+
+function pathPresent(path: string): boolean {
+  try { lstatSync(path); return true; } catch { return false; }
+}
+
+function isHash(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isSafeFolder(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._-]+$/.test(value) && value !== "." && value !== "..";
+}
+
+function writeJsonAtomic(path: string, value: unknown): void {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  chmodSync(temporary, 0o600);
+  renameSync(temporary, path);
+  chmodSync(path, 0o600);
 }
 
 function symlinkTargetIsPresent(path: string): boolean {

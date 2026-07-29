@@ -88,6 +88,14 @@ test("native project menu receives one working Project color item before Remove"
 
   assert.equal(menu.querySelectorAll('[data-tweaker-project-color-menu="trigger"]').length, 1);
   const trigger = menu.querySelector('[data-tweaker-project-color-menu="trigger"]');
+  assert.equal(trigger.children.length, 1);
+  const triggerContent = trigger.children[0];
+  assert.match(triggerContent.className, /\bflex\b/);
+  assert.match(triggerContent.className, /\bitems-center\b/);
+  assert.match(triggerContent.className, /\bjustify-between\b/);
+  assert.equal(triggerContent.children[0].textContent, "Project color");
+  assert.equal(triggerContent.children[1].textContent, "›");
+  assert.equal(triggerContent.children[1].getAttribute("aria-hidden"), "true");
   trigger.rect = { left: 260, top: 700, right: 300, bottom: 730, width: 40, height: 30 };
   assert.equal(menu.children.indexOf(trigger) < menu.children.indexOf(remove), true);
   trigger.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {}, stopPropagation() {} });
@@ -209,6 +217,71 @@ test("renamed native projects retain their saved color and menu identity by work
   assert.equal(row.getAttribute("data-tweaker-project-color-row"), "true");
   assert.equal(row.style.values.get("--tweaker-project-color"), "#6d28d9");
   assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
+});
+
+test("moved native projects retain their saved appearance through Codex's workspace-root label alias", () => {
+  const oldPath = "/Users/example/Projects/SKILLS MANAGER";
+  const newPath = "/Users/example/Projects/PROJECT MANAGER";
+  const nativeProjects = _test.normalizeNativeLocalProjects({
+    "local-projects": {
+      "local-project-manager": {
+        id: "local-project-manager",
+        name: "PROJECT MANAGER",
+        rootPaths: [newPath],
+      },
+    },
+    "electron-workspace-root-labels": {
+      [oldPath]: "PROJECT MANAGER",
+    },
+  });
+  const savedState = {
+    schemaVersion: 1,
+    nodes: [{
+      id: "project-skills-manager",
+      type: "project",
+      parentId: null,
+      name: "SKILLS MANAGER",
+      icon: { kind: "emoji", value: "📁" },
+      color: "#6d28d9",
+      colorMode: "manual",
+      overlayIntensity: "strong",
+      projectPath: oldPath,
+      connections: {},
+    }],
+  };
+
+  assert.deepEqual(nativeProjects[0].rootPathAliases, [oldPath]);
+  const runtimeState = _test.bindNativeProjectIdentities(savedState, nativeProjects);
+  assert.deepEqual(runtimeState.nodes[0].nativeProjectIds, ["local-project-manager"]);
+  assert.deepEqual(runtimeState.nodes[0].nativeProjectNames, ["PROJECT MANAGER"]);
+  assert.deepEqual(runtimeState.nodes[0].nativeProjectPaths, [newPath]);
+  assert.equal(
+    _test.projectForNativeIdentity(runtimeState.nodes, "PROJECT MANAGER", newPath)?.id,
+    "project-skills-manager",
+  );
+});
+
+test("workspace-root label aliases fail closed when more than one native project has the same name", () => {
+  const nativeProjects = _test.normalizeNativeLocalProjects({
+    "local-projects": {
+      "local-project-manager-a": {
+        id: "local-project-manager-a",
+        name: "PROJECT MANAGER",
+        rootPaths: ["/Users/example/Projects/PROJECT MANAGER"],
+      },
+      "local-project-manager-b": {
+        id: "local-project-manager-b",
+        name: "PROJECT MANAGER",
+        rootPaths: ["/Users/example/Archives/PROJECT MANAGER"],
+      },
+    },
+    "electron-workspace-root-labels": {
+      "/Users/example/Projects/SKILLS MANAGER": "PROJECT MANAGER",
+    },
+  });
+
+  assert.equal(nativeProjects[0].rootPathAliases, undefined);
+  assert.equal(nativeProjects[1].rootPathAliases, undefined);
 });
 
 test("native menu targeting chooses the nearest visible open project menu", () => {
@@ -347,7 +420,9 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   const task = document.createElement("div");
   task.setAttribute("role", "listitem");
   const taskAction = document.createElement("button");
-  taskAction.textContent = "Write audit fix plan";
+  const taskLabel = document.createElement("span");
+  taskLabel.textContent = "Write audit fix plan with a deliberately long nested label";
+  taskAction.appendChild(taskLabel);
   task.appendChild(taskAction);
   const selectedTask = document.createElement("div");
   selectedTask.setAttribute("role", "listitem");
@@ -379,9 +454,11 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
   assert.equal(title.textContent, "TRR", "saved casing is preserved");
   assert.equal(task.getAttribute("data-tweaker-project-color-task"), "true");
-  assert.equal(taskAction.getAttribute("data-tweaker-project-task-label"), "true");
+  assert.equal(taskAction.getAttribute("data-tweaker-project-task-action"), "true");
+  assert.equal(taskLabel.getAttribute("data-tweaker-project-task-label"), "true");
   assert.equal(task.getAttribute("data-tweaker-project-selected"), null);
   assert.equal(selectedTask.getAttribute("data-tweaker-project-color-task"), "true");
+  assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-action"), "true");
   assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-label"), "true");
   assert.equal(selectedTask.getAttribute("data-tweaker-project-selected"), "true");
   assert.equal(showMore.getAttribute("data-tweaker-project-show-more"), "true");
@@ -390,22 +467,45 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   assert.equal(selectedTask.style.values.get("--tweaker-project-foreground"), "var(--gray-0)");
 
   const css = document.getElementById("tweaker-project-colors").textContent;
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*100%\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*min-inline-size:\s*0/s);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*max-inline-size:\s*100%/s);
+  assert.doesNotMatch(css, /--tweaker-project-row-end-inset/);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*contain:\s*inline-size/s);
+  assert.doesNotMatch(css, /\[data-tweaker-project-color-group\][^}]*margin-inline-end/s);
+  assert.doesNotMatch(css, /\[data-tweaker-project-color-group\][^}]*padding-inline-end/s);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*overflow-x:\s*visible/s);
+  assert.match(css, /data-tweaker-project-color-group[^}]*role="list"[^}]*data-tweaker-project-color-row[^}]*data-tweaker-project-color-task[^}]*data-tweaker-project-show-more[^}]*data-tweaker-project-task-action[^}]*box-sizing:\s*border-box/s);
+  assert.match(css, /data-tweaker-project-color-group[^}]*role="list"[^}]*data-tweaker-project-color-row[^}]*data-tweaker-project-color-task[^}]*data-tweaker-project-show-more[^}]*data-tweaker-project-task-action[^}]*inline-size:\s*100%\s*!important/s);
+  assert.match(css, /data-tweaker-project-color-group[^}]*role="list"[^}]*data-tweaker-project-color-row[^}]*data-tweaker-project-color-task[^}]*data-tweaker-project-show-more[^}]*data-tweaker-project-task-action[^}]*min-inline-size:\s*0/s);
+  assert.match(css, /data-tweaker-project-color-group[^}]*role="list"[^}]*data-tweaker-project-color-row[^}]*data-tweaker-project-color-task[^}]*data-tweaker-project-show-more[^}]*data-tweaker-project-task-action[^}]*max-inline-size:\s*100%/s);
+  assert.match(css, /\[data-tweaker-project-color-row\][^}]*overflow-x:\s*visible\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-task-action\][^}]*overflow:\s*hidden/s);
+  assert.match(css, /\[data-tweaker-project-task-action\]\s*>\s*\[data-tweaker-project-task-label\][^}]*flex:\s*1 1 auto/s);
+  assert.match(css, /data-tweaker-project-color-title[^}]*data-tweaker-project-task-label[^}]*text-overflow:\s*ellipsis/s);
   assert.match(css, /data-tweaker-project-color-row[^}]*background-color:\s*var\(--tweaker-project-color\)/s);
   assert.match(css, /data-tweaker-project-color-title[^}]*font-weight:\s*700/s);
   assert.match(css, /data-tweaker-project-color-title[^}]*text-transform:\s*uppercase/s);
   assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*background-color:\s*var\(--gray-1000\)/s);
   assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*color:\s*var\(--gray-0\)/s);
   assert.match(css, /data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\]\s+\*[^}]*color:\s*var\(--gray-0\)/s);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*--tweaker-project-row-radius:\s*var\(--radius-lg,\s*0\.625rem\)/s);
+  assert.match(css, /\[data-tweaker-project-color-row\][^}]*border-radius:\s*var\(--tweaker-project-row-radius\)\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*border-radius:\s*var\(--tweaker-project-row-radius\)\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*outline:\s*2px solid var\(--color-token-focus-border,\s*var\(--color-token-text-link-foreground\)\)\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*outline-offset:\s*0\s*!important/s);
+  assert.doesNotMatch(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\]::after/);
   assert.match(css, /data-tweaker-project-task-label[^}]*font-weight:\s*400/s);
   assert.match(css, /data-tweaker-project-color-task.*data-tweaker-project-selected[^}]*data-tweaker-project-task-label[^}]*color:\s*var\(--tweaker-project-foreground\)/s);
   assert.match(css, /data-tweaker-project-color-task.*data-tweaker-project-selected[^}]*svg[^}]*color:\s*var\(--tweaker-project-foreground\)/s);
   assert.match(css, /data-tweaker-project-color-row.*data-tweaker-project-selected[^}]*data-tweaker-project-color-icon[^}]*color:\s*var\(--gray-0\)/s);
-  assert.match(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\]::after/);
   assert.doesNotMatch(css, /\[data-tweaker-project-color-row\]\[data-tweaker-project-selected="true"\][^}]*box-shadow/s);
   assert.doesNotMatch(css, /data-tweaker-project-color-task\]\s+:is/);
   assert.match(css, /electron-dark[^}]*--tweaker-project-task-foreground/s);
 
+  document.getElementById("tweaker-project-colors").textContent = "/* stale hot-reload stylesheet */";
   _test.applyNativeProjectColors(api, state);
+  assert.match(document.getElementById("tweaker-project-colors").textContent, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*100%\s*!important/s);
   assert.equal(project.querySelectorAll("[data-tweaker-project-color-row]").length, 1);
   assert.equal(project.querySelectorAll("[data-tweaker-project-color-task]").length, 2);
 
@@ -418,7 +518,10 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   assert.equal(title.getAttribute("data-tweaker-project-color-title"), null);
   assert.equal(task.getAttribute("data-tweaker-project-color-task"), null);
   assert.equal(taskAction.getAttribute("data-tweaker-project-task-label"), null);
+  assert.equal(taskAction.getAttribute("data-tweaker-project-task-action"), null);
+  assert.equal(taskLabel.getAttribute("data-tweaker-project-task-label"), null);
   assert.equal(selectedTask.getAttribute("data-tweaker-project-color-task"), null);
+  assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-action"), null);
   assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-label"), null);
   assert.equal(header.style.values.has("--tweaker-project-foreground"), false);
   assert.equal(selectedTask.style.values.has("--tweaker-project-foreground"), false);

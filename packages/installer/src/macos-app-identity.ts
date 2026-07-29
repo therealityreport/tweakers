@@ -177,7 +177,13 @@ function runTargetGuiCommand(command: string, args: string[], encoding: BufferEn
 }
 
 export function reconcileLaunchServices(
-  options: { appRoot: string; bundleId: string; nonLiveAppRoots: string[]; garbageCollect?: boolean },
+  options: {
+    appRoot: string;
+    bundleId: string;
+    nonLiveAppRoots: string[];
+    garbageCollect?: boolean;
+    mutate?: boolean;
+  },
   adapters: LaunchServicesAdapters = {},
 ): LaunchServicesResult {
   const result: LaunchServicesResult = {
@@ -188,6 +194,7 @@ export function reconcileLaunchServices(
     garbageCollected: false,
   };
   if ((adapters.platform ?? currentPlatform()) !== "darwin") return result;
+  if (options.mutate === false) return result;
   const exists = adapters.exists ?? existsSync;
   const bundleIdentifier = adapters.bundleIdentifier ?? readBundleIdentifier;
   const run = adapters.run ?? ((command, args) => {

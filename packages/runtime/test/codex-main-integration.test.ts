@@ -40,7 +40,9 @@ test("Codex IPC exposes only the approved narrow action channels", () => {
     "tweaker:prepare-environment",
     "tweaker:commit-environment",
     "tweaker:rollback-environment",
+    "tweaker:recover-environment",
     "tweaker:cancel-environment",
+    "tweaker:get-tweaks-health",
   ]) {
     assert.match(mainSource, new RegExp(`ipcMain\\.handle\\(\"${channel}\"`));
   }
@@ -58,6 +60,19 @@ test("Codex IPC exposes only the approved narrow action channels", () => {
   assert.match(mainSource, /assertExactObjectKeys\(payload, \["transactionId"\]/);
   assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:set-codex-cli-lane"/);
   assert.doesNotMatch(mainSource, /ipcMain\.handle\("tweaker:install-codex-desktop-update"/);
+});
+
+test("Tweaks health IPC compares stored catalog, runtime, and live tweak manifests", () => {
+  const body = extractFunctionBody(mainSource, "buildTweakHealthSnapshot");
+  assert.match(mainSource, /ipcMain\.handle\("tweaker:get-tweaks-health", \(\) => buildTweakHealthSnapshot\(\)\)/);
+  assert.match(body, /readBundledTweakCatalog\(\)/);
+  assert.match(body, /TWEAKS_DIR/);
+  assert.match(body, /readRuntimeTweakVersion\(entry\)/);
+  assert.match(body, /catalogVersion/);
+  assert.match(body, /liveDriftCount/);
+  assert.match(body, /runtimeDriftCount/);
+  assert.match(body, /mcpRestartRequired/);
+  assert.doesNotMatch(body, /fetchLatestRelease|startInstalledCli|spawn|exec/i);
 });
 
 test("renderer cannot supply a path, URL, tag, asset, or command to managed Codex actions", () => {
@@ -93,11 +108,16 @@ test("environment IPC stages fixed selections and submits only a validated durab
 
   const prepare = extractHandlerBody(mainSource, "tweaker:prepare-environment");
   assert.match(prepare, /assertEnvironmentRequest\(payload\)/);
+  assert.match(prepare, /await buildDevelopmentEnvironmentControlPlane\(\)/);
   assert.match(prepare, /payload\.appExperience === "tweakers" && payload\.releaseProfile === "alpha"/);
   assert.match(prepare, /ensureManagedAlphaEnvironmentBackend\(\)/);
   assert.match(prepare, /"--app-experience",\s*payload\.appExperience/);
   assert.match(prepare, /"--release-profile",\s*payload\.releaseProfile/);
   assert.match(prepare, /ENVIRONMENT_PREPARE_TIMEOUT_MS/);
+  assert.match(
+    mainSource,
+    /buildDevelopmentEnvironmentControlPlane[\s\S]*spawn\(command, \["run", "build"\][\s\S]*packages", "installer", "dist", "cli\.js"/,
+  );
 
   const commit = extractHandlerBody(mainSource, "tweaker:commit-environment");
   assert.match(commit, /assertEnvironmentTransactionRequest\(payload\)/);
@@ -162,6 +182,29 @@ test("proactive desktop update checks are metadata-only, deduplicated, and exclu
   const ready = mainSource.slice(readyStart, readyEnd);
   assert.match(ready, /if \(healthCheckOnly\)[\s\S]*?else \{[\s\S]*?scheduleProactiveDesktopUpdateChecks\(\)/);
   assert.match(mainSource, /PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 \* 60 \* 60 \* 1_000/);
+});
+
+test("health probes select the inert Sparkle contract while normal launches retain the managed update flow", () => {
+  const configure = extractFunctionBody(mainSource, "configureCodexSparkleForProcess");
+  const healthStart = configure.indexOf("if (healthCheckOnly)");
+  const healthEnd = configure.indexOf("return;", healthStart);
+  assert.ok(healthStart >= 0 && healthEnd > healthStart, "missing bounded health-only Sparkle branch");
+  const health = configure.slice(healthStart, healthEnd);
+  assert.match(health, /configureCodexSparkleBridge\(createHealthProbeCodexSparkleBridgeOptions\(\)\)/);
+  assert.doesNotMatch(
+    health,
+    /requestCodexDesktopManualCheck|runProactiveDesktopUpdateCheck|startCodexDesktopUpdateTransaction|prepareSignedCodexForSparkleInstall|codexDesktopInstallPrerequisiteFailure|persistCapturedCodexDesktopProfileFeed|publishCodexDesktopUpdateResult|broadcastCodexDesktopUpdateResult|Notification\.|fetch\(/,
+  );
+
+  const normal = configure.slice(healthEnd + "return;".length);
+  assert.match(normal, /requestCodexDesktopManualCheck\("native-sparkle"\)/);
+  assert.match(normal, /requestBackgroundCheck: runProactiveDesktopUpdateCheck/);
+  assert.match(normal, /requestInstall: startCodexDesktopUpdateTransaction/);
+  assert.match(normal, /prepareForInstall: prepareSignedCodexForSparkleInstall/);
+  assert.match(normal, /getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure/);
+  assert.match(normal, /onFeedCaptured: persistCapturedCodexDesktopProfileFeed/);
+  assert.match(normal, /broadcastCodexDesktopUpdateResult\(published\)/);
+  assert.match(mainSource, /configureCodexSparkleForProcess\(\);\s*installSparkleUpdateHook\(\);/);
 });
 
 test("startup desktop-update reconciliation is guarded, bounded, and uses the cutover launcher", () => {
@@ -239,10 +282,11 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
   const launchdLaunch = extractFunctionBody(mainSource, "startInstalledCliWithLaunchd");
   assert.match(mainSource, /function localCliRuntime[\s\S]*?resolveLocalCliRuntime\(\{/);
   assert.match(launchdLaunch, /localCliRuntime\(cli, args\)/);
-  assert.match(launchdLaunch, /command: runtime\.command/);
-  assert.match(launchdLaunch, /args: runtime\.args/);
+  assert.match(launchdLaunch, /\[runtime\.command, \.\.\.runtime\.args\]\.map\(shellQuote\)\.join\(" "\)/);
+  assert.match(launchdLaunch, /launchctl",\s*\["bootstrap"/);
+  assert.match(launchdLaunch, /<key>AbandonProcessGroup<\/key><true\/>/);
   assert.doesNotMatch(launchdLaunch, /process\.execPath, cli/);
-  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE: "1"/);
+  assert.match(launchdLaunch, /ELECTRON_RUN_AS_NODE=1/);
   for (const exactRootVariable of [
     "TWEAKERS_HOME",
     "TWEAKER_HOME",
@@ -250,10 +294,10 @@ test("runtime CLI probes cannot launch a second Electron app instance", () => {
     "TWEAKER_USER_ROOT",
   ]) {
     assert.match(localRuntime, new RegExp(`${exactRootVariable}: userRoot!`));
-    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}: userRoot!`));
+    assert.match(launchdLaunch, new RegExp(`${exactRootVariable}=\\$\\{shellQuote\\(userRoot!\\)\\}`));
   }
   assert.match(localRuntime, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
-  assert.match(launchdLaunch, /\[LEGACY_USER_ROOT_ENV\]: userRoot!/);
+  assert.match(launchdLaunch, /\$\{LEGACY_USER_ROOT_ENV\}=\$\{shellQuote\(userRoot!\)\}/);
 });
 
 test("Sparkle update mode is committed only after the signed app restore", () => {
@@ -265,14 +309,19 @@ test("Sparkle update mode is committed only after the signed app restore", () =>
   assert.match(body, /rmSync\(UPDATE_MODE_FILE, \{ force: true \}\)/);
 });
 
-test("appcast cache is version-keyed, bounded to 24 hours, and never persists headers", () => {
+test("appcast cache is version-keyed, bounded to 24 hours, and health probes cannot persist it", () => {
   assert.match(mainSource, /CODEX_APPCAST_CACHE_TTL_MS = 24 \* 60 \* 60 \* 1000/);
   assert.match(mainSource, /codexAppcastCache\?: \{\s*schemaVersion: 1;\s*desktopVersion: string;/);
   const writer = extractFunctionBody(mainSource, "persistCodexAppcast");
+  const healthGuard = writer.indexOf("if (healthCheckOnly) return;");
+  const stateRead = writer.indexOf("const state = readState();");
+  assert.ok(healthGuard >= 0, "health-only appcast persistence guard is missing");
+  assert.ok(stateRead > healthGuard, "health-only guard must run before config state is read or written");
   assert.match(writer, /desktopVersion,/);
   assert.match(writer, /marketingVersion: metadata\.marketingVersion/);
   assert.match(writer, /build: metadata\.build/);
   assert.match(writer, /feedUrl,/);
+  assert.match(writer, /writeState\(state\)/);
   assert.doesNotMatch(writer, /headers|authorization|token/i);
   const reader = extractFunctionBody(mainSource, "readPersistedCodexAppcast");
   assert.match(reader, /cache\.desktopVersion !== desktopVersion/);
@@ -321,6 +370,10 @@ test("Codex version snapshots report the exact measured active backend separatel
   assert.match(body, /versionChannel: codexVersionChannel\(activeCliProbe\.version\)/);
   assert.match(body, /source: activeCliSource/);
   assert.match(body, /resolveTerminalCodexBinary/);
+  assert.match(body, /loginShellPath: terminalCodexFromLoginShell\(\)/);
+  const loginShellProbe = extractFunctionBody(mainSource, "terminalCodexFromLoginShell");
+  assert.match(loginShellProbe, /spawnSync\(shellPath, \["-lic", "command -v codex"\]/);
+  assert.match(loginShellProbe, /timeout: 5_000/);
   assert.match(body, /terminalCli:\s*\{/);
   assert.match(body, /version: terminalProbe\?\.version \?\? null/);
   assert.match(body, /Math\.min\(\.\.\.lookupCheckedAt\)/);

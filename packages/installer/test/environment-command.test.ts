@@ -148,6 +148,7 @@ function fakeCoordinator(overrides: Partial<EnvironmentCoordinator> = {}): Envir
       error: null,
     }),
     rollback: async () => current!,
+    recover: async () => current!,
     cancel: async () => current!,
     ...overrides,
   };
@@ -156,6 +157,10 @@ function fakeCoordinator(overrides: Partial<EnvironmentCoordinator> = {}): Envir
 function helperReceipt(input: {
   transactionId: string;
   cliPath: string;
+  cliArtifactDigest: string;
+  managedRuntimeArtifactPath: string;
+  managedRuntimeArtifactDigest: string;
+  userRoot: string;
   receiptFile: string;
 }): EnvironmentCommitHelperReceipt {
   const root = input.receiptFile.slice(0, -"commit-helper.json".length);
@@ -165,6 +170,10 @@ function helperReceipt(input: {
     transactionId: input.transactionId,
     label: `co.tweakers.environment.${input.transactionId}`,
     cliPath: input.cliPath,
+    cliArtifactDigest: input.cliArtifactDigest,
+    managedRuntimeArtifactPath: input.managedRuntimeArtifactPath,
+    managedRuntimeArtifactDigest: input.managedRuntimeArtifactDigest,
+    userRoot: input.userRoot,
     wrapperFile: `${root}helper.sh`,
     stdoutFile: `${root}stdout.log`,
     stderrFile: `${root}stderr.log`,
@@ -189,6 +198,14 @@ function dependencies(overrides: Partial<EnvironmentCommandDependencies> = {}) {
       loadInputs.push(input);
       return state;
     },
+    inspectProfile: () => trustedEvidence("stable"),
+    inspectManagedAlpha: () => ({
+      installed: true,
+      binaryPath: `${ROOT}/codex-cli/releases/alpha/codex`,
+      version: "0.145.0-alpha.19",
+      fingerprint: "alpha-managed",
+      error: null,
+    }),
     writeRegistry: (file) => { writes.push(file); },
     preparationCapabilities: () => ({ patchedPayloadBuildable: true, backendInstallable: true }),
     createRequestedSelection: createRequestedEnvironmentSelection,
@@ -201,7 +218,12 @@ function dependencies(overrides: Partial<EnvironmentCommandDependencies> = {}) {
       return helperReceipt(input);
     },
     readRegistry: () => state.registry,
-    resolveCurrentCliPath: () => "/opt/tweakers/packages/installer/dist/cli.js",
+    resolvePreparedCommitCli: (receipt, receiptRoot) => ({
+      cliPath: `${receiptRoot}/${receipt.transactionId}/prepared/managed-runtime/requested/packages/installer/dist/cli.js`,
+      cliArtifactDigest: "a".repeat(64),
+      managedRuntimeArtifactPath: `${receiptRoot}/${receipt.transactionId}/prepared/managed-runtime/requested`,
+      managedRuntimeArtifactDigest: "b".repeat(64),
+    }),
     print: (value) => { printed.push(value); },
     ...overrides,
   };
@@ -293,6 +315,60 @@ test("status --observe remains available while the lifecycle lease is held", asy
   }
 });
 
+test("status --observe never runs expensive profile or managed Alpha verification", async () => {
+  const observedState = loadedState();
+  const unverifiedRegistry = createEnvironmentProfileRegistry({
+    stableDesktopPath: "/Applications/ChatGPT.app",
+    alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+    environmentRoot: ROOT,
+  });
+  const expensiveCalls: string[] = [];
+  const cachedVersions: Array<string | null | undefined> = [];
+  const fixture = dependencies({
+    loadState: (_input, loadDependencies) => {
+      assert.ok(loadDependencies.inspectProfile);
+      cachedVersions.push(loadDependencies.inspectProfile(
+        unverifiedRegistry.profiles.stable,
+        observedState.current,
+        observedState.registry.profiles.stable,
+      ).officialVersion);
+      cachedVersions.push(loadDependencies.inspectProfile(
+        unverifiedRegistry.profiles.alpha,
+        observedState.current,
+        observedState.registry.profiles.alpha,
+      ).officialVersion);
+      return observedState;
+    },
+    inspectProfile: (profile) => {
+      expensiveCalls.push(`profile:${profile.releaseProfile}`);
+      return trustedEvidence(profile.releaseProfile);
+    },
+    inspectManagedAlpha: () => {
+      expensiveCalls.push("managed-alpha");
+      return {
+        installed: true,
+        binaryPath: `${ROOT}/codex-cli/releases/alpha/codex`,
+        version: "0.145.0-alpha.19",
+        fingerprint: "alpha-managed",
+        error: null,
+      };
+    },
+  });
+
+  await environment("status", { observe: true, json: true }, fixture.deps);
+
+  assert.deepEqual(expensiveCalls, []);
+  assert.deepEqual(cachedVersions, ["26.707.1", "26.717.1"]);
+
+  await environment("status", { json: true }, fixture.deps);
+
+  assert.deepEqual(expensiveCalls, [
+    "managed-alpha",
+    "profile:stable",
+    "profile:alpha",
+  ]);
+});
+
 test("register-alpha validates a native-selected absolute app path and preserves selection", async () => {
   const fixture = dependencies({
     registerAlpha: (registry, appPath) => ({
@@ -337,6 +413,38 @@ test("prepare normalizes Sade option keys, publishes only recomputed registry ev
   assert.equal(fixture.printed.length, 1);
 });
 
+test("prepare forwards only an explicit internal bundled-derived receipt to the production coordinator", async () => {
+  const coordinatorInputs: Parameters<EnvironmentCommandDependencies["createCoordinator"]>[0][] = [];
+  const fixture = dependencies({
+    createCoordinator: (options) => {
+      coordinatorInputs.push(options);
+      return fakeCoordinator();
+    },
+  });
+  const receiptFile = `${ROOT}/codex-source/receipts/bundled-derived.json`;
+
+  await environment("prepare", {
+    appExperience: "tweakers",
+    releaseProfile: "stable",
+    "bundled-derived-receipt": receiptFile,
+    json: true,
+  }, fixture.deps);
+
+  assert.equal(coordinatorInputs.length, 1);
+  assert.equal(coordinatorInputs[0]?.bundledDerivedReceiptFile, receiptFile);
+
+  const external = dependencies();
+  await assert.rejects(
+    environment("prepare", {
+      appExperience: "tweakers",
+      releaseProfile: "stable",
+      bundledDerivedReceipt: "/Volumes/HardDrive/receipt.json",
+    }, external.deps),
+    /internal filesystem/,
+  );
+  assert.equal(external.writes.length, 0);
+});
+
 test("prepare rejects invalid or conflicting enums before writing state", async () => {
   const invalid = dependencies();
   await assert.rejects(
@@ -368,7 +476,10 @@ test("submit accepts only the matching prepared receipt and derives helper paths
   assert.equal(result.kind, "environment-commit-helper");
   assert.deepEqual(fixture.submits, [{
     transactionId: "safe-id",
-    cliPath: "/opt/tweakers/packages/installer/dist/cli.js",
+    cliPath: `${ROOT}/transactions/environment/safe-id/prepared/managed-runtime/requested/packages/installer/dist/cli.js`,
+    cliArtifactDigest: "a".repeat(64),
+    managedRuntimeArtifactPath: `${ROOT}/transactions/environment/safe-id/prepared/managed-runtime/requested`,
+    managedRuntimeArtifactDigest: "b".repeat(64),
     userRoot: ROOT,
     receiptFile: `${ROOT}/transactions/environment/safe-id/commit-helper.json`,
   }]);
@@ -399,7 +510,7 @@ test("submit fails closed for missing, mismatched, non-prepared, or unsafe trans
   }
 });
 
-test("transaction returns schema-1 idle JSON and commit/verify/rollback/cancel delegate exact IDs", async () => {
+test("transaction returns schema-1 idle JSON and commit/verify/rollback/recover/cancel delegate exact IDs", async () => {
   const calls: string[] = [];
   const noTransaction = dependencies({
     createCoordinator: () => fakeCoordinator({ status: () => null }),
@@ -428,22 +539,24 @@ test("transaction returns schema-1 idle JSON and commit/verify/rollback/cancel d
         };
       },
       rollback: async (id) => { calls.push(`rollback:${id}`); return receipt(id); },
+      recover: async (id) => { calls.push(`recover:${id}`); return receipt(id, "cancelled"); },
       cancel: async (id) => { calls.push(`cancel:${id}`); return receipt(id); },
     }),
   });
-  for (const action of ["commit", "verify", "rollback", "cancel"] as const) {
+  for (const action of ["commit", "verify", "rollback", "recover", "cancel"] as const) {
     await environment(action, { transaction: "exact-id", json: true }, fixture.deps);
   }
   assert.deepEqual(calls, [
     "commit:exact-id",
     "verify:exact-id",
     "rollback:exact-id",
+    "recover:exact-id",
     "cancel:exact-id",
   ]);
-  assert.equal(fixture.printed.length, 4);
+  assert.equal(fixture.printed.length, 5);
 });
 
-test("CLI commit outcome is successful only for an exactly committed environment receipt", () => {
+test("CLI action success requires an allowed terminal receipt phase", () => {
   assert.doesNotThrow(() => assertEnvironmentCliSuccess("commit", receipt("exact-id", "committed")));
   for (const phase of ["rolled-back", "failed", "cancelled"] as const) {
     assert.throws(
@@ -451,5 +564,12 @@ test("CLI commit outcome is successful only for an exactly committed environment
       new RegExp(`phase ${phase}`),
     );
   }
+  for (const phase of ["committed", "rolled-back", "cancelled"] as const) {
+    assert.doesNotThrow(() => assertEnvironmentCliSuccess("recover", receipt("exact-id", phase)));
+  }
+  assert.throws(
+    () => assertEnvironmentCliSuccess("recover", receipt("exact-id", "failed")),
+    /phase failed/,
+  );
   assert.doesNotThrow(() => assertEnvironmentCliSuccess("status", receipt("exact-id", "failed")));
 });

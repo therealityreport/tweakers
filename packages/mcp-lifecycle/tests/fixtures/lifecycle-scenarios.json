@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "ui-owned",
+      "purpose": "A signed wrapper below the visible ChatGPT UI is observation-only."
+    },
+    {
+      "id": "exact-detached",
+      "purpose": "An exact launchd-owned wrapper with one matching app-server starts a 600-second grace period."
+    },
+    {
+      "id": "blocker",
+      "purpose": "Sleeping user work blocks automated cleanup regardless of CPU use."
+    },
+    {
+      "id": "pid-reuse",
+      "purpose": "A changed kernel birth identity resets the grace timer and prevents signalling."
+    },
+    {
+      "id": "corrupt-state",
+      "purpose": "Invalid lifecycle state fails closed and starts a new grace period."
+    },
+    {
+      "id": "action-receipt",
+      "purpose": "A verified action records a redacted result without test writes to the host."
+    },
+    {
+      "id": "matcher-near-match",
+      "purpose": "MCP-looking user arguments remain blockers unless they match an approved executable and argv shape."
+    }
+  ]
+}

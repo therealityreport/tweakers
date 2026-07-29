@@ -18,12 +18,15 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-runtime && npm run build --workspace @therealityreport/tweakers-loader && npm run build --workspace @therealityreport/tweakers-installer",
+    "browser": "tsx packages/installer/src/cli.ts browser",
     "lint": "eslint packages/*/src --ext .ts --no-error-on-unmatched-pattern",
     "check:tweak-catalog": "node scripts/check-tweak-catalog.mjs store/index.json",
     "sync:tweaks": "node scripts/sync-tweaks.mjs",
     "check:public-history": "scripts/check-public-history.sh",
     "clean": "rm -rf packages/*/dist packages/installer/assets/runtime",
-    "test": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && node --import tsx --test packages/*/test/*.test.ts && node --test scripts/*.test.mjs",
+    "test": "npm run build --workspace @therealityreport/tweakers-sdk && npm run build --workspace @therealityreport/tweakers-native-host && npm run build --workspace @therealityreport/tweakers-switcher && node --import ./scripts/test-root-preload.mjs --import tsx --test packages/*/test/*.test.ts && node --import ./scripts/test-root-preload.mjs --test scripts/*.test.mjs && npm run test:tweaks && npm test --workspace @therealityreport/tweakers-mcp-lifecycle",
+    "test:user-questions": "node --import ./scripts/test-root-preload.mjs scripts/test-tweaks.mjs --tweak user-questions",
+    "test:tweaks": "node --import ./scripts/test-root-preload.mjs scripts/test-tweaks.mjs",
     "typecheck": "tsc --noEmit -p packages/installer/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p packages/sdk/tsconfig.json",
     "audit": "npm audit --workspaces --include-workspace-root",
     "prepare": "npm run build"

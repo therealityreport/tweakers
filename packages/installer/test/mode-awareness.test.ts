@@ -528,6 +528,16 @@ test("update-chatgpt start/status/resume/reconcile/cancel delegate to one durabl
     resume: async () => { calls.push("resume"); return { ...receipt, phase: "completed" }; },
     reconcile: async () => { calls.push("reconcile"); return { ...receipt, phase: "completed" }; },
     cancel: async () => { calls.push("cancel"); return { ...receipt, phase: "failed" }; },
+    heartbeat: () => ({
+      schemaVersion: 1,
+      transactionId: "desktop-1",
+      ownerPid: 4242,
+      ownerToken: "owner-token",
+      ownerGeneration: "owner-generation",
+      phase: "awaiting_native_update",
+      beatAt: new Date().toISOString(),
+      observed: { marketingVersion: "1.1.0", build: "110" },
+    }),
   };
   const output: string[] = [];
   const deps = {
@@ -546,6 +556,14 @@ test("update-chatgpt start/status/resume/reconcile/cancel delegate to one durabl
     output.map((line) => JSON.parse(line).blocksLifecycle),
     [true, true, false, false, true],
   );
+  // Only the status command carries the live progress block, sourced from the
+  // owner heartbeat (beat age + sampled disk version).
+  const statusJson = JSON.parse(output[1]!) as {
+    progress?: { heartbeat: { observed: { build: string } | null; beatAgeMs: number | null } | null };
+  };
+  assert.equal(statusJson.progress?.heartbeat?.observed?.build, "110");
+  assert.notEqual(statusJson.progress?.heartbeat?.beatAgeMs, null);
+  assert.equal("progress" in (JSON.parse(output[0]!) as Record<string, unknown>), false);
 });
 
 test("update-chatgpt reconcile prints the explicit idle JSON contract when there is no receipt", async () => {
