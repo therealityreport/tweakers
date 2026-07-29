@@ -1,14 +1,15 @@
-# User Questions variation round
+# User Questions rich decision round
 
 `variation-round.json` is a reusable question-round fixture covering:
 
-- a multi-select question with five choices and conditional inline Other input;
-- a single-select question with four choices and conditional inline Other input;
-- an optional single-select question;
-- a required multi-select question with a minimum while every available choice remains selectable.
+- explicit boolean recommendations, longer details, and pros/cons/give-up tradeoffs;
+- a multi-select question with five listed choices plus conditional Other text;
+- a single-select question with four choices plus conditional Other text;
+- an optional question answered with explicit Skip; and
+- a required multi-select question whose minimum and maximum are validated.
 
 The automated tests load this exact fixture, validate representative answers,
-and verify that every available multi-select choice can be selected together.
+and verify that the enhanced and generic result contracts stay aligned.
 
 ## Non-UI protocol harness
 
@@ -20,22 +21,28 @@ node tweaks/user-questions/examples/ask-variation-round.js
 
 The harness starts the source `mcp-server.js` as a child process, negotiates MCP
 `2025-11-25` with form elicitation, calls `ask`, and plays the role of a scripted
-MCP client. It answers every one-at-a-time question request, selects Other in
-one answer, supplies its inline Other text, and validates the final structured
-result before printing it. It also verifies that a separate required Other form
-remains available as a compatibility fallback when inline text is absent.
+generic MCP client. It answers each real question in its own fallback form,
+selects Other in one answer, explicitly skips the optional question, validates
+rich details in the first form description, and checks the final preference
+result before printing it.
 
-This is a protocol test only. It does not connect to Codex, launch a popup, or
-verify the installed visual interface.
+This is a source-only protocol test. It does not connect to Codex, show the
+enhanced card, create a resumable task-bound draft, change policy, or prove the
+installed visual interface.
 
-## Real visual testing
+## Disposable candidate testing
 
-After validation and `dev-sync`, start a fresh Codex task so it receives the
-newly installed MCP registration. In that task, ask Codex to call the installed
-`ask` tool from the `co-tweakers-user-questions` server (exposed as
-`mcp__co_tweakers_user_questions__ask`) with the contents of
+After source validation and generated synchronization, use a disposable
+candidate with isolated Tweakers and Codex data roots. In a fresh candidate
+task, call `mcp__co_tweakers_user_questions__ask` with the contents of
 `variation-round.json`.
 
-Verify in Codex that questions appear one at a time, the current task remains
-visible, multi-select markers are rounded squares, and the Other text field is
-hidden until Other is selected and then appears directly beneath that choice.
+Verify the one-question-at-a-time enhanced card, details disclosure, Recommended
+badge, Back restoration, rounded-square multi-select, Other, explicit Skip,
+Resume and Start over, review/submit, generic fallback parity, and visible
+`display_failed` retry recovery. Check keyboard/focus behavior, screen-reader
+labels, light/dark appearance, narrow layout, and 200% zoom.
+
+Do not apply the optional policy change or restart the live app as part of this
+example. Preview is read-only; Apply, Restore, and any later restart each require
+their own explicit user action.

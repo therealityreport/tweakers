@@ -1,0 +1,37 @@
+{
+  "input": {
+    "round_id": "legacy-round",
+    "questions": [
+      {
+        "id": "delivery",
+        "header": "Delivery",
+        "question": "How should this be delivered?",
+        "selection_mode": "single",
+        "options": [
+          { "id": "safe", "label": "Safe path (Recommended)", "description": "Use the established path." },
+          { "id": "fast", "label": "Fast path", "description": "Use the shorter path." }
+        ],
+        "allow_other": true
+      }
+    ]
+  },
+  "normalized": {
+    "round_id": "legacy-round",
+    "questions": [
+      {
+        "id": "delivery",
+        "header": "Delivery",
+        "question": "How should this be delivered?",
+        "selection_mode": "single",
+        "options": [
+          { "id": "safe", "label": "Safe path (Recommended)", "description": "Use the established path.", "details": null, "pros": [], "cons": [], "gives_up": [], "recommended": false },
+          { "id": "fast", "label": "Fast path", "description": "Use the shorter path.", "details": null, "pros": [], "cons": [], "gives_up": [], "recommended": false }
+        ],
+        "allow_other": true,
+        "required": true,
+        "min_selections": 1,
+        "max_selections": 1
+      }
+    ]
+  }
+}

@@ -15,6 +15,10 @@ import { startSettingsInjector } from "./settings-injector";
 import { startTweakHost, teardownTweakHost } from "./tweak-host";
 import { mountManager } from "./manager";
 import { startDesktopUpdateIndicator } from "./desktop-update-indicator";
+import {
+  captureTweakReloadFocus,
+  restoreTweakReloadFocus,
+} from "./reload-focus";
 
 const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
 const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
@@ -119,6 +123,7 @@ function subscribeReload(): void {
   ipcRenderer.on("tweaker:tweaks-changed", () => {
     if (reloading) return;
     reloading = (async () => {
+      const focusSnapshot = captureTweakReloadFocus(document);
       try {
         console.info("[tweaker] hot-reloading tweaks");
         teardownTweakHost();
@@ -127,6 +132,9 @@ function subscribeReload(): void {
       } catch (e) {
         console.error("[tweaker] hot reload failed:", e);
       } finally {
+        window.requestAnimationFrame(() => {
+          restoreTweakReloadFocus(focusSnapshot);
+        });
         reloading = null;
       }
     })();

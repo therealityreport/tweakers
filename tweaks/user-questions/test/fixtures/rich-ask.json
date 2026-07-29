@@ -1,0 +1,100 @@
+{
+  "input": {
+    "round_id": "rich-round",
+    "resume_token": "resume_token_0123456789abcdef",
+    "questions": [
+      {
+        "id": "scanner_setup",
+        "header": "Scanner setup",
+        "question": "How should the added security scanning be delivered?",
+        "selection_mode": "single",
+        "required": true,
+        "allow_other": true,
+        "options": [
+          {
+            "id": "built_in",
+            "label": "Built into the app",
+            "description": "The app handles scanning without a separate setup step.",
+            "details": "This keeps scanning in the same workflow as the rest of the app.",
+            "pros": ["Simpler day-to-day use"],
+            "cons": ["Adds maintenance inside the app"],
+            "gives_up": ["Independent scanner upgrades"],
+            "recommended": true
+          },
+          {
+            "id": "separate",
+            "label": "Separate scanner",
+            "description": "Run scanning through a separately managed tool.",
+            "recommended": false
+          }
+        ]
+      },
+      {
+        "id": "proof",
+        "header": "Proof",
+        "question": "Which checks should demonstrate the result?",
+        "selection_mode": "multiple",
+        "required": false,
+        "allow_other": true,
+        "min_selections": 2,
+        "max_selections": 2,
+        "options": [
+          { "id": "tests", "label": "Automated tests", "description": "Run focused automated coverage." },
+          { "id": "review", "label": "Manual review", "description": "Inspect the completed behavior." }
+        ]
+      }
+    ]
+  },
+  "normalized": {
+    "round_id": "rich-round",
+    "resume_token": "resume_token_0123456789abcdef",
+    "questions": [
+      {
+        "id": "scanner_setup",
+        "header": "Scanner setup",
+        "question": "How should the added security scanning be delivered?",
+        "selection_mode": "single",
+        "options": [
+          {
+            "id": "built_in",
+            "label": "Built into the app",
+            "description": "The app handles scanning without a separate setup step.",
+            "details": "This keeps scanning in the same workflow as the rest of the app.",
+            "pros": ["Simpler day-to-day use"],
+            "cons": ["Adds maintenance inside the app"],
+            "gives_up": ["Independent scanner upgrades"],
+            "recommended": true
+          },
+          {
+            "id": "separate",
+            "label": "Separate scanner",
+            "description": "Run scanning through a separately managed tool.",
+            "details": null,
+            "pros": [],
+            "cons": [],
+            "gives_up": [],
+            "recommended": false
+          }
+        ],
+        "allow_other": true,
+        "required": true,
+        "min_selections": 1,
+        "max_selections": 1
+      },
+      {
+        "id": "proof",
+        "header": "Proof",
+        "question": "Which checks should demonstrate the result?",
+        "selection_mode": "multiple",
+        "options": [
+          { "id": "tests", "label": "Automated tests", "description": "Run focused automated coverage.", "details": null, "pros": [], "cons": [], "gives_up": [], "recommended": false },
+          { "id": "review", "label": "Manual review", "description": "Inspect the completed behavior.", "details": null, "pros": [], "cons": [], "gives_up": [], "recommended": false }
+        ],
+        "allow_other": true,
+        "required": false,
+        "min_selections": 2,
+        "max_selections": 3
+      }
+    ]
+  }
+}

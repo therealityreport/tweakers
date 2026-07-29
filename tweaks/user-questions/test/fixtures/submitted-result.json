@@ -1,0 +1,28 @@
+{
+  "result": {
+    "status": "submitted",
+    "cancelled": false,
+    "answers": {
+      "scanner_setup": { "status": "answered", "selected_option_ids": ["built_in"], "other_text": null },
+      "proof": { "status": "skipped", "selected_option_ids": [], "other_text": null }
+    }
+  },
+  "normalized": {
+    "round_id": "rich-round",
+    "status": "submitted",
+    "cancelled": false,
+    "cancel_reason": null,
+    "answers": {
+      "scanner_setup": { "status": "answered", "selected_option_ids": ["built_in"], "other_text": null },
+      "proof": { "status": "skipped", "selected_option_ids": [], "other_text": null }
+    },
+    "skipped_question_ids": ["proof"],
+    "decision_guidance": {
+      "scope": "current_task",
+      "authority": "preference",
+      "semantics": "preference-not-policy",
+      "on_conflict": "Explain the conflict, the pros and cons, and what must be given up. Ask before materially changing the selected direction."
+    },
+    "draft": { "resumable": false, "resume_token": null }
+  }
+}

@@ -1,13 +1,13 @@
 {
   "id": "co.tweakers.user-questions",
   "name": "User Questions",
-  "version": "0.4.10",
+  "version": "0.6.3",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Native task-scoped questions shown one at a time, with conditional inline Other input and rounded-square multi-select controls.",
+  "description": "Task-scoped preference rounds with rich tradeoffs, explicit Skip and Other choices, resumable drafts, and safe generic fallback.",
   "author": "hulibrands",
   "tags": ["questions", "productivity", "forms"],
   "scope": "both",
-  "permissions": ["settings", "filesystem"],
+  "permissions": ["settings", "filesystem", "ipc", "network"],
   "minRuntime": ">=1.0.0",
   "mcp": {
     "command": "node",

@@ -22,8 +22,15 @@ export interface McpSyncReceipt {
     afterFingerprint: string;
     plannedAfterFingerprint?: string;
     restartRequired: boolean;
+    /**
+     * Completion time of the most recent reconciliation that changed the
+     * Tweakers-owned MCP configuration. No-op/error receipts preserve it so a
+     * required desktop restart cannot be forgotten by a later watcher pass.
+     */
+    managedConfigurationChangedAt?: string | null;
     error?: string;
 }
+export declare function userQuestionsMcpReceiptMatchesEnabledState(receipt: Pick<McpSyncReceipt, "status" | "desiredNames" | "appliedNames" | "conflicts" | "approvalPolicy">, enabled: boolean): boolean;
 export interface ReconcileMcpConfigOptions {
     configPath: string;
     statePath: string;
@@ -71,6 +78,32 @@ export interface McpReconciler {
     readState(): McpSyncReceipt | null;
     close(): Promise<void>;
 }
+export declare const MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
+export declare const MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+export interface ResolveMcpRuntimePathsOptions {
+    /** Exact Tweakers user root selected by the loader for this runtime. */
+    userRoot: string;
+    /** Ordinary OS home. Candidate mode never substitutes this implicitly. */
+    homeDirectory: string;
+    env?: Readonly<Record<string, string | undefined>>;
+}
+export interface McpRuntimePaths {
+    codexHome: string;
+    configPath: string;
+    statePath: string;
+    candidateIsolated: boolean;
+}
+/**
+ * Resolve the only MCP config and receipt paths the desktop reconciler may use.
+ *
+ * Ordinary launches intentionally retain the historical ~/.codex/config.toml
+ * behavior, even when CODEX_HOME happens to be present. A disposable candidate
+ * must explicitly opt in and supply an exact CODEX_HOME below its exact,
+ * non-symlink Tweakers user root. Existing symlink components, the real
+ * ~/.codex tree, and paths outside the candidate root fail closed before a
+ * watcher or reconciler can be created.
+ */
+export declare function resolveMcpRuntimePaths(options: ResolveMcpRuntimePathsOptions): McpRuntimePaths;
 export declare function reconcileMcpConfig(options: ReconcileMcpConfigOptions, dependencies?: ReconcileMcpConfigDependencies): McpSyncReceipt;
 export declare function createMcpReconciler(options: McpReconcilerOptions, dependencies?: CreateMcpReconcilerDependencies): McpReconciler;
 export declare function readMcpSyncState(statePath: string): McpSyncReceipt | null;

@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { signatureInfo } from "./codesign.js";
+import { sweepMacOsJunk } from "./fs-copy.js";
 import {
   acquireProcessLock,
   isLockHeldByLiveOwner,
@@ -217,6 +218,11 @@ export function cloneAppTree(source: string, destination: string, deps: CloneApp
     try {
       // -R recurse, -c clonefile, -p preserve attributes.
       exec("cp", ["-Rcp", source, destination], { stdio: "ignore" });
+      // Finder junk cloned from a browsed source bundle must not enter a
+      // receipt-owned artifact: its digest becomes durable evidence, and
+      // Apple's sealed-resource rules omit .DS_Store, so removal can never
+      // invalidate a signature.
+      sweepMacOsJunk(destination);
       return;
     } catch {
       // clonefile unavailable / cross-volume — fall back to a byte copy.
@@ -224,6 +230,7 @@ export function cloneAppTree(source: string, destination: string, deps: CloneApp
     }
   }
   copyDir(source, destination);
+  sweepMacOsJunk(destination);
 }
 
 /**

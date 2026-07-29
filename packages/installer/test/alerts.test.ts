@@ -5,6 +5,7 @@ import {
   codexMainProcessObservationFromReport,
   observeCodexMainProcess,
   openCodex,
+  openAndActivateCodex,
   quitCodexMainProcess,
   requestCodexNativeUpdate,
   setAlertExecFileSyncForTest,
@@ -465,6 +466,27 @@ test(
       const options = call.options as { env?: Record<string, string | undefined> };
       assert.equal(options.env?.TWEAKER_ALERT_TITLE, "Tweakers needs app repair");
       assert.equal(options.env?.TWEAKER_ALERT_MESSAGE, 'Run "tweaker repair" in your terminal.');
+    } finally {
+      restore();
+    }
+  },
+);
+
+test(
+  "transaction relaunch captures AppleScript diagnostics",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const { calls, restore } = installExecSpy();
+    try {
+      openAndActivateCodex("/Applications/ChatGPT.app");
+
+      assert.equal(calls.length, 1);
+      const call = calls[0];
+      assert.match(scriptFrom(call), /\/usr\/bin\/open '\/Applications\/ChatGPT\.app'/);
+      assert.deepEqual(call.options, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
     } finally {
       restore();
     }

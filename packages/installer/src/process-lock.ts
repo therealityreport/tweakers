@@ -14,6 +14,14 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+/**
+ * Existence-only liveness: kill(pid, 0), with EPERM counting as alive. A
+ * recycled PID (or another user's process via EPERM) reports alive for an
+ * owner that actually died — the conservative direction for every gate that
+ * uses this (a false "alive" defers work; it never triggers recovery or
+ * mutation). Do not add start-time heuristics here; callers that need
+ * stronger identity must record their own token beside the PID.
+ */
 export function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

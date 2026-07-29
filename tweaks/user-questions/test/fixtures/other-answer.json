@@ -1,0 +1,10 @@
+{
+  "answers": {
+    "scanner_setup": { "status": "answered", "selected_option_ids": [], "other_text": "Use the existing external service" },
+    "proof": { "status": "skipped", "selected_option_ids": [], "other_text": null }
+  },
+  "normalized": {
+    "scanner_setup": { "status": "answered", "selected_option_ids": [], "other_text": "Use the existing external service" },
+    "proof": { "status": "skipped", "selected_option_ids": [], "other_text": null }
+  }
+}

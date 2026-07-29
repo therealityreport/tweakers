@@ -61,6 +61,15 @@ export interface TweakMcpServer {
   env?: Record<string, string>;
 }
 
+/**
+ * Runtime-owned MCP launch variables. They are injected only while Tweakers
+ * formats a managed MCP entry and may not be supplied by tweak manifests.
+ */
+export const RESERVED_TWEAK_MCP_ENV_KEYS = [
+  "TWEAKER_TWEAK_DATA_DIR",
+  "TWEAKER_TWEAK_ID",
+] as const;
+
 export type TweakPermission =
   | "ipc"
   | "filesystem"
@@ -251,6 +260,13 @@ function validateMcpManifest(value: unknown, errors: TweakManifestIssue[]): void
       return;
     }
     for (const [key, envValue] of Object.entries(value.env)) {
+      if ((RESERVED_TWEAK_MCP_ENV_KEYS as readonly string[]).includes(key)) {
+        errors.push({
+          path: `mcp.env.${key}`,
+          message: `mcp.env.${key} is reserved for the managed Tweakers runtime`,
+        });
+        continue;
+      }
       if (typeof envValue !== "string") {
         errors.push({
           path: `mcp.env.${key}`,
@@ -411,7 +427,59 @@ export interface HostUiApi {
   observe(kinds: HostSurfaceKind[], listener: (snapshots: HostSurfaceSnapshot[]) => void): () => void;
   getActiveProject(): HostProjectContext | null;
   attachFiles(files: HostAttachmentFile[]): Promise<HostAttachmentResult>;
+  /** Attach fail-closed to one exact nonce-bearing standard MCP form. */
+  attachMcpFormCarrier(nonce: string): HostMcpFormAttachResult;
 }
+
+export interface HostMcpFormIdentity {
+  requestId: string;
+  conversationId: string;
+  hostId: string;
+  schemaPropertyNames: readonly string[];
+}
+
+export type HostMcpFormDeclineReason =
+  | "invalid_nonce"
+  | "carrier_not_found"
+  | "multiple_carriers"
+  | "not_semantic_form"
+  | "disconnected_form"
+  | "missing_fiber"
+  | "ancestor_cycle"
+  | "ancestor_bound_exceeded"
+  | "missing_or_invalid_props"
+  | "duplicate_props"
+  | "conflicting_props"
+  | "nonce_not_in_schema";
+
+export type HostMcpDeliveryAcknowledgement = Readonly<{
+  version: 1;
+  stage: "carrier_attach" | "owned_mount" | "generic_mount";
+  contentRedacted: true;
+}>;
+
+export interface HostMcpFormController {
+  readonly form: HTMLFormElement;
+  /** Exact carrier node; owned UI should mount relative to this node only. */
+  readonly taskCardAnchor: HTMLElement;
+  readonly identity: Readonly<HostMcpFormIdentity>;
+  isCurrent(): boolean;
+  setRadio(propertyKey: string, optionKey: string): void;
+  setCheckbox(propertyKey: string, optionKey: string, checked: boolean): void;
+  setText(propertyKey: string, value: string): void;
+  continueNormally(): void;
+  cancelNormally(): void;
+  mountAcknowledgement(owner: "owned" | "generic"): HostMcpDeliveryAcknowledgement;
+}
+
+export type HostMcpFormAttachResult =
+  | {
+      status: "attached";
+      identity: Readonly<HostMcpFormIdentity>;
+      controller: HostMcpFormController;
+      acknowledgement: HostMcpDeliveryAcknowledgement;
+    }
+  | { status: "declined"; reason: HostMcpFormDeclineReason };
 
 export interface HostAttachmentFile {
   name: string;
@@ -440,10 +508,24 @@ export interface TweakIpc {
   send(channel: string, ...args: unknown[]): void;
   /** Main-side: send to the primary Codex renderer only. */
   sendToPrimary?(channel: string, ...args: unknown[]): boolean;
+  /** Main-side: send only to a currently owned, non-destroyed renderer. */
+  sendToRenderer?(webContentsId: number, channel: string, ...args: unknown[]): boolean;
   /** Renderer ↔ main round-trip; resolves with the handler's return value. */
   invoke<T = unknown>(channel: string, ...args: unknown[]): Promise<T>;
   /** Main-side: handle invokes from the renderer. */
   handle?(channel: string, handler: (...args: unknown[]) => unknown): void;
+  /**
+   * Main-side: handle invokes with bounded sender identity. The returned
+   * cleanup removes only this registration, never a later replacement.
+   */
+  handleWithContext?(
+    channel: string,
+    handler: (context: TweakIpcInvokeContext, ...args: unknown[]) => unknown,
+  ): () => void;
+}
+
+export interface TweakIpcInvokeContext {
+  readonly sender: Readonly<{ webContentsId: number }>;
 }
 
 export interface TweakFs {

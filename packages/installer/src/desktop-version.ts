@@ -3,58 +3,26 @@ export interface DesktopVersionIdentity {
   build: string | null;
 }
 
-export type DesktopVersionComparison = "newer" | "not-newer" | "unknown";
-
 /**
- * Sparkle build numbers are authoritative whenever either side reports one.
- * Marketing versions are a fallback only for older snapshots where both build
- * numbers are absent. Incomplete or malformed identities are never guessed.
+ * Build numbers are the authoritative ordering when both sides expose one;
+ * marketing versions only decide when a build is unreadable. An unreadable or
+ * non-numeric pair is never treated as advancement.
  */
-export function compareDesktopVersionIdentity(
+export function desktopVersionAdvanced(
   baseline: DesktopVersionIdentity,
   observed: DesktopVersionIdentity,
-): DesktopVersionComparison {
-  if (baseline.build !== null || observed.build !== null) {
-    const buildComparison = compareNumericDotted(baseline.build, observed.build);
-    if (buildComparison === null) return "unknown";
-    return buildComparison < 0 ? "newer" : "not-newer";
-  }
-
-  const marketingComparison = compareNumericDotted(
-    baseline.marketingVersion,
-    observed.marketingVersion,
-  );
-  if (marketingComparison === null) return "unknown";
-  return marketingComparison < 0 ? "newer" : "not-newer";
+): boolean {
+  const buildComparison = compareNumericVersion(baseline.build, observed.build);
+  if (buildComparison !== null) return buildComparison < 0;
+  const marketingComparison = compareNumericVersion(baseline.marketingVersion, observed.marketingVersion);
+  return marketingComparison !== null && marketingComparison < 0;
 }
 
-/**
- * Fast-path payload reuse requires both the marketing version and build to be
- * present, numeric, and equal. A missing field is unknown rather than equal.
- */
-export function desktopVersionIdentityEqual(
-  left: DesktopVersionIdentity,
-  right: DesktopVersionIdentity,
-): boolean | null {
-  const marketingComparison = compareNumericDotted(
-    left.marketingVersion,
-    right.marketingVersion,
-  );
-  const buildComparison = compareNumericDotted(left.build, right.build);
-  if (marketingComparison === null || buildComparison === null) return null;
-  return marketingComparison === 0 && buildComparison === 0;
-}
-
-function compareNumericDotted(leftValue: string | null, rightValue: string | null): number | null {
-  if (!leftValue || !rightValue) return null;
-  const left = leftValue.trim().split(".");
-  const right = rightValue.trim().split(".");
-  if (!left.length
-    || !right.length
-    || !left.every(isDecimalSegment)
-    || !right.every(isDecimalSegment)) {
-    return null;
-  }
+export function compareNumericVersion(baseline: string | null, observed: string | null): number | null {
+  if (!baseline || !observed) return null;
+  const left = baseline.trim().split(".");
+  const right = observed.trim().split(".");
+  if (!left.length || !right.length || !left.every(isDecimalSegment) || !right.every(isDecimalSegment)) return null;
   const length = Math.max(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
     const a = BigInt(left[index] ?? "0");

@@ -16,6 +16,7 @@ const settings_injector_1 = require("./settings-injector");
 const tweak_host_1 = require("./tweak-host");
 const manager_1 = require("./manager");
 const desktop_update_indicator_1 = require("./desktop-update-indicator");
+const reload_focus_1 = require("./reload-focus");
 const BROWSER_UI_CONNECT_PORT = "tweaker:browser-ui-connect-app-host";
 const BROWSER_UI_BRIDGE_REQUEST = "tweaker:browser-ui-bridge-request";
 const BROWSER_UI_BRIDGE_RESPONSE = "tweaker:browser-ui-bridge-response";
@@ -115,6 +116,7 @@ function subscribeReload() {
         if (reloading)
             return;
         reloading = (async () => {
+            const focusSnapshot = (0, reload_focus_1.captureTweakReloadFocus)(document);
             try {
                 console.info("[tweaker] hot-reloading tweaks");
                 (0, tweak_host_1.teardownTweakHost)();
@@ -125,6 +127,9 @@ function subscribeReload() {
                 console.error("[tweaker] hot reload failed:", e);
             }
             finally {
+                window.requestAnimationFrame(() => {
+                    (0, reload_focus_1.restoreTweakReloadFocus)(focusSnapshot);
+                });
                 reloading = null;
             }
         })();

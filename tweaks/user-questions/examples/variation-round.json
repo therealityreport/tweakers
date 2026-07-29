@@ -1,126 +1,157 @@
 {
-  "round_id": "user-questions-variation-demo-v1",
+  "round_id": "user-questions-rich-decision-demo-v2",
   "questions": [
     {
       "id": "improvements",
       "header": "Improvements",
       "question": "Which improvements should be included? Select every choice that applies.",
       "selection_mode": "multiple",
+      "required": true,
+      "allow_other": true,
+      "min_selections": 1,
+      "max_selections": 6,
       "options": [
         {
           "id": "faster",
-          "label": "Faster responses (Recommended)",
-          "description": "Prioritize changes that reduce how long the workflow takes."
+          "label": "Faster responses",
+          "description": "Prioritize changes that reduce how long the workflow takes.",
+          "details": "Measure the slow path first, then optimize only the steps that materially affect waiting time.",
+          "pros": ["Quicker feedback during normal use"],
+          "cons": ["Performance work can add implementation complexity"],
+          "gives_up": ["Some time that could be spent on additional features"],
+          "recommended": true
         },
         {
           "id": "simpler",
           "label": "Simpler controls",
-          "description": "Reduce the number of steps and choices shown during normal use."
+          "description": "Reduce the number of steps and choices shown during normal use.",
+          "details": "Keep advanced controls available only where they are needed.",
+          "pros": ["Easier first-time use"],
+          "cons": ["Some controls may take an extra step to reach"],
+          "gives_up": ["Showing every advanced option at once"],
+          "recommended": false
         },
         {
           "id": "accessible",
           "label": "Better accessibility",
-          "description": "Improve keyboard navigation, focus visibility, and screen-reader support."
+          "description": "Improve keyboard navigation, focus visibility, and screen-reader support.",
+          "recommended": false
         },
         {
           "id": "safer",
           "label": "Safer defaults",
-          "description": "Add clearer confirmations and reduce accidental actions."
+          "description": "Add clearer confirmations and reduce accidental actions.",
+          "recommended": false
         },
         {
           "id": "customizable",
           "label": "More customization",
-          "description": "Let people adjust appearance and behavior to their preferences."
+          "description": "Let people adjust appearance and behavior to their preferences.",
+          "recommended": false
         }
-      ],
-      "allow_other": true,
-      "min_selections": 1,
-      "max_selections": 6
+      ]
     },
     {
       "id": "release_style",
       "header": "Release style",
       "question": "How should the changes be introduced?",
       "selection_mode": "single",
+      "required": true,
+      "allow_other": true,
       "options": [
         {
           "id": "preview",
-          "label": "Preview first (Recommended)",
-          "description": "Try the changes in a disposable environment before making them active."
+          "label": "Preview first",
+          "description": "Try the changes in a disposable environment before making them active.",
+          "details": "Validate the complete source and candidate without changing the installed app.",
+          "pros": ["Problems are contained before promotion"],
+          "cons": ["Adds a separate validation step"],
+          "gives_up": ["Immediate activation"],
+          "recommended": true
         },
         {
           "id": "gradual",
           "label": "Gradual rollout",
-          "description": "Enable the changes in stages so problems are easier to contain."
+          "description": "Enable the changes in stages so problems are easier to contain.",
+          "recommended": false
         },
         {
           "id": "immediate",
           "label": "Enable immediately",
-          "description": "Make the changes active as soon as validation finishes."
+          "description": "Make the changes active as soon as validation finishes.",
+          "recommended": false
         },
         {
           "id": "documentation_only",
           "label": "Document only",
-          "description": "Prepare the instructions but do not activate the changes."
+          "description": "Prepare the instructions but do not activate the changes.",
+          "recommended": false
         }
-      ],
-      "allow_other": true
+      ]
     },
     {
       "id": "notifications",
       "header": "Notifications",
       "question": "Should completion notifications be enabled?",
       "selection_mode": "single",
+      "required": false,
+      "allow_other": false,
       "options": [
         {
           "id": "important_only",
-          "label": "Important results only (Recommended)",
-          "description": "Notify only when work finishes or needs attention."
+          "label": "Important results only",
+          "description": "Notify only when work finishes or needs attention.",
+          "recommended": true
         },
         {
           "id": "all_updates",
           "label": "Every update",
-          "description": "Notify for progress updates as well as final results."
+          "description": "Notify for progress updates as well as final results.",
+          "recommended": false
         },
         {
           "id": "none",
           "label": "No notifications",
-          "description": "Keep all updates inside the conversation."
+          "description": "Keep all updates inside the conversation.",
+          "recommended": false
         }
-      ],
-      "allow_other": false,
-      "required": false
+      ]
     },
     {
       "id": "proof",
       "header": "Validation",
       "question": "Which evidence should be required before the work is considered complete?",
       "selection_mode": "multiple",
+      "required": true,
+      "allow_other": false,
+      "min_selections": 2,
+      "max_selections": 4,
       "options": [
         {
           "id": "automated_tests",
-          "label": "Automated tests (Recommended)",
-          "description": "Require repeatable checks that can run without manual interaction."
+          "label": "Automated tests",
+          "description": "Require repeatable checks that can run without manual interaction.",
+          "recommended": true
         },
         {
           "id": "visual_check",
           "label": "Visual check",
-          "description": "Confirm the interface looks and behaves correctly in the app."
+          "description": "Confirm the interface looks and behaves correctly in the app.",
+          "recommended": false
         },
         {
           "id": "restart_check",
           "label": "Restart check",
-          "description": "Confirm the behavior still works after closing and reopening the app."
+          "description": "Confirm the behavior still works after a separately approved close and reopen.",
+          "recommended": false
         },
         {
           "id": "fallback_check",
           "label": "Fallback check",
-          "description": "Confirm a clear alternative remains available when the preferred tool fails."
+          "description": "Confirm a clear alternative remains available when the preferred tool fails.",
+          "recommended": false
         }
-      ],
-      "allow_other": false,
-      "min_selections": 2,
-      "max_selections": 4
+      ]
     }
   ]
 }

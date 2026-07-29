@@ -8,7 +8,6 @@ import {
   OFFICIAL_CODEX_BUNDLE_ID,
   repair,
   repairWithOutcome,
-  type AsarStatFingerprint,
   type OfficialUpdateDriftInput,
 } from "../src/commands/repair";
 import { readDeferredRepair, writeDeferredRepair } from "../src/deferred-repair";
@@ -20,8 +19,6 @@ import { lifecycleLockFile } from "../src/lifecycle-lock";
 import { acquireProcessLock } from "../src/process-lock";
 
 const APP = "/Applications/ChatGPT.app";
-const PATCHED_HEADER_HASH = "a".repeat(64);
-const REPLACEMENT_HEADER_HASH = "b".repeat(64);
 
 function state(partial: Partial<InstallerState> = {}): InstallerState {
   return {
@@ -187,7 +184,7 @@ async function withTweakersHome(run: (root: string) => Promise<void>): Promise<v
 interface RepairFixture {
   appRoot: string;
   asarPath: string;
-  asarStat: AsarStatFingerprint;
+  asarStat: { size: number; mtimeMs: number };
 }
 
 function makeRepairFixture(root: string): RepairFixture {
@@ -207,26 +204,21 @@ function makeRepairFixture(root: string): RepairFixture {
 </dict></plist>`,
   );
   const asarPath = join(resources, "app.asar");
-  const { size, mtimeMs, dev, ino, ctimeMs } = statSync(asarPath);
-  return {
-    appRoot,
-    asarPath,
-    asarStat: { size, mtimeMs, dev, ino, ctimeMs, headerHash: PATCHED_HEADER_HASH },
-  };
+  const { size, mtimeMs } = statSync(asarPath);
+  return { appRoot, asarPath, asarStat: { size, mtimeMs } };
 }
 
 function seedRepairState(
   root: string,
   fixture: RepairFixture,
   watcherStatGuardPasses = 0,
-  patchedAsarStat: { size: number; mtimeMs: number } = fixture.asarStat,
 ): void {
   writeState(
     join(root, "state.json"),
     state({
       appRoot: fixture.appRoot,
-      patchedAsarHash: PATCHED_HEADER_HASH,
-      patchedAsarStat,
+      patchedAsarHash: "patched",
+      patchedAsarStat: fixture.asarStat,
       watcher: "none",
       watcherStatGuardPasses,
       // Explicit Tweakers mode: these fixtures model existing patched installs,
@@ -235,29 +227,6 @@ function seedRepairState(
       mode: "tweakers",
     }),
   );
-}
-
-async function assertFingerprintFallsThrough(
-  root: string,
-  fixture: RepairFixture,
-  current: AsarStatFingerprint,
-): Promise<void> {
-  seedRepairState(root, fixture);
-  let settles = 0;
-  let installs = 0;
-
-  await repair({ watcher: true, quiet: true }, {
-    statAsar: () => current,
-    readExpectedRuntimeFingerprint: () => "same",
-    readActiveRuntimeFingerprint: () => "same",
-    waitForSettle: async () => { settles += 1; },
-    readHeaderHash: () => ({ headerHash: REPLACEMENT_HEADER_HASH, header: {} }),
-    signingAvailable: () => true,
-    install: async () => { installs += 1; },
-  });
-
-  assert.ok(settles >= 1);
-  assert.equal(installs, 1);
 }
 
 test("watcher repair yields while a local refresh holds the lock", async () => {
@@ -338,7 +307,7 @@ test("unchanged asar without verified active runtime bytes enters repair instead
         statAsar: () => fixture.asarStat,
         readHeaderHash: () => {
           counts.header += 1;
-          return { headerHash: PATCHED_HEADER_HASH, header: {} };
+          return { headerHash: "patched", header: {} };
         },
         runtimeAssetsMatch: () => {
           counts.tree += 1;
@@ -360,7 +329,7 @@ test("unchanged asar without verified active runtime bytes enters repair instead
     assert.equal(counts.header, 1);
     assert.equal(counts.tree, 1);
     assert.equal(counts.settle, 1);
-    assert.equal(counts.processes, 1);
+  assert.equal(counts.processes, 0);
     assert.equal(counts.installs, 0);
     assert.equal(readState(join(root, "state.json"))?.watcherStatGuardPasses, 0);
   });
@@ -388,91 +357,26 @@ test("unchanged asar plus equal runtime fingerprint preserves the zero-tree fast
   });
 });
 
-test("legacy size-and-mtime-only asar fingerprints fall through to full verification", async () => {
+test("repair reconciles an adopted MCP lifecycle package inside the shared lifecycle lease", async () => {
   await withTweakersHome(async (root) => {
     const fixture = makeRepairFixture(root);
-    seedRepairState(root, fixture, 0, {
-      size: fixture.asarStat.size,
-      mtimeMs: fixture.asarStat.mtimeMs,
-    });
-    let settles = 0;
-    let installs = 0;
+    seedRepairState(root, fixture);
+    let lifecycleReconciliations = 0;
 
     await repair({ watcher: true, quiet: true }, {
+      reconcileMcpLifecycle: () => {
+        lifecycleReconciliations += 1;
+        assert.equal(existsSync(lifecycleLockFile(root)), true);
+        return null;
+      },
       statAsar: () => fixture.asarStat,
       readExpectedRuntimeFingerprint: () => "same",
       readActiveRuntimeFingerprint: () => "same",
-      waitForSettle: async () => { settles += 1; },
-      readHeaderHash: () => ({ headerHash: REPLACEMENT_HEADER_HASH, header: {} }),
-      signingAvailable: () => true,
-      install: async () => { installs += 1; },
+      isAppRunning: () => true,
+      runtimeAssetsMatch: () => true,
     });
 
-    assert.ok(settles >= 1);
-    assert.equal(installs, 1);
-  });
-});
-
-test("malformed asar fingerprints fall through to full verification", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    const malformed = { ...fixture.asarStat, headerHash: "not-a-sha256-digest" };
-    seedRepairState(root, fixture, 0, malformed);
-    let settles = 0;
-    let installs = 0;
-
-    await repair({ watcher: true, quiet: true }, {
-      statAsar: () => malformed,
-      readExpectedRuntimeFingerprint: () => "same",
-      readActiveRuntimeFingerprint: () => "same",
-      waitForSettle: async () => { settles += 1; },
-      readHeaderHash: () => ({ headerHash: REPLACEMENT_HEADER_HASH, header: {} }),
-      signingAvailable: () => true,
-      install: async () => { installs += 1; },
-    });
-
-    assert.ok(settles >= 1);
-    assert.equal(installs, 1);
-  });
-});
-
-test("same-size atomic asar replacement changes inode and bypasses the fast path", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    await assertFingerprintFallsThrough(root, fixture, {
-      ...fixture.asarStat,
-      ino: fixture.asarStat.ino + 1,
-    });
-  });
-});
-
-test("same-size asar replacement across devices bypasses the fast path", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    await assertFingerprintFallsThrough(root, fixture, {
-      ...fixture.asarStat,
-      dev: fixture.asarStat.dev + 1,
-    });
-  });
-});
-
-test("same-size asar repack changes ctime and bypasses the fast path", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    await assertFingerprintFallsThrough(root, fixture, {
-      ...fixture.asarStat,
-      ctimeMs: fixture.asarStat.ctimeMs + 1,
-    });
-  });
-});
-
-test("same-size in-place asar modification changes its header hash and bypasses the fast path", async () => {
-  await withTweakersHome(async (root) => {
-    const fixture = makeRepairFixture(root);
-    await assertFingerprintFallsThrough(root, fixture, {
-      ...fixture.asarStat,
-      headerHash: REPLACEMENT_HEADER_HASH,
-    });
+    assert.equal(lifecycleReconciliations, 1);
   });
 });
 
@@ -518,7 +422,7 @@ test("unchanged asar plus runtime drift stages verified assets after the app clo
       readActiveRuntimeFingerprint: () => staged > 0 ? "new" : "old",
       isAppRunning: () => false,
       waitForSettle: async () => {},
-      readHeaderHash: () => ({ headerHash: PATCHED_HEADER_HASH, header: {} }),
+      readHeaderHash: () => ({ headerHash: "patched", header: {} }),
       readAsarPatchSchema: () => "current",
       runtimeAssetsMatch: () => {
         treeChecks += 1;
@@ -547,7 +451,7 @@ test("runtime staging without portable fingerprints remains unknown rather than 
       readActiveRuntimeFingerprint: () => null,
       isAppRunning: () => false,
       waitForSettle: async () => {},
-      readHeaderHash: () => ({ headerHash: PATCHED_HEADER_HASH, header: {} }),
+      readHeaderHash: () => ({ headerHash: "patched", header: {} }),
       readAsarPatchSchema: () => "current",
       runtimeAssetsMatch: () => false,
       stageAssets: () => { staged += 1; },
@@ -578,7 +482,7 @@ test("failed runtime staging keeps drift pending with an actionable receipt", as
         readActiveRuntimeFingerprint: () => "old",
         isAppRunning: () => false,
         waitForSettle: async () => {},
-        readHeaderHash: () => ({ headerHash: PATCHED_HEADER_HASH, header: {} }),
+        readHeaderHash: () => ({ headerHash: "patched", header: {} }),
         readAsarPatchSchema: () => "current",
         runtimeAssetsMatch: () => false,
         stageAssets: () => { throw new Error("atomic replacement failed"); },
@@ -606,7 +510,7 @@ test("sixth unchanged asar pass without fingerprints runs bounded heavy verifica
         statAsar: () => fixture.asarStat,
         readHeaderHash: () => {
           counts.header += 1;
-          return { headerHash: PATCHED_HEADER_HASH, header: {} };
+          return { headerHash: "patched", header: {} };
         },
         runtimeAssetsMatch: () => {
           counts.tree += 1;
@@ -622,7 +526,7 @@ test("sixth unchanged asar pass without fingerprints runs bounded heavy verifica
       },
     );
 
-    assert.equal(counts.processes, 1);
+  assert.equal(counts.processes, 0);
     assert.equal(counts.header, 1);
     assert.equal(counts.tree, 1);
     assert.equal(counts.settle, 1);

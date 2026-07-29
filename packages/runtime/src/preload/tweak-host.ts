@@ -214,6 +214,11 @@ async function loadTweak(t: ListedTweak, paths: UserPaths): Promise<void> {
 
 function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
   const id = manifest.id;
+  const assertIpcPermission = () => {
+    if (!manifest.permissions?.includes("ipc")) {
+      throw new Error(`tweak ${id} must declare ipc permission`);
+    }
+  };
   const log = (level: "debug" | "info" | "warn" | "error", ...a: unknown[]) => {
     const consoleFn =
       level === "debug" ? console.debug
@@ -286,12 +291,17 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
     },
     ipc: {
       on: (c, h) => {
+        assertIpcPermission();
         const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
         ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
         return () => ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
       },
-      send: (c, ...args) => ipcRenderer.send(`tweaker:${id}:${c}`, ...args),
+      send: (c, ...args) => {
+        assertIpcPermission();
+        ipcRenderer.send(`tweaker:${id}:${c}`, ...args);
+      },
       invoke: <T>(c: string, ...args: unknown[]) => {
+        assertIpcPermission();
         if (id === "co.tweakers.thread-summary-profiles" && c === "profiles.read") {
           return ipcRenderer.invoke(
             "tweaker:cross-tweak-read",

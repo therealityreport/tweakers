@@ -6,11 +6,9 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   createDesktopUpdateTransaction,
-  compareDesktopVersionIdentity,
   desktopVersionAdvanced,
-  invalidateParkedPayloadForOfficialAdoption,
-  preferredDesktopRefreshSource,
   pristineBackupProvesObservedDesktop,
+  readDesktopUpdateReceipt,
   runSynchronousLocalRefresh,
   writeDesktopUpdateReceipt,
   type DesktopUpdateDependencies,
@@ -52,74 +50,6 @@ test("desktop version comparison accepts only a numeric advance", () => {
     { marketingVersion: "1.0.0", build: "100" },
     { marketingVersion: "1.0.0", build: "100" },
   ), false);
-});
-
-test("desktop version comparison fails closed for missing, malformed, and incomparable identities", () => {
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: "1.0.0", build: "100" },
-    { marketingVersion: "1.1.0", build: null },
-  ), "unknown");
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: "1.0.0", build: "100" },
-    { marketingVersion: "1.1.0", build: "not-a-build" },
-  ), "unknown");
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: "release-a", build: null },
-    { marketingVersion: "release-b", build: null },
-  ), "unknown");
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: null, build: null },
-    { marketingVersion: "1.1.0", build: null },
-  ), "unknown");
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: "1.0.0", build: null },
-    { marketingVersion: "1.1.0", build: null },
-  ), "newer");
-  assert.equal(compareDesktopVersionIdentity(
-    { marketingVersion: "1.1.0", build: "110" },
-    { marketingVersion: "1.0.0", build: "100" },
-  ), "not-newer");
-});
-
-test("official adoption atomically invalidates parked payload and retries idempotently", () => {
-  const root = mkdtempSync(join(tmpdir(), "tweakers-invalidated-payload-"));
-  try {
-    const parked = join(root, "mode", "patched-payload");
-    const invalidated = `${parked}.invalidated`;
-    fs.mkdirSync(parked, { recursive: true });
-    fs.writeFileSync(join(parked, "payload.json"), "{}");
-
-    assert.equal(invalidateParkedPayloadForOfficialAdoption(root), invalidated);
-    assert.equal(existsSync(parked), false);
-    assert.equal(existsSync(invalidated), true);
-    assert.equal(invalidateParkedPayloadForOfficialAdoption(root), invalidated);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("official adoption invalidation failure preserves the active parked payload", () => {
-  const root = "/tmp/tweakers-invalidation-failure";
-  const parked = join(root, "mode", "patched-payload");
-  assert.throws(
-    () => invalidateParkedPayloadForOfficialAdoption(root, {
-      exists: (path) => path === parked,
-      rename: () => {
-        throw new Error("rename denied");
-      },
-    }),
-    /rename denied/,
-  );
-});
-
-test("official adoption refuses ambiguous active and invalidated payloads", () => {
-  const root = "/tmp/tweakers-invalidation-ambiguous";
-  assert.throws(
-    () => invalidateParkedPayloadForOfficialAdoption(root, {
-      exists: () => true,
-    }),
-    /both the active and invalidated parked payloads exist/,
-  );
 });
 
 test("pristine backup proof requires a Developer ID valid exact updated version and build", () => {
@@ -178,6 +108,36 @@ test("desktop receipt publication fsyncs its parent directory", async () => {
     }
 
     assert.equal(directoryFsyncs, 1);
+  });
+});
+
+test("additive terminal chronology remains compatible with legacy schema-v1 receipts", async () => {
+  await withFixture(async (fixture) => {
+    const legacy = persistedReceipt({
+      phase: "failed",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "legacy failure",
+    });
+    delete legacy.terminalAt;
+    delete legacy.continuationAbandonedAt;
+    fs.mkdirSync(join(fixture.root, "transactions"), { recursive: true });
+    fs.writeFileSync(fixture.stateFile, `${JSON.stringify(legacy)}\n`);
+
+    const decoded = readDesktopUpdateReceipt(fixture.stateFile);
+
+    assert.equal(decoded?.schemaVersion, 1);
+    assert.equal(decoded?.terminalAt, undefined);
+    assert.equal(decoded?.continuationAbandonedAt, undefined);
+
+    fs.writeFileSync(fixture.stateFile, `${JSON.stringify({
+      ...legacy,
+      terminalAt: "not-an-iso-timestamp",
+    })}\n`);
+    assert.throws(
+      () => readDesktopUpdateReceipt(fixture.stateFile),
+      /Desktop update receipt is invalid/,
+    );
   });
 });
 
@@ -284,10 +244,8 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
     verifyFinal: async () => ({ ok: true, error: null }),
     recoverVerifiedOfficialUpdate: async () => null,
     processAlive: () => false,
-    readProcessStartToken: () => "test-owner-start",
     now: () => NOW,
     createId: () => "desktop-1",
-    createOwnerGeneration: () => "owner-generation-1",
     ...overrides,
   };
   return { calls, deps };
@@ -313,6 +271,8 @@ function persistedReceipt(overrides: Partial<DesktopUpdateReceipt> = {}): Deskto
     error: null,
     createdAt: NOW,
     updatedAt: NOW,
+    terminalAt: null,
+    continuationAbandonedAt: null,
     completedAt: null,
     rolledBackAt: null,
     ...overrides,
@@ -332,6 +292,8 @@ test("a real official version change returns to Tweakers, refreshes the chosen s
     assert.deepEqual(receipt.baseline, { marketingVersion: "1.0.0", build: "100" });
     assert.deepEqual(receipt.observed, { marketingVersion: "1.1.0", build: "110" });
     assert.equal(receipt.refreshSource, "development");
+    assert.equal(receipt.terminalAt, receipt.completedAt);
+    assert.equal(receipt.continuationAbandonedAt, null);
     assert.deepEqual(calls, [
       "refresh-environment-truth",
       "prepare:chatgpt",
@@ -344,67 +306,6 @@ test("a real official version change returns to Tweakers, refreshes the chosen s
     ]);
     assert.equal(transaction.status()?.phase, "completed");
     assert.equal(readdirSync(fixture.receiptRoot).length, 1);
-  });
-});
-
-test("desktop update transaction logs one ordered event per persisted phase transition", async () => {
-  await withFixture(async (fixture) => {
-    const { deps } = dependencies();
-    const transaction = createDesktopUpdateTransaction(fixture, deps);
-
-    await transaction.start();
-
-    const records = readFileSync(
-      join(fixture.root, "log", "desktop-update.log"),
-      "utf8",
-    )
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { event: string; phase: string });
-    assert.deepEqual(
-      records.map(({ event, phase }) => `${event}:${phase}`),
-      [
-        "owner_started:preparing",
-        "phase_transition:switching_to_chatgpt",
-        "phase_transition:awaiting_native_update",
-        "phase_transition:returning_to_tweakers",
-        "phase_transition:refreshing_runtime",
-        "phase_transition:verifying",
-        "owner_completed:completed",
-      ],
-    );
-  });
-});
-
-test("recovery transaction logs redact the user root and end with handled failure evidence", async () => {
-  await withFixture(async (fixture) => {
-    const { deps } = dependencies({
-      refreshTweakers: async () => {
-        throw new Error(`refresh failed under ${fixture.root}/managed-runtime`);
-      },
-    });
-    const transaction = createDesktopUpdateTransaction(fixture, deps);
-
-    const result = await transaction.start();
-    const log = readFileSync(join(fixture.root, "log", "desktop-update.log"), "utf8");
-    const records = log
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { event: string; phase: string; error?: string });
-
-    assert.equal(result.phase, "rolled_back");
-    assert.equal(log.includes(fixture.root), false);
-    assert.deepEqual(records.at(-1), {
-      schemaVersion: 1,
-      ts: NOW,
-      transactionId: "desktop-1",
-      phase: "rolled_back",
-      ownerPid: process.pid,
-      ownerToken: "test-owner-start",
-      ownerGeneration: "owner-generation-1",
-      event: "handled_failure",
-      error: "refresh failed under [user-root]/managed-runtime",
-    });
   });
 });
 
@@ -590,7 +491,7 @@ test("completion waits until the selected refresh has actually resolved", async 
   });
 });
 
-test("native wait releases the lifecycle lease while the durable receipt still blocks mutation", async () => {
+test("desktop update holds the shared lifecycle lease through native wait and cancellation stays terminal", async () => {
   await withFixture(async (fixture) => {
     let announceWait!: () => void;
     let releaseWait!: (value: DesktopVersionIdentity | null) => void;
@@ -606,12 +507,10 @@ test("native wait releases the lifecycle lease while the durable receipt still b
     const pending = transaction.start();
     await waitStarted;
 
-    await withLifecycleLock(lifecycleLockFile(fixture.root), "competing refresh", async () => {
-      assert.throws(
-        () => assertLifecycleReceiptsIdle(fixture.root, { contextOwned: false }),
-        /Desktop update desktop-1 is awaiting_native_update/i,
-      );
-    });
+    await assert.rejects(
+      withLifecycleLock(lifecycleLockFile(fixture.root), "competing refresh", async () => undefined),
+      /Another Tweakers lifecycle operation is active/,
+    );
     const cancelled = await transaction.cancel();
     assert.equal(cancelled.phase, "failed");
     assert.equal(cancelled.resumable, false);
@@ -648,50 +547,6 @@ test("a cancellation that wins after the native wait settles cannot be overwritt
     assert.equal(cancelled.resumable, false);
     assert.deepEqual(result, cancelled);
     assert.deepEqual(waiter.status(), cancelled);
-  });
-});
-
-test("a stale owner generation cannot overwrite a reconciliation takeover", async () => {
-  await withFixture(async (fixture) => {
-    let announceTransition!: () => void;
-    let releaseTransition!: () => void;
-    const transitionReached = new Promise<void>((resolve) => { announceTransition = resolve; });
-    const transitionGate = new Promise<void>((resolve) => { releaseTransition = resolve; });
-    const { deps: waiterDeps } = dependencies({
-      beforeNativeWaitTransition: async () => {
-        announceTransition();
-        await transitionGate;
-      },
-      processAlive: () => true,
-      readProcessStartToken: () => "test-owner-start",
-      createOwnerGeneration: () => "owner-generation-1",
-    });
-    const waiter = createDesktopUpdateTransaction(fixture, waiterDeps);
-    const pending = waiter.start();
-    await transitionReached;
-
-    const staleNow = new Date(Date.parse(NOW) + 91_000).toISOString();
-    const { deps: reconcilerDeps } = dependencies({
-      inspectLiveOfficialDesktop: () => ({
-        version: { marketingVersion: "1.1.0", build: "110" },
-        mainPid: 202,
-      }),
-      processAlive: () => true,
-      readProcessStartToken: () => "test-owner-start",
-      now: () => staleNow,
-      createOwnerGeneration: () => "owner-generation-2",
-    });
-    const reconciler = createDesktopUpdateTransaction(fixture, reconcilerDeps);
-    const recovered = await reconciler.reconcile();
-
-    assert.equal(recovered?.phase, "failed");
-    assert.equal(recovered?.resumable, true);
-    assert.equal(recovered?.ownerGeneration, "owner-generation-2");
-    releaseTransition();
-
-    const staleResult = await pending;
-    assert.deepEqual(staleResult, recovered);
-    assert.deepEqual(waiter.status(), recovered);
   });
 });
 
@@ -880,6 +735,8 @@ test("timeout leaves the verified official app active and records a resumable sa
     assert.equal(receipt.safeOfficialMode, true);
     assert.equal(receipt.resumable, true);
     assert.match(receipt.error ?? "", /did not complete/i);
+    assert.equal(receipt.terminalAt, NOW);
+    assert.equal(receipt.continuationAbandonedAt, null);
     assert.deepEqual(calls, ["refresh-environment-truth", "prepare:chatgpt", "commit:chatgpt", "native-update-handoff"]);
   });
 });
@@ -887,6 +744,7 @@ test("timeout leaves the verified official app active and records a resumable sa
 test("resume continues a persisted safe-official timeout without starting a second official switch", async () => {
   await withFixture(async (fixture) => {
     const initial = selection("tweakers");
+    const priorTerminalAt = "2026-07-15T11:00:00.000Z";
     const timedOut: DesktopUpdateReceipt = {
       schemaVersion: 1,
       kind: "desktop-update",
@@ -903,8 +761,10 @@ test("resume continues a persisted safe-official timeout without starting a seco
       safeOfficialMode: true,
       resumable: true,
       error: "The official update did not complete before the timeout.",
-      createdAt: NOW,
-      updatedAt: NOW,
+      createdAt: priorTerminalAt,
+      updatedAt: priorTerminalAt,
+      terminalAt: priorTerminalAt,
+      continuationAbandonedAt: null,
       completedAt: null,
       rolledBackAt: null,
     };
@@ -915,6 +775,9 @@ test("resume continues a persisted safe-official timeout without starting a seco
     const receipt = await transaction.resume();
 
     assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.terminalAt, receipt.completedAt);
+    assert.notEqual(receipt.terminalAt, priorTerminalAt);
+    assert.equal(receipt.continuationAbandonedAt, null);
     assert.deepEqual(calls, ["native-update-handoff", "refresh-environment-truth", "prepare:tweakers", "commit:tweakers", "refresh:development"]);
   });
 });
@@ -1172,98 +1035,13 @@ test("resume after a return failure reuses the observed update instead of handin
     const receipt = await transaction.resume();
 
     assert.equal(receipt.phase, "completed");
-    assert.equal(receipt.rolledBackAt, null);
     assert.deepEqual(calls, ["refresh-environment-truth", "prepare:tweakers", "commit:tweakers", "refresh:development"]);
   });
 });
 
-test("reconcile is idle without a receipt and leaves a live owner unchanged", async () => {
+test("rolled-back resume failure receives fresh terminal chronology", async () => {
   await withFixture(async (fixture) => {
-    const { deps } = dependencies({ processAlive: () => true });
-    const transaction = createDesktopUpdateTransaction(fixture, deps);
-    assert.equal(await transaction.reconcile(), null);
-
-    const active = persistedReceipt({
-      phase: "switching_to_chatgpt",
-      ownerPid: 999,
-    });
-    writeDesktopUpdateReceipt(fixture.stateFile, active);
-    assert.deepEqual(await transaction.reconcile(), active);
-  });
-});
-
-test("reconcile terminalizes a dead native wait from current live official proof", async () => {
-  for (const entry of [
-    {
-      name: "not advanced",
-      version: { marketingVersion: "1.0.0", build: "100" },
-      resumable: false,
-    },
-    {
-      name: "advanced",
-      version: { marketingVersion: "1.1.0", build: "110" },
-      resumable: true,
-    },
-  ]) {
-    await withFixture(async (fixture) => {
-      writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
-        phase: "awaiting_native_update",
-        source: selection("tweakers"),
-        official: selection("chatgpt"),
-        safeOfficialMode: true,
-        resumable: true,
-      }));
-      const { deps } = dependencies({
-        inspectLiveOfficialDesktop: () => ({
-          version: entry.version,
-          mainPid: 321,
-        }),
-        processAlive: () => false,
-      });
-      const transaction = createDesktopUpdateTransaction(fixture, deps);
-
-      const reconciled = await transaction.reconcile();
-
-      assert.equal(reconciled?.phase, "failed", entry.name);
-      assert.equal(reconciled?.safeOfficialMode, true, entry.name);
-      assert.equal(reconciled?.resumable, entry.resumable, entry.name);
-      assert.deepEqual(reconciled?.observed, entry.resumable ? entry.version : null, entry.name);
-      assert.equal(reconciled?.officialMainPid, 321, entry.name);
-      assert.deepEqual(await transaction.reconcile(), reconciled, `${entry.name} idempotence`);
-    });
-  }
-});
-
-test("reconcile fails closed when current official proof is unavailable", async () => {
-  await withFixture(async (fixture) => {
-    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
-      phase: "awaiting_native_update",
-      safeOfficialMode: true,
-      resumable: true,
-    }));
-    const { deps } = dependencies({
-      inspectLiveOfficialDesktop: () => {
-        throw new Error("signature proof unavailable");
-      },
-      processAlive: () => false,
-    });
-    const transaction = createDesktopUpdateTransaction(fixture, deps);
-
-    const reconciled = await transaction.reconcile();
-
-    assert.equal(reconciled?.phase, "failed");
-    assert.equal(reconciled?.safeOfficialMode, false);
-    assert.equal(reconciled?.resumable, false);
-    assert.match(reconciled?.error ?? "", /current official.*signature proof unavailable/i);
-    assert.throws(
-      () => assertLifecycleReceiptsIdle(fixture.root, { contextOwned: false }),
-      /without confirmed safe official mode/i,
-    );
-  });
-});
-
-test("resume re-proves live official state even when an older observed update is persisted", async () => {
-  await withFixture(async (fixture) => {
+    const priorTerminalAt = "2026-07-15T11:00:00.000Z";
     writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
       phase: "rolled_back",
       source: selection("tweakers"),
@@ -1274,6 +1052,11 @@ test("resume re-proves live official state even when an older observed update is
       safeOfficialMode: true,
       resumable: true,
       error: "refresh failed",
+      updatedAt: priorTerminalAt,
+      terminalAt: priorTerminalAt,
+      continuationAbandonedAt: null,
+      completedAt: null,
+      rolledBackAt: priorTerminalAt,
     }));
     const { calls, deps } = dependencies({
       inspectLiveOfficialDesktop: async () => ({
@@ -1290,6 +1073,11 @@ test("resume re-proves live official state even when an older observed update is
     assert.equal(receipt.resumable, true);
     assert.equal(receipt.officialMainPid, 30001);
     assert.match(receipt.error ?? "", /live official version.*did not advance/i);
+    assert.equal(receipt.terminalAt, NOW);
+    assert.notEqual(receipt.terminalAt, priorTerminalAt);
+    assert.equal(receipt.continuationAbandonedAt, null);
+    assert.equal(receipt.completedAt, null);
+    assert.equal(receipt.rolledBackAt, null);
     assert.deepEqual(calls, []);
   });
 });
@@ -1424,6 +1212,8 @@ test("cancel marks an awaiting transaction terminal without leaving temporary fi
     assert.equal(receipt.safeOfficialMode, true);
     assert.equal(receipt.resumable, false);
     assert.match(receipt.error ?? "", /cancelled/i);
+    assert.equal(receipt.terminalAt, NOW);
+    assert.equal(receipt.continuationAbandonedAt, null);
     assert.equal(statSync(fixture.stateFile).mode & 0o777, 0o600);
     assert.equal(existsSync(`${fixture.stateFile}.${process.pid}.tmp`), false);
     assert.equal(JSON.parse(readFileSync(fixture.stateFile, "utf8")).transactionId, "active");
@@ -1455,9 +1245,11 @@ test("a separate process may cancel an exact native-update wait while its owner 
   });
 });
 
-test("cancel abandons a timed-out continuation while preserving safe official mode", async () => {
+test("cancel abandons a failed continuation without overwriting its causal error", async () => {
   await withFixture(async (fixture) => {
     const initial = selection("tweakers");
+    const causalError = "The official update did not complete before the timeout.";
+    const causalUpdatedAt = "2026-07-15T11:00:00.000Z";
     writeDesktopUpdateReceipt(fixture.stateFile, {
       schemaVersion: 1,
       kind: "desktop-update",
@@ -1473,9 +1265,9 @@ test("cancel abandons a timed-out continuation while preserving safe official mo
       environmentTransactionId: "env-1",
       safeOfficialMode: true,
       resumable: true,
-      error: "The official update did not complete before the timeout.",
-      createdAt: NOW,
-      updatedAt: NOW,
+      error: causalError,
+      createdAt: causalUpdatedAt,
+      updatedAt: causalUpdatedAt,
       completedAt: null,
       rolledBackAt: null,
     });
@@ -1487,7 +1279,56 @@ test("cancel abandons a timed-out continuation while preserving safe official mo
     assert.equal(receipt.phase, "failed");
     assert.equal(receipt.safeOfficialMode, true);
     assert.equal(receipt.resumable, false);
-    assert.match(receipt.error ?? "", /cancelled/i);
+    assert.equal(receipt.error, causalError);
+    assert.equal(receipt.ownerPid, process.pid);
+    assert.equal(receipt.terminalAt, causalUpdatedAt);
+    assert.equal(receipt.continuationAbandonedAt, NOW);
+    assert.equal(receipt.updatedAt, NOW);
+  });
+});
+
+test("cancel abandons a rolled-back continuation without overwriting durable diagnostics", async () => {
+  await withFixture(async (fixture) => {
+    const initial = selection("tweakers");
+    const causalError = "Commit failed: osascript failed (exit 1): launch rejected by taskgated";
+    const causalTerminalAt = "2026-07-15T11:30:00.000Z";
+    writeDesktopUpdateReceipt(fixture.stateFile, {
+      schemaVersion: 1,
+      kind: "desktop-update",
+      transactionId: "rolled-back-relaunch",
+      phase: "rolled_back",
+      ownerPid: 456,
+      source: initial,
+      official: selection("chatgpt"),
+      baseline: { marketingVersion: "1.0.0", build: "100" },
+      observed: { marketingVersion: "1.1.0", build: "110" },
+      nativeUpdateHandoffAt: NOW,
+      refreshSource: null,
+      environmentTransactionId: "env-return",
+      safeOfficialMode: true,
+      resumable: true,
+      error: causalError,
+      createdAt: causalTerminalAt,
+      updatedAt: causalTerminalAt,
+      terminalAt: causalTerminalAt,
+      continuationAbandonedAt: null,
+      completedAt: null,
+      rolledBackAt: causalTerminalAt,
+    });
+    const { deps } = dependencies();
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.equal(receipt.resumable, false);
+    assert.equal(receipt.error, causalError);
+    assert.equal(receipt.terminalAt, causalTerminalAt);
+    assert.equal(receipt.continuationAbandonedAt, NOW);
+    assert.equal(receipt.rolledBackAt, causalTerminalAt);
+    assert.equal(receipt.updatedAt, NOW);
+    assert.equal(receipt.ownerPid, process.pid);
   });
 });
 
@@ -1884,14 +1725,6 @@ test("owner-dead recovery refuses every non-resumable phase while its different 
       assert.equal(transaction.status()?.phase, phase);
     });
   }
-});
-
-test("desktop refresh prefers a registered development checkout even when hash-current", () => {
-  assert.equal(preferredDesktopRefreshSource({ source: "development", developmentSourceRoot: "/repo" }), "development");
-  assert.equal(preferredDesktopRefreshSource({ source: "current", developmentSourceRoot: "/repo" }), "development");
-  assert.equal(preferredDesktopRefreshSource({ source: "stable", developmentSourceRoot: "/repo" }), "development");
-  assert.equal(preferredDesktopRefreshSource({ source: "current", developmentSourceRoot: null }), "stable");
-  assert.equal(preferredDesktopRefreshSource({ source: "stable", developmentSourceRoot: null }), "stable");
 });
 
 test("native updater handoff failure remains safe and resumable in official mode", async () => {

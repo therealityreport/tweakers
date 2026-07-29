@@ -4,7 +4,18 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { validateAnswers, validateAskInput } = require("../core");
+const {
+  ANSWER_STATUSES,
+  CONTRACT_LIMITS,
+  DECISION_GUIDANCE,
+  FAILURE_STAGES,
+  RESULT_STATUSES,
+  normalizeResult,
+  serializeResult,
+  validateAnswers,
+  validateAnswerStates,
+  validateAskInput,
+} = require("../core");
 
 function validInput(overrides = {}) {
   return {
@@ -132,4 +143,159 @@ test("variation example covers multi-select, five choices, optional input, limit
     proof: { selected_option_ids: ["automated_tests", "visual_check", "restart_check", "fallback_check"], other_text: null }
   });
   assert.equal(everyAvailableChoice.ok, true, everyAvailableChoice.errors?.join("\n"));
+});
+
+function fixture(name) {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8"));
+}
+
+function richInput() {
+  const rich = fixture("rich-ask.json");
+  const validation = validateAskInput(rich.input);
+  assert.equal(validation.ok, true, validation.errors?.join("\n"));
+  return validation.value;
+}
+
+test("freezes the additive public core exports and bounded contract constants", () => {
+  assert.deepEqual(Object.keys(require("../core")).sort(), [
+    "ANSWER_STATUSES",
+    "CONTRACT_LIMITS",
+    "DECISION_GUIDANCE",
+    "FAILURE_STAGES",
+    "RESULT_STATUSES",
+    "normalizeResult",
+    "serializeResult",
+    "validateAnswerStates",
+    "validateAnswers",
+    "validateAskInput",
+  ]);
+  assert.deepEqual(ANSWER_STATUSES, ["unanswered", "answered", "skipped"]);
+  assert.deepEqual(RESULT_STATUSES, ["submitted", "cancelled", "display_failed"]);
+  assert.deepEqual(FAILURE_STAGES, ["tool_discovery", "carrier_attach", "owned_mount", "generic_mount", "host_empty_response"]);
+  assert.equal(CONTRACT_LIMITS.ask_payload_bytes, 65536);
+  assert.deepEqual(DECISION_GUIDANCE, {
+    scope: "current_task",
+    authority: "preference",
+    semantics: "preference-not-policy",
+    on_conflict: "Explain the conflict, the pros and cons, and what must be given up. Ask before materially changing the selected direction.",
+  });
+});
+
+test("legacy and rich ask fixtures normalize exactly without inferring Recommended from label text", () => {
+  for (const name of ["legacy-ask.json", "rich-ask.json"]) {
+    const golden = fixture(name);
+    const validation = validateAskInput(golden.input);
+    assert.equal(validation.ok, true, validation.errors?.join("\n"));
+    assert.deepEqual(validation.value, golden.normalized);
+  }
+  assert.equal(fixture("legacy-ask.json").normalized.questions[0].options[0].recommended, false);
+  assert.equal(fixture("rich-ask.json").normalized.questions[0].options[0].recommended, true);
+});
+
+test("rejects unsupported, malformed, HTML, and oversized rich ask content", () => {
+  const golden = fixture("rich-ask.json").input;
+  const unsupported = structuredClone(golden);
+  unsupported.questions[0].options[0].policy = "permanent";
+  assert.match(validateAskInput(unsupported).errors.join(" "), /policy is not supported/);
+
+  const malformed = structuredClone(golden);
+  malformed.questions[0].options[0].recommended = "yes";
+  assert.match(validateAskInput(malformed).errors.join(" "), /recommended must be a boolean/);
+
+  const html = structuredClone(golden);
+  html.questions[0].options[0].details = "<strong>Important</strong>";
+  assert.match(validateAskInput(html).errors.join(" "), /plain text without HTML/);
+
+  const oversized = structuredClone(golden);
+  oversized.questions = Array.from({ length: 6 }, (_, questionIndex) => ({
+    ...structuredClone(golden.questions[0]),
+    id: `question_${questionIndex}`,
+    options: Array.from({ length: 5 }, (_, optionIndex) => ({
+      ...structuredClone(golden.questions[0].options[0]),
+      id: `option_${optionIndex}`,
+      details: "d".repeat(CONTRACT_LIMITS.details_characters),
+      pros: Array(5).fill("p".repeat(CONTRACT_LIMITS.tradeoff_item_characters)),
+      cons: Array(5).fill("c".repeat(CONTRACT_LIMITS.tradeoff_item_characters)),
+      gives_up: Array(5).fill("g".repeat(CONTRACT_LIMITS.tradeoff_item_characters)),
+    })),
+  }));
+  assert.match(validateAskInput(oversized).errors.join(" "), /at most 65536 UTF-8 bytes/);
+});
+
+test("freezes single, multiple, Other, and skipped answer-state fixtures", () => {
+  const input = richInput();
+  for (const name of ["single-answer.json", "multiple-answer.json", "other-answer.json", "skipped-answer.json"]) {
+    const golden = fixture(name);
+    const validation = validateAnswerStates(input, golden.answers);
+    assert.equal(validation.ok, true, `${name}: ${validation.errors?.join("\n")}`);
+    assert.deepEqual(validation.value, golden.normalized);
+  }
+});
+
+test("legacy validateAnswers consumers keep their status-free answer shape", () => {
+  const input = richInput();
+  const golden = fixture("single-answer.json");
+  const validation = validateAnswers(input, golden.answers);
+  assert.equal(validation.ok, true, validation.errors?.join("\n"));
+  assert.deepEqual(validation.value, {
+    scanner_setup: { selected_option_ids: ["built_in"], other_text: null },
+    proof: { selected_option_ids: [], other_text: null },
+  });
+});
+
+test("rejects dangling and duplicate IDs, skipped selections, and blank Other text", () => {
+  const input = richInput();
+  assert.match(validateAnswerStates(input, {
+    scanner_setup: { status: "answered", selected_option_ids: ["built_in", "built_in"], other_text: null },
+    proof: { status: "skipped", selected_option_ids: [], other_text: null },
+  }).errors.join(" "), /duplicate choice built_in/);
+  assert.match(validateAnswerStates(input, {
+    scanner_setup: { status: "answered", selected_option_ids: ["missing"], other_text: null },
+    proof: { status: "skipped", selected_option_ids: [], other_text: null },
+    dangling: { status: "skipped", selected_option_ids: [], other_text: null },
+  }).errors.join(" "), /unknown question dangling.*unknown choices: missing/);
+  assert.match(validateAnswerStates(input, {
+    scanner_setup: { status: "skipped", selected_option_ids: ["built_in"], other_text: null },
+    proof: { status: "skipped", selected_option_ids: [], other_text: null },
+  }).errors.join(" "), /cannot be skipped with selected choices/);
+  assert.match(validateAnswerStates(input, {
+    scanner_setup: { status: "answered", selected_option_ids: [], other_text: "   " },
+    proof: { status: "skipped", selected_option_ids: [], other_text: null },
+  }).errors.join(" "), /Other answer must not be blank/);
+});
+
+test("submitted, cancelled draft, display-failed, and host-empty result fixtures normalize exactly", () => {
+  const input = richInput();
+  for (const name of [
+    "submitted-result.json",
+    "cancelled-draft-result.json",
+    "display-failed-result.json",
+    "host-empty-response-result.json",
+  ]) {
+    const golden = fixture(name);
+    const validation = normalizeResult(input, golden.result);
+    assert.equal(validation.ok, true, `${name}: ${validation.errors?.join("\n")}`);
+    assert.deepEqual(validation.value, golden.normalized);
+  }
+});
+
+test("owned and fallback serialization share one normalized golden result", () => {
+  const input = richInput();
+  const golden = fixture("submitted-result.json");
+  const owned = serializeResult(input, golden.result);
+  const fallback = serializeResult(input, structuredClone(golden.result));
+  assert.equal(owned.ok, true, owned.errors?.join("\n"));
+  assert.deepEqual(owned, fallback);
+  assert.deepEqual(owned.value.structuredContent, golden.normalized);
+  assert.deepEqual(JSON.parse(owned.value.text), golden.normalized);
+});
+
+test("terminal result normalization rejects partial cancellation and successful empty answers", () => {
+  const input = richInput();
+  assert.match(normalizeResult(input, {
+    status: "cancelled",
+    cancel_reason: "user_cancelled",
+    answers: { scanner_setup: { selected_option_ids: ["built_in"], other_text: null } },
+  }).errors.join(" "), /must not include partial answers/);
+  assert.equal(normalizeResult(input, { status: "submitted", cancelled: false, answers: {} }).ok, false);
 });

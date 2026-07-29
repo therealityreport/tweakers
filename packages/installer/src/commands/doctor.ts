@@ -1,6 +1,6 @@
 import kleur from "kleur";
 import { join } from "node:path";
-import { ensureUserPaths } from "../paths.js";
+import { userPaths } from "../paths.js";
 import { readState, resolveMode } from "../state.js";
 import { locateCodex } from "../platform.js";
 import { readHeaderHash } from "../asar.js";
@@ -11,7 +11,11 @@ import { inspectChromeBridge } from "../chrome-bridge-health.js";
 import { readAsarMarker, readCodexVersion } from "./install.js";
 import { describeChatgptModeAsar } from "./status.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
-import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
+import { targetUserHome } from "../ownership.js";
+import {
+  inspectMcpLifecycleHealth,
+  type McpLifecycleHealthReport,
+} from "../mcp-lifecycle-health.js";
 
 interface Check {
   name: string;
@@ -19,34 +23,33 @@ interface Check {
   detail: string;
 }
 
-export async function doctor(): Promise<void> {
+export interface DoctorOptions {
+  deep?: boolean;
+  json?: boolean;
+}
+
+export async function doctor(options: DoctorOptions = {}): Promise<void> {
   const checks: Check[] = [];
-  const paths = ensureUserPaths();
+  // Doctor is read-only: unlike install/repair it must never create user dirs.
+  const paths = userPaths();
   const state = readState(paths.stateFile);
+  const lifecycle = inspectMcpLifecycleHealth({
+    targetHome: targetUserHome(),
+    backupRoot: join(paths.backup, "mcp-lifecycle"),
+    managedReceiptPath: join(paths.root, "mcp-lifecycle-managed.json"),
+    deep: options.deep === true,
+  });
 
   checks.push({
     name: "user dir writable",
     ok: tryWrite(paths.root),
     detail: paths.root,
   });
-
-  const desktopUpdate = collectDesktopUpdateDiagnostics(paths);
-  checks.push({
-    name: "desktop update lifecycle",
-    ok: desktopUpdate.blocking ? "warn" : true,
-    detail: desktopUpdate.blocking
-      ? `${desktopUpdate.receiptError ?? desktopUpdate.receipt?.phase ?? "unknown"} blocks lifecycle${desktopUpdate.stale ? " and is stale" : ""}`
-      : `${desktopUpdate.receipt?.phase ?? "idle"} is not blocking`,
-  });
-  checks.push({
-    name: "desktop update safety",
-    ok: desktopUpdate.unsafe ? false : true,
-    detail: desktopUpdate.unsafe
-      ? desktopUpdate.receiptError
-        ?? desktopUpdate.receipt?.error
-        ?? "official-mode safety was not proved"
-      : "no unsafe failed receipt",
-  });
+  checks.push(...lifecycle.checks.map((item) => ({
+    name: `MCP ${item.name}`,
+    ok: item.status === "ok" ? true : item.status === "warn" ? "warn" as const : false,
+    detail: item.detail,
+  })));
 
   if (!state) {
     checks.push({
@@ -54,7 +57,7 @@ export async function doctor(): Promise<void> {
       ok: false,
       detail: "no state file — run `tweaker install`",
     });
-    print(checks);
+    print(checks, options, lifecycle);
     return;
   }
 
@@ -68,7 +71,7 @@ export async function doctor(): Promise<void> {
       ok: false,
       detail: (e as Error).message,
     });
-    print(checks);
+    print(checks, options, lifecycle);
     return;
   }
 
@@ -153,7 +156,7 @@ export async function doctor(): Promise<void> {
     });
   }
 
-  print(checks);
+  print(checks, options, lifecycle);
 }
 
 function hasCodexStorageKeychainItem(): boolean {
@@ -174,7 +177,26 @@ function tryWrite(p: string): boolean {
   }
 }
 
-function print(checks: Check[]): void {
+function print(
+  checks: Check[],
+  options: DoctorOptions,
+  lifecycle: McpLifecycleHealthReport,
+): void {
+  const failed = checks.filter((c) => c.ok === false).length;
+  if (options.json) {
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      status: failed > 0 ? "error" : checks.some((check) => check.ok === "warn") ? "warn" : "ok",
+      checks: checks.map((item) => ({
+        name: item.name,
+        status: item.ok === true ? "ok" : item.ok === "warn" ? "warn" : "error",
+        detail: item.detail,
+      })),
+      mcpLifecycle: lifecycle,
+    }));
+    if (failed > 0) process.exitCode = 1;
+    return;
+  }
   console.log(kleur.bold("tweaker doctor\n"));
   for (const c of checks) {
     const mark =
@@ -185,7 +207,6 @@ function print(checks: Check[]): void {
           : kleur.red("✗");
     console.log(`  ${mark} ${c.name.padEnd(24)} ${kleur.dim(c.detail)}`);
   }
-  const failed = checks.filter((c) => c.ok === false).length;
   console.log();
   if (failed === 0) {
     console.log(kleur.green("All checks passed."));

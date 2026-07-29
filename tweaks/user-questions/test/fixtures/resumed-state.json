@@ -1,0 +1,26 @@
+{
+  "draft": {
+    "phase": "cancelled",
+    "current_question_id": "proof",
+    "answers": {
+      "scanner_setup": { "status": "answered", "selected_option_ids": ["built_in"], "other_text": null },
+      "proof": { "status": "unanswered", "selected_option_ids": [], "other_text": null }
+    },
+    "other_selected_question_ids": [],
+    "expanded_detail_ids": ["scanner_setup:built_in"],
+    "validation_errors": {},
+    "revision": 5
+  },
+  "normalized": {
+    "phase": "question",
+    "current_question_id": "proof",
+    "answers": {
+      "scanner_setup": { "status": "answered", "selected_option_ids": ["built_in"], "other_text": null },
+      "proof": { "status": "unanswered", "selected_option_ids": [], "other_text": null }
+    },
+    "other_selected_question_ids": [],
+    "expanded_detail_ids": ["scanner_setup:built_in"],
+    "validation_errors": {},
+    "revision": 1
+  }
+}
