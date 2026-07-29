@@ -30,10 +30,10 @@ import {
 import { chownForTargetUser, targetUserHome } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
-import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
+import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
@@ -175,6 +175,111 @@ function readDesignatedRequirement(path: string): string {
 
 function certificateLeafHash(requirement: string): string | null {
   return /certificate leaf = H"([a-f0-9]+)"/i.exec(requirement)?.[1]?.toLowerCase() ?? null;
+}
+
+function sha256Of(file: string): string {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+export interface SwapHostIdentityEvidence {
+  digest: string;
+  strict: boolean;
+  designatedRequirement: string;
+  teamIdentifier: string | null;
+  authority: string[];
+  certificateLeafHash: string | null;
+}
+
+export interface SwapHostVerificationDeps {
+  verify?: typeof verifySignature;
+  signature?: typeof signatureInfo;
+  designatedRequirement?: (path: string) => string;
+}
+
+/**
+ * Describe a native host on its own terms, without reference to a containing
+ * app. A receipt-owned helper has no signing container, so its identity is
+ * pinned by digest plus the exact signing facts recorded when it was staged.
+ */
+export function readSwapHostIdentity(
+  hostPath: string,
+  deps: SwapHostVerificationDeps = {},
+): SwapHostIdentityEvidence {
+  const entry = lstatSync(hostPath);
+  if (!entry.isFile()) throw new Error(`Swap host must be a regular file: ${hostPath}`);
+  const verify = deps.verify ?? verifySignature;
+  const signature = deps.signature ?? signatureInfo;
+  const designatedRequirement = deps.designatedRequirement ?? readDesignatedRequirement;
+  const strict = verify(hostPath);
+  if (!strict.ok) throw new Error(`Swap host failed strict verification: ${strict.output}`);
+  const identity = signature(hostPath);
+  if (!identity.ok) throw new Error(`Swap host signing identity is unreadable at ${hostPath}`);
+  const requirement = designatedRequirement(hostPath);
+  if (requirement.trim().length === 0) {
+    throw new Error(`Swap host designated requirement is empty at ${hostPath}`);
+  }
+  return {
+    digest: sha256Of(hostPath),
+    strict: true,
+    designatedRequirement: requirement,
+    teamIdentifier: identity.teamIdentifier,
+    authority: identity.authority,
+    certificateLeafHash: certificateLeafHash(requirement),
+  };
+}
+
+/**
+ * Copy a signed native host out of a prepared app payload into the receipt's
+ * own directory. The source is whichever prepared payload actually carries a
+ * host — the Tweakers candidate on the way in, the Tweakers rollback clone on
+ * the way out — and it is verified against its containing bundle before the
+ * copy, so the receipt-owned file inherits proven provenance.
+ */
+export function stagePreparedSwapHost(
+  candidateAppPaths: string[],
+  destination: string,
+  deps: SwapHostVerificationDeps = {},
+): { sourceAppPath: string; identity: SwapHostIdentityEvidence } | null {
+  for (const appRoot of candidateAppPaths) {
+    const hostPath = stagedNativeHostPath(appRoot);
+    if (!existsSync(hostPath)) continue;
+    verifyNativeHostMatchesApp(appRoot, hostPath, deps);
+    mkdirSync(dirname(destination), { recursive: true });
+    rmSync(destination, { force: true });
+    copyFileSync(hostPath, destination);
+    const identity = readSwapHostIdentity(destination, deps);
+    if (identity.digest !== sha256Of(hostPath)) {
+      throw new Error(`Swap host changed while it was being staged from ${hostPath}`);
+    }
+    return { sourceAppPath: appRoot, identity };
+  }
+  // A transition between two host-less payloads needs no bundle exchange, so
+  // the absence of a host is not by itself an error. Callers that do need to
+  // swap still fail closed when they try to load the missing evidence.
+  return null;
+}
+
+/**
+ * `require` caches by resolved path, so a single stable helper path per
+ * process also guarantees the addon's Objective-C classes are registered once.
+ */
+export function loadVerifiedSwapHost(
+  evidence: SwapHostIdentityEvidence & { path: string },
+  deps: SwapHostVerificationDeps = {},
+): (first: string, second: string) => void {
+  if (process.platform !== "darwin") throw new Error("Atomic app bundle exchange is available only on macOS");
+  const observed = readSwapHostIdentity(evidence.path, deps);
+  if (observed.digest !== evidence.digest) {
+    throw new Error(`Swap host digest does not match its prepared evidence at ${evidence.path}`);
+  }
+  if (observed.teamIdentifier !== evidence.teamIdentifier
+    || observed.certificateLeafHash !== evidence.certificateLeafHash
+    || observed.authority.join("\n") !== evidence.authority.join("\n")) {
+    throw new Error(`Swap host signing identity does not match its prepared evidence at ${evidence.path}`);
+  }
+  const require = createRequire(import.meta.url);
+  const nativeHost = require(evidence.path) as NativeAppIdentityHost;
+  return (first, second) => nativeHost.swapDirectories(first, second);
 }
 
 export function spawnHiddenHealthProbe(
@@ -344,7 +449,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       rmSync(destination, { recursive: true, force: true });
       if (existsSync(runtimeRoot)) {
         mkdirSync(dirname(destination), { recursive: true });
-        cpSync(runtimeRoot, destination, { recursive: true, verbatimSymlinks: true });
+        copyDirectoryPreservingModes(runtimeRoot, destination);
       }
       signedBackupWiring.snapshotLive();
     },
@@ -560,12 +665,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
               return readState(paths.stateFile)?.mode !== "chatgpt";
             },
             quitApp: () => quitCodex(liveAppRoot),
-            cleanupOrphans: () => {
-              terminateStaleHelperProcesses(liveAppRoot, {
-                mainStartedAt: null,
-                log: (line) => console.log(`  ${line}`),
-              });
-            },
+            cleanupOrphans: () => {},
             notifyUpdateQuit: () => showCodexUpdateDetectedNotification(),
             // Re-entry always drops coordinatedQuit so a relaunch race yields a
             // plain held + passive wait, never a second forced quit.
@@ -601,6 +701,8 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
 export interface BuildPatchedCandidateOnlyInput {
   sourceApp: string;
   destinationApp: string;
+  /** Durable receipt-owned copy of the runtime validated inside the candidate. */
+  destinationRuntime: string;
   finalUserRoot: string;
 }
 
@@ -612,6 +714,7 @@ export interface BuildPatchedCandidateOnlyInput {
 export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnlyInput): Promise<void> {
   const sourceApp = resolve(input.sourceApp);
   const destinationApp = resolve(input.destinationApp);
+  const destinationRuntime = resolve(input.destinationRuntime);
   const finalUserRoot = resolve(input.finalUserRoot);
   if (!isAbsolute(input.sourceApp) || sourceApp !== input.sourceApp) {
     throw new Error("Patched candidate source must be an exact absolute path");
@@ -619,15 +722,13 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
   if (!isAbsolute(input.destinationApp) || destinationApp !== input.destinationApp) {
     throw new Error("Patched candidate destination must be an exact absolute path");
   }
+  if (!isAbsolute(input.destinationRuntime) || destinationRuntime !== input.destinationRuntime) {
+    throw new Error("Patched candidate runtime destination must be an exact absolute path");
+  }
   if (!isAbsolute(input.finalUserRoot) || finalUserRoot !== input.finalUserRoot) {
     throw new Error("Patched candidate user root must be an exact absolute path");
   }
-  const sourceToDestination = relative(sourceApp, destinationApp);
-  const destinationToSource = relative(destinationApp, sourceApp);
-  const contains = (value: string): boolean => value === "" || (!value.startsWith("../") && value !== "..");
-  if (contains(sourceToDestination) || contains(destinationToSource)) {
-    throw new Error("Patched candidate source and destination must be disjoint paths");
-  }
+  assertDisjointPatchedCandidatePaths([sourceApp, destinationApp, destinationRuntime]);
   const source = locateCodex(sourceApp);
   if (source.platform !== "darwin") throw new Error("Environment candidates are supported only for macOS app bundles");
   if (source.bundleId !== "com.openai.codex" && source.bundleId !== "com.openai.codex.beta") {
@@ -664,11 +765,46 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
     if (readAsarMarker(candidate.asarPath) !== "present") throw new Error("Patched candidate marker is absent");
     const candidateSignature = verifySignature(destinationApp);
     if (!candidateSignature.ok) throw new Error(`Patched candidate signature is invalid: ${candidateSignature.output}`);
+    stagePatchedCandidateRuntimeArtifact(join(candidateUserRoot, "runtime"), destinationRuntime);
   } catch (error) {
     rmSync(destinationApp, { recursive: true, force: true });
     throw error;
   } finally {
     rmSync(candidateUserRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Persist the runtime that was built and validated with a disposable app
+ * candidate. The replacement is atomic at the destination boundary, so a
+ * failed staged-copy never exposes partial runtime bytes to a later promotion.
+ */
+export function stagePatchedCandidateRuntimeArtifact(candidateRuntime: string, destinationRuntime: string): void {
+  const source = resolve(candidateRuntime);
+  const destination = resolve(destinationRuntime);
+  if (!isAbsolute(candidateRuntime) || source !== candidateRuntime) {
+    throw new Error("Patched candidate runtime source must be an exact absolute path");
+  }
+  if (!isAbsolute(destinationRuntime) || destination !== destinationRuntime) {
+    throw new Error("Patched candidate runtime destination must be an exact absolute path");
+  }
+  assertDisjointPatchedCandidatePaths([source, destination]);
+  if (!existsSync(source)) {
+    throw new Error(`Patched candidate runtime is missing: ${source}`);
+  }
+  replaceDirectory(source, destination);
+}
+
+function assertDisjointPatchedCandidatePaths(paths: string[]): void {
+  const contains = (value: string): boolean => value === "" || (!value.startsWith("../") && value !== "..");
+  for (let index = 0; index < paths.length; index += 1) {
+    for (let other = index + 1; other < paths.length; other += 1) {
+      const first = paths[index]!;
+      const second = paths[other]!;
+      if (contains(relative(first, second)) || contains(relative(second, first))) {
+        throw new Error("Patched candidate app and runtime destinations must be disjoint paths");
+      }
+    }
   }
 }
 
@@ -1002,6 +1138,8 @@ export function hashDirectoryTree(root: string): string {
   const hash = createHash("sha256");
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      // Finder junk must not perturb payload/runtime hashes.
+      if (isMacOsJunkName(entry.name)) continue;
       const path = join(directory, entry.name);
       const name = relative(root, path);
       hash.update(name);
@@ -1028,7 +1166,7 @@ function replaceDirectory(source: string, destination: string): void {
   const previous = `${destination}.tweakers-previous-${process.pid}`;
   rmSync(temporary, { recursive: true, force: true });
   rmSync(previous, { recursive: true, force: true });
-  cpSync(source, temporary, { recursive: true, verbatimSymlinks: true });
+  copyDirectoryPreservingModes(source, temporary);
   if (existsSync(destination)) renameDirectory(destination, previous);
   try {
     renameDirectory(temporary, destination);
@@ -1085,7 +1223,9 @@ export function replaceAppBundlePreservingIdentity(
   // promotion removes any old payload left here before preparing its swap.
   const incoming = `${destination}.tweakers-contents-swap`;
   remove(incoming);
-  cpSync(sourceContents, incoming, { recursive: true, verbatimSymlinks: true });
+  // The swapped-in Contents becomes the live bundle, so its permission bits
+  // must come from the source payload and never from the caller's umask.
+  copyDirectoryPreservingModes(sourceContents, incoming);
   let preserveIncoming = false;
   // Only true while `incoming` holds the swapped-out (previous) Contents; a
   // rolled-back validation failure flips it back so we never park rejected bytes.
@@ -1150,7 +1290,7 @@ function moveDirectoryAcrossVolumes(source: string, destination: string): void {
     renameSync(source, destination);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
+    copyDirectoryPreservingModes(source, destination);
     rmSync(source, { recursive: true, force: true });
   }
 }
@@ -1350,7 +1490,7 @@ export function snapshotSignedBackup(liveBackup: string, snapshot: string, marke
   // transaction's marker before copying so an interruption cannot replay it.
   rmSync(marker, { force: true });
   const existed = existsSync(liveBackup);
-  if (existed) cpSync(liveBackup, snapshot, { recursive: true, verbatimSymlinks: true });
+  if (existed) copyDirectoryPreservingModes(liveBackup, snapshot);
   const temporary = `${marker}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, existed })}\n`, { mode: 0o600 });
   renameSync(temporary, marker);

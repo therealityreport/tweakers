@@ -16,6 +16,7 @@ import {
   migrateLegacyEnvironmentFiles,
   migrateLegacyEnvironmentSelection,
   normalizeBackendLane,
+  publishEnvironmentSnapshot,
   registerAlphaDesktopProfile,
   readEnvironmentSelection,
   recoverEnvironmentDocumentCommit,
@@ -682,6 +683,72 @@ test("failed legacy migration preserves every pre-existing byte and rejects part
 
     writeFileSync(registryFile, JSON.stringify({ schemaVersion: 1, profiles: { stable: {} } }));
     assert.throws(() => readEnvironmentProfileRegistry(registryFile), /invalid/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publishEnvironmentSnapshot journals a matching registry and selection as one pair", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-snapshot-"));
+  const registryFile = join(root, "environment-registry.json");
+  const selectionFile = join(root, "environment-selection.json");
+  try {
+    const base = defaultEnvironmentProfileRegistry(root);
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-07-24T20:00:00.000Z",
+      appliedAt: "2026-07-24T20:00:00.000Z",
+    });
+    const registry: EnvironmentProfileRegistry = {
+      ...base,
+      selected: selection,
+      lastKnownWorkingSelection: selection,
+    };
+
+    publishEnvironmentSnapshot(registryFile, selectionFile, registry, selection);
+
+    assert.deepEqual(readEnvironmentProfileRegistry(registryFile), registry);
+    assert.deepEqual(readEnvironmentSelection(selectionFile), selection);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publishEnvironmentSnapshot refuses a registry whose selected or last-known-working value differs", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-snapshot-mismatch-"));
+  const registryFile = join(root, "environment-registry.json");
+  const selectionFile = join(root, "environment-selection.json");
+  try {
+    const base = defaultEnvironmentProfileRegistry(root);
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-07-24T20:00:00.000Z",
+      appliedAt: "2026-07-24T20:00:00.000Z",
+    });
+    const other = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "tweakers",
+      requestedAt: "2026-07-24T20:01:00.000Z",
+      appliedAt: "2026-07-24T20:01:00.000Z",
+    });
+
+    assert.throws(() => publishEnvironmentSnapshot(registryFile, selectionFile, {
+      ...base,
+      selected: other,
+      lastKnownWorkingSelection: selection,
+    }, selection), /selected value does not match/);
+    assert.equal(existsSync(registryFile), false);
+    assert.equal(existsSync(selectionFile), false);
+
+    assert.throws(() => publishEnvironmentSnapshot(registryFile, selectionFile, {
+      ...base,
+      selected: selection,
+      lastKnownWorkingSelection: other,
+    }, selection), /last-known-working selection does not match/);
+    assert.equal(existsSync(registryFile), false);
+    assert.equal(existsSync(selectionFile), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

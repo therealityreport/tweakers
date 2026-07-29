@@ -247,6 +247,29 @@ function normalizeNativeLocalProjects(value) {
       projects.push({ id, name, rootPaths });
     } catch {}
   }
+  const workspaceRootLabels = value["electron-workspace-root-labels"];
+  if (!isRecord(workspaceRootLabels)) return projects;
+  const projectsByName = new Map();
+  for (const project of projects) {
+    const matches = projectsByName.get(project.name) || [];
+    matches.push(project);
+    projectsByName.set(project.name, matches);
+  }
+  let aliasCount = 0;
+  for (const [rootPath, label] of Object.entries(workspaceRootLabels)) {
+    if (aliasCount >= MAX_NATIVE_PROJECTS * 8) break;
+    aliasCount += 1;
+    try {
+      const matches = projectsByName.get(safeText(label, 120)) || [];
+      if (matches.length !== 1) continue;
+      const project = matches[0];
+      const alias = normalizeWorkspacePath(rootPath);
+      if (project.rootPaths.includes(alias)) continue;
+      const aliases = project.rootPathAliases || [];
+      if (aliases.length >= 8 || aliases.includes(alias)) continue;
+      project.rootPathAliases = [...aliases, alias];
+    } catch {}
+  }
   return projects;
 }
 
@@ -1155,13 +1178,17 @@ function injectProjectColorMenu(doc, nativeMenu, context, onSelect) {
   trigger.setAttribute("tabindex", "-1");
   trigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
   trigger.className = template?.className || "text-token-foreground rounded-lg px-2 py-2 text-sm flex items-center cursor-interaction";
+  const content = doc.createElement("span");
+  content.className = "flex min-w-0 w-full flex-1 items-center justify-between gap-2";
   const label = doc.createElement("span");
   label.textContent = "Project color";
   label.className = "min-w-0 flex-1 truncate";
   const chevron = doc.createElement("span");
   chevron.textContent = "›";
   chevron.className = "text-token-text-secondary";
-  trigger.append(label, chevron);
+  chevron.setAttribute("aria-hidden", "true");
+  content.append(label, chevron);
+  trigger.appendChild(content);
   const open = (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -1370,6 +1397,7 @@ function bindNativeProjectIdentities(state, nativeProjects) {
   for (const node of runtimeState.nodes) {
     delete node.nativeProjectIds;
     delete node.nativeProjectNames;
+    delete node.nativeProjectPaths;
     if (node.type !== "project" || !node.projectPath) continue;
     const matches = projectsByPath.get(node.projectPath) || [];
     matches.push(node);
@@ -1377,13 +1405,21 @@ function bindNativeProjectIdentities(state, nativeProjects) {
   }
   for (const nativeProject of Array.isArray(nativeProjects) ? nativeProjects : []) {
     const matches = new Set();
-    for (const rootPath of nativeProject?.rootPaths || []) {
+    const identityPaths = [
+      ...(Array.isArray(nativeProject?.rootPaths) ? nativeProject.rootPaths : []),
+      ...(Array.isArray(nativeProject?.rootPathAliases) ? nativeProject.rootPathAliases : []),
+    ];
+    for (const rootPath of identityPaths) {
       for (const project of projectsByPath.get(rootPath) || []) matches.add(project);
     }
     if (matches.size !== 1) continue;
     const [project] = matches;
     project.nativeProjectIds = [...new Set([...(project.nativeProjectIds || []), nativeProject.id])];
     project.nativeProjectNames = [...new Set([...(project.nativeProjectNames || []), nativeProject.name])];
+    project.nativeProjectPaths = [...new Set([
+      ...(project.nativeProjectPaths || []),
+      ...(Array.isArray(nativeProject.rootPaths) ? nativeProject.rootPaths : []),
+    ])];
   }
   return runtimeState;
 }
@@ -1396,7 +1432,8 @@ function projectNativeNames(project) {
 function projectForNativeIdentity(projects, label, identity) {
   if (identity) {
     const exact = projects.find((project) => project.id === identity || project.projectPath === identity ||
-      (Array.isArray(project.nativeProjectIds) && project.nativeProjectIds.includes(identity)));
+      (Array.isArray(project.nativeProjectIds) && project.nativeProjectIds.includes(identity)) ||
+      (Array.isArray(project.nativeProjectPaths) && project.nativeProjectPaths.includes(identity)));
     if (exact) return exact;
   }
   return projects.find((project) => projectNativeNames(project)
@@ -1427,11 +1464,20 @@ function findNativeProjectMenu(doc, context = {}) {
 
 function ensureProjectColorStyle() {
   let style = document.getElementById(PROJECT_COLOR_STYLE_ID);
-  if (style) return style;
-  style = document.createElement("style");
-  style.id = PROJECT_COLOR_STYLE_ID;
+  if (!style) {
+    style = document.createElement("style");
+    style.id = PROJECT_COLOR_STYLE_ID;
+    document.head.appendChild(style);
+  }
   style.textContent = `
     [data-tweaker-project-color-group] {
+      box-sizing: border-box;
+      inline-size: 100% !important;
+      min-inline-size: 0;
+      max-inline-size: 100%;
+      contain: inline-size;
+      overflow-x: visible;
+      --tweaker-project-row-radius: var(--radius-lg, 0.625rem);
       --tweaker-project-task-tint: 10%;
       --tweaker-project-task-foreground: var(--tweaker-project-color);
       --tweaker-project-header-tint: 16%;
@@ -1449,9 +1495,20 @@ function ensureProjectColorStyle() {
     .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="subtle"] { --tweaker-project-task-tint: 11%; }
     .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="medium"] { --tweaker-project-task-tint: 18%; }
     .electron-dark [data-tweaker-project-color-group][data-tweaker-project-overlay="strong"] { --tweaker-project-task-tint: 24%; }
+    [data-tweaker-project-color-group] [role="list"],
+    [data-tweaker-project-color-row],
+    [data-tweaker-project-color-task],
+    [data-tweaker-project-show-more],
+    [data-tweaker-project-task-action] {
+      box-sizing: border-box;
+      inline-size: 100% !important;
+      min-inline-size: 0;
+      max-inline-size: 100%;
+    }
     [data-tweaker-project-color-row] {
-      width: 100%;
-      border-radius: var(--radius-lg, 0.625rem) !important;
+      inline-size: 100%;
+      overflow-x: visible !important;
+      border-radius: var(--tweaker-project-row-radius) !important;
       background-color: var(--tweaker-project-color) !important;
       color: var(--tweaker-project-foreground) !important;
     }
@@ -1460,23 +1517,35 @@ function ensureProjectColorStyle() {
     }
     [data-tweaker-project-color-row][data-tweaker-project-selected="true"] {
       position: relative;
+      border-radius: var(--tweaker-project-row-radius) !important;
+      outline: 2px solid var(--color-token-focus-border, var(--color-token-text-link-foreground)) !important;
+      outline-offset: 0 !important;
       background-color: var(--gray-1000) !important;
       color: var(--gray-0) !important;
     }
     [data-tweaker-project-color-row][data-tweaker-project-selected="true"] * {
       color: var(--gray-0) !important;
     }
-    [data-tweaker-project-color-row][data-tweaker-project-selected="true"]::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border: 2px solid var(--color-token-focus-border, var(--color-token-text-link-foreground));
-      border-radius: inherit;
-      pointer-events: none;
-    }
     [data-tweaker-project-color-icon] { color: var(--tweaker-project-foreground) !important; }
     [data-tweaker-project-color-row][data-tweaker-project-selected="true"] [data-tweaker-project-color-icon] {
       color: var(--gray-0) !important;
+    }
+    [data-tweaker-project-color-title],
+    [data-tweaker-project-task-label] {
+      min-inline-size: 0;
+      max-inline-size: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    [data-tweaker-project-color-title],
+    [data-tweaker-project-task-action] > [data-tweaker-project-task-label] {
+      flex: 1 1 auto;
+    }
+    [data-tweaker-project-task-action] {
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
     }
     [data-tweaker-project-color-title] {
       color: var(--tweaker-project-foreground) !important;
@@ -1512,7 +1581,6 @@ function ensureProjectColorStyle() {
     }
     [${PROJECT_COLOR_MENU_ATTR}="submenu"] { color-scheme: light dark; }
   `;
-  document.head.appendChild(style);
   return style;
 }
 
@@ -1614,7 +1682,9 @@ function markProjectTaskRows(container, project, header) {
     for (const task of list.querySelectorAll?.('[role="listitem"]') || []) {
       if (nearestRoleList(task) !== list) continue;
       markProjectColorNode(task, "data-tweaker-project-color-task", project);
-      taskLabelForRow(task)?.setAttribute?.("data-tweaker-project-task-label", "true");
+      const action = taskActionForRow(task);
+      action?.setAttribute?.("data-tweaker-project-task-action", "true");
+      taskLabelForRow(task, action)?.setAttribute?.("data-tweaker-project-task-label", "true");
       if (isNativeSelected(task)) {
         task.setAttribute("data-tweaker-project-selected", "true");
         hasSelectedTask = true;
@@ -1636,7 +1706,9 @@ function markProjectTaskRows(container, project, header) {
         continue;
       }
       markProjectColorNode(task, "data-tweaker-project-color-task", project);
-      taskLabelForRow(task)?.setAttribute?.("data-tweaker-project-task-label", "true");
+      const action = taskActionForRow(task);
+      action?.setAttribute?.("data-tweaker-project-task-action", "true");
+      taskLabelForRow(task, action)?.setAttribute?.("data-tweaker-project-task-label", "true");
       if (isNativeSelected(task)) {
         task.setAttribute("data-tweaker-project-selected", "true");
         hasSelectedTask = true;
@@ -1646,9 +1718,14 @@ function markProjectTaskRows(container, project, header) {
   return hasSelectedTask;
 }
 
-function taskLabelForRow(task) {
-  const interactive = [...(task.querySelectorAll?.('a, button, [role="button"]') || [])]
-    .find((node) => String(node.textContent || "").trim() || [...(node.querySelectorAll?.("span") || [])].some((span) => String(span.textContent || "").trim()));
+function taskActionForRow(task) {
+  const tagName = String(task?.tagName || "").toUpperCase();
+  if (tagName === "A" || tagName === "BUTTON" || task?.getAttribute?.("role") === "button") return task;
+  return [...(task?.querySelectorAll?.('a, button, [role="button"]') || [])]
+    .find((node) => String(node.textContent || "").trim() || [...(node.querySelectorAll?.("span") || [])].some((span) => String(span.textContent || "").trim())) || null;
+}
+
+function taskLabelForRow(task, interactive = taskActionForRow(task)) {
   const scope = interactive || task;
   const spans = [...(scope.querySelectorAll?.("span") || [])].filter(isTaskLabelCandidate);
   const accessibleName = String(scope.getAttribute?.("aria-label") || scope.getAttribute?.("title") || task.getAttribute?.("aria-label") || "").trim();
@@ -1718,9 +1795,10 @@ function clearNativeProjectColors() {
     node.style.removeProperty("--tweaker-project-color");
     node.style.removeProperty("--tweaker-project-foreground");
   }
-  for (const node of document.querySelectorAll("[data-tweaker-project-color-icon], [data-tweaker-project-color-title], [data-tweaker-project-task-label]")) {
+  for (const node of document.querySelectorAll("[data-tweaker-project-color-icon], [data-tweaker-project-color-title], [data-tweaker-project-task-action], [data-tweaker-project-task-label]")) {
     node.removeAttribute("data-tweaker-project-color-icon");
     node.removeAttribute("data-tweaker-project-color-title");
+    node.removeAttribute("data-tweaker-project-task-action");
     node.removeAttribute("data-tweaker-project-task-label");
   }
 }

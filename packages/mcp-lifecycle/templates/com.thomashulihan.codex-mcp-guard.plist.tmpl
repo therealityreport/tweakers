@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.thomashulihan.codex-mcp-guard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>{{HOME}}/.codex/bin/codex-mcp-guard.py</string>
+    <string>--quiet</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TWEAKERS_MCP_LIFECYCLE_JOB</key>
+    <string>com.thomashulihan.codex-mcp-guard</string>
+    <key>CODEX_GUARD_COMPUTER_USE_WARN</key>
+    <string>3</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/.codex/tmp/codex-mcp-guard.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/.codex/tmp/codex-mcp-guard.err.log</string>
+</dict>
+</plist>

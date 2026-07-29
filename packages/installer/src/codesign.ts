@@ -156,11 +156,16 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
     : { mode: "adhoc", identity: "-" };
 }
 
-const TEAM_BOUND_ENTITLEMENTS = [
+/**
+ * These are bound either to the original Apple Team ID or to that team's
+ * provisioning profile. They cannot be carried over to a locally signed app.
+ */
+const NON_PORTABLE_ENTITLEMENTS = [
   "com.apple.application-identifier",
   "com.apple.developer.team-identifier",
   "com.apple.security.application-groups",
   "keychain-access-groups",
+  "com.apple.developer.aps-environment",
 ];
 
 function preparePortableSignature(appRoot: string, identityHash: string, posture: SigningPosture): {
@@ -200,13 +205,14 @@ function preparePortableSignature(appRoot: string, identityHash: string, posture
 }
 
 /**
- * Removes entitlements bound to Apple's original Team ID. Strict signing keeps
- * Library Validation enabled by omitting its disable entitlement; contained
- * fallback signing restores that entitlement for launch compatibility.
+ * Removes entitlements that require Apple's original Team ID or provisioning
+ * profile. Strict signing keeps Library Validation enabled by omitting its
+ * disable entitlement; contained fallback signing restores that entitlement
+ * for launch compatibility.
  */
 export function portableEntitlements(entitlements: Plist, posture: SigningPosture = "strict"): Plist {
   const portable = { ...entitlements };
-  for (const key of TEAM_BOUND_ENTITLEMENTS) delete portable[key];
+  for (const key of NON_PORTABLE_ENTITLEMENTS) delete portable[key];
   delete portable["com.apple.security.cs.disable-library-validation"];
   if (posture === "contained") {
     portable["com.apple.security.cs.disable-library-validation"] = true;

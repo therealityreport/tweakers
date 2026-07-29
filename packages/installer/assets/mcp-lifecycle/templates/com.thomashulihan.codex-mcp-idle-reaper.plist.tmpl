@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.thomashulihan.codex-mcp-idle-reaper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>{{HOME}}/.codex/bin/codex-mcp-idle-reaper.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TWEAKERS_MCP_LIFECYCLE_JOB</key>
+    <string>com.thomashulihan.codex-mcp-idle-reaper</string>
+    <key>REAPER_ORPHAN_MIN_AGE</key>
+    <string>120</string>
+    <key>REAPER_PROTECT_NODE_REPL</key>
+    <string>1</string>
+    <key>REAPER_NODE_REPL_ORPHAN_MIN_AGE</key>
+    <string>3600</string>
+    <key>REAPER_CLAUDE_IDLE_SECS</key>
+    <string>900</string>
+    <key>REAPER_CLAUDE_CPU_EPS</key>
+    <string>2.0</string>
+    <key>REAPER_DETACHED_IDLE_SECS</key>
+    <string>600</string>
+    <key>REAPER_TERM_GRACE_SECS</key>
+    <string>5</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/.codex/tmp/codex-mcp-idle-reaper.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/.codex/tmp/codex-mcp-idle-reaper.err.log</string>
+</dict>
+</plist>

@@ -15,6 +15,7 @@ import { status } from "./commands/status.js";
 import { debug } from "./commands/debug.js";
 import { browserUi } from "./commands/browser-ui.js";
 import { doctor } from "./commands/doctor.js";
+import { mcpLifecycle } from "./commands/mcp-lifecycle.js";
 import { safeMode } from "./commands/safe-mode.js";
 import { migrate } from "./commands/migrate.js";
 import { TWEAKER_VERSION } from "./version.js";
@@ -135,7 +136,9 @@ async function runMode(target: string, opts: { json?: boolean; yes?: boolean; ap
 
 async function runEnvironment(action: string, opts: EnvironmentCommandOptions): Promise<void> {
   const result = await environment(action, opts);
-  if (action === "commit") assertEnvironmentCliSuccess("commit", result);
+  // The receipt has already been printed, so callers still get the durable
+  // diagnosis alongside a truthful exit code.
+  assertEnvironmentCliSuccess(action as Parameters<typeof assertEnvironmentCliSuccess>[0], result);
 }
 
 async function runRefreshStatus(): Promise<void> {
@@ -266,7 +269,7 @@ prog
 
 prog
   .command("environment <action>")
-  .describe("Inspect, prepare, and complete a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
+  .describe("Inspect, prepare, complete, and recover a durable Stable/Alpha and ChatGPT/Tweakers environment transaction")
   .option("--app-experience", "App experience: chatgpt or tweakers")
   .option("--release-profile", "Release profile: stable or alpha")
   .option("--transaction", "Durable environment transaction ID")
@@ -286,7 +289,18 @@ prog
 prog
   .command("doctor")
   .describe("Diagnose common issues (signature, fuses, asar integrity, perms)")
-  .action(doctor);
+  .option("--deep", "Verify lifecycle asset bytes, modes, and action receipts")
+  .option("--json", "Print exactly one machine-readable JSON value")
+  .action(wrap(doctor));
+
+prog
+  .command("mcp-lifecycle <action>")
+  .describe("Inspect, preview, repair current managed services, or explicitly adopt the exact recognized predecessor")
+  .option("--apply", "Apply the selected verified repair or explicit predecessor adoption and reload the exact existing labels")
+  .option("--deep", "Verify installed asset bytes, modes, status, and receipts")
+  .option("--json", "Print exactly one machine-readable JSON value")
+  .option("--source", "Explicit canonical package root")
+  .action(wrap(mcpLifecycle));
 
 prog
   .command("debug")

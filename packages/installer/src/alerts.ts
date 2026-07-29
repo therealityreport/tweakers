@@ -174,11 +174,21 @@ export function requestCodexNativeUpdate(
     `set candidateNames to {${candidateNames.map(appleScriptString).join(", ")}}`,
     "set appMenu to menu 1 of menu bar item 2 of menu bar 1 of targetProcess",
     "set updateItem to missing value",
+    // Bulk name enumeration is reliable even when the menu has never been
+    // opened; a `whose name is` filter against the same lazily-populated AX
+    // tree is nondeterministic and produced false MENU_NOT_FOUND failures.
+    "set itemNames to name of every menu item of appMenu",
+    "repeat with itemIndex from 1 to count of itemNames",
+    "set itemName to item itemIndex of itemNames",
+    "if itemName is not missing value then",
     "repeat with candidateName in candidateNames",
-    "try",
-    "set updateItem to first menu item of appMenu whose name is (candidateName as text)",
+    "if (itemName as text) is equal to (candidateName as text) then",
+    "set updateItem to menu item itemIndex of appMenu",
     "exit repeat",
-    "end try",
+    "end if",
+    "end repeat",
+    "end if",
+    "if updateItem is not missing value then exit repeat",
     "end repeat",
     "if updateItem is missing value then",
     "try",
@@ -407,7 +417,8 @@ export function openAndActivateCodex(appRoot: string): void {
   if (platform() !== "darwin") return;
   const bundleId = codexBundleId(appRoot);
   alertExecFileSync("osascript", ["-e", codexReopenScript(appRoot, bundleId, 0)], {
-    stdio: "ignore",
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
   });
 }
 

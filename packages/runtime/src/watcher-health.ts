@@ -1,8 +1,23 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, platform } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
+import {
+  buildWatcherRegistry,
+  type WatcherHealthEntry,
+  type WatcherProbe,
+} from "./watcher-registry";
 
 type CheckStatus = "ok" | "warn" | "error";
 
@@ -20,6 +35,28 @@ export interface WatcherHealth {
   watcher: string;
   checks: WatcherHealthCheck[];
   latestCompletedCycle?: WatcherCycleReceipt;
+  watchers: WatcherHealthEntry[];
+}
+
+export interface WatcherHealthProbeDependencies {
+  homeDirectory?: string;
+  platformKind?: NodeJS.Platform;
+  launchdState?: (label: string) => LaunchdLoadedState;
+  pathExists?: (path: string) => boolean;
+  modifiedAt?: (path: string) => string | null;
+  readJsonDocument?: (path: string) => Record<string, unknown> | null;
+}
+
+export interface PublishedWatcherHealth {
+  schema: "tweakers.health.v1";
+  schemaVersion: 1;
+  checkedAt: string;
+  status: CheckStatus;
+  watchers: WatcherHealthEntry[];
+}
+
+export interface WatcherHealthPublisherDependencies {
+  writeAtomic?: (path: string, document: PublishedWatcherHealth) => void;
 }
 
 interface InstallerState {
@@ -92,7 +129,20 @@ export interface RuntimeFingerprintHealth extends RuntimeFingerprintSet {
   status: "current" | "managed-pending" | "runtime-pending" | "unknown";
 }
 
-export function getWatcherHealth(userRoot: string): WatcherHealth {
+/**
+ * Verified fingerprint metadata for one packaged runtime tree. Consumers use
+ * this to prove the exact files that were validated, not merely the digest
+ * recorded in the runtime manifest.
+ */
+export interface RuntimeFingerprintEvidence {
+  fingerprint: string;
+  fileCount: number;
+}
+
+export function getWatcherHealth(
+  userRoot: string,
+  probeDependencies: WatcherHealthProbeDependencies = {},
+): WatcherHealth {
   const checks: WatcherHealthCheck[] = [];
   const state = readJson<InstallerState>(join(userRoot, "state.json"));
   const config = normalizeRuntimeConfig(readJson<RuntimeConfig & Record<string, unknown>>(join(userRoot, "config.json")) ?? {});
@@ -104,7 +154,7 @@ export function getWatcherHealth(userRoot: string): WatcherHealth {
     detail: state ? `Tweakers ${state.version ?? "(unknown version)"}` : "state.json is missing",
   });
 
-  if (!state) return summarize("none", checks);
+  if (!state) return withWatcherRegistry(summarize("none", checks), userRoot, probeDependencies);
 
   const autoUpdate = config.tweaker?.autoUpdate !== false;
   checks.push({
@@ -168,7 +218,50 @@ export function getWatcherHealth(userRoot: string): WatcherHealth {
     detail: runtime.status,
   });
 
-  return summarize(state.watcher ?? "none", checks, autoRepairState?.latestCompletedCycle);
+  return withWatcherRegistry(
+    summarize(state.watcher ?? "none", checks, autoRepairState?.latestCompletedCycle),
+    userRoot,
+    probeDependencies,
+  );
+}
+
+/**
+ * Reads the canonical health truth and publishes a privacy-bounded snapshot
+ * for read-only consumers such as Menu Bar. A failing current snapshot never
+ * replaces the last-known-good watcher snapshot.
+ */
+export function getAndPublishWatcherHealth(
+  userRoot: string,
+  probeDependencies: WatcherHealthProbeDependencies = {},
+  publisherDependencies: WatcherHealthPublisherDependencies = {},
+): WatcherHealth {
+  const health = getWatcherHealth(userRoot, probeDependencies);
+  publishWatcherHealthSnapshot(userRoot, health, publisherDependencies);
+  return health;
+}
+
+export function publishWatcherHealthSnapshot(
+  userRoot: string,
+  health: WatcherHealth,
+  dependencies: WatcherHealthPublisherDependencies = {},
+): PublishedWatcherHealth {
+  const homeDirectory = dirnameForPublishedPaths(userRoot);
+  const document: PublishedWatcherHealth = {
+    schema: "tweakers.health.v1",
+    schemaVersion: 1,
+    checkedAt: health.checkedAt,
+    status: health.status,
+    watchers: health.watchers.map((watcher) => redactPublishedWatcher(watcher, homeDirectory)),
+  };
+  const writeAtomic = dependencies.writeAtomic ?? writePrivateJsonAtomically;
+  writeAtomic(join(userRoot, "watcher-health.json"), document);
+  if (
+    document.watchers.length === 3
+    && document.watchers.every((watcher) => watcher.status === "ok")
+  ) {
+    writeAtomic(join(userRoot, "watcher-health.last-known-good.json"), document);
+  }
+  return document;
 }
 
 function normalizeRuntimeConfig(config: RuntimeConfig & Record<string, unknown>): RuntimeConfig {
@@ -464,7 +557,283 @@ function summarize(
     watcher,
     checks,
     latestCompletedCycle,
+    watchers: [],
   };
+}
+
+function withWatcherRegistry(
+  health: WatcherHealth,
+  userRoot: string,
+  dependencies: WatcherHealthProbeDependencies,
+): WatcherHealth {
+  const checkedAt = health.checkedAt;
+  const homeDirectory = dependencies.homeDirectory ?? homedir();
+  const pathExists = dependencies.pathExists ?? existsSync;
+  const modifiedAt = dependencies.modifiedAt ?? fileModifiedAt;
+  const launchdState = dependencies.launchdState ?? readLaunchdLoadedState;
+  const readJsonDocument = dependencies.readJsonDocument ?? readJsonRecord;
+  const launchdDirectory = join(homeDirectory, "Library", "LaunchAgents");
+  const lifecycleDirectory = join(homeDirectory, ".codex", "tmp");
+  const repairLoaded = launchdState(LAUNCHD_LABEL);
+  const repairLastRunAt = health.latestCompletedCycle?.completedAt
+    ?? modifiedAt(join(homeDirectory, "Library", "Logs", "tweaker-watcher.log"))
+    ?? modifiedAt(join(homeDirectory, "Library", "Logs", "codex-plusplus-watcher.log"));
+  const repairLastSuccessAt = (
+    health.latestCompletedCycle?.repair.status === "succeeded"
+    && health.latestCompletedCycle.outcome === "completed"
+  )
+    || (
+      health.latestCompletedCycle?.repair.status === "skipped"
+      && health.latestCompletedCycle.outcome === "completed"
+    )
+    ? health.latestCompletedCycle.completedAt
+    : null;
+  const repairProbeState = repairWatcherProbeState(health.latestCompletedCycle);
+  const repairPlist = join(launchdDirectory, `${LAUNCHD_LABEL}.plist`);
+  const lifecycleStatus = readWatcherStatus(
+    join(lifecycleDirectory, "codex-mcp-lifecycle-status.json"),
+    [1, 2],
+    "v1",
+    readJsonDocument,
+  );
+  const guardStatus = readWatcherStatus(
+    join(lifecycleDirectory, "codex-mcp-guard-status.json"),
+    [1],
+    "v1",
+    readJsonDocument,
+  );
+
+  return {
+    ...health,
+    watchers: buildWatcherRegistry({
+      checkedAt,
+      platformKind: dependencies.platformKind ?? platform(),
+      homeDirectory,
+      tweakersRoot: userRoot,
+      repair: {
+        installed: pathExists(repairPlist),
+        loaded: repairLoaded.loaded,
+        running: repairLoaded.running,
+        lastExitCode: repairLoaded.lastExitCode,
+        lastRunAt: repairLastRunAt,
+        lastSuccessAt: repairLastSuccessAt,
+        statusSchemaVersion: 1,
+        policyVersion: "v1",
+        deferredReason: repairProbeState.deferredReason,
+        error: repairProbeState.error,
+        supportedStatusSchemas: [1],
+      },
+      reaper: lifecycleProbe(
+        "com.thomashulihan.codex-mcp-idle-reaper",
+        join(launchdDirectory, "com.thomashulihan.codex-mcp-idle-reaper.plist"),
+        lifecycleStatus,
+        pathExists,
+        launchdState,
+      ),
+      guard: lifecycleProbe(
+        "com.thomashulihan.codex-mcp-guard",
+        join(launchdDirectory, "com.thomashulihan.codex-mcp-guard.plist"),
+        guardStatus,
+        pathExists,
+        launchdState,
+      ),
+    }),
+  };
+}
+
+function dirnameForPublishedPaths(userRoot: string): string {
+  const expectedSuffix = join("Library", "Application Support", "codex-plusplus");
+  return userRoot.endsWith(expectedSuffix)
+    ? dirname(dirname(dirname(userRoot)))
+    : homedir();
+}
+
+function redactPublishedWatcher(
+  watcher: WatcherHealthEntry,
+  homeDirectory: string,
+): WatcherHealthEntry {
+  const redact = (value: string | null): string | null => {
+    if (value === null) return null;
+    return redactWatcherText(value, homeDirectory);
+  };
+  return {
+    ...watcher,
+    installedPath: redactWatcherText(watcher.installedPath, homeDirectory),
+    policyVersion: redact(watcher.policyVersion),
+    statePath: redact(watcher.statePath),
+    receiptPath: redact(watcher.receiptPath),
+    deferredReason: redact(watcher.deferredReason),
+    error: redact(watcher.error),
+    recommendedAction: redact(watcher.recommendedAction),
+  };
+}
+
+function redactWatcherText(value: string, homeDirectory: string): string {
+  let redacted = homeDirectory && value.includes(homeDirectory)
+    ? value.replaceAll(homeDirectory, "~")
+    : value;
+  redacted = redacted
+    .replace(/\/Users\/[^/\s]+/g, "~")
+    .replace(/(--(?:token|api[-_]?key|password)(?:=|\s+))\S+/gi, "$1[redacted]")
+    .replace(/\b(Bearer)\s+\S+/gi, "$1 [redacted]")
+    .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, "[redacted]");
+  return redacted.slice(0, 512);
+}
+
+function writePrivateJsonAtomically(path: string, document: PublishedWatcherHealth): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function lifecycleProbe(
+  label: string,
+  plistPath: string,
+  status: {
+    lastRunAt: string | null;
+    lastSuccessAt: string | null;
+    statusSchemaVersion: number | null;
+    policyVersion: string | null;
+    error: string | null;
+  },
+  pathExists: (path: string) => boolean,
+  launchdState: (label: string) => LaunchdLoadedState,
+): WatcherProbe {
+  const loaded = launchdState(label);
+  return {
+    installed: pathExists(plistPath),
+    loaded: loaded.loaded,
+    running: loaded.running,
+    lastExitCode: loaded.lastExitCode,
+    lastRunAt: status.lastRunAt,
+    lastSuccessAt: status.lastSuccessAt,
+    statusSchemaVersion: status.statusSchemaVersion,
+    policyVersion: status.policyVersion,
+    deferredReason: null,
+    error: status.error,
+    supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [1],
+  };
+}
+
+function readWatcherStatus(
+  path: string,
+  supportedSchemas: number[],
+  fallbackPolicyVersion: string,
+  readDocument: (path: string) => Record<string, unknown> | null = readJsonRecord,
+): {
+  lastRunAt: string | null;
+  lastSuccessAt: string | null;
+  statusSchemaVersion: number | null;
+  policyVersion: string | null;
+  error: string | null;
+} {
+  const document = readDocument(path);
+  if (!document) {
+    return {
+      lastRunAt: null,
+      lastSuccessAt: null,
+      statusSchemaVersion: null,
+      policyVersion: fallbackPolicyVersion,
+      error: `status missing: ${path}`,
+    };
+  }
+  const schemaVersion = numericValue(document.schema_version ?? document.schemaVersion);
+  const generatedAt = dateValue(document.generated_at ?? document.generatedAt);
+  const job = recordValue(document.job);
+  const jobOK = job?.ok;
+  const policyVersion = stringValue(
+    document.cleanup_policy_version ?? document.policyVersion,
+  ) ?? fallbackPolicyVersion;
+  const error = schemaVersion === null
+    ? "status schema missing or invalid"
+    : !supportedSchemas.includes(schemaVersion)
+      ? `unsupported status schema: ${schemaVersion}`
+      : generatedAt === null
+        ? "status timestamp missing or invalid"
+        : !job || typeof jobOK !== "boolean"
+          ? "status job missing or invalid"
+          : jobOK === false
+            ? stringValue(job.error) ?? "watcher reported an unhealthy run"
+            : null;
+  return {
+    lastRunAt: generatedAt,
+    lastSuccessAt: jobOK === true ? generatedAt : null,
+    statusSchemaVersion: schemaVersion,
+    policyVersion,
+    error,
+  };
+}
+
+function repairWatcherProbeState(receipt: WatcherCycleReceipt | undefined): {
+  deferredReason: string | null;
+  error: string | null;
+} {
+  if (!receipt) return { deferredReason: null, error: null };
+  if (receipt.outcome !== "completed" && receipt.outcome !== "failed") {
+    return { deferredReason: null, error: "repair cycle outcome is invalid" };
+  }
+  if (receipt.repair.status === "failed") {
+    return { deferredReason: null, error: receipt.repair.error ?? "repair failed" };
+  }
+  if (receipt.repair.status === "succeeded" && receipt.outcome !== "completed") {
+    return { deferredReason: null, error: "repair succeeded without a completed cycle" };
+  }
+  if (receipt.repair.status === "skipped" && receipt.outcome !== "completed") {
+    return { deferredReason: null, error: "repair skipped without a completed cycle" };
+  }
+  if (receipt.repair.status === "pending") {
+    return { deferredReason: receipt.repair.error ?? "repair-pending", error: null };
+  }
+  return { deferredReason: null, error: null };
+}
+
+function dateValue(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const milliseconds = value * 1_000;
+    if (!Number.isFinite(milliseconds)) return null;
+    const date = new Date(milliseconds);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
+  if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+    return new Date(value).toISOString();
+  }
+  return null;
+}
+
+function numericValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | null {
+  return readJson<Record<string, unknown>>(path);
+}
+
+function fileModifiedAt(path: string): string | null {
+  try {
+    return new Date(statSync(path).mtimeMs).toISOString();
+  } catch {
+    return null;
+  }
 }
 
 function commandSucceeds(command: string, args: string[]): boolean {
@@ -476,15 +845,15 @@ function commandSucceeds(command: string, args: string[]): boolean {
   }
 }
 
-function readLaunchdLoadedState(): LaunchdLoadedState {
-  const output = commandOutput("launchctl", ["list", LAUNCHD_LABEL]);
+function readLaunchdLoadedState(label = LAUNCHD_LABEL): LaunchdLoadedState {
+  const output = commandOutput("launchctl", ["list", label]);
   if (output === null) return { loaded: false, running: false, lastExitCode: null };
   const pidMatch = output.match(/["']?PID["']?\s*[=:]\s*(\d+)/i);
   const exitMatch = output.match(/["']?LastExitStatus["']?\s*[=:]\s*(-?\d+)/i);
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   const loadedDefinition = uid === null
     ? null
-    : commandOutput("launchctl", ["print", `gui/${uid}/${LAUNCHD_LABEL}`]);
+    : commandOutput("launchctl", ["print", `gui/${uid}/${label}`]);
   return {
     loaded: true,
     running: Boolean(pidMatch && Number(pidMatch[1]) > 0),
@@ -517,7 +886,7 @@ function commandsMatch(plist: string, loadedCommand: string): boolean {
   return expected.length > 0 && (observed.includes(expected) || expected.includes(observed));
 }
 
-function readRuntimeFingerprint(root: string): string | null {
+export function readRuntimeFingerprintEvidence(root: string): RuntimeFingerprintEvidence | null {
   if (!root) return null;
   const value = readJson<{ schemaVersion?: number; fingerprint?: unknown; fileCount?: unknown }>(
     join(root, RUNTIME_FINGERPRINT_FILE),
@@ -532,11 +901,15 @@ function readRuntimeFingerprint(root: string): string | null {
   try {
     const actual = computeRuntimeFingerprint(root);
     return actual.fingerprint === value.fingerprint && actual.fileCount === value.fileCount
-      ? actual.fingerprint
+      ? actual
       : null;
   } catch {
     return null;
   }
+}
+
+function readRuntimeFingerprint(root: string): string | null {
+  return readRuntimeFingerprintEvidence(root)?.fingerprint ?? null;
 }
 
 function computeRuntimeFingerprint(runtimeRoot: string): { fingerprint: string; fileCount: number } {
@@ -545,6 +918,10 @@ function computeRuntimeFingerprint(runtimeRoot: string): { fingerprint: string; 
 
   const walk = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      // Junk skip must stay in lockstep with installer/src/runtime-fingerprint.ts
+      // and installer/scripts/copy-assets.mjs — all three must produce identical
+      // fingerprints or every tweakers prepare fails its cross-check.
+      if (entry.name === ".DS_Store") continue;
       const path = join(directory, entry.name);
       const name = relative(runtimeRoot, path);
       if (name === RUNTIME_FINGERPRINT_FILE) continue;

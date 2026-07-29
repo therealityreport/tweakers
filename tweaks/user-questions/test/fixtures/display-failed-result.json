@@ -1,0 +1,16 @@
+{
+  "result": {
+    "status": "display_failed",
+    "failure_stage": "owned_mount",
+    "answers": {}
+  },
+  "normalized": {
+    "round_id": "rich-round",
+    "status": "display_failed",
+    "cancelled": true,
+    "cancel_reason": "question_ui_not_shown",
+    "answers": {},
+    "retryable": true,
+    "failure_stage": "owned_mount"
+  }
+}

@@ -13,6 +13,15 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
+import { desktopVersionAdvanced, type DesktopVersionIdentity } from "./desktop-version.js";
+// Re-exported from its new home so existing importers keep working.
+export { desktopVersionAdvanced, type DesktopVersionIdentity };
+import {
+  commitVerifiedOfficialDesktop,
+  officialAdoptionError,
+  OFFICIAL_ADOPTION_MESSAGE,
+  proveVerifiedOfficialDesktop,
+} from "./adopt-official-desktop.js";
 import {
   createEnvironmentSelection,
   defaultEnvironmentProfileRegistry,
@@ -71,11 +80,6 @@ export type DesktopUpdatePhase =
 
 export type DesktopUpdateRefreshSource = Exclude<RefreshSource, "current">;
 
-export interface DesktopVersionIdentity {
-  marketingVersion: string | null;
-  build: string | null;
-}
-
 export interface DesktopUpdateReceipt {
   schemaVersion: typeof DESKTOP_UPDATE_SCHEMA_VERSION;
   kind: "desktop-update";
@@ -96,6 +100,16 @@ export interface DesktopUpdateReceipt {
   error: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Immutable time of the current terminal outcome. Additive schema-v1 field:
+   * legacy receipts omit it and consumers fall back to updatedAt.
+   */
+  terminalAt?: string | null;
+  /**
+   * Audit time for abandoning the last recovery continuation. This must not
+   * replace terminalAt or the causal terminal error.
+   */
+  continuationAbandonedAt?: string | null;
   completedAt: string | null;
   rolledBackAt: string | null;
 }
@@ -218,12 +232,16 @@ export function createDesktopUpdateTransaction(
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 2_000);
   const now = overrides.now ?? (() => new Date().toISOString());
   const environment = overrides.environment ?? createEnvironmentCoordinator({
+    environmentRoot: root,
     transactionFile: environmentTransactionFile,
     receiptRoot: environmentReceiptRoot,
     selectionFile: environmentSelectionFile,
     registryFile: environmentRegistryFile,
     stateFile: installerStateFile,
     configFile: join(root, "config.json"),
+    runtimeProofFile: join(root, "environment-runtime-proof.json"),
+    mcpStateFile: join(root, "mcp-sync-state.json"),
+    tweaksRoot: join(root, "tweaks"),
     lockFile: environmentLockFile,
     lifecycleLockFile,
   });
@@ -240,15 +258,25 @@ export function createDesktopUpdateTransaction(
       readDesktopBundleIdentity(appPath).bundleId
     )),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
-    initiateNativeUpdate: overrides.initiateNativeUpdate ?? (({ selection, baseline, officialMainPid }) => {
-      const result: NativeUpdateHandoffResult = officialMainPid !== null
-        ? requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid)
-        : {
-            ok: false,
-            kind: "process_not_proven",
-            message: "The exact ChatGPT process was not recorded after entering official mode.",
-            permissionGuidance: null,
-          };
+    initiateNativeUpdate: overrides.initiateNativeUpdate ?? (async ({ selection, baseline, officialMainPid }) => {
+      let result: NativeUpdateHandoffResult = {
+        ok: false,
+        kind: "process_not_proven",
+        message: "The exact ChatGPT process was not recorded after entering official mode.",
+        permissionGuidance: null,
+      };
+      if (officialMainPid !== null) {
+        // A freshly reopened official app can take several seconds to build
+        // its full signed-in app menu, so a missing/disabled update item (or
+        // not-yet-visible window) right after cutover is usually transient.
+        // Retry briefly before treating the handoff as terminal.
+        const transientKinds = new Set(["menu_item_not_found", "menu_item_disabled", "window_not_visible"]);
+        for (let attempt = 1; attempt <= 5; attempt += 1) {
+          result = requestCodexNativeUpdate(selection.selectedDesktopPath, officialMainPid);
+          if (result.ok || !transientKinds.has(result.kind)) break;
+          if (attempt < 5) await new Promise((resolvePause) => setTimeout(resolvePause, 3_000));
+        }
+      }
       if (!result.ok) {
         showUpdateModePausedAlert(selection.selectedDesktopPath, baseline.marketingVersion, result);
         throw new Error(
@@ -340,7 +368,27 @@ export function createDesktopUpdateTransaction(
     receipt: DesktopUpdateReceipt,
     patch: Partial<DesktopUpdateReceipt>,
     terminal = false,
-  ): DesktopUpdateReceipt => persist({ ...receipt, ...patch, updatedAt: deps.now() }, terminal);
+  ): DesktopUpdateReceipt => {
+    const updatedAt = deps.now();
+    const updated: DesktopUpdateReceipt = { ...receipt, ...patch, updatedAt };
+    if (terminal) {
+      updated.terminalAt = receipt.terminalAt
+        ?? patch.terminalAt
+        ?? patch.completedAt
+        ?? patch.rolledBackAt
+        ?? updatedAt;
+      updated.continuationAbandonedAt ??= null;
+    } else if (isTerminalDesktopUpdatePhase(receipt.phase)
+      && !isTerminalDesktopUpdatePhase(updated.phase)) {
+      // A resumed continuation creates a new outcome. Its next terminal
+      // transition receives a new immutable causal timestamp.
+      updated.terminalAt = null;
+      updated.continuationAbandonedAt = null;
+      updated.completedAt = null;
+      updated.rolledBackAt = null;
+    }
+    return persist(updated, terminal);
+  };
 
   const status = (): DesktopUpdateReceipt | null => readDesktopUpdateReceipt(stateFile);
 
@@ -399,6 +447,8 @@ export function createDesktopUpdateTransaction(
         error: null,
         createdAt: now,
         updatedAt: now,
+        terminalAt: null,
+        continuationAbandonedAt: null,
         completedAt: null,
         rolledBackAt: null,
       });
@@ -679,11 +729,18 @@ export function createDesktopUpdateTransaction(
           `Desktop update ${existing.transactionId} is not resumable from ${existing.phase}; cancel it to recover an exited owner`,
         );
       }
+      const resumed: DesktopUpdateReceipt = {
+        ...existing,
+        terminalAt: null,
+        continuationAbandonedAt: null,
+        completedAt: null,
+        rolledBackAt: null,
+      };
       let liveOfficial: LiveOfficialDesktopObservation;
       try {
-        liveOfficial = await deps.inspectLiveOfficialDesktop(existing.official);
+        liveOfficial = await deps.inspectLiveOfficialDesktop(resumed.official);
       } catch (error) {
-        return update(existing, {
+        return update(resumed, {
           phase: "failed",
           ownerPid: process.pid,
           safeOfficialMode: true,
@@ -692,8 +749,8 @@ export function createDesktopUpdateTransaction(
         }, true);
       }
 
-      if (desktopVersionAdvanced(existing.baseline, liveOfficial.version)) {
-        return update(existing, {
+      if (desktopVersionAdvanced(resumed.baseline, liveOfficial.version)) {
+        return update(resumed, {
           phase: "returning_to_tweakers",
           ownerPid: process.pid,
           observed: liveOfficial.version,
@@ -702,8 +759,8 @@ export function createDesktopUpdateTransaction(
           error: null,
         });
       }
-      if (existing.observed !== null) {
-        return update(existing, {
+      if (resumed.observed !== null) {
+        return update(resumed, {
           phase: "failed",
           ownerPid: process.pid,
           observed: null,
@@ -713,7 +770,7 @@ export function createDesktopUpdateTransaction(
           error: "The live official version/build did not advance from the transaction baseline; refusing to restart into Tweakers.",
         }, true);
       }
-      return update(existing, {
+      return update(resumed, {
         phase: "awaiting_native_update",
         ownerPid: process.pid,
         officialMainPid: liveOfficial.mainPid,
@@ -808,18 +865,29 @@ export function createDesktopUpdateTransaction(
         && deps.processAlive(existing.ownerPid)) {
         throw new Error(`Desktop update owner PID ${existing.ownerPid} is still active`);
       }
-      const supported = existing.phase === "awaiting_native_update"
-        || (isTerminalDesktopUpdatePhase(existing.phase) && existing.resumable);
-      if (supported) {
-        const safeOfficialMode = existing.phase === "awaiting_native_update" || existing.safeOfficialMode;
+      if (existing.phase === "awaiting_native_update") {
         return update(existing, {
           phase: "failed",
           ownerPid: process.pid,
-          safeOfficialMode,
+          safeOfficialMode: true,
           resumable: false,
-          error: safeOfficialMode
-            ? "Desktop update was cancelled; ChatGPT remains in official mode."
-            : "Desktop update was cancelled before safe official mode was confirmed.",
+          error: "Desktop update was cancelled; ChatGPT remains in official mode.",
+        }, true);
+      }
+
+      if ((existing.phase === "failed" || existing.phase === "rolled_back")
+        && existing.resumable) {
+        // This action abandons a recovery continuation; it does not replace
+        // the failure that made recovery necessary. Preserve the causal phase
+        // and diagnostic verbatim so the durable receipt remains useful after
+        // its last available continuation is dismissed.
+        return update(existing, {
+          ownerPid: process.pid,
+          resumable: false,
+          // A legacy schema-v1 failure has no terminalAt. Freeze its last
+          // causal update before recording the later abandonment separately.
+          terminalAt: existing.terminalAt ?? existing.rolledBackAt ?? existing.updatedAt,
+          continuationAbandonedAt: deps.now(),
         }, true);
       }
 
@@ -895,9 +963,7 @@ export function createDesktopUpdateTransaction(
     const rollbackFailed = environmentReceipt.phase === "failed"
       && /\brollback failed\b/i.test(environmentReceipt.error ?? "");
     const alreadyAdoptedOfficial = environmentReceipt.phase === "cancelled"
-      && (environmentReceipt.error ?? "").startsWith(
-        "Recovered by adopting the verified live official ChatGPT update.",
-      );
+      && (environmentReceipt.error ?? "").startsWith(OFFICIAL_ADOPTION_MESSAGE);
     if (rollbackFailed || alreadyAdoptedOfficial) {
       if (environmentReceipt.ownerPid !== process.pid
         && deps.processAlive(environmentReceipt.ownerPid)) {
@@ -925,6 +991,36 @@ export function createDesktopUpdateTransaction(
               safeOfficialMode: true,
               resumable: existing.observed !== null,
               error: "Desktop update owner exited; the environment was recovered to safe official mode.",
+              rolledBackAt: deps.now(),
+            }, true);
+          }
+        } catch {
+          // If exact-source proof cannot recover this attempt-zero failure,
+          // retain the existing independently verified official-adoption path.
+        }
+      }
+      // Switching-leg twin of failedBeforeFirstReopen: the owner died before
+      // any cutover on the way TO official ChatGPT, so the proven-live target
+      // is the original source environment, not official mode.
+      const failedBeforeFirstSwapProven = rollbackFailed
+        && !returning
+        && environmentReceipt.attempt === 0
+        && environmentReceipt.applied == null
+        && environmentReceipt.newMainPid === null
+        && sameEnvironmentSelection(environmentReceipt.source, existing.source)
+        && sameEnvironmentSelection(environmentReceipt.requested, existing.official);
+      if (failedBeforeFirstSwapProven) {
+        try {
+          const recovered = await deps.environment.rollback(environmentReceipt.transactionId);
+          if ((recovered.phase === "cancelled" || recovered.phase === "rolled-back")
+            && recovered.applied !== null
+            && sameEnvironmentSelection(recovered.applied.selection, existing.source)) {
+            return update(existing, {
+              phase: "rolled_back",
+              ownerPid: process.pid,
+              safeOfficialMode: existing.source.appExperience === "chatgpt",
+              resumable: false,
+              error: "Desktop update owner exited before cutover; the source environment was proven live and the update was rolled back.",
               rolledBackAt: deps.now(),
             }, true);
           }
@@ -994,7 +1090,17 @@ export function createDesktopUpdateTransaction(
         recovered = environmentReceipt;
       } else {
         recovered = await deps.environment.rollback(environmentReceipt.transactionId);
-        if (recovered.phase !== "rolled-back") {
+        // A proof-based recovery concludes "cancelled" with applied evidence
+        // proving the expected selection live; accept it alongside a real
+        // byte-restoring "rolled-back". A bare "cancelled" without proven
+        // applied evidence must still fail closed.
+        const provenCancelled = recovered.phase === "cancelled"
+          && recovered.applied !== null
+          && sameEnvironmentSelection(
+            recovered.applied.selection,
+            returning ? existing.official : existing.source,
+          );
+        if (recovered.phase !== "rolled-back" && !provenCancelled) {
           return unsafeRecoveryFailure(existing, `environment rollback ended in ${recovered.phase}`);
         }
       }
@@ -1108,112 +1214,33 @@ function adoptVerifiedOfficialUpdateLocked(
     return null;
   }
 
-  const appPath = selection.selectedDesktopPath;
-  const asarPath = join(appPath, "Contents", "Resources", "app.asar");
-  if (readAsarMarker(asarPath) !== "absent") return null;
-  validateOfficialEnvironmentProfile(selection);
-
-  const observed = readDesktopVersion(appPath);
-  if (!desktopVersionAdvanced(receipt.baseline, observed)) return null;
-  const identity = readDesktopBundleIdentity(appPath);
-  if (identity.bundleId !== selection.selectedDesktopBundleId) return null;
-  const processObservation = observeCodexMainProcess(appPath);
-  if (processObservation === null
-    || !processObservation.visibleWindow
-    || processObservation.pid === environmentReceipt.oldMainPid) {
-    return null;
-  }
-
-  const state = readState(files.installerStateFile);
-  const registry = readEnvironmentProfileRegistry(files.environmentRegistryFile);
-  if (state === null || state.appRoot !== appPath || registry === null) return null;
-  const registeredProfile = resolveEnvironmentProfile(registry, selection.releaseProfile);
-  if (registeredProfile.officialPath !== selection.selectedDesktopPath
-    || registeredProfile.officialBundleId !== selection.selectedDesktopBundleId
-    || registeredProfile.releaseProfile !== selection.releaseProfile) {
-    return null;
-  }
-
-  const appliedSelection: EnvironmentSelection = {
-    ...selection,
-    appliedAt: files.now,
+  const adoptionInput = {
+    selection,
+    baseline: receipt.baseline,
+    excludedMainPid: environmentReceipt.oldMainPid,
   };
-  const mcpConfigPath = defaultCodexMcpConfigFile();
-  const mcpModeBridge = createMcpModeBridge({
-    configPath: mcpConfigPath,
-    statePath: join(files.root, "mcp-sync-state.json"),
+  const adoptionFiles = {
+    root: files.root,
+    installerStateFile: files.installerStateFile,
+    environmentRegistryFile: files.environmentRegistryFile,
+    environmentSelectionFile: files.environmentSelectionFile,
+    runtimeProofFile: files.runtimeProofFile,
+    mcpConfigFile: defaultCodexMcpConfigFile(),
+    mcpStateFile: join(files.root, "mcp-sync-state.json"),
     tweaksRoot: join(files.root, "tweaks"),
-    tweakersConfigPath: join(files.root, "config.json"),
-  });
-  const mcpReconciliation = mcpModeBridge.reconcile("chatgpt");
-  mcpModeBridge.prove("chatgpt");
-  const mcpRuntimeProof = proveRegularChatGptMcpRuntime({
-    mainPid: processObservation.pid,
-    configPath: mcpConfigPath,
-    tweaksRoot: join(files.root, "tweaks"),
-    configurationChanged: mcpReconciliation.restartRequired,
-  });
-  if (!mcpRuntimeProof.ok) {
-    throw new Error(mcpRuntimeProof.error ?? "Regular ChatGPT MCP runtime could not be proven clean");
-  }
-
-  const {
-    patchedAsarStat: _patchedAsarStat,
-    watcherStatGuardPasses: _watcherStatGuardPasses,
-    ...stateWithoutPatchedRuntimeStats
-  } = state;
-  writeState(files.installerStateFile, {
-    ...stateWithoutPatchedRuntimeStats,
-    appRoot: appPath,
-    mode: "chatgpt",
-    codexVersion: observed.marketingVersion,
-    codexChannel: selection.releaseProfile === "alpha" ? "beta" : "stable",
-    codexBundleId: selection.selectedDesktopBundleId,
-  });
-  publishEnvironmentSelection(
-    files.environmentRegistryFile,
-    files.environmentSelectionFile,
-    appliedSelection,
-  );
-
-  const capabilities = environmentPreparationCapabilities();
-  const managedAlpha = inspectManagedAlphaBackend(files.root);
-  const loaded = loadEnvironmentState({
-    legacyStateFile: files.installerStateFile,
-    registryFile: files.environmentRegistryFile,
-    selectionFile: files.environmentSelectionFile,
-    environmentRoot: files.root,
+    tweakersConfigFile: join(files.root, "config.json"),
     now: files.now,
-    stableEvidence: {
-      patchedPayloadBuildable: capabilities.patchedPayloadBuildable,
-    },
-    alphaEvidence: {
-      backendInstallable: capabilities.backendInstallable,
-      patchedPayloadBuildable: capabilities.patchedPayloadBuildable,
-    },
-  }, {
-    inspectProfile: (profile, current) => {
-      const evidence = inspectEnvironmentProfile(profile, current);
-      if (profile.releaseProfile === "alpha") {
-        evidence.backendVersion = managedAlpha.installed ? managedAlpha.version : null;
-        evidence.backendFingerprint = managedAlpha.installed ? managedAlpha.fingerprint : null;
-      }
-      return evidence;
-    },
-  });
-  writeEnvironmentProfileRegistry(files.environmentRegistryFile, loaded.registry);
-  rmSync(files.runtimeProofFile, { force: true });
+  };
+  const proof = proveVerifiedOfficialDesktop(adoptionInput, adoptionFiles);
+  if (proof === null) return null;
+  const adopted = commitVerifiedOfficialDesktop(adoptionInput, proof, adoptionFiles);
 
-  const previousFailure = environmentReceipt.error?.trim() ?? "";
-  const recoveryMessage = "Recovered by adopting the verified live official ChatGPT update.";
   const terminalEnvironment: EnvironmentTransactionReceipt = {
     ...environmentReceipt,
     phase: "cancelled",
     ownerPid: process.pid,
-    newMainPid: processObservation.pid,
-    error: previousFailure.startsWith(recoveryMessage)
-      ? previousFailure
-      : `${recoveryMessage}${previousFailure ? ` Previous failure: ${previousFailure}` : ""}`,
+    newMainPid: adopted.mainPid,
+    error: officialAdoptionError(environmentReceipt.error),
     updatedAt: files.now,
     cancelledAt: files.now,
   };
@@ -1227,11 +1254,7 @@ function adoptVerifiedOfficialUpdateLocked(
   // idempotently finishes the desktop receipt.
   writeEnvironmentTransactionReceipt(files.environmentTransactionFile, terminalEnvironment);
 
-  return {
-    observed,
-    selection: appliedSelection,
-    mainPid: processObservation.pid,
-  };
+  return adopted;
 }
 
 function correlatedFailedPreparation(
@@ -1252,16 +1275,6 @@ function correlatedFailedPreparation(
 
 export function isTerminalDesktopUpdatePhase(phase: DesktopUpdatePhase): boolean {
   return phase === "completed" || phase === "failed" || phase === "rolled_back";
-}
-
-export function desktopVersionAdvanced(
-  baseline: DesktopVersionIdentity,
-  observed: DesktopVersionIdentity,
-): boolean {
-  const buildComparison = compareNumericVersion(baseline.build, observed.build);
-  if (buildComparison !== null) return buildComparison < 0;
-  const marketingComparison = compareNumericVersion(baseline.marketingVersion, observed.marketingVersion);
-  return marketingComparison !== null && marketingComparison < 0;
 }
 
 export function pristineBackupProvesObservedDesktop(
@@ -1492,6 +1505,10 @@ function isDesktopUpdateReceipt(value: unknown): value is DesktopUpdateReceipt {
     && (receipt.error === null || typeof receipt.error === "string")
     && isIsoDate(receipt.createdAt)
     && isIsoDate(receipt.updatedAt)
+    && (receipt.terminalAt === undefined || receipt.terminalAt === null || isIsoDate(receipt.terminalAt))
+    && (receipt.continuationAbandonedAt === undefined
+      || receipt.continuationAbandonedAt === null
+      || isIsoDate(receipt.continuationAbandonedAt))
     && (receipt.completedAt === null || isIsoDate(receipt.completedAt))
     && (receipt.rolledBackAt === null || isIsoDate(receipt.rolledBackAt));
 }
@@ -1574,25 +1591,6 @@ async function waitForVersionChange(
     });
   }
   return null;
-}
-
-function compareNumericVersion(baseline: string | null, observed: string | null): number | null {
-  if (!baseline || !observed) return null;
-  const left = baseline.trim().split(".");
-  const right = observed.trim().split(".");
-  if (!left.length || !right.length || !left.every(isDecimalSegment) || !right.every(isDecimalSegment)) return null;
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const a = BigInt(left[index] ?? "0");
-    const b = BigInt(right[index] ?? "0");
-    if (a < b) return -1;
-    if (a > b) return 1;
-  }
-  return 0;
-}
-
-function isDecimalSegment(value: string): boolean {
-  return /^(?:0|[1-9]\d*)$/.test(value);
 }
 
 async function withDesktopUpdateLock<T>(lockFile: string, operation: () => Promise<T>): Promise<T> {

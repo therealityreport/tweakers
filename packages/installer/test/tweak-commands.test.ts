@@ -45,7 +45,7 @@ import {
   watcherShellScript,
 } from "../src/watcher";
 import { hashDirectoryTree, stageBundledTweaks } from "../src/commands/install";
-import { hasReleaseProvenance, installManagedRuntime, managedCliPath, managedSourceRoot, writeReleaseProvenance } from "../src/managed-runtime";
+import { hasReleaseProvenance, installManagedRuntime, managedCliPath, managedSourceRoot, stageManagedRuntime, writeReleaseProvenance } from "../src/managed-runtime";
 
 test("createTweak scaffolds a both-scope tweak", () => {
   withTempDir((root) => {
@@ -503,6 +503,67 @@ test("managed runtime is atomically copied outside the development checkout", ()
   });
 });
 
+test("managed runtime can be staged to an isolated destination with deterministic provenance", () => {
+  withTempDir((root) => {
+    const source = join(root, "repo");
+    const live = join(root, "user", "managed-runtime", "current");
+    const staged = join(root, "transaction", "managed-runtime");
+    mkdirSync(join(source, ".git"), { recursive: true });
+    mkdirSync(join(source, "packages", "installer", "dist"), { recursive: true });
+    mkdirSync(join(source, "node_modules", ".bin"), { recursive: true });
+    mkdirSync(join(source, "node_modules", "example-tool", "bin"), { recursive: true });
+    mkdirSync(live, { recursive: true });
+    writeFileSync(join(source, ".git", "config"), "private\n");
+    writeFileSync(join(source, "local-notes.txt"), "do not copy\n");
+    writeFileSync(join(source, "packages", "installer", "dist", "cli.js"), "candidate\n");
+    writeFileSync(join(source, "node_modules", "example-tool", "bin", "cli.js"), "tool\n");
+    symlinkSync("../example-tool/bin/cli.js", join(source, "node_modules", ".bin", "example-tool"));
+    symlinkSync(
+      join(source, "packages", "installer", "dist", "cli.js"),
+      join(source, "node_modules", "absolute-source-link"),
+    );
+    symlinkSync("../../../outside-stage", join(source, "node_modules", "escaping-link"));
+    symlinkSync("../missing-package", join(source, "node_modules", "broken-link"));
+    writeFileSync(join(live, "sentinel.txt"), "live runtime remains untouched\n");
+
+    const result = stageManagedRuntime(source, staged, {
+      provenance: {
+        kind: "development-bootstrap",
+        sourceRuntimeHash: "candidate-hash",
+        installedAt: "2026-07-24T00:00:00.000Z",
+      },
+    });
+
+    assert.equal(result, staged);
+    assert.equal(readFileSync(join(staged, "packages", "installer", "dist", "cli.js"), "utf8"), "candidate\n");
+    assert.equal(existsSync(join(staged, ".git")), false);
+    assert.equal(existsSync(join(staged, "local-notes.txt")), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(staged, ".tweakers-provenance.json"), "utf8")), {
+      kind: "development-bootstrap",
+      sourceRuntimeHash: "candidate-hash",
+      installedAt: "2026-07-24T00:00:00.000Z",
+    });
+    assert.equal(lstatSync(join(staged, "node_modules", ".bin", "example-tool")).isSymbolicLink(), true);
+    assert.equal(
+      readFileSync(join(staged, "node_modules", ".bin", "example-tool"), "utf8"),
+      "tool\n",
+      "a valid internal relative link remains usable",
+    );
+    for (const relative of [
+      join("node_modules", "absolute-source-link"),
+      join("node_modules", "escaping-link"),
+      join("node_modules", "broken-link"),
+    ]) {
+      assert.throws(
+        () => lstatSync(join(staged, relative)),
+        /ENOENT/,
+        `${relative} must not survive standalone staging`,
+      );
+    }
+    assert.equal(readFileSync(join(live, "sentinel.txt"), "utf8"), "live runtime remains untouched\n");
+  });
+});
+
 test("Windows watcher task names keep the current interval and documented legacy aliases", () => {
   assert.deepEqual(currentWindowsWatcherTaskNames(), [
     "tweaker-watcher",
@@ -685,7 +746,8 @@ test("staging preserves dev symlinks into the configured source root only", () =
 test("watcher repair reconciles dev tweaks in both intact and reinstall paths", () => {
   const source = readFileSync(new URL("../src/commands/repair.ts", import.meta.url), "utf8");
 
-  assert.match(source, /cleanupStaleHelperGeneration\(codex\.appRoot, opts(?:, dependencies)?\);\s*\n\s*syncDevTweaks\(/);
+  assert.doesNotMatch(source, /cleanupStaleHelperGeneration/);
+  assert.doesNotMatch(source, /terminateStaleHelperProcesses/);
   assert.match(source, /coordinatedQuit,\s*\n\s*reconcileCliShims: false,\s*\n\s*\}\);\s*\n\s*syncDevTweaks\(/);
   assert.match(source, /stageBundledTweaks\)\(paths\.tweaks, paths\.runtime, \{\s*\n\s*devTweaksRoot: readDevTweaksRoot\(paths\.configFile\)/);
 });

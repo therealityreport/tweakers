@@ -3,9 +3,11 @@ import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   createDesktopUpdateTransaction,
+  isTerminalDesktopUpdatePhase,
   type DesktopUpdateReceipt,
   type DesktopUpdateTransaction,
 } from "../desktop-update-transaction.js";
+import { processAlive } from "../process-lock.js";
 
 export interface UpdateCodexOptions {
   app?: string;
@@ -58,7 +60,7 @@ export function codexUpdateStatus(
   deps: UpdateCodexCommandDeps = DEFAULT_DEPS,
 ): DesktopUpdateReceipt | null {
   const receipt = deps.createTransaction(opts).status();
-  if (receipt) printReceipt(receipt, opts, deps);
+  if (receipt) printReceipt(receipt, opts, deps, { annotateOwner: true });
   else if (opts.json) deps.print(JSON.stringify({ schemaVersion: 1, kind: "desktop-update", transactionId: null, phase: "idle" }));
   else deps.print(kleur.dim("No desktop Update and Reload transaction has started."));
   return receipt;
@@ -86,9 +88,16 @@ function printReceipt(
   receipt: DesktopUpdateReceipt,
   opts: UpdateCodexOptions,
   deps: UpdateCodexCommandDeps,
+  options: { annotateOwner?: boolean } = {},
 ): void {
+  // Presentation-layer only: ownerAlive is never persisted into the receipt,
+  // so durable evidence and receipt validators are untouched. Null for
+  // terminal receipts, where owner liveness is meaningless.
+  const ownerAlive = options.annotateOwner === true
+    ? (isTerminalDesktopUpdatePhase(receipt.phase) ? null : processAlive(receipt.ownerPid))
+    : undefined;
   if (opts.json) {
-    deps.print(JSON.stringify(receipt));
+    deps.print(JSON.stringify(ownerAlive === undefined ? receipt : { ...receipt, ownerAlive }));
     return;
   }
   const tone = receipt.phase === "completed" ? kleur.green
@@ -96,5 +105,18 @@ function printReceipt(
     : kleur.cyan;
   deps.print(tone(`Desktop Update and Reload: ${receipt.phase}`));
   deps.print(kleur.dim(`Transaction ${receipt.transactionId}`));
+  if (ownerAlive === false) {
+    deps.print(kleur.red(
+      `Owner process ${receipt.ownerPid} exited before this update reached a terminal phase — `
+      + "recovery required (run update-chatgpt-cancel).",
+    ));
+  }
+  // A receipt's terminal timestamp exists only once it IS terminal; never
+  // label updatedAt as terminal for an in-flight receipt.
+  if (typeof receipt.terminalAt === "string") {
+    deps.print(kleur.dim(`Terminal at ${receipt.terminalAt}`));
+  } else {
+    deps.print(kleur.dim(`Last update at ${receipt.updatedAt}`));
+  }
   if (receipt.error) deps.print(kleur.yellow(receipt.error));
 }

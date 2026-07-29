@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   commandExecutesInsideBundle,
@@ -156,4 +157,10 @@ test("terminateStaleHelperProcesses is a no-op off darwin, else scans safely", (
   // Either platform: a nonexistent root must never signal anything.
   assert.deepEqual(result.terminated, []);
   assert.equal(result.scanned, 0);
+});
+
+test("the compatibility observer contains no process-signal path", () => {
+  const source = readFileSync(new URL("../src/orphans.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /process\.kill\s*\(/);
+  assert.doesNotMatch(source, /os\.kill\s*\(/);
 });

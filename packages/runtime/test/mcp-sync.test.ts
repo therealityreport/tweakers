@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   buildManagedMcpBlock,
@@ -9,9 +9,8 @@ import {
   MCP_MANAGED_START,
   mcpServerNameFromTweakId,
   planManagedMcpReconciliation,
-  planUserQuestionsApprovalPolicy,
   syncManagedMcpServers,
-  USER_QUESTIONS_APPROVAL_POLICY,
+  RESERVED_MANAGED_MCP_ENV_KEYS,
 } from "../src/mcp-sync";
 
 const MALFORMED_TOML_FIXTURE = [
@@ -53,7 +52,74 @@ test("buildManagedMcpBlock creates TOML entries and resolves local server script
     assert.match(built.block, /\[mcp_servers\.co-bennett-native-widgets\]/);
     assert.match(built.block, /command = "node"/);
     assert.match(built.block, new RegExp(`args = \\["${escapeRegExp(join(tweakDir, "mcp-server.js"))}"\\]`));
-    assert.match(built.block, /env = \{ WIDGETS = "1" \}/);
+    assert.match(built.block, /env = \{ WIDGETS = "1", TWEAKER_TWEAK_DATA_DIR = .*TWEAKER_TWEAK_ID = "co\.bennett\.native-widgets" \}/);
+  });
+});
+
+test("managed MCP formatting injects reserved tweak identity and data directory without mutating manifests", () => {
+  withTempDir((root) => {
+    const tweakDir = join(root, "tweaks", "co.tweakers.example");
+    mkdirSync(tweakDir, { recursive: true });
+    const mcp = { command: "node", env: { DECLARED: "kept" } };
+    const built = buildManagedMcpBlock([{
+      dir: tweakDir,
+      manifest: { id: "co.tweakers.example", mcp },
+    }]);
+    const expectedDataDir = resolve(tweakDir, "..", "..", "tweak-data", "co.tweakers.example");
+    assert.match(built.block, /DECLARED = "kept"/);
+    assert.match(built.block, new RegExp(`TWEAKER_TWEAK_DATA_DIR = "${escapeRegExp(expectedDataDir)}"`));
+    assert.match(built.block, /TWEAKER_TWEAK_ID = "co\.tweakers\.example"/);
+    assert.deepEqual(mcp.env, { DECLARED: "kept" });
+    assert.deepEqual(RESERVED_MANAGED_MCP_ENV_KEYS, ["TWEAKER_TWEAK_DATA_DIR", "TWEAKER_TWEAK_ID"]);
+  });
+});
+
+test("managed MCP formatting rejects manifest overrides of reserved environment variables", () => {
+  for (const reserved of RESERVED_MANAGED_MCP_ENV_KEYS) {
+    assert.throws(() => buildManagedMcpBlock([{
+      dir: "/tmp/tweaks/co.tweakers.example",
+      manifest: {
+        id: "co.tweakers.example",
+        mcp: { command: "node", env: { [reserved]: "override" } },
+      },
+    }]), new RegExp(`${reserved}.*reserved`, "i"));
+  }
+});
+
+test("exact legacy ownership comparison ignores only correct runtime-reserved injection", () => {
+  withTempDir((root) => {
+    const tweakDir = join(root, "tweaks", "co.tweakers.user-questions");
+    mkdirSync(tweakDir, { recursive: true });
+    writeFileSync(join(tweakDir, "mcp-server.js"), "");
+    const dataDir = resolve(tweakDir, "..", "..", "tweak-data", "co.tweakers.user-questions");
+    const exactLegacy = [
+      "[mcp_servers.co-thomashulihan-user-questions]",
+      'command = "node"',
+      `args = [${JSON.stringify(join(tweakDir, "mcp-server.js"))}]`,
+      `env = { TWEAKER_TWEAK_DATA_DIR = ${JSON.stringify(dataDir)}, TWEAKER_TWEAK_ID = "co.tweakers.user-questions" }`,
+      "",
+    ].join("\n");
+    const tweak = {
+      dir: tweakDir,
+      manifest: {
+        id: "co.tweakers.user-questions",
+        mcp: { command: "node", args: ["mcp-server.js"] },
+      },
+    };
+    const migrated = planManagedMcpReconciliation([tweak], exactLegacy);
+    assert.deepEqual(migrated.conflicts, []);
+    assert.deepEqual(migrated.migrations, [{
+      from: "co-thomashulihan-user-questions",
+      to: "co-tweakers-user-questions",
+    }]);
+
+    const tampered = exactLegacy.replace(dataDir, `${dataDir}-tampered`);
+    const rejected = planManagedMcpReconciliation([tweak], tampered);
+    assert.deepEqual(rejected.conflicts, [{
+      observedName: "co-thomashulihan-user-questions",
+      canonicalName: "co-tweakers-user-questions",
+      reason: "legacy-shape-mismatch",
+    }]);
   });
 });
 
@@ -229,6 +295,7 @@ test("planManagedMcpReconciliation adopts an exact manual canonical entry idempo
       "[mcp_servers.co-tweakers-user-questions]",
       'command = "node"',
       `args = [${JSON.stringify(serverPath)}]`,
+      `env = { TWEAKER_TWEAK_DATA_DIR = ${JSON.stringify(resolve(root, "..", "..", "tweak-data", "co.tweakers.user-questions"))}, TWEAKER_TWEAK_ID = "co.tweakers.user-questions" }`,
       "",
     ].join("\n");
     const tweaks = [{
@@ -256,14 +323,17 @@ test("planManagedMcpReconciliation adopts an exact manual canonical entry idempo
   });
 });
 
-test("exact canonical adoption keeps the managed approval policy outside MCP markers and idempotent", () => {
+test("exact canonical adoption keeps the user's approval policy byte-stable and idempotent", () => {
   withTempDir((root) => {
     const serverPath = join(root, "mcp-server.js");
     writeFileSync(serverPath, "");
     const current = [
+      'approval_policy = "never" # user-owned exact bytes',
+      "",
       "[mcp_servers.co-tweakers-user-questions]",
       'command = "node"',
       `args = [${JSON.stringify(serverPath)}]`,
+      `env = { TWEAKER_TWEAK_DATA_DIR = ${JSON.stringify(resolve(root, "..", "..", "tweak-data", "co.tweakers.user-questions"))}, TWEAKER_TWEAK_ID = "co.tweakers.user-questions" }`,
       "",
     ].join("\n");
     const tweaks = [{
@@ -275,29 +345,13 @@ test("exact canonical adoption keeps the managed approval policy outside MCP mar
     }];
 
     const adopted = planManagedMcpReconciliation(tweaks, current);
-    const policy = planUserQuestionsApprovalPolicy({
-      currentToml: current,
-      candidateToml: adopted.nextToml,
-      owned: true,
-      enabled: true,
-      preserved: null,
-    });
+    assert.ok(adopted.nextToml.indexOf('approval_policy = "never" # user-owned exact bytes') >= 0);
+    assert.ok(adopted.nextToml.indexOf('approval_policy = "never" # user-owned exact bytes') < adopted.nextToml.indexOf(MCP_MANAGED_START));
 
-    assert.ok(policy.nextToml.indexOf(USER_QUESTIONS_APPROVAL_POLICY) >= 0);
-    assert.ok(policy.nextToml.indexOf(USER_QUESTIONS_APPROVAL_POLICY) < policy.nextToml.indexOf(MCP_MANAGED_START));
-
-    const repeatedMcp = planManagedMcpReconciliation(tweaks, policy.nextToml);
-    const repeatedPolicy = planUserQuestionsApprovalPolicy({
-      currentToml: policy.nextToml,
-      candidateToml: repeatedMcp.nextToml,
-      owned: true,
-      enabled: true,
-      preserved: policy.preserved,
-    });
+    const repeatedMcp = planManagedMcpReconciliation(tweaks, adopted.nextToml);
 
     assert.equal(repeatedMcp.changed, false);
-    assert.equal(repeatedPolicy.nextToml, policy.nextToml);
-    assert.equal(repeatedPolicy.receipt.restartRequired, false);
+    assert.equal(repeatedMcp.nextToml, adopted.nextToml);
   });
 });
 

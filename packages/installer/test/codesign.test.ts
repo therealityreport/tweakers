@@ -54,6 +54,7 @@ test("strict portable signing keeps privacy entitlements with library validation
     "com.apple.developer.team-identifier": "TEAM",
     "com.apple.security.application-groups": ["TEAM.group"],
     "keychain-access-groups": ["TEAM.com.openai.codex"],
+    "com.apple.developer.aps-environment": "production",
     "com.apple.security.cs.disable-library-validation": true,
   };
   const strictByDefault = portableEntitlements(original);
@@ -71,6 +72,7 @@ test("contained portable signing keeps library validation disabled", () => {
   assert.deepEqual(portableEntitlements({
     "com.apple.security.automation.apple-events": true,
     "com.apple.application-identifier": "TEAM.com.openai.codex",
+    "com.apple.developer.aps-environment": "production",
   }, "contained"), {
     "com.apple.security.automation.apple-events": true,
     "com.apple.security.cs.disable-library-validation": true,

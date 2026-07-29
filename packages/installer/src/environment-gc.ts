@@ -215,6 +215,13 @@ function collectSnapshot(
     if (retainedRollbackTransactionId === transactionId) {
       return [{ ...base, action: "keep", reason: "newest committed rollback candidate" }];
     }
+    if (hasUnconsumedRollbackEvidence(receipt)) {
+      return [{
+        ...base,
+        action: "keep",
+        reason: "failed transaction still owns the only copy of its rollback evidence",
+      }];
+    }
     const evidenceError = preparedEvidencePathError(receipt, preparedPath);
     if (evidenceError) return [{ ...base, action: "keep", reason: evidenceError }];
     if (size.error) return [{ ...base, action: "keep", reason: size.error }];
@@ -226,6 +233,20 @@ function collectSnapshot(
     currentTransactionId: currentReceipt?.transactionId ?? null,
     retainedRollbackTransactionId,
   };
+}
+
+/**
+ * `failed` is terminal but not necessarily finished: a transaction that failed
+ * without ever applying or rolling back still has recovery ahead of it, and its
+ * prepared directory holds the only rollback bytes. Collecting those would turn
+ * a recoverable receipt into a permanently stuck one.
+ */
+function hasUnconsumedRollbackEvidence(receipt: EnvironmentTransactionReceipt): boolean {
+  return receipt.phase === "failed"
+    && receipt.prepared !== null
+    && receipt.applied === null
+    && receipt.rolledBackAt === null
+    && receipt.committedAt === null;
 }
 
 function latestCommittedReceipt(receipts: EnvironmentTransactionReceipt[]): EnvironmentTransactionReceipt | null {
@@ -244,6 +265,18 @@ function preparedEvidencePathError(receipt: EnvironmentTransactionReceipt, prepa
     receipt.prepared.backend.artifactPath,
     receipt.prepared.rollback.desktopArtifactPath,
     receipt.prepared.rollback.backendArtifactPath,
+    ...(receipt.prepared.runtime
+      ? [
+          receipt.prepared.runtime.requested.artifactPath,
+          receipt.prepared.runtime.rollback.artifactPath,
+        ]
+      : []),
+    ...(receipt.prepared.managedRuntime
+      ? [
+          receipt.prepared.managedRuntime.requested.artifactPath,
+          receipt.prepared.managedRuntime.rollback.artifactPath,
+        ]
+      : []),
   ];
   return paths.every((path) => exactDescendant(preparedRoot, path))
     ? null

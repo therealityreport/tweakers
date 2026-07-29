@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
+import { isMacOsJunkName } from "./fs-copy.js";
 
 export const RUNTIME_FINGERPRINT_FILE = "runtime-fingerprint.json";
 
@@ -29,6 +30,9 @@ export function computeRuntimeFingerprint(runtimeRoot: string): RuntimeTreeFinge
 
   const walk = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      // Junk skip must stay in lockstep with runtime/src/watcher-health.ts and
+      // scripts/copy-assets.mjs — all three must produce identical fingerprints.
+      if (isMacOsJunkName(entry.name)) continue;
       const path = join(directory, entry.name);
       const name = relative(runtimeRoot, path);
       if (name === RUNTIME_FINGERPRINT_FILE) continue;
@@ -48,7 +52,7 @@ export function computeRuntimeFingerprint(runtimeRoot: string): RuntimeTreeFinge
   return { fingerprint: hash.digest("hex"), fileCount };
 }
 
-export function readRuntimeFingerprint(runtimeRoot: string): string | null {
+export function readRuntimeFingerprintEvidence(runtimeRoot: string): RuntimeTreeFingerprint | null {
   try {
     const value = JSON.parse(readFileSync(join(runtimeRoot, RUNTIME_FINGERPRINT_FILE), "utf8")) as Partial<RuntimeFingerprintDocument>;
     if (
@@ -60,11 +64,15 @@ export function readRuntimeFingerprint(runtimeRoot: string): string | null {
     ) return null;
     const actual = computeRuntimeFingerprint(runtimeRoot);
     return actual.fingerprint === value.fingerprint && actual.fileCount === value.fileCount
-      ? actual.fingerprint
+      ? actual
       : null;
   } catch {
     return null;
   }
+}
+
+export function readRuntimeFingerprint(runtimeRoot: string): string | null {
+  return readRuntimeFingerprintEvidence(runtimeRoot)?.fingerprint ?? null;
 }
 
 export function decideRuntimeFingerprintRepair(input: {

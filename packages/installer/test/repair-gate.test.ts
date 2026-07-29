@@ -329,7 +329,7 @@ test("unchanged asar without verified active runtime bytes enters repair instead
     assert.equal(counts.header, 1);
     assert.equal(counts.tree, 1);
     assert.equal(counts.settle, 1);
-    assert.equal(counts.processes, 1);
+  assert.equal(counts.processes, 0);
     assert.equal(counts.installs, 0);
     assert.equal(readState(join(root, "state.json"))?.watcherStatGuardPasses, 0);
   });
@@ -354,6 +354,29 @@ test("unchanged asar plus equal runtime fingerprint preserves the zero-tree fast
 
     assert.equal(treeChecks, 0);
     assert.equal(readAutoRepairState(root)?.runtime?.status, "current");
+  });
+});
+
+test("repair reconciles an adopted MCP lifecycle package inside the shared lifecycle lease", async () => {
+  await withTweakersHome(async (root) => {
+    const fixture = makeRepairFixture(root);
+    seedRepairState(root, fixture);
+    let lifecycleReconciliations = 0;
+
+    await repair({ watcher: true, quiet: true }, {
+      reconcileMcpLifecycle: () => {
+        lifecycleReconciliations += 1;
+        assert.equal(existsSync(lifecycleLockFile(root)), true);
+        return null;
+      },
+      statAsar: () => fixture.asarStat,
+      readExpectedRuntimeFingerprint: () => "same",
+      readActiveRuntimeFingerprint: () => "same",
+      isAppRunning: () => true,
+      runtimeAssetsMatch: () => true,
+    });
+
+    assert.equal(lifecycleReconciliations, 1);
   });
 });
 
@@ -503,7 +526,7 @@ test("sixth unchanged asar pass without fingerprints runs bounded heavy verifica
       },
     );
 
-    assert.equal(counts.processes, 1);
+  assert.equal(counts.processes, 0);
     assert.equal(counts.header, 1);
     assert.equal(counts.tree, 1);
     assert.equal(counts.settle, 1);

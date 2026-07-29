@@ -1,5 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.MCP_CANDIDATE_CODEX_HOME_ENV = exports.MCP_CANDIDATE_RECONCILIATION_ENV = void 0;
+exports.userQuestionsMcpReceiptMatchesEnabledState = userQuestionsMcpReceiptMatchesEnabledState;
+exports.resolveMcpRuntimePaths = resolveMcpRuntimePaths;
 exports.reconcileMcpConfig = reconcileMcpConfig;
 exports.createMcpReconciler = createMcpReconciler;
 exports.readMcpSyncState = readMcpSyncState;
@@ -10,11 +13,147 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const node_util_1 = require("node:util");
 const mcp_sync_1 = require("./mcp-sync");
+function userQuestionsMcpReceiptMatchesEnabledState(receipt, enabled) {
+    if (receipt.status === "conflict"
+        || receipt.status === "error"
+        || receipt.conflicts.length !== 0
+        || receipt.approvalPolicy.status !== "unchanged"
+        || receipt.approvalPolicy.beforeRaw !== receipt.approvalPolicy.afterRaw
+        || receipt.approvalPolicy.sandboxModeBeforeRaw !== receipt.approvalPolicy.sandboxModeAfterRaw
+        || receipt.approvalPolicy.restartRequired)
+        return false;
+    const desiredCount = receipt.desiredNames.filter((name) => name === mcp_sync_1.USER_QUESTIONS_MCP_SERVER_NAME).length;
+    const appliedCount = receipt.appliedNames.filter((name) => name === mcp_sync_1.USER_QUESTIONS_MCP_SERVER_NAME).length;
+    if (!enabled)
+        return desiredCount === 0 && appliedCount === 0;
+    return desiredCount === 1
+        && appliedCount === 1;
+}
+exports.MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
+exports.MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+/**
+ * Resolve the only MCP config and receipt paths the desktop reconciler may use.
+ *
+ * Ordinary launches intentionally retain the historical ~/.codex/config.toml
+ * behavior, even when CODEX_HOME happens to be present. A disposable candidate
+ * must explicitly opt in and supply an exact CODEX_HOME below its exact,
+ * non-symlink Tweakers user root. Existing symlink components, the real
+ * ~/.codex tree, and paths outside the candidate root fail closed before a
+ * watcher or reconciler can be created.
+ */
+function resolveMcpRuntimePaths(options) {
+    const env = options.env ?? process.env;
+    const statePath = (0, node_path_1.join)(options.userRoot, "mcp-sync-state.json");
+    const ordinaryCodexHome = (0, node_path_1.join)(options.homeDirectory, ".codex");
+    const candidateOptIn = env[exports.MCP_CANDIDATE_RECONCILIATION_ENV];
+    if (candidateOptIn === undefined || candidateOptIn === "") {
+        return {
+            codexHome: ordinaryCodexHome,
+            configPath: (0, node_path_1.join)(ordinaryCodexHome, "config.toml"),
+            statePath,
+            candidateIsolated: false,
+        };
+    }
+    if (candidateOptIn !== "1") {
+        throw new Error(`${exports.MCP_CANDIDATE_RECONCILIATION_ENV} must be exactly 1`);
+    }
+    const candidateCodexHome = env[exports.MCP_CANDIDATE_CODEX_HOME_ENV];
+    if (!candidateCodexHome) {
+        throw new Error(`${exports.MCP_CANDIDATE_CODEX_HOME_ENV} is required for candidate MCP reconciliation`);
+    }
+    assertExactAbsolutePath(options.userRoot, "Tweakers candidate user root");
+    assertExactAbsolutePath(candidateCodexHome, "Candidate CODEX_HOME");
+    assertExistingDirectoryWithoutSymlinks(options.userRoot, "Tweakers candidate user root");
+    assertPathHasNoExistingSymlink(candidateCodexHome, "Candidate CODEX_HOME");
+    if (!isStrictDescendant(options.userRoot, candidateCodexHome)) {
+        throw new Error("Candidate CODEX_HOME must be contained under the Tweakers candidate user root");
+    }
+    const resolvedCandidateHome = resolveThroughExistingAncestor(candidateCodexHome);
+    const resolvedOrdinaryHome = resolveThroughExistingAncestor(ordinaryCodexHome);
+    if (resolvedCandidateHome === resolvedOrdinaryHome
+        || isStrictDescendant(resolvedOrdinaryHome, resolvedCandidateHome)
+        || isStrictDescendant(resolvedCandidateHome, resolvedOrdinaryHome)) {
+        throw new Error("Candidate CODEX_HOME must not resolve to or contain the real ~/.codex directory");
+    }
+    if ((0, node_fs_1.existsSync)(candidateCodexHome) && !(0, node_fs_1.lstatSync)(candidateCodexHome).isDirectory()) {
+        throw new Error("Candidate CODEX_HOME must be a directory when it already exists");
+    }
+    const configPath = (0, node_path_1.join)(candidateCodexHome, "config.toml");
+    assertPathHasNoExistingSymlink(configPath, "Candidate Codex config");
+    assertPathHasNoExistingSymlink(statePath, "Candidate MCP receipt");
+    assertRegularFileWhenPresent(configPath, "Candidate Codex config");
+    assertRegularFileWhenPresent(statePath, "Candidate MCP receipt");
+    return {
+        codexHome: candidateCodexHome,
+        configPath,
+        statePath,
+        candidateIsolated: true,
+    };
+}
+function assertExactAbsolutePath(path, label) {
+    if (!path || path.includes("\0") || !(0, node_path_1.isAbsolute)(path) || (0, node_path_1.resolve)(path) !== path) {
+        throw new Error(`${label} must be an exact normalized absolute path`);
+    }
+}
+function assertExistingDirectoryWithoutSymlinks(path, label) {
+    if (!(0, node_fs_1.existsSync)(path) || !(0, node_fs_1.lstatSync)(path).isDirectory()) {
+        throw new Error(`${label} must already exist as a directory`);
+    }
+    if ((0, node_fs_1.lstatSync)(path).isSymbolicLink() || resolveThroughExistingAncestor(path) !== path) {
+        throw new Error(`${label} must not contain symbolic-link components`);
+    }
+}
+function assertPathHasNoExistingSymlink(path, label) {
+    const pathStat = lstatIfPresent(path);
+    if (pathStat?.isSymbolicLink()
+        || resolveThroughExistingAncestor(path) !== path) {
+        throw new Error(`${label} must not contain symbolic-link components`);
+    }
+}
+function assertRegularFileWhenPresent(path, label) {
+    const pathStat = lstatIfPresent(path);
+    if (pathStat && !pathStat.isFile()) {
+        throw new Error(`${label} must be a regular file when it already exists`);
+    }
+    if (pathStat && pathStat.nlink !== 1) {
+        throw new Error(`${label} must not be hard-linked`);
+    }
+}
+function lstatIfPresent(path) {
+    try {
+        return (0, node_fs_1.lstatSync)(path);
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return null;
+        throw error;
+    }
+}
+function resolveThroughExistingAncestor(path) {
+    let ancestor = path;
+    const missing = [];
+    while (!(0, node_fs_1.existsSync)(ancestor)) {
+        const parent = (0, node_path_1.dirname)(ancestor);
+        if (parent === ancestor)
+            break;
+        missing.unshift((0, node_path_1.basename)(ancestor));
+        ancestor = parent;
+    }
+    return (0, node_path_1.resolve)((0, node_fs_1.realpathSync)(ancestor), ...missing);
+}
+function isStrictDescendant(root, candidate) {
+    const remainder = (0, node_path_1.relative)(root, candidate);
+    return remainder.length > 0
+        && remainder !== ".."
+        && !remainder.startsWith(`..${node_path_1.sep}`)
+        && !(0, node_path_1.isAbsolute)(remainder);
+}
 function reconcileMcpConfig(options, dependencies = {}) {
     return (0, mcp_sync_1.withMcpConfigMutationLock)(options.configPath, () => reconcileMcpConfigWithLock(options, dependencies));
 }
 function reconcileMcpConfigWithLock(options, dependencies) {
     const ownedTweaks = options.ownedTweaks ?? options.tweaks;
+    const previousManagedConfigurationChangedAt = readMcpSyncState(options.statePath)?.managedConfigurationChangedAt ?? null;
     let preservedOptions = readPreservedOptions(options.statePath, ownedTweaks);
     const durablePreservedApprovalPolicy = readPreservedApprovalPolicy(options.statePath, options.configPath);
     recoverInterruptedCas(options.configPath);
@@ -59,6 +198,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
                         afterFingerprint: beforeFingerprint,
                         plannedAfterFingerprint: fingerprint(plan.nextToml),
                         restartRequired: false,
+                        managedConfigurationChangedAt: previousManagedConfigurationChangedAt,
                     });
                 }
                 const mode = (0, node_fs_1.existsSync)(options.configPath)
@@ -132,13 +272,17 @@ function reconcileMcpConfigWithLock(options, dependencies) {
         }
         const after = readBytesIfExists(options.configPath);
         const policyTransitionAccepted = !hasPlanConflict(plan) && (appliedPlanChange || !plan.changed);
+        const completedAt = now().toISOString();
+        const managedConfigurationChangedAt = appliedPlanChange || recoveredRetiredEdit
+            ? completedAt
+            : previousManagedConfigurationChangedAt;
         const receipt = {
             schemaVersion: 2,
             phase: "complete",
             transactionId,
             trigger: options.trigger,
             startedAt,
-            completedAt: now().toISOString(),
+            completedAt,
             status: hasPlanConflict(plan)
                 ? "conflict"
                 : appliedPlanChange || recoveredRetiredEdit
@@ -156,18 +300,20 @@ function reconcileMcpConfigWithLock(options, dependencies) {
             beforeFingerprint,
             afterFingerprint: fingerprint(after),
             restartRequired: appliedPlanChange || recoveredRetiredEdit,
+            managedConfigurationChangedAt,
         };
         writeReceipt(options.statePath, receipt);
         return receipt;
     }
     catch (error) {
+        const completedAt = now().toISOString();
         const receipt = {
             schemaVersion: 2,
             phase: "complete",
             transactionId,
             trigger: options.trigger,
             startedAt,
-            completedAt: now().toISOString(),
+            completedAt,
             status: "error",
             desiredNames: plan.desiredNames,
             appliedNames: plan.appliedNames,
@@ -181,6 +327,9 @@ function reconcileMcpConfigWithLock(options, dependencies) {
             beforeFingerprint,
             afterFingerprint: fingerprint(readBytesIfExists(options.configPath)),
             restartRequired: false,
+            managedConfigurationChangedAt: appliedPlanChange || recoveredRetiredEdit
+                ? completedAt
+                : previousManagedConfigurationChangedAt,
             error: error instanceof Error ? error.message : String(error),
         };
         writeReceipt(options.statePath, receipt);
@@ -606,6 +755,9 @@ function readMcpSyncState(statePath) {
         const optionNames = rawOptions && typeof rawOptions === "object" && !Array.isArray(rawOptions)
             ? Object.keys(rawOptions)
             : [];
+        const managedConfigurationChangedAt = normalizedTimestamp(parsed.managedConfigurationChangedAt) ?? (parsed.restartRequired === true
+            ? normalizedTimestamp(parsed.completedAt)
+            : null);
         return {
             ...parsed,
             schemaVersion: 2,
@@ -626,11 +778,18 @@ function readMcpSyncState(statePath) {
             preservedApprovalPolicy: parsed.schemaVersion === 2
                 ? (0, mcp_sync_1.sanitizePreservedApprovalPolicy)(parsed.preservedApprovalPolicy)
                 : null,
+            managedConfigurationChangedAt,
         };
     }
     catch {
         return null;
     }
+}
+function normalizedTimestamp(value) {
+    if (typeof value !== "string")
+        return null;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 function readPreservedApprovalPolicy(statePath, configPath) {
     const state = readMcpSyncState(statePath);
@@ -657,23 +816,16 @@ function fingerprint(value) {
 function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
     const mcpPlan = (0, mcp_sync_1.planManagedMcpReconciliation)(tweaks, currentToml, options);
     const ownedTweaks = options.ownedTweaks ?? tweaks;
-    const approvalPolicyPlan = (0, mcp_sync_1.planUserQuestionsApprovalPolicy)({
-        currentToml,
-        candidateToml: mcpPlan.nextToml,
-        owned: ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions"),
-        enabled: tweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions"),
-        preserved: (0, mcp_sync_1.sanitizePreservedApprovalPolicy)(options.preservedApprovalPolicy),
-    });
+    const preservedApprovalPolicy = (0, mcp_sync_1.sanitizePreservedApprovalPolicy)(options.preservedApprovalPolicy);
+    const approvalPolicy = ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions")
+        ? (0, mcp_sync_1.observeUserQuestionsApprovalPolicy)(currentToml, preservedApprovalPolicy)
+        : mcpPlan.approvalPolicy;
     const plan = {
         ...mcpPlan,
-        nextToml: approvalPolicyPlan.nextToml,
-        approvalPolicy: approvalPolicyPlan.receipt,
-        preservedApprovalPolicy: approvalPolicyPlan.preserved,
-        changed: approvalPolicyPlan.nextToml !== currentToml || mcpPlan.changed,
-        restartRequired: approvalPolicyPlan.nextToml !== currentToml || mcpPlan.restartRequired,
+        approvalPolicy,
+        preservedApprovalPolicy,
     };
-    const policyChanged = approvalPolicyPlan.nextToml !== mcpPlan.nextToml;
-    if (!mcpPlan.changed || policyChanged || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {
+    if (!mcpPlan.changed || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {
         return plan;
     }
     return {

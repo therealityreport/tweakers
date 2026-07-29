@@ -133,6 +133,11 @@ async function loadTweak(t, paths) {
 }
 function makeRendererApi(manifest, paths) {
     const id = manifest.id;
+    const assertIpcPermission = () => {
+        if (!manifest.permissions?.includes("ipc")) {
+            throw new Error(`tweak ${id} must declare ipc permission`);
+        }
+    };
     const log = (level, ...a) => {
         const consoleFn = level === "debug" ? console.debug
             : level === "warn" ? console.warn
@@ -208,12 +213,17 @@ function makeRendererApi(manifest, paths) {
         },
         ipc: {
             on: (c, h) => {
+                assertIpcPermission();
                 const wrapped = (_e, ...args) => h(...args);
                 electron_1.ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
                 return () => electron_1.ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
             },
-            send: (c, ...args) => electron_1.ipcRenderer.send(`tweaker:${id}:${c}`, ...args),
+            send: (c, ...args) => {
+                assertIpcPermission();
+                electron_1.ipcRenderer.send(`tweaker:${id}:${c}`, ...args);
+            },
             invoke: (c, ...args) => {
+                assertIpcPermission();
                 if (id === "co.tweakers.thread-summary-profiles" && c === "profiles.read") {
                     return electron_1.ipcRenderer.invoke("tweaker:cross-tweak-read", id, "co.tweakers.projects", "profiles.read", args[0]);
                 }

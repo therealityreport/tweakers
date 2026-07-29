@@ -19,9 +19,11 @@ import { extract as extractTar, list as listTar } from "tar";
 import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
-import { createMcpReconciler } from "./mcp-reconciliation";
-import { USER_QUESTIONS_APPROVAL_POLICY, USER_QUESTIONS_SANDBOX_MODE } from "./mcp-sync";
-import { getWatcherHealth } from "./watcher-health";
+import {
+  createMcpReconciler,
+  userQuestionsMcpReceiptMatchesEnabledState,
+} from "./mcp-reconciliation";
+import { getAndPublishWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
 import {
   isMainProcessTweakScope,
   bindMainTweakStop,
@@ -356,6 +358,31 @@ interface TweakUpdateCheck {
   releaseUrl: string | null;
   updateAvailable: boolean;
   error?: string;
+}
+
+interface TweakVersionDriftRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  hasMcp: boolean;
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  status: "current" | "drift" | "missing";
+  reason: string;
+}
+
+interface TweakHealthSnapshot {
+  checkedAt: string;
+  catalogCount: number;
+  installedCount: number;
+  enabledCount: number;
+  liveDriftCount: number;
+  runtimeDriftCount: number;
+  missingLiveCount: number;
+  missingRuntimeCount: number;
+  mcpRestartRequired: boolean;
+  rows: TweakVersionDriftRow[];
 }
 
 function readState(): PersistedState {
@@ -1089,6 +1116,8 @@ function inferMacAppRoot(): string | null {
 
 function writeEnvironmentRuntimeProof(): void {
   try {
+    const proofUserRoot = userRoot;
+    if (!proofUserRoot) throw new Error("could not determine the Tweakers user root");
     const appRoot = inferMacAppRoot();
     if (!appRoot) throw new Error("could not infer the exact running app path");
     const state = readInstallerState();
@@ -1105,6 +1134,21 @@ function writeEnvironmentRuntimeProof(): void {
     if (versionProbe.status !== 0) throw new Error("selected backend version probe failed");
     const version = `${versionProbe.stdout ?? ""}${versionProbe.stderr ?? ""}`.trim().split(/\s+/).at(-1) ?? null;
     if (!version) throw new Error("selected backend version is empty");
+    const activeRuntimePath = join(proofUserRoot, "runtime");
+    const activeRuntime = readRuntimeFingerprintEvidence(activeRuntimePath);
+    if (!activeRuntime) throw new Error(`active runtime fingerprint is invalid at ${activeRuntimePath}`);
+    const managedRuntimePath = join(
+      proofUserRoot,
+      "managed-runtime",
+      "current",
+      "packages",
+      "installer",
+      "assets",
+      "runtime",
+    );
+    const managedRuntime = readRuntimeFingerprintEvidence(managedRuntimePath);
+    if (!managedRuntime) throw new Error(`managed runtime fingerprint is invalid at ${managedRuntimePath}`);
+    const managedSourceRuntimeHash = readManagedRuntimeSourceHash(proofUserRoot);
     const proof = {
       schemaVersion: 1,
       kind: "environment-runtime-proof",
@@ -1117,13 +1161,38 @@ function writeEnvironmentRuntimeProof(): void {
       binaryPath,
       backendVersion: version,
       backendFingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"),
+      runtimePath: activeRuntimePath,
+      runtimeFingerprint: activeRuntime.fingerprint,
+      runtimeFileCount: activeRuntime.fileCount,
+      managedRuntimePath,
+      managedRuntimeFingerprint: managedRuntime.fingerprint,
+      managedRuntimeFileCount: managedRuntime.fileCount,
+      managedSourceRuntimeHash,
       observedAt: new Date().toISOString(),
     };
     const temporary = `${ENVIRONMENT_RUNTIME_PROOF_FILE}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(proof, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, ENVIRONMENT_RUNTIME_PROOF_FILE);
   } catch (error) {
+    // A failed startup must never leave a previous process's runtime proof
+    // available for a transaction to mistake as current evidence.
+    try { rmSync(ENVIRONMENT_RUNTIME_PROOF_FILE, { force: true }); } catch {}
     log("error", "environment runtime proof failed", { message: (error as Error).message });
+  }
+}
+
+function readManagedRuntimeSourceHash(root: string): string | null {
+  try {
+    const provenance = JSON.parse(readFileSync(
+      join(root, "managed-runtime", "current", ".tweakers-provenance.json"),
+      "utf8",
+    )) as { sourceRuntimeHash?: unknown };
+    return typeof provenance.sourceRuntimeHash === "string"
+      && /^[a-f0-9]{64}$/i.test(provenance.sourceRuntimeHash)
+      ? provenance.sourceRuntimeHash
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1238,6 +1307,7 @@ const tweakState = {
   discovered: [] as DiscoveredTweak[],
   loadedMain: new Map<string, LoadedMainTweak>(),
 };
+const mainIpcHandlerRegistrations = new Map<string, symbol>();
 
 // Candidate health probes run from a disposable user root and must remain
 // observational. In particular, they must never watch or reconcile the real
@@ -1245,8 +1315,8 @@ const tweakState = {
 const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   configPath: CODEX_CONFIG_FILE,
   statePath: MCP_SYNC_STATE_FILE,
-  getTweaks: () => tweakState.discovered.filter((tweak) => isTweakEnabled(tweak.manifest.id)),
-  getOwnedTweaks: () => tweakState.discovered,
+  getTweaks: () => mcpSyncTweaks(true),
+  getOwnedTweaks: () => mcpSyncTweaks(false),
   onReceipt: (receipt) => {
     const summary = receipt.conflicts.length > 0
       ? receipt.conflicts.map((conflict) => (
@@ -1261,6 +1331,16 @@ const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
   onError: (error) => log("warn", "failed to reconcile Codex MCP config:", error),
 });
 let initialMcpReconciliationPending = true;
+
+function mcpSyncTweaks(enabledOnly: boolean) {
+  return tweakState.discovered
+    .filter((tweak) => !enabledOnly || isTweakEnabled(tweak.manifest.id))
+    .map((tweak) => ({
+      dir: tweak.dir,
+      dataDir: join(userRoot!, "tweak-data", tweak.manifest.id),
+      manifest: tweak.manifest,
+    }));
+}
 
 const nativeBridge = new NativeBridge(log, {
   nativeHostPath: resolveRuntimeNativeHostPath({
@@ -1490,6 +1570,7 @@ ipcMain.handle("tweaker:list-tweaks", async () => {
     };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 });
+ipcMain.handle("tweaker:get-tweaks-health", () => buildTweakHealthSnapshot());
 ipcMain.on("tweaker:tweak-lifecycle", (_event, payload: unknown) => {
   if (!payload || typeof payload !== "object") return;
   const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown };
@@ -2076,6 +2157,7 @@ ipcMain.handle("tweaker:get-environment-transaction", async (_e, ...args: unknow
 
 ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
   assertEnvironmentRequest(payload);
+  await buildDevelopmentEnvironmentControlPlane();
   if (payload.appExperience === "tweakers" && payload.releaseProfile === "alpha") {
     await ensureManagedAlphaEnvironmentBackend();
   }
@@ -2117,6 +2199,20 @@ ipcMain.handle("tweaker:rollback-environment", async (_e, payload: unknown) => {
   return runInstalledCliJson([
     "environment",
     "rollback",
+    "--transaction",
+    payload.transactionId,
+    "--json",
+  ], ENVIRONMENT_PREPARE_TIMEOUT_MS);
+});
+
+// Recovery resolves a stranded receipt from live proof without replacing any
+// bytes, so it is the safe action to offer in the UI; rollback stays available
+// for callers that specifically want the recorded payload restored.
+ipcMain.handle("tweaker:recover-environment", async (_e, payload: unknown) => {
+  assertEnvironmentTransactionRequest(payload);
+  return runInstalledCliJson([
+    "environment",
+    "recover",
     "--transaction",
     payload.transactionId,
     "--json",
@@ -2188,7 +2284,7 @@ ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "
   return { started: true, status: { ...status, phase: "preparing" } };
 });
 
-ipcMain.handle("tweaker:get-watcher-health", () => getWatcherHealth(userRoot!));
+ipcMain.handle("tweaker:get-watcher-health", () => getAndPublishWatcherHealth(userRoot!));
 ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
   const cli = localRefreshCli();
@@ -2514,15 +2610,11 @@ async function loadAllMainTweaks(): Promise<void> {
 
   const mcpTrigger = initialMcpReconciliationPending ? "startup" : "tweak-reload";
   initialMcpReconciliationPending = false;
-  let userQuestionsPolicyReady = false;
+  let userQuestionsMcpReady = false;
   if (mcpReconciler) {
     try {
       const receipt = await mcpReconciler.reconcileNow(mcpTrigger);
-      userQuestionsPolicyReady = receipt.status !== "conflict"
-        && receipt.status !== "error"
-        && receipt.approvalPolicy.status !== "conflict"
-        && receipt.approvalPolicy.afterRaw === USER_QUESTIONS_APPROVAL_POLICY
-        && receipt.approvalPolicy.sandboxModeAfterRaw === USER_QUESTIONS_SANDBOX_MODE;
+      userQuestionsMcpReady = userQuestionsMcpReceiptMatchesEnabledState(receipt, true);
     } catch (error) {
       log("error", "MCP reconciliation failed before main tweak startup:", error);
     }
@@ -2535,8 +2627,8 @@ async function loadAllMainTweaks(): Promise<void> {
       log("info", `skipping disabled main tweak: ${t.manifest.id}`);
       continue;
     }
-    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsPolicyReady) {
-      const error = "authoritative approval policy reconciliation did not complete";
+    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsMcpReady) {
+      const error = "canonical User Questions MCP reconciliation did not complete";
       recordTweakLifecycle(t.manifest.id, "main", "failed", error);
       recordTweakHealth(t.manifest.id, "failed", error);
       log("error", `skipping User Questions main migration: ${error}`);
@@ -2553,7 +2645,7 @@ async function loadAllMainTweaks(): Promise<void> {
           process: "main",
           log: makeLogger(t.manifest.id),
           storage,
-          ipc: makeMainIpc(t.manifest.id),
+          ipc: makeMainIpc(t),
           fs: makeMainFs(t.manifest.id),
           codex: makeCodexApi(t),
         });
@@ -2764,6 +2856,106 @@ function readBundledTweakCatalog(): TweakStoreRegistry | null {
     log("warn", "failed to read bundled Tweakers catalog:", String(error));
     return null;
   }
+}
+
+function buildTweakHealthSnapshot(): TweakHealthSnapshot {
+  const catalog = readBundledTweakCatalog();
+  const catalogEntries = catalog?.entries ?? [];
+  const discoveredById = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
+  const mcpState = mcpReconciler?.readState() as { restartRequired?: boolean } | null | undefined;
+  const rows = catalogEntries.map((entry) => {
+    const local = discoveredById.get(entry.id);
+    const liveVersion = local?.manifest.version ?? readManifestVersion(join(TWEAKS_DIR, liveTweakFolder(entry), "manifest.json"));
+    const runtimeVersion = readRuntimeTweakVersion(entry);
+    const catalogVersion = entry.manifest.version ?? null;
+    const liveMatches = liveVersion !== null && catalogVersion !== null && normalizeVersion(liveVersion) === normalizeVersion(catalogVersion);
+    const runtimeMatches = runtimeVersion !== null && catalogVersion !== null && normalizeVersion(runtimeVersion) === normalizeVersion(catalogVersion);
+    const hasMcp = Boolean((entry.manifest as TweakManifest & { mcp?: unknown }).mcp);
+    const enabled = local ? isTweakEnabled(entry.id) : false;
+    const status: TweakVersionDriftRow["status"] =
+      liveVersion === null || runtimeVersion === null ? "missing" :
+        liveMatches && runtimeMatches ? "current" : "drift";
+    return {
+      id: entry.id,
+      name: entry.manifest.name,
+      enabled,
+      hasMcp,
+      liveVersion,
+      runtimeVersion,
+      catalogVersion,
+      status,
+      reason: tweakVersionDriftReason({
+        liveVersion,
+        runtimeVersion,
+        catalogVersion,
+        liveMatches,
+        runtimeMatches,
+      }),
+    };
+  });
+  const liveDriftCount = rows.filter((row) =>
+    row.liveVersion !== null &&
+    row.catalogVersion !== null &&
+    normalizeVersion(row.liveVersion) !== normalizeVersion(row.catalogVersion)
+  ).length;
+  const runtimeDriftCount = rows.filter((row) =>
+    row.runtimeVersion !== null &&
+    row.catalogVersion !== null &&
+    normalizeVersion(row.runtimeVersion) !== normalizeVersion(row.catalogVersion)
+  ).length;
+  return {
+    checkedAt: new Date().toISOString(),
+    catalogCount: catalogEntries.length,
+    installedCount: tweakState.discovered.length,
+    enabledCount: tweakState.discovered.filter((t) => isTweakEnabled(t.manifest.id)).length,
+    liveDriftCount,
+    runtimeDriftCount,
+    missingLiveCount: rows.filter((row) => row.liveVersion === null).length,
+    missingRuntimeCount: rows.filter((row) => row.runtimeVersion === null).length,
+    mcpRestartRequired: mcpState?.restartRequired === true,
+    rows,
+  };
+}
+
+function liveTweakFolder(entry: TweakStoreEntry): string {
+  if (entry.source?.kind === "bundled") return entry.source.path.split("/").pop() ?? entry.id;
+  return entry.id;
+}
+
+function readRuntimeTweakVersion(entry: TweakStoreEntry): string | null {
+  if (entry.source?.kind !== "bundled") return null;
+  try {
+    return readManifestVersion(join(resolveBundledTweakPath(runtimeDir!, entry), "manifest.json"));
+  } catch {
+    return null;
+  }
+}
+
+function readManifestVersion(manifestPath: string): string | null {
+  try {
+    if (!existsSync(manifestPath)) return null;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Partial<TweakManifest>;
+    return typeof manifest.version === "string" ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function tweakVersionDriftReason(input: {
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  liveMatches: boolean;
+  runtimeMatches: boolean;
+}): string {
+  if (!input.catalogVersion) return "No catalog version is available.";
+  if (!input.liveVersion) return "Live installed copy is missing.";
+  if (!input.runtimeVersion) return "Bundled runtime copy is missing.";
+  const stale: string[] = [];
+  if (!input.liveMatches) stale.push(`live ${input.liveVersion}`);
+  if (!input.runtimeMatches) stale.push(`runtime ${input.runtimeVersion}`);
+  if (stale.length) return `${stale.join(" and ")} differs from latest stored ${input.catalogVersion}.`;
+  return "Live and runtime copies match the latest stored version.";
 }
 
 function restrictRegistryToBundledCatalog(registry: TweakStoreRegistry): TweakStoreRegistry {
@@ -3249,14 +3441,79 @@ function startCodexDesktopUpdateTransaction(): void {
   startInstalledCli(cli, ["update-chatgpt", "--json"]);
 }
 
-function desktopUpdateCli(): string {
-  const cli = localRefreshCli();
+function desktopUpdateCli(status?: LocalRefreshStatusValue): string {
+  const cli = localRefreshCli(status);
   if (!existsSync(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
   return cli;
 }
 
-function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
-  const cli = desktopUpdateCli();
+let environmentDevelopmentBuildInFlight: Promise<void> | null = null;
+
+async function buildDevelopmentEnvironmentControlPlane(): Promise<void> {
+  const status = await localRefreshStatus();
+  if (status.source !== "development" || !status.developmentSourceRoot) return;
+  if (environmentDevelopmentBuildInFlight) return environmentDevelopmentBuildInFlight;
+  const sourceRoot = realpathSync(status.developmentSourceRoot);
+  const packageFile = join(sourceRoot, "package.json");
+  if (!existsSync(packageFile)) {
+    throw new Error("The registered Tweakers development checkout is unavailable");
+  }
+  environmentDevelopmentBuildInFlight = new Promise<void>((resolvePromise, rejectPromise) => {
+    const command = process.platform === "win32" ? "npm.cmd" : "npm";
+    const child = spawn(command, ["run", "build"], {
+      cwd: sourceRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let outputBytes = 0;
+    let settled = false;
+    const finish = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      operation();
+    };
+    const capture = (chunk: Buffer): void => {
+      if (settled) return;
+      outputBytes += chunk.byteLength;
+      output = `${output}${chunk.toString()}`.slice(-8_000);
+      if (outputBytes > 16 * 1024 * 1024) {
+        child.kill("SIGTERM");
+        finish(() => rejectPromise(new Error("Tweakers development build output exceeded the limit")));
+      }
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.once("error", (error) => finish(() => rejectPromise(error)));
+    child.once("close", (code, signal) => finish(() => {
+      if (code !== 0) {
+        rejectPromise(new Error(
+          `Tweakers development build failed with ${signal ? `signal ${signal}` : `status ${code ?? "unknown"}`}`
+          + `${output.trim() ? `: ${output.trim()}` : ""}`,
+        ));
+        return;
+      }
+      const cli = join(sourceRoot, "packages", "installer", "dist", "cli.js");
+      if (!existsSync(cli)) {
+        rejectPromise(new Error("Tweakers development build did not produce its installer CLI"));
+        return;
+      }
+      resolvePromise();
+    }));
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => rejectPromise(new Error("Tweakers development build timed out")));
+    }, 10 * 60_000);
+  }).finally(() => {
+    environmentDevelopmentBuildInFlight = null;
+  });
+  return environmentDevelopmentBuildInFlight;
+}
+
+async function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
+  const status = await localRefreshStatus();
+  const cli = desktopUpdateCli(status);
   const runtime = localCliRuntime(cli, args);
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(runtime.command, runtime.args, {
@@ -3293,15 +3550,29 @@ function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknow
     child.stderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
     child.once("error", (error) => finish(() => rejectPromise(error)));
     child.once("close", (code) => finish(() => {
+      let parsed: unknown;
+      let parseFailed = false;
+      try {
+        parsed = JSON.parse(stdout.trim());
+      } catch {
+        parseFailed = true;
+      }
       if (code !== 0) {
+        // A durable receipt on stdout is the diagnosis; the non-zero exit only
+        // says the action did not reach its success phase. Keep the receipt so
+        // the renderer can surface why, rather than a generic failure.
+        if (!parseFailed) {
+          resolvePromise(parsed);
+          return;
+        }
         rejectPromise(new Error(stderr.trim() || `Tweakers CLI exited with status ${code ?? "unknown"}`));
         return;
       }
-      try {
-        resolvePromise(JSON.parse(stdout.trim()));
-      } catch {
+      if (parseFailed) {
         rejectPromise(new Error(`Tweakers CLI returned invalid JSON for ${args[0] ?? "command"}`));
+        return;
       }
+      resolvePromise(parsed);
     }));
   });
 }
@@ -3448,37 +3719,75 @@ function localRefreshCli(status?: { source?: string; developmentSourceRoot?: str
 }
 
 // This launchd helper runs the installer CLI, which must outlive the app's own
-// bundle swap. It deliberately uses launchctl submit instead of app.relaunch(),
-// which cannot outlive replacing the running executable; the per-PID label and
-// EXIT trap's launchctl remove/bootout make the transient job self-remove.
+// bundle swap AND the app's own termination. It deliberately avoids both
+// app.relaunch() (cannot outlive replacing the running executable) and
+// `launchctl submit` from the app process: LaunchServices records submitted
+// jobs as the submitting application's "one-shot jobs" and the Dock's quit
+// support UNLOADS them when that app terminates — which killed a coordinator
+// mid-commit the moment it quit the app for cutover (observed 2026-07-29:
+// `_LSForceQuitApplication: Unloading one-shot jobs for application "ChatGPT"`).
+// A plist bootstrapped into the gui domain is a plain domain service with no
+// application attribution, so it survives the app quitting; the per-PID label
+// and EXIT trap's bootout + plist removal make the transient job self-remove.
 function startInstalledCliWithLaunchd(cli: string, args: string[]): boolean {
   const label = `com.therealityreport.tweakers.patch-helper.${process.pid}.${Date.now()}`;
-  const cleanup = `launchctl remove ${label} >/dev/null 2>&1 || launchctl bootout gui/$(id -u)/${label} >/dev/null 2>&1 || true`;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null) return false;
+  const plistPath = join(tmpdir(), `${label}.plist`);
+  // rm BEFORE bootout: booting out a running service SIGTERMs the very shell
+  // executing this trap, so anything after bootout races signal delivery.
+  const cleanup = `rm -f ${shellQuote(plistPath)}; launchctl bootout gui/${uid}/${label} >/dev/null 2>&1; true`;
   const runtime = localCliRuntime(cli, args);
   const command = [
     `trap ${shellQuote(cleanup)} EXIT`,
     `cd ${shellQuote(resolve(dirname(cli), "..", "..", ".."))}`,
     `TWEAKERS_HOME=${shellQuote(userRoot!)} TWEAKER_HOME=${shellQuote(userRoot!)} TWEAKERS_USER_ROOT=${shellQuote(userRoot!)} TWEAKER_USER_ROOT=${shellQuote(userRoot!)} ${LEGACY_USER_ROOT_ENV}=${shellQuote(userRoot!)} TWEAKER_MANUAL_UPDATE=1 ${LEGACY_MANUAL_UPDATE_ENV}=1 ELECTRON_RUN_AS_NODE=1 ${[runtime.command, ...runtime.args].map(shellQuote).join(" ")}`,
   ].join(" && ");
+  const plist = [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
+    `<plist version="1.0"><dict>`,
+    `  <key>Label</key><string>${label}</string>`,
+    `  <key>ProgramArguments</key><array>`,
+    `    <string>/bin/sh</string>`,
+    `    <string>-c</string>`,
+    `    <string>${xmlEscape(`${command} || true`)}</string>`,
+    `  </array>`,
+    `  <key>RunAtLoad</key><true/>`,
+    `  <key>AbandonProcessGroup</key><true/>`,
+    `</dict></plist>`,
+  ].join("\n");
+  try {
+    writeFileSync(plistPath, plist, { mode: 0o600 });
+  } catch (error) {
+    log("warn", `could not stage Tweakers patch helper plist: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
   const result = spawnSync(
     "launchctl",
-    [
-      "submit",
-      "-l",
-      label,
-      "--",
-      "/bin/sh",
-      "-c",
-      `${command} || true`,
-    ],
+    ["bootstrap", `gui/${uid}`, plistPath],
     {
       encoding: "utf8",
       stdio: "ignore",
     },
   );
   if (result.status === 0) return true;
-  log("warn", `launchctl submit failed for Tweakers patch helper: ${result.error?.message ?? result.status}`);
+  try {
+    rmSync(plistPath, { force: true });
+  } catch {
+    // Best effort — a stale tmp plist is inert without its bootstrap.
+  }
+  log("warn", `launchctl bootstrap failed for Tweakers patch helper: ${result.error?.message ?? result.status}`);
   return false;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function shellQuote(value: string): string {
@@ -3527,20 +3836,25 @@ function makeLogger(scope: string) {
   };
 }
 
-function makeMainIpc(id: string) {
+function makeMainIpc(tweak: DiscoveredTweak) {
+  const id = tweak.manifest.id;
   const ch = (c: string) => `tweaker:${id}:${c}`;
+  const requireIpc = () => assertTweakPermission(tweak, "ipc");
   return {
     on: (c: string, h: (...args: unknown[]) => void) => {
+      requireIpc();
       const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
       ipcMain.on(ch(c), wrapped);
       return () => ipcMain.removeListener(ch(c), wrapped as never);
     },
     send: (c: string, ...args: unknown[]) => {
+      requireIpc();
       for (const wc of webContents.getAllWebContents()) {
         try { wc.send(ch(c), ...args); } catch {}
       }
     },
     sendToPrimary: (c: string, ...args: unknown[]) => {
+      requireIpc();
       const win = getPrimaryCodexWindow();
       if (!win || win.isDestroyed()) return false;
       try {
@@ -3550,26 +3864,80 @@ function makeMainIpc(id: string) {
         return false;
       }
     },
+    sendToRenderer: (webContentsId: number, c: string, ...args: unknown[]) => {
+      requireIpc();
+      const target = ownedCodexRenderer(webContentsId);
+      if (!target) return false;
+      try {
+        target.send(ch(c), ...args);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     invoke: (_c: string) => {
       throw new Error("ipc.invoke is renderer→main; main side uses handle");
     },
     handle: (c: string, handler: (...args: unknown[]) => unknown) => {
+      requireIpc();
       const channel = ch(c);
+      const registration = Symbol(channel);
       // Main tweaks are stopped and reloaded in place. Remove an old handler
       // before registering its replacement so a settings reload cannot fail
       // with Electron's "handler already registered" error.
       try { ipcMain.removeHandler(channel); } catch {}
+      mainIpcHandlerRegistrations.set(channel, registration);
       const invokeHandler = async (...args: unknown[]) => handler(...args);
       ipcMain.handle(channel, async (_e: unknown, ...args: unknown[]) => invokeHandler(...args));
       if (id === "co.tweakers.projects" && c === "projects") {
         mainTweakReadHandlers.set(`${id}:${c}`, invokeHandler);
       }
       return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
         if (mainTweakReadHandlers.get(`${id}:${c}`) === invokeHandler) mainTweakReadHandlers.delete(`${id}:${c}`);
         try { ipcMain.removeHandler(channel); } catch {}
       };
     },
+    handleWithContext: (
+      c: string,
+      handler: (
+        context: Readonly<{ sender: Readonly<{ webContentsId: number }> }>,
+        ...args: unknown[]
+      ) => unknown,
+    ) => {
+      requireIpc();
+      const channel = ch(c);
+      const registration = Symbol(channel);
+      try { ipcMain.removeHandler(channel); } catch {}
+      mainIpcHandlerRegistrations.set(channel, registration);
+      mainTweakReadHandlers.delete(`${id}:${c}`);
+      ipcMain.handle(channel, async (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => {
+        const sender = ownedCodexRenderer(event.sender.id);
+        if (!sender || sender !== event.sender) {
+          throw new Error("IPC invoke sender is not an owned Codex renderer");
+        }
+        const context = Object.freeze({
+          sender: Object.freeze({ webContentsId: sender.id }),
+        });
+        return handler(context, ...args);
+      });
+      return () => {
+        if (mainIpcHandlerRegistrations.get(channel) !== registration) return;
+        mainIpcHandlerRegistrations.delete(channel);
+        try { ipcMain.removeHandler(channel); } catch {}
+      };
+    },
   };
+}
+
+function ownedCodexRenderer(webContentsId: number): Electron.WebContents | null {
+  if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) return null;
+  const target = webContents.fromId(webContentsId);
+  if (!target || target.isDestroyed()) return null;
+  const owner = BrowserWindow.fromWebContents(target);
+  if (!owner || owner.isDestroyed() || owner.webContents !== target) return null;
+  return BrowserWindow.getAllWindows().some((window) => window === owner) ? target : null;
 }
 
 function makeMainFs(id: string) {

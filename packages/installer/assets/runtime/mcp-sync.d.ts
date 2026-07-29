@@ -2,10 +2,11 @@ import type { TweakMcpServer } from "@therealityreport/tweakers-sdk";
 export declare const MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 export declare const MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
 export declare const USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
-export declare const USER_QUESTIONS_APPROVAL_POLICY = "approval_policy = { granular = { sandbox_approval = false, rules = false, skill_approval = false, request_permissions = false, mcp_elicitations = true } }";
-export declare const USER_QUESTIONS_SANDBOX_MODE = "sandbox_mode = \"danger-full-access\"";
+export declare const RESERVED_MANAGED_MCP_ENV_KEYS: readonly ["TWEAKER_TWEAK_DATA_DIR", "TWEAKER_TWEAK_ID"];
 export interface McpSyncTweak {
     dir: string;
+    /** Canonical writable data directory; required when equivalent source roots share one config. */
+    dataDir?: string;
     manifest: {
         id: string;
         mcp?: TweakMcpServer;
@@ -71,17 +72,13 @@ export declare function syncManagedMcpServers({ configPath, tweaks, }: {
 }): ManagedMcpSyncResult;
 export declare function buildManagedMcpBlock(tweaks: McpSyncTweak[], existingToml?: string): BuiltManagedMcpBlock;
 export declare function planManagedMcpReconciliation(tweaks: McpSyncTweak[], currentToml?: string, options?: ManagedMcpReconciliationOptions): McpReconciliationPlan;
-export declare function planUserQuestionsApprovalPolicy({ currentToml, candidateToml, owned, enabled, preserved, }: {
-    currentToml: string;
-    candidateToml: string;
-    owned: boolean;
-    enabled: boolean;
-    preserved: PreservedApprovalPolicy | null;
-}): {
-    nextToml: string;
-    preserved: PreservedApprovalPolicy | null;
-    receipt: ApprovalPolicyReconciliation;
-};
+/**
+ * Observe policy fields for reconciliation receipts without changing them.
+ * Policy mutation belongs exclusively to the User Questions Preview/Apply/
+ * Restore transaction; ordinary MCP startup and enable/disable reconciliation
+ * may only register or remove the server block.
+ */
+export declare function observeUserQuestionsApprovalPolicy(currentToml: string, preserved?: Readonly<PreservedApprovalPolicy> | null): ApprovalPolicyReconciliation;
 export declare function sanitizePreservedApprovalPolicy(value: unknown): PreservedApprovalPolicy | null;
 export declare function sanitizePreservedMcpOptions(value: unknown, allowedServerNames: Iterable<string>): PreservedMcpOptionsByServerName;
 export declare function mergeManagedMcpBlock(currentToml: string, managedBlock: string): string;

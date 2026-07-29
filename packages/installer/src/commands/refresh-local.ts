@@ -182,7 +182,7 @@ export function hashTree(root: string, tweaksOnly: boolean): string {
   if (!existsSync(root)) return hash.digest("hex");
   const visit = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if ([".git", "node_modules", "dist"].includes(entry.name)) continue;
+      if ([".git", "node_modules", "dist", ".DS_Store"].includes(entry.name)) continue;
       const path = join(dir, entry.name);
       const rel = relative(root, path).replaceAll("\\", "/");
       if (!tweaksOnly && (rel === "tweaks" || rel.startsWith("tweaks/") || rel.startsWith("packages/installer/assets/runtime"))) continue;

@@ -90,6 +90,31 @@ interface TweakUpdateCheck {
   error?: string;
 }
 
+interface TweakVersionDriftRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  hasMcp: boolean;
+  liveVersion: string | null;
+  runtimeVersion: string | null;
+  catalogVersion: string | null;
+  status: "current" | "drift" | "missing";
+  reason: string;
+}
+
+interface TweakHealthSnapshot {
+  checkedAt: string;
+  catalogCount: number;
+  installedCount: number;
+  enabledCount: number;
+  liveDriftCount: number;
+  runtimeDriftCount: number;
+  missingLiveCount: number;
+  missingRuntimeCount: number;
+  mcpRestartRequired: boolean;
+  rows: TweakVersionDriftRow[];
+}
+
 interface TweakerConfig {
   version: string;
   autoUpdate: boolean;
@@ -221,6 +246,8 @@ interface EnvironmentTransaction {
   } | null;
   helper?: EnvironmentHelperStatus | null;
   updatedAt?: string;
+  /** Output-only annotation from the CLI: liveness of the recorded owner PID. */
+  ownerAlive?: boolean;
 }
 
 interface McpSyncState {
@@ -267,6 +294,9 @@ interface DesktopUpdateTransactionState {
   refreshSource?: "development" | "stable" | null;
   error?: string | null;
   updatedAt?: string;
+  terminalAt?: string | null;
+  /** Output-only annotation from the CLI: liveness of the recorded owner PID. */
+  ownerAlive?: boolean | null;
 }
 
 type CodexUiReload = (mode?: "operation-start" | "operation-stop") => void;
@@ -1437,6 +1467,7 @@ function renderConfigPage(
   const cardUpdates = new ConfigCardUpdateCoordinator<unknown>();
   cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
   cleanups.push(renderDesktopUpdateSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderTweaksHealthSection(sectionsWrap, cardUpdates));
   cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
   cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
 
@@ -1505,6 +1536,7 @@ function renderEnvironmentSection(
   let externalBusy = false;
   let environmentActionError: string | null = null;
   let transactionPolling: ReturnType<typeof setTimeout> | null = null;
+  let lastTransactionFetchFailed = false;
 
   const currentSelection = (): EnvironmentSelection | null => environment?.selected ?? null;
   const hasPendingChanges = (): boolean => environment !== null && environmentController.snapshot.hasPendingChanges;
@@ -1519,15 +1551,16 @@ function renderEnvironmentSection(
   const scheduleEnvironmentTransactionPoll = (): void => {
     if (transactionPolling) clearTimeout(transactionPolling);
     transactionPolling = null;
-    if (
-      !card.isConnected
-      || !transaction
-      || environmentTransactionIsTerminal(transaction.phase)
-    ) return;
+    if (!card.isConnected) return;
+    // A null transaction after a FAILED fetch must not end polling: a
+    // transiently failing `environment transaction --json` would otherwise
+    // hide an in-flight or stranded receipt until the tab is re-mounted.
+    if (!transaction && !lastTransactionFetchFailed) return;
+    if (transaction && environmentTransactionIsTerminal(transaction.phase)) return;
     transactionPolling = setTimeout(() => {
       transactionPolling = null;
       void loadEnvironmentTransaction();
-    }, 900);
+    }, lastTransactionFetchFailed ? 5_000 : 900);
   };
 
   async function prepareEnvironmentSelection(
@@ -1645,10 +1678,16 @@ function renderEnvironmentSection(
     externalBusy = true;
     draw();
     void ipcRenderer
-      .invoke("tweaker:rollback-environment", { transactionId: receipt.transactionId })
+      .invoke("tweaker:recover-environment", { transactionId: receipt.transactionId })
       .then((result) => {
-        transaction = normalizeEnvironmentTransaction(result) ?? receipt;
-        environmentActionError = null;
+        const next = normalizeEnvironmentTransaction(result) ?? receipt;
+        transaction = next;
+        // The CLI returns its durable receipt whether or not recovery
+        // succeeded. A receipt still sitting in `failed` is a failure, not a
+        // result to render silently.
+        environmentActionError = next.phase === "failed"
+          ? `Could not recover the app mode safely: ${next.error ?? "the transaction is still failed"}`
+          : null;
         externalBusy = false;
         draw();
         scheduleEnvironmentTransactionPoll();
@@ -1866,6 +1905,7 @@ function renderEnvironmentSection(
     try {
       const result = await ipcRenderer.invoke("tweaker:get-environment-transaction");
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      lastTransactionFetchFailed = false;
       const previous = transaction;
       transaction = normalizeEnvironmentTransaction(result);
       if (
@@ -1901,6 +1941,7 @@ function renderEnvironmentSection(
       }
     } catch (error) {
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      lastTransactionFetchFailed = true;
       if (transaction) {
         transaction = {
           ...transaction,
@@ -1930,6 +1971,7 @@ function renderEnvironmentSection(
         if (environment?.selected) environmentController.setSelected(environment.selected);
       }
       if (transactionIsCurrent) {
+        lastTransactionFetchFailed = false;
         transaction = normalizeEnvironmentTransaction(transactionResult);
         restorePersistedRequest();
       }
@@ -1939,6 +1981,14 @@ function renderEnvironmentSection(
       if ((!cardUpdates.isCurrent(statusUpdate) && !cardUpdates.isCurrent(transactionUpdate)) || !card.isConnected) return;
       card.textContent = "";
       card.appendChild(rowSimple("Could not load environment", safeUiError(error)));
+      // Never latch on a failed initial load: an in-flight or stranded
+      // receipt would stay invisible until the tab was re-mounted (this is
+      // exactly how a Recover banner once hid for ~40 minutes). Retry slowly
+      // while the card stays mounted.
+      lastTransactionFetchFailed = true;
+      setTimeout(() => {
+        if (card.isConnected) void load();
+      }, 5_000);
     }
   };
 
@@ -2141,7 +2191,10 @@ function environmentTransactionRow(
   actionsConfig?: EnvironmentTransactionRowActions,
 ): HTMLElement {
   const helperFailure = environmentHelperFailureDetail(transaction);
+  const ownerExited = transaction.ownerAlive === false
+    && !environmentTransactionIsTerminal(transaction.phase);
   const details = [
+    ownerExited ? "Owner process exited — recovery required." : null,
     environmentTransactionLabel(transaction.phase),
     transaction.error,
     helperFailure,
@@ -2151,7 +2204,12 @@ function environmentTransactionRow(
     [...new Set(details)].join(" · "),
   );
   const left = row.firstElementChild as HTMLElement | null;
-  if (left) left.prepend(statusBadge(environmentTransactionTone(transaction.phase), environmentTransactionLabel(transaction.phase)));
+  if (left) {
+    left.prepend(statusBadge(
+      ownerExited ? "error" : environmentTransactionTone(transaction.phase),
+      environmentTransactionLabel(transaction.phase),
+    ));
+  }
   const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   if (actionsConfig?.onResume) {
     const resume = compactButton("Resume/Confirm", actionsConfig.onResume);
@@ -2329,8 +2387,9 @@ function renderDesktopUpdateSection(
   let transactionPollFailures = 0;
   let awaitingTransactionReceiptUntil = 0;
   let initialResultSuperseded = false;
+  let transactionFetchFailed = false;
 
-  const transactionIsActive = (): boolean => {
+  const transactionIsNonTerminal = (): boolean => {
     if (!transaction?.transactionId) {
       return transaction?.phase === "preparing" && Date.now() < awaitingTransactionReceiptUntil;
     }
@@ -2338,7 +2397,12 @@ function renderDesktopUpdateSection(
   };
   const scheduleTransactionPoll = (delayMs = 2_000): void => {
     if (polling) clearTimeout(polling);
-    if (!card.isConnected || (!transactionIsActive() && transaction?.resumable !== true)) return;
+    // A failed fetch must keep polling even with no known transaction: a
+    // stranded receipt would otherwise stay invisible until tab re-mount.
+    if (!card.isConnected
+      || (!transactionIsNonTerminal()
+        && transaction?.resumable !== true
+        && !transactionFetchFailed)) return;
     polling = setTimeout(() => {
       polling = null;
       void loadTransaction();
@@ -2349,6 +2413,7 @@ function renderDesktopUpdateSection(
     try {
       const value = await ipcRenderer.invoke("tweaker:get-codex-desktop-update-transaction");
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
+      transactionFetchFailed = false;
       const observed = normalizeDesktopUpdateTransaction(value);
       if (observed?.phase === "idle"
         && observed.transactionId === null
@@ -2362,7 +2427,8 @@ function renderDesktopUpdateSection(
           };
         }
       } else {
-        transaction = observed;
+        const idleWithoutReceipt = observed?.phase === "idle" && observed.transactionId === null;
+        transaction = idleWithoutReceipt ? null : observed;
         if (transaction?.transactionId) awaitingTransactionReceiptUntil = 0;
       }
       transactionPollFailures = 0;
@@ -2370,11 +2436,16 @@ function renderDesktopUpdateSection(
       scheduleTransactionPoll();
     } catch (error) {
       if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
-      transaction = {
-        transactionId: transaction?.transactionId ?? null,
-        phase: transaction?.phase ?? "preparing",
-        error: safeUiError(error),
-      };
+      transactionFetchFailed = true;
+      // With no known transaction, keep it null: fabricating a phantom
+      // "preparing" row both misinforms and used to satisfy no poll gate,
+      // permanently hiding any real stranded receipt on disk.
+      if (transaction) {
+        transaction = {
+          ...transaction,
+          error: safeUiError(error),
+        };
+      }
       draw();
       transactionPollFailures += 1;
       const backoff = Math.min(30_000, 1_000 * (2 ** Math.min(transactionPollFailures - 1, 5)));
@@ -2424,9 +2495,11 @@ function renderDesktopUpdateSection(
         .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
         .finally(() => { busy = false; draw(); });
     });
+    // Gate on non-terminal (not "active"): a stranded dead-owner receipt still
+    // blocks start() on disk, so the button must stay disabled until recovery.
     update.disabled = busy
       || result?.status !== "update-available"
-      || transactionIsActive()
+      || transactionIsNonTerminal()
       || transaction?.resumable === true;
     actions?.appendChild(update);
     card.appendChild(row);
@@ -2529,10 +2602,20 @@ function desktopUpdateTransactionRow(
   actions: { busy: boolean; onResume: () => void; onCancel: () => void },
 ): HTMLElement {
   const phase = humanizeCodexPhase(transaction.phase);
+  const nonTerminal = !["completed", "failed", "rolled_back"].includes(transaction.phase);
+  // ownerAlive === false on a non-terminal receipt means the coordinator died
+  // mid-flight: the receipt is stranded, not progressing.
+  const ownerExited = nonTerminal && transaction.ownerAlive === false;
   const detail = [
+    ownerExited ? "Owner process exited — recovery required." : null,
     transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
     transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
     transaction.refreshSource ? `${transaction.refreshSource} Tweakers refresh` : null,
+    typeof transaction.terminalAt === "string"
+      ? `Terminal at ${new Date(transaction.terminalAt).toLocaleString()}`
+      : transaction.updatedAt
+        ? `Last update at ${new Date(transaction.updatedAt).toLocaleString()}`
+        : null,
     transaction.error ?? null,
   ].filter(Boolean).join(" · ") || "Waiting for the durable updater receipt.";
   const row = actionRow("Update and Reload", detail);
@@ -2541,15 +2624,21 @@ function desktopUpdateTransactionRow(
   const left = row.firstElementChild as HTMLElement | null;
   const tone = transaction.phase === "completed"
     ? "ok"
-    : transaction.phase === "failed" && !transaction.resumable
+    : ownerExited || (transaction.phase === "failed" && !transaction.resumable)
       ? "error"
       : "warn";
   left?.prepend(statusBadge(tone, phase));
   const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
   const canResume = transaction.resumable === true
     && (transaction.phase === "failed" || transaction.phase === "rolled_back");
+  // cancelUnlocked handles exited owners for these stranded phases via
+  // recoverExitedOwner, so a dead-owner receipt gets a safe-recovery Cancel.
+  const deadOwnerRecoverable = ownerExited
+    && ["switching_to_chatgpt", "returning_to_tweakers", "refreshing_runtime", "verifying", "preparing"]
+      .includes(transaction.phase);
   const canCancel = transaction.phase === "awaiting_native_update"
-    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase));
+    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase))
+    || deadOwnerRecoverable;
   if (canResume) {
     const resume = compactButton("Resume", actions.onResume);
     resume.disabled = actions.busy;
@@ -2560,6 +2649,92 @@ function desktopUpdateTransactionRow(
     cancel.disabled = actions.busy;
     controls?.appendChild(cancel);
   }
+  return row;
+}
+
+function renderTweaksHealthSection(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+): () => void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Tweaks Health"));
+  const card = roundedCard();
+  card.dataset.tweakerTweaksHealthCard = "true";
+  card.appendChild(rowSimple("Checking tweaks", "Comparing live copies, bundled runtime copies, and latest stored catalog versions."));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  const render = (snapshot: TweakHealthSnapshot): void => {
+    card.textContent = "";
+    const missingCount = snapshot.missingLiveCount + snapshot.missingRuntimeCount;
+    const totalProblems = snapshot.liveDriftCount
+      + snapshot.runtimeDriftCount
+      + missingCount
+      + (snapshot.mcpRestartRequired ? 1 : 0);
+    const summary = actionRow(
+      "Installed Tweaks",
+      `${snapshot.installedCount} installed · ${snapshot.enabledCount} enabled · ${snapshot.catalogCount} latest stored catalog entries.`,
+    );
+    summary.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
+      statusBadge(totalProblems === 0 ? "ok" : "warn", totalProblems === 0 ? "Current" : "Review"),
+    );
+    card.appendChild(summary);
+
+    if (totalProblems === 0) {
+      card.appendChild(rowSimple(
+        "Version Drift",
+        "All installed live copies and bundled runtime copies match the latest stored catalog versions.",
+      ));
+    } else {
+      card.appendChild(rowSimple(
+        "Version Drift",
+        [
+          `${snapshot.liveDriftCount} outdated live ${snapshot.liveDriftCount === 1 ? "copy" : "copies"}`,
+          `${snapshot.runtimeDriftCount} outdated runtime ${snapshot.runtimeDriftCount === 1 ? "copy" : "copies"}`,
+          `${missingCount} missing ${missingCount === 1 ? "copy" : "copies"}`,
+          snapshot.mcpRestartRequired ? "MCP restart required" : null,
+        ].filter(Boolean).join(" · "),
+      ));
+      for (const row of snapshot.rows.filter((candidate) => candidate.status !== "current")) {
+        card.appendChild(tweakHealthDriftRow(row));
+      }
+    }
+    if (snapshot.mcpRestartRequired) {
+      card.appendChild(rowSimple(
+        "MCP Process State",
+        "The managed MCP config changed. Start a new task or restart Codex to replace already-running MCP processes.",
+      ));
+    }
+    card.appendChild(rowSimple("Last checked", new Date(snapshot.checkedAt).toLocaleString()));
+  };
+
+  const update = cardUpdates.begin("tweaks-health");
+  void ipcRenderer.invoke("tweaker:get-tweaks-health")
+    .then((value) => {
+      if (!card.isConnected || !cardUpdates.complete(update, value)) return;
+      render(value as TweakHealthSnapshot);
+    })
+    .catch((error) => {
+      if (!card.isConnected || !cardUpdates.complete(update, error)) return;
+      card.textContent = "";
+      card.appendChild(rowSimple("Tweaks health unavailable", safeUiError(error)));
+    });
+  return () => {
+    cardUpdates.invalidate("tweaks-health");
+  };
+}
+
+function tweakHealthDriftRow(drift: TweakVersionDriftRow): HTMLElement {
+  const row = actionRow(
+    drift.name,
+    `${drift.reason} Live: ${drift.liveVersion ?? "missing"} · Runtime: ${drift.runtimeVersion ?? "missing"} · Latest stored: ${drift.catalogVersion ?? "missing"}.`,
+  );
+  makeCodexRowResponsive(row);
+  const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
+  actions?.appendChild(statusBadge(drift.status === "missing" ? "error" : "warn", drift.status === "missing" ? "Missing" : "Outdated"));
+  if (drift.enabled) actions?.appendChild(codexNeutralBadge("Enabled"));
+  if (drift.hasMcp) actions?.appendChild(codexNeutralBadge("MCP"));
   return row;
 }
 
@@ -3261,7 +3436,7 @@ function safeUiError(error: unknown): string {
 }
 
 function humanizeCodexPhase(value: string): string {
-  return value.replace(/-/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return value.replace(/[-_]/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatBytes(value: number): string {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,8 @@ import {
   classifyRuntimeFingerprints,
   getWatcherHealth,
   parseLaunchdLoadedCommand,
+  publishWatcherHealthSnapshot,
+  readRuntimeFingerprintEvidence,
 } from "../src/watcher-health";
 
 const FIXTURE_FINGERPRINT = "8ae9a8787f4db77dd61d6c23087b8941b303d3cf2f75dcc1864a169f9604c179";
@@ -243,6 +245,21 @@ test("runtime fingerprint health distinguishes source, managed, and active drift
   assert.equal(classifyRuntimeFingerprints({ generated: null, managed: "new", active: "old" }).status, "unknown");
 });
 
+test("runtime fingerprint evidence includes the verified digest and file count", () => {
+  withTempDir((root) => {
+    const runtime = join(root, "runtime");
+    writeValidRuntime(runtime);
+
+    assert.deepEqual(readRuntimeFingerprintEvidence(runtime), {
+      fingerprint: FIXTURE_FINGERPRINT,
+      fileCount: 1,
+    });
+
+    writeFileSync(join(runtime, "main.js"), "tampered\n");
+    assert.equal(readRuntimeFingerprintEvidence(runtime), null);
+  });
+});
+
 test("watcher runtime health verifies generated, managed, and active bytes before comparison", () => {
   withTempDir((root) => {
     const sourceRoot = join(root, "source");
@@ -296,6 +313,207 @@ test("watcher health prefers a completed cycle receipt over sticky historical lo
 
     const health = getWatcherHealth(root);
     assert.equal(health.checks.find((check) => check.name === "watcher cycle")?.status, "ok");
+  });
+});
+
+test("watcher registry probes are hermetic through injected home and launchd seams", () => {
+  withTempDir((root) => {
+    const home = join(root, "home");
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    const lifecycle = join(home, ".codex", "tmp");
+    mkdirSync(launchAgents, { recursive: true });
+    mkdirSync(lifecycle, { recursive: true });
+    for (const label of [
+      "com.therealityreport.tweakers.watcher",
+      "com.thomashulihan.codex-mcp-idle-reaper",
+      "com.thomashulihan.codex-mcp-guard",
+    ]) {
+      writeFileSync(join(launchAgents, `${label}.plist`), label);
+    }
+    const generatedAt = Date.now() / 1_000;
+    writeFileSync(join(lifecycle, "codex-mcp-lifecycle-status.json"), JSON.stringify({
+      schema_version: 2,
+      generated_at: generatedAt,
+      cleanup_policy_version: "strict-detached-v3",
+      job: { ok: true },
+    }));
+    writeFileSync(join(lifecycle, "codex-mcp-guard-status.json"), JSON.stringify({
+      schema_version: 1,
+      generated_at: generatedAt,
+      policy_version: "notification-only-v1",
+      job: { ok: true },
+    }));
+
+    const seenLabels: string[] = [];
+    const health = getWatcherHealth(root, {
+      homeDirectory: home,
+      platformKind: "darwin",
+      launchdState(label) {
+        seenLabels.push(label);
+        return { loaded: true, running: false, lastExitCode: 0 };
+      },
+    });
+    const reaper = health.watchers.find((watcher) => watcher.id === "mcp-lifecycle-reaper");
+    const guard = health.watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
+
+    assert.equal(reaper?.status, "ok");
+    assert.equal(reaper?.statusSchemaVersion, 2);
+    assert.equal(guard?.status, "ok");
+    assert.equal(guard?.authority, "notification-only");
+    assert.deepEqual(seenLabels.sort(), [
+      "com.therealityreport.tweakers.watcher",
+      "com.thomashulihan.codex-mcp-guard",
+      "com.thomashulihan.codex-mcp-idle-reaper",
+    ]);
+  });
+});
+
+test("watcher status documents require a supported schema, timestamp, and boolean job result", () => {
+  withTempDir((root) => {
+    const home = join(root, "home");
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    mkdirSync(launchAgents, { recursive: true });
+    for (const label of [
+      "com.therealityreport.tweakers.watcher",
+      "com.thomashulihan.codex-mcp-idle-reaper",
+      "com.thomashulihan.codex-mcp-guard",
+    ]) {
+      writeFileSync(join(launchAgents, `${label}.plist`), label);
+    }
+    const generatedAt = Date.now() / 1_000;
+    const invalidDocuments = [
+      [{ schema_version: 2, job: { ok: true } }, /timestamp missing or invalid/i],
+      [{ schema_version: 2, generated_at: Number.MAX_VALUE, job: { ok: true } }, /timestamp missing or invalid/i],
+      [{ schema_version: 2, generated_at: generatedAt, job: null }, /job missing or invalid/i],
+      [{ generated_at: generatedAt, job: { ok: true } }, /schema missing or invalid/i],
+    ] as const;
+    for (const [reaperDocument, expectedError] of invalidDocuments) {
+      const health = getWatcherHealth(root, {
+        homeDirectory: home,
+        platformKind: "darwin",
+        launchdState: () => ({ loaded: true, running: false, lastExitCode: 0 }),
+        readJsonDocument(path) {
+          return path.endsWith("codex-mcp-lifecycle-status.json")
+            ? reaperDocument
+            : { schema_version: 1, generated_at: generatedAt, job: { ok: true } };
+        },
+      });
+      const reaper = health.watchers.find((watcher) => watcher.id === "mcp-lifecycle-reaper");
+      assert.equal(reaper?.status, "error");
+      assert.match(reaper?.error ?? "", expectedError);
+    }
+  });
+});
+
+test("watcher health publication is atomic, redacted, and preserves last-known-good", () => {
+  withTempDir((root) => {
+    const home = join(root, "home");
+    const userRoot = join(home, "Library", "Application Support", "codex-plusplus");
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    const lifecycle = join(home, ".codex", "tmp");
+    mkdirSync(userRoot, { recursive: true });
+    mkdirSync(launchAgents, { recursive: true });
+    mkdirSync(lifecycle, { recursive: true });
+    for (const label of [
+      "com.therealityreport.tweakers.watcher",
+      "com.thomashulihan.codex-mcp-idle-reaper",
+      "com.thomashulihan.codex-mcp-guard",
+    ]) {
+      writeFileSync(join(launchAgents, `${label}.plist`), label);
+    }
+    const generatedAt = Date.now() / 1_000;
+    const completedAt = new Date(generatedAt * 1_000).toISOString();
+    writeFileSync(join(userRoot, "state.json"), JSON.stringify({
+      version: "1.0.0",
+      watcher: "launchd",
+      appRoot: "/missing",
+    }));
+    writeFileSync(join(userRoot, "auto-repair-state.json"), JSON.stringify({
+      schemaVersion: 1,
+      latestCompletedCycle: {
+        schemaVersion: 1,
+        cycleId: "cycle-ok",
+        startedAt: completedAt,
+        completedAt,
+        update: { status: "succeeded", error: null },
+        repair: { status: "succeeded", error: null },
+        outcome: "completed",
+        error: null,
+      },
+    }));
+    writeFileSync(join(lifecycle, "codex-mcp-lifecycle-status.json"), JSON.stringify({
+      schema_version: 2,
+      generated_at: generatedAt,
+      cleanup_policy_version: "strict-detached-v3",
+      job: { ok: true },
+    }));
+    writeFileSync(join(lifecycle, "codex-mcp-guard-status.json"), JSON.stringify({
+      schema_version: 1,
+      generated_at: generatedAt,
+      policy_version: "notification-only-v1",
+      job: { ok: true },
+    }));
+
+    const health = getWatcherHealth(userRoot, {
+      homeDirectory: home,
+      platformKind: "darwin",
+      launchdState: () => ({ loaded: true, running: false, lastExitCode: 0 }),
+    });
+    assert.equal(health.watchers.every((watcher) => watcher.status === "ok"), true);
+    const published = publishWatcherHealthSnapshot(userRoot, health);
+    assert.equal(published.schema, "tweakers.health.v1");
+    assert.equal(published.watchers[0]?.installedPath.startsWith("~/"), true);
+
+    const currentPath = join(userRoot, "watcher-health.json");
+    const lastKnownGoodPath = join(userRoot, "watcher-health.last-known-good.json");
+    const originalLastKnownGood = readFileSync(lastKnownGoodPath, "utf8");
+    assert.equal(statSync(currentPath).mode & 0o777, 0o600);
+    assert.equal(statSync(lastKnownGoodPath).mode & 0o777, 0o600);
+
+    writeFileSync(join(userRoot, "auto-repair-state.json"), JSON.stringify({
+      schemaVersion: 1,
+      latestCompletedCycle: {
+        schemaVersion: 1,
+        cycleId: "cycle-failed",
+        startedAt: completedAt,
+        completedAt,
+        update: { status: "succeeded", error: null },
+        repair: { status: "failed", error: "/Users/another-user/private --token=hidden" },
+        outcome: "failed",
+        error: null,
+      },
+    }));
+    const failedRepairHealth = getWatcherHealth(userRoot, {
+      homeDirectory: home,
+      platformKind: "darwin",
+      launchdState: () => ({ loaded: true, running: false, lastExitCode: 0 }),
+    });
+    const failedRepair = failedRepairHealth.watchers.find((watcher) => watcher.id === "tweakers-repair");
+    assert.equal(failedRepair?.status, "error");
+    assert.match(failedRepair?.error ?? "", /repair failed|hidden/i);
+    publishWatcherHealthSnapshot(userRoot, failedRepairHealth);
+    assert.equal(readFileSync(lastKnownGoodPath, "utf8"), originalLastKnownGood);
+
+    publishWatcherHealthSnapshot(userRoot, {
+      ...health,
+      checkedAt: new Date(Date.now() + 1_000).toISOString(),
+      watchers: health.watchers.map((watcher, index) => index === 0
+        ? {
+            ...watcher,
+            status: "error",
+            error: `/Users/another-user/private --token sk-proj-supersecret`,
+            policyVersion: `${home}/policy Bearer secret ${"x".repeat(600)}`,
+          }
+        : watcher),
+    });
+    const current = readFileSync(currentPath, "utf8");
+    assert.match(current, /"status": "error"/);
+    assert.doesNotMatch(current, new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(current, /\/Users\/another-user/);
+    assert.doesNotMatch(current, /supersecret/);
+    assert.doesNotMatch(current, /Bearer secret/);
+    assert.doesNotMatch(current, new RegExp("x".repeat(513)));
+    assert.equal(readFileSync(lastKnownGoodPath, "utf8"), originalLastKnownGood);
   });
 });
 

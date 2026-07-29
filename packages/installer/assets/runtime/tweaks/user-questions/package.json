@@ -1,5 +1,9 @@
 {
   "name": "@therealityreport/user-questions-tweak",
+  "version": "0.6.3",
   "private": true,
-  "type": "commonjs"
+  "type": "commonjs",
+  "scripts": {
+    "test": "node ../../scripts/test-tweaks.mjs --tweak user-questions"
+  }
 }

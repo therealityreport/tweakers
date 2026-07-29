@@ -1,0 +1,23 @@
+{
+  "result": {
+    "status": "cancelled",
+    "cancel_reason": "user_cancelled",
+    "answers": {},
+    "draft": { "resumable": true, "resume_token": "cancelled_draft_0123456789abcdef" }
+  },
+  "normalized": {
+    "round_id": "rich-round",
+    "status": "cancelled",
+    "cancelled": true,
+    "cancel_reason": "user_cancelled",
+    "answers": {},
+    "skipped_question_ids": [],
+    "decision_guidance": {
+      "scope": "current_task",
+      "authority": "preference",
+      "semantics": "preference-not-policy",
+      "on_conflict": "Explain the conflict, the pros and cons, and what must be given up. Ask before materially changing the selected direction."
+    },
+    "draft": { "resumable": true, "resume_token": "cancelled_draft_0123456789abcdef" }
+  }
+}
