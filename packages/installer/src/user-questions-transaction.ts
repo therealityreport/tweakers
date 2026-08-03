@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { copyDirectoryPreservingModes } from "./fs-copy.js";
 import {
   fingerprintPath,
   LEGACY_USER_QUESTIONS_TWEAK_IDS,
@@ -463,8 +464,12 @@ function copyPathAtomic(source: string, destination: string): void {
   const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
   rmSync(temporary, { recursive: true, force: true });
   try {
-    cpSync(source, temporary, { recursive: true, errorOnExist: true, force: false, verbatimSymlinks: true });
-    if (sourceProof.mode !== null) chmodSync(temporary, sourceProof.mode);
+    if (sourceProof.kind === "directory") {
+      copyDirectoryPreservingModes(source, temporary);
+    } else {
+      cpSync(source, temporary, { errorOnExist: true, force: false, verbatimSymlinks: true });
+      if (sourceProof.mode !== null) chmodSync(temporary, sourceProof.mode);
+    }
     if (existsSync(destination)) throw new Error(`copy destination already exists: ${destination}`);
     renameSync(temporary, destination);
   } finally {

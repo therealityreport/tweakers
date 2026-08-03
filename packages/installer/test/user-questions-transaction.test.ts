@@ -116,6 +116,28 @@ test("prepare and seal are idempotent and sealing rejects MCP conflicts", () => 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("prepare preserves private nested modes in canonical preimages", () => {
+  const f = fixture();
+  try {
+    const livePayload = join(f.liveTweaksRoot, "user-questions");
+    mkdirSync(livePayload, { recursive: true });
+    writeFileSync(join(livePayload, "index.js"), "module.exports = {};\n");
+    const canonical = join(f.userRoot, "tweak-data", "co.tweakers.user-questions");
+    const privateDrafts = join(canonical, "user-questions-drafts.v1");
+    mkdirSync(privateDrafts, { recursive: true });
+    writeFileSync(join(privateDrafts, "install-secret"), "secret", { mode: 0o600 });
+    chmodSync(privateDrafts, 0o700);
+    chmodSync(canonical, 0o700);
+
+    const prepared = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    const data = prepared.pathSurfaces.find((surface) => surface.name === "tweak_data")!;
+
+    assert.equal(lstatSync(data.preimagePath).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(data.preimagePath, "user-questions-drafts.v1")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(data.preimagePath, "user-questions-drafts.v1", "install-secret")).mode & 0o777, 0o600);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("commit archives legacy only after acceptance and rollback restores exact preimages", () => {
   const f = fixture();
   try {
