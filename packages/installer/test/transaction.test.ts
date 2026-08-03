@@ -1120,6 +1120,17 @@ test("receipt-bound prebuilt prepare and promotion reuse one exact candidate wit
     assert.deepEqual(held.state.prebuiltCombinedCandidate?.prepared, prepared);
     assert.equal(first.calls.filter((call) => call === "buildCandidate").length, 1);
 
+    const reorderedAuthority: PrebuiltCombinedCandidateAuthority = {
+      sourceApp: authority.sourceApp,
+      runtime: authority.runtime,
+      backend: authority.backend,
+      acceptedBuildReceipt: authority.acceptedBuildReceipt,
+      installerPayloadHash: authority.installerPayloadHash,
+      payloadIdentity: authority.payloadIdentity,
+      transactionId: authority.transactionId,
+      schemaVersion: authority.schemaVersion,
+    };
+
     const requestFile = join(f.workRoot, "candidate-user", "health", "request.json");
     mkdirSync(join(f.workRoot, "candidate-user", "health"), { recursive: true });
     writeFileSync(requestFile, `${JSON.stringify({
@@ -1145,7 +1156,7 @@ test("receipt-bound prebuilt prepare and promotion reuse one exact candidate wit
     const promoted = await runInstallTransaction({
       ...options(f),
       payloadHash: authority.payloadIdentity,
-      prebuiltCombinedCandidate: authority,
+      prebuiltCombinedCandidate: reorderedAuthority,
       requirePreparedCandidate: true,
       now: new Date("2026-07-10T12:01:00.000Z"),
     }, second.adapters);

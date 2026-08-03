@@ -18,6 +18,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { signatureInfo } from "./codesign.js";
 import { sweepMacOsJunk } from "./fs-copy.js";
 import {
@@ -1217,7 +1218,7 @@ function samePrebuiltCombinedCandidate(
   if (!existing || !requested) return existing === undefined && requested === undefined;
   return existing.transactionId === requested.transactionId
     && existing.payloadIdentity === requested.payloadIdentity
-    && JSON.stringify(existing) === JSON.stringify(requested);
+    && isDeepStrictEqual(existing, requested);
 }
 
 function candidateIntentMatches(state: TransactionState, options: TransactionOptions): boolean {

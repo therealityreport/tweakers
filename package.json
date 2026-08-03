@@ -36,7 +36,7 @@
     "@typescript-eslint/eslint-plugin": "^8.64.0",
     "@typescript-eslint/parser": "^8.64.0",
     "eslint": "^10.7.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.5",
     "typescript": "^5.6.0"
   },
   "engines": {
@@ -54,6 +54,6 @@
     "plist": "^3.1.0",
     "prompts": "^2.4.2",
     "sade": "^1.8.1",
-    "tar": "^7.5.2"
+    "tar": "^7.5.22"
   }
 }

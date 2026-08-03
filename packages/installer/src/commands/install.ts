@@ -27,6 +27,7 @@ import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "n
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { isDeepStrictEqual } from "node:util";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { ensureUserPaths, type UserPaths } from "../paths.js";
 import { backupOnce, patchAsar, readFileInAsar, readHeaderHash } from "../asar.js";
@@ -875,7 +876,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         if (
           refreshed.payloadIdentity !== authority.payloadIdentity
           || refreshed.transactionId !== authority.transactionId
-          || JSON.stringify(refreshed) !== JSON.stringify(authority)
+          || !isDeepStrictEqual(refreshed, authority)
         ) {
           throw new Error("Prebuilt combined candidate authority drifted before transaction entry");
         }

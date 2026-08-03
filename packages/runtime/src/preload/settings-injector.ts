@@ -566,7 +566,7 @@ export function stopSettingsInjector(): void {
     delete originalHistoryMethods[m];
   }
   plog("scheduler stopped", {
-    ...metrics,
+    ...(metrics ?? {}),
     installedRuntimeFingerprint: state.installedRuntimeFingerprint,
     sourceRuntimeFingerprint: state.sourceRuntimeFingerprint,
     runtimeFingerprintDrift: state.runtimeFingerprintDrift,

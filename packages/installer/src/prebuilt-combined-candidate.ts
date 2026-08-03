@@ -6,6 +6,7 @@ import {
   readFileSync,
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { isDeveloperIdSignedBackup, verifySignature } from "./codesign.js";
 import { fingerprintAppContents } from "./environment-profile.js";
 import { assertInternalStoragePath } from "./internal-storage.js";
@@ -447,7 +448,7 @@ export function assertPreparedPrebuiltCombinedCandidateEvidence(
     paths,
     dependencyOverrides,
   );
-  if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+  if (!isDeepStrictEqual(observed, expected)) {
     throw new Error("Prepared combined candidate evidence drifted after preparation");
   }
 }
