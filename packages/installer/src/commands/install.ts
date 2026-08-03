@@ -763,10 +763,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
 
   // Mutation-site mode guard: while ChatGPT mode is active the official app
   // stays pristine, so no caller (CLI, watcher repair, held promotion re-entry)
-  // may patch it without the deliberate mode-switch flag. This is what closes
-  // the watcher race — every promotion path re-enters install() and re-reads
-  // the mode here.
-  if (!opts.modeTransition && readState(paths.stateFile)?.mode === "chatgpt") {
+  // may patch it without either the deliberate mode-switch flag or the exact
+  // receipt-bound prepare/promote authority. This closes the watcher race —
+  // every promotion path re-enters install() and re-reads the mode here.
+  if (!installMayRunWhileChatgptMode(opts) && readState(paths.stateFile)?.mode === "chatgpt") {
     throw new Error(
       "Refusing to install while ChatGPT mode is active.\n" +
         "The app at the official path stays pristine in ChatGPT mode.\n" +
@@ -1399,6 +1399,14 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     default:
       throw new Error(`Install finished in an unexpected state: ${(result as { status: string }).status}`);
   }
+}
+
+export function installMayRunWhileChatgptMode(
+  opts: Pick<Opts, "modeTransition" | "prebuiltCombinedCandidate" | "candidateOnly" | "requirePreparedCandidate">,
+): boolean {
+  if (opts.modeTransition === true) return true;
+  if (!opts.prebuiltCombinedCandidate) return false;
+  return opts.candidateOnly === true || opts.requirePreparedCandidate === true;
 }
 
 export interface BuildPatchedCandidateOnlyInput {

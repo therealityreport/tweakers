@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   assertCodexNotRunning,
+  installMayRunWhileChatgptMode,
   prepareCodexForPatching,
   preflightWritableTargets,
   promoteVerifiedSignedBackup,
@@ -16,6 +17,21 @@ import {
 } from "../src/commands/install";
 import type { OpenReport } from "../src/commands/debug";
 import type { CodexInstall } from "../src/platform";
+
+test("ChatGPT mode admits only an explicit transition or receipt-bound prebuilt transaction", () => {
+  assert.equal(installMayRunWhileChatgptMode({}), false);
+  assert.equal(installMayRunWhileChatgptMode({ candidateOnly: true }), false);
+  assert.equal(installMayRunWhileChatgptMode({ requirePreparedCandidate: true }), false);
+  assert.equal(installMayRunWhileChatgptMode({ modeTransition: true }), true);
+  assert.equal(installMayRunWhileChatgptMode({
+    prebuiltCombinedCandidate: {} as never,
+    candidateOnly: true,
+  }), true);
+  assert.equal(installMayRunWhileChatgptMode({
+    prebuiltCombinedCandidate: {} as never,
+    requirePreparedCandidate: true,
+  }), true);
+});
 
 test("install preflight checks Info.plist before patching", { skip: process.platform === "win32" }, () => {
   withTempDir((root) => {
