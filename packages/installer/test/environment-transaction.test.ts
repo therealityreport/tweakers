@@ -23,6 +23,7 @@ import {
   InstallerEnvironmentCoordinator,
   readEnvironmentCommitHelperOutcome,
   readEnvironmentCommitHelperReceipt,
+  readEnvironmentRuntimeProof,
   readEnvironmentTransactionReceipt,
   resolvePreparedEnvironmentCommitCli,
   submitEnvironmentCommitHelper,
@@ -39,6 +40,43 @@ test("default MCP ownership path targets the user's Codex config", () => {
     defaultCodexMcpConfigFile("/Users/example"),
     "/Users/example/.codex/config.toml",
   );
+});
+
+test("legacy runtime proofs are stale and current proofs bind the desktop and app.asar", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-runtime-proof-"));
+  const file = join(root, "environment-runtime-proof.json");
+  const proof = {
+    schemaVersion: 2,
+    kind: "environment-runtime-proof",
+    pid: 123,
+    appRoot: "/Applications/ChatGPT.app",
+    bundleId: "com.openai.codex",
+    desktopVersion: "26.727.51351",
+    desktopBuild: "6119",
+    appAsarHeaderHash: "a".repeat(64),
+    appExperience: "tweakers",
+    releaseProfile: "stable",
+    backendLane: "bundled",
+    binaryPath: "/Applications/ChatGPT.app/Contents/Resources/codex",
+    backendVersion: "0.146.0-alpha.9.2",
+    backendFingerprint: "b".repeat(64),
+    runtimePath: "/tmp/runtime",
+    runtimeFingerprint: "c".repeat(64),
+    runtimeFileCount: 1,
+    managedRuntimePath: "/tmp/managed-runtime",
+    managedRuntimeFingerprint: "d".repeat(64),
+    managedRuntimeFileCount: 1,
+    managedSourceRuntimeHash: null,
+    observedAt: "2026-08-03T12:00:00.000Z",
+  };
+  try {
+    writeFileSync(file, JSON.stringify({ ...proof, schemaVersion: 1 }));
+    assert.equal(readEnvironmentRuntimeProof(file), null);
+    writeFileSync(file, JSON.stringify(proof));
+    assert.deepEqual(readEnvironmentRuntimeProof(file), proof);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("custom coordinators keep every adoption path inside their explicit root", () => {
@@ -1375,6 +1413,9 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     backendDigest: prepared.backend.artifactDigest,
     runtimeBinaryPath: backendPath,
     runtimePid: 202,
+    runtimeDesktopVersion: prepared.candidate.version,
+    runtimeDesktopBuild: prepared.candidate.build,
+    runtimeAsarHeaderHash: prepared.candidate.asarHeaderHash!,
     runtimeFingerprint: prepared.runtime.requested.runtimeFingerprint,
     runtimeFileCount: prepared.runtime.requested.fileCount,
     managedRuntimeFingerprint: prepared.managedRuntime.requested.runtimeFingerprint,
@@ -1431,11 +1472,14 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
         patchedAsarHash: "a".repeat(64),
       }),
       readRuntimeProof: () => ({
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: "environment-runtime-proof",
         pid: mutable.runtimePid,
         appRoot: requested.selectedDesktopPath,
         bundleId: requested.selectedDesktopBundleId,
+        desktopVersion: mutable.runtimeDesktopVersion,
+        desktopBuild: mutable.runtimeDesktopBuild,
+        appAsarHeaderHash: mutable.runtimeAsarHeaderHash,
         appExperience: "tweakers",
         releaseProfile: requested.releaseProfile,
         backendLane: "managed-alpha",
@@ -1515,6 +1559,15 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
     assert.equal(await prove(), null, "runtime proof from another PID must fail");
     assert.equal(appFingerprintCalls, 1, "stale runtime proof must not hash the app");
     mutable.runtimePid = 202;
+    mutable.runtimeDesktopVersion = "0.0.0";
+    assert.equal(await prove(), null, "runtime proof from another desktop version must fail");
+    mutable.runtimeDesktopVersion = prepared.candidate.version;
+    mutable.runtimeDesktopBuild = "0";
+    assert.equal(await prove(), null, "runtime proof from another desktop build must fail");
+    mutable.runtimeDesktopBuild = prepared.candidate.build;
+    mutable.runtimeAsarHeaderHash = "0".repeat(64);
+    assert.equal(await prove(), null, "runtime proof from another app.asar must fail");
+    mutable.runtimeAsarHeaderHash = prepared.candidate.asarHeaderHash!;
     mutable.runtimeFingerprint = "0".repeat(64);
     assert.equal(await prove(), null, "wrong active runtime fingerprint must fail");
     mutable.runtimeFingerprint = prepared.runtime.requested.runtimeFingerprint;
@@ -3839,6 +3892,56 @@ test("legacy receipts gain receipt-owned swap evidence before recovery touches t
     const again = await coordinator.recover("swap-migration");
     assert.deepEqual(migrations, ["swap-migration"]);
     assert.equal(again.phase, recovered.phase);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy receipts without asar integrity evidence stay readable when terminal", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-legacy-"));
+  const file = join(root, "environment.json");
+  const { current, requested } = selections();
+  try {
+    const prepared = preparedEvidence(current, requested) as Record<string, unknown>;
+    delete (prepared.candidate as Record<string, unknown>).asarHeaderHash;
+    delete (prepared.rollback as Record<string, unknown>).desktopAsarHeaderHash;
+    const applied = appliedEvidence(requested) as Record<string, unknown>;
+    delete applied.asarHeaderHash;
+    const receipt = {
+      schemaVersion: 1,
+      kind: "environment",
+      transactionId: "legacy-committed",
+      phase: "committed",
+      error: null,
+      ownerPid: 4242,
+      source: current,
+      requested: { ...requested, appliedAt: "2026-07-17T02:00:10.000Z" },
+      prepared,
+      applied,
+      oldMainPid: 101,
+      newMainPid: 202,
+      attempt: 1,
+      createdAt: "2026-07-17T02:00:05.000Z",
+      updatedAt: "2026-07-17T02:00:10.000Z",
+      committedAt: "2026-07-17T02:00:10.000Z",
+      rolledBackAt: null,
+      cancelledAt: null,
+    };
+    writeFileSync(file, `${JSON.stringify(receipt)}\n`);
+    // A committed legacy receipt is terminal history; the lifecycle gate must
+    // treat it as idle instead of poisoning every refresh with "invalid".
+    assert.equal(readEnvironmentTransactionReceipt(file)?.phase, "committed");
+
+    // The same evidence in an in-flight phase cannot be verified and must
+    // stay invalid (fail closed).
+    writeFileSync(file, `${JSON.stringify({
+      ...receipt,
+      phase: "applying",
+      applied: null,
+      committedAt: null,
+      newMainPid: null,
+    })}\n`);
+    assert.throws(() => readEnvironmentTransactionReceipt(file), /invalid/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

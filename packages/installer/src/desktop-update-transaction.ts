@@ -49,6 +49,7 @@ import {
 } from "./environment-transaction.js";
 import { userPaths } from "./paths.js";
 import { readPlist } from "./plist.js";
+import { readHeaderHash } from "./asar.js";
 import { acquireProcessLock, processAlive as isProcessAlive } from "./process-lock.js";
 import { assertLifecycleReceiptsIdle, withLifecycleLock } from "./lifecycle-lock.js";
 import { readState, writeState } from "./state.js";
@@ -1542,6 +1543,9 @@ async function verifyFinalDesktopReturn(
             || proof.pid !== observed.pid
             || proof.appRoot !== input.expected.selectedDesktopPath
             || proof.bundleId !== input.expected.selectedDesktopBundleId
+            || proof.desktopVersion !== identity.version
+            || proof.desktopBuild !== identity.build
+            || proof.appAsarHeaderHash !== readDesktopAsarHeaderHash(input.expected.selectedDesktopPath)
             || proof.releaseProfile !== input.expected.releaseProfile
             || proof.backendLane !== (input.expected.backendLane === "managed-alpha" ? "managed-alpha" : "bundled")
             || proof.binaryPath !== expectedBackendPath
@@ -1568,12 +1572,28 @@ function sameEnvironmentSelection(first: EnvironmentSelection, second: Environme
     && first.selectedDesktopBundleId === second.selectedDesktopBundleId;
 }
 
-function readDesktopBundleIdentity(appPath: string): { bundleId: string | null } {
+function readDesktopBundleIdentity(appPath: string): {
+  bundleId: string | null;
+  version: string | null;
+  build: string | null;
+} {
   try {
     const plist = readPlist(join(appPath, "Contents", "Info.plist"));
-    return { bundleId: typeof plist.CFBundleIdentifier === "string" ? plist.CFBundleIdentifier : null };
+    return {
+      bundleId: typeof plist.CFBundleIdentifier === "string" ? plist.CFBundleIdentifier : null,
+      version: typeof plist.CFBundleShortVersionString === "string" ? plist.CFBundleShortVersionString : null,
+      build: typeof plist.CFBundleVersion === "string" ? plist.CFBundleVersion : null,
+    };
   } catch {
-    return { bundleId: null };
+    return { bundleId: null, version: null, build: null };
+  }
+}
+
+function readDesktopAsarHeaderHash(appPath: string): string | null {
+  try {
+    return readHeaderHash(join(appPath, "Contents", "Resources", "app.asar")).headerHash;
+  } catch {
+    return null;
   }
 }
 

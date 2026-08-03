@@ -34,6 +34,17 @@ import { setIntegrity, getIntegrity } from "../integrity.js";
 import { writeFuse } from "../fuses.js";
 import { clearQuarantine, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
 import { assertInternalStoragePath } from "../internal-storage.js";
+import { fingerprintAppContents } from "../environment-profile.js";
+import {
+  assertPreparedPrebuiltCombinedCandidateEvidence,
+  capturePrebuiltRollbackEvidence,
+  capturePreparedPrebuiltCombinedCandidateEvidence,
+  resolvePrebuiltCombinedCandidateCliInput,
+  validatePrebuiltCombinedCandidate,
+  type PrebuiltCombinedCandidateCliOptions,
+  type PrebuiltCombinedCandidateInput,
+  type PrebuiltCombinedCandidateAuthority,
+} from "../prebuilt-combined-candidate.js";
 
 // Re-export from its new home (codesign.ts) so existing importers keep working.
 export { isDeveloperIdSignedBackup };
@@ -60,6 +71,8 @@ import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
+  HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS,
+  isValidProductionHealthExpectationV2,
   PROMOTION_SURFACE_NAMES,
   runInstallTransaction,
   readProductionHealthReceipt,
@@ -120,6 +133,10 @@ interface Opts {
     finalUserRoot: string;
     bundledDerivedBackend?: BundledDerivedBackendArtifact;
   };
+  /** Private receipt-bound prebuilt backend and reviewed-runtime candidate input. */
+  prebuiltCombinedCandidate?: PrebuiltCombinedCandidateInput;
+  /** Promotion action: consume the exact held candidate and never rebuild it. */
+  requirePreparedCandidate?: boolean;
   /** Internal only: repair already reconciles shims before its fast paths. */
   reconcileCliShims?: boolean;
   /**
@@ -721,6 +738,23 @@ export async function install(opts: Opts = {}): Promise<void> {
   return withLifecycleLock(lifecycleLockFile(paths.root), "install or repair promotion", () => installWithLifecycle(opts, paths));
 }
 
+export async function prebuiltCombinedCandidate(
+  action: string,
+  cliOptions: PrebuiltCombinedCandidateCliOptions,
+): Promise<void> {
+  const resolved = resolvePrebuiltCombinedCandidateCliInput(action, cliOptions);
+  await install({
+    app: resolved.app,
+    watcher: false,
+    localSigning: true,
+    candidateOnly: resolved.candidateOnly,
+    candidateOnlyReason: "coordinated-refresh",
+    prebuiltCombinedCandidate: resolved.input,
+    requirePreparedCandidate: resolved.action === "promote",
+    reconcileCliShims: false,
+  });
+}
+
 async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void> {
   assertLifecycleReceiptsIdle(paths.root);
   if (opts.localSigning === false && opts.candidateOnly !== true) {
@@ -742,7 +776,28 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
 
   const codex = locateCodex(opts.app);
   const source = fingerprintCodex(codex);
-  const payloadHash = installerPayloadHash();
+  const basePayloadHash = installerPayloadHash();
+  if (
+    opts.prebuiltCombinedCandidate
+    && (
+      opts.localSigning === false
+      || opts.watcher !== false
+      || opts.candidateOnlyReason !== "coordinated-refresh"
+    )
+  ) {
+    throw new Error(
+      "Prebuilt combined candidates require local signing, no watcher, and coordinated-refresh intent",
+    );
+  }
+  let prebuiltAuthority: PrebuiltCombinedCandidateAuthority | undefined =
+    opts.prebuiltCombinedCandidate
+      ? validatePrebuiltCombinedCandidate(opts.prebuiltCombinedCandidate, {
+        installerPayloadHash: basePayloadHash,
+        runtimeRoot: join(assetsDir, "runtime"),
+        sourceAppRoot: codex.appRoot,
+      })
+      : undefined;
+  const payloadHash = prebuiltAuthority?.payloadIdentity ?? basePayloadHash;
   const candidateUserRoot = join(paths.transactionRoot, "candidate-user");
   const candidatePaths = transactionUserPaths(candidateUserRoot);
   const liveCodexHome = join(targetUserHome(), ".codex");
@@ -802,6 +857,83 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const candidateOnly = opts.candidateOnly === true;
   const signingMode = opts.localSigning === false ? "adhoc" : "local-identity";
   const adapters = filesystemTransactionAdapters({
+    validatePrebuiltCombinedCandidateAuthority: prebuiltAuthority
+      ? (authority) => {
+        const refreshed = validatePrebuiltCombinedCandidate(opts.prebuiltCombinedCandidate!, {
+          installerPayloadHash: basePayloadHash,
+          runtimeRoot: join(assetsDir, "runtime"),
+          sourceAppRoot: codex.appRoot,
+        });
+        if (
+          refreshed.payloadIdentity !== authority.payloadIdentity
+          || refreshed.transactionId !== authority.transactionId
+          || JSON.stringify(refreshed) !== JSON.stringify(authority)
+        ) {
+          throw new Error("Prebuilt combined candidate authority drifted before transaction entry");
+        }
+        prebuiltAuthority = refreshed;
+      }
+      : undefined,
+    validatePrebuiltRollbackRoots: prebuiltAuthority
+      ? (state) => {
+        capturePrebuiltRollbackEvidence({
+          lastKnownGoodRoot: state.lastKnownGoodRoot,
+          lastKnownGoodRuntimeRoot: state.lastKnownGoodRuntimeRoot,
+          signedBackupRoot: signedBackupSnapshot,
+          signedBackupMarker: signedBackupSnapshotState,
+        });
+      }
+      : undefined,
+    removeSupersededPrebuiltCandidateArtifacts: prebuiltAuthority
+      ? (state) => {
+        const expectedCandidate = join(paths.transactionRoot, "candidate.app");
+        const expectedPristine = join(paths.transactionRoot, "pristine.app");
+        if (
+          resolve(state.candidateRoot) !== expectedCandidate
+          || resolve(state.pristineRoot) !== expectedPristine
+        ) {
+          throw new Error("Stale candidate artifact paths do not match the app-install transaction root");
+        }
+        rmSync(expectedCandidate, { recursive: true, force: true });
+        rmSync(expectedPristine, { recursive: true, force: true });
+        rmSync(candidateUserRoot, { recursive: true, force: true });
+      }
+      : undefined,
+    capturePreparedPrebuiltCombinedCandidateEvidence: prebuiltAuthority
+      ? (state) => capturePreparedPrebuiltCombinedCandidateEvidence(prebuiltAuthority!, {
+        candidateRoot: state.candidateRoot,
+        candidateRuntimeRoot: candidatePaths.runtime,
+        lastKnownGoodRoot: state.lastKnownGoodRoot,
+        lastKnownGoodRuntimeRoot: state.lastKnownGoodRuntimeRoot,
+        signedBackupRoot: signedBackupSnapshot,
+        signedBackupMarker: signedBackupSnapshotState,
+      })
+      : undefined,
+    validatePreparedPrebuiltCombinedCandidateEvidence: prebuiltAuthority
+      ? (state, context) => {
+        const prepared = state.prebuiltCombinedCandidate?.prepared;
+        if (!prepared) throw new Error("Prepared prebuilt combined candidate receipt evidence is missing");
+        assertPreparedPrebuiltCombinedCandidateEvidence(prebuiltAuthority!, prepared, {
+          candidateRoot: state.candidateRoot,
+          candidateRuntimeRoot: candidatePaths.runtime,
+          lastKnownGoodRoot: state.lastKnownGoodRoot,
+          lastKnownGoodRuntimeRoot: state.lastKnownGoodRuntimeRoot,
+          signedBackupRoot: signedBackupSnapshot,
+          signedBackupMarker: signedBackupSnapshotState,
+        });
+        candidateHealthExpectation = readCandidatePromotionHealthExpectation(
+          join(candidateUserRoot, "health", "request.json"),
+          {
+            transactionCreatedAt: state.createdAt,
+            now: context.now,
+            maxAgeMs: context.maxCandidateAgeMs,
+          },
+        );
+        if (!candidateHealthExpectation) {
+          throw new Error("Prepared candidate schema-v2 health expectation is unavailable");
+        }
+      }
+      : undefined,
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
       resetCandidateUserRootForBuild(candidateUserRoot);
@@ -817,7 +949,19 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         watcher: false,
         quiet: true,
         localSigning: signingMode === "local-identity",
-        candidateContext: { paths: candidatePaths, finalUserRoot: paths.root },
+        candidateContext: {
+          paths: candidatePaths,
+          finalUserRoot: paths.root,
+          ...(prebuiltAuthority ? {
+            bundledDerivedBackend: {
+              binaryPath: prebuiltAuthority.backend.sourcePath,
+              version: prebuiltAuthority.backend.version,
+              fingerprint: prebuiltAuthority.backend.sha256,
+              receiptPath: prebuiltAuthority.acceptedBuildReceipt.path,
+              transactionId: prebuiltAuthority.transactionId,
+            },
+          } : {}),
+        },
       });
       stageBundledTweaks(candidatePaths.tweaks, candidatePaths.runtime);
       const candidateRolloutOptions = defaultUserQuestionsRolloutOptions({
@@ -1104,6 +1248,8 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     candidateOnly,
     candidateOnlyReason: opts.candidateOnlyReason ?? "explicit",
     signingMode,
+    prebuiltCombinedCandidate: prebuiltAuthority,
+    requirePreparedCandidate: opts.requirePreparedCandidate,
   }, adapters);
 
   if (shouldReconcileCliShims(result.status, candidateOnly, opts.reconcileCliShims)) {
@@ -2033,6 +2179,49 @@ function requiredMacPermissions(configFile: string): string[] {
   }
 }
 
+export function readCandidatePromotionHealthExpectation(
+  requestFile: string,
+  bounds: {
+    transactionCreatedAt: string;
+    now: Date;
+    maxAgeMs: number;
+  },
+): ProductionHealthExpectationV2 | null {
+  try {
+    const status = lstatSync(requestFile);
+    if (
+      !status.isFile()
+      || status.isSymbolicLink()
+      || status.size <= 0
+      || status.size > 128 * 1024
+      || (status.mode & 0o777) !== 0o600
+    ) return null;
+    const value = recordValue(JSON.parse(readFileSync(requestFile, "utf8")) as unknown);
+    if (!value) return null;
+    const { requestedAt, ...expected } = value;
+    const requestedAtMs = Date.parse(typeof requestedAt === "string" ? requestedAt : "");
+    const transactionCreatedAtMs = Date.parse(bounds.transactionCreatedAt);
+    const nowMs = bounds.now.getTime();
+    const requestAgeMs = nowMs - requestedAtMs;
+    if (
+      typeof requestedAt !== "string"
+      || !Number.isFinite(requestedAtMs)
+      || !Number.isFinite(transactionCreatedAtMs)
+      || !Number.isFinite(nowMs)
+      || !Number.isFinite(requestAgeMs)
+      || !Number.isFinite(bounds.maxAgeMs)
+      || bounds.maxAgeMs < 0
+      || requestedAtMs > nowMs + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS
+      || requestedAtMs < transactionCreatedAtMs
+      || requestAgeMs > bounds.maxAgeMs
+      || !isValidProductionHealthExpectationV2(expected)
+    ) return null;
+    return expected;
+  } catch {
+    return null;
+  }
+}
+
 function writeHealthRequest(path: string, request: object): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   // A receipt must prove this launch, never a previous launch of the same build.
@@ -2061,7 +2250,7 @@ export function hashDirectoryTree(root: string): string {
   return hash.digest("hex");
 }
 
-function installerPayloadHash(): string {
+export function installerPayloadHash(): string {
   const hash = createHash("sha256");
   for (const root of [resolve(here, ".."), assetsDir]) {
     hash.update(root === assetsDir ? "assets" : "installer");

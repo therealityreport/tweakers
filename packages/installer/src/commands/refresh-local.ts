@@ -7,10 +7,10 @@ import { ensureModeCoordinatorConfigured } from "../switcher-setup.js";
 import { readConfigFile, updateConfigFile } from "../config.js";
 import { installManagedRuntime, managedCliPath, managedSourceRoot, writeDevelopmentProvenanceHash } from "../managed-runtime.js";
 import { locateCodex } from "../platform.js";
-import { openCodex, quitCodex } from "../alerts.js";
+import { isCodexMainProcessRunning, openCodex, quitCodex } from "../alerts.js";
 import { install, readAsarMarker } from "./install.js";
 import { repair } from "./repair.js";
-import { acquireProcessLock, type ProcessLock } from "../process-lock.js";
+import { acquireProcessLock, processAlive, readLockOwner, type ProcessLock } from "../process-lock.js";
 import { readState, resolveMode } from "../state.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 
@@ -99,6 +99,12 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
   // consult or update the co-owned config.json development registration.
   const explicitDevelopmentRoot = resolveExplicitDevelopmentRoot(opts);
   const paths = ensureUserPaths();
+  // The detached launchd run has no console; any failure that never reaches
+  // refresh-state.json strands the UI on "preparing" forever. Every throw
+  // below must land in the state file unless the workflow already recorded a
+  // richer failure itself.
+  let workflowFailureWritten = false;
+  try {
   // Refuse BEFORE the launchd handoff: a local refresh in ChatGPT mode would
   // rebuild and promote a patched bundle over the pristine official app.
   assertRefreshAllowedByMode(paths.stateFile, opts.app);
@@ -147,7 +153,17 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           await install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true });
         }
       },
-      quit: () => quitCodex(appRoot),
+      quit: () => {
+        quitCodex(appRoot);
+        // Promotion swaps the live bundle; a still-running app would keep the
+        // old runtime mapped and corrupt the handoff. Refuse instead of
+        // promoting under it.
+        if (isCodexMainProcessRunning(appRoot)) {
+          throw new Error(
+            "ChatGPT is still running after the quit request. Quit it completely, then run the reload again.",
+          );
+        }
+      },
       promote: async () => {
         if (selected === "stable") {
           if (!preparedStableSource) throw new Error("Stable refresh source was not prepared");
@@ -164,12 +180,27 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
     });
   } catch (error) {
     writePhase("failed", error instanceof Error ? error.message : String(error));
+    workflowFailureWritten = true;
     throw error;
   } finally {
     lock.release();
     rmSync(stableStageRoot, { recursive: true, force: true });
   }
   });
+  } catch (error) {
+    if (!workflowFailureWritten) {
+      writeRefreshState(paths.root, {
+        available: true,
+        source: explicitDevelopmentRoot === null ? "current" : "development",
+        phase: "failed",
+        developmentSourceRoot: explicitDevelopmentRoot,
+        detail: "Local refresh failed before it could start",
+        error: error instanceof Error ? error.message : String(error),
+        checkedAt: new Date().toISOString(),
+      });
+    }
+    throw error;
+  }
 }
 
 export function resolveRefreshSelection(userRoot: string, opts: RefreshLocalOptions = {}): RefreshSelection {
@@ -426,6 +457,104 @@ export function handoffRefreshLocalToLaunchd(
   const result = adapters.submit("launchctl", ["submit", "-l", label, "--", "/bin/sh", "-c", command]);
   if (result.status === 0) return true;
   return false;
+}
+
+export interface RefreshCancelResult {
+  cancelled: boolean;
+  detail: string;
+}
+
+const TRANSIENT_REFRESH_LABEL_PREFIX = "com.therealityreport.tweakers.refresh-local.";
+
+interface RefreshCancelAdapters {
+  listLaunchdLabels(): string[];
+  removeLaunchdJob(label: string): void;
+  readLockOwner(lockFile: string): number | null;
+  processAlive(pid: number): boolean;
+  kill(pid: number, signal: NodeJS.Signals): void;
+  sleep(ms: number): void;
+  now(): number;
+}
+
+/**
+ * Cancel an in-flight or stranded local refresh: remove its transient launchd
+ * job, terminate the detached refresh process if one is still alive, and
+ * record the cancellation in refresh-state.json so the UI leaves the
+ * "running in background" state. Cancelling during promotion is refused
+ * without `force` — killing mid-promotion can strand a half-swapped app.
+ */
+export function cancelRefreshLocal(
+  userRoot: string,
+  opts: { force?: boolean } = {},
+  overrides: Partial<RefreshCancelAdapters> = {},
+): RefreshCancelResult {
+  const adapters: RefreshCancelAdapters = {
+    listLaunchdLabels: () => {
+      const result = spawnSync("launchctl", ["list"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      if (result.status !== 0 || typeof result.stdout !== "string") return [];
+      return result.stdout.split("\n")
+        .map((line) => line.trim().split(/\s+/).pop() ?? "")
+        .filter((label) => label.startsWith(TRANSIENT_REFRESH_LABEL_PREFIX));
+    },
+    removeLaunchdJob: (label) => {
+      spawnSync("launchctl", ["remove", label], { stdio: "ignore" });
+    },
+    readLockOwner: (lockFile) => readLockOwner(lockFile),
+    processAlive: (pid) => processAlive(pid),
+    kill: (pid, signal) => {
+      try { process.kill(pid, signal); } catch { /* already gone */ }
+    },
+    sleep: (ms) => spawnSync("sleep", [String(ms / 1000)], { stdio: "ignore" }),
+    now: Date.now,
+    ...overrides,
+  };
+
+  const state = readJson<Partial<LocalRefreshStatus>>(join(userRoot, "refresh-state.json"));
+  const phase = state?.phase;
+  const inFlight = phase === "preparing" || phase === "quitting" || phase === "promoting";
+  if (phase === "promoting" && opts.force !== true) {
+    throw new Error(
+      "The local refresh is promoting the new bundle; cancelling now could leave the app half-swapped. "
+        + "Wait for it to finish, or re-run with --force if it is provably stuck.",
+    );
+  }
+
+  const removedLabels = adapters.listLaunchdLabels();
+  for (const label of removedLabels) adapters.removeLaunchdJob(label);
+
+  // launchctl remove signals the trap shell, but the node child it spawned
+  // survives as an orphan; terminate the recorded refresh-lock owner directly.
+  const lockOwner = adapters.readLockOwner(join(userRoot, "refresh-local.lock"));
+  let ownerTerminated = false;
+  if (lockOwner !== null && lockOwner !== process.pid && adapters.processAlive(lockOwner)) {
+    adapters.kill(lockOwner, "SIGTERM");
+    const started = adapters.now();
+    while (adapters.now() - started < 5_000 && adapters.processAlive(lockOwner)) {
+      adapters.sleep(250);
+    }
+    if (adapters.processAlive(lockOwner)) adapters.kill(lockOwner, "SIGKILL");
+    ownerTerminated = true;
+  }
+
+  if (!inFlight && removedLabels.length === 0 && !ownerTerminated) {
+    return { cancelled: false, detail: "No local refresh is in flight" };
+  }
+
+  writeRefreshState(userRoot, {
+    available: true,
+    source: (state?.source === "development" || state?.source === "stable") ? state.source : "current",
+    phase: "failed",
+    developmentSourceRoot: state?.developmentSourceRoot ?? null,
+    detail: "Local refresh cancelled",
+    error: "Cancelled by user",
+    checkedAt: new Date().toISOString(),
+  });
+  const parts = [
+    inFlight ? `cancelled ${phase} refresh` : "cleared stale refresh state",
+    removedLabels.length > 0 ? `removed ${removedLabels.length} launchd job(s)` : null,
+    ownerTerminated ? `terminated refresh process ${lockOwner}` : null,
+  ].filter((part): part is string => part !== null);
+  return { cancelled: true, detail: parts.join("; ") };
 }
 
 export function acquireRefreshLock(lockFile: string): ProcessLock {

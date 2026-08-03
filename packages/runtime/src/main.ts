@@ -1243,12 +1243,19 @@ function writeEnvironmentRuntimeProof(): void {
     const managedRuntime = readRuntimeFingerprintEvidence(managedRuntimePath);
     if (!managedRuntime) throw new Error(`managed runtime fingerprint is invalid at ${managedRuntimePath}`);
     const managedSourceRuntimeHash = readManagedRuntimeSourceHash(proofUserRoot);
+    const installedDesktop = installedCodexDesktopVersion();
+    if (!installedDesktop.installedMarketingVersion || !installedDesktop.installedBuild) {
+      throw new Error("could not prove the running desktop version and build");
+    }
     const proof = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: "environment-runtime-proof",
       pid: process.pid,
       appRoot,
       bundleId,
+      desktopVersion: installedDesktop.installedMarketingVersion,
+      desktopBuild: installedDesktop.installedBuild,
+      appAsarHeaderHash: promotionAppHeaderHash(),
       appExperience: "tweakers",
       releaseProfile: bundleId === "com.openai.codex.beta" ? "alpha" : "stable",
       backendLane: codexCliBootstrap.effectiveLane === "beta" ? "managed-alpha" : "bundled",
@@ -3610,6 +3617,25 @@ ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "
 ));
 
 ipcMain.handle("tweaker:get-watcher-health", () => getAndPublishWatcherHealth(userRoot!));
+ipcMain.handle("tweaker:get-runtime-fingerprint", (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-runtime-fingerprint");
+  const installedRuntimeFingerprint =
+    readRuntimeFingerprintEvidence(runtimeDir!)?.fingerprint ?? null;
+  const sourceRoot = readInstallerState()?.sourceRoot ?? fallbackSourceRoot();
+  const sourceRuntimeFingerprint = sourceRoot
+    ? readRuntimeFingerprintEvidence(
+      join(sourceRoot, "packages", "installer", "assets", "runtime"),
+    )?.fingerprint ?? null
+    : null;
+  return {
+    installedRuntimeFingerprint,
+    sourceRuntimeFingerprint,
+    runtimeFingerprintDrift:
+      installedRuntimeFingerprint !== null
+      && sourceRuntimeFingerprint !== null
+      && installedRuntimeFingerprint !== sourceRuntimeFingerprint,
+  };
+});
 ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
   const cli = localRefreshCli();

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import sade from "sade";
 import kleur from "kleur";
-import { install } from "./commands/install.js";
+import { install, prebuiltCombinedCandidate } from "./commands/install.js";
+import type { PrebuiltCombinedCandidateCliOptions } from "./prebuilt-combined-candidate.js";
 import { uninstall } from "./commands/uninstall.js";
 import { repair } from "./commands/repair.js";
 import {
@@ -158,6 +159,13 @@ async function runRefreshStatus(): Promise<void> {
   console.log(JSON.stringify(getLocalRefreshStatus(ensureUserPaths().root)));
 }
 
+async function runRefreshCancel(opts: { force?: boolean }): Promise<void> {
+  const { cancelRefreshLocal } = await import("./commands/refresh-local.js");
+  const { ensureUserPaths } = await import("./paths.js");
+  const result = cancelRefreshLocal(ensureUserPaths().root, { force: opts.force });
+  console.log(JSON.stringify(result));
+}
+
 function maybeShowPatchFailedAlert(message: string): void {
   const command = process.argv[2];
   if (command !== "repair") return;
@@ -184,6 +192,26 @@ prog
   .option("--ad-hoc", "Use ad-hoc signing for an explicit candidate-only build; this candidate can never promote")
   .option("--verbose", "Show low-level patching details")
   .action(wrap(runInstall));
+
+prog
+  .command("prebuilt-combined-candidate <action>")
+  .describe("Prepare or promote one receipt-bound prebuilt Codex + reviewed Tweakers candidate")
+  .option("--app", "Exact source/live ChatGPT.app path")
+  .option("--transaction", "Caller-stable transaction ID shared by prepare and promote")
+  .option("--binary", "Exact internal regular-file path to the accepted prebuilt Codex binary")
+  .option("--binary-sha256", "Caller-recorded SHA-256 of the accepted prebuilt Codex binary")
+  .option("--codex-version", "Caller-recorded accepted Codex version")
+  .option("--architecture", "Accepted Codex architecture (arm64)")
+  .option("--receipt", "Exact internal accepted-build receipt path")
+  .option("--receipt-sha256", "Caller-recorded SHA-256 of the accepted-build receipt")
+  .option("--runtime-fingerprint", "Reviewed Tweakers runtime fingerprint")
+  .option("--runtime-files", "Reviewed Tweakers runtime file count")
+  .option("--runtime-document-sha256", "SHA-256 of the reviewed runtime fingerprint document")
+  .option("--source-app-fingerprint", "Caller-recorded full source app contents fingerprint")
+  .option("--bundle-id", "Required source app bundle ID")
+  .action(wrap((action: string, options: PrebuiltCombinedCandidateCliOptions) =>
+    prebuiltCombinedCandidate(action, options)
+  ));
 
 prog
   .command("create-variant")
@@ -397,6 +425,12 @@ prog
   .action(wrap(runRefreshLocal));
 
 prog.command("refresh-status").describe("Print local ChatGPT refresh status as JSON").action(wrap(runRefreshStatus));
+
+prog
+  .command("refresh-cancel")
+  .describe("Cancel an in-flight or stranded local refresh and clear its background job")
+  .option("--force", "Also cancel during promotion (only when it is provably stuck)")
+  .action(wrap(runRefreshCancel));
 
 prog.command("tweaks").describe("List and manage installed tweaks").action(() => console.log("Tweaks are stored in the user data directory."));
 prog.command("migrate")

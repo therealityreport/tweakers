@@ -56,6 +56,11 @@ import {
   restoreEnvironmentFocus,
   type EnvironmentConfirmationDecision,
 } from "./environment-config-controller";
+import {
+  SettingsProbeScheduler,
+  type SettingsProbeMetrics,
+  type SettingsProbeOutcome,
+} from "./settings-probe-scheduler";
 import type {
   CodexCliLane,
   CodexCliVersionState,
@@ -399,6 +404,11 @@ interface InjectorState {
   pageNavButtons: Map<string, HTMLButtonElement>;
   panelHost: HTMLElement | null;
   observer: MutationObserver | null;
+  observerTarget: Node | null;
+  probeScheduler: SettingsProbeScheduler | null;
+  installedRuntimeFingerprint: string | null;
+  sourceRuntimeFingerprint: string | null;
+  runtimeFingerprintDrift: boolean | null;
   fingerprint: string | null;
   sidebarDumped: boolean;
   activePage: ActivePage | null;
@@ -430,6 +440,11 @@ const state: InjectorState = {
   pageNavButtons: new Map(),
   panelHost: null,
   observer: null,
+  observerTarget: null,
+  probeScheduler: null,
+  installedRuntimeFingerprint: null,
+  sourceRuntimeFingerprint: null,
+  runtimeFingerprintDrift: null,
   fingerprint: null,
   sidebarDumped: false,
   activePage: null,
@@ -446,6 +461,7 @@ const state: InjectorState = {
 };
 
 let activeBuiltinPageCleanup: (() => void) | null = null;
+const originalHistoryMethods: Partial<Record<"pushState" | "replaceState", History["pushState"]>> = {};
 
 function plog(msg: string, extra?: unknown): void {
   ipcRenderer.send(
@@ -465,20 +481,58 @@ function safeStringify(v: unknown): string {
 // ───────────────────────────────────────────────────────────── public API ──
 
 export function startSettingsInjector(): void {
-  if (state.observer) return;
+  if (state.probeScheduler) return;
 
-  const obs = new MutationObserver(() => {
-    tryInject();
-    maybeDumpDom();
+  state.probeScheduler = new SettingsProbeScheduler({
+    probe: runSettingsProbe,
+    onProbe: (outcome) => {
+      scopeSettingsObserver(outcome);
+      publishSettingsInjectorDiagnostics();
+    },
+    onProbeError: (error) => {
+      plog("scheduler probe failed; retrying", {
+        error: error instanceof Error ? error.message : safeStringify(error),
+      });
+    },
   });
-  obs.observe(document.documentElement, { childList: true, subtree: true });
-  state.observer = obs;
+  scopeSettingsObserver("missing");
+  publishSettingsInjectorDiagnostics();
+  void ipcRenderer
+    .invoke("tweaker:get-runtime-fingerprint")
+    .then((result: unknown) => {
+      const snapshot = result as {
+        installedRuntimeFingerprint?: unknown;
+        sourceRuntimeFingerprint?: unknown;
+        runtimeFingerprintDrift?: unknown;
+      } | null;
+      const fingerprint = snapshot?.installedRuntimeFingerprint;
+      state.installedRuntimeFingerprint =
+        typeof fingerprint === "string" ? fingerprint : null;
+      state.sourceRuntimeFingerprint =
+        typeof snapshot?.sourceRuntimeFingerprint === "string"
+          ? snapshot.sourceRuntimeFingerprint
+          : null;
+      state.runtimeFingerprintDrift =
+        typeof snapshot?.runtimeFingerprintDrift === "boolean"
+          ? snapshot.runtimeFingerprintDrift
+          : null;
+      publishSettingsInjectorDiagnostics();
+      plog("diagnostics ready", {
+        ...state.probeScheduler?.metrics(),
+        installedRuntimeFingerprint: state.installedRuntimeFingerprint,
+        sourceRuntimeFingerprint: state.sourceRuntimeFingerprint,
+        runtimeFingerprintDrift: state.runtimeFingerprintDrift,
+      });
+    })
+    .catch(() => {});
 
   window.addEventListener("popstate", onNav);
   window.addEventListener("hashchange", onNav);
   document.addEventListener("click", onDocumentClick, true);
+  window.addEventListener("pagehide", stopSettingsInjector, { once: true });
   for (const m of ["pushState", "replaceState"] as const) {
     const orig = history[m];
+    originalHistoryMethods[m] = orig as History["pushState"];
     history[m] = function (this: History, ...args: Parameters<typeof orig>) {
       const r = orig.apply(this, args);
       window.dispatchEvent(new Event(`tweaker-${m}`));
@@ -487,21 +541,43 @@ export function startSettingsInjector(): void {
     window.addEventListener(`tweaker-${m}`, onNav);
   }
 
-  tryInject();
-  maybeDumpDom();
-  let ticks = 0;
-  const interval = setInterval(() => {
-    ticks++;
-    tryInject();
-    maybeDumpDom();
-    if (ticks > 60) clearInterval(interval);
-  }, 500);
+  state.probeScheduler.request({ immediate: true, resetBackoff: true });
+}
+
+export function stopSettingsInjector(): void {
+  const metrics = state.probeScheduler?.metrics() ?? null;
+  state.probeScheduler?.stop();
+  state.probeScheduler = null;
+  state.observer?.disconnect();
+  state.observer = null;
+  state.observerTarget = null;
+  if (state.settingsSurfaceHideTimer) {
+    clearTimeout(state.settingsSurfaceHideTimer);
+    state.settingsSurfaceHideTimer = null;
+  }
+  window.removeEventListener("popstate", onNav);
+  window.removeEventListener("hashchange", onNav);
+  document.removeEventListener("click", onDocumentClick, true);
+  window.removeEventListener("pagehide", stopSettingsInjector);
+  for (const m of ["pushState", "replaceState"] as const) {
+    window.removeEventListener(`tweaker-${m}`, onNav);
+    const original = originalHistoryMethods[m];
+    if (original) history[m] = original as typeof history[typeof m];
+    delete originalHistoryMethods[m];
+  }
+  plog("scheduler stopped", {
+    ...metrics,
+    installedRuntimeFingerprint: state.installedRuntimeFingerprint,
+    sourceRuntimeFingerprint: state.sourceRuntimeFingerprint,
+    runtimeFingerprintDrift: state.runtimeFingerprintDrift,
+  });
 }
 
 function onNav(): void {
   state.fingerprint = null;
-  tryInject();
-  maybeDumpDom();
+  state.sidebarRoot = null;
+  scopeSettingsObserver("missing");
+  state.probeScheduler?.request({ immediate: true, resetBackoff: true });
 }
 
 function onDocumentClick(e: MouseEvent): void {
@@ -511,7 +587,67 @@ function onDocumentClick(e: MouseEvent): void {
   if (compactSettingsText(control.textContent || "") !== "Back to app") return;
   setTimeout(() => {
     setSettingsSurfaceVisible(false, "back-to-app");
+    state.sidebarRoot = null;
+    scopeSettingsObserver("missing");
+    state.probeScheduler?.request({ immediate: true, resetBackoff: true });
   }, 0);
+}
+
+function runSettingsProbe(): SettingsProbeOutcome {
+  const outcome = tryInject();
+  maybeDumpDom();
+  return outcome;
+}
+
+function scopeSettingsObserver(_outcome: SettingsProbeOutcome): void {
+  // Keep this observer anchored above the routed sidebar. React can replace
+  // the entire root without a history event, which a root-scoped observer
+  // cannot observe after that root has been detached.
+  const target = document.documentElement;
+  if (state.observer && state.observerTarget === target) return;
+  state.observer?.disconnect();
+  state.observer = new MutationObserver(() => {
+    const sidebarRoot = state.sidebarRoot;
+    if (sidebarRoot && !sidebarRoot.isConnected) {
+      state.sidebarRoot = null;
+      state.fingerprint = null;
+      state.probeScheduler?.request({ immediate: true, resetBackoff: true });
+      return;
+    }
+    state.probeScheduler?.request();
+  });
+  state.observer.observe(target, { childList: true, subtree: true });
+  state.observerTarget = target;
+}
+
+function publishSettingsInjectorDiagnostics(): void {
+  const metrics: SettingsProbeMetrics = state.probeScheduler?.metrics() ?? {
+    requestCount: 0,
+    coalescedRequestCount: 0,
+    backoffEventCount: 0,
+    activeTimerCount: 0,
+    probeCount: 0,
+    cumulativeProbeTimeMs: 0,
+    consecutiveMisses: 0,
+    currentBackoffMs: 0,
+    lastOutcome: null,
+  };
+  try {
+    (
+      window as Window & {
+        __tweakerSettingsInjectorDiagnostics?: SettingsProbeMetrics & {
+          installedRuntimeFingerprint: string | null;
+          sourceRuntimeFingerprint: string | null;
+          runtimeFingerprintDrift: boolean | null;
+        };
+      }
+    ).__tweakerSettingsInjectorDiagnostics = {
+      ...metrics,
+      installedRuntimeFingerprint: state.installedRuntimeFingerprint,
+      sourceRuntimeFingerprint: state.sourceRuntimeFingerprint,
+      runtimeFingerprintDrift: state.runtimeFingerprintDrift,
+    };
+  } catch {}
 }
 
 export function registerSection(section: SettingsSection): SettingsHandle {
@@ -658,20 +794,20 @@ function lifecycleLabel(lifecycle: SettingsNavigationItem["lifecycle"], warning?
 
 // ───────────────────────────────────────────────────────────── injection ──
 
-function tryInject(): void {
-  if (isNavGroupInjectionSuppressed()) return;
+function tryInject(): SettingsProbeOutcome {
+  if (isNavGroupInjectionSuppressed()) return "suppressed";
   removeMisplacedSettingsGroups();
 
-  const itemsGroup = findSidebarItemsGroup();
+  const itemsGroup =
+    state.sidebarRoot?.isConnected === true
+      ? state.sidebarRoot
+      : findSidebarItemsGroup();
   if (!itemsGroup) {
     scheduleSettingsSurfaceHidden();
-    // tryInject polls every 500ms; log only on the transition into this state
-    // so repeated misses don't flood preload.log.
-    if (state.sidebarProbeStatus !== "missing") {
-      state.sidebarProbeStatus = "missing";
-      plog("sidebar not found");
-    }
-    return;
+    // The coalescing scheduler continues bounded probes; log only the transition
+    // into this state so repeated misses never flood preload.log.
+    recordSidebarProbeTransition("missing");
+    return "missing";
   }
   if (state.settingsSurfaceHideTimer) {
     clearTimeout(state.settingsSurfaceHideTimer);
@@ -684,17 +820,14 @@ function tryInject(): void {
   if (!isSettingsSidebarCandidate(itemsGroup)) {
     scheduleSettingsSurfaceHidden();
     // Same transition-only throttling as the "sidebar not found" branch.
-    if (state.sidebarProbeStatus !== "rejected") {
-      state.sidebarProbeStatus = "rejected";
-      plog("rejected non-settings sidebar candidate", {
+    recordSidebarProbeTransition("rejected", {
         itemsGroup: describe(itemsGroup),
         outer: describe(outer),
-      });
-    }
-    return;
+    });
+    return "rejected";
   }
   // Success transition already logs via setSettingsSurfaceVisible("sidebar-found").
-  state.sidebarProbeStatus = "found";
+  recordSidebarProbeTransition("found", { outer: describe(outer) });
   state.sidebarRoot = outer;
   syncNativeSettingsHeader(itemsGroup, outer);
   bindSettingsSearch(outer);
@@ -705,7 +838,7 @@ function tryInject(): void {
     // If one of our pages is active, re-strip Codex's active styling so
     // General doesn't reappear as selected.
     if (state.activePage !== null) syncCodexNativeNavActive(true);
-    return;
+    return "found";
   }
 
   // Sidebar was either freshly mounted (Settings just opened) or re-mounted
@@ -737,7 +870,7 @@ function tryInject(): void {
     syncPagesGroup();
     refreshSidebarTweakerUpdateButton();
     if (state.activePage !== null) syncCodexNativeNavActive(true);
-    return;
+    return "found";
   }
 
   // ── Group container ───────────────────────────────────────────────────
@@ -772,6 +905,22 @@ function tryInject(): void {
   state.navButtons = { config: configBtn, tweaks: tweaksBtn };
   noteNavGroupInjection(outer);
   syncPagesGroup();
+  return "found";
+}
+
+function recordSidebarProbeTransition(
+  outcome: "found" | "missing" | "rejected",
+  detail?: unknown,
+): void {
+  if (state.sidebarProbeStatus === outcome) return;
+  state.sidebarProbeStatus = outcome;
+  if (outcome === "missing") {
+    plog("sidebar not found");
+  } else if (outcome === "rejected") {
+    plog("rejected non-settings sidebar candidate", detail);
+  } else {
+    plog("sidebar found", detail);
+  }
 }
 
 // Backstop against inject/remove feedback loops: if the nav group needs

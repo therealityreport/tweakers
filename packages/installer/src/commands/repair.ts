@@ -466,6 +466,13 @@ async function repairWithLifecycle(
     // install() will surface the real locate/preflight error below.
   }
 
+  // In ChatGPT mode no repair is wanted at all, so never record a deferred
+  // "signing-unavailable" repair (and its warning) for work that would stand
+  // down anyway. The pre-mutation re-check below still closes the race.
+  if (repairStandsDownInChatgptMode(opts, dependencies)) {
+    return { status: "skipped", reason: "chatgpt-mode" };
+  }
+
   const localSigning = opts.localSigning ?? (state?.signingMode !== "adhoc");
   const canSign = dependencies.signingAvailable ?? signingAvailable;
   if (watcherRepair && localSigning && !canSign()) {
