@@ -5,10 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS,
   bundledDerivedBackendPath,
   stageBundledDerivedBackendInsideApp,
   type BundledDerivedBackendArtifact,
 } from "../src/commands/install";
+
+test("freshly copied bundled-derived backends receive a bounded macOS first-run allowance", () => {
+  assert.equal(BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS, 15_000);
+});
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -71,6 +76,13 @@ test("bundled-derived staging rejects fingerprint and version mismatches", () =>
     assert.throws(
       () => stageBundledDerivedBackendInsideApp(app, artifact, { readVersion: () => "0.144.6" }),
       /version does not match/,
+    );
+    assert.throws(
+      () => stageBundledDerivedBackendInsideApp(app, artifact, {
+        readVersion: () => artifact.version,
+        copy: (_source, destination) => writeFileSync(destination, "changed-after-validation"),
+      }),
+      /Staged bundled-derived backend fingerprint does not match/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

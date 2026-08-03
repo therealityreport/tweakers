@@ -165,6 +165,8 @@ export function bundledDerivedBackendPath(appRoot: string): string {
   return join(appRoot, "Contents", "Resources", "codex");
 }
 
+export const BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS = 15_000;
+
 /**
  * Copy a receipt-validated, desktop-bundled-derived backend into a disposable
  * app. Both source and destination must stay on the internal filesystem, and
@@ -207,17 +209,21 @@ export function stageBundledDerivedBackendInsideApp(
   try {
     (deps.copy ?? copyFileSync)(artifact.binaryPath, temporary);
     chmodSync(temporary, 0o755);
-    if (fingerprint(temporary).toLowerCase() !== expectedFingerprint
-      || readVersion(temporary) !== artifact.version) {
-      throw new Error("Staged bundled-derived backend does not match its validated descriptor");
+    if (fingerprint(temporary).toLowerCase() !== expectedFingerprint) {
+      throw new Error("Staged bundled-derived backend fingerprint does not match its validated descriptor");
+    }
+    if (readVersion(temporary) !== artifact.version) {
+      throw new Error("Staged bundled-derived backend version does not match its validated descriptor");
     }
     renameSync(temporary, destination);
   } finally {
     rmSync(temporary, { force: true });
   }
-  if (fingerprint(destination).toLowerCase() !== expectedFingerprint
-    || readVersion(destination) !== artifact.version) {
-    throw new Error("Embedded bundled-derived backend failed final verification");
+  if (fingerprint(destination).toLowerCase() !== expectedFingerprint) {
+    throw new Error("Embedded bundled-derived backend fingerprint failed final verification");
+  }
+  if (readVersion(destination) !== artifact.version) {
+    throw new Error("Embedded bundled-derived backend version failed final verification");
   }
   return destination;
 }
@@ -246,7 +252,7 @@ function probeCodexCliVersion(file: string): string | null {
   const result = spawnSync(file, ["--version"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5_000,
+    timeout: BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS,
     maxBuffer: 64 * 1024,
   });
   if (result.status !== 0) return null;
