@@ -166,6 +166,21 @@ async function runRefreshCancel(opts: { force?: boolean }): Promise<void> {
   console.log(JSON.stringify(result));
 }
 
+async function runRestartApp(opts: { app?: string }): Promise<void> {
+  const { locateCodex } = await import("./platform.js");
+  const { isCodexMainProcessRunning, openCodex, quitCodex } = await import("./alerts.js");
+  const { readState } = await import("./state.js");
+  const { ensureUserPaths } = await import("./paths.js");
+  const state = readState(ensureUserPaths().stateFile);
+  const appRoot = locateCodex(opts.app ?? state?.appRoot).appRoot;
+  quitCodex(appRoot);
+  if (isCodexMainProcessRunning(appRoot)) {
+    throw new Error("The app is still running after the quit request; close it manually and retry.");
+  }
+  openCodex(appRoot, { detached: true, delayMs: 750 });
+  console.log(JSON.stringify({ restarted: true, appRoot }));
+}
+
 function maybeShowPatchFailedAlert(message: string): void {
   const command = process.argv[2];
   if (command !== "repair") return;
@@ -431,6 +446,12 @@ prog
   .describe("Cancel an in-flight or stranded local refresh and clear its background job")
   .option("--force", "Also cancel during promotion (only when it is provably stuck)")
   .action(wrap(runRefreshCancel));
+
+prog
+  .command("restart-app")
+  .describe("Quit and reopen the selected desktop app (regenerates the live runtime proof in Tweakers mode)")
+  .option("--app", "Path to ChatGPT.app / install dir")
+  .action(wrap(runRestartApp));
 
 prog.command("tweaks").describe("List and manage installed tweaks").action(() => console.log("Tweaks are stored in the user data directory."));
 prog.command("migrate")
