@@ -808,7 +808,9 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const candidatePaths = transactionUserPaths(candidateUserRoot);
   const liveCodexHome = join(targetUserHome(), ".codex");
   const candidateCodexHome = join(candidateUserRoot, "codex-home");
-  const rolloutKey = `${source.hash}-${payloadHash}`;
+  // Rollout transaction IDs are capped at 128 chars; two full sha256 digests
+  // plus the separator is 129, so bind the key to 128-bit prefixes of each.
+  const rolloutKey = `${source.hash.slice(0, 32)}-${payloadHash.slice(0, 32)}`;
   const liveUserQuestionsReceiptFile = join(paths.transactionRoot, "user-questions", `${rolloutKey}.json`);
   const liveUserQuestionsArchiveRoot = join(paths.transactionRoot, "user-questions", rolloutKey);
   let candidateHealthExpectation: ProductionHealthExpectationV2 | null = null;
