@@ -345,8 +345,9 @@ test("install refuses in ChatGPT mode without the modeTransition flag", async ()
 
 test("install wires the mode machinery: modeTransition bypass, promote finalization, held guard", () => {
   const source = readFileSync(new URL("../src/commands/install.ts", import.meta.url), "utf8");
-  // The refusal is skipped only for the deliberate mode switch.
-  assert.match(source, /!opts\.modeTransition && readState\(paths\.stateFile\)\?\.mode === "chatgpt"/);
+  // The refusal is skipped only for the exact cases installMayRunWhileChatgptMode
+  // allows; that predicate's own behavior is covered in install-preflight.test.ts.
+  assert.match(source, /!installMayRunWhileChatgptMode\(opts\) && readState\(paths\.stateFile\)\?\.mode === "chatgpt"/);
   // Promotion records tweakers mode and discards the stale parked payload.
   assert.match(source, /finalizePromotedModeState\(paths\.stateFile, paths\.root\);/);
   // The held-promotion continuation re-checks the mode at entry.
