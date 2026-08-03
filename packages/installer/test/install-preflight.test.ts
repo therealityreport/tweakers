@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   assertCodexNotRunning,
+  copyCandidatePreimage,
+  installMayRunWhileChatgptMode,
   prepareCodexForPatching,
   preflightWritableTargets,
   promoteVerifiedSignedBackup,
@@ -16,6 +18,40 @@ import {
 } from "../src/commands/install";
 import type { OpenReport } from "../src/commands/debug";
 import type { CodexInstall } from "../src/platform";
+
+test("ChatGPT mode admits only an explicit transition or receipt-bound prebuilt transaction", () => {
+  assert.equal(installMayRunWhileChatgptMode({}), false);
+  assert.equal(installMayRunWhileChatgptMode({ candidateOnly: true }), false);
+  assert.equal(installMayRunWhileChatgptMode({ requirePreparedCandidate: true }), false);
+  assert.equal(installMayRunWhileChatgptMode({ modeTransition: true }), true);
+  assert.equal(installMayRunWhileChatgptMode({
+    prebuiltCombinedCandidate: {} as never,
+    candidateOnly: true,
+  }), true);
+  assert.equal(installMayRunWhileChatgptMode({
+    prebuiltCombinedCandidate: {} as never,
+    requirePreparedCandidate: true,
+  }), true);
+});
+
+test("candidate preimage copies preserve private directory permissions", () => {
+  withTempDir((root) => {
+    const source = join(root, "source");
+    const nested = join(source, "private");
+    const destination = join(root, "candidate", "copied");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "secret"), "secret");
+    chmodSync(join(nested, "secret"), 0o600);
+    chmodSync(nested, 0o700);
+    chmodSync(source, 0o700);
+
+    copyCandidatePreimage(source, destination);
+
+    assert.equal(lstatSync(destination).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(destination, "private")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(destination, "private", "secret")).mode & 0o777, 0o600);
+  });
+});
 
 test("install preflight checks Info.plist before patching", { skip: process.platform === "win32" }, () => {
   withTempDir((root) => {

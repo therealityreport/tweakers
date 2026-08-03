@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  cancelRefreshLocal,
   getLocalRefreshStatus,
   handoffRefreshLocalToLaunchd,
   hashTree,
@@ -138,7 +139,9 @@ test("macOS refresh-local hands promotion to launchd before quitting the app", (
   assert.match(source, /launchctl", \["submit", "-l", label/);
   assert.match(source, /com\.therealityreport\.tweakers\.refresh-local/);
   assert.match(source, /TWEAKERS_REFRESH_LOCAL_DETACHED=1/);
-  assert.match(source, /quit: \(\) => quitCodex\(appRoot\)/);
+  assert.match(source, /quitCodex\(appRoot\);/);
+  // Promotion must be gated on a proven-complete quit, not a best-effort one.
+  assert.match(source, /isCodexMainProcessRunning\(appRoot\)/);
 });
 
 test("launchd handoff succeeds, falls back on submit failure, and prevents recursion", () => {
@@ -362,4 +365,82 @@ test("refresh validates before quitting and always reopens after promotion start
     reopen: () => failedPromotion.push("reopen"),
   }), /rollback/);
   assert.deepEqual(failedPromotion, ["prepare", "quit", "promote", "reopen"]);
+});
+
+test("refresh cancel clears a stranded preparing state and its background job", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-cancel-"));
+  try {
+    writeFileSync(join(root, "refresh-state.json"), JSON.stringify({
+      available: false,
+      source: "development",
+      phase: "preparing",
+      developmentSourceRoot: "/tmp/checkout",
+      detail: "Local refresh handed off to launchd",
+      error: null,
+      checkedAt: new Date().toISOString(),
+    }));
+    const removed: string[] = [];
+    const killed: Array<[number, string]> = [];
+    let alive = true;
+    const result = cancelRefreshLocal(root, {}, {
+      listLaunchdLabels: () => ["com.therealityreport.tweakers.refresh-local.123.456"],
+      removeLaunchdJob: (label) => { removed.push(label); },
+      readLockOwner: () => 9999,
+      processAlive: () => alive,
+      kill: (pid, signal) => {
+        killed.push([pid, signal]);
+        alive = false;
+      },
+      sleep: () => {},
+      now: Date.now,
+    });
+    assert.equal(result.cancelled, true);
+    assert.deepEqual(removed, ["com.therealityreport.tweakers.refresh-local.123.456"]);
+    assert.deepEqual(killed, [[9999, "SIGTERM"]]);
+    const state = JSON.parse(readFileSync(join(root, "refresh-state.json"), "utf8"));
+    assert.equal(state.phase, "failed");
+    assert.equal(state.error, "Cancelled by user");
+    assert.equal(state.source, "development");
+    assert.equal(state.developmentSourceRoot, "/tmp/checkout");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("refresh cancel refuses mid-promotion without force and is a no-op when idle", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-cancel-promote-"));
+  try {
+    writeFileSync(join(root, "refresh-state.json"), JSON.stringify({
+      available: false,
+      source: "development",
+      phase: "promoting",
+      developmentSourceRoot: null,
+      detail: "Local refresh promoting",
+      error: null,
+      checkedAt: new Date().toISOString(),
+    }));
+    const inert = {
+      listLaunchdLabels: () => [],
+      removeLaunchdJob: () => {},
+      readLockOwner: () => null,
+      processAlive: () => false,
+      kill: () => {},
+      sleep: () => {},
+      now: Date.now,
+    };
+    assert.throws(() => cancelRefreshLocal(root, {}, inert), /promoting/);
+    const forced = cancelRefreshLocal(root, { force: true }, inert);
+    assert.equal(forced.cancelled, true);
+
+    const idleRoot = mkdtempSync(join(tmpdir(), "tweakers-refresh-cancel-idle-"));
+    try {
+      const result = cancelRefreshLocal(idleRoot, {}, inert);
+      assert.equal(result.cancelled, false);
+      assert.equal(existsSync(join(idleRoot, "refresh-state.json")), false);
+    } finally {
+      rmSync(idleRoot, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

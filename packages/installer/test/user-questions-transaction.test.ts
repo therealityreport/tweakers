@@ -116,6 +116,28 @@ test("prepare and seal are idempotent and sealing rejects MCP conflicts", () => 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("prepare preserves private nested modes in canonical preimages", () => {
+  const f = fixture();
+  try {
+    const livePayload = join(f.liveTweaksRoot, "user-questions");
+    mkdirSync(livePayload, { recursive: true });
+    writeFileSync(join(livePayload, "index.js"), "module.exports = {};\n");
+    const canonical = join(f.userRoot, "tweak-data", "co.tweakers.user-questions");
+    const privateDrafts = join(canonical, "user-questions-drafts.v1");
+    mkdirSync(privateDrafts, { recursive: true });
+    writeFileSync(join(privateDrafts, "install-secret"), "secret", { mode: 0o600 });
+    chmodSync(privateDrafts, 0o700);
+    chmodSync(canonical, 0o700);
+
+    const prepared = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    const data = prepared.pathSurfaces.find((surface) => surface.name === "tweak_data")!;
+
+    assert.equal(lstatSync(data.preimagePath).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(data.preimagePath, "user-questions-drafts.v1")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(data.preimagePath, "user-questions-drafts.v1", "install-secret")).mode & 0o777, 0o600);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("commit archives legacy only after acceptance and rollback restores exact preimages", () => {
   const f = fixture();
   try {
@@ -219,5 +241,21 @@ test("commit is idempotent after the durable committed receipt", () => {
     const committed = commitUserQuestionsRollout(receipt);
     assert.equal(commitUserQuestionsRollout(committed), committed);
     assert.equal(readUserQuestionsRolloutReceipt(f.receiptFile)?.phase, "committed");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("Finder junk in a rollout surface does not break preimage verification", () => {
+  const f = fixture();
+  try {
+    writeLegacyState(f);
+    // Finder writes .DS_Store into any directory the user merely browses, and
+    // copyDirectoryPreservingModes sweeps it out of every copy. A fingerprint
+    // that counted it could never match its own preimage.
+    writeFileSync(join(f.userRoot, "tweak-data", "co.thomashulihan.user-questions", ".DS_Store"), "junk\n");
+    writeFileSync(join(f.liveTweaksRoot, "co.thomashulihan.user-questions", ".DS_Store"), "junk\n");
+    const prepared = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    assert.equal(prepared.phase, "prepared");
+    const sealed = sealUserQuestionsRollout(prepared, { mcpConflictCount: 0 });
+    assert.equal(commitUserQuestionsRollout(sealed).phase, "committed");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

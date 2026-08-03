@@ -18,6 +18,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { signatureInfo } from "./codesign.js";
 import { sweepMacOsJunk } from "./fs-copy.js";
 import {
@@ -26,11 +27,17 @@ import {
   processAlive,
   readLockOwner,
 } from "./process-lock.js";
+import type {
+  PrebuiltCombinedCandidateAuthority,
+  PreparedPrebuiltCombinedCandidateEvidence,
+} from "./prebuilt-combined-candidate.js";
 
 export type HealthValue = "pass" | "fail" | "unknown";
 
 /** Thirty seconds beyond the contained probe cap, while still rejecting old receipts. */
 export const PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS = 200_000;
+/** Narrow allowance for clock skew between the health-request writer and validator. */
+export const HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS = 5_000;
 
 export interface AppFingerprint {
   version: string;
@@ -186,6 +193,16 @@ export interface TransactionState {
   failureCount?: number;
   lastFailureAt?: string;
   signingMode?: "local-identity" | "adhoc";
+  /**
+   * Private receipt-bound authority for a prebuilt backend plus reviewed
+   * Tweakers runtime. The payload identity and transaction ID must be supplied
+   * unchanged by both candidate preparation and the later promotion call.
+   */
+  prebuiltCombinedCandidate?: {
+    authority: PrebuiltCombinedCandidateAuthority;
+    prepared?: PreparedPrebuiltCombinedCandidateEvidence;
+    supersededTransactionArchive?: string;
+  };
 }
 
 export interface TransactionOptions {
@@ -204,6 +221,14 @@ export interface TransactionOptions {
   maxCandidateAgeMs?: number;
   now?: Date;
   signingMode?: "local-identity" | "adhoc";
+  prebuiltCombinedCandidate?: PrebuiltCombinedCandidateAuthority;
+  /** Promotion-only entrypoints must consume an exact held candidate and may never rebuild. */
+  requirePreparedCandidate?: boolean;
+}
+
+export interface PreparedPrebuiltCandidateValidationContext {
+  now: Date;
+  maxCandidateAgeMs: number;
 }
 
 export interface TransactionAdapters {
@@ -235,6 +260,23 @@ export interface TransactionAdapters {
   /** Unwinds sidecar/config/snapshot work when promotion or acceptance fails. */
   rollbackPromotion?(): void | Promise<void>;
   openApp(appRoot: string): void | Promise<void>;
+  /** Re-probes the receipt, source binary/runtime, and source app under the app-install lock. */
+  validatePrebuiltCombinedCandidateAuthority?(
+    authority: PrebuiltCombinedCandidateAuthority,
+  ): void | Promise<void>;
+  /** Proves rollback roots before a stale pending authority can be superseded. */
+  validatePrebuiltRollbackRoots?(state: TransactionState): void | Promise<void>;
+  /** Removes only stale candidate/pristine/private build artifacts after strict archival. */
+  removeSupersededPrebuiltCandidateArtifacts?(state: TransactionState): void | Promise<void>;
+  /** Captures candidate/backend/runtime/rollback evidence after candidate health passes. */
+  capturePreparedPrebuiltCombinedCandidateEvidence?(
+    state: TransactionState,
+  ): PreparedPrebuiltCombinedCandidateEvidence | Promise<PreparedPrebuiltCombinedCandidateEvidence>;
+  /** Re-probes the persisted candidate and rollback evidence before any later cutover. */
+  validatePreparedPrebuiltCombinedCandidateEvidence?(
+    state: TransactionState,
+    context: PreparedPrebuiltCandidateValidationContext,
+  ): void | Promise<void>;
 }
 
 export interface TransactionResult {
@@ -367,6 +409,35 @@ async function runLockedInstallTransaction(
 ): Promise<TransactionResult> {
   const now = options.now ?? new Date();
   const existing = readTransactionState(options.stateFile);
+  const requestedPrebuilt = options.prebuiltCombinedCandidate;
+  if (requestedPrebuilt) {
+    if (options.payloadHash !== requestedPrebuilt.payloadIdentity) {
+      throw new Error("Prebuilt combined candidate payload identity is not bound to the installer transaction");
+    }
+    if (!adapters.validatePrebuiltCombinedCandidateAuthority) {
+      throw new Error("Prebuilt combined candidate authority validator is unavailable");
+    }
+    if (!options.candidateOnly && !options.requirePreparedCandidate) {
+      throw new Error("Prebuilt combined candidates require an explicit prepare or promotion-only action");
+    }
+    try {
+      await adapters.validatePrebuiltCombinedCandidateAuthority(requestedPrebuilt);
+    } catch (error) {
+      if (
+        existing?.phase === "pendingPromotion"
+        && samePayload(existing.payloadHash, options.payloadHash)
+        && samePrebuiltCombinedCandidate(existing, requestedPrebuilt)
+      ) {
+        return invalidatePreparedPrebuiltCandidate(options, adapters, existing, now, {
+          pendingReason: "candidate-evidence-drift",
+          failure: `prepared combined candidate evidence drifted: ${errorMessage(error)}`,
+        });
+      }
+      throw error;
+    }
+  } else if (options.requirePreparedCandidate) {
+    throw new Error("Prepared-candidate-only promotion requires prebuilt combined candidate authority");
+  }
   try {
     sweepStaleTempDirs(installTransactionSweepDirectories(options));
   } catch { /* best-effort startup sweep */ }
@@ -374,11 +445,28 @@ async function runLockedInstallTransaction(
   if (
     existing?.phase === "healthy" &&
     sameFingerprint(existing.source, options.source) &&
-    samePayload(existing.payloadHash, options.payloadHash)
+    samePayload(existing.payloadHash, options.payloadHash) &&
+    samePrebuiltCombinedCandidate(existing, requestedPrebuilt)
   ) {
     return { status: "promoted", state: existing };
   }
 
+  if (
+    options.requirePreparedCandidate
+    && !(
+      existing?.phase === "pendingPromotion"
+      && samePayload(existing.payloadHash, options.payloadHash)
+      && samePrebuiltCombinedCandidate(existing, requestedPrebuilt)
+      && candidateIntentMatches(existing, options)
+      && existing.prebuiltCombinedCandidate?.prepared
+    )
+  ) {
+    throw new Error(
+      "No exact receipt-bound prepared candidate exists for this transaction; promotion will not rebuild",
+    );
+  }
+
+  let supersededTransactionArchive: string | undefined;
   if (existing?.phase === "degraded" && existing.rollbackAttempted) {
     // A degraded transaction blocks retries of the SAME source to prevent a
     // promote → fail → rollback → promote loop. A different source (e.g. the
@@ -395,6 +483,13 @@ async function runLockedInstallTransaction(
         return { status: "invalidated", state: existing };
       }
       const lastFailureAt = Date.parse(existing.lastFailureAt ?? "");
+      const lastFailureAge = now.getTime() - lastFailureAt;
+      if (
+        requestedPrebuilt
+        && (!Number.isFinite(lastFailureAt) || !Number.isFinite(lastFailureAge) || lastFailureAge < 0)
+      ) {
+        return { status: "invalidated", state: existing };
+      }
       if (
         Number.isFinite(lastFailureAt) &&
         now.getTime() < lastFailureAt + INVALIDATED_RETRY_BACKOFF_MS(failureCount)
@@ -407,19 +502,36 @@ async function runLockedInstallTransaction(
   } else if (existing?.phase === "pendingPromotion") {
     if (
       samePayload(existing.payloadHash, options.payloadHash) &&
+      samePrebuiltCombinedCandidate(existing, requestedPrebuilt) &&
       candidateIntentMatches(existing, options)
     ) {
       return continuePendingPromotion(options, adapters, existing, now);
     }
-    await adapters.removeApp(existing.candidateRoot);
-    const sameInstallerPayload = samePayload(existing.payloadHash, options.payloadHash);
-    existing.pendingReason = sameInstallerPayload
-      ? "candidate-intent-drift"
-      : "installer-payload-drift";
-    existing.failure = sameInstallerPayload
-      ? "candidate promotion intent changed after the candidate was built"
-      : "installer payload changed after the candidate was built";
-    invalidateTransactionState(options.stateFile, existing, now);
+    if (requestedPrebuilt) {
+      if (
+        !adapters.validatePrebuiltRollbackRoots
+        || !adapters.removeSupersededPrebuiltCandidateArtifacts
+      ) {
+        throw new Error("Prebuilt stale-candidate reconciliation adapters are unavailable");
+      }
+      await adapters.validatePrebuiltRollbackRoots(existing);
+      const archived = archiveTransactionState(options.stateFile, existing);
+      if (archived === null) {
+        throw new Error("Stale pending-promotion receipt could not be archived; authority was preserved");
+      }
+      supersededTransactionArchive = archived;
+      await adapters.removeSupersededPrebuiltCandidateArtifacts(existing);
+    } else {
+      await adapters.removeApp(existing.candidateRoot);
+      const sameInstallerPayload = samePayload(existing.payloadHash, options.payloadHash);
+      existing.pendingReason = sameInstallerPayload
+        ? "candidate-intent-drift"
+        : "installer-payload-drift";
+      existing.failure = sameInstallerPayload
+        ? "candidate promotion intent changed after the candidate was built"
+        : "installer payload changed after the candidate was built";
+      invalidateTransactionState(options.stateFile, existing, now);
+    }
   } else if (existing && phaseMayHaveMutatedLiveApp(existing.phase)) {
     // The lock proves no live owner holds this transaction, but a state file
     // written by a still-running legacy (pre-lock) process must not be treated
@@ -446,6 +558,12 @@ async function runLockedInstallTransaction(
     updatedAt: now.toISOString(),
     rollbackAttempted: false,
     signingMode: options.signingMode,
+    ...(requestedPrebuilt ? {
+      prebuiltCombinedCandidate: {
+        authority: requestedPrebuilt,
+        ...(supersededTransactionArchive ? { supersededTransactionArchive } : {}),
+      },
+    } : {}),
   };
   writeTransactionState(options.stateFile, state);
 
@@ -490,6 +608,13 @@ async function runLockedInstallTransaction(
       invalidateTransactionState(options.stateFile, state, now, existing);
       return { status: "invalidated", state };
     }
+    if (requestedPrebuilt) {
+      if (!adapters.capturePreparedPrebuiltCombinedCandidateEvidence) {
+        throw new Error("Prebuilt prepared-candidate evidence adapter is unavailable");
+      }
+      state.prebuiltCombinedCandidate!.prepared =
+        await adapters.capturePreparedPrebuiltCombinedCandidateEvidence(state);
+    }
     state.phase = "pendingPromotion";
     state.pendingReason = options.signingMode === "adhoc"
       ? "adhoc-never-promotes"
@@ -523,6 +648,27 @@ async function runLockedInstallTransaction(
   }
 
   return promoteAndVerify(options, adapters, state, now);
+}
+
+async function invalidatePreparedPrebuiltCandidate(
+  options: TransactionOptions,
+  adapters: TransactionAdapters,
+  state: TransactionState,
+  now: Date,
+  reason: { pendingReason: string; failure: string },
+): Promise<TransactionResult> {
+  state.pendingReason = reason.pendingReason;
+  state.failure = reason.failure;
+  invalidateTransactionState(options.stateFile, state, now);
+  try {
+    await adapters.validatePrebuiltRollbackRoots?.(state);
+    await adapters.removeSupersededPrebuiltCandidateArtifacts?.(state);
+  } catch (cleanupError) {
+    state.failure = `${state.failure}; candidate cleanup: ${errorMessage(cleanupError)}`;
+    state.updatedAt = now.toISOString();
+    writeTransactionState(options.stateFile, state);
+  }
+  return { status: "invalidated", state };
 }
 
 async function recoverInterruptedPromotion(
@@ -572,6 +718,43 @@ async function continuePendingPromotion(
   state: TransactionState,
   now: Date,
 ): Promise<TransactionResult> {
+  if (options.prebuiltCombinedCandidate) {
+    if (
+      !state.prebuiltCombinedCandidate?.prepared
+      || !adapters.validatePreparedPrebuiltCombinedCandidateEvidence
+    ) {
+      throw new Error("Prepared prebuilt combined candidate evidence is unavailable");
+    }
+    try {
+      await adapters.validatePreparedPrebuiltCombinedCandidateEvidence(state, {
+        now,
+        maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
+      });
+    } catch (error) {
+      return invalidatePreparedPrebuiltCandidate(options, adapters, state, now, {
+        pendingReason: "candidate-evidence-drift",
+        failure: `prepared combined candidate evidence drifted: ${errorMessage(error)}`,
+      });
+    }
+  }
+
+  const createdAt = Date.parse(state.createdAt);
+  const age = now.getTime() - createdAt;
+  const maxAge = options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS;
+  const expired =
+    !Number.isFinite(createdAt)
+    || !Number.isFinite(age)
+    || !Number.isFinite(maxAge)
+    || maxAge < 0
+    || age < 0
+    || age > maxAge;
+  if (expired && options.prebuiltCombinedCandidate) {
+    return invalidatePreparedPrebuiltCandidate(options, adapters, state, now, {
+      pendingReason: "candidate-expired",
+      failure: "candidate expired before promotion (a newer app landed first)",
+    });
+  }
+
   if (
     options.candidateOnly ||
     state.signingMode === "adhoc" ||
@@ -581,9 +764,7 @@ async function continuePendingPromotion(
     return { status: "candidate-ready", state };
   }
 
-  const age = now.getTime() - Date.parse(state.createdAt);
-  const maxAge = options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS;
-  if (age < 0 || age > maxAge) {
+  if (expired) {
     await adapters.removeApp(state.candidateRoot);
     state.pendingReason = "candidate-expired";
     state.failure = "candidate expired before promotion (a newer app landed first)";
@@ -649,7 +830,7 @@ export function readProductionHealthReceipt(
     const observedAt = Date.parse(typeof receipt.observedAt === "string" ? receipt.observedAt : "");
     if (
       !Number.isFinite(observedAt)
-      || observedAt > now + 5_000
+      || observedAt > now + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS
       || now - observedAt > (options.maxAgeMs ?? PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS)
     ) return unknown;
     if (v2Expected) return readV2HealthReceipt(receipt, expected, unknown);
@@ -746,12 +927,36 @@ async function promoteAndVerify(
     writeTransactionState(options.stateFile, state);
     return { status: "held", state };
   }
+  if (options.prebuiltCombinedCandidate) {
+    if (!adapters.validatePreparedPrebuiltCombinedCandidateEvidence) {
+      throw new Error("Prepared prebuilt combined candidate revalidation is unavailable");
+    }
+    try {
+      await adapters.validatePreparedPrebuiltCombinedCandidateEvidence(state, {
+        now,
+        maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
+      });
+    } catch (error) {
+      return invalidatePreparedPrebuiltCandidate(options, adapters, state, now, {
+        pendingReason: "candidate-evidence-drift",
+        failure: `prepared combined candidate evidence drifted: ${errorMessage(error)}`,
+      });
+    }
+  }
 
   updateState(options.stateFile, state, "promoting", now);
   await adapters.removeApp(state.lastKnownGoodRoot);
   await adapters.copyApp(options.appRoot, state.lastKnownGoodRoot);
   await adapters.removeApp(state.lastKnownGoodRuntimeRoot);
   await adapters.snapshotRuntime(options.runtimeRoot, state.lastKnownGoodRuntimeRoot);
+  if (options.prebuiltCombinedCandidate) {
+    if (!adapters.capturePreparedPrebuiltCombinedCandidateEvidence) {
+      throw new Error("Prebuilt rollback snapshot evidence adapter is unavailable");
+    }
+    state.prebuiltCombinedCandidate!.prepared =
+      await adapters.capturePreparedPrebuiltCombinedCandidateEvidence(state);
+    writeTransactionState(options.stateFile, state);
+  }
   await adapters.promoteCandidate(state.candidateRoot, options.appRoot);
 
   updateState(options.stateFile, state, "checkingHealth", now);
@@ -896,13 +1101,19 @@ export function isTransactionLockHeld(lockFile: string): boolean {
 }
 
 /** Move a stale/degraded transaction record aside so a fresh transaction can start; never deletes evidence. */
-export function archiveTransactionState(stateFile: string, state: TransactionState): void {
+export function archiveTransactionState(stateFile: string, state: TransactionState): string | null {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const archived = `${stateFile.replace(/\.json$/, "")}.${stamp}.${state.phase}.json`;
   try {
+    if (existsSync(archived)) return null;
     renameSync(stateFile, archived);
     fsyncDirectory(dirname(stateFile));
-  } catch { /* preserve the source journal when archival cannot be completed */ }
+    return archived;
+  } catch {
+    // Preserve the source journal when archival cannot be completed. Receipt-
+    // bound callers treat null as a hard stop before removing candidate bytes.
+    return null;
+  }
 }
 
 export function filesystemTransactionAdapters(overrides: Partial<TransactionAdapters> = {}): TransactionAdapters {
@@ -999,6 +1210,17 @@ function samePayload(left: string | undefined, right: string | undefined): boole
   return (left ?? null) === (right ?? null);
 }
 
+function samePrebuiltCombinedCandidate(
+  state: TransactionState,
+  requested: PrebuiltCombinedCandidateAuthority | undefined,
+): boolean {
+  const existing = state.prebuiltCombinedCandidate?.authority;
+  if (!existing || !requested) return existing === undefined && requested === undefined;
+  return existing.transactionId === requested.transactionId
+    && existing.payloadIdentity === requested.payloadIdentity
+    && isDeepStrictEqual(existing, requested);
+}
+
 function candidateIntentMatches(state: TransactionState, options: TransactionOptions): boolean {
   if (options.signingMode === "adhoc") return state.pendingReason === "adhoc-never-promotes";
   if (options.candidateOnly) {
@@ -1054,6 +1276,29 @@ function validHealthValue(value: unknown): HealthValue {
 
 function isV2HealthExpectation(value: ProductionHealthExpectation): value is ProductionHealthExpectationV2 {
   return "schemaVersion" in value && value.schemaVersion === 2;
+}
+
+export function isValidProductionHealthExpectationV2(
+  value: unknown,
+): value is ProductionHealthExpectationV2 {
+  if (
+    !plainRecord(value)
+    || !exactKeys(value, ["schemaVersion", "app", "requiredPermissions", "surfaces", "userQuestions"])
+    || value.schemaVersion !== 2
+    || !plainRecord(value.app)
+    || !exactKeys(value.app, ["version", "build", "hash"])
+    || typeof value.app.version !== "string"
+    || value.app.version.length === 0
+    || typeof value.app.build !== "string"
+    || value.app.build.length === 0
+    || !validPromotionHash(value.app.hash)
+    || !Array.isArray(value.requiredPermissions)
+    || !value.requiredPermissions.every(
+      (permission) => permission === "accessibility" || permission === "screen-recording",
+    )
+    || new Set(value.requiredPermissions).size !== value.requiredPermissions.length
+  ) return false;
+  return validPromotionExpectation(value as unknown as ProductionHealthExpectationV2);
 }
 
 function validLegacyHealthReceipt(

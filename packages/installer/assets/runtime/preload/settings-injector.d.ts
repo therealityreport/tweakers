@@ -49,6 +49,7 @@ interface TweakUpdateCheck {
     error?: string;
 }
 export declare function startSettingsInjector(): void;
+export declare function stopSettingsInjector(): void;
 export declare function registerSection(section: SettingsSection): SettingsHandle;
 export declare function clearSections(): void;
 /**

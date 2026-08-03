@@ -175,8 +175,12 @@ export interface PreparedDesktopCandidateEvidence {
   version: string;
   build: string;
   artifactDigest: string;
-  /** Electron integrity hash for the exact app.asar carried by this candidate. */
-  asarHeaderHash: string;
+  /**
+   * Electron integrity hash for the exact app.asar carried by this candidate.
+   * Absent on legacy receipts written before integrity evidence existed; only
+   * terminal-phase receipts may omit it.
+   */
+  asarHeaderHash?: string;
   signature: PreparedCandidateSignatureEvidence;
 }
 
@@ -197,8 +201,11 @@ export interface PreparedRollbackEvidence {
   desktopVersion: string;
   desktopBuild: string;
   desktopArtifactDigest: string;
-  /** Electron integrity hash for the exact rollback app.asar. */
-  desktopAsarHeaderHash: string;
+  /**
+   * Electron integrity hash for the exact rollback app.asar. Absent on legacy
+   * receipts written before integrity evidence existed.
+   */
+  desktopAsarHeaderHash?: string;
   /** Additive schema-v1 trust evidence; newly prepared receipts always include it. */
   signature?: PreparedCandidateSignatureEvidence;
   backendLane: BackendLane;
@@ -294,19 +301,25 @@ export interface EnvironmentAppliedEvidence {
   desktopBuild: string;
   backendVersion: string;
   desktopArtifactDigest: string;
-  /** Re-observed Electron integrity hash for the running app.asar. */
-  asarHeaderHash: string;
+  /**
+   * Re-observed Electron integrity hash for the running app.asar. Absent on
+   * legacy receipts written before integrity evidence existed.
+   */
+  asarHeaderHash?: string;
   backendArtifactDigest: string;
   runtimeArtifactDigest?: string;
   managedRuntimeArtifactDigest?: string;
 }
 
 export interface EnvironmentRuntimeProof {
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: "environment-runtime-proof";
   pid: number;
   appRoot: string;
   bundleId: EnvironmentSelection["selectedDesktopBundleId"];
+  desktopVersion: string;
+  desktopBuild: string;
+  appAsarHeaderHash: string;
   appExperience: "tweakers";
   releaseProfile: ReleaseProfile;
   backendLane: "bundled" | "managed-alpha";
@@ -1804,6 +1817,8 @@ async function prepareEnvironmentPrerequisites(
   const rollbackBackendTarget = backendTargetPath(input.current, rollbackBackendRegistryPath);
   const rollbackBackendArtifact = join(preparedRoot, "backend", "rollback-codex");
   if (input.current.backendLane === "managed-alpha") {
+    const runningDesktopIdentity = deps.readDesktopIdentity(input.current.selectedDesktopPath);
+    const runningAsarHeaderHash = deps.readAsarHeaderHash(input.current.selectedDesktopPath);
     const proof = deps.readRuntimeProof(
       options.runtimeProofFile ?? join(dirname(options.configFile), "environment-runtime-proof.json"),
     );
@@ -1811,6 +1826,9 @@ async function prepareEnvironmentPrerequisites(
       || (input.oldMainPid !== null && proof.pid !== input.oldMainPid)
       || proof.appRoot !== input.current.selectedDesktopPath
       || proof.bundleId !== input.current.selectedDesktopBundleId
+      || proof.desktopVersion !== runningDesktopIdentity.version
+      || proof.desktopBuild !== runningDesktopIdentity.build
+      || proof.appAsarHeaderHash.toLowerCase() !== runningAsarHeaderHash.toLowerCase()
       || proof.releaseProfile !== input.current.releaseProfile
       || proof.backendLane !== "managed-alpha"
       || proof.binaryPath !== rollbackBackendSource
@@ -2973,6 +2991,9 @@ function proveAppliedEnvironment(
   const asarHeaderHash = requestedDirection
     ? input.prepared.candidate.asarHeaderHash
     : input.prepared.rollback.desktopAsarHeaderHash;
+  // Legacy prepared evidence (no asar integrity hash) can never prove an
+  // applied environment; fail closed instead of matching on undefined.
+  if (asarHeaderHash === undefined) return null;
   const backendPath = requestedDirection
     ? input.prepared.backend.binaryPath
     : input.prepared.rollback.backendBinaryPath;
@@ -3032,6 +3053,9 @@ function proveAppliedEnvironment(
       runtimeProof,
       input.observation.pid,
       expected,
+      desktopVersion,
+      desktopBuild,
+      asarHeaderHash,
       backendPath,
       backendVersion,
       backendDigest,
@@ -3079,6 +3103,9 @@ function bindWatcherTarget(
   const expectedAsarHeaderHash = input.direction === "requested"
     ? input.prepared.candidate.asarHeaderHash
     : input.prepared.rollback.desktopAsarHeaderHash;
+  if (expectedAsarHeaderHash === undefined) {
+    throw new Error("Prepared evidence lacks asar integrity hashes; a legacy transaction cannot bind a watcher target");
+  }
   if (input.applied.asarHeaderHash !== expectedAsarHeaderHash) {
     throw new Error("Proven target ASAR hash does not match prepared watcher evidence");
   }
@@ -3123,11 +3150,16 @@ export function readEnvironmentRuntimeProof(file: string): EnvironmentRuntimePro
 
 function isEnvironmentRuntimeProof(value: unknown): value is EnvironmentRuntimeProof {
   if (!isRecord(value)) return false;
-  return value.schemaVersion === 1
+  return value.schemaVersion === 2
     && value.kind === "environment-runtime-proof"
     && positiveInteger(value.pid)
     && typeof value.appRoot === "string"
     && (value.bundleId === "com.openai.codex" || value.bundleId === "com.openai.codex.beta")
+    && typeof value.desktopVersion === "string"
+    && value.desktopVersion.length > 0
+    && typeof value.desktopBuild === "string"
+    && value.desktopBuild.length > 0
+    && /^[a-f0-9]{64}$/i.test(typeof value.appAsarHeaderHash === "string" ? value.appAsarHeaderHash : "")
     && value.appExperience === "tweakers"
     && (value.releaseProfile === "stable" || value.releaseProfile === "alpha")
     && (value.backendLane === "bundled" || value.backendLane === "managed-alpha")
@@ -3153,6 +3185,9 @@ function runtimeProofMatches(
   proof: EnvironmentRuntimeProof | null,
   pid: number,
   expected: EnvironmentSelection,
+  desktopVersion: string,
+  desktopBuild: string,
+  appAsarHeaderHash: string,
   backendPath: string,
   backendVersion: string,
   backendFingerprint: string,
@@ -3174,6 +3209,9 @@ function runtimeProofMatches(
     && proof.pid === pid
     && proof.appRoot === expected.selectedDesktopPath
     && proof.bundleId === expected.selectedDesktopBundleId
+    && proof.desktopVersion === desktopVersion
+    && proof.desktopBuild === desktopBuild
+    && proof.appAsarHeaderHash.toLowerCase() === appAsarHeaderHash.toLowerCase()
     && proof.releaseProfile === expected.releaseProfile
     && backendLanesProve(proof.backendLane, expected.backendLane)
     && proof.binaryPath === backendPath
@@ -4687,6 +4725,18 @@ function isEnvironmentTransactionReceipt(value: unknown): value is EnvironmentTr
     return false;
   }
   if (phaseRequiresPreparedEvidence(receipt.phase) && receipt.prepared === null) return false;
+  // Legacy receipts predate asar integrity evidence. Only terminal phases may
+  // omit it: an in-flight transaction without the hashes cannot be verified,
+  // so it must stay invalid (fail closed) rather than resume unverifiable.
+  const terminalPhase = receipt.phase === "committed"
+    || receipt.phase === "rolled-back"
+    || receipt.phase === "failed"
+    || receipt.phase === "cancelled";
+  if (!terminalPhase && receipt.prepared !== null
+    && (receipt.prepared.candidate.asarHeaderHash === undefined
+      || receipt.prepared.rollback.desktopAsarHeaderHash === undefined)) {
+    return false;
+  }
   if (receipt.phase === "committed") {
     return receipt.prepared !== null
       && receipt.applied !== null
@@ -4821,7 +4871,7 @@ function isPreparedEnvironmentEvidence(value: unknown): value is PreparedEnviron
     || !nonEmpty(candidate.version)
     || !nonEmpty(candidate.build)
     || !nonEmpty(candidate.artifactDigest)
-    || !validDigest(candidate.asarHeaderHash)
+    || (candidate.asarHeaderHash !== undefined && !validDigest(candidate.asarHeaderHash))
     || !isPreparedSignatureEvidence(candidate.signature)) return false;
   if (!isRecord(backend)
     || !isBackendLane(backend.lane)
@@ -4845,6 +4895,7 @@ function isPreparedEnvironmentEvidence(value: unknown): value is PreparedEnviron
     && nonEmpty(rollback.desktopVersion)
     && nonEmpty(rollback.desktopBuild)
     && nonEmpty(rollback.desktopArtifactDigest)
+    && (rollback.desktopAsarHeaderHash === undefined || validDigest(rollback.desktopAsarHeaderHash))
     && (rollback.signature === undefined || isPreparedSignatureEvidence(rollback.signature))
     && isBackendLane(rollback.backendLane)
     && exactAbsolutePath(rollback.backendBinaryPath)
@@ -4942,6 +4993,7 @@ function isEnvironmentAppliedEvidence(value: unknown): value is EnvironmentAppli
     && nonEmpty(value.desktopBuild)
     && nonEmpty(value.backendVersion)
     && nonEmpty(value.desktopArtifactDigest)
+    && (value.asarHeaderHash === undefined || validDigest(value.asarHeaderHash))
     && nonEmpty(value.backendArtifactDigest)
     && (value.runtimeArtifactDigest === undefined || nonEmpty(value.runtimeArtifactDigest))
     && (value.managedRuntimeArtifactDigest === undefined || nonEmpty(value.managedRuntimeArtifactDigest));

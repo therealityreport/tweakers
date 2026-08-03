@@ -14,9 +14,19 @@ import {
   runInstallTransaction,
   transactionLockFile,
   TransactionLockHeldError,
+  type PreparedPrebuiltCandidateValidationContext,
   type ProductionHealthExpectationV2,
+  type TransactionState,
 } from "../src/transaction";
-import { createSignedBackupTransactionWiring, formatInvalidatedInstallError } from "../src/commands/install";
+import {
+  createSignedBackupTransactionWiring,
+  formatInvalidatedInstallError,
+  readCandidatePromotionHealthExpectation,
+} from "../src/commands/install";
+import type {
+  PrebuiltCombinedCandidateAuthority,
+  PreparedPrebuiltCombinedCandidateEvidence,
+} from "../src/prebuilt-combined-candidate";
 
 type Health = { host: "pass" | "fail" | "unknown"; session: "pass" | "fail" | "unknown"; permissions: Record<string, "pass" | "fail" | "unknown"> };
 
@@ -86,6 +96,73 @@ function adapters(overrides: Record<string, unknown> = {}) {
     openApp: () => calls.push("openApp"),
   };
   return { adapters: { ...base, ...overrides }, calls };
+}
+
+function prebuiltAuthority(
+  transactionId = "combined-canary-001",
+  payloadIdentity = "d".repeat(64),
+): PrebuiltCombinedCandidateAuthority {
+  return {
+    schemaVersion: 1,
+    transactionId,
+    payloadIdentity,
+    installerPayloadHash: "e".repeat(64),
+    acceptedBuildReceipt: {
+      path: "/private/tmp/accepted-build.json",
+      sha256: "1".repeat(64),
+      acceptedAt: "2026-07-10T11:00:00.000Z",
+      sourceCommit: "2".repeat(40),
+      sourceTree: "3".repeat(40),
+      cargoLockSha256: "4".repeat(64),
+      reviewedDiffSha256: "5".repeat(64),
+      buildCommand: "cargo build --locked --release --package codex-cli --bin codex",
+      toolchain: "rustc fixture",
+      testEvidence: [{
+        name: "lifecycle receipt",
+        command: "cargo test lifecycle_receipt",
+        receiptSha256: "6".repeat(64),
+      }],
+    },
+    backend: {
+      sourcePath: "/private/tmp/codex",
+      sha256: "7".repeat(64),
+      version: "0.146.0-alpha.3.1",
+      architecture: "arm64",
+    },
+    runtime: {
+      sourceRoot: "/private/tmp/runtime",
+      fingerprint: "8".repeat(64),
+      fileCount: 209,
+      documentSha256: "9".repeat(64),
+    },
+    sourceApp: {
+      path: "/Applications/ChatGPT.app",
+      bundleId: "com.openai.codex",
+      contentsFingerprint: "a".repeat(64),
+    },
+  };
+}
+
+function preparedPrebuiltEvidence(): PreparedPrebuiltCombinedCandidateEvidence {
+  return {
+    candidateAppFingerprint: "b".repeat(64),
+    embeddedBackendSha256: "7".repeat(64),
+    embeddedBackendVersion: "0.146.0-alpha.3.1",
+    stagedRuntime: {
+      fingerprint: "8".repeat(64),
+      fileCount: 209,
+    },
+    stagedRuntimeDocumentSha256: "9".repeat(64),
+    rollback: {
+      lastKnownGoodAppFingerprint: "c".repeat(64),
+      lastKnownGoodRuntime: {
+        fingerprint: "d".repeat(64),
+        fileCount: 177,
+      },
+      signedBackupFingerprint: "e".repeat(64),
+      signedBackupMarkerSha256: "f".repeat(64),
+    },
+  };
 }
 
 function signedBackupFixture(root: string, candidateVersion: string, liveVersion: string | null) {
@@ -332,6 +409,52 @@ test("backs off an invalidated transaction until its retry window expires", asyn
     assert.equal(injected.calls.filter((call) => call === "buildCandidate").length, 2);
   } finally {
     clean(f.root);
+  }
+});
+
+test("malformed receipt-bound invalidation time cannot bypass retry backoff", async () => {
+  for (const invalidLastFailureAt of [undefined, "not-a-timestamp"] as const) {
+    const f = fixture();
+    try {
+      const authority = prebuiltAuthority();
+      const first = adapters({
+        validatePrebuiltCombinedCandidateAuthority: () => undefined,
+        validateCandidate: () => false,
+      });
+      const invalidated = await runInstallTransaction({
+        ...options(f),
+        payloadHash: authority.payloadIdentity,
+        candidateOnly: true,
+        candidateOnlyReason: "coordinated-refresh",
+        prebuiltCombinedCandidate: authority,
+      }, first.adapters);
+      assert.equal(invalidated.status, "invalidated");
+
+      const durable = readTransactionState(f.stateFile);
+      assert.ok(durable);
+      if (invalidLastFailureAt === undefined) delete durable.lastFailureAt;
+      else durable.lastFailureAt = invalidLastFailureAt;
+      writeFileSync(f.stateFile, `${JSON.stringify(durable, null, 2)}\n`);
+
+      const repeated = adapters({
+        validatePrebuiltCombinedCandidateAuthority: () => undefined,
+        validateCandidate: () => false,
+      });
+      const result = await runInstallTransaction({
+        ...options(f),
+        payloadHash: authority.payloadIdentity,
+        candidateOnly: true,
+        candidateOnlyReason: "coordinated-refresh",
+        prebuiltCombinedCandidate: authority,
+        now: new Date("2026-07-10T12:10:00.000Z"),
+      }, repeated.adapters);
+
+      assert.equal(result.status, "invalidated");
+      assert.equal(result.state.failureCount, 1);
+      assert.deepEqual(repeated.calls, []);
+    } finally {
+      clean(f.root);
+    }
   }
 });
 
@@ -969,6 +1092,572 @@ test("a coordinated refresh promotes the exact candidate held before quit", asyn
     assert.equal(promoted.status, "promoted");
     assert.ok(second.calls.includes("promoteCandidate"));
     assert.equal(second.calls.includes("buildCandidate"), false);
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("receipt-bound prebuilt prepare and promotion reuse one exact candidate without rebuilding", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const prepared = preparedPrebuiltEvidence();
+    let authorityValidations = 0;
+    let preparedValidations = 0;
+    const first = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => { authorityValidations += 1; },
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => prepared,
+    });
+    const held = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, first.adapters);
+    assert.equal(held.status, "candidate-ready");
+    assert.equal(held.state.prebuiltCombinedCandidate?.authority.transactionId, authority.transactionId);
+    assert.deepEqual(held.state.prebuiltCombinedCandidate?.prepared, prepared);
+    assert.equal(first.calls.filter((call) => call === "buildCandidate").length, 1);
+
+    const reorderedAuthority: PrebuiltCombinedCandidateAuthority = {
+      sourceApp: authority.sourceApp,
+      runtime: authority.runtime,
+      backend: authority.backend,
+      acceptedBuildReceipt: authority.acceptedBuildReceipt,
+      installerPayloadHash: authority.installerPayloadHash,
+      payloadIdentity: authority.payloadIdentity,
+      transactionId: authority.transactionId,
+      schemaVersion: authority.schemaVersion,
+    };
+
+    const requestFile = join(f.workRoot, "candidate-user", "health", "request.json");
+    mkdirSync(join(f.workRoot, "candidate-user", "health"), { recursive: true });
+    writeFileSync(requestFile, `${JSON.stringify({
+      ...promotionExpectation(),
+      requestedAt: "2026-07-10T12:00:30.000Z",
+    }, null, 2)}\n`);
+    chmodSync(requestFile, 0o600);
+    const second = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => { authorityValidations += 1; },
+      validatePreparedPrebuiltCombinedCandidateEvidence: (
+        state: TransactionState,
+        context: PreparedPrebuiltCandidateValidationContext,
+      ) => {
+        preparedValidations += 1;
+        assert.deepEqual(readCandidatePromotionHealthExpectation(requestFile, {
+          transactionCreatedAt: state.createdAt,
+          now: context.now,
+          maxAgeMs: context.maxCandidateAgeMs,
+        }), promotionExpectation());
+      },
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => prepared,
+    });
+    const promoted = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      prebuiltCombinedCandidate: reorderedAuthority,
+      requirePreparedCandidate: true,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, second.adapters);
+    assert.equal(promoted.status, "promoted");
+    assert.equal(second.calls.includes("buildCandidate"), false);
+    assert.equal(second.calls.includes("promoteCandidate"), true);
+    assert.equal(authorityValidations, 2);
+    assert.equal(preparedValidations, 2);
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("expired receipt-bound repeated prepare cleans only bounded scratch without rebuilding or promoting", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const first = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+    });
+    const prepared = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, first.adapters);
+    assert.equal(prepared.status, "candidate-ready");
+    assert.equal(first.calls.filter((call) => call === "buildCandidate").length, 1);
+
+    const candidateUserRoot = join(f.workRoot, "candidate-user");
+    const preservedRoots = [
+      f.appRoot,
+      f.runtimeRoot,
+      prepared.state.lastKnownGoodRoot,
+      prepared.state.lastKnownGoodRuntimeRoot,
+    ];
+    const scratchRoots = [
+      prepared.state.candidateRoot,
+      prepared.state.pristineRoot,
+      candidateUserRoot,
+    ];
+    for (const root of [...preservedRoots, ...scratchRoots]) {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, "sentinel"), root);
+    }
+
+    let preparedValidations = 0;
+    let cleanupCalls = 0;
+    const repeated = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      validatePreparedPrebuiltCombinedCandidateEvidence: () => { preparedValidations += 1; },
+      validatePrebuiltRollbackRoots: () => {
+        for (const root of preservedRoots) {
+          assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root);
+        }
+      },
+      removeSupersededPrebuiltCandidateArtifacts: (state: { candidateRoot: string; pristineRoot: string }) => {
+        cleanupCalls += 1;
+        rmSync(state.candidateRoot, { recursive: true, force: true });
+        rmSync(state.pristineRoot, { recursive: true, force: true });
+        rmSync(candidateUserRoot, { recursive: true, force: true });
+      },
+    });
+    const fresh = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, repeated.adapters);
+    assert.equal(fresh.status, "candidate-ready");
+    assert.equal(preparedValidations, 1);
+    assert.equal(cleanupCalls, 0);
+    assert.equal(repeated.calls.includes("buildCandidate"), false);
+    assert.equal(repeated.calls.includes("promoteCandidate"), false);
+    for (const root of [...preservedRoots, ...scratchRoots]) {
+      assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root);
+    }
+
+    const result = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+      now: new Date("2026-07-11T12:00:00.001Z"),
+    }, repeated.adapters);
+
+    assert.equal(result.status, "invalidated");
+    assert.equal(result.state.pendingReason, "candidate-expired");
+    assert.equal(result.state.failure, "candidate expired before promotion (a newer app landed first)");
+    assert.equal(preparedValidations, 2);
+    assert.equal(cleanupCalls, 1);
+    assert.equal(repeated.calls.includes("buildCandidate"), false);
+    assert.equal(repeated.calls.includes("promoteCandidate"), false);
+    for (const root of scratchRoots) assert.equal(existsSync(root), false);
+    for (const root of preservedRoots) {
+      assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root);
+    }
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("malformed receipt-bound candidate time invalidates only bounded scratch", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const malformedCreatedAt = "not-a-timestamp";
+    const prepared = interruptedState(f, {
+      phase: "pendingPromotion",
+      pendingReason: "coordinated-refresh",
+      payloadHash: authority.payloadIdentity,
+      createdAt: malformedCreatedAt,
+      prebuiltCombinedCandidate: {
+        authority,
+        prepared: preparedPrebuiltEvidence(),
+      },
+    });
+    writeFileSync(f.stateFile, `${JSON.stringify(prepared, null, 2)}\n`);
+    assert.equal(readTransactionState(f.stateFile)?.createdAt, malformedCreatedAt);
+
+    const candidateUserRoot = join(f.workRoot, "candidate-user");
+    const preservedRoots = [
+      f.appRoot,
+      f.runtimeRoot,
+      prepared.lastKnownGoodRoot,
+      prepared.lastKnownGoodRuntimeRoot,
+    ];
+    const scratchRoots = [
+      prepared.candidateRoot,
+      prepared.pristineRoot,
+      candidateUserRoot,
+    ];
+    for (const root of [...preservedRoots, ...scratchRoots]) {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, "sentinel"), root);
+    }
+
+    let preparedValidations = 0;
+    let cleanupCalls = 0;
+    const repeated = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      validatePreparedPrebuiltCombinedCandidateEvidence: () => { preparedValidations += 1; },
+      validatePrebuiltRollbackRoots: () => {
+        for (const root of preservedRoots) {
+          assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root);
+        }
+      },
+      removeSupersededPrebuiltCandidateArtifacts: (state: { candidateRoot: string; pristineRoot: string }) => {
+        cleanupCalls += 1;
+        rmSync(state.candidateRoot, { recursive: true, force: true });
+        rmSync(state.pristineRoot, { recursive: true, force: true });
+        rmSync(candidateUserRoot, { recursive: true, force: true });
+      },
+    });
+    const result = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, repeated.adapters);
+
+    assert.equal(result.status, "invalidated");
+    assert.equal(result.state.pendingReason, "candidate-expired");
+    assert.equal(result.state.failure, "candidate expired before promotion (a newer app landed first)");
+    assert.equal(preparedValidations, 1);
+    assert.equal(cleanupCalls, 1);
+    assert.deepEqual(repeated.calls, []);
+    for (const root of scratchRoots) assert.equal(existsSync(root), false);
+    for (const root of preservedRoots) {
+      assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root);
+    }
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("invalid durable candidate health-request times invalidate only bounded scratch", async () => {
+  const scenarios = [
+    {
+      name: "missing request file",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: null,
+    },
+    {
+      name: "malformed request JSON",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: "{",
+    },
+    {
+      name: "missing requestedAt",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: JSON.stringify(promotionExpectation()),
+    },
+    {
+      name: "non-finite requestedAt",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: JSON.stringify({ ...promotionExpectation(), requestedAt: "not-a-timestamp" }),
+    },
+    {
+      name: "future requestedAt beyond clock skew",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: JSON.stringify({ ...promotionExpectation(), requestedAt: "2026-07-10T12:00:05.001Z" }),
+    },
+    {
+      name: "pre-transaction requestedAt",
+      createdAt: "2026-07-10T11:59:00.000Z",
+      request: JSON.stringify({ ...promotionExpectation(), requestedAt: "2026-07-10T11:58:59.999Z" }),
+    },
+    {
+      name: "over-age requestedAt",
+      createdAt: "2026-07-09T11:59:59.999Z",
+      request: JSON.stringify({ ...promotionExpectation(), requestedAt: "2026-07-09T11:59:59.999Z" }),
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const f = fixture();
+    try {
+      const authority = prebuiltAuthority();
+      const prepared = interruptedState(f, {
+        phase: "pendingPromotion",
+        pendingReason: "coordinated-refresh",
+        payloadHash: authority.payloadIdentity,
+        createdAt: scenario.createdAt,
+        prebuiltCombinedCandidate: {
+          authority,
+          prepared: preparedPrebuiltEvidence(),
+        },
+      });
+      writeFileSync(f.stateFile, `${JSON.stringify(prepared, null, 2)}\n`);
+
+      const candidateUserRoot = join(f.workRoot, "candidate-user");
+      const requestFile = join(candidateUserRoot, "health", "request.json");
+      if (scenario.request !== null) {
+        mkdirSync(join(candidateUserRoot, "health"), { recursive: true });
+        writeFileSync(requestFile, scenario.request);
+        chmodSync(requestFile, 0o600);
+      }
+
+      const signedBackupRoot = join(f.workRoot, "last-known-good-backup");
+      const signedBackupMarker = join(f.workRoot, "last-known-good-backup.json");
+      const preservedRoots = [
+        f.appRoot,
+        f.runtimeRoot,
+        prepared.lastKnownGoodRoot,
+        prepared.lastKnownGoodRuntimeRoot,
+        signedBackupRoot,
+      ];
+      const scratchRoots = [
+        prepared.candidateRoot,
+        prepared.pristineRoot,
+        candidateUserRoot,
+      ];
+      for (const root of [...preservedRoots, ...scratchRoots]) {
+        mkdirSync(root, { recursive: true });
+        writeFileSync(join(root, "sentinel"), root);
+      }
+      writeFileSync(signedBackupMarker, "signed-backup-marker");
+
+      let preparedValidations = 0;
+      let cleanupCalls = 0;
+      const repeated = adapters({
+        validatePrebuiltCombinedCandidateAuthority: () => undefined,
+        validatePreparedPrebuiltCombinedCandidateEvidence: (
+          state: TransactionState,
+          context: PreparedPrebuiltCandidateValidationContext,
+        ) => {
+          preparedValidations += 1;
+          const expectation = readCandidatePromotionHealthExpectation(requestFile, {
+            transactionCreatedAt: state.createdAt,
+            now: context.now,
+            maxAgeMs: context.maxCandidateAgeMs,
+          });
+          if (!expectation) {
+            throw new Error("Prepared candidate schema-v2 health expectation is unavailable");
+          }
+        },
+        validatePrebuiltRollbackRoots: () => {
+          for (const root of preservedRoots) {
+            assert.equal(
+              readFileSync(join(root, "sentinel"), "utf8"),
+              root,
+              scenario.name,
+            );
+          }
+          assert.equal(readFileSync(signedBackupMarker, "utf8"), "signed-backup-marker", scenario.name);
+        },
+        removeSupersededPrebuiltCandidateArtifacts: (
+          state: { candidateRoot: string; pristineRoot: string },
+        ) => {
+          cleanupCalls += 1;
+          rmSync(state.candidateRoot, { recursive: true, force: true });
+          rmSync(state.pristineRoot, { recursive: true, force: true });
+          rmSync(candidateUserRoot, { recursive: true, force: true });
+        },
+      });
+      const result = await runInstallTransaction({
+        ...options(f),
+        payloadHash: authority.payloadIdentity,
+        candidateOnly: true,
+        candidateOnlyReason: "coordinated-refresh",
+        prebuiltCombinedCandidate: authority,
+        now: new Date("2026-07-10T12:00:00.000Z"),
+      }, repeated.adapters);
+
+      assert.equal(result.status, "invalidated", scenario.name);
+      assert.equal(result.state.pendingReason, "candidate-evidence-drift", scenario.name);
+      assert.match(result.state.failure ?? "", /health expectation is unavailable/, scenario.name);
+      assert.equal(preparedValidations, 1, scenario.name);
+      assert.equal(cleanupCalls, 1, scenario.name);
+      assert.deepEqual(repeated.calls, [], scenario.name);
+      for (const root of scratchRoots) assert.equal(existsSync(root), false, scenario.name);
+      for (const root of preservedRoots) {
+        assert.equal(readFileSync(join(root, "sentinel"), "utf8"), root, scenario.name);
+      }
+      assert.equal(readFileSync(signedBackupMarker, "utf8"), "signed-backup-marker", scenario.name);
+    } finally {
+      clean(f.root);
+    }
+  }
+});
+
+test("prebuilt prepare strictly archives stale pending authority before candidate-only cleanup", async () => {
+  const f = fixture();
+  try {
+    const stale = {
+      ...interruptedState(f, {
+        phase: "pendingPromotion",
+        pendingReason: "coordinated-refresh",
+        payloadHash: "old-payload",
+      }),
+      candidateRoot: join(f.workRoot, "candidate.app"),
+      pristineRoot: join(f.workRoot, "pristine.app"),
+    };
+    const staleBytes = `${JSON.stringify(stale, null, 2)}\n`;
+    mkdirSync(stale.candidateRoot, { recursive: true });
+    mkdirSync(stale.pristineRoot, { recursive: true });
+    mkdirSync(stale.lastKnownGoodRoot, { recursive: true });
+    mkdirSync(stale.lastKnownGoodRuntimeRoot, { recursive: true });
+    writeFileSync(join(stale.lastKnownGoodRoot, "sentinel"), "lkg-app");
+    writeFileSync(join(stale.lastKnownGoodRuntimeRoot, "sentinel"), "lkg-runtime");
+    writeFileSync(f.stateFile, staleBytes);
+
+    const order: string[] = [];
+    const authority = prebuiltAuthority();
+    const injected = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => order.push("authority"),
+      validatePrebuiltRollbackRoots: () => {
+        order.push("rollback");
+        assert.equal(readFileSync(join(stale.lastKnownGoodRoot, "sentinel"), "utf8"), "lkg-app");
+        assert.equal(readFileSync(join(stale.lastKnownGoodRuntimeRoot, "sentinel"), "utf8"), "lkg-runtime");
+      },
+      removeSupersededPrebuiltCandidateArtifacts: () => {
+        order.push("remove-stale");
+        assert.equal(existsSync(f.stateFile), false);
+        rmSync(stale.candidateRoot, { recursive: true, force: true });
+        rmSync(stale.pristineRoot, { recursive: true, force: true });
+      },
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+    });
+    const result = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, injected.adapters);
+    assert.equal(result.status, "candidate-ready");
+    assert.deepEqual(order, ["authority", "rollback", "remove-stale"]);
+    const archive = result.state.prebuiltCombinedCandidate?.supersededTransactionArchive;
+    assert.equal(typeof archive, "string");
+    assert.equal(readFileSync(archive!, "utf8"), staleBytes);
+    assert.equal(readFileSync(join(stale.lastKnownGoodRoot, "sentinel"), "utf8"), "lkg-app");
+    assert.equal(readFileSync(join(stale.lastKnownGoodRuntimeRoot, "sentinel"), "utf8"), "lkg-runtime");
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("prebuilt promotion mismatch fails without rebuilding or superseding the prepared authority", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const first = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+    });
+    await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, first.adapters);
+    const changed = prebuiltAuthority("combined-canary-002", "c".repeat(64));
+    const second = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      validatePreparedPrebuiltCombinedCandidateEvidence: () => undefined,
+    });
+    await assert.rejects(() => runInstallTransaction({
+      ...options(f),
+      payloadHash: changed.payloadIdentity,
+      prebuiltCombinedCandidate: changed,
+      requirePreparedCandidate: true,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, second.adapters), /No exact receipt-bound prepared candidate/);
+    assert.equal(second.calls.includes("buildCandidate"), false);
+    assert.equal(readTransactionState(f.stateFile)?.prebuiltCombinedCandidate?.authority.transactionId, authority.transactionId);
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("prepared prebuilt candidate evidence drift invalidates before live mutation", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const first = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+    });
+    await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, first.adapters);
+    let cleaned = false;
+    const second = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      validatePreparedPrebuiltCombinedCandidateEvidence: () => {
+        throw new Error("embedded backend digest mismatch");
+      },
+      validatePrebuiltRollbackRoots: () => undefined,
+      removeSupersededPrebuiltCandidateArtifacts: () => { cleaned = true; },
+    });
+    const result = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      prebuiltCombinedCandidate: authority,
+      requirePreparedCandidate: true,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, second.adapters);
+    assert.equal(result.status, "invalidated");
+    assert.equal(result.state.pendingReason, "candidate-evidence-drift");
+    assert.match(result.state.failure ?? "", /embedded backend digest mismatch/);
+    assert.equal(cleaned, true);
+    assert.equal(second.calls.includes("promoteCandidate"), false);
+    assert.equal(second.calls.includes("openApp"), false);
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("receipt-bound prebuilt promotion retains the existing automatic rollback owner", async () => {
+  const f = fixture();
+  try {
+    const authority = prebuiltAuthority();
+    const first = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+    });
+    await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      candidateOnly: true,
+      candidateOnlyReason: "coordinated-refresh",
+      prebuiltCombinedCandidate: authority,
+    }, first.adapters);
+
+    const second = adapters({
+      validatePrebuiltCombinedCandidateAuthority: () => undefined,
+      validatePreparedPrebuiltCombinedCandidateEvidence: () => undefined,
+      capturePreparedPrebuiltCombinedCandidateEvidence: () => preparedPrebuiltEvidence(),
+      probeHealth: (): Health => ({
+        host: "fail",
+        session: "pass",
+        permissions: { accessibility: "pass" },
+      }),
+    });
+    const result = await runInstallTransaction({
+      ...options(f),
+      payloadHash: authority.payloadIdentity,
+      prebuiltCombinedCandidate: authority,
+      requirePreparedCandidate: true,
+      now: new Date("2026-07-10T12:01:00.000Z"),
+    }, second.adapters);
+    assert.equal(result.status, "rolled-back");
+    assert.equal(result.state.rollbackAttempted, true);
+    assert.equal(result.state.rollbackResult, "succeeded");
+    assert.equal(second.calls.includes("buildCandidate"), false);
+    assert.ok(second.calls.includes("restoreApp"));
+    assert.ok(second.calls.includes("restoreRuntime"));
   } finally {
     clean(f.root);
   }
