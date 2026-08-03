@@ -2043,11 +2043,15 @@ export function stageCandidateCodexAuth(liveCodexHome: string, candidateCodexHom
   };
 }
 
-function copyCandidatePreimage(source: string, destination: string): void {
+export function copyCandidatePreimage(source: string, destination: string): void {
   const before = fingerprintPath(source);
   if (before.kind === "missing") return;
   mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-  cpSync(source, destination, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+  if (before.kind === "directory") {
+    copyDirectoryPreservingModes(source, destination);
+  } else {
+    cpSync(source, destination, { verbatimSymlinks: true, preserveTimestamps: true });
+  }
   const after = fingerprintPath(destination);
   if (before.kind !== after.kind || before.mode !== after.mode || before.hash !== after.hash) {
     throw new Error(`Candidate rollout preimage copy failed verification: ${source}`);
