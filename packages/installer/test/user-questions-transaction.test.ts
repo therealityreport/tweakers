@@ -243,3 +243,19 @@ test("commit is idempotent after the durable committed receipt", () => {
     assert.equal(readUserQuestionsRolloutReceipt(f.receiptFile)?.phase, "committed");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test("Finder junk in a rollout surface does not break preimage verification", () => {
+  const f = fixture();
+  try {
+    writeLegacyState(f);
+    // Finder writes .DS_Store into any directory the user merely browses, and
+    // copyDirectoryPreservingModes sweeps it out of every copy. A fingerprint
+    // that counted it could never match its own preimage.
+    writeFileSync(join(f.userRoot, "tweak-data", "co.thomashulihan.user-questions", ".DS_Store"), "junk\n");
+    writeFileSync(join(f.liveTweaksRoot, "co.thomashulihan.user-questions", ".DS_Store"), "junk\n");
+    const prepared = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    assert.equal(prepared.phase, "prepared");
+    const sealed = sealUserQuestionsRollout(prepared, { mcpConflictCount: 0 });
+    assert.equal(commitUserQuestionsRollout(sealed).phase, "committed");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});

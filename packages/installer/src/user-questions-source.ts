@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join, relative } from "node:path";
+import { isMacOsJunkName } from "./fs-copy.js";
 
 export const USER_QUESTIONS_TWEAK_ID = "co.tweakers.user-questions";
 export const USER_QUESTIONS_FOLDER = "user-questions";
@@ -47,6 +48,9 @@ export function fingerprintPath(path: string): PathFingerprint {
   const visit = (directory: string): void => {
     const entries = readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
+      // copyDirectoryPreservingModes sweeps Finder junk out of every copy, so a
+      // fingerprint that counted it would never match its own preimage.
+      if (isMacOsJunkName(entry.name)) continue;
       const entryPath = join(directory, entry.name);
       const entryStat = lstatSync(entryPath);
       if (entryStat.isSymbolicLink()) throw new Error(`symbolic links are not allowed in rollout surfaces: ${entryPath}`);
