@@ -25,11 +25,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME_TOKEN = "{{HOME}}";
 
 export const MCP_LIFECYCLE_PACKAGE_NAME = "@therealityreport/tweakers-mcp-lifecycle";
-export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.3.1";
+export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.4.0";
 export const MCP_LIFECYCLE_MANIFEST_SCHEMA_VERSION = 1;
 export const MCP_LIFECYCLE_SCHEMA_VERSION = 2;
-export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v3";
-export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v3";
+export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v4";
+export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v4";
 export const MCP_LIFECYCLE_LABELS = [
   "com.thomashulihan.codex-mcp-idle-reaper",
   "com.thomashulihan.codex-mcp-guard",

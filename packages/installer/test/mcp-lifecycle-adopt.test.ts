@@ -49,15 +49,23 @@ const VERSION_030_DIGESTS = {
   "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
 };
 
+const VERSION_031_DIGESTS = {
+  "lifecycle-module": "90669677b9d694290c33ce4b18d6547a50afd464bce1d95367dbb28b3a7ba946",
+  "idle-reaper": "963cf893e0832706662ad04d1d297c15ccc4e03358c70e1ca4522892e3f73999",
+  guard: "59b0c1d7e78fe978f74734f0f231a4b4c80f1366dfcafd637e07abffc14617bb",
+  "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+  "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+};
+
 test("explicit adopt upgrades exactly the recognized v2 managed receipt", () => {
   withFixture((fixture) => {
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
     assert.equal(result.status, "installed");
     assert.equal(fixture.reloads(), 1);
     const receipt = fixture.receipt();
-    assert.equal(receipt.packageVersion, "0.3.1");
-    assert.equal(receipt.policyVersion, "strict-detached-v3");
-    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v3");
+    assert.equal(receipt.packageVersion, "0.4.0");
+    assert.equal(receipt.policyVersion, "strict-detached-v4");
+    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v4");
     assert.deepEqual(receipt.labels, MCP_LIFECYCLE_LABELS);
   });
 });
@@ -75,8 +83,26 @@ test("explicit adopt upgrades exactly the recognized 0.3.0 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.3.1");
-    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v3");
+    assert.equal(fixture.receipt().packageVersion, "0.4.0");
+    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v4");
+  });
+});
+
+test("explicit adopt upgrades exactly the recognized 0.3.1 managed receipt", () => {
+  withFixture((fixture) => {
+    fixture.writeReceipt({
+      packageVersion: "0.3.1",
+      lifecycleSchemaVersion: 2,
+      policyVersion: "strict-detached-v3",
+      matcherRegistryVersion: "mcp-family-descriptors-v3",
+      assetDigests: VERSION_031_DIGESTS,
+    });
+
+    const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
+
+    assert.equal(result.status, "installed");
+    assert.equal(fixture.receipt().packageVersion, "0.4.0");
+    assert.equal(fixture.receipt().policyVersion, "strict-detached-v4");
   });
 });
 

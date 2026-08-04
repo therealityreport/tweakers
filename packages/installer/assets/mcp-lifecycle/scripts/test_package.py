@@ -65,14 +65,14 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("schema_version") != 1:
         fail("manifest schema_version must be 1")
     package = manifest.get("package")
-    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.3.1"}:
+    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.4.0"}:
         fail("manifest package identity/version changed")
     if (
         manifest.get("lifecycle_schema_version") != 2
-        or manifest.get("policy_version") != "strict-detached-v3"
+        or manifest.get("policy_version") != "strict-detached-v4"
     ):
         fail("manifest lifecycle/policy schema changed")
-    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v3":
+    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v4":
         fail("manifest matcher registry version changed")
     expected_policy = {
         "detached_stable_grace_seconds": 600,
