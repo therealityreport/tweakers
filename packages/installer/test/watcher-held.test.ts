@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runHeldPromotion, type HeldPromotionDeps } from "../src/watcher-held";
+import { transition } from "../src/update-recovery/index";
 import type { OpenReport } from "../src/commands/debug";
 
 function report(partial: Partial<OpenReport>): OpenReport {
@@ -131,6 +132,66 @@ test("reenter is invoked exactly once per run in every scenario", async () => {
     const { deps, calls } = makeDeps(scenario.reports);
     await runHeldPromotion(deps, { coordinatedQuit: scenario.coordinatedQuit });
     assert.equal(calls.filter((c) => c === "reenter").length, 1);
+  }
+});
+
+test("v2: an entry event that never authorizes re-entry still yields to sleep every iteration (no busy-spin)", async () => {
+  const previousFlag = process.env.TWEAKERS_UPDATE_RECOVERY_V2;
+  process.env.TWEAKERS_UPDATE_RECOVERY_V2 = "1";
+  try {
+    const ITERATIONS = 5;
+    const stop = new Error("stop-held-loop");
+    const calls: string[] = [];
+    let sleeps = 0;
+    let reportsRead = 0;
+    const deps: HeldPromotionDeps = {
+      getReport: () => {
+        calls.push("getReport");
+        reportsRead += 1;
+        // Backstop so a busy-spin regression fails deterministically instead
+        // of hanging the runner: a spinning loop reads reports without ever
+        // sleeping, so it trips this before the sleep-based stop.
+        if (reportsRead > ITERATIONS + 1) throw stop;
+        return report({ status: "closed", hasMainProcess: false, pid: null });
+      },
+      quitApp: () => calls.push("quitApp"),
+      cleanupOrphans: () => calls.push("cleanupOrphans"),
+      notifyUpdateQuit: () => calls.push("notify"),
+      reenter: async () => {
+        calls.push("reenter");
+      },
+      sleep: async () => {
+        calls.push("sleep");
+        sleeps += 1;
+        if (sleeps >= ITERATIONS) throw stop;
+      },
+      log: () => {},
+      // Simulates a future entry event whose held transition authorizes
+      // neither a coordinated quit nor re-entry (reentryAuthorized === false).
+      // The wait loop then walks the real table: held --appClosed--> promoting,
+      // whose subsequent decisions emit no waitForCodexClose action.
+      transitionImpl: (state, event) =>
+        state === "held" && event.type === "confirmedOfficialDrift"
+          ? { state: "held", actions: [] }
+          : transition(state, event),
+    };
+
+    await assert.rejects(
+      () => runHeldPromotion(deps, { coordinatedQuit: true }),
+      (err: unknown) => err === stop,
+    );
+
+    // Deterministic bound: N loop iterations => N report reads and N sleeps,
+    // i.e. every iteration that did not re-enter yielded to sleep.
+    assert.equal(sleeps, ITERATIONS);
+    assert.equal(reportsRead, ITERATIONS);
+    assert.ok(!calls.includes("reenter"));
+    assert.ok(!calls.includes("cleanupOrphans"));
+    assert.ok(!calls.includes("quitApp"));
+    assert.ok(!calls.includes("notify"));
+  } finally {
+    if (previousFlag === undefined) delete process.env.TWEAKERS_UPDATE_RECOVERY_V2;
+    else process.env.TWEAKERS_UPDATE_RECOVERY_V2 = previousFlag;
   }
 });
 

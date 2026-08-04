@@ -2,11 +2,11 @@
   "schema_version": 1,
   "package": {
     "name": "@therealityreport/tweakers-mcp-lifecycle",
-    "version": "0.3.1"
+    "version": "0.4.1"
   },
   "lifecycle_schema_version": 2,
-  "policy_version": "strict-detached-v3",
-  "matcher_registry_version": "mcp-family-descriptors-v3",
+  "policy_version": "strict-detached-v4",
+  "matcher_registry_version": "mcp-family-descriptors-v4",
   "policy": {
     "detached_stable_grace_seconds": 600,
     "termination_order": "children-first-term",
@@ -36,7 +36,7 @@
       "source": "assets/lib/codex_mcp_lifecycle.py",
       "destination": "{{HOME}}/.codex/lib/codex_mcp_lifecycle.py",
       "mode": "0644",
-      "source_sha256": "90669677b9d694290c33ce4b18d6547a50afd464bce1d95367dbb28b3a7ba946"
+      "source_sha256": "d70b1813b50082e19a71c0c392341caa9e584f66ee42e336c2966c7161b6f6a7"
     },
     {
       "id": "idle-reaper",
@@ -44,7 +44,7 @@
       "source": "assets/bin/codex-mcp-idle-reaper.py",
       "destination": "{{HOME}}/.codex/bin/codex-mcp-idle-reaper.py",
       "mode": "0755",
-      "source_sha256": "963cf893e0832706662ad04d1d297c15ccc4e03358c70e1ca4522892e3f73999"
+      "source_sha256": "60e801e3e5c6b230cee593f5bb5171d28c84e6ad1b83ceb4f955e845463e24f8"
     },
     {
       "id": "guard",
@@ -52,7 +52,7 @@
       "source": "assets/bin/codex-mcp-guard.py",
       "destination": "{{HOME}}/.codex/bin/codex-mcp-guard.py",
       "mode": "0755",
-      "source_sha256": "59b0c1d7e78fe978f74734f0f231a4b4c80f1366dfcafd637e07abffc14617bb"
+      "source_sha256": "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9"
     },
     {
       "id": "idle-reaper-launch-agent",
@@ -80,7 +80,7 @@
     }
   ],
   "tests": {
-    "baseline_count": 61,
+    "baseline_count": 74,
     "path": "tests/test_mcp_lifecycle.py",
     "fixtures": "tests/fixtures/lifecycle-scenarios.json"
   }

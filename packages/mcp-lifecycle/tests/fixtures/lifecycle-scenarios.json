@@ -28,6 +28,22 @@
     {
       "id": "matcher-near-match",
       "purpose": "MCP-looking user arguments remain blockers unless they match an approved executable and argv shape."
+    },
+    {
+      "id": "soft-blocker-idle",
+      "purpose": "A CPU-idle unrecognized node MCP under a detached tree lets the 600-second countdown run and the tree be reaped."
+    },
+    {
+      "id": "soft-blocker-active",
+      "purpose": "A soft blocker accruing at least 0.5 CPU-seconds per cycle, or one without a baseline yet, keeps the detached tree blocked."
+    },
+    {
+      "id": "helper-churn",
+      "purpose": "MCP helper pid churn never resets idle_since because the generation keys on the stable wrapper/app-server identity."
+    },
+    {
+      "id": "legacy-state-compat",
+      "purpose": "A pre-v4 state file without soft-blocker baselines loads cleanly and fails closed for exactly one cycle."
     }
   ]
 }

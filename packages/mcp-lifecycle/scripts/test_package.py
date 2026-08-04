@@ -32,6 +32,10 @@ EXPECTED_SCENARIOS = {
     "corrupt-state",
     "action-receipt",
     "matcher-near-match",
+    "soft-blocker-idle",
+    "soft-blocker-active",
+    "helper-churn",
+    "legacy-state-compat",
 }
 
 
@@ -61,14 +65,14 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("schema_version") != 1:
         fail("manifest schema_version must be 1")
     package = manifest.get("package")
-    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.3.1"}:
+    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.4.1"}:
         fail("manifest package identity/version changed")
     if (
         manifest.get("lifecycle_schema_version") != 2
-        or manifest.get("policy_version") != "strict-detached-v3"
+        or manifest.get("policy_version") != "strict-detached-v4"
     ):
         fail("manifest lifecycle/policy schema changed")
-    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v3":
+    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v4":
         fail("manifest matcher registry version changed")
     expected_policy = {
         "detached_stable_grace_seconds": 600,
@@ -152,8 +156,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("launchd labels must be exact and unique")
 
     tests = manifest.get("tests")
-    if not isinstance(tests, dict) or tests.get("baseline_count") != 61:
-        fail("manifest must declare the 58-test baseline")
+    if not isinstance(tests, dict) or tests.get("baseline_count") != 74:
+        fail("manifest must declare the 74-test baseline")
     fixture = PACKAGE_ROOT / checked_relative(str(tests.get("fixtures", "")), label="fixture")
     fixture_payload = json.loads(fixture.read_text(encoding="utf-8"))
     scenarios = fixture_payload.get("scenarios") if isinstance(fixture_payload, dict) else None
@@ -217,7 +221,7 @@ def main() -> int:
     compile_python_assets(manifest)
     validate_plists_if_available(manifest)
     run_baseline(manifest)
-    print("mcp-lifecycle package validation passed (61 baseline tests; no live writes)")
+    print("mcp-lifecycle package validation passed (74 baseline tests; no live writes)")
     return 0
 
 

@@ -114,6 +114,34 @@ const ADOPTABLE_PREDECESSOR_RECEIPTS = [{
     "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
   },
   compatibility: "current labels and paths preserved; rename deferred",
+}, {
+  packageVersion: "0.3.1",
+  lifecycleSchemaVersion: 2,
+  policyVersion: "strict-detached-v3",
+  matcherRegistryVersion: "mcp-family-descriptors-v3",
+  labels: [...MCP_LIFECYCLE_LABELS],
+  assetDigests: {
+    "lifecycle-module": "90669677b9d694290c33ce4b18d6547a50afd464bce1d95367dbb28b3a7ba946",
+    "idle-reaper": "963cf893e0832706662ad04d1d297c15ccc4e03358c70e1ca4522892e3f73999",
+    guard: "59b0c1d7e78fe978f74734f0f231a4b4c80f1366dfcafd637e07abffc14617bb",
+    "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+    "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+  },
+  compatibility: "current labels and paths preserved; rename deferred",
+}, {
+  packageVersion: "0.4.0",
+  lifecycleSchemaVersion: 2,
+  policyVersion: "strict-detached-v4",
+  matcherRegistryVersion: "mcp-family-descriptors-v4",
+  labels: [...MCP_LIFECYCLE_LABELS],
+  assetDigests: {
+    "lifecycle-module": "4021016ed4a6e9883377e5cf07c47111f069ea665ff50e2e35584ba3c20aae6f",
+    "idle-reaper": "9cdca57a1c612be0dadd1e8b70e0cd068998815ca88b70bf5e2470573e34db8e",
+    guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
+    "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+    "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+  },
+  compatibility: "current labels and paths preserved; rename deferred",
 }] as const;
 
 export async function mcpLifecycle(

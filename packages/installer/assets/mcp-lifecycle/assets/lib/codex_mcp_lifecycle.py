@@ -24,9 +24,20 @@ from typing import Any, Callable, Iterable
 
 SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
-PRODUCER_VERSION = "0.3.1"
-CLEANUP_POLICY_VERSION = "strict-detached-v3"
-MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v3"
+PRODUCER_VERSION = "0.4.1"
+CLEANUP_POLICY_VERSION = "strict-detached-v4"
+MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v4"
+# Soft-blocker policy (strict-detached-v4): inside a *detached* tree, an
+# unrecognized node/node_repl process -- or a node/npm/npx/python launcher
+# whose arguments mention "mcp" -- is presumed to be an MCP helper that the
+# dead UI can no longer retire.  Such a process blocks cleanup only while it
+# accrues CPU; a CPU-idle soft blocker lets the 600-second countdown run.
+# Live/ui_owned trees never reach the blocker branch and stay observation-only.
+SOFT_BLOCKER_BASENAMES = {"node", "node_repl"}
+SOFT_BLOCKER_LAUNCHER_BASENAMES = {"node", "npm", "npx", "python", "python3"}
+SOFT_BLOCKER_LAUNCHER_PATTERN = re.compile(r"python3\.\d+")
+# Minimum per-cycle CPU accrual (seconds) that proves a soft blocker is active.
+SOFT_BLOCKER_CPU_DELTA = 0.5
 LANE_MODES = {
     "detached_wrapper": "automatic",
     # Only a kernel-proven, direct app-server orphan can enter this lane.
@@ -137,6 +148,7 @@ MCP_SIGNATURES = (
     "playwright-mcp",
     "headroom mcp serve",
     "user-questions/mcp-server.js",
+    "gsd-pi/packages/mcp-server",
     "iconify-mcp.mjs",
     "react-doctor-mcp.mjs",
     "telemetry/watchdog/main.js",
@@ -429,8 +441,14 @@ class Blocker:
     identity: ProcessIdentity | None
     name: str
     command_summary: str
+    executable: str = ""
+    cpu_seconds: float = 0.0
+    # Computed at classification time from the full ProcessInfo (argv access);
+    # a soft blocker defers to the per-cycle CPU baseline in active_blockers.
+    soft: bool = False
 
     def to_json(self) -> dict[str, Any]:
+        # Deliberately unchanged: the guard and Menu Bar consume this schema.
         return {
             "identity": self.identity.to_json() if self.identity else None,
             "name": self.name,
@@ -1208,6 +1226,77 @@ def _matcher_drift_summary(process: ProcessInfo) -> str | None:
     return f"{executable}:{_command_shape(process.executable, process.args)}"
 
 
+def _is_soft_blocker_process(process: ProcessInfo) -> bool:
+    """Classify a blocker as soft using the kernel executable, never argv[0].
+
+    Soft means: a node/node_repl executable, or a node/npm/npx/python launcher
+    whose arguments mention "mcp" (the unrecognized-MCP drift case).  Matcher
+    drift is still emitted for these; softness only changes how the lifecycle
+    weighs the blocker.  Everything else (shells, builds, python without mcp)
+    remains a hard blocker.
+    """
+    basename = Path(process.executable).name.lower()
+    if basename in SOFT_BLOCKER_BASENAMES:
+        return True
+    if basename in SOFT_BLOCKER_LAUNCHER_BASENAMES or SOFT_BLOCKER_LAUNCHER_PATTERN.fullmatch(basename):
+        return "mcp" in process.args.lower()
+    return False
+
+
+def _soft_blocker_key(blocker: Blocker) -> str | None:
+    """Baseline key: kernel (pid, birth) identity, or None when unprovable."""
+    if blocker.identity is None:
+        return None
+    return f"{blocker.identity.pid}|{blocker.identity.birth}"
+
+
+def soft_blocker_baselines(tree: TreeClassification) -> dict[str, float]:
+    """Current-cycle CPU baselines for every identity-proven soft blocker."""
+    baselines: dict[str, float] = {}
+    for blocker in tree.blockers:
+        if not blocker.soft:
+            continue
+        key = _soft_blocker_key(blocker)
+        if key is not None:
+            baselines[key] = float(blocker.cpu_seconds)
+    return baselines
+
+
+def active_blockers(
+    tree: TreeClassification, prior_tree_state: dict[str, Any] | None
+) -> tuple[Blocker, ...]:
+    """Return the blockers that must keep a detached tree blocked.
+
+    Hard blockers always count.  A soft blocker counts only when its CPU time
+    moved at least ``SOFT_BLOCKER_CPU_DELTA`` seconds since the prior cycle's
+    baseline for the same kernel (pid, birth) identity -- or when no baseline
+    exists yet, which fails closed for one cycle.  ``prior_tree_state`` is the
+    per-tree entry from codex-mcp-lifecycle-state.json; old state files without
+    baselines are tolerated (every soft blocker fails closed once).
+    """
+    baselines: dict[str, Any] = {}
+    if isinstance(prior_tree_state, dict):
+        raw = prior_tree_state.get("soft_blocker_baselines")
+        if isinstance(raw, dict):
+            baselines = raw
+    active: list[Blocker] = []
+    for blocker in tree.blockers:
+        if not blocker.soft:
+            active.append(blocker)
+            continue
+        key = _soft_blocker_key(blocker)
+        prior_cpu = baselines.get(key) if key is not None else None
+        if (
+            not isinstance(prior_cpu, (int, float))
+            or isinstance(prior_cpu, bool)
+            or not math.isfinite(float(prior_cpu))
+        ):
+            active.append(blocker)  # fail closed: no proven baseline yet
+        elif float(blocker.cpu_seconds) - float(prior_cpu) >= SOFT_BLOCKER_CPU_DELTA:
+            active.append(blocker)
+    return tuple(active)
+
+
 def _tree_key(root: ProcessIdentity | None, app: ProcessIdentity | None, fallback_pid: int) -> str:
     if root and app:
         raw = f"{root.pid}|{root.birth}|{root.command_shape}|{app.pid}|{app.birth}|{app.command_shape}"
@@ -1253,6 +1342,9 @@ def _classify_exact_tree(
             identity=process.identity,
             name=Path(process.executable).name or process.executable,
             command_summary=_command_summary(process),
+            executable=process.executable,
+            cpu_seconds=process.cpu_seconds,
+            soft=_is_soft_blocker_process(process),
         ))
         drift = _matcher_drift_summary(process)
         if drift:
@@ -1262,9 +1354,15 @@ def _classify_exact_tree(
     if identity_missing:
         error = "one or more tree processes lack stable birth identity"
         ownership = "ambiguous"
+    # The generation keys on the tree's stable identity (wrapper/app-server)
+    # only.  Including transient helper pids let MCP-descendant and soft-blocker
+    # churn reset idle_since every cycle, so the 600s countdown never completed
+    # on a busy detached tree.  Descendant changes are still caught at signal
+    # time by per-pid identity revalidation and the new-descendant probe.
     generation_raw = "|".join(
-        f"{pid}:{owned[pid].birth}:{_command_shape(owned[pid].executable, owned[pid].args)}"
-        for pid in sorted(ids) if pid in owned
+        f"{identity.pid}:{identity.birth}:{identity.command_shape}"
+        if identity is not None else "missing"
+        for identity in (root_identity, app_identity)
     )
     return TreeClassification(
         tree_key=_tree_key(root_identity, app_identity, root.pid),
@@ -1381,10 +1479,12 @@ def advance_lifecycle_state(
         error = tree.error
 
         if tree.ownership == "ui_owned":
+            # Live trees stay observation-only and never reach the blocker
+            # branch; the soft-blocker lane below applies to detached trees only.
             state = "observed"
         elif tree.ownership != "detached" or tree.error:
             state = "detached_candidate"
-        elif tree.blockers:
+        elif active_blockers(tree, old if isinstance(old, dict) else None):
             state = "blocked_active_work"
         elif not now_valid:
             state = "detached_candidate"
@@ -1427,6 +1527,9 @@ def advance_lifecycle_state(
             "generation": tree.generation,
             "idle_since": idle_since,
             "eligible_at": eligible_at,
+            # Compatible schema extension: absent in old state files, in which
+            # case every soft blocker fails closed for one cycle.
+            "soft_blocker_baselines": soft_blocker_baselines(tree),
         }
 
     return updated, {

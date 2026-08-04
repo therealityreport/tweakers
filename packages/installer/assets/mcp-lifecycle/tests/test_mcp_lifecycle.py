@@ -371,7 +371,9 @@ class StatusCounterTests(unittest.TestCase):
         }
 
     def test_guard_pressure_status_is_truthful_and_observation_only(self):
-        counts, _warnings = guard.inspect_process_pressure(self.fixture_for_guard())
+        counts, _warnings = guard.inspect_process_pressure(
+            self.fixture_for_guard(), swap_usage_reader=lambda: None,
+        )
 
         self.assertEqual(1, counts["loaded_task_stacks"])
         self.assertEqual(1, counts["chrome_zombies"])
@@ -381,6 +383,143 @@ class StatusCounterTests(unittest.TestCase):
         self.assertEqual(1, counts["chrome_wrappers"])
         self.assertEqual(0, counts["would_kill"])
         self.assertEqual(0, counts["killed_pids"])
+
+
+class GuardPressureSignalTests(unittest.TestCase):
+    """Machine-wide swap and helper-count pressure signals (notification-only)."""
+
+    def fixture_with_helper_tree(self):
+        return {
+            p.pid: p
+            for p in (
+                guard_proc(400, 50, "codex -c x=y app-server", comm="/opt/codex"),
+                guard_proc(
+                    500,
+                    400,
+                    "/opt/node /tmp/runtime/node_modules/chrome-devtools-mcp/"
+                    "build/src/bin/chrome-devtools-mcp.js",
+                    comm="/opt/node",
+                ),
+                guard_proc(501, 500, "node helper-a"),
+                guard_proc(502, 500, "node helper-b"),
+                guard_proc(503, 502, "node helper-grandchild"),
+            )
+        }
+
+    def test_read_swap_usage_parses_sysctl_and_handles_absence(self):
+        def runner_for(stdout, returncode=0):
+            def runner(argv, **_kwargs):
+                self.assertEqual(["sysctl", "-n", "vm.swapusage"], argv)
+                return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
+
+            return runner
+
+        parsed = guard.read_swap_usage(
+            runner_for("total = 2048.00M  used = 1017.12M  free = 1030.88M  (encrypted)\n")
+        )
+        self.assertIsNotNone(parsed)
+        used_mib, total_mib = parsed
+        self.assertAlmostEqual(1017.12, used_mib, places=2)
+        self.assertAlmostEqual(2048.0, total_mib, places=2)
+
+        scaled = guard.read_swap_usage(
+            runner_for("vm.swapusage: total = 4.00G  used = 3.00G  free = 1.00G\n")
+        )
+        self.assertEqual((3072.0, 4096.0), scaled)
+
+        self.assertIsNone(guard.read_swap_usage(runner_for("")))
+        self.assertIsNone(guard.read_swap_usage(runner_for("no swap counters here")))
+        self.assertIsNone(guard.read_swap_usage(runner_for("total = 0.00M  used = 0.00M  free = 0.00M")))
+        self.assertIsNone(guard.read_swap_usage(runner_for("total = 2048.00M  used = 10.00M", returncode=1)))
+
+        def missing_sysctl(_argv, **_kwargs):
+            raise FileNotFoundError("sysctl not found")
+
+        self.assertIsNone(guard.read_swap_usage(missing_sysctl))
+
+    def test_swap_pressure_signal_reports_measured_values_above_threshold_only(self):
+        table = self.fixture_with_helper_tree()
+
+        counts, warnings = guard.inspect_process_pressure(
+            table, swap_usage_reader=lambda: (1536.0, 2048.0),
+        )
+        self.assertEqual(1536, counts["swap_used_mib"])
+        self.assertEqual(2048, counts["swap_total_mib"])
+        self.assertEqual(75, counts["swap_used_pct"])
+        swap_warnings = [w for w in warnings if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
+        self.assertEqual(1, len(swap_warnings))
+        self.assertIn("1536 MiB", swap_warnings[0])
+        self.assertIn("2048 MiB", swap_warnings[0])
+        self.assertIn("75%", swap_warnings[0])
+        self.assertIn(f"{guard.SWAP_PRESSURE_PCT}% threshold", swap_warnings[0])
+
+        _counts, at_threshold = guard.inspect_process_pressure(
+            table, swap_usage_reader=lambda: (1024.0, 2048.0),
+        )
+        self.assertEqual(
+            [], [w for w in at_threshold if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
+        )
+
+        absent_counts, absent = guard.inspect_process_pressure(
+            table, swap_usage_reader=lambda: None,
+        )
+        self.assertNotIn("swap_used_pct", absent_counts)
+        self.assertEqual(
+            [], [w for w in absent if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
+        )
+
+    def test_helper_count_pressure_reuses_process_tree_accounting(self):
+        table = self.fixture_with_helper_tree()
+
+        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 3):
+            counts, warnings = guard.inspect_process_pressure(
+                table, swap_usage_reader=lambda: None,
+            )
+        self.assertEqual(4, counts["mcp_helper_processes"])
+        helper_warnings = [
+            w for w in warnings if w.startswith(f"{guard.HELPER_PRESSURE_SIGNAL_ID}:")
+        ]
+        self.assertEqual(1, len(helper_warnings))
+        self.assertIn("4 MCP helper processes", helper_warnings[0])
+        self.assertIn("3-process threshold", helper_warnings[0])
+
+        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 4):
+            _counts, at_threshold = guard.inspect_process_pressure(
+                table, swap_usage_reader=lambda: None,
+            )
+        self.assertEqual(
+            [], [w for w in at_threshold if w.startswith(f"{guard.HELPER_PRESSURE_SIGNAL_ID}:")]
+        )
+
+    def test_pressure_signals_reach_the_guard_status_heartbeat(self):
+        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 3):
+            counts, warnings = guard.inspect_process_pressure(
+                self.fixture_with_helper_tree(),
+                swap_usage_reader=lambda: (1536.0, 2048.0),
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "guard-status.json"
+            guard.write_guard_status(counts, warnings, None, path=path, generated_at=1_000)
+            payload = json.loads(path.read_text())
+
+        signal_ids = {signal.split(":", 1)[0] for signal in payload["pressure_signals"]}
+        self.assertIn(guard.SWAP_PRESSURE_SIGNAL_ID, signal_ids)
+        self.assertIn(guard.HELPER_PRESSURE_SIGNAL_ID, signal_ids)
+        self.assertEqual(4, payload["counts"]["mcp_helper_processes"])
+        self.assertEqual(75, payload["counts"]["swap_used_pct"])
+        self.assertEqual("notification-only", payload["authority"])
+
+    def test_pressure_thresholds_are_env_overridable(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CODEX_GUARD_SWAP_PRESSURE_PCT": "90",
+                "CODEX_GUARD_HELPER_PRESSURE_COUNT": "7",
+            },
+        ):
+            override = load_script("codex_mcp_guard_env_override_under_test", "codex-mcp-guard.py")
+        self.assertEqual(90, override.SWAP_PRESSURE_PCT)
+        self.assertEqual(7, override.HELPER_PRESSURE_COUNT)
 
 
 class GuardLifecycleStatusTests(unittest.TestCase):
@@ -534,7 +673,9 @@ class GuardLifecycleStatusTests(unittest.TestCase):
             computer_use=3,
         )
 
-        counts, warnings = guard.inspect_process_pressure(proc_table, status)
+        counts, warnings = guard.inspect_process_pressure(
+            proc_table, status, swap_usage_reader=lambda: None,
+        )
 
         self.assertEqual(3, counts["computer_use_helpers"])
         self.assertEqual([], warnings)
@@ -1407,8 +1548,8 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertNotIn("NODE_OPTIONS", encoded)
         self.assertNotIn("raw_argv", encoded)
         self.assertEqual(2, status["schema_version"])
-        self.assertEqual("strict-detached-v3", status["cleanup_policy_version"])
-        self.assertEqual("mcp-family-descriptors-v3", status["matcher_registry_version"])
+        self.assertEqual("strict-detached-v4", status["cleanup_policy_version"])
+        self.assertEqual("mcp-family-descriptors-v4", status["matcher_registry_version"])
         self.assertEqual("automatic", status["lane_modes"]["exact_standalone_app_server"])
         self.assertEqual("observation_only", status["lane_modes"]["standalone_orphan"])
         self.assertEqual("observation_only", status["lane_modes"]["claude_idle"])
@@ -1498,6 +1639,35 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
         self.assertIn("immediately before TERM", instance.lifecycle_trees[0].error or "")
 
+    def test_recognized_mcp_spawned_after_planning_aborts_before_any_signal(self):
+        # A recognized-MCP descendant is neither a blocker nor part of the
+        # generation hash; if it sprouts between planning and revalidation the
+        # plan must abort, or killing its parents would leak it as an orphan.
+        clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
+        tree = self.classify(clean.values())[0]
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _eligible, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_600)
+        sprouted = dict(clean)
+        sprouted[12] = self.proc(
+            12, 11, "/usr/bin/npm",
+            "npm exec chrome-devtools-mcp --browserUrl http://127.0.0.1:9422",
+        )
+        snapshots = iter([clean, sprouted])
+        signals = []
+        instance = reaper.Reaper(
+            snapshot_provider=lambda: next(snapshots),
+            clock=lambda: 1_600,
+            signal_sender=lambda pid, sig: signals.append((pid, sig)),
+            sleeper=lambda _seconds: None,
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, _tags = instance.execute_detached()
+
+        self.assertEqual(0, signaled)
+        self.assertEqual([], signals)
+        self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
+        self.assertIn("appeared after planning", instance.lifecycle_trees[0].error or "")
+
     def test_abort_clears_persisted_timer_and_next_clean_cycle_restarts_grace(self):
         clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
         tree = self.classify(clean.values())[0]
@@ -1565,6 +1735,243 @@ class SharedLifecycleTests(unittest.TestCase):
                 self.assertEqual("terminating", status_writes[0][1]["trees"][0]["state"])
                 self.assertFalse(temp_state.exists())
                 self.assertFalse(temp_receipt.exists())
+
+
+class SoftBlockerLifecycleTests(unittest.TestCase):
+    """strict-detached-v4: idle soft blockers stop starving the detached lane."""
+
+    uid = 501
+    wrapper_executable = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    codex_executable = "/Applications/ChatGPT.app/Contents/Resources/codex"
+
+    def proc(self, pid, ppid, executable, args, *, birth=None, age=900, cpu=0.0, state="S", cwd=""):
+        return lifecycle.ProcessInfo(
+            pid=pid, ppid=ppid, uid=self.uid, rss_kib=1024, state=state,
+            age_seconds=age, cpu_seconds=cpu, executable=executable, args=args,
+            birth=birth or f"birth-{pid}", cwd=cwd,
+        )
+
+    def wrapper(self, ppid=1, *, birth="wrapper-a", age=900):
+        return self.proc(
+            10, ppid, self.wrapper_executable,
+            "node -e require(\"node:child_process\"); Tweakers Codex parent: missing child command; "
+            "NODE_OPTIONS=--enable-source-maps stdio: \"inherit\" -- "
+            f"{self.codex_executable} -c features.code_mode_host=true app-server --analytics-default-enabled",
+            birth=birth, age=age,
+        )
+
+    def app_server(self, *, birth="app-a"):
+        return self.proc(
+            11, 10, self.codex_executable,
+            f"{self.codex_executable} -c features.code_mode_host=true app-server --analytics-default-enabled",
+            birth=birth,
+        )
+
+    def unrecognized_node_mcp(self, *, pid=12, cpu=42.0, birth=None):
+        return self.proc(
+            pid, 11, "/opt/homebrew/bin/node",
+            "node /Users/test/gsd-pi/packages/mcp-server/dist/cli.js",
+            cpu=cpu, birth=birth,
+        )
+
+    def classify(self, processes):
+        return lifecycle.classify_codex_trees({proc.pid: proc for proc in processes}, uid=self.uid)
+
+    def test_soft_classification_covers_node_and_mcp_launchers_only(self):
+        probes = [
+            self.unrecognized_node_mcp(pid=12),
+            self.proc(13, 11, "/tmp/node_repl", "/tmp/node_repl --user-job"),
+            self.proc(14, 11, "/usr/bin/python3", "python3 /Users/test/serve_mcp.py"),
+            self.proc(15, 11, "/usr/bin/python3", "python3 build.py --release"),
+            self.proc(16, 11, "/bin/zsh", "zsh -c 'make build'"),
+        ]
+        tree = self.classify([self.wrapper(), self.app_server(), *probes])[0]
+        by_pid = {blocker.identity.pid: blocker for blocker in tree.blockers}
+
+        self.assertEqual({12, 13, 14, 15, 16}, set(by_pid))
+        self.assertTrue(by_pid[12].soft)   # unrecognized node MCP
+        self.assertTrue(by_pid[13].soft)   # node_repl basename
+        self.assertTrue(by_pid[14].soft)   # python launcher mentioning mcp
+        self.assertFalse(by_pid[15].soft)  # python without mcp stays hard
+        self.assertFalse(by_pid[16].soft)  # shells and builds stay hard
+        self.assertEqual("/opt/homebrew/bin/node", by_pid[12].executable)
+        self.assertEqual(42.0, by_pid[12].cpu_seconds)
+        # The unrecognized-MCP drift cases still surface as matcher drift.
+        self.assertEqual(2, len(tree.matcher_drift))
+        self.assertEqual(
+            {"node", "node_repl"},
+            {drift.split(":", 1)[0] for drift in tree.matcher_drift},
+        )
+
+    def test_detached_tree_with_idle_unrecognized_node_mcp_counts_down_and_reaps(self):
+        processes = {
+            proc.pid: proc
+            for proc in [self.wrapper(), self.app_server(), self.unrecognized_node_mcp()]
+        }
+        tree = self.classify(processes.values())[0]
+        self.assertEqual("detached", tree.ownership)
+
+        blocked, state = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        self.assertEqual("blocked_active_work", blocked[0].state)  # fail closed once
+
+        pending, state = lifecycle.advance_lifecycle_state([tree], state, 1_060)
+        self.assertEqual("idle_pending", pending[0].state)
+        self.assertEqual(600, pending[0].remaining_seconds)
+
+        eligible, state = lifecycle.advance_lifecycle_state([tree], state, 1_660)
+        self.assertEqual("eligible", eligible[0].state)
+        self.assertTrue(eligible[0].actionable)
+
+        snapshots = iter([processes] * 5 + [{}, {}])
+        signals = []
+        # Rewind to the persisted pre-eligibility state, as a real cycle would.
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_060)
+        instance = reaper.Reaper(
+            snapshot_provider=lambda: next(snapshots),
+            clock=lambda: 1_660,
+            signal_sender=lambda pid, sig: signals.append((pid, sig)),
+            sleeper=lambda _seconds: None,
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, tags = instance.execute_detached()
+
+        self.assertEqual(3, signaled)
+        self.assertEqual({"detached-app-server-tree": 3}, tags)
+        self.assertEqual([(12, reaper.signal.SIGTERM), (11, reaper.signal.SIGTERM), (10, reaper.signal.SIGTERM)], signals)
+        self.assertEqual("verified_gone", instance.lifecycle_trees[0].state)
+
+    def test_cpu_accruing_zsh_build_remains_hard_blocked(self):
+        def build(cpu):
+            return self.proc(12, 11, "/bin/zsh", "zsh -c 'cargo build --release'", cpu=cpu)
+
+        tree = self.classify([self.wrapper(), self.app_server(), build(10.0)])[0]
+        blocked, state = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        self.assertEqual("blocked_active_work", blocked[0].state)
+
+        later = self.classify([self.wrapper(), self.app_server(), build(24.0)])[0]
+        still_blocked, _state = lifecycle.advance_lifecycle_state([later], state, 1_060)
+        self.assertEqual("blocked_active_work", still_blocked[0].state)
+        self.assertFalse(later.blockers[0].soft)
+
+    def test_soft_blocker_with_cpu_movement_stays_blocked_until_it_settles(self):
+        def snapshot(cpu):
+            return [self.wrapper(), self.app_server(), self.unrecognized_node_mcp(cpu=cpu)]
+
+        tree = self.classify(snapshot(10.0))[0]
+        _blocked, state = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+
+        moving = self.classify(snapshot(10.6))[0]
+        blocked, state = lifecycle.advance_lifecycle_state([moving], state, 1_060)
+        self.assertEqual("blocked_active_work", blocked[0].state)  # +0.6s >= 0.5s
+
+        settled = self.classify(snapshot(10.6))[0]
+        pending, state = lifecycle.advance_lifecycle_state([settled], state, 1_120)
+        self.assertEqual("idle_pending", pending[0].state)
+        self.assertEqual(1_120, pending[0].idle_since)
+
+        drifting = self.classify(snapshot(10.9))[0]
+        still_pending, _state = lifecycle.advance_lifecycle_state([drifting], state, 1_180)
+        self.assertEqual("idle_pending", still_pending[0].state)  # +0.3s < 0.5s
+        self.assertEqual(1_120, still_pending[0].idle_since)
+        self.assertEqual(540, still_pending[0].remaining_seconds)
+
+    def test_helper_pid_churn_does_not_reset_the_countdown(self):
+        node = str(Path.home() / ".nvm" / "versions" / "node" / "v22.18.0" / "bin" / "node")
+
+        def snapshot(root_pid, child_pid):
+            return [
+                self.wrapper(),
+                self.app_server(),
+                self.proc(root_pid, 11, node, "npm exec @playwright/mcp@latest --headless"),
+                self.proc(child_pid, root_pid, node, "node /tmp/npm-cache/playwright-mcp --worker"),
+            ]
+
+        first = self.classify(snapshot(12, 13))[0]
+        self.assertEqual((), first.blockers)
+        pending, state = lifecycle.advance_lifecycle_state([first], {}, 1_000)
+        self.assertEqual("idle_pending", pending[0].state)
+        self.assertEqual(1_000, pending[0].idle_since)
+
+        churned = self.classify(snapshot(24, 25))[0]
+        self.assertEqual(first.generation, churned.generation)
+        continued, state = lifecycle.advance_lifecycle_state([churned], state, 1_300)
+        self.assertEqual("idle_pending", continued[0].state)
+        self.assertEqual(1_000, continued[0].idle_since)
+        self.assertEqual(300, continued[0].remaining_seconds)
+
+        eligible, _state = lifecycle.advance_lifecycle_state([churned], state, 1_600)
+        self.assertEqual("eligible", eligible[0].state)
+        self.assertTrue(eligible[0].actionable)
+
+    def test_revalidate_passes_with_idle_soft_blocker_and_aborts_with_an_active_one(self):
+        idle = {
+            proc.pid: proc
+            for proc in [self.wrapper(), self.app_server(), self.unrecognized_node_mcp(cpu=42.0)]
+        }
+        active = {
+            proc.pid: proc
+            for proc in [self.wrapper(), self.app_server(), self.unrecognized_node_mcp(cpu=43.0)]
+        }
+        tree = self.classify(idle.values())[0]
+        _blocked, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_060)
+
+        signals = []
+        snapshots = iter([idle] * 5 + [{}, {}])
+        instance = reaper.Reaper(
+            snapshot_provider=lambda: next(snapshots),
+            clock=lambda: 1_660,
+            signal_sender=lambda pid, sig: signals.append((pid, sig)),
+            sleeper=lambda _seconds: None,
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, _tags = instance.execute_detached()
+        self.assertEqual(3, signaled)
+        self.assertEqual("verified_gone", instance.lifecycle_trees[0].state)
+
+        abort_signals = []
+        abort_snapshots = iter([idle, active])
+        aborting = reaper.Reaper(
+            snapshot_provider=lambda: next(abort_snapshots),
+            clock=lambda: 1_660,
+            signal_sender=lambda pid, sig: abort_signals.append((pid, sig)),
+            sleeper=lambda _seconds: None,
+        )
+        aborting.plan_detached_wrappers(prior)
+        signaled, _tags = aborting.execute_detached()
+        self.assertEqual(0, signaled)
+        self.assertEqual([], abort_signals)
+        self.assertEqual("partial_failure", aborting.lifecycle_trees[0].state)
+        self.assertIn("no longer an unblocked", aborting.lifecycle_trees[0].error or "")
+
+    def test_old_state_file_without_baselines_loads_cleanly_and_fails_closed_once(self):
+        tree = self.classify(
+            [self.wrapper(), self.app_server(), self.unrecognized_node_mcp(cpu=42.0)]
+        )[0]
+        legacy = {
+            "schema_version": 1,
+            "last_now": 940,
+            "trees": {
+                tree.tree_key: {
+                    "root_identity": tree.root_identity.to_json(),
+                    "app_server_identity": tree.app_server_identity.to_json(),
+                    "state": "idle_pending",
+                    "generation": tree.generation,
+                    "idle_since": 900,
+                    "eligible_at": 1_500,
+                }
+            },
+        }
+        blocked, state = lifecycle.advance_lifecycle_state([tree], legacy, 1_000)
+        self.assertEqual("blocked_active_work", blocked[0].state)
+        self.assertEqual(1, state["schema_version"])
+        baselines = state["trees"][tree.tree_key]["soft_blocker_baselines"]
+        self.assertEqual({"12|birth-12": 42.0}, baselines)
+
+        pending, _state = lifecycle.advance_lifecycle_state([tree], state, 1_060)
+        self.assertEqual("idle_pending", pending[0].state)
+        self.assertEqual(1_060, pending[0].idle_since)
 
 
 if __name__ == "__main__":

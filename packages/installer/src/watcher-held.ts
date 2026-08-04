@@ -21,6 +21,9 @@ import {
   type UpdateRecoveryState,
 } from "./update-recovery/index.js";
 
+/** Poll interval for the passive "wait for Codex to close" loops. */
+const HELD_POLL_INTERVAL_MS = 500;
+
 export interface HeldPromotionDeps {
   getReport(): OpenReport;
   /**
@@ -39,6 +42,12 @@ export interface HeldPromotionDeps {
   reenter(): Promise<void>;
   sleep(ms: number): Promise<void>;
   log(line: string): void;
+  /**
+   * Test seam: overrides the update-recovery transition table so tests can
+   * exercise entry events the current state machine does not define.
+   * Production wiring leaves this unset, using the real state machine.
+   */
+  transitionImpl?: typeof transition;
 }
 
 export async function runHeldPromotion(
@@ -64,7 +73,7 @@ export async function runHeldPromotion(
 
   deps.log("Watcher is waiting for Codex to close, then it will promote immediately.");
   while (reportsMainProcessRunning(deps.getReport())) {
-    await deps.sleep(500);
+    await deps.sleep(HELD_POLL_INTERVAL_MS);
   }
   deps.cleanupOrphans();
   return deps.reenter();
@@ -75,7 +84,8 @@ async function runHeldPromotionV2(
   opts: { coordinatedQuit: boolean },
 ): Promise<void> {
   let state: UpdateRecoveryState = "held";
-  const driftDecision = transition(state, {
+  const step = deps.transitionImpl ?? transition;
+  const driftDecision = step(state, {
     type: opts.coordinatedQuit ? "confirmedOfficialDrift" : "unconfirmedDrift",
   });
   state = driftDecision.state;
@@ -86,7 +96,7 @@ async function runHeldPromotionV2(
     deps.log("Confirmed Codex update: quitting Codex to promote the rebuilt candidate.");
     deps.notifyUpdateQuit();
     deps.quitApp();
-    const postQuitDecision = transition(state, {
+    const postQuitDecision = step(state, {
       type: reportsMainProcessRunning(deps.getReport()) ? "appRunning" : "appClosed",
     });
     state = postQuitDecision.state;
@@ -99,7 +109,7 @@ async function runHeldPromotionV2(
 
   deps.log("Watcher is waiting for Codex to close, then it will promote immediately.");
   while (true) {
-    const waitDecision = transition(state, {
+    const waitDecision = step(state, {
       type: reportsMainProcessRunning(deps.getReport()) ? "appRunning" : "appClosed",
     });
     state = waitDecision.state;
@@ -107,6 +117,14 @@ async function runHeldPromotionV2(
       deps.cleanupOrphans();
       return deps.reenter();
     }
-    if (waitDecision.actions.includes("waitForCodexClose")) await deps.sleep(500);
+    if (waitDecision.actions.includes("waitForCodexClose")) {
+      await deps.sleep(HELD_POLL_INTERVAL_MS);
+      continue;
+    }
+    // Fallback: no iteration may complete without returning or yielding. An
+    // entry event that never authorizes re-entry parks the machine in
+    // "promoting" (actions [] / ["promote"], no waitForCodexClose), which
+    // would otherwise busy-spin this loop at 100% CPU.
+    await deps.sleep(HELD_POLL_INTERVAL_MS);
   }
 }
