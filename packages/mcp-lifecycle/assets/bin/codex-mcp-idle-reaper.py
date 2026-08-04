@@ -18,10 +18,14 @@ Why (observed 2026-06-10)
 Rules (each 60s cycle)
 ----------------------
  1. detached-codex : an exact launchd-owned signed wrapper with one direct
-                     app-server child is observed. Any non-MCP descendant
-                     blocks cleanup. Once the same tree generation has been
-                     blocker-free for 600 seconds, revalidate identities and
-                     terminate the detached tree children-first.
+                     app-server child is observed. Any hard non-MCP descendant
+                     blocks cleanup; a soft blocker (node/node_repl, or a
+                     node/npm/npx/python launcher mentioning "mcp") blocks only
+                     while it accrues CPU vs the prior cycle's baseline
+                     (strict-detached-v4). Once the same stable tree generation
+                     has been free of active blockers for 600 seconds,
+                     revalidate identities and terminate the detached tree
+                     children-first.
     orphan-codex   : observation-only legacy lane.
     orphan-node_repl: observation-only legacy lane.
  2. orphan-mcp     : observation-only legacy lane.
@@ -73,6 +77,7 @@ from codex_mcp_lifecycle import (  # noqa: E402
     ProcessIdentity,
     ProcessInfo as LifecycleProcess,
     TreeClassification,
+    active_blockers,
     advance_lifecycle_state,
     append_jsonl,
     atomic_read_json,
@@ -101,9 +106,8 @@ LIFECYCLE_STATUS = Path(
 LIFECYCLE_ACTIONS = Path(
     os.environ.get("REAPER_LIFECYCLE_ACTIONS", str(TMP / "codex-mcp-lifecycle-actions.jsonl"))
 )
-PROTECT_NODE_REPL = os.environ.get("REAPER_PROTECT_NODE_REPL", "1").lower() not in {
-    "0", "false", "no", "off"
-}
+# REAPER_PROTECT_NODE_REPL was removed: it only gated mark_tree, which no v2
+# lane calls, and it must not interfere with the soft-blocker detached lane.
 
 # Long-lived transports that Codex does not respawn after idle cleanup.
 PROTECT_SUBSTR = ("9422", "modal_ops_mcp.py")
@@ -133,6 +137,7 @@ CLAUDE_SIGS = (
     "@playwright/mcp",
     "headroom mcp serve",
     "user-questions/mcp-server.js",
+    "gsd-pi/packages/mcp-server",
 )
 
 # Standalone strays we may meet reparented to launchd (ppid 1).
@@ -366,12 +371,12 @@ class Reaper:
         self.lifecycle_state: dict = {}
         self.detached_plans: dict[str, dict[int, ProcessIdentity]] = {}
 
-    def mark_tree(self, root: int, tag: str, allow_node_repl: bool = False) -> None:
+    def mark_tree(self, root: int, tag: str) -> None:
+        # Inert in v2: no lane calls this; the strict detached lane plans
+        # identity-frozen victims in plan_detached_wrappers instead.
         for pid in subtree(root, self.kids):
             p = self.procs.get(pid)
             if p is None or pid in self.protected or is_protected(p):
-                continue
-            if PROTECT_NODE_REPL and is_node_repl(p) and not allow_node_repl:
                 continue
             self.victims.setdefault(pid, tag)
 
@@ -445,7 +450,18 @@ class Reaper:
         match = next((tree for tree in trees if tree.tree_key == tree_key), None)
         if match is None:
             return None, "tree identity no longer exists"
-        if match.ownership != "detached" or match.error or match.blockers:
+        # Apply the same soft-blocker filter as advance_lifecycle_state: an
+        # idle soft blocker must not cancel an armed kill at signal time, while
+        # hard blockers and CPU-active (or baseline-less) soft blockers abort.
+        prior_tree_state: dict = {}
+        state_trees = self.lifecycle_state.get("trees") if isinstance(self.lifecycle_state, dict) else None
+        if isinstance(state_trees, dict) and isinstance(state_trees.get(tree_key), dict):
+            prior_tree_state = state_trees[tree_key]
+        if (
+            match.ownership != "detached"
+            or match.error
+            or active_blockers(match, prior_tree_state)
+        ):
             return None, "tree is no longer an unblocked exact detached tree"
         if match.generation != self.detached_generations.get(tree_key):
             return None, "tree process generation changed before signal"

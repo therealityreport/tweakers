@@ -32,6 +32,10 @@ EXPECTED_SCENARIOS = {
     "corrupt-state",
     "action-receipt",
     "matcher-near-match",
+    "soft-blocker-idle",
+    "soft-blocker-active",
+    "helper-churn",
+    "legacy-state-compat",
 }
 
 
@@ -152,8 +156,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("launchd labels must be exact and unique")
 
     tests = manifest.get("tests")
-    if not isinstance(tests, dict) or tests.get("baseline_count") != 61:
-        fail("manifest must declare the 58-test baseline")
+    if not isinstance(tests, dict) or tests.get("baseline_count") != 73:
+        fail("manifest must declare the 73-test baseline")
     fixture = PACKAGE_ROOT / checked_relative(str(tests.get("fixtures", "")), label="fixture")
     fixture_payload = json.loads(fixture.read_text(encoding="utf-8"))
     scenarios = fixture_payload.get("scenarios") if isinstance(fixture_payload, dict) else None
@@ -217,7 +221,7 @@ def main() -> int:
     compile_python_assets(manifest)
     validate_plists_if_available(manifest)
     run_baseline(manifest)
-    print("mcp-lifecycle package validation passed (61 baseline tests; no live writes)")
+    print("mcp-lifecycle package validation passed (73 baseline tests; no live writes)")
     return 0
 
 

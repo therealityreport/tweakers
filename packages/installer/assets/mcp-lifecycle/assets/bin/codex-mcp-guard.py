@@ -82,6 +82,8 @@ CHROME_WARN = int(os.environ.get("CODEX_GUARD_CHROME_WARN", "3"))
 DECODO_WARN = int(os.environ.get("CODEX_GUARD_DECODO_WARN", "4"))
 COMPUTER_USE_WARN = int(os.environ.get("CODEX_GUARD_COMPUTER_USE_WARN", "2"))
 COMPUTER_USE_CRITICAL = int(os.environ.get("CODEX_GUARD_COMPUTER_USE_CRITICAL", "20"))
+SWAP_PRESSURE_PCT = int(os.environ.get("CODEX_GUARD_SWAP_PRESSURE_PCT", "50"))
+HELPER_PRESSURE_COUNT = int(os.environ.get("CODEX_GUARD_HELPER_PRESSURE_COUNT", "300"))
 PROJECTS_TWEAK_WARN = int(os.environ.get("CODEX_GUARD_PROJECTS_TWEAK_WARN", "2"))
 PROJECT_CHROME_PROFILE_WARN = int(os.environ.get("CODEX_GUARD_PROJECT_CHROME_PROFILE_WARN", "2"))
 NOTIFY_COOLDOWN_SEC = int(os.environ.get("CODEX_GUARD_NOTIFY_COOLDOWN_SEC", "3600"))
@@ -558,9 +560,79 @@ def lifecycle_notification_events(
     return events
 
 
+SWAP_PRESSURE_SIGNAL_ID = "swap-pressure"
+HELPER_PRESSURE_SIGNAL_ID = "mcp-helper-count-pressure"
+_SWAP_USAGE_FIELD = re.compile(r"\b(total|used)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)", re.IGNORECASE)
+_SWAP_UNIT_MIB = {"": 1.0 / (1024.0 * 1024.0), "K": 1.0 / 1024.0, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024.0}
+
+
+def read_swap_usage(runner=None) -> tuple[float, float] | None:
+    """Return (used_mib, total_mib) parsed from `sysctl vm.swapusage`.
+
+    Returns None whenever swap telemetry is unavailable: sysctl is missing,
+    exits non-zero, times out, or prints something this parser does not
+    recognize.  Absence must never fail the guard run.
+    """
+    run = runner or subprocess.run
+    try:
+        result = run(
+            ["sysctl", "-n", "vm.swapusage"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    fields: dict[str, float] = {}
+    for name, quantity, unit in _SWAP_USAGE_FIELD.findall(stdout):
+        try:
+            fields[name.lower()] = float(quantity) * _SWAP_UNIT_MIB[unit.upper()]
+        except (KeyError, ValueError):
+            continue
+    used = fields.get("used")
+    total = fields.get("total")
+    if used is None or total is None:
+        return None
+    if not math.isfinite(used) or not math.isfinite(total) or total <= 0 or used < 0:
+        return None
+    return used, total
+
+
+def swap_pressure_signal(swap_usage: tuple[float, float] | None) -> str | None:
+    """Format the swap pressure signal, or None when below threshold/unavailable."""
+    if swap_usage is None:
+        return None
+    used_mib, total_mib = swap_usage
+    used_pct = used_mib / total_mib * 100.0
+    if used_pct <= SWAP_PRESSURE_PCT:
+        return None
+    return (
+        f"{SWAP_PRESSURE_SIGNAL_ID}: swap used {used_mib:.0f} MiB of {total_mib:.0f} MiB "
+        f"({used_pct:.0f}% > {SWAP_PRESSURE_PCT}% threshold)"
+    )
+
+
+def helper_count_pressure_signal(helper_process_count: int) -> str | None:
+    """Format the MCP helper-count pressure signal, or None when below threshold."""
+    if helper_process_count <= HELPER_PRESSURE_COUNT:
+        return None
+    return (
+        f"{HELPER_PRESSURE_SIGNAL_ID}: {helper_process_count} MCP helper processes "
+        f"exceed the {HELPER_PRESSURE_COUNT}-process threshold"
+    )
+
+
 def inspect_process_pressure(
     proc_table: dict[int, Proc],
     lifecycle_status: dict[str, object] | None = None,
+    *,
+    swap_usage_reader: Callable[[], tuple[float, float] | None] | None = None,
 ) -> tuple[dict[str, int], list[str]]:
     app_servers = sorted(
         proc.pid for proc in proc_table.values() if is_codex_appserver(proc)
@@ -587,6 +659,7 @@ def inspect_process_pressure(
         "loaded_task_stacks": sum(proc.ppid in live_app_servers for proc in node_repls),
         "chrome_zombies": chrome_zombies,
         "node_repls": len(node_repls),
+        "mcp_helper_processes": len(mcp_pids),
         "mcp_rss_mib": sum(proc_table[pid].rss_kib for pid in mcp_pids if pid in proc_table) // 1024,
         "actionable_orphans": len(orphan_roots),
         "would_kill": 0,
@@ -600,6 +673,21 @@ def inspect_process_pressure(
         "killed_pids": 0,
     }
     warnings: list[str] = []
+
+    # Machine-wide pressure signals come first so a death spiral is never
+    # crowded out of the (truncated) notification by per-app wrapper noise.
+    helper_signal = helper_count_pressure_signal(len(mcp_pids))
+    if helper_signal is not None:
+        warnings.append(helper_signal)
+    swap_usage = (swap_usage_reader or read_swap_usage)()
+    if swap_usage is not None:
+        used_mib, total_mib = swap_usage
+        counts["swap_used_mib"] = int(used_mib)
+        counts["swap_total_mib"] = int(total_mib)
+        counts["swap_used_pct"] = int(round(used_mib / total_mib * 100.0))
+    swap_signal = swap_pressure_signal(swap_usage)
+    if swap_signal is not None:
+        warnings.append(swap_signal)
 
     for app_pid in app_servers:
         context7_roots = matching_root_processes(proc_table, app_pid, "context7")
@@ -1314,7 +1402,13 @@ def print_status(
     print(f"loaded_task_stacks={counts['loaded_task_stacks']}")
     print(f"chrome_zombies={counts['chrome_zombies']}")
     print(f"node_repls={counts['node_repls']}")
+    print(f"mcp_helper_processes={counts.get('mcp_helper_processes', 0)}")
     print(f"mcp_rss_mib={counts['mcp_rss_mib']}")
+    if "swap_used_pct" in counts:
+        print(
+            f"swap_used_pct={counts['swap_used_pct']} "
+            f"({counts.get('swap_used_mib', 0)}/{counts.get('swap_total_mib', 0)} MiB)"
+        )
     print(f"actionable_orphans={counts['actionable_orphans']}")
     print(f"would_kill={counts['would_kill']}")
     print(f"context7_wrappers={counts['context7_wrappers']}")
@@ -1381,6 +1475,7 @@ def main(*, publisher: Callable[[], object] | None = None) -> int:
         "loaded_task_stacks": 0,
         "chrome_zombies": 0,
         "node_repls": 0,
+        "mcp_helper_processes": 0,
         "mcp_rss_mib": 0,
         "actionable_orphans": 0,
         "would_kill": 0,
