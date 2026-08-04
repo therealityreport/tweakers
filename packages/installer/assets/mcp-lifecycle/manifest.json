@@ -2,7 +2,7 @@
   "schema_version": 1,
   "package": {
     "name": "@therealityreport/tweakers-mcp-lifecycle",
-    "version": "0.4.0"
+    "version": "0.4.1"
   },
   "lifecycle_schema_version": 2,
   "policy_version": "strict-detached-v4",
@@ -36,7 +36,7 @@
       "source": "assets/lib/codex_mcp_lifecycle.py",
       "destination": "{{HOME}}/.codex/lib/codex_mcp_lifecycle.py",
       "mode": "0644",
-      "source_sha256": "4021016ed4a6e9883377e5cf07c47111f069ea665ff50e2e35584ba3c20aae6f"
+      "source_sha256": "d70b1813b50082e19a71c0c392341caa9e584f66ee42e336c2966c7161b6f6a7"
     },
     {
       "id": "idle-reaper",
@@ -44,7 +44,7 @@
       "source": "assets/bin/codex-mcp-idle-reaper.py",
       "destination": "{{HOME}}/.codex/bin/codex-mcp-idle-reaper.py",
       "mode": "0755",
-      "source_sha256": "9cdca57a1c612be0dadd1e8b70e0cd068998815ca88b70bf5e2470573e34db8e"
+      "source_sha256": "60e801e3e5c6b230cee593f5bb5171d28c84e6ad1b83ceb4f955e845463e24f8"
     },
     {
       "id": "guard",
@@ -80,7 +80,7 @@
     }
   ],
   "tests": {
-    "baseline_count": 73,
+    "baseline_count": 74,
     "path": "tests/test_mcp_lifecycle.py",
     "fixtures": "tests/fixtures/lifecycle-scenarios.json"
   }

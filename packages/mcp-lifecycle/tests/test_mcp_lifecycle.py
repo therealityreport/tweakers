@@ -1639,6 +1639,35 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
         self.assertIn("immediately before TERM", instance.lifecycle_trees[0].error or "")
 
+    def test_recognized_mcp_spawned_after_planning_aborts_before_any_signal(self):
+        # A recognized-MCP descendant is neither a blocker nor part of the
+        # generation hash; if it sprouts between planning and revalidation the
+        # plan must abort, or killing its parents would leak it as an orphan.
+        clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
+        tree = self.classify(clean.values())[0]
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _eligible, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_600)
+        sprouted = dict(clean)
+        sprouted[12] = self.proc(
+            12, 11, "/usr/bin/npm",
+            "npm exec chrome-devtools-mcp --browserUrl http://127.0.0.1:9422",
+        )
+        snapshots = iter([clean, sprouted])
+        signals = []
+        instance = reaper.Reaper(
+            snapshot_provider=lambda: next(snapshots),
+            clock=lambda: 1_600,
+            signal_sender=lambda pid, sig: signals.append((pid, sig)),
+            sleeper=lambda _seconds: None,
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, _tags = instance.execute_detached()
+
+        self.assertEqual(0, signaled)
+        self.assertEqual([], signals)
+        self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
+        self.assertIn("appeared after planning", instance.lifecycle_trees[0].error or "")
+
     def test_abort_clears_persisted_timer_and_next_clean_cycle_restarts_grace(self):
         clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
         tree = self.classify(clean.values())[0]

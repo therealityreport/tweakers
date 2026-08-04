@@ -25,7 +25,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME_TOKEN = "{{HOME}}";
 
 export const MCP_LIFECYCLE_PACKAGE_NAME = "@therealityreport/tweakers-mcp-lifecycle";
-export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.4.0";
+export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.4.1";
 export const MCP_LIFECYCLE_MANIFEST_SCHEMA_VERSION = 1;
 export const MCP_LIFECYCLE_SCHEMA_VERSION = 2;
 export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v4";

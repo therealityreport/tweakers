@@ -128,6 +128,20 @@ const ADOPTABLE_PREDECESSOR_RECEIPTS = [{
     "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
   },
   compatibility: "current labels and paths preserved; rename deferred",
+}, {
+  packageVersion: "0.4.0",
+  lifecycleSchemaVersion: 2,
+  policyVersion: "strict-detached-v4",
+  matcherRegistryVersion: "mcp-family-descriptors-v4",
+  labels: [...MCP_LIFECYCLE_LABELS],
+  assetDigests: {
+    "lifecycle-module": "4021016ed4a6e9883377e5cf07c47111f069ea665ff50e2e35584ba3c20aae6f",
+    "idle-reaper": "9cdca57a1c612be0dadd1e8b70e0cd068998815ca88b70bf5e2470573e34db8e",
+    guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
+    "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+    "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+  },
+  compatibility: "current labels and paths preserved; rename deferred",
 }] as const;
 
 export async function mcpLifecycle(

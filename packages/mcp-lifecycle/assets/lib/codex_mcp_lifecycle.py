@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable
 
 SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
-PRODUCER_VERSION = "0.4.0"
+PRODUCER_VERSION = "0.4.1"
 CLEANUP_POLICY_VERSION = "strict-detached-v4"
 MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v4"
 # Soft-blocker policy (strict-detached-v4): inside a *detached* tree, an

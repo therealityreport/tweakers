@@ -21,13 +21,14 @@ const repoRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..", "..
 /**
  * Recursive content digest of a tree: relative path -> sha256 (or symlink
  * target). Deliberately ignores inodes and timestamps so only actual bytes
- * count, and skips .DS_Store to match the packaging junk rule.
+ * count, and skips .DS_Store/__pycache__/*.pyc to match the packaging junk
+ * rule in copy-assets.mjs sweepFinderJunk.
  */
 function hashTree(root: string): Record<string, string> {
   const rows: Record<string, string> = {};
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (entry.name === ".DS_Store") continue;
+      if (entry.name === ".DS_Store" || entry.name === "__pycache__" || entry.name.endsWith(".pyc")) continue;
       const path = join(directory, entry.name);
       const name = relative(root, path);
       if (entry.isSymbolicLink()) rows[name] = `link:${readlinkSync(path)}`;

@@ -22,3 +22,6 @@ coverage
 /.plan-work/
 /${CLAUDE_PLUGIN_ROOT}/
 /codex-*.png
+
+# Impeccable plugin hook caches must never ship in packages
+.impeccable/

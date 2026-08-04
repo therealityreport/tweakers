@@ -108,8 +108,12 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
 function sweepFinderJunk(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) sweepFinderJunk(path);
-    else if (entry.isFile() && entry.name === ".DS_Store") rmSync(path);
+    if (entry.isDirectory()) {
+      // Python bytecode caches appear whenever the in-tree tests run without
+      // -B; they must never ship or count toward staged-content equality.
+      if (entry.name === "__pycache__") rmSync(path, { recursive: true, force: true });
+      else sweepFinderJunk(path);
+    } else if (entry.isFile() && (entry.name === ".DS_Store" || entry.name.endsWith(".pyc"))) rmSync(path);
   }
 }
 

@@ -468,6 +468,13 @@ class Reaper:
         for pid, identity in planned.items():
             if not self._identity_matches(current.get(pid), identity):
                 return None, f"pid {pid} identity changed before signal"
+        # Baseline against the PLAN-time snapshot, not this revalidation one: a
+        # recognized-MCP descendant spawned between planning and revalidation is
+        # neither a blocker nor part of the generation hash, and killing its
+        # planned parents would leak it as an unowned orphan.
+        new_descendant = self._new_descendant_since(self.lifecycle_snapshot, current, planned)
+        if new_descendant is not None:
+            return None, f"new descendant pid {new_descendant.pid} appeared after planning"
         return current, None
 
     @staticmethod
@@ -595,7 +602,7 @@ class Reaper:
                 if not self._identity_matches(live.get(pid), planned[pid]):
                     abort_error = f"pid {pid} identity changed immediately before TERM"
                     break
-                new_descendant = self._new_descendant_since(current, live, planned)
+                new_descendant = self._new_descendant_since(self.lifecycle_snapshot, live, planned)
                 if new_descendant is not None:
                     abort_error = (
                         f"new descendant pid {new_descendant.pid} appeared immediately before TERM"
@@ -622,7 +629,7 @@ class Reaper:
                 live = self.snapshot_provider()
                 if not self._identity_matches(live.get(pid), planned[pid]):
                     continue
-                new_descendant = self._new_descendant_since(current, live, planned)
+                new_descendant = self._new_descendant_since(self.lifecycle_snapshot, live, planned)
                 if new_descendant is not None:
                     abort_error = (
                         f"new descendant pid {new_descendant.pid} appeared immediately before KILL"
