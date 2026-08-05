@@ -9,6 +9,7 @@ import {
   MCP_MANAGED_START,
   mcpServerNameFromTweakId,
   planManagedMcpReconciliation,
+  stripManagedMcpBlock,
   syncManagedMcpServers,
   RESERVED_MANAGED_MCP_ENV_KEYS,
 } from "../src/mcp-sync";
@@ -675,12 +676,15 @@ test("orphan managed markers fail closed instead of consuming manual content on 
 test("malformed managed marker pairs fail closed", () => {
   const legacyStart = "# BEGIN CODEX++ MANAGED MCP SERVERS";
   const legacyEnd = "# END CODEX++ MANAGED MCP SERVERS";
+  // An orphan END with no BEGIN anywhere before it is intentionally NOT in
+  // this list — it self-heals (see the orphan end marker tests above). Every
+  // shape where a BEGIN exists stays a hard failure.
   const malformed = [
-    `\n${MCP_MANAGED_END}\n`,
     `${MCP_MANAGED_START}\nmanual_key = "keep"\n`,
     `${MCP_MANAGED_START}\n${legacyEnd}\n`,
     `${MCP_MANAGED_START}\n${MCP_MANAGED_START}\n${MCP_MANAGED_END}\n`,
     `${legacyStart}\n${MCP_MANAGED_END}\n`,
+    `${MCP_MANAGED_START}\n${MCP_MANAGED_END}\n${MCP_MANAGED_END}\n`,
   ];
   for (const current of malformed) {
     assert.throws(
@@ -826,6 +830,180 @@ test("syncManagedMcpServers creates the Codex config directory", () => {
 
     assert.equal(existsSync(configPath), true);
   });
+});
+
+// Mirrors the source's own construction so repo-wide marker greps only match
+// real config content, never this fixture.
+const LEGACY_END_MARKER = ["# END CODEX", "++ MANAGED MCP SERVERS"].join("");
+const LEGACY_START_MARKER = ["# BEGIN CODEX", "++ MANAGED MCP SERVERS"].join("");
+
+test("stripManagedMcpBlock heals an orphan end marker at end of file", () => {
+  // Observed live 2026-08-05: an external writer dropped the managed block
+  // but left its END marker as the file's last line, which made environment
+  // commit, rollback, AND recover all fail until the line was hand-deleted.
+  const orphanAtEof = [
+    'model = "gpt-5.6"',
+    "",
+    "[shell_environment_policy.set]",
+    'TRUSTED = "/tmp"',
+    MCP_MANAGED_END,
+    "",
+  ].join("\n");
+
+  const stripped = stripManagedMcpBlock(orphanAtEof);
+  assert.equal(stripped.includes(MCP_MANAGED_END), false);
+  assert.equal(stripped.includes('model = "gpt-5.6"'), true);
+  assert.equal(stripped.includes('TRUSTED = "/tmp"'), true);
+  // Healing is idempotent: a healed document strips to itself.
+  assert.equal(stripManagedMcpBlock(stripped), stripped);
+});
+
+test("stripManagedMcpBlock heals an orphan end marker mid-file", () => {
+  const orphanMidFile = [
+    'model = "gpt-5.6"',
+    MCP_MANAGED_END,
+    "",
+    "[unrelated.manual]",
+    'label = "kept"',
+    "",
+  ].join("\n");
+
+  const stripped = stripManagedMcpBlock(orphanMidFile);
+  assert.equal(stripped.includes(MCP_MANAGED_END), false);
+  assert.equal(stripped.includes('label = "kept"'), true);
+});
+
+test("stripManagedMcpBlock heals an orphan end marker before a valid managed block", () => {
+  const orphanThenBlock = [
+    MCP_MANAGED_END,
+    'model = "gpt-5.6"',
+    "",
+    MCP_MANAGED_START,
+    "[mcp_servers.co-tweakers-user-questions]",
+    'command = "node"',
+    MCP_MANAGED_END,
+    "",
+  ].join("\n");
+
+  const stripped = stripManagedMcpBlock(orphanThenBlock);
+  assert.equal(stripped.includes(MCP_MANAGED_START), false);
+  assert.equal(stripped.includes(MCP_MANAGED_END), false);
+  assert.equal(stripped.includes('model = "gpt-5.6"'), true);
+  assert.equal(stripped.includes("co-tweakers-user-questions"), false);
+});
+
+test("stripManagedMcpBlock heals an orphan legacy end marker", () => {
+  const legacyOrphan = [
+    'model = "gpt-5.6"',
+    LEGACY_END_MARKER,
+    "",
+  ].join("\n");
+
+  const stripped = stripManagedMcpBlock(legacyOrphan);
+  assert.equal(stripped.includes(LEGACY_END_MARKER), false);
+  assert.equal(stripped.includes('model = "gpt-5.6"'), true);
+});
+
+test("stripManagedMcpBlock still fails closed for genuinely ambiguous markers", () => {
+  // BEGIN without END: the block's extent is unknowable.
+  assert.throws(
+    () => stripManagedMcpBlock([MCP_MANAGED_START, 'command = "node"', ""].join("\n")),
+    /missing its end marker/,
+  );
+  // Nested/repeated BEGIN before any END.
+  assert.throws(
+    () => stripManagedMcpBlock([MCP_MANAGED_START, MCP_MANAGED_START, MCP_MANAGED_END, ""].join("\n")),
+    /nested or missing its end marker/,
+  );
+  // An END after a completed block: its BEGIN may have been lost between the
+  // markers, which would leak managed content as manual — never heal that.
+  assert.throws(
+    () => stripManagedMcpBlock([
+      MCP_MANAGED_START,
+      MCP_MANAGED_END,
+      'leaked = "maybe-managed"',
+      MCP_MANAGED_END,
+      "",
+    ].join("\n")),
+    /unmatched end marker/,
+  );
+  // Mismatched pair across marker generations stays a hard failure.
+  assert.throws(
+    () => stripManagedMcpBlock([MCP_MANAGED_START, LEGACY_END_MARKER, ""].join("\n")),
+    /unmatched end marker/,
+  );
+  assert.throws(
+    () => stripManagedMcpBlock([LEGACY_START_MARKER, MCP_MANAGED_END, ""].join("\n")),
+    /unmatched end marker/,
+  );
+});
+
+test("planManagedMcpReconciliation reclaims managed residue stranded by a lost begin marker", () => {
+  const ghostTweak = {
+    dir: "/expected/tweaks/ghost",
+    manifest: { id: "co.tweakers.ghost", mcp: { command: "node" } },
+  };
+  const healthy = planManagedMcpReconciliation([ghostTweak], "");
+  assert.equal(healthy.nextToml.includes(MCP_MANAGED_START), true);
+  // Simulate the sibling corruption of the orphan-END incident: only the
+  // BEGIN line is lost, stranding the managed table above the END marker.
+  const corrupted = healthy.nextToml.replace(`${MCP_MANAGED_START}\n`, "");
+  assert.equal(corrupted.includes(MCP_MANAGED_START), false);
+  assert.equal(corrupted.includes(MCP_MANAGED_END), true);
+
+  // Tweak uninstalled: the stranded table carries reserved managed env keys,
+  // so it is reclaimed (removed) — never adopted as manual user config.
+  const uninstalled = planManagedMcpReconciliation([], corrupted);
+  assert.equal(uninstalled.conflicts.length, 0);
+  assert.equal(uninstalled.nextToml.includes("co-tweakers-ghost"), false);
+  assert.equal(uninstalled.nextToml.includes(MCP_MANAGED_END), false);
+
+  // Tweak still installed: the stranded table is reclaimed into a fresh
+  // managed block, restoring the healthy document exactly.
+  const reclaimed = planManagedMcpReconciliation([ghostTweak], corrupted);
+  assert.equal(reclaimed.conflicts.length, 0);
+  assert.equal(reclaimed.nextToml, healthy.nextToml);
+
+  // A manual table without reserved keys stays untouched by the purge.
+  const manual = [
+    "[mcp_servers.hand-written]",
+    'command = "node"',
+    "",
+  ].join("\n");
+  const manualPlan = planManagedMcpReconciliation([], manual);
+  assert.equal(manualPlan.nextToml.includes("hand-written"), true);
+});
+
+test("planManagedMcpReconciliation rewrites through an orphan end marker", () => {
+  const tweak = {
+    dir: "/expected/tweaks/user-questions",
+    manifest: {
+      id: "co.tweakers.user-questions",
+      mcp: { command: "node" },
+    },
+  };
+  const corrupted = [
+    'model = "gpt-5.6"',
+    "",
+    "[shell_environment_policy.set]",
+    'TRUSTED = "/tmp"',
+    MCP_MANAGED_END,
+    "",
+  ].join("\n");
+
+  const plan = planManagedMcpReconciliation([tweak], corrupted);
+  assert.equal(plan.conflicts.length, 0);
+  assert.equal(plan.changed, true);
+  assert.equal(plan.nextToml.match(new RegExp(escapeRegExp(MCP_MANAGED_START), "g"))?.length, 1);
+  assert.equal(plan.nextToml.match(new RegExp(escapeRegExp(MCP_MANAGED_END), "g"))?.length, 1);
+  assert.equal(plan.nextToml.indexOf(MCP_MANAGED_START) < plan.nextToml.indexOf(MCP_MANAGED_END), true);
+  assert.equal(plan.nextToml.includes('TRUSTED = "/tmp"'), true);
+
+  // With no tweaks the stray marker is still removed, leaving clean TOML.
+  const emptyPlan = planManagedMcpReconciliation([], corrupted);
+  assert.equal(emptyPlan.changed, true);
+  assert.equal(emptyPlan.nextToml.includes(MCP_MANAGED_END), false);
+  assert.equal(emptyPlan.nextToml.includes('TRUSTED = "/tmp"'), true);
 });
 
 function withTempDir(fn: (root: string) => void): void {

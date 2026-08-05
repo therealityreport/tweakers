@@ -844,6 +844,12 @@ function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
  * directory for the same canonical server.
  */
 function managedBlocksDifferOnlyByLiveRoot(currentToml, plannedToml, tweaks) {
+    // stripManagedMcpBlock heals stray END markers, so a heal-only difference
+    // passes the stripped comparison below. Such a document is corrupt, not a
+    // live-root twin — suppressing its rewrite would plan the heal and discard
+    // it forever while prove reports healthy.
+    if ((0, mcp_sync_1.hasStrayManagedMcpEndMarker)(currentToml))
+        return false;
     if ((0, mcp_sync_1.stripManagedMcpBlock)(currentToml) !== (0, mcp_sync_1.stripManagedMcpBlock)(plannedToml))
         return false;
     const currentBlock = extractManagedBlock(currentToml);

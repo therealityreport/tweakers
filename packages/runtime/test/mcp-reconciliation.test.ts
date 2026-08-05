@@ -27,6 +27,7 @@ import {
   userQuestionsMcpReceiptMatchesEnabledState,
 } from "../src/mcp-reconciliation";
 import {
+  MCP_MANAGED_END,
   USER_QUESTIONS_MCP_SERVER_NAME,
   sanitizePreservedApprovalPolicy,
 } from "../src/mcp-sync";
@@ -1466,6 +1467,39 @@ test("createMcpReconciler performs one rerun for a request arriving in flight", 
       await reconciler.close();
     }
   });
+});
+
+test("reconcileMcpConfig durably heals a stray end marker above a current managed block", () => {
+  // The heal executes at this layer in environment commit/rollback/recover.
+  // A stray END above an otherwise up-to-date managed block must not be
+  // suppressed by the live-root exemption — for either marker generation.
+  const legacyEnd = ["# END CODEX", "++ MANAGED MCP SERVERS"].join("");
+  for (const stray of [MCP_MANAGED_END, legacyEnd]) {
+    withTempDir((root) => {
+      const configPath = join(root, "config.toml");
+      const statePath = join(root, "state.json");
+      const tweaks = [{
+        dir: root,
+        manifest: { id: "co.tweakers.example", mcp: { command: "node" } },
+      }];
+
+      reconcileMcpConfig({ configPath, statePath, trigger: "startup", tweaks });
+      const canonical = readFileSync(configPath, "utf8");
+      writeFileSync(configPath, `${stray}\n${canonical}`);
+
+      const healed = reconcileMcpConfig({ configPath, statePath, trigger: "config-change", tweaks });
+      assert.equal(healed.status, "updated");
+
+      const after = readFileSync(configPath, "utf8");
+      assert.equal(after, canonical);
+      assert.equal(after.includes(legacyEnd), false);
+      assert.equal(after.match(new RegExp(MCP_MANAGED_END, "g"))?.length, 1);
+
+      // The healed file is a fixed point.
+      const settled = reconcileMcpConfig({ configPath, statePath, trigger: "config-change", tweaks });
+      assert.equal(settled.status, "unchanged");
+    });
+  }
 });
 
 function withTempDir(fn: (root: string) => void): void {

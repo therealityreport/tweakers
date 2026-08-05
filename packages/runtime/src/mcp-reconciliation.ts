@@ -29,6 +29,7 @@ import {
   MCP_MANAGED_END,
   MCP_MANAGED_START,
   USER_QUESTIONS_MCP_SERVER_NAME,
+  hasStrayManagedMcpEndMarker,
   mcpServerNameFromTweakId,
   observeUserQuestionsApprovalPolicy,
   planManagedMcpReconciliation,
@@ -1115,6 +1116,11 @@ function managedBlocksDifferOnlyByLiveRoot(
   plannedToml: string,
   tweaks: McpSyncTweak[],
 ): boolean {
+  // stripManagedMcpBlock heals stray END markers, so a heal-only difference
+  // passes the stripped comparison below. Such a document is corrupt, not a
+  // live-root twin — suppressing its rewrite would plan the heal and discard
+  // it forever while prove reports healthy.
+  if (hasStrayManagedMcpEndMarker(currentToml)) return false;
   if (stripManagedMcpBlock(currentToml) !== stripManagedMcpBlock(plannedToml)) return false;
   const currentBlock = extractManagedBlock(currentToml);
   const plannedBlock = extractManagedBlock(plannedToml);
