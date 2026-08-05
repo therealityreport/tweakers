@@ -181,7 +181,7 @@ export function planManagedMcpReconciliation(
   const preservedOptions = sanitizePreservedMcpOptions(options.preservedOptions, ownedByName.keys());
   const allTables = findMcpServerTables(currentToml);
   let manualToml = stripManagedMcpBlock(currentToml);
-  const tables = findMcpServerTables(manualToml);
+  const manualTables = findMcpServerTables(manualToml);
   const desiredNames: string[] = [];
   const appliedNames: string[] = [];
   const migrations: Array<{ from: string; to: string }> = [];
@@ -192,8 +192,12 @@ export function planManagedMcpReconciliation(
   // A lost BEGIN marker strands managed table content in the manual half
   // (its orphan END is healed by stripManagedMcpBlock). Reserved env keys
   // prove managed origin — normalizeMcpServer refuses them in tweak
-  // manifests — so a manual table carrying one that no owned tweak claims is
-  // managed residue to reclaim, never user config to adopt.
+  // manifests — so a manual table carrying one is managed residue to
+  // reclaim, never user config to adopt. An exactly-owned inline table keeps
+  // the existing reclaim/migration path below; a nested-shape group (for
+  // example Codex normalizing env into a [mcp_servers.X.env] subtable) can
+  // never be reclaimed by that path — it reports canonical-collision forever
+  // — so reserved keys make the whole group residue here.
   // Matches the key as a bare assignment (env subtable line) or inside the
   // writer's inline env table ("env = { TWEAKER_TWEAK_ID = ... }").
   const reservedKeyPattern = new RegExp(
@@ -205,15 +209,26 @@ export function planManagedMcpReconciliation(
     if (legacy) ownedLegacyNames.add(legacy);
   }
   const residueBaseNames = new Set<string>();
-  for (const table of tables) {
+  for (const table of manualTables) {
     if (!reservedKeyPattern.test(table.body)) continue;
-    const baseName = table.name.split(".")[0]!;
-    if (ownedByName.has(baseName) || ownedLegacyNames.has(baseName)) continue;
+    const dot = table.name.indexOf(".");
+    const baseName = dot === -1 ? table.name : table.name.slice(0, dot);
+    const owned = ownedByName.has(baseName) || ownedLegacyNames.has(baseName);
+    // Reserved keys inside a nested table (the writer's env normalized into
+    // [mcp_servers.X.env]) prove the nested shape itself is managed — purge
+    // even for owned bases, since the exactly-owned path can never match it.
+    // For an owned base with reserved keys only inline, a nested subtable
+    // may be a manual user extension: keep the existing reclaim/conflict
+    // paths, which preserve the document byte-for-byte on conflict.
+    if (owned && dot === -1) continue;
     residueBaseNames.add(baseName);
   }
-  for (const table of tables) {
+  for (const table of manualTables) {
     if (residueBaseNames.has(table.name.split(".")[0]!)) rangesToRemove.push(table);
   }
+  const tables = manualTables.filter(
+    (table) => !residueBaseNames.has(table.name.split(".")[0]!),
+  );
 
   for (const [canonicalName, tweak] of ownedByName) {
     const mcp = normalizeMcpServer(tweak.manifest.mcp);

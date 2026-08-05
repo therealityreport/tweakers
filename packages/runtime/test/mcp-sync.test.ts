@@ -974,6 +974,41 @@ test("planManagedMcpReconciliation reclaims managed residue stranded by a lost b
   assert.equal(manualPlan.nextToml.includes("hand-written"), true);
 });
 
+test("planManagedMcpReconciliation reclaims owned residue normalized into env subtables", () => {
+  // Live 2026-08-05 shape: markers lost, and the desktop app rewrote the
+  // stranded managed entry with env as a [mcp_servers.X.env] subtable. The
+  // exactly-owned reclaim path cannot match that nested shape, so without
+  // the residue purge it reports canonical-collision forever and every
+  // reconcile-bearing recovery fails.
+  const ghostTweak = {
+    dir: "/expected/tweaks/ghost",
+    manifest: { id: "co.tweakers.ghost", mcp: { command: "node" } },
+  };
+  const corrupted = [
+    'model = "gpt-5.6"',
+    "",
+    "[mcp_servers.co-tweakers-ghost]",
+    'command = "node"',
+    "",
+    "[mcp_servers.co-tweakers-ghost.env]",
+    'TWEAKER_TWEAK_DATA_DIR = "/expected/data/co.tweakers.ghost"',
+    'TWEAKER_TWEAK_ID = "co.tweakers.ghost"',
+    MCP_MANAGED_END,
+    "",
+  ].join("\n");
+
+  const plan = planManagedMcpReconciliation([ghostTweak], corrupted);
+  assert.equal(plan.conflicts.length, 0);
+  assert.equal(plan.nextToml.match(new RegExp(escapeRegExp(MCP_MANAGED_START), "g"))?.length, 1);
+  assert.equal(plan.nextToml.includes("[mcp_servers.co-tweakers-ghost.env]"), false);
+  assert.equal(plan.nextToml.includes('model = "gpt-5.6"'), true);
+
+  // Uninstalled: the whole nested group disappears.
+  const uninstalled = planManagedMcpReconciliation([], corrupted);
+  assert.equal(uninstalled.conflicts.length, 0);
+  assert.equal(uninstalled.nextToml.includes("co-tweakers-ghost"), false);
+});
+
 test("planManagedMcpReconciliation rewrites through an orphan end marker", () => {
   const tweak = {
     dir: "/expected/tweaks/user-questions",
