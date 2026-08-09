@@ -106,9 +106,9 @@ function normalizeQuestion(value, index, seenQuestions, errors) {
   validateOptionalInteger(value.max_selections, `${prefix}.max_selections`, errors);
   const defaultMin = required ? 1 : 0;
   const minSelections = integerOr(value.min_selections, defaultMin);
-  // Preserve the 0.4.x compatibility behavior: multi-select always permits all listed choices and Other.
+  const availableSelections = options.length + (allowOther ? 1 : 0);
   const maxSelections = selectionMode === "multiple"
-    ? options.length + (allowOther ? 1 : 0)
+    ? integerOr(value.max_selections, availableSelections)
     : integerOr(value.max_selections, 1);
   if (minSelections < 0 || minSelections > options.length + (allowOther ? 1 : 0)) errors.push(`${prefix}.min_selections is out of range`);
   if (maxSelections < 1 || maxSelections > options.length + (allowOther ? 1 : 0)) errors.push(`${prefix}.max_selections is out of range`);

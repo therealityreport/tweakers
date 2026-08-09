@@ -15,6 +15,8 @@ choices into permanent rules.
   `pros`, `cons`, and `gives_up` lists.
 - Single- or multi-select answers, optional Other text, and an explicit Skip
   action for every question. Skip is a real answer state, not a missing result.
+- Multi-select `max_selections` is enforced by validation, the owned card, and
+  the standard form schema; callers can omit it to allow every available choice.
 - Back and Edit without losing choices or expanded details, followed by a
   review step before Submit.
 
@@ -90,7 +92,9 @@ Ordinary startup and ordinary question rounds never apply or restore policy.
 
 Question text, option details, answers, Other text, raw task IDs, resume tokens,
 and draft contents are excluded from diagnostic logs. Broker and delivery logs
-contain only bounded status codes and `contentRedacted: true`. Draft, broker,
+contain only allowlisted status codes and `contentRedacted: true`; unknown host
+errors collapse to `request_failed`. The MCP process rejects an unterminated
+input line before it can grow beyond its byte budget. Draft, broker,
 policy-transaction, and metadata files are private to the current user and use
 bounded, fail-closed formats.
 

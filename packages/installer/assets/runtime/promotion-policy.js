@@ -4,6 +4,7 @@ exports.PromotionPolicyFingerprintError = void 0;
 exports.promotionPolicyFingerprintFailureReason = promotionPolicyFingerprintFailureReason;
 exports.trustedPromotionPolicyMode = trustedPromotionPolicyMode;
 exports.fingerprintPromotionPolicyPath = fingerprintPromotionPolicyPath;
+exports.fingerprintPromotionCodexConfigPath = fingerprintPromotionCodexConfigPath;
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 // This runtime is copied into the application as a standalone CommonJS tree.
@@ -371,5 +372,34 @@ function canonicalJson(value, depth, budget) {
     const record = requireRecord(value, "Promotion policy value");
     const fields = Object.keys(record).sort().map((key) => (`${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1, budget)}`));
     return `{${fields.join(",")}}`;
+}
+/**
+ * Codex config promotion proof. The desktop app stamps volatile bookkeeping
+ * into config.toml on every boot (`last_updated = "…"` in marketplace
+ * tables), so a raw byte hash can never survive the candidate health probe,
+ * which must boot the app to observe the surface. Hash the content with those
+ * volatile lines removed; every substantive edit (servers, enabled flags,
+ * env, args) still changes the fingerprint. Paired with the installer twin in
+ * packages/installer/src/promotion-policy.ts — keep both byte-identical.
+ */
+function fingerprintPromotionCodexConfigPath(path) {
+    let bytes;
+    try {
+        bytes = (0, node_fs_1.readFileSync)(path);
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return "missing";
+        throw error;
+    }
+    const canonical = bytes
+        .toString("utf8")
+        .split("\n")
+        .filter((line) => !/^\s*last_updated\s*=/.test(line))
+        .join("\n");
+    return (0, node_crypto_1.createHash)("sha256")
+        .update("tweakers-promotion-codex-config-v1\0")
+        .update(canonical)
+        .digest("hex");
 }
 //# sourceMappingURL=promotion-policy.js.map

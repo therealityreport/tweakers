@@ -2,18 +2,48 @@
 
 const OWNER = "co.tweakers.shadcn-codex-ui";
 const STYLE_ID = "tweaker-shadcn-codex-ui-style";
-const MOUNT_ATTR = "data-tweaker-rich-block-owner";
+const MOUNT_ATTR = "data-co-tweakers-shadcn-codex-ui-rich-block-owner";
 const ENABLED_KEY = "enabled";
-const SUPPORTED_KINDS = Object.freeze(["heading", "text", "paragraph", "code", "list", "badge", "divider", "keyValue", "callout"]);
+const NORMALIZED_PAYLOADS = new WeakSet();
+const RICH_BLOCK_MOUNTS = new WeakMap();
+const INVALID_VALUE = Symbol("invalid-rich-block-value");
+
+// Rich Blocks v1 is deliberately extensible. The built-in kinds below receive
+// native-looking renderers; a valid unknown kind receives a safe text fallback.
+// This lets a producer add a new v1 block without making older renderers blank.
+const RICH_BLOCK_PROTOCOL = Object.freeze({
+  version: 1,
+  extensible: true,
+  builtInKinds: Object.freeze(["heading", "text", "paragraph", "code", "list", "badge", "divider", "keyValue", "callout"]),
+  bounds: Object.freeze({
+    serializedBytes: 64 * 1024,
+    normalizedBytes: 48 * 1024,
+    blocks: 50,
+    messageCandidates: 100,
+    fieldsPerBlock: 20,
+    fieldNameChars: 64,
+    stringChars: 2000,
+    arrayItems: 20,
+    objectFields: 12,
+    nesting: 3,
+    keyValuePairs: 20,
+    pairTextChars: 500,
+  }),
+});
 const states = new WeakMap();
 
 const helpers = {
   parseRichPayload,
   reconcileRichBlock,
   collectRichBlockRoots,
+  mergeRichBlockRoots,
   disposeRichBlockMount,
   renderBlock,
-  SUPPORTED_KINDS,
+  renderSettings,
+  scan,
+  getRichBlockMount: (message) => RICH_BLOCK_MOUNTS.get(message) || null,
+  getState: (instance) => states.get(instance),
+  RICH_BLOCK_PROTOCOL,
 };
 
 module.exports = {
@@ -24,9 +54,7 @@ module.exports = {
       disposed: false,
       observer: null,
       pending: null,
-      // Keyed by message element so a changed payload REPLACES the message's
-      // mount instead of accumulating a stale one (the old Set leaked a mount
-      // object per streamed payload update).
+      // Keyed by message element so a streamed update replaces its prior mount.
       mounts: new Map(),
       style: null,
       settings: null,
@@ -38,7 +66,7 @@ module.exports = {
       state.settings = api.settings.registerPage({
         id: "shadcn-codex-ui",
         title: "Shadcn Codex UI",
-        description: "Render supported rich blocks without replacing native messages.",
+        description: "Render bounded Rich Blocks v1 without replacing native messages.",
         iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m4 11 5 5 7-7M4 6l2-2m3 7 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         render(root) { renderSettings(root, state); },
       });
@@ -69,9 +97,7 @@ module.exports = {
 };
 
 function disposeAllMounts(state) {
-  for (const mount of Array.from(state.mounts.values())) {
-    disposeRichBlockMount(mount.message, mount);
-  }
+  for (const mount of Array.from(state.mounts.values())) disposeRichBlockMount(mount.message, mount);
   state.mounts.clear();
 }
 
@@ -97,11 +123,11 @@ function renderSettings(root, state) {
   row.append(text, input);
   const note = document.createElement("div");
   note.className = "text-token-text-secondary text-xs px-2";
-  note.textContent = `Supported blocks: ${SUPPORTED_KINDS.join(", ")}. Only valid version 1 payloads render; native messages are never replaced.`;
+  note.textContent = `Rich Blocks v${RICH_BLOCK_PROTOCOL.version} accepts safe extension kinds. Built-in renderers: ${RICH_BLOCK_PROTOCOL.builtInKinds.join(", ")}. Invalid or oversized payloads do not render.`;
   const status = document.createElement("div");
   status.className = "rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
   const matches = state.api?.react?.host?.snapshot?.("assistant-turns")?.count || 0;
-  status.textContent = `Live assistant surfaces detected: ${matches}. Active rich mounts: ${state.mounts.size}.`;
+  status.textContent = `Reported assistant surfaces: ${matches}. Active rich mounts: ${state.mounts.size}.`;
   const previewTitle = document.createElement("div");
   previewTitle.className = "pt-2 text-sm font-medium text-token-text-primary";
   previewTitle.textContent = "Block preview";
@@ -111,8 +137,8 @@ function renderSettings(root, state) {
     { kind: "heading", text: "Rich response" },
     { kind: "text", text: "Native message content remains intact." },
     { kind: "badge", text: "Preview" },
-    { kind: "keyValue", key: "Status", value: "Ready" },
-    { kind: "callout", title: "Bounded", text: "Only supported version 1 blocks render." },
+    { kind: "keyValue", pairs: [{ key: "Status", value: "Ready" }] },
+    { kind: "callout", title: "Bounded", text: "Only valid version 1 blocks render." },
   ]);
   root.append(row, note, status, previewTitle, preview);
 }
@@ -120,34 +146,100 @@ function renderSettings(root, state) {
 function parseRichPayload(value) {
   let candidate = value;
   if (typeof value === "string") {
+    if (!withinByteLimit(value, RICH_BLOCK_PROTOCOL.bounds.serializedBytes)) return null;
     try { candidate = JSON.parse(value); } catch { return null; }
+  } else if (serializedWithinLimit(value, RICH_BLOCK_PROTOCOL.bounds.serializedBytes) == null) {
+    return null;
   }
-  if (!isRecord(candidate) || candidate.version !== 1 || !Array.isArray(candidate.blocks)) return null;
-  if (candidate.blocks.length > 100) return null;
+  if (!isRecord(candidate) || candidate.version !== RICH_BLOCK_PROTOCOL.version || !Array.isArray(candidate.blocks)) return null;
+  if (candidate.blocks.length > RICH_BLOCK_PROTOCOL.bounds.blocks) return null;
   const blocks = candidate.blocks.map(normalizeBlock);
   if (blocks.some((block) => !block)) return null;
-  return { version: 1, blocks };
+  const payload = { version: RICH_BLOCK_PROTOCOL.version, blocks };
+  if (serializedWithinLimit(payload, RICH_BLOCK_PROTOCOL.bounds.normalizedBytes) == null) return null;
+  NORMALIZED_PAYLOADS.add(payload);
+  return payload;
 }
 
 function normalizeBlock(block) {
-  if (!isRecord(block) || typeof block.kind !== "string" || !block.kind.trim() || block.kind.length > 80) return null;
-  // Rich blocks are intentionally opaque to native content. Keep only a
-  // bounded JSON-safe projection so payloads cannot smuggle DOM or callbacks.
-  const out = { kind: block.kind.trim() };
+  if (!isRecord(block) || typeof block.kind !== "string") return null;
+  const kind = block.kind.trim();
+  const { bounds } = RICH_BLOCK_PROTOCOL;
+  if (!kind || kind.length > bounds.fieldNameChars || Object.keys(block).length > bounds.fieldsPerBlock) return null;
+  const out = { kind };
+  if (kind === "keyValue") {
+    const pairs = normalizePairs(block);
+    if (!pairs) return null;
+    out.pairs = pairs;
+  }
   for (const [key, value] of Object.entries(block)) {
-    if (key === "kind" || key.length > 80 || /^(?:html|script|on[a-z])/i.test(key)) continue;
-    if (typeof value === "string") out[key] = value.slice(0, 2000);
-    else if (typeof value === "number" || typeof value === "boolean") out[key] = value;
-    else if (value === null) out[key] = null;
-    else if (Array.isArray(value)) out[key] = value.slice(0, 20).map((item) => typeof item === "string" ? item.slice(0, 500) : item);
+    if (key === "kind" || (kind === "keyValue" && (key === "pairs" || key === "key" || key === "value"))) continue;
+    if (!isSafeFieldName(key)) return null;
+    const normalized = normalizeValue(value, 0);
+    if (normalized === INVALID_VALUE) return null;
+    out[key] = normalized;
   }
   return out;
 }
 
+function normalizePairs(block) {
+  const rawPairs = Array.isArray(block.pairs)
+    ? block.pairs
+    : (Object.prototype.hasOwnProperty.call(block, "key") || Object.prototype.hasOwnProperty.call(block, "value"))
+      ? [{ key: block.key, value: block.value }]
+      : [];
+  if (rawPairs.length > RICH_BLOCK_PROTOCOL.bounds.keyValuePairs) return null;
+  const pairs = [];
+  for (const pair of rawPairs) {
+    if (!isRecord(pair)) return null;
+    const key = normalizePairText(pair.key);
+    const value = normalizePairText(pair.value);
+    if (key == null || value == null) return null;
+    pairs.push({ key, value });
+  }
+  return pairs;
+}
+
+function normalizePairText(value) {
+  if (!["string", "number", "boolean"].includes(typeof value) && value !== null) return null;
+  if (typeof value === "number" && !Number.isFinite(value)) return null;
+  return String(value ?? "").slice(0, RICH_BLOCK_PROTOCOL.bounds.pairTextChars);
+}
+
+function normalizeValue(value, depth) {
+  const { bounds } = RICH_BLOCK_PROTOCOL;
+  if (typeof value === "string") return value.slice(0, bounds.stringChars);
+  if (typeof value === "boolean" || value === null) return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : INVALID_VALUE;
+  if (depth >= bounds.nesting) return INVALID_VALUE;
+  if (Array.isArray(value)) {
+    const out = [];
+    for (const item of value.slice(0, bounds.arrayItems)) {
+      const normalized = normalizeValue(item, depth + 1);
+      if (normalized === INVALID_VALUE) return INVALID_VALUE;
+      out.push(normalized);
+    }
+    return out;
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.length > bounds.objectFields) return INVALID_VALUE;
+    const out = {};
+    for (const [key, item] of entries) {
+      if (!isSafeFieldName(key)) return INVALID_VALUE;
+      const normalized = normalizeValue(item, depth + 1);
+      if (normalized === INVALID_VALUE) return INVALID_VALUE;
+      out[key] = normalized;
+    }
+    return out;
+  }
+  return INVALID_VALUE;
+}
+
 function reconcileRichBlock(message, rawPayload) {
   if (!message || typeof message !== "object") return null;
-  const payload = parseRichPayload(rawPayload);
-  const previous = message.ownedMount;
+  const payload = NORMALIZED_PAYLOADS.has(rawPayload) ? rawPayload : parseRichPayload(rawPayload);
+  const previous = RICH_BLOCK_MOUNTS.get(message) || null;
   if (!payload) {
     if (previous?.owner === OWNER) disposeRichBlockMount(message, previous);
     return null;
@@ -155,8 +247,6 @@ function reconcileRichBlock(message, rawPayload) {
   // Never replace a mount owned by another adapter.
   if (previous && previous.owner !== OWNER) return null;
   const payloadHash = JSON.stringify(payload);
-  // Reuse the existing mount only if it is unchanged AND still attached. If a
-  // host re-render detached our <section>, fall through and re-anchor it.
   if (
     previous?.owner === OWNER &&
     previous.messageId === message.id &&
@@ -173,25 +263,23 @@ function reconcileRichBlock(message, rawPayload) {
     const content = message.querySelector?.("[data-message-content], [data-testid*=message-content], .markdown, [class*=markdown]") || message;
     content.appendChild(host);
     const mount = { owner: OWNER, messageId: message.id || message.getAttribute?.("data-message-id") || null, payloadHash, payload, host, message };
-    message.ownedMount = mount;
+    RICH_BLOCK_MOUNTS.set(message, mount);
     return mount;
   }
   const mount = { owner: OWNER, messageId: message.id, payloadHash, payload, message };
-  message.ownedMount = mount;
+  RICH_BLOCK_MOUNTS.set(message, mount);
   return mount;
 }
 
 function disposeRichBlockMount(message, mount) {
   if (!mount || mount.owner !== OWNER) return;
   mount.host?.remove?.();
-  if (message && message.ownedMount === mount) message.ownedMount = null;
+  if (message && RICH_BLOCK_MOUNTS.get(message) === mount) RICH_BLOCK_MOUNTS.delete(message);
 }
 
 function collectRichBlockRoots(root) {
   if (Array.isArray(root)) return root.filter((item) => item?.kind === "message");
   const source = root || (typeof document !== "undefined" ? document : null);
-  // Stable data-* hooks only; the old `.group.flex.min-w-0.flex-col` class chain
-  // was coupled to Codex's Tailwind output and broke on any restyle.
   const nodes = Array.from(source?.querySelectorAll?.(
     '[data-message-author-role="assistant"], [data-role="assistant"], [data-message-id]',
   ) || []);
@@ -202,18 +290,29 @@ function collectRichBlockRoots(root) {
   });
 }
 
+function mergeRichBlockRoots(hostRoots, nativeRoots) {
+  const merged = new Map();
+  for (const root of [...hostRoots, ...nativeRoots]) {
+    if (!root) continue;
+    const id = root.id || root.getAttribute?.("data-message-id");
+    merged.set(id ? `id:${id}` : root, root);
+  }
+  return Array.from(merged.values()).slice(-RICH_BLOCK_PROTOCOL.bounds.messageCandidates);
+}
+
 function scan(state) {
   if (state.disposed) return;
   if (!state.enabled) { disposeAllMounts(state); return; }
-  const hostMatches = state.api?.react?.host?.query?.("assistant-turns") || [];
-  const roots = hostMatches.length ? hostMatches.map((match) => match.element) : collectRichBlockRoots(document);
+  const hostRoots = (state.api?.react?.host?.query?.("assistant-turns") || []).map((match) => match?.element).filter(Boolean);
+  // The host can return an early capped page. Merge it with native candidates,
+  // deduplicate by message id, then retain the newest bounded window.
+  const roots = mergeRichBlockRoots(hostRoots, collectRichBlockRoots(document));
   for (const message of roots) {
-    const found = findPayload(message);
-    const mount = reconcileRichBlock(message, found);
-    if (mount?.host) state.mounts.set(message, mount); // replaces any prior mount for this message
+    const payload = findPayload(message); // Parsed once; reconcile reuses normalized payloads.
+    const mount = reconcileRichBlock(message, payload);
+    if (mount?.host) state.mounts.set(message, mount);
     else if (!mount) state.mounts.delete(message);
   }
-  // Drop mounts whose message OR injected host has left the DOM.
   for (const [message, mount] of Array.from(state.mounts)) {
     if (message?.isConnected === false || mount.host?.isConnected === false) {
       disposeRichBlockMount(mount.message, mount);
@@ -224,20 +323,18 @@ function scan(state) {
 
 function findPayload(message) {
   const raw = message.getAttribute?.("data-rich-payload") || message.querySelector?.("[data-rich-payload]")?.getAttribute?.("data-rich-payload");
-  if (raw) return raw;
+  if (raw) return parseRichPayload(raw);
   for (const node of Array.from(message.querySelectorAll?.("pre, code") || []).reverse()) {
-    if (parseRichPayload(node.textContent || "")) return node.textContent;
+    const payload = parseRichPayload(node.textContent || "");
+    if (payload) return payload;
   }
   return null;
 }
 
 function renderBlocks(host, blocks) {
-  for (const block of blocks) host.appendChild(renderBlock(block));
+  for (const block of blocks || []) host.appendChild(renderBlock(block));
 }
 
-// Per-kind, shadcn-flavored rendering. Everything is set via textContent (the
-// payload is already stripped of html/script/on* keys upstream), so no markup
-// can be smuggled in through a block.
 function renderBlock(block) {
   const kind = String(block?.kind || "").trim();
   const el = (tag, className, text) => {
@@ -268,9 +365,8 @@ function renderBlock(block) {
     }
     case "list": {
       wrap.className = "flex flex-col gap-1";
-      const items = Array.isArray(block.items) ? block.items : [];
       const list = el("ul", "list-disc pl-5 text-sm text-token-text-secondary");
-      for (const item of items) list.appendChild(el("li", null, str(item)));
+      for (const item of Array.isArray(block.items) ? block.items : []) list.appendChild(el("li", null, str(item)));
       wrap.appendChild(list);
       return wrap;
     }
@@ -283,8 +379,7 @@ function renderBlock(block) {
       return wrap;
     case "keyValue": {
       wrap.className = "border-token-border flex flex-col divide-y-[0.5px] divide-token-border rounded-md border";
-      const pairs = Array.isArray(block.pairs) ? block.pairs : [];
-      for (const pair of pairs) {
+      for (const pair of Array.isArray(block.pairs) ? block.pairs : []) {
         const rowEl = el("div", "flex items-center justify-between gap-4 px-3 py-1.5 text-sm");
         rowEl.appendChild(el("span", "text-token-text-secondary", str(pair?.key)));
         rowEl.appendChild(el("span", "text-token-text-primary", str(pair?.value)));
@@ -299,20 +394,10 @@ function renderBlock(block) {
       return wrap;
     }
     default:
-      // Unknown kind: show a labelled fallback rather than nothing.
       wrap.className = "border-token-border rounded-md border px-3 py-2 text-sm text-token-text-primary";
       wrap.textContent = str(block.text) || kind || "block";
       return wrap;
   }
-}
-
-function str(value) {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-function schedule(state) {
-  if (state.disposed || state.pending != null) return;
-  state.pending = requestFrame(() => { state.pending = null; scan(state); });
 }
 
 function installStyle() {
@@ -321,6 +406,11 @@ function installStyle() {
   style.textContent = `[${MOUNT_ATTR}="${OWNER}"] { contain: layout style; }`;
   if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
   return style;
+}
+
+function schedule(state) {
+  if (state.disposed || state.pending != null) return;
+  state.pending = requestFrame(() => { state.pending = null; scan(state); });
 }
 
 function requestFrame(callback) {
@@ -333,5 +423,23 @@ function cancelFrame(id) {
   if (typeof clearTimeout === "function") clearTimeout(id);
 }
 
+function withinByteLimit(value, limit) { return byteLength(value) <= limit; }
+function serializedWithinLimit(value, limit) {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" && withinByteLimit(serialized, limit) ? serialized : null;
+  } catch { return null; }
+}
+function byteLength(value) {
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(value).length;
+  return encodeURIComponent(value).replace(/%[0-9A-F]{2}|./gi, "x").length;
+}
+function isSafeFieldName(key) {
+  return typeof key === "string"
+    && key.length > 0
+    && key.length <= RICH_BLOCK_PROTOCOL.bounds.fieldNameChars
+    && !/^(?:html|script|on[a-z]|__proto__|constructor|prototype)$/i.test(key);
+}
+function str(value) { return typeof value === "string" ? value : value == null ? "" : String(value); }
 function isDomNode(value) { return typeof Node !== "undefined" && value instanceof Node && typeof value.appendChild === "function"; }
 function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
