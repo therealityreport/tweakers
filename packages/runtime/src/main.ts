@@ -2830,7 +2830,46 @@ app.on("will-quit", () => {
   finishTweakLifecycleAttempt();
 });
 
+function openNativeSettingsFromApplicationMenu(owner?: BrowserWindow): boolean {
+  const applicationMenu = Menu.getApplicationMenu();
+  if (!applicationMenu) return false;
+  const candidates: Electron.MenuItem[] = [];
+  const visit = (items: readonly Electron.MenuItem[]): void => {
+    for (const item of items) {
+      if (item.submenu) visit(item.submenu.items);
+      if (item.enabled === false || item.visible === false || typeof item.click !== "function") continue;
+      const label = item.label.replace(/&/g, "").replace(/\.{3}|…/g, "").trim().toLowerCase();
+      const role = String(item.role ?? "").toLowerCase();
+      const accelerator = String(item.accelerator ?? "").replace(/\s/g, "").toLowerCase();
+      if (
+        role === "preferences" ||
+        label === "settings" ||
+        label === "preferences" ||
+        /^(commandorcontrol|cmdorctrl|command|cmd)\+,?$/.test(accelerator)
+      ) {
+        candidates.push(item);
+      }
+    }
+  };
+  visit(applicationMenu.items);
+  const unique = [...new Set(candidates)];
+  if (unique.length !== 1) return false;
+  try {
+    Reflect.apply(unique[0].click!, unique[0], [unique[0], owner, undefined]);
+    return true;
+  } catch (error) {
+    log("warn", "open settings application-menu action failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
 // 3. IPC: expose tweak metadata + reveal-in-finder.
+ipcMain.handle("tweaker:open-settings", (event) => {
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  return openNativeSettingsFromApplicationMenu(owner);
+});
 ipcMain.handle("tweaker:list-tweaks", async () => {
   await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
   const updateChecks = readState().tweakUpdateChecks ?? {};
@@ -6129,6 +6168,17 @@ function makeCodexApi(tweak: DiscoveredTweak) {
     runtime: {
       getInfo: async () => currentRuntimeInfo(),
       getCapabilities: async () => currentRuntimeCapabilities(),
+    },
+    settings: {
+      open: async (ownerWebContentsId?: number) => {
+        assertTweakPermission(tweak, "settings");
+        if (ownerWebContentsId !== undefined) {
+          const sender = ownedCodexRenderer(ownerWebContentsId);
+          if (!sender) return false;
+          return openNativeSettingsFromApplicationMenu(BrowserWindow.fromWebContents(sender) ?? undefined);
+        }
+        return openNativeSettingsFromApplicationMenu(getPrimaryCodexWindow() ?? undefined);
+      },
     },
     windows: {
       create: createCodexWindow,

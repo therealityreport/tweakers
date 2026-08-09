@@ -40,7 +40,6 @@ export type TweakStoreSource =
 export const BUNDLED_TWEAK_SOURCE_PATHS: Readonly<Record<string, string>> = Object.freeze({
   "co.tweakers.account-switcher": "tweaks/co.tweakers.account-switcher",
   "co.tweakers.appshots": "tweaks/co.tweakers.appshots",
-  "co.tweakers.browser-trust": "tweaks/co.tweakers.browser-trust",
   "co.tweakers.developer-tools": "tweaks/co.tweakers.developer-tools",
   "co.tweakers.shadcn-codex-ui": "tweaks/co.tweakers.shadcn-codex-ui",
   "co.tweakers.followup": "tweaks/followup",

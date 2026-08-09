@@ -28,6 +28,7 @@ import type {
   SettingsSection,
   SettingsPage,
   SettingsHandle,
+  SettingsOpenResult,
   TweakManifest,
 } from "@therealityreport/tweakers-sdk";
 import {
@@ -425,6 +426,13 @@ interface InjectorState {
   tweaksPageQuery: string;
 }
 
+interface PendingRegisteredPageOpen {
+  tweakId: string;
+  pageId: string;
+  resolve: (result: SettingsOpenResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 const state: InjectorState = {
   sections: new Map(),
   sectionTokens: new Map(),
@@ -459,6 +467,8 @@ const state: InjectorState = {
   tweaksPageFilter: "all",
   tweaksPageQuery: "",
 };
+
+let pendingRegisteredPageOpen: PendingRegisteredPageOpen | null = null;
 
 let activeBuiltinPageCleanup: (() => void) | null = null;
 const originalHistoryMethods: Partial<Record<"pushState" | "replaceState", History["pushState"]>> = {};
@@ -732,6 +742,71 @@ export function registerPage(
   };
 }
 
+function settlePendingRegisteredPageOpen(result: SettingsOpenResult): void {
+  const pending = pendingRegisteredPageOpen;
+  if (!pending) return;
+  pendingRegisteredPageOpen = null;
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+}
+
+function activatePendingRegisteredPageOpen(): boolean {
+  const pending = pendingRegisteredPageOpen;
+  if (!pending) return false;
+  const entry = state.pages.get(pending.pageId);
+  if (!entry || entry.tweakId !== pending.tweakId) {
+    settlePendingRegisteredPageOpen({ ok: false, reason: "not-registered" });
+    return false;
+  }
+  if (!state.settingsSurfaceVisible || !state.sidebarRoot?.isConnected || !findContentArea()) return false;
+  activatePage({ kind: "registered", id: pending.tweakId });
+  settlePendingRegisteredPageOpen({ ok: true });
+  return true;
+}
+
+/** Open native Settings, then activate a page already registered by the caller. */
+export function openRegisteredPage(
+  tweakId: string,
+  pageId: string,
+): Promise<SettingsOpenResult> {
+  const entry = state.pages.get(pageId);
+  if (!entry || entry.tweakId !== tweakId) {
+    return Promise.resolve({ ok: false, reason: "not-registered" });
+  }
+  if (state.settingsSurfaceVisible && state.sidebarRoot?.isConnected && findContentArea()) {
+    activatePage({ kind: "registered", id: tweakId });
+    return Promise.resolve({ ok: true });
+  }
+
+  if (pendingRegisteredPageOpen) {
+    settlePendingRegisteredPageOpen({ ok: false, reason: "mount-timeout" });
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (pendingRegisteredPageOpen?.pageId === pageId) {
+        settlePendingRegisteredPageOpen({ ok: false, reason: "mount-timeout" });
+      }
+    }, 5_000);
+    pendingRegisteredPageOpen = { tweakId, pageId, resolve, timer };
+    void ipcRenderer.invoke("tweaker:open-settings").then((opened: unknown) => {
+      if (opened === true) return;
+      if (pendingRegisteredPageOpen?.pageId === pageId) {
+        settlePendingRegisteredPageOpen({
+          ok: false,
+          reason: "settings-command-unavailable",
+        });
+      }
+    }).catch(() => {
+      if (pendingRegisteredPageOpen?.pageId === pageId) {
+        settlePendingRegisteredPageOpen({
+          ok: false,
+          reason: "settings-command-unavailable",
+        });
+      }
+    });
+  });
+}
+
 /** Called by the tweak host after fetching the tweak list from main. */
 export function setListedTweaks(list: ListedTweak[]): void {
   state.listedTweaks = list;
@@ -838,6 +913,7 @@ function tryInject(): SettingsProbeOutcome {
     // If one of our pages is active, re-strip Codex's active styling so
     // General doesn't reappear as selected.
     if (state.activePage !== null) syncCodexNativeNavActive(true);
+    activatePendingRegisteredPageOpen();
     return "found";
   }
 
@@ -870,6 +946,7 @@ function tryInject(): SettingsProbeOutcome {
     syncPagesGroup();
     refreshSidebarTweakerUpdateButton();
     if (state.activePage !== null) syncCodexNativeNavActive(true);
+    activatePendingRegisteredPageOpen();
     return "found";
   }
 
@@ -905,6 +982,7 @@ function tryInject(): SettingsProbeOutcome {
   state.navButtons = { config: configBtn, tweaks: tweaksBtn };
   noteNavGroupInjection(outer);
   syncPagesGroup();
+  activatePendingRegisteredPageOpen();
   return "found";
 }
 
@@ -1442,7 +1520,8 @@ function activatePage(page: ActivePage): void {
   if (!panel) {
     panel = document.createElement("div");
     panel.dataset.tweaker = "tweaks-panel";
-    panel.style.cssText = "width:100%;height:100%;overflow:auto;";
+    panel.className = "bg-token-main-surface-primary";
+    panel.style.cssText = "width:100%;height:100%;overflow:auto;background-color:var(--color-token-main-surface-primary, var(--color-background-primary, #fff));";
     content.appendChild(panel);
   }
   panel.style.display = "block";
@@ -5469,7 +5548,8 @@ function panelShell(
   headerTitleActions: HTMLElement;
 } {
   const outer = document.createElement("div");
-  outer.className = "main-surface flex h-full min-h-0 flex-col";
+  outer.className = "main-surface bg-token-main-surface-primary flex h-full min-h-0 flex-col";
+  outer.style.backgroundColor = "var(--color-token-main-surface-primary, var(--color-background-primary, #fff))";
 
   const toolbar = document.createElement("div");
   toolbar.className =
@@ -5477,7 +5557,8 @@ function panelShell(
   outer.appendChild(toolbar);
 
   const scroll = document.createElement("div");
-  scroll.className = "flex-1 overflow-y-auto p-panel";
+  scroll.className = "bg-token-main-surface-primary flex-1 overflow-y-auto p-panel";
+  scroll.style.backgroundColor = "var(--color-token-main-surface-primary, var(--color-background-primary, #fff))";
   outer.appendChild(scroll);
 
   const inner = document.createElement("div");

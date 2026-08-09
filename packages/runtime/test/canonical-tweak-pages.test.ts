@@ -6,7 +6,6 @@ import test from "node:test";
 const tweaks = [
   "co.tweakers.account-switcher",
   "co.tweakers.appshots",
-  "co.tweakers.browser-trust",
   "co.tweakers.developer-tools",
   "co.tweakers.projects",
   "co.tweakers.shadcn-codex-ui",
@@ -18,7 +17,7 @@ const tweaks = [
   "user-questions",
 ];
 
-test("all twelve canonical Tweakers register one purpose-built settings page", () => {
+test("all eleven canonical Tweakers register one purpose-built settings page", () => {
   const icons = new Set<string>();
   for (const folder of tweaks) {
     const source = readFileSync(resolve(process.cwd(), "tweaks", folder, "index.js"), "utf8");
@@ -32,7 +31,7 @@ test("all twelve canonical Tweakers register one purpose-built settings page", (
     assert.equal(icons.has(icon), false, `${folder} should have a distinct icon`);
     icons.add(icon);
   }
-  assert.equal(icons.size, 12);
+  assert.equal(icons.size, 11);
 });
 
 test("canonical pages contain meaningful controls or live status instead of an Enabled placeholder", () => {
