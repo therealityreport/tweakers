@@ -93,7 +93,7 @@
         "allow_other": true,
         "required": false,
         "min_selections": 2,
-        "max_selections": 3
+        "max_selections": 2
       }
     ]
   }

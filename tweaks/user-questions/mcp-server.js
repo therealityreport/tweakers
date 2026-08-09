@@ -26,6 +26,7 @@ const SKIP_TITLE = "Skip this question";
 const OTHER_TITLE = "Other";
 const DEFAULT_DISPLAY_TIMEOUT_MS = 5 * 60_000;
 const BROKER_TIMEOUT_MS = 5_000;
+const MCP_MAX_INPUT_LINE_BYTES = 128 * 1024;
 const TWEAK_DATA_DIR_ENV = "TWEAKER_TWEAK_DATA_DIR";
 const TWEAK_ID_ENV = "TWEAKER_TWEAK_ID";
 const CARRIER_OTHER_TEXT_PREFIX = "__tweakers_carrier_other_";
@@ -41,16 +42,34 @@ function createMcpRuntime(options = {}) {
   let clientCapabilities = {};
   let negotiatedProtocolVersion = LATEST_PROTOCOL_VERSION;
   let buffer = "";
+  let bufferBytes = 0;
   let shuttingDown = false;
 
   inputStream.setEncoding("utf8");
   inputStream.on("data", (chunk) => {
-    buffer += chunk;
-    while (buffer.includes("\n")) {
-      const index = buffer.indexOf("\n");
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
+    if (shuttingDown) return;
+    let cursor = 0;
+    while (cursor <= chunk.length) {
+      const newline = chunk.indexOf("\n", cursor);
+      const end = newline === -1 ? chunk.length : newline;
+      const fragment = chunk.slice(cursor, end);
+      const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+      if (bufferBytes + fragmentBytes > MCP_MAX_INPUT_LINE_BYTES) {
+        buffer = "";
+        bufferBytes = 0;
+        inputStream.destroy?.();
+        shutdown();
+        return;
+      }
+      buffer += fragment;
+      bufferBytes += fragmentBytes;
+      if (newline === -1) return;
+      const line = buffer.trim();
+      buffer = "";
+      bufferBytes = 0;
       if (line) void handleMessage(line);
+      cursor = newline + 1;
+      if (cursor === chunk.length) return;
     }
   });
 
@@ -616,7 +635,7 @@ function addQuestionProperties(properties, required, question, questionIndex, le
           title: question.header,
           description,
           minItems: 1,
-          maxItems: question.options.length + (question.allow_other ? 1 : 0),
+          maxItems: question.max_selections,
           items: { anyOf: choices },
           ...(priorValues.length ? { default: priorValues } : {}),
         }
@@ -1017,7 +1036,7 @@ function deepFreeze(value) {
 
 function publicToolError(error) {
   if (error instanceof BrokerProtocolError) return `question delivery failed (${error.code})`;
-  return String(error?.message || error).slice(0, 500);
+  return "question delivery failed (request_failed)";
 }
 
 if (require.main === module) createMcpRuntime();
@@ -1025,6 +1044,7 @@ if (require.main === module) createMcpRuntime();
 module.exports = {
   LEGACY_PROTOCOL_VERSION,
   LATEST_PROTOCOL_VERSION,
+  MCP_MAX_INPUT_LINE_BYTES,
   OTHER_VALUE,
   SKIP_VALUE,
   buildQuestionElicitation,

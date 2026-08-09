@@ -10,7 +10,7 @@ const { CARRIER_NONCE_PREFIX } = require("../broker-protocol");
 const { createDraftStore } = require("../draft-store");
 const { createMainBroker } = require("../main-broker");
 const manifest = require("../manifest.json");
-const { serializeToolResult } = require("../mcp-server");
+const { MCP_MAX_INPUT_LINE_BYTES, serializeToolResult } = require("../mcp-server");
 
 const MODERN = "2025-11-25";
 const LEGACY = "2025-06-18";
@@ -65,6 +65,7 @@ test("modern MCP keeps generic fallback to one real question per form without ca
   assert.match(second.params.message, /Question 2 of 2/);
   assert.deepEqual(Object.keys(second.params.requestedSchema.properties).sort(), ["proof", "proof__other_text"]);
   assert.equal(second.params.requestedSchema.properties.proof.type, "array");
+  assert.equal(second.params.requestedSchema.properties.proof.maxItems, 2);
   assertNoInternalCarrierCopy(second);
   accept(child, second, { proof: ["__skip__"] });
   const response = (await messages.next()).value;
@@ -163,6 +164,12 @@ test("legacy MCP keeps one primitive question form at a time", async (t) => {
   assert.deepEqual(result.answers.delivery.selected_option_ids, ["separate"]);
   assert.deepEqual(result.answers.proof.selected_option_ids, ["tests", "review"]);
   await closeServer(child);
+});
+
+test("MCP closes an over-limit unterminated input line before parsing", async (t) => {
+  const child = spawnServer(t);
+  child.stdin.write("x".repeat(MCP_MAX_INPUT_LINE_BYTES + 1));
+  assert.deepEqual(await waitForExit(child), { code: 0, signal: null });
 });
 
 test("explicit generic cancellation is final and reports the secure-binding limitation", async (t) => {

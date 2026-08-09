@@ -218,6 +218,23 @@ test("the reducer is pure and deterministic for identical state and action", () 
   assert.notEqual(first.value, state);
 });
 
+test("owned round actions enforce the published multi-select maximum", () => {
+  const roundInput = input();
+  roundInput.questions[1].min_selections = 1;
+  roundInput.questions[1].max_selections = 1;
+  let state = apply(roundInput, createRoundState(roundInput), { type: "claim", revision: 0 });
+  state = apply(roundInput, state, { type: "skip", revision: 1 });
+  state = apply(roundInput, state, { type: "next", revision: 2 });
+  const result = reduceRoundState(roundInput, state, {
+    type: "answer",
+    revision: 3,
+    question_id: "proof",
+    selected_option_ids: ["tests", "review"],
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join(" "), /allows at most 1 answer/);
+});
+
 test("rejects stale revisions, unknown actions and fields, dangling IDs, blank Other, and skipped selections", () => {
   const roundInput = input();
   const claiming = createRoundState(roundInput);
