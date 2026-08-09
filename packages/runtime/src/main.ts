@@ -23,6 +23,7 @@ import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } fr
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
 import { hashRawAsarHeader } from "./promotion-asar";
 import {
+  fingerprintPromotionCodexConfigPath,
   fingerprintPromotionPolicyPath,
   promotionPolicyFingerprintFailureReason,
 } from "./promotion-policy";
@@ -1553,7 +1554,7 @@ function promotionSurfaceHash(surface: PromotionSurfaceName): string {
     case "runtime": return fingerprintPromotionPath(runtimeDir!);
     case "tweakTree": return fingerprintPromotionPath(TWEAKS_DIR);
     case "tweakersConfig": return fingerprintPromotionPath(CONFIG_FILE);
-    case "codexConfig": return fingerprintPromotionPath(CODEX_CONFIG_FILE);
+    case "codexConfig": return fingerprintPromotionCodexConfigPath(CODEX_CONFIG_FILE);
     case "namespaceData": return fingerprintPromotionPath(join(userRoot!, "tweak-data", USER_QUESTIONS_TWEAK_ID));
     case "mainStorage": return fingerprintPromotionPath(join(userRoot!, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`));
     case "policy": return promotionPolicySurfaceHash();

@@ -92,7 +92,7 @@ import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
 import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
-import { fingerprintPromotionPolicyPath } from "../promotion-policy.js";
+import { fingerprintPromotionCodexConfigPath, fingerprintPromotionPolicyPath } from "../promotion-policy.js";
 import {
   fingerprintPath,
   inspectUserQuestionsSource,
@@ -1936,7 +1936,7 @@ function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSu
     runtime: fingerprintPromotionPath(roots.runtimeRoot),
     tweakTree: fingerprintPromotionPath(roots.tweaksRoot),
     tweakersConfig: fingerprintPromotionPath(roots.tweakersConfigPath),
-    codexConfig: fingerprintPromotionPath(roots.codexConfigPath),
+    codexConfig: fingerprintPromotionCodexConfigPath(roots.codexConfigPath),
     namespaceData: fingerprintPromotionPath(roots.namespaceDataPath),
     mainStorage: fingerprintPromotionPath(roots.mainStoragePath),
     policy: fingerprintPromotionPolicyPath(roots.policyPath),
