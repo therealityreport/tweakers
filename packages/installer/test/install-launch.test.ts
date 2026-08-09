@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  HEALTH_PROBE_CLEANUP_MAX_RETRIES,
+  HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS,
   HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH,
   HEALTH_PROBE_PROCESS_TIMEOUT_MS,
   HEALTH_PROBE_RECEIPT_TIMEOUT_MS,
@@ -12,9 +14,96 @@ import {
   HEALTH_PROBE_TEMP_RELATIVE_PATH,
   HEALTH_PROBE_USER_DATA_RELATIVE_PATH,
   formatHealthProbeLaunchFailure,
+  ownedHealthProbeProcesses,
+  removeHealthProbeRoot,
   spawnAuthenticatedHiddenHealthProbe,
   spawnHiddenHealthProbe,
 } from "../src/commands/install";
+
+test("health probe cleanup retries transient late-writer directory races", () => {
+  let observedPath = "";
+  let observedOptions: {
+    recursive: true;
+    force: true;
+    maxRetries: number;
+    retryDelay: number;
+  } | null = null;
+
+  removeHealthProbeRoot("/tmp/contained-health-probe", (path, options) => {
+    observedPath = path;
+    observedOptions = options;
+  });
+
+  assert.equal(observedPath, "/tmp/contained-health-probe");
+  assert.deepEqual(observedOptions, {
+    recursive: true,
+    force: true,
+    maxRetries: HEALTH_PROBE_CLEANUP_MAX_RETRIES,
+    retryDelay: HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS,
+  });
+  assert.equal(HEALTH_PROBE_CLEANUP_MAX_RETRIES, 5);
+  assert.equal(HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS, 100);
+  assert.equal(
+    (HEALTH_PROBE_CLEANUP_MAX_RETRIES * (HEALTH_PROBE_CLEANUP_MAX_RETRIES + 1) / 2)
+      * HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS,
+    1_500,
+  );
+});
+
+test("health probe ownership includes new sandbox and exact app helpers only", () => {
+  const baseline = [
+    { pid: 10, ppid: 1, startedAtRaw: "before", startedAt: null, command: "/Applications/ChatGPT.app/Contents/Resources/native/bare-modifier-monitor" },
+  ];
+  const observed = [
+    ...baseline,
+    { pid: 11, ppid: 1, startedAtRaw: "after", startedAt: null, command: "/Applications/ChatGPT.app/Contents/Frameworks/browser_crashpad_handler --database=/tmp/probe-abc/electron-user-data/Crashpad" },
+    { pid: 12, ppid: 1, startedAtRaw: "after", startedAt: null, command: "/Applications/ChatGPT.app/Contents/Resources/native/bare-modifier-monitor --immediate" },
+    { pid: 13, ppid: 1, startedAtRaw: "after", startedAt: null, command: "/Applications/Other.app/Contents/MacOS/Other" },
+  ];
+  assert.deepEqual(
+    ownedHealthProbeProcesses(
+      baseline,
+      observed,
+      "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+      "/tmp/probe-abc",
+    ).map((process) => process.pid),
+    [11, 12],
+  );
+});
+
+test("health probe terminates and waits for owned reparented helpers before sandbox removal", (t) => {
+  const userRoot = mkdtempSync(join(tmpdir(), "tweakers-health-owned-tree-"));
+  t.after(() => rmSync(userRoot, { recursive: true, force: true }));
+  const executable = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+  const baseline = [
+    { pid: 20, ppid: 1, startedAtRaw: "before", startedAt: null, command: "/Applications/Other.app/Contents/MacOS/Other" },
+  ];
+  let processes = [...baseline];
+  const signals: Array<[number, NodeJS.Signals]> = [];
+  const fakeSpawn = ((_command: string, args: readonly string[]) => {
+    const probeRoot = String(args[0]).replace(/^--user-data-dir=/, "").replace(/\/electron-user-data$/, "");
+    processes.push(
+      { pid: 21, ppid: 1, startedAtRaw: "after", startedAt: null, command: `${executable} --database=${probeRoot}/electron-user-data/Crashpad` },
+      { pid: 22, ppid: 1, startedAtRaw: "after", startedAt: null, command: "/Applications/ChatGPT.app/Contents/Resources/native/bare-modifier-monitor --immediate" },
+    );
+    return { status: 0 } as ReturnType<typeof spawnSync>;
+  }) as typeof spawnSync;
+
+  spawnHiddenHealthProbe(executable, userRoot, {
+    spawn: fakeSpawn,
+    platform: "darwin",
+    listProcesses: () => [...processes],
+    signalProcess: (pid, signal) => {
+      signals.push([pid, signal]);
+      processes = processes.filter((process) => process.pid !== pid);
+    },
+    sleep: () => {},
+  });
+
+  assert.deepEqual(signals, [[21, "SIGTERM"], [22, "SIGTERM"]]);
+  assert.deepEqual(processes, baseline);
+  assert.deepEqual(retainedProbeRoots(userRoot), []);
+});
 
 test("health probe timeouts cover startup, load, mount, and bounded cleanup headroom", () => {
   assert.equal(HEALTH_PROBE_PROCESS_TIMEOUT_MS, 170_000);
