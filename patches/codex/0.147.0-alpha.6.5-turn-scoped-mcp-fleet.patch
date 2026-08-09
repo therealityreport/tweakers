@@ -1,0 +1,283 @@
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 8ed7a7b..37b1dd5 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -598,6 +598,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
+         warn!("failed to shutdown code mode session: {err}");
+     }
+     sess.stop_mcp_prewarm_worker().await;
++    sess.abort_idle_mcp_shutdown();
+     {
+         let _refresh = sess.mcp_refresh.acquire().await;
+         sess.mcp_refresh.close();
+diff --git a/codex-rs/core/src/session/mcp_idle.rs b/codex-rs/core/src/session/mcp_idle.rs
+new file mode 100644
+index 0000000..2f9516d
+--- /dev/null
++++ b/codex-rs/core/src/session/mcp_idle.rs
+@@ -0,0 +1,74 @@
++//! Turn-scoped MCP fleets for subagent threads.
++//!
++//! Subagent threads stay loaded and subscribed for the lifetime of their
++//! parent, so their MCP servers would otherwise remain resident long after the
++//! last turn finished. Once a turn has been idle for the delay below, the
++//! thread's servers are shut down and the runtime is marked dirty; the next
++//! tool call or turn start respawns them through `refresh_mcp_if_dirty`.
++
++use std::time::Duration;
++
++use super::*;
++
++/// How long a subagent thread's turn must stay idle before its MCP servers
++/// are shut down.
++pub(crate) const MCP_TURN_IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
++
++impl Session {
++    pub(crate) fn abort_idle_mcp_shutdown(&self) {
++        let handle = self
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++        if let Some(handle) = handle {
++            handle.abort();
++        }
++    }
++
++    pub(crate) async fn schedule_idle_mcp_shutdown(self: &Arc<Self>, delay: Duration) {
++        let is_non_root_agent = {
++            let state = self.state.lock().await;
++            state
++                .session_configuration
++                .session_source
++                .is_non_root_agent()
++        };
++        if !is_non_root_agent {
++            return;
++        }
++        let session = Arc::downgrade(self);
++        let handle = self
++            .services
++            .runtime_handle
++            .spawn(async move {
++                tokio::time::sleep(delay).await;
++                let Some(session) = session.upgrade() else {
++                    return;
++                };
++                session.shutdown_mcp_if_turn_idle().await;
++            })
++            .abort_handle();
++        let previous = self
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .replace(handle);
++        if let Some(previous) = previous {
++            previous.abort();
++        }
++    }
++
++    pub(crate) async fn shutdown_mcp_if_turn_idle(self: &Arc<Self>) -> bool {
++        // New work may have raced with the idle delay; keep a busy thread's fleet.
++        if self.active_turn.lock().await.is_some()
++            || self.input_queue.has_trigger_turn_mailbox_items().await
++        {
++            return false;
++        }
++        self.services.mcp_runtime.shutdown().await;
++        self.mark_mcp_runtime_dirty();
++        debug!(thread_id = %self.thread_id, "shut down idle subagent MCP servers");
++        true
++    }
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 4b3aadf..3efb8f5 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -206,6 +206,7 @@ mod handlers;
+ mod inject;
+ mod input_queue;
+ mod mcp;
++mod mcp_idle;
+ mod mcp_prewarm;
+ mod mcp_refresh;
+ mod mcp_runtime;
+@@ -230,6 +231,7 @@ use self::handlers::submission_loop;
+ pub(crate) use self::input_queue::InputQueueActivity;
+ pub(crate) use self::input_queue::TurnInput;
+ pub(crate) use self::input_queue::TurnInputQueue;
++pub(crate) use self::mcp_idle::MCP_TURN_IDLE_SHUTDOWN_DELAY;
+ use self::review::spawn_review_thread;
+ use self::session::AppServerClientMetadata;
+ use self::session::Session;
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 29bd0af..bac0886 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -52,6 +52,7 @@ pub(crate) struct Session {
+     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
+     pub(super) mcp_prewarm_shutdown: CancellationToken,
+     pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
++    pub(super) mcp_idle_shutdown: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+     pub(crate) conversation: Arc<RealtimeConversationManager>,
+     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+     pub(crate) pending_user_message_admissions:
+@@ -1192,6 +1193,7 @@ impl Session {
+                 mcp_prewarm_tx,
+                 mcp_prewarm_shutdown: CancellationToken::new(),
+                 mcp_prewarm_task: std::sync::Mutex::new(None),
++                mcp_idle_shutdown: std::sync::Mutex::new(None),
+                 conversation: Arc::new(RealtimeConversationManager::new()),
+                 active_turn: Mutex::new(None),
+                 pending_user_message_admissions: Default::default(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index b8a91c4..36fb9c5 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5844,6 +5844,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         mcp_prewarm_tx: async_channel::bounded(1).0,
+         mcp_prewarm_shutdown: CancellationToken::new(),
+         mcp_prewarm_task: std::sync::Mutex::new(None),
++        mcp_idle_shutdown: std::sync::Mutex::new(None),
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         active_turn: Mutex::new(None),
+         pending_user_message_admissions: Default::default(),
+@@ -8047,6 +8048,7 @@ where
+         mcp_prewarm_tx: async_channel::bounded(1).0,
+         mcp_prewarm_shutdown: CancellationToken::new(),
+         mcp_prewarm_task: std::sync::Mutex::new(None),
++        mcp_idle_shutdown: std::sync::Mutex::new(None),
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         active_turn: Mutex::new(None),
+         pending_user_message_admissions: Default::default(),
+@@ -8198,6 +8200,101 @@ async fn refreshed_mcp_binding_captures_current_approval_authority() {
+     assert_eq!(old_turn.approval_policy.value(), previous_policy);
+ }
+ 
++async fn mark_session_as_subagent(session: &Session) {
++    let mut state = session.state.lock().await;
++    state.session_configuration.session_source =
++        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++            parent_thread_id: ThreadId::new(),
++            depth: 1,
++            agent_path: None,
++            agent_nickname: None,
++            agent_role: None,
++        });
++}
++
++#[tokio::test]
++async fn idle_turn_shuts_down_mcp_runtime_and_refresh_respawns_it() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    let config_before = session
++        .services
++        .mcp_runtime
++        .current_config()
++        .expect("published MCP config");
++    assert!(!session.mcp_refresh.is_pending());
++
++    assert!(session.shutdown_mcp_if_turn_idle().await);
++    assert!(
++        session.mcp_refresh.is_pending(),
++        "idle shutdown must mark the runtime dirty"
++    );
++
++    session.refresh_mcp_if_dirty().await;
++    let config_after = session
++        .services
++        .mcp_runtime
++        .current_config()
++        .expect("republished MCP config");
++    assert!(!session.mcp_refresh.is_pending());
++    assert!(
++        !Arc::ptr_eq(&config_before, &config_after),
++        "refresh after idle shutdown should publish a fresh runtime"
++    );
++}
++
++#[tokio::test]
++async fn idle_mcp_shutdown_keeps_runtime_while_turn_is_active() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++
++    assert!(!session.shutdown_mcp_if_turn_idle().await);
++    assert!(!session.mcp_refresh.is_pending());
++}
++
++#[tokio::test]
++async fn idle_mcp_shutdown_is_scheduled_only_for_subagent_threads() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++
++    session
++        .schedule_idle_mcp_shutdown(Duration::from_secs(600))
++        .await;
++    assert!(
++        session
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .is_none(),
++        "root threads keep their MCP fleet warm"
++    );
++
++    mark_session_as_subagent(&session).await;
++    session
++        .schedule_idle_mcp_shutdown(Duration::from_secs(600))
++        .await;
++    assert!(
++        session
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .is_some()
++    );
++
++    session.abort_idle_mcp_shutdown();
++    assert!(
++        session
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .is_none()
++    );
++}
++
+ #[tokio::test]
+ async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
+     let (session, old_turn, rx) = make_session_and_context_with_rx().await;
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index bfd18ef..5885c71 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -27,6 +27,7 @@ use crate::context::ContextualUserFragment;
+ use crate::hook_runtime::inspect_pending_input;
+ use crate::hook_runtime::record_additional_contexts;
+ use crate::hook_runtime::record_pending_input;
++use crate::session::MCP_TURN_IDLE_SHUTDOWN_DELAY;
+ use crate::session::TurnInput;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+@@ -292,6 +293,7 @@ impl Session {
+         task: T,
+         mailbox_parent_provenance: MailboxParentProvenance,
+     ) {
++        self.abort_idle_mcp_shutdown();
+         let task: Arc<dyn AnySessionTask> = Arc::new(task);
+         let task_kind = task.kind();
+         let span_name = task.span_name();
+@@ -813,6 +815,8 @@ impl Session {
+         };
+         if cleared_active_turn {
+             self.emit_thread_idle_lifecycle_if_idle().await;
++            self.schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++                .await;
+         }
+         // Regular items were flushed before this terminal event was appended; buffering
+         // thread writers may not flush it without another explicit barrier.
