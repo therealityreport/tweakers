@@ -200,6 +200,9 @@ function fakeCoordinator(calls: string[]): EnvironmentCoordinator {
       return prepared;
     },
     cancel: async (id) => environmentReceipt(id!, prepared!.source, prepared!.requested, "cancelled"),
+    recover: async (id) => {
+      throw new Error(`unexpected environment recover for ${id}`);
+    },
   };
 }
 
@@ -844,6 +847,240 @@ test("resume continues a persisted safe-official timeout without starting a seco
     assert.notEqual(receipt.terminalAt, priorTerminalAt);
     assert.equal(receipt.continuationAbandonedAt, null);
     assert.deepEqual(calls, ["native-update-handoff", "refresh-environment-truth", "prepare:tweakers", "commit:tweakers", "refresh:development"]);
+  });
+});
+
+test("resume recovers its own stranded environment transaction before returning to Tweakers", async () => {
+  // Live 2026-08-07 deadlock: the desktop receipt was failed+resumable while
+  // its recorded environment transaction sat failed mid-rollback. Resume must
+  // recover that transaction first — its receipt blocks the returning leg's
+  // fresh prepare — instead of telling the user to run `environment recover`,
+  // which the desktop receipt in turn blocks.
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      environmentTransactionId: "env-stranded",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "refresh failed",
+    }));
+    const stranded = {
+      ...environmentReceipt("env-stranded", selection("chatgpt"), selection("tweakers"), "failed"),
+      error: "Rollback requested; rollback failed: watcher promotion race",
+    };
+    let recovered = false;
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => ({
+        version: { marketingVersion: "1.1.0", build: "110" },
+        mainPid: 26138,
+      }),
+    });
+    deps.environment = {
+      ...deps.environment,
+      status: () => (recovered
+        ? { ...stranded, phase: "rolled-back", error: null }
+        : stranded),
+      recover: async (id) => {
+        assert.equal(id, "env-stranded");
+        calls.push(`recover:${id}`);
+        recovered = true;
+        return { ...stranded, phase: "rolled-back", error: null };
+      },
+    };
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(calls, [
+      "recover:env-stranded",
+      "refresh-environment-truth",
+      "prepare:tweakers",
+      "commit:tweakers",
+      "refresh:development",
+    ]);
+  });
+});
+
+test("resume finishes only the refresh and verify legs when recovery proves Tweakers already live", async () => {
+  // The stranded return-leg commit had actually landed: recover() proves the
+  // REQUESTED Tweakers environment live and republishes its selection. The
+  // official app is not running, so resume must not inspect official truth or
+  // re-prepare the return — only the runtime refresh and final verification
+  // remain.
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      observed: { marketingVersion: "1.1.0", build: "110" },
+      environmentTransactionId: "env-stranded",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "refresh failed",
+    }));
+    const stranded = {
+      ...environmentReceipt("env-stranded", selection("chatgpt"), selection("tweakers"), "failed"),
+      error: "Rollback requested; rollback failed: watcher promotion race",
+    };
+    let recovered = false;
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => {
+        throw new Error("official ChatGPT must not be inspected when Tweakers is proven live");
+      },
+      refreshEnvironmentTruth: async () => {
+        throw new Error("official truth must not be refreshed when Tweakers is proven live");
+      },
+    });
+    deps.environment = {
+      ...deps.environment,
+      status: () => (recovered
+        ? environmentReceipt("env-stranded", selection("chatgpt"), selection("tweakers"), "committed")
+        : stranded),
+      recover: async (id) => {
+        assert.equal(id, "env-stranded");
+        calls.push(`recover:${id}`);
+        recovered = true;
+        return environmentReceipt("env-stranded", selection("chatgpt"), selection("tweakers"), "committed");
+      },
+      prepare: async () => {
+        throw new Error("the return leg must not be re-prepared after a committed recovery");
+      },
+    };
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.deepEqual(calls, ["recover:env-stranded", "refresh:development"]);
+  });
+});
+
+test("resume surfaces an unrecoverable environment transaction as a resumable failure", async () => {
+  await withFixture(async (fixture) => {
+    // observed is non-null in every real return-leg failure; the terminal
+    // recover diagnostic below must survive the tail dispatch anyway.
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      observed: { marketingVersion: "1.1.0", build: "110" },
+      environmentTransactionId: "env-stranded",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "refresh failed",
+    }));
+    const stranded = {
+      ...environmentReceipt("env-stranded", selection("chatgpt"), selection("tweakers"), "failed"),
+      error: "Rollback requested; rollback failed: watcher promotion race",
+    };
+    const { calls, deps } = dependencies();
+    deps.environment = {
+      ...deps.environment,
+      status: () => stranded,
+      recover: async () => {
+        throw new Error(
+          "live desktop proves neither direction. Last failure: Rollback requested; rollback failed: watcher race",
+        );
+      },
+    };
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.resumable, true);
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.match(receipt.error ?? "", /Could not recover environment transaction env-stranded/);
+    assert.match(receipt.error ?? "", /proves neither direction/);
+    // The environment's quoted "rollback failed" text must be neutralized:
+    // reproduced verbatim it would make desktopReceiptBlocksLifecycle treat
+    // THIS receipt as a desktop-level rollback failure (permanently blocking
+    // after a cancel).
+    assert.doesNotMatch(receipt.error ?? "", /\brollback failed\b/i);
+    assert.match(receipt.error ?? "", /rollback unsuccessful/);
+    assert.deepEqual(calls, []);
+  });
+});
+
+test("resume continues from a standalone environment recovery without inspecting official ChatGPT", async () => {
+  // The gate's coupling allowance exists so `environment recover` can run
+  // FIRST. When it already proved the requested Tweakers environment live,
+  // the coupled receipt no longer blocks — resume must recognize the
+  // committed recovery instead of inspecting the official app (which would
+  // throw on the patched asar and stamp a false safeOfficialMode failure).
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      observed: { marketingVersion: "1.1.0", build: "110" },
+      environmentTransactionId: "env-recovered",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "refresh failed",
+    }));
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => {
+        throw new Error("official ChatGPT must not be inspected after a committed recovery");
+      },
+      refreshEnvironmentTruth: async () => {
+        throw new Error("official truth must not be refreshed after a committed recovery");
+      },
+    });
+    deps.environment = {
+      ...deps.environment,
+      status: () => environmentReceipt("env-recovered", selection("chatgpt"), selection("tweakers"), "committed"),
+      recover: async () => {
+        throw new Error("recovery already happened standalone; resume must not repeat it");
+      },
+      prepare: async () => {
+        throw new Error("the return leg must not be re-prepared after a committed recovery");
+      },
+    };
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.deepEqual(calls, ["refresh:development"]);
+  });
+});
+
+test("resume leaves a terminal non-blocking environment receipt untouched", async () => {
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source: selection("tweakers"),
+      official: selection("chatgpt"),
+      environmentTransactionId: "env-done",
+      safeOfficialMode: true,
+      resumable: true,
+      error: "handoff timed out",
+    }));
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: async () => ({
+        version: { marketingVersion: "1.1.0", build: "110" },
+        mainPid: 26138,
+      }),
+    });
+    deps.environment = {
+      ...deps.environment,
+      status: () => environmentReceipt("env-done", selection("chatgpt"), selection("tweakers"), "rolled-back"),
+      recover: async () => {
+        throw new Error("must not recover a non-blocking environment receipt");
+      },
+    };
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).resume();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(calls, [
+      "refresh-environment-truth",
+      "prepare:tweakers",
+      "commit:tweakers",
+      "refresh:development",
+    ]);
   });
 });
 

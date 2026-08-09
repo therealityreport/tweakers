@@ -97,7 +97,11 @@ test("post-promotion health requires a clean probe exit before its receipt can b
   const openApp = installSource.slice(start, end);
   assert.match(openApp, /const launched = spawnAuthenticatedHiddenHealthProbe\(/);
   assert.match(openApp, /launched\.error \|\| launched\.status !== 0 \|\| launched\.signal !== null/);
-  assert.match(openApp, /throw new Error\("Post-promotion health process did not exit cleanly"\)/);
+  // A probe killed by the 170s spawnSync timeout and a probe that exited 3 are
+  // the same refusal but very different bugs, and this throw is the only record
+  // either one leaves: the probe answers inside a disposable root that is
+  // deleted with it. The message must name which happened.
+  assert.match(openApp, /throw new Error\(`Post-promotion \$\{formatHealthProbeLaunchFailure\(launched\)\}`\)/);
 });
 
 test("candidate authentication proof is private, contained, and removed after the one-shot probe", () => {

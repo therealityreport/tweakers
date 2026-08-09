@@ -1,0 +1,514 @@
+diff --git a/codex-rs/core/src/guardian/review.rs b/codex-rs/core/src/guardian/review.rs
+index e9d8f8af23..4c1df35a6b 100644
+--- a/codex-rs/core/src/guardian/review.rs
++++ b/codex-rs/core/src/guardian/review.rs
+@@ -25,6 +25,7 @@ use tokio::time::Instant;
+ use tokio::time::sleep_until;
+ use tokio_util::sync::CancellationToken;
+ 
++use crate::session::MCP_TURN_IDLE_SHUTDOWN_DELAY;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+ use crate::turn_timing::now_unix_timestamp_ms;
+@@ -274,6 +275,9 @@ async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>,
+             // Guardian aborts bypass normal task completion, so emit its idle lifecycle here.
+             // User interrupts deliberately do not take this path.
+             session.emit_thread_idle_lifecycle_if_idle().await;
++            session
++                .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++                .await;
+         }
+     });
+ }
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 8ed7a7badd..37b1dd58b0 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -598,6 +598,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
+         warn!("failed to shutdown code mode session: {err}");
+     }
+     sess.stop_mcp_prewarm_worker().await;
++    sess.abort_idle_mcp_shutdown();
+     {
+         let _refresh = sess.mcp_refresh.acquire().await;
+         sess.mcp_refresh.close();
+diff --git a/codex-rs/core/src/session/mcp_idle.rs b/codex-rs/core/src/session/mcp_idle.rs
+new file mode 100644
+index 0000000000..8a56e67ddb
+--- /dev/null
++++ b/codex-rs/core/src/session/mcp_idle.rs
+@@ -0,0 +1,119 @@
++//! Turn-scoped MCP fleets for subagent threads.
++//!
++//! Subagent threads stay loaded and subscribed for the lifetime of their
++//! parent, so their MCP servers would otherwise remain resident long after the
++//! last turn finished. Once a turn has been idle for the delay below, the
++//! thread's servers are shut down and the runtime is marked dirty; the next
++//! tool call or turn start respawns them through `refresh_mcp_if_dirty`.
++//!
++//! The scheduled teardown retries instead of firing once: a thread that is busy
++//! when its deadline lands would otherwise keep its fleet until the parent
++//! exits, because the paths that disarm the timer (turn start, interrupt,
++//! guardian abort) vastly outnumber the ones that arm it.
++
++use std::time::Duration;
++
++use super::*;
++
++/// How long a subagent thread's turn must stay idle before its MCP servers
++/// are shut down.
++pub(crate) const MCP_TURN_IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
++
++/// Counter incremented once per reclaimed subagent MCP fleet.
++const MCP_TURN_IDLE_SHUTDOWN_METRIC: &str = "codex.mcp.turn_idle_shutdown";
++/// Counter incremented when an idle deadline lands on a thread that is still busy.
++const MCP_TURN_IDLE_SHUTDOWN_SKIPPED_METRIC: &str = "codex.mcp.turn_idle_shutdown.skipped";
++
++impl Session {
++    pub(super) async fn is_non_root_agent_thread(&self) -> bool {
++        let state = self.state.lock().await;
++        state
++            .session_configuration
++            .session_source
++            .is_non_root_agent()
++    }
++
++    pub(crate) fn abort_idle_mcp_shutdown(&self) {
++        let handle = self
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++        if let Some(handle) = handle {
++            handle.abort();
++        }
++    }
++
++    pub(crate) async fn schedule_idle_mcp_shutdown(self: &Arc<Self>, delay: Duration) {
++        if !self.is_non_root_agent_thread().await {
++            return;
++        }
++        let session = Arc::downgrade(self);
++        let handle = self
++            .services
++            .runtime_handle
++            .spawn(async move {
++                loop {
++                    tokio::time::sleep(delay).await;
++                    // Only hold the session across the check, never across the sleep.
++                    let Some(session) = session.upgrade() else {
++                        return;
++                    };
++                    if session.shutdown_mcp_if_turn_idle().await {
++                        return;
++                    }
++                }
++            })
++            .abort_handle();
++        let previous = self
++            .mcp_idle_shutdown
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .replace(handle);
++        if let Some(previous) = previous {
++            previous.abort();
++        }
++    }
++
++    pub(crate) async fn shutdown_mcp_if_turn_idle(self: &Arc<Self>) -> bool {
++        // New work may have raced with the idle delay; keep a busy thread's fleet.
++        let busy_reason = if self.active_turn.lock().await.is_some() {
++            Some("active_turn")
++        } else if self.input_queue.has_trigger_turn_mailbox_items().await {
++            Some("mailbox")
++        } else {
++            None
++        };
++        if let Some(reason) = busy_reason {
++            self.services.session_telemetry.counter(
++                MCP_TURN_IDLE_SHUTDOWN_SKIPPED_METRIC,
++                /*inc*/ 1,
++                &[("reason", reason)],
++            );
++            // The caller retries every delay, so a long turn would emit one line per
++            // minute at info level; the counter carries the signal for aggregates.
++            debug!(
++                thread_id = %self.thread_id,
++                reason,
++                "keeping subagent MCP servers; thread is not idle"
++            );
++            return false;
++        }
++        let configured_servers = self
++            .services
++            .mcp_runtime
++            .current_config()
++            .map_or(0, |config| codex_mcp::configured_mcp_servers(&config).len());
++        self.services.mcp_runtime.shutdown().await;
++        self.mark_mcp_runtime_dirty();
++        self.services
++            .session_telemetry
++            .counter(MCP_TURN_IDLE_SHUTDOWN_METRIC, /*inc*/ 1, &[]);
++        info!(
++            thread_id = %self.thread_id,
++            configured_servers,
++            "shut down idle subagent MCP servers"
++        );
++        true
++    }
++}
+diff --git a/codex-rs/core/src/session/mcp_prewarm.rs b/codex-rs/core/src/session/mcp_prewarm.rs
+index f4b45b6e21..c0fb531bc7 100644
+--- a/codex-rs/core/src/session/mcp_prewarm.rs
++++ b/codex-rs/core/src/session/mcp_prewarm.rs
+@@ -42,6 +42,14 @@ impl Session {
+                 if auth_changed {
+                     session.mark_mcp_runtime_dirty();
+                 }
++                // Auth revisions fan out to every live session, so an idle subagent
++                // would prewarm a fleet that turn-idle teardown just reclaimed and
++                // then never re-arm. Leave the runtime dirty for its next turn.
++                if session.is_non_root_agent_thread().await
++                    && session.active_turn.lock().await.is_none()
++                {
++                    continue;
++                }
+                 tokio::select! {
+                     biased;
+                     _ = shutdown.cancelled() => break,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 4b3aadf7ae..3efb8f5e43 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -206,6 +206,7 @@ mod handlers;
+ mod inject;
+ mod input_queue;
+ mod mcp;
++mod mcp_idle;
+ mod mcp_prewarm;
+ mod mcp_refresh;
+ mod mcp_runtime;
+@@ -230,6 +231,7 @@ use self::handlers::submission_loop;
+ pub(crate) use self::input_queue::InputQueueActivity;
+ pub(crate) use self::input_queue::TurnInput;
+ pub(crate) use self::input_queue::TurnInputQueue;
++pub(crate) use self::mcp_idle::MCP_TURN_IDLE_SHUTDOWN_DELAY;
+ use self::review::spawn_review_thread;
+ use self::session::AppServerClientMetadata;
+ use self::session::Session;
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 29bd0af114..bac08866e2 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -52,6 +52,7 @@ pub(crate) struct Session {
+     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
+     pub(super) mcp_prewarm_shutdown: CancellationToken,
+     pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
++    pub(super) mcp_idle_shutdown: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+     pub(crate) conversation: Arc<RealtimeConversationManager>,
+     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+     pub(crate) pending_user_message_admissions:
+@@ -1192,6 +1193,7 @@ impl Session {
+                 mcp_prewarm_tx,
+                 mcp_prewarm_shutdown: CancellationToken::new(),
+                 mcp_prewarm_task: std::sync::Mutex::new(None),
++                mcp_idle_shutdown: std::sync::Mutex::new(None),
+                 conversation: Arc::new(RealtimeConversationManager::new()),
+                 active_turn: Mutex::new(None),
+                 pending_user_message_admissions: Default::default(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index b8a91c4b34..667243e375 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5844,6 +5844,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         mcp_prewarm_tx: async_channel::bounded(1).0,
+         mcp_prewarm_shutdown: CancellationToken::new(),
+         mcp_prewarm_task: std::sync::Mutex::new(None),
++        mcp_idle_shutdown: std::sync::Mutex::new(None),
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         active_turn: Mutex::new(None),
+         pending_user_message_admissions: Default::default(),
+@@ -8047,6 +8048,7 @@ where
+         mcp_prewarm_tx: async_channel::bounded(1).0,
+         mcp_prewarm_shutdown: CancellationToken::new(),
+         mcp_prewarm_task: std::sync::Mutex::new(None),
++        mcp_idle_shutdown: std::sync::Mutex::new(None),
+         conversation: Arc::new(RealtimeConversationManager::new()),
+         active_turn: Mutex::new(None),
+         pending_user_message_admissions: Default::default(),
+@@ -8198,6 +8200,232 @@ async fn refreshed_mcp_binding_captures_current_approval_authority() {
+     assert_eq!(old_turn.approval_policy.value(), previous_policy);
+ }
+ 
++async fn mark_session_as_subagent(session: &Session) {
++    let mut state = session.state.lock().await;
++    state.session_configuration.session_source =
++        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++            parent_thread_id: ThreadId::new(),
++            depth: 1,
++            agent_path: None,
++            agent_nickname: None,
++            agent_role: None,
++        });
++}
++
++fn idle_mcp_shutdown_is_armed(session: &Session) -> bool {
++    session
++        .mcp_idle_shutdown
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++        .is_some()
++}
++
++/// Yields enough times to let every ready task on the current-thread runtime make
++/// progress. Yielding rather than sleeping keeps the scheduler busy, so the paused
++/// clock cannot auto-advance into a later deadline while draining.
++async fn drain_paused_runtime() {
++    for _ in 0..64 {
++        tokio::task::yield_now().await;
++    }
++}
++
++/// Fires exactly one `MCP_TURN_IDLE_SHUTDOWN_DELAY` deadline on the paused clock and
++/// reports whether `settled` observed the teardown.
++async fn advance_past_idle_mcp_deadline(settled: impl Fn() -> bool) -> bool {
++    // The scheduled task must be polled once so its sleep is registered with the timer
++    // driver; advancing first would move the clock past a deadline that does not exist
++    // yet and silently turn this into a no-op.
++    drain_paused_runtime().await;
++    tokio::time::advance(MCP_TURN_IDLE_SHUTDOWN_DELAY + Duration::from_secs(1)).await;
++    for _ in 0..64 {
++        if settled() {
++            return true;
++        }
++        tokio::task::yield_now().await;
++    }
++    settled()
++}
++
++/// Regression test for a one-shot teardown: a thread that is busy when its deadline
++/// lands must be retried, not abandoned until the parent exits.
++#[tokio::test(start_paused = true)]
++async fn scheduled_idle_mcp_shutdown_retries_until_the_thread_is_idle() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    assert!(!session.mcp_refresh.is_pending());
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++
++    session
++        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++        .await;
++
++    assert!(
++        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
++        "a busy thread must keep its MCP fleet"
++    );
++
++    *session.active_turn.lock().await = None;
++    assert!(
++        advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
++        "the teardown must retry once the thread goes idle"
++    );
++}
++
++/// Interrupts skip `on_task_finished`, so the abort path owns re-arming the teardown.
++#[tokio::test(start_paused = true)]
++async fn interrupted_turn_rearms_idle_mcp_shutdown() {
++    let (session, turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    assert!(!session.mcp_refresh.is_pending());
++
++    session
++        .spawn_task(
++            Arc::new(turn_context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++    assert!(
++        !idle_mcp_shutdown_is_armed(&session),
++        "starting a turn disarms the teardown"
++    );
++
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++
++    assert!(
++        advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
++        "an interrupted turn must still release its MCP fleet"
++    );
++}
++
++/// Drives the prewarm worker through one full loop body. The bounded channel supplies
++/// the happens-after edge: the third send can only land once the worker has taken the
++/// second, which it does only after it finished handling the first.
++async fn settle_mcp_prewarm(prewarm_tx: &async_channel::Sender<()>) {
++    for _ in 0..3 {
++        prewarm_tx.send(()).await.expect("prewarm worker running");
++    }
++}
++
++/// Auth revisions fan out to every live session, so prewarm must not respawn the fleet
++/// that turn-idle teardown just reclaimed.
++#[tokio::test]
++async fn mcp_prewarm_skips_idle_subagent_threads() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    let (prewarm_tx, prewarm_rx) = async_channel::bounded(1);
++    let (_auth_tx, auth_rx) = tokio::sync::watch::channel(0u64);
++    session.start_mcp_prewarm_worker(prewarm_rx, auth_rx);
++
++    session.mark_mcp_runtime_dirty();
++    settle_mcp_prewarm(&prewarm_tx).await;
++    assert!(
++        !session.mcp_refresh.is_pending(),
++        "root threads still prewarm while idle"
++    );
++
++    mark_session_as_subagent(&session).await;
++    session.mark_mcp_runtime_dirty();
++    settle_mcp_prewarm(&prewarm_tx).await;
++    assert!(
++        session.mcp_refresh.is_pending(),
++        "an idle subagent must leave its runtime dirty for the next turn"
++    );
++
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++    settle_mcp_prewarm(&prewarm_tx).await;
++    assert!(
++        !session.mcp_refresh.is_pending(),
++        "a subagent with real work still prewarms"
++    );
++
++    session.stop_mcp_prewarm_worker().await;
++}
++
++#[tokio::test]
++async fn idle_turn_shuts_down_mcp_runtime_and_refresh_respawns_it() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    let config_before = session
++        .services
++        .mcp_runtime
++        .current_config()
++        .expect("published MCP config");
++    assert!(!session.mcp_refresh.is_pending());
++
++    assert!(session.shutdown_mcp_if_turn_idle().await);
++    assert!(
++        session.mcp_refresh.is_pending(),
++        "idle shutdown must mark the runtime dirty"
++    );
++
++    session.refresh_mcp_if_dirty().await;
++    let config_after = session
++        .services
++        .mcp_runtime
++        .current_config()
++        .expect("republished MCP config");
++    assert!(!session.mcp_refresh.is_pending());
++    assert!(
++        !Arc::ptr_eq(&config_before, &config_after),
++        "refresh after idle shutdown should publish a fresh runtime"
++    );
++}
++
++#[tokio::test]
++async fn idle_mcp_shutdown_keeps_runtime_while_turn_is_active() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    mark_session_as_subagent(&session).await;
++    session.refresh_mcp_if_dirty().await;
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++
++    assert!(!session.shutdown_mcp_if_turn_idle().await);
++    assert!(!session.mcp_refresh.is_pending());
++}
++
++#[tokio::test(start_paused = true)]
++async fn idle_mcp_shutdown_is_scheduled_only_for_subagent_threads() {
++    let (session, _turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    session.refresh_mcp_if_dirty().await;
++    assert!(!session.mcp_refresh.is_pending());
++
++    session
++        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++        .await;
++    assert!(
++        !idle_mcp_shutdown_is_armed(&session),
++        "root threads keep their MCP fleet warm"
++    );
++    assert!(
++        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
++        "root threads must never have their MCP fleet torn down"
++    );
++
++    mark_session_as_subagent(&session).await;
++    session
++        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++        .await;
++    assert!(idle_mcp_shutdown_is_armed(&session));
++
++    session.abort_idle_mcp_shutdown();
++    assert!(!idle_mcp_shutdown_is_armed(&session));
++    assert!(
++        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
++        "an aborted teardown must not fire"
++    );
++}
++
+ #[tokio::test]
+ async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
+     let (session, old_turn, rx) = make_session_and_context_with_rx().await;
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index bfd18ef09d..5a2e126118 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -27,6 +27,7 @@ use crate::context::ContextualUserFragment;
+ use crate::hook_runtime::inspect_pending_input;
+ use crate::hook_runtime::record_additional_contexts;
+ use crate::hook_runtime::record_pending_input;
++use crate::session::MCP_TURN_IDLE_SHUTDOWN_DELAY;
+ use crate::session::TurnInput;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+@@ -292,6 +293,7 @@ impl Session {
+         task: T,
+         mailbox_parent_provenance: MailboxParentProvenance,
+     ) {
++        self.abort_idle_mcp_shutdown();
+         let task: Arc<dyn AnySessionTask> = Arc::new(task);
+         let task_kind = task.kind();
+         let span_name = task.span_name();
+@@ -821,6 +823,10 @@ impl Session {
+         }
+         if cleared_active_turn {
+             self.maybe_start_turn_for_pending_work().await;
++            // Arm last so a queued turn started just above disarms this from `start_task`
++            // instead of racing an arm that was placed before it.
++            self.schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++                .await;
+         }
+     }
+ 
+@@ -849,6 +855,11 @@ impl Session {
+ 
+     async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
+         let sub_id = task.turn_context.sub_id.clone();
++        // Aborted tasks skip `on_task_finished`, so arm the idle MCP teardown here or an
++        // interrupt would leave the fleet resident. A replacement turn disarms it again
++        // from `start_task`.
++        self.schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++            .await;
+         if task.cancellation_token.is_cancelled() {
+             return;
+         }

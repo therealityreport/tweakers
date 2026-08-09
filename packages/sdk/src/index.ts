@@ -348,7 +348,22 @@ export interface SettingsApi {
    * components in `tweaks/AGENTS.md`.
    */
   registerPage(page: SettingsPage): SettingsHandle;
+
+  /**
+   * Open Codex Settings and activate one of this tweak's registered pages.
+   * The page id is the same tweak-scoped id passed to `registerPage`.
+   */
+  openPage(pageId: string): Promise<SettingsOpenResult>;
 }
+
+export type SettingsOpenFailureReason =
+  | "not-registered"
+  | "settings-command-unavailable"
+  | "mount-timeout";
+
+export type SettingsOpenResult =
+  | { ok: true }
+  | { ok: false; reason: SettingsOpenFailureReason };
 
 export interface SettingsSection {
   id: string;

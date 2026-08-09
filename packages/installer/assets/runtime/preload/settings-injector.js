@@ -29,6 +29,7 @@ exports.stopSettingsInjector = stopSettingsInjector;
 exports.registerSection = registerSection;
 exports.clearSections = clearSections;
 exports.registerPage = registerPage;
+exports.openRegisteredPage = openRegisteredPage;
 exports.setListedTweaks = setListedTweaks;
 exports.updateListedTweakLifecycle = updateListedTweakLifecycle;
 const electron_1 = require("electron");
@@ -72,6 +73,7 @@ const state = {
     tweaksPageFilter: "all",
     tweaksPageQuery: "",
 };
+let pendingRegisteredPageOpen = null;
 let activeBuiltinPageCleanup = null;
 const originalHistoryMethods = {};
 function plog(msg, extra) {
@@ -325,6 +327,68 @@ function registerPage(tweakId, manifest, page) {
         },
     };
 }
+function settlePendingRegisteredPageOpen(result) {
+    const pending = pendingRegisteredPageOpen;
+    if (!pending)
+        return;
+    pendingRegisteredPageOpen = null;
+    clearTimeout(pending.timer);
+    pending.resolve(result);
+}
+function activatePendingRegisteredPageOpen() {
+    const pending = pendingRegisteredPageOpen;
+    if (!pending)
+        return false;
+    const entry = state.pages.get(pending.pageId);
+    if (!entry || entry.tweakId !== pending.tweakId) {
+        settlePendingRegisteredPageOpen({ ok: false, reason: "not-registered" });
+        return false;
+    }
+    if (!state.settingsSurfaceVisible || !state.sidebarRoot?.isConnected || !findContentArea())
+        return false;
+    activatePage({ kind: "registered", id: pending.tweakId });
+    settlePendingRegisteredPageOpen({ ok: true });
+    return true;
+}
+/** Open native Settings, then activate a page already registered by the caller. */
+function openRegisteredPage(tweakId, pageId) {
+    const entry = state.pages.get(pageId);
+    if (!entry || entry.tweakId !== tweakId) {
+        return Promise.resolve({ ok: false, reason: "not-registered" });
+    }
+    if (state.settingsSurfaceVisible && state.sidebarRoot?.isConnected && findContentArea()) {
+        activatePage({ kind: "registered", id: tweakId });
+        return Promise.resolve({ ok: true });
+    }
+    if (pendingRegisteredPageOpen) {
+        settlePendingRegisteredPageOpen({ ok: false, reason: "mount-timeout" });
+    }
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            if (pendingRegisteredPageOpen?.pageId === pageId) {
+                settlePendingRegisteredPageOpen({ ok: false, reason: "mount-timeout" });
+            }
+        }, 5_000);
+        pendingRegisteredPageOpen = { tweakId, pageId, resolve, timer };
+        void electron_1.ipcRenderer.invoke("tweaker:open-settings").then((opened) => {
+            if (opened === true)
+                return;
+            if (pendingRegisteredPageOpen?.pageId === pageId) {
+                settlePendingRegisteredPageOpen({
+                    ok: false,
+                    reason: "settings-command-unavailable",
+                });
+            }
+        }).catch(() => {
+            if (pendingRegisteredPageOpen?.pageId === pageId) {
+                settlePendingRegisteredPageOpen({
+                    ok: false,
+                    reason: "settings-command-unavailable",
+                });
+            }
+        });
+    });
+}
 /** Called by the tweak host after fetching the tweak list from main. */
 function setListedTweaks(list) {
     state.listedTweaks = list;
@@ -426,6 +490,7 @@ function tryInject() {
         // General doesn't reappear as selected.
         if (state.activePage !== null)
             syncCodexNativeNavActive(true);
+        activatePendingRegisteredPageOpen();
         return "found";
     }
     // Sidebar was either freshly mounted (Settings just opened) or re-mounted
@@ -453,6 +518,7 @@ function tryInject() {
         refreshSidebarTweakerUpdateButton();
         if (state.activePage !== null)
             syncCodexNativeNavActive(true);
+        activatePendingRegisteredPageOpen();
         return "found";
     }
     // ── Group container ───────────────────────────────────────────────────
@@ -483,6 +549,7 @@ function tryInject() {
     state.navButtons = { config: configBtn, tweaks: tweaksBtn };
     noteNavGroupInjection(outer);
     syncPagesGroup();
+    activatePendingRegisteredPageOpen();
     return "found";
 }
 function recordSidebarProbeTransition(outcome, detail) {
@@ -995,7 +1062,8 @@ function activatePage(page) {
     if (!panel) {
         panel = document.createElement("div");
         panel.dataset.tweaker = "tweaks-panel";
-        panel.style.cssText = "width:100%;height:100%;overflow:auto;";
+        panel.className = "bg-token-main-surface-primary";
+        panel.style.cssText = "width:100%;height:100%;overflow:auto;background-color:var(--color-token-main-surface-primary, var(--color-background-primary, #fff));";
         content.appendChild(panel);
     }
     panel.style.display = "block";
@@ -4739,13 +4807,15 @@ async function submitPublishTweak(repoInput, status) {
 /** The full panel shell (toolbar + scroll + heading + sections wrap). */
 function panelShell(title, subtitle, options) {
     const outer = document.createElement("div");
-    outer.className = "main-surface flex h-full min-h-0 flex-col";
+    outer.className = "main-surface bg-token-main-surface-primary flex h-full min-h-0 flex-col";
+    outer.style.backgroundColor = "var(--color-token-main-surface-primary, var(--color-background-primary, #fff))";
     const toolbar = document.createElement("div");
     toolbar.className =
         "draggable flex items-center px-panel electron:h-toolbar extension:h-toolbar-sm";
     outer.appendChild(toolbar);
     const scroll = document.createElement("div");
-    scroll.className = "flex-1 overflow-y-auto p-panel";
+    scroll.className = "bg-token-main-surface-primary flex-1 overflow-y-auto p-panel";
+    scroll.style.backgroundColor = "var(--color-token-main-surface-primary, var(--color-background-primary, #fff))";
     outer.appendChild(scroll);
     const inner = document.createElement("div");
     const width = options?.width ?? (options?.wide ? "wide" : "default");

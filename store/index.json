@@ -12,7 +12,7 @@
       "manifest": {
         "id": "co.tweakers.account-switcher",
         "name": "Easy Account Switcher",
-        "version": "0.1.6",
+        "version": "0.1.8",
         "githubRepo": "therealityreport/tweakers",
         "description": "Switch existing local Codex sessions from the account menu without duplicating credentials.",
         "author": "hulibrands",
@@ -24,7 +24,8 @@
         "scope": "both",
         "permissions": [
           "ipc",
-          "filesystem"
+          "filesystem",
+          "settings"
         ]
       },
       "approvedAt": "2026-07-10T00:00:00.000Z",
@@ -67,37 +68,6 @@
       "approvedBy": "tweakers"
     },
     {
-      "id": "co.tweakers.browser-trust",
-      "available": true,
-      "source": {
-        "kind": "bundled",
-        "path": "tweaks/co.tweakers.browser-trust"
-      },
-      "manifest": {
-        "id": "co.tweakers.browser-trust",
-        "name": "Browser Trust",
-        "version": "0.1.0",
-        "githubRepo": "therealityreport/tweakers",
-        "description": "Explicit, reversible trust for exact browser inspection and built-in HTTP(S) browse routes while higher-risk browser actions remain gated.",
-        "author": "hulibrands",
-        "tags": [
-          "browser",
-          "trust",
-          "security",
-          "inspection"
-        ],
-        "scope": "both",
-        "minRuntime": ">=1.0.0",
-        "permissions": [
-          "settings",
-          "filesystem",
-          "ipc"
-        ]
-      },
-      "approvedAt": "2026-07-28T13:29:33.840Z",
-      "approvedBy": "tweakers"
-    },
-    {
       "id": "co.tweakers.developer-tools",
       "available": true,
       "source": {
@@ -107,9 +77,9 @@
       "manifest": {
         "id": "co.tweakers.developer-tools",
         "name": "Developer Tools",
-        "version": "0.3.2",
+        "version": "0.3.3",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Inspect Codex tools, models, runtime capabilities, and source evidence. Manage CLI feature flags in Config.",
+        "description": "Inspect Codex tools, models, runtime capabilities, source evidence, and protected configuration recovery.",
         "author": "hulibrands",
         "tags": [
           "developer",
@@ -122,7 +92,8 @@
         "permissions": [
           "ipc",
           "settings",
-          "filesystem"
+          "filesystem",
+          "network"
         ]
       },
       "approvedAt": "2026-07-12T00:00:00.000Z",
@@ -165,9 +136,9 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.4.19",
+        "version": "0.5.4",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Nested projects with connection references and per-project GitHub identities.",
+        "description": "Project-colored sidebar rows, project settings, connection references, and read-only repository inventory.",
         "author": "hulibrands",
         "tags": [
           "projects",
@@ -196,9 +167,9 @@
       "manifest": {
         "id": "co.tweakers.shadcn-codex-ui",
         "name": "Shadcn Codex UI",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Render supported rich assistant blocks in an owned, native-safe message section.",
+        "description": "Render bounded, extensible Rich Blocks v1 in an owned, native-safe message section.",
         "author": "hulibrands",
         "tags": [
           "ui",
@@ -224,9 +195,9 @@
       "manifest": {
         "id": "co.tweakers.thread-summary-profiles",
         "name": "Thread Summary Profiles",
-        "version": "0.2.3",
+        "version": "0.2.4",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Show read-only connection profiles for the active thread project.",
+        "description": "Show read-only, sanitized connection profiles for the validated active thread project.",
         "author": "hulibrands",
         "tags": [
           "ui",
@@ -277,7 +248,7 @@
       "manifest": {
         "id": "co.tweakers.ui-improvements",
         "name": "UI Improvements",
-        "version": "0.2.4",
+        "version": "0.2.5",
         "githubRepo": "therealityreport/tweakers",
         "description": "Four independent interface improvements with reversible lifecycle cleanup.",
         "author": "hulibrands",
@@ -331,7 +302,7 @@
       "manifest": {
         "id": "co.tweakers.user-questions",
         "name": "User Questions",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "githubRepo": "therealityreport/tweakers",
         "description": "Task-scoped preference rounds with rich tradeoffs, explicit Skip and Other choices, resumable drafts, and safe generic fallback.",
         "author": "hulibrands",

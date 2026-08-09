@@ -7,6 +7,7 @@ exports.reconcileMcpConfig = reconcileMcpConfig;
 exports.createMcpReconciler = createMcpReconciler;
 exports.readMcpSyncState = readMcpSyncState;
 exports.fingerprint = fingerprint;
+exports.canonicalConfigFingerprint = canonicalConfigFingerprint;
 exports.planMcpConfigReconciliation = planMcpConfigReconciliation;
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
@@ -196,6 +197,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
                         preservedApprovalPolicy: plan.preservedApprovalPolicy,
                         beforeFingerprint,
                         afterFingerprint: beforeFingerprint,
+                        afterFingerprintCanonical: canonicalConfigFingerprint(beforeBytes),
                         plannedAfterFingerprint: fingerprint(plan.nextToml),
                         restartRequired: false,
                         managedConfigurationChangedAt: previousManagedConfigurationChangedAt,
@@ -299,6 +301,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
                 : durablePreservedApprovalPolicy,
             beforeFingerprint,
             afterFingerprint: fingerprint(after),
+            afterFingerprintCanonical: canonicalConfigFingerprint(after),
             restartRequired: appliedPlanChange || recoveredRetiredEdit,
             managedConfigurationChangedAt,
         };
@@ -307,6 +310,7 @@ function reconcileMcpConfigWithLock(options, dependencies) {
     }
     catch (error) {
         const completedAt = now().toISOString();
+        const errorConfigBytes = readBytesIfExists(options.configPath);
         const receipt = {
             schemaVersion: 2,
             phase: "complete",
@@ -325,7 +329,8 @@ function reconcileMcpConfigWithLock(options, dependencies) {
                 ? plan.preservedApprovalPolicy
                 : durablePreservedApprovalPolicy,
             beforeFingerprint,
-            afterFingerprint: fingerprint(readBytesIfExists(options.configPath)),
+            afterFingerprint: fingerprint(errorConfigBytes),
+            afterFingerprintCanonical: canonicalConfigFingerprint(errorConfigBytes),
             restartRequired: false,
             managedConfigurationChangedAt: appliedPlanChange || recoveredRetiredEdit
                 ? completedAt
@@ -813,6 +818,19 @@ function readPreservedOptions(statePath, ownedTweaks) {
 function fingerprint(value) {
     return (0, node_crypto_1.createHash)("sha256").update(value).digest("hex");
 }
+/**
+ * Stamp-immune fingerprint of a Codex config: identical to `fingerprint`
+ * except app-stamped volatile `last_updated` lines are removed first. Used
+ * only for the receipt's `afterFingerprintCanonical` binding; CAS/retired
+ * inode naming keeps raw `fingerprint` semantics.
+ */
+function canonicalConfigFingerprint(value) {
+    const canonical = (typeof value === "string" ? value : value.toString("utf8"))
+        .split("\n")
+        .filter((line) => !/^\s*last_updated\s*=/.test(line))
+        .join("\n");
+    return (0, node_crypto_1.createHash)("sha256").update(canonical).digest("hex");
+}
 function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
     const mcpPlan = (0, mcp_sync_1.planManagedMcpReconciliation)(tweaks, currentToml, options);
     const ownedTweaks = options.ownedTweaks ?? tweaks;
@@ -844,6 +862,12 @@ function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
  * directory for the same canonical server.
  */
 function managedBlocksDifferOnlyByLiveRoot(currentToml, plannedToml, tweaks) {
+    // stripManagedMcpBlock heals stray END markers, so a heal-only difference
+    // passes the stripped comparison below. Such a document is corrupt, not a
+    // live-root twin — suppressing its rewrite would plan the heal and discard
+    // it forever while prove reports healthy.
+    if ((0, mcp_sync_1.hasStrayManagedMcpEndMarker)(currentToml))
+        return false;
     if ((0, mcp_sync_1.stripManagedMcpBlock)(currentToml) !== (0, mcp_sync_1.stripManagedMcpBlock)(plannedToml))
         return false;
     const currentBlock = extractManagedBlock(currentToml);

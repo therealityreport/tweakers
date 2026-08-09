@@ -20,6 +20,13 @@ export interface McpSyncReceipt {
     preservedApprovalPolicy: PreservedApprovalPolicy | null;
     beforeFingerprint: string;
     afterFingerprint: string;
+    /**
+     * Raw-byte binding (afterFingerprint) breaks whenever the desktop app stamps
+     * volatile bookkeeping (marketplace `last_updated`) into config.toml after a
+     * reconcile. This canonical twin hashes the same content with those lines
+     * stripped so health probes can bind the receipt across app boots.
+     */
+    afterFingerprintCanonical?: string;
     plannedAfterFingerprint?: string;
     restartRequired: boolean;
     /**
@@ -108,6 +115,13 @@ export declare function reconcileMcpConfig(options: ReconcileMcpConfigOptions, d
 export declare function createMcpReconciler(options: McpReconcilerOptions, dependencies?: CreateMcpReconcilerDependencies): McpReconciler;
 export declare function readMcpSyncState(statePath: string): McpSyncReceipt | null;
 export declare function fingerprint(value: string | Buffer): string;
+/**
+ * Stamp-immune fingerprint of a Codex config: identical to `fingerprint`
+ * except app-stamped volatile `last_updated` lines are removed first. Used
+ * only for the receipt's `afterFingerprintCanonical` binding; CAS/retired
+ * inode naming keeps raw `fingerprint` semantics.
+ */
+export declare function canonicalConfigFingerprint(value: string | Buffer): string;
 export interface PlanMcpConfigReconciliationOptions {
     ownedTweaks?: McpSyncTweak[];
     preservedOptions?: Readonly<PreservedMcpOptionsByServerName>;

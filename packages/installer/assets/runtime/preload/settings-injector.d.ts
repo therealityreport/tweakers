@@ -22,7 +22,7 @@
  * our own `main-surface` panel in their place. Clicking any of Codex's
  * sidebar items restores the original view.
  */
-import type { SettingsSection, SettingsPage, SettingsHandle, TweakManifest } from "@therealityreport/tweakers-sdk";
+import type { SettingsSection, SettingsPage, SettingsHandle, SettingsOpenResult, TweakManifest } from "@therealityreport/tweakers-sdk";
 import { type TweakHealthRecord, type TweakStatus, type TweakStoreEntry } from "../tweak-store";
 import { type SettingsNavigationItem } from "./settings-page-model";
 interface ListedTweak {
@@ -58,6 +58,8 @@ export declare function clearSections(): void;
  * is registered) and routes clicks to the page's `render(root)`.
  */
 export declare function registerPage(tweakId: string, manifest: TweakManifest, page: SettingsPage): SettingsHandle;
+/** Open native Settings, then activate a page already registered by the caller. */
+export declare function openRegisteredPage(tweakId: string, pageId: string): Promise<SettingsOpenResult>;
 /** Called by the tweak host after fetching the tweak list from main. */
 export declare function setListedTweaks(list: ListedTweak[]): void;
 export declare function updateListedTweakLifecycle(id: string, lifecycle: SettingsNavigationItem["lifecycle"], error?: string): void;

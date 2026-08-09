@@ -69,6 +69,26 @@ export function registerDevelopmentCheckout(configFile: string, sourceRoot: stri
   });
 }
 
+/**
+ * Preferred refresh source for a coordinated desktop update.
+ *
+ * - A dirty registered checkout ("development") always wins: unapplied
+ *   changes are explicit developer intent.
+ * - "stable" means self-update state proves a newer published release is
+ *   actually installable, so the stable path is viable — take it even when a
+ *   checkout is registered.
+ * - "current" with a registered checkout falls back to development: without a
+ *   newer published release the stable path dead-ends with an empty staging
+ *   tree (cli.js MODULE_NOT_FOUND, seen live 2026-08-05 and 2026-08-07).
+ *
+ * `refresh-local --source stable|development` still forces either path.
+ */
+export function preferredDesktopRefreshSource(status: LocalRefreshStatus): "development" | "stable" {
+  if (status.source === "development") return "development";
+  if (status.source === "stable") return "stable";
+  return status.developmentSourceRoot !== null ? "development" : "stable";
+}
+
 export function getLocalRefreshStatus(userRoot: string): LocalRefreshStatus {
   const configFile = join(userRoot, "config.json");
   const config = readConfigFile(configFile);
@@ -147,6 +167,17 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           runChecked(process.execPath, [resolve(process.argv[1]), "update", "--no-repair", "--quiet", "--force"], process.cwd(), stageEnv);
           preparedStableSource = managedSourceRoot(stableStageRoot);
           const stagedCli = managedCliPath(stableStageRoot);
+          // The update step exits 0 without installing anything when no
+          // published release runtime exists; running node against the missing
+          // CLI then fails with a bare MODULE_NOT_FOUND (seen live 2026-08-05
+          // and 2026-08-07). Fail with the actual cause instead.
+          if (!existsSync(stagedCli)) {
+            throw new Error(
+              `Stable refresh staging produced no runtime CLI at ${stagedCli}; `
+              + "no published Tweakers release runtime is installable. "
+              + "Register a development checkout or rerun with --source development.",
+            );
+          }
           runChecked(process.execPath, [stagedCli, "install", "--app", appRoot, "--candidate-only", "--coordinated-refresh", "--no-watcher"], process.cwd(), process.env);
         } else {
           runChecked(npmCommand(), ["run", "build"], sourceRoot);
@@ -213,7 +244,7 @@ export function resolveRefreshSelection(userRoot: string, opts: RefreshLocalOpti
   // exist or may lag the installed desktop. `--source stable` still forces it.
   const selected = opts.source === "development" ? "development"
     : opts.source === "stable" ? "stable"
-    : current.source === "development" || current.developmentSourceRoot !== null ? "development" : "stable";
+    : preferredDesktopRefreshSource(current);
   const sourceRoot = selected === "development" ? current.developmentSourceRoot : managedSourceRoot(userRoot);
   if (!sourceRoot) throw new Error("No registered Tweakers development checkout is available");
   return {

@@ -72,15 +72,18 @@ test("enforces the multi-select minimum while allowing every possible choice", (
   assert.equal(validateAnswers(validation.value, { tracker: { selected_option_ids: ["github", "local"], other_text: "Linear" } }).ok, true);
 });
 
-test("normalizes a lower multi-select maximum to every available choice", () => {
+test("enforces a caller-supplied multi-select maximum", () => {
   const question = validInput().questions[0];
   const validation = validateAskInput(validInput({
     questions: [{ ...question, selection_mode: "multiple", max_selections: 1 }],
   }));
   assert.equal(validation.ok, true);
-  assert.equal(validation.value.questions[0].max_selections, 3);
+  assert.equal(validation.value.questions[0].max_selections, 1);
   assert.equal(validateAnswers(validation.value, {
     tracker: { selected_option_ids: ["github", "local"], other_text: "Linear" },
+  }).ok, false);
+  assert.equal(validateAnswers(validation.value, {
+    tracker: { selected_option_ids: ["github"], other_text: null },
   }).ok, true);
 });
 

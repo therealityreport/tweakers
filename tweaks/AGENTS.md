@@ -91,6 +91,7 @@ See `@therealityreport/tweakers-sdk` for full types. The most-used pieces:
 - `api.settings.register({ id, title, description, render })` — register a
   section that appears under your tweak's row in the Tweaks page.
 - `api.settings.registerPage({ id, title, description?, iconSvg?, render })` — register a dedicated settings page in the sidebar.
+- `api.settings.openPage(id)` — open native Settings and activate a page that the same tweak registered with `registerPage`.
 - `api.react.waitForElement(selector, timeoutMs?)` — async DOM-ready wait.
 - `api.react.findOwnerByName(node, "Component")` — fiber walk.
 - `api.ipc.{on,send,invoke}` — channels are auto-prefixed with `tweaker:<id>:`.

@@ -178,6 +178,7 @@ function makeRendererApi(manifest, paths) {
         settings: {
             register: (s) => (0, settings_injector_1.registerSection)({ ...s, id: `${id}:${s.id}` }),
             registerPage: (p) => (0, settings_injector_1.registerPage)(id, manifest, { ...p, id: `${id}:${p.id}` }),
+            openPage: (pageId) => (0, settings_injector_1.openRegisteredPage)(id, `${id}:${pageId}`),
         },
         react: {
             getFiber: (n) => (0, react_hook_1.fiberForNode)(n),

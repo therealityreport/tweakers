@@ -27,6 +27,15 @@ export interface LifecycleReceiptAllowance {
   desktopTransactionId?: string;
   /** Disable implicit ownership for preflight checks that run inside a new owner. */
   contextOwned?: boolean;
+  /**
+   * Set ONLY by environment recovery. Together with environmentTransactionId
+   * it lets recovery of the exact environment transaction a blocked desktop
+   * receipt recorded cross the desktop gate — and nothing else: forward
+   * mutations (prepare/commit/rollback) of a coupled transaction stay blocked
+   * so they cannot cut over or swap bytes outside the desktop update's own
+   * supervised recovery.
+   */
+  environmentRecovery?: boolean;
 }
 
 export function currentLifecycleOperation(): string | null {
@@ -106,7 +115,26 @@ export function assertLifecycleReceiptsIdle(
     const unsafeDesktopFailure = desktop.phase === "failed"
       && (desktop.safeOfficialMode !== true || desktopRollbackFailed);
     const contextOwns = context?.startsWith("desktop update") === true;
-    if (detail !== null && desktop.transactionId !== allowance.desktopTransactionId && !contextOwns) {
+    // Recovering the exact environment transaction that the blocking desktop
+    // receipt itself recorded is a prerequisite of that receipt's own
+    // continuation, not an unrelated mutation. Without this, `environment
+    // recover` and `update-chatgpt-resume` deadlock: each tells the user to
+    // run the other first (hit live 2026-08-07). Three conditions keep this
+    // narrow: the caller must be a recovery (environmentRecovery flag — a
+    // coupled commit/rollback would cut over or swap bytes unsupervised), the
+    // ids must couple, and the environment receipt itself must currently
+    // block (an idle committed receipt has nothing to recover, so it must not
+    // open the desktop gate).
+    const ownsCoupledEnvironment = allowance.environmentRecovery === true
+      && allowance.environmentTransactionId !== undefined
+      && desktop.environmentTransactionId === allowance.environmentTransactionId
+      && environment !== null
+      && environment.transactionId === allowance.environmentTransactionId
+      && environmentDetail !== null;
+    if (detail !== null
+      && desktop.transactionId !== allowance.desktopTransactionId
+      && !contextOwns
+      && !ownsCoupledEnvironment) {
       const instruction = unsafeDesktopFailure
         ? "recover it explicitly before another lifecycle operation"
         : "resume or cancel it before another lifecycle operation";

@@ -20,6 +20,7 @@ const copies = [
   ["packages/loader/loader.cjs", "loader.cjs"],
   ["packages/runtime/dist", "runtime"],
   ["packages/mcp-lifecycle", "mcp-lifecycle"],
+  ["packages/native-host/dist/Tweakers Swap Helper.app", "swap-helper/Tweakers Swap Helper.app"],
 ];
 
 export function copyInstallerAssets(root = defaultRoot, { publicationDependencies } = {}) {
@@ -50,6 +51,7 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
       if (!existsSync(source)) continue;
       const staged = join(stagedAssets, destinationName);
       rmSync(staged, { recursive: true, force: true });
+      mkdirSync(dirname(staged), { recursive: true });
       cpSync(source, staged, {
         recursive: true,
         verbatimSymlinks: true,

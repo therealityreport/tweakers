@@ -1474,6 +1474,21 @@ function assertRustLifecycleTestEvidence(
 }
 
 /**
+ * Resolve the candidate app a bundled-derived receipt points at. Receipts live
+ * at `<root>/codex-source/receipts/<id>.json`, so the user root is three
+ * levels up; the candidate location itself must always come from
+ * `codexSourceTransactionPaths` so the consumer can never drift from the path
+ * the build and canary actually write.
+ */
+export function bundledDerivedCandidateAppPathForReceipt(
+  receiptFile: string,
+  transactionId: string,
+): string {
+  const userRoot = dirname(dirname(dirname(receiptFile)));
+  return codexSourceTransactionPaths(userRoot, transactionId).candidateApp;
+}
+
+/**
  * Fail-closed handoff consumed by desktop-candidate preparation. The path is
  * derived from the receipt transaction ID, then version, digest, and app
  * signature are re-probed before the artifact can be embedded or selected.
@@ -1508,15 +1523,7 @@ export function readValidatedBundledDerivedArtifact(
   if (!receipt.managedMcp) throw new Error("Bundled-derived receipt predates complete managed MCP fleet evidence");
   assertManagedMcpPreparedRuntimeEvidence(receipt.managedMcp);
   const codexSourceRoot = dirname(dirname(exactReceipt));
-  const candidateApp = join(
-    codexSourceRoot,
-    "transactions",
-    receipt.transactionId,
-    "candidate",
-    "managedMcp",
-    "trustedRunner",
-    "ChatGPT.app",
-  );
+  const candidateApp = bundledDerivedCandidateAppPathForReceipt(exactReceipt, receipt.transactionId);
   const binaryPath = exactExistingFile(join(candidateApp, "Contents", "Resources", "codex"), "bundled-derived binary");
   const fingerprint = sha256File(binaryPath);
   const expected = receipt.candidateBinary.digests.find((digest) =>

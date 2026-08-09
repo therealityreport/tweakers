@@ -5,7 +5,15 @@ const { _test } = require("../index.js");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+const { checkRendererEntry } = require("../scripts/build-renderer-entry.cjs");
+const tweakRoot = path.join(__dirname, "..");
+const source = [
+  fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"),
+  ...fs.readdirSync(path.join(tweakRoot, "lib"))
+    .filter((file) => file.endsWith(".js"))
+    .sort()
+    .map((file) => fs.readFileSync(path.join(tweakRoot, "lib", file), "utf8")),
+].join("\n");
 
 test("nested groups and emoji/Iconify icons validate", () => {
   const state = _test.normalizeState({ schemaVersion: 1, nodes: [
@@ -767,8 +775,8 @@ test("profile projection keeps the safe Chrome reference and adds its friendly d
 });
 
 test("Chrome detection does not manufacture a default profile assignment", () => {
-  assert.doesNotMatch(source, /chrome:\s*existsSync\(probe\.chromeState\)/);
-  assert.match(source, /result\.chrome\s*=\s*existsSync\(probe\.chromeState\)[\s\S]*status:\s*"available",\s*refs:\s*\[\]/);
+  assert.doesNotMatch(source, /chrome:\s*(?:fs\.)?existsSync\(probe\.chromeState\)/);
+  assert.match(source, /result\.chrome\s*=\s*fs\.existsSync\(probe\.chromeState\)[\s\S]*status:\s*"available",\s*refs:\s*\[\]/);
   assert.match(source, /Set, replace, or remove this project's Chrome profile/);
   assert.match(source, /Leave blank to remove this assignment/);
 });
@@ -841,6 +849,192 @@ test("save enforces optimistic concurrency via base revision", async (t) => {
   // No baseRevision provided → backward-compatible last-write-wins.
   const loose = await service.handle({ action: "save", state: { schemaVersion: 1, nodes: [] } });
   assert.equal(loose.ok, true);
+});
+
+test("inventory service returns live local branches and worktrees without a GitHub call", async (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "projects-live-inventory-"));
+  const dataDir = path.join(fixture, "data");
+  const repo = path.join(fixture, "repo");
+  fs.mkdirSync(repo);
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const run = (...args) => require("node:child_process").execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  run("init", "-b", "main");
+  run("config", "user.name", "Projects Test");
+  run("config", "user.email", "projects@example.invalid");
+  fs.writeFileSync(path.join(repo, "README.md"), "inventory\n");
+  run("add", "README.md"); run("commit", "-m", "initial"); run("branch", "feature/local");
+  const service = _test.createService({ fs: { dataDir }, ipc: { send() {} } });
+  const state = { schemaVersion: 1, nodes: [{
+    id: "project", type: "project", parentId: null, name: "Project", icon: { kind: "emoji", value: "📁" }, projectPath: repo, connections: {},
+  }] };
+  assert.equal((await service.handle({ action: "save", state })).ok, true);
+  const inventory = await service.handle({ action: "inventory.get", projectId: "project" });
+  assert.equal(inventory.ok, true);
+  assert.equal(inventory.repositories.length, 1);
+  assert.deepEqual(inventory.repositories[0].localBranches.map((branch) => branch.name).sort(), ["feature/local", "main"]);
+  assert.equal(fs.realpathSync(inventory.repositories[0].worktrees[0].path), fs.realpathSync(repo));
+  service.dispose();
+});
+
+test("first run persists only an exact native root and leaves ambiguous folders repairable", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "projects-first-run-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const seeded = _test.seedProjectsFromNativeSurface([
+    { id: "native-one", label: "One" },
+    { id: "native-many", label: "Many" },
+    { label: "Unmatched" },
+  ], [
+    { id: "native-one", name: "One", rootPaths: ["/tmp/projects-one"] },
+    { id: "native-many", name: "Many", rootPaths: ["/tmp/projects-many-a", "/tmp/projects-many-b"] },
+  ]);
+  const one = seeded.nodes.find((node) => node.name === "One");
+  const many = seeded.nodes.find((node) => node.name === "Many");
+  const unmatched = seeded.nodes.find((node) => node.name === "Unmatched");
+  assert.equal(one.projectPath, "/tmp/projects-one");
+  assert.equal(Object.hasOwn(many, "projectPath"), false);
+  assert.equal(Object.hasOwn(unmatched, "projectPath"), false);
+  const unboundWithNativePaths = await _test.readProjectInventory(seeded, many.id, [
+    { id: "native-many", name: "Many", rootPaths: ["/tmp/projects-many-a", "/tmp/projects-many-b"] },
+  ]);
+  assert.equal(unboundWithNativePaths.ok, false);
+  assert.equal(unboundWithNativePaths.error.code, "project-unbound");
+
+  const api = { fs: { dataDir }, ipc: { send() {} } };
+  const dependencies = {
+    detectConnections: async () => ({}),
+    readNativeLocalProjects: () => [],
+  };
+  const first = _test.createService(api, dependencies);
+  assert.equal((await first.handle({ action: "save", state: seeded })).ok, true);
+  first.dispose();
+  const restored = _test.createService(api, dependencies);
+  const persisted = await restored.handle({ action: "get" });
+  assert.equal(persisted.state.nodes.find((node) => node.name === "One").projectPath, "/tmp/projects-one");
+  const unboundInventory = await restored.handle({ action: "inventory.get", projectId: many.id });
+  assert.equal(unboundInventory.ok, false);
+  assert.equal(unboundInventory.error.code, "project-unbound");
+  assert.match(source, /Needs folder repair/);
+  assert.match(source, /Repair folder/);
+  restored.dispose();
+});
+
+test("GitHub branch refresh has deterministic success, failure, and recovery outcomes", async () => {
+  const projectState = _test.normalizeState({ schemaVersion: 1, nodes: [{
+    id: "project", type: "project", parentId: null, name: "Project", icon: { kind: "emoji", value: "📁" },
+    githubRepo: "owner/repo", connections: { github: "gh:1234567890abcdef12345678" },
+  }] });
+  const githubRefs = new Map([["gh:1234567890abcdef12345678", { host: "github.com", login: "octocat" }]]);
+  const cache = new Map();
+  const now = () => 1_700_000_000_000;
+  let mode = "success";
+  let branchCalls = 0;
+  const runCommand = async (_command, argv) => {
+    if (argv[0] === "auth") return { status: 0, error: null, stdout: "test-token\n", stderr: "" };
+    if (argv[0] !== "api") throw new Error(`unexpected provider command: ${argv.join(" ")}`);
+    branchCalls += 1;
+    if (mode === "failure") return { status: 1, error: null, stdout: "", stderr: "denied" };
+    return {
+      status: 0,
+      error: null,
+      stdout: JSON.stringify([[{ name: "main", protected: true, commit: { sha: "abcdef0123456789" } }]]),
+      stderr: "",
+    };
+  };
+  const options = { now, runCommand, totalTimeoutMs: 100, commandTimeoutMs: 50 };
+  const success = await _test.refreshGitHubBranches(projectState, githubRefs, cache, "project", [], options);
+  assert.equal(success.ok, true);
+  assert.equal(success.status, "ready");
+  assert.deepEqual(success.remotes[0].branches, [{ name: "main", sha: "abcdef0123456789", protected: true }]);
+  assert.equal(branchCalls, 1);
+
+  const cached = await _test.refreshGitHubBranches(projectState, githubRefs, cache, "project", [], options);
+  assert.equal(cached.remotes[0].cached, true);
+  assert.equal(branchCalls, 1, "a fresh branch request reuses the bounded cache");
+
+  cache.clear();
+  mode = "failure";
+  const failed = await _test.refreshGitHubBranches(projectState, githubRefs, cache, "project", [], options);
+  assert.equal(failed.ok, true);
+  assert.equal(failed.status, "partial");
+  assert.equal(failed.partial, true);
+  assert.equal(failed.remotes[0].branches.length, 0);
+  assert.ok(failed.remotes[0].error);
+
+  mode = "success";
+  const recovered = await _test.refreshGitHubBranches(projectState, githubRefs, cache, "project", [], options);
+  assert.equal(recovered.status, "ready");
+  assert.equal(recovered.partial, false);
+  assert.equal(recovered.remotes[0].branches[0].name, "main");
+});
+
+test("inventory coordination bounds Git work, reports progress, caches, and cancels", async (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "projects-inventory-coordinator-"));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const roots = ["one", "two", "three", "four"].map((name) => path.join(fixture, name));
+  for (const root of roots) fs.mkdirSync(path.join(root, ".git"), { recursive: true });
+  const projectState = _test.normalizeState({ schemaVersion: 1, nodes: [{
+    id: "project", type: "project", parentId: null, name: "Project", icon: { kind: "emoji", value: "📁" }, projectPath: fixture, connections: {},
+  }] });
+  const progress = [];
+  const timeouts = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let gitCalls = 0;
+  const runCommand = async (_command, argv, options) => {
+    gitCalls += 1;
+    timeouts.push(options.timeout);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight -= 1;
+    const root = argv[1];
+    const command = argv.slice(2);
+    if (command[0] === "rev-parse" && command[1] === "--show-toplevel") return { status: 0, error: null, stdout: `${root}\n`, stderr: "" };
+    if (command[0] === "rev-parse") return { status: 0, error: null, stdout: "abcdef012345\n", stderr: "" };
+    if (command[0] === "remote") return { status: 0, error: null, stdout: "origin https://github.com/owner/repo.git (fetch)\n", stderr: "" };
+    if (command[0] === "for-each-ref") return { status: 0, error: null, stdout: "main\u0000abcdef012345\u0000origin/main\u0000*\n", stderr: "" };
+    if (command[0] === "worktree") return { status: 0, error: null, stdout: `worktree ${root}\nHEAD abcdef012345\nbranch refs/heads/main\n\n`, stderr: "" };
+    throw new Error(`unexpected Git command: ${command.join(" ")}`);
+  };
+  const coordinator = _test.createInventoryCoordinator({
+    getState: () => projectState,
+    getNativeProjects: () => [],
+    notify: (event) => progress.push(event),
+    inventoryOptions: { runCommand, concurrency: 3, commandTimeoutMs: 50, totalTimeoutMs: 500 },
+  });
+  const first = await coordinator.get("project", { requestId: "scan-one" });
+  assert.equal(first.status, "ready");
+  assert.equal(first.repositories.length, 4);
+  assert.ok(maxInFlight <= 3, `expected at most three Git commands, received ${maxInFlight}`);
+  assert.ok(timeouts.every((timeout) => timeout <= 50));
+  assert.ok(progress.some((event) => event.requestId === "scan-one" && event.status === "scanning"));
+  assert.ok(progress.some((event) => event.requestId === "scan-one" && event.status === "ready"));
+  const callsBeforeCache = gitCalls;
+  const cached = await coordinator.get("project", { requestId: "scan-two" });
+  assert.equal(cached.cached, true);
+  assert.equal(gitCalls, callsBeforeCache);
+  coordinator.dispose();
+
+  let started;
+  const running = new Promise((resolve) => { started = resolve; });
+  const cancelCoordinator = _test.createInventoryCoordinator({
+    getState: () => projectState,
+    getNativeProjects: () => [],
+    inventoryOptions: {
+      totalTimeoutMs: 500,
+      runCommand: (_command, _argv, options) => new Promise((resolve) => {
+        started();
+        options.signal?.addEventListener?.("abort", () => resolve({ status: null, error: { code: "ABORT_ERR" }, stdout: "", stderr: "" }), { once: true });
+      }),
+    },
+  });
+  const pending = cancelCoordinator.get("project", { requestId: "scan-cancel" });
+  await running;
+  assert.equal(cancelCoordinator.cancel("project", "scan-cancel").cancelled, true);
+  const cancelled = await pending;
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.partial, true);
+  cancelCoordinator.dispose();
 });
 
 test("adapterProbePaths resolves per-platform config locations", () => {
@@ -917,6 +1111,475 @@ test("task tint variables remain available while headers use their full project 
   assert.match(source, /data-tweaker-project-color-row[^}]*background-color:\s*var\(--tweaker-project-color\)/s);
 });
 
+test("repository discovery is bounded, skips generated folders, and never follows symlinks", async (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "projects-inventory-"));
+  const root = path.join(fixture, "root");
+  const outside = path.join(fixture, "outside");
+  fs.mkdirSync(root); fs.mkdirSync(outside);
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, ".git"));
+  fs.mkdirSync(path.join(root, "apps", "web", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(root, "node_modules", "ignored", ".git"), { recursive: true });
+  fs.mkdirSync(path.join(outside, ".git"));
+  fs.symlinkSync(outside, path.join(root, "linked"));
+  const result = await _test.discoverRepositoryPaths([root]);
+  assert.deepEqual(result.repositories.sort(), [root, path.join(root, "apps", "web")].sort());
+  assert.equal(result.truncated, false);
+});
+
+test("Git worktree and GitHub remote parsing preserve detached and tracking identities", () => {
+  assert.deepEqual(_test.parseGitRemoteUrl("git@github.com:therealityreport/tweakers.git"), {
+    host: "github.com", slug: "therealityreport/tweakers",
+  });
+  assert.deepEqual(_test.parseGitRemoteUrl("https://github.com/openai/codex.git"), {
+    host: "github.com", slug: "openai/codex",
+  });
+  assert.equal(_test.parseGitRemoteUrl("file:///tmp/repo"), null);
+  assert.deepEqual(_test.parseGitWorktrees("worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo-wt\nHEAD def\ndetached\nlocked busy\n\n"), [
+    { path: "/repo", branch: "main", head: "abc", detached: false, locked: false, prunable: false },
+    { path: "/repo-wt", branch: null, head: "def", detached: true, locked: "busy", prunable: false },
+  ]);
+});
+
+test("project connection signals read only fixed non-secret metadata surfaces", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "projects-signals-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "supabase"));
+  fs.writeFileSync(path.join(root, "supabase", "config.toml"), 'project_id = "safe-project"\n');
+  fs.mkdirSync(path.join(root, ".vercel"));
+  fs.writeFileSync(path.join(root, ".vercel", "project.json"), JSON.stringify({ orgId: "org", projectId: "project" }));
+  fs.writeFileSync(path.join(root, "modal_jobs.py"), 'import modal\napp = modal.App("jobs")\n');
+  fs.writeFileSync(path.join(root, ".env"), "SECRET=must-not-appear\n");
+  const signals = await _test.detectProjectConnectionSignals([root], [{ root, remotes: [{ name: "origin", fetchUrl: "git@github.com:owner/repo.git" }] }]);
+  assert.deepEqual(signals.map((signal) => signal.type).sort(), ["github", "modal", "supabase", "vercel"]);
+  assert.doesNotMatch(JSON.stringify(signals), /must-not-appear|SECRET/);
+});
+
+test("pinned project identity uses bounded fiber props and fails closed when ambiguous", () => {
+  const projects = [
+    { id: "one", nativeProjectIds: ["native-one"], nativeProjectNames: [], nativeProjectPaths: [] },
+    { id: "two", nativeProjectIds: ["native-two"], nativeProjectNames: [], nativeProjectPaths: [] },
+  ];
+  const exactApi = { react: { getFiber: () => ({ memoizedProps: { hoverCardProjectId: "native-one" }, return: null }) } };
+  assert.equal(_test.projectIdFromPinnedFiber(exactApi, {}, projects), "one");
+  const ambiguousApi = { react: { getFiber: () => ({ memoizedProps: { projectId: "native-one", thread: { projectId: "native-two" } }, return: null }) } };
+  assert.equal(_test.projectIdFromPinnedFiber(ambiguousApi, {}, projects), null);
+});
+
+test("pinned project rows are discovered between native Pinned and Projects headings without a pinned attribute", () => {
+  const document = new FakeDocument();
+  const pinnedHeading = document.createElement("div");
+  pinnedHeading.textContent = "Pinned";
+  pinnedHeading.rect = { top: 100, bottom: 120, height: 20 };
+  const pinnedRow = document.createElement("div");
+  pinnedRow.setAttribute("role", "listitem");
+  pinnedRow.rect = { top: 130, bottom: 160, height: 30 };
+  const thread = document.createElement("button");
+  thread.setAttribute("data-app-action-sidebar-thread-id", "thread-one");
+  pinnedRow.appendChild(thread);
+  const projectsHeading = document.createElement("div");
+  projectsHeading.textContent = "Projects";
+  projectsHeading.rect = { top: 200, bottom: 220, height: 20 };
+  document.body.append(pinnedHeading, pinnedRow, projectsHeading);
+
+  assert.deepEqual(_test.pinnedProjectRows(document), [pinnedRow]);
+});
+
+test("Edit Project discovery tolerates the current dialog wrapper and compact appearance editor uses wrapping rows", (t) => {
+  const document = new FakeDocument();
+  const previousDocument = global.document;
+  global.document = document;
+  t.after(() => { global.document = previousDocument; });
+  const dialog = document.createElement("div");
+  dialog.setAttribute("role", "dialog");
+  dialog.textContent = "Edit project tweakers Save";
+  const heading = document.createElement("h2");
+  heading.textContent = "Edit project";
+  const save = document.createElement("button");
+  save.textContent = "Save";
+  dialog.append(heading, save);
+  document.body.appendChild(dialog);
+
+  assert.deepEqual(_test.editProjectDialogCandidates(document), [dialog]);
+  const editor = _test.projectAppearanceEditor({
+    id: "p",
+    name: "tweakers",
+    projectPath: "/Projects/tweakers",
+    color: "#be123c",
+    colorMode: "manual",
+    overlayIntensity: "medium",
+  }, () => {});
+  assert.match(editor.children[0].children[1].className, /\bflex-wrap\b/);
+  assert.doesNotMatch(editor.children[0].children[1].className, /grid-cols/);
+  assert.match(editor.children[1].children[1].className, /\bflex\b/);
+});
+
+test("Edit Project gets a Settings button even when project state arrives after the dialog", (t) => {
+  const document = new FakeDocument();
+  const previous = {
+    document: global.document,
+    window: global.window,
+    MutationObserver: global.MutationObserver,
+  };
+  global.document = document;
+  global.window = {
+    listeners: new Map(),
+    addEventListener(type, listener) { this.listeners.set(type, listener); },
+    removeEventListener(type) { this.listeners.delete(type); },
+  };
+  global.MutationObserver = class {
+    constructor(callback) { this.callback = callback; }
+    observe() {}
+    disconnect() {}
+  };
+  t.after(() => {
+    global.document = previous.document;
+    global.window = previous.window;
+    global.MutationObserver = previous.MutationObserver;
+  });
+  const dialog = document.createElement("div");
+  dialog.setAttribute("role", "dialog");
+  dialog.textContent = "Edit project tweakers Save";
+  const header = document.createElement("div");
+  const heading = document.createElement("h2"); heading.textContent = "Edit project";
+  const close = document.createElement("button"); close.setAttribute("aria-label", "Close");
+  header.append(heading, close);
+  const save = document.createElement("button"); save.textContent = "Save";
+  dialog.append(header, save);
+  document.body.append(dialog);
+
+  const dispose = _test.installEditProjectDialogControls({}, () => null, () => {}, () => {});
+  const gear = header.children.find((node) => node.dataset?.tweakerProjectSettingsButton === "true");
+  assert.ok(gear, "settings gear is injected before project identity is available");
+  assert.equal(header.children.indexOf(gear), header.children.indexOf(close) - 1);
+  dispose();
+});
+
+test("row spacing is measured from adjacent native project folders", () => {
+  const parent = {};
+  const rows = [
+    { parentElement: parent, getBoundingClientRect: () => ({ top: 0, bottom: 30 }) },
+    { parentElement: parent, getBoundingClientRect: () => ({ top: 34, bottom: 64 }) },
+    { parentElement: parent, getBoundingClientRect: () => ({ top: 68, bottom: 98 }) },
+  ];
+  assert.equal(_test.measureNativeProjectRowGap(rows), 4);
+  assert.equal(_test.measureNativeProjectRowGap([
+    { parentElement: parent, getBoundingClientRect: () => ({ top: 0, bottom: 30 }) },
+    { parentElement: parent, getBoundingClientRect: () => ({ top: 30, bottom: 60 }) },
+  ]), null, "zero native gaps must use the visible token fallback");
+});
+
+test("session row geometry copies the native collapsed project row size and gap", () => {
+  const parent = {};
+  const makeGroup = (top, headerRect) => ({
+    parentElement: parent,
+    getBoundingClientRect: () => ({ top, bottom: top + 30, width: 440, height: 30 }),
+    querySelector: (selector) => selector === "[data-tweaker-project-color-row]" ? { getBoundingClientRect: () => headerRect } : null,
+    querySelectorAll: () => [],
+  });
+  const geometry = _test.measureNativeProjectRowGeometry([
+    makeGroup(0, { left: 12, top: 0, width: 440, height: 30 }),
+    makeGroup(32, { left: 12, top: 32, width: 440, height: 30 }),
+    makeGroup(64, { left: 12, top: 64, width: 440, height: 30 }),
+  ]);
+  assert.deepEqual(geometry, { gap: 2, blockSize: 30, inlineSize: 440 });
+});
+
+test("active project session counts prefer explicit totals and deduplicate active session records", () => {
+  const project = { id: "project-one", nativeProjectIds: ["native-one"] };
+  assert.equal(_test.activeProjectSessionCount({ activeSessionCount: 4 }, project), 4);
+  assert.equal(_test.activeProjectSessionCount({ projectId: "project-one", runningThreads: ["one", "two", "three"] }, project), 3);
+  assert.equal(_test.activeProjectSessionCount({ runningThreads: ["one", "two", "three"] }, project), 0, "unbound global arrays do not leak totals across projects");
+  assert.equal(_test.activeProjectSessionCount({ sessions: [
+    { id: "one", projectId: "project-one", status: "working" },
+    { id: "one", projectId: "project-one", isStreaming: true },
+    { id: "two", workspaceId: "native-one", state: "running" },
+    { id: "three", projectId: "another-project", status: "running" },
+    { id: "four", projectId: "project-one", status: "idle" },
+  ] }, project), 2);
+});
+
+test("branch inventory uses bounded disclosure rows instead of a newline wall", (t) => {
+  const document = new FakeDocument();
+  const previousDocument = global.document;
+  global.document = document;
+  t.after(() => { global.document = previousDocument; });
+  const disclosure = _test.branchInventoryDisclosure("Local branches", [
+    { name: "main", current: true, upstream: "origin/main", sha: "1234567890abcdef" },
+    { name: "feature/readable-inventory", current: false, upstream: null, sha: "fedcba0987654321" },
+  ], { open: true });
+  assert.equal(disclosure.tagName, "DETAILS");
+  assert.equal(disclosure.open, true);
+  assert.equal(disclosure.getAttribute("data-tweaker-branch-inventory"), "true");
+  assert.equal(disclosure.children[1].children.length, 2);
+});
+
+test("Projects UI includes dialog appearance, Settings deep-link, pinned colors, and bounded inventories", () => {
+  assert.match(source, /installEditProjectDialogControls/);
+  assert.match(source, /api\.settings\.openPage\("projects"\)/);
+  assert.match(source, /data-tweaker-project-settings-button/);
+  assert.match(source, /data-tweaker-project-color-pinned/);
+  assert.match(source, /data-tweaker-project-color-pinned[^}]*color:\s*var\(--gray-0\) !important/s);
+  assert.match(source, /data-tweaker-project-spacing-list[^}]*gap:\s*var\(--tweaker-project-native-row-gap/s);
+  assert.match(source, /--tweaker-project-native-row-block-size/);
+  assert.match(source, /--tweaker-project-native-row-inline-size/);
+  assert.match(source, /geometry\.gap === null \? "var\(--spacing-px, 1px\)"/);
+  assert.match(source, /data-tweaker-project-active-count[^}]*position:\s*relative/s);
+  assert.match(source, /activeProjectSessionCountFromFiber/);
+  assert.match(source, /data-tweaker-project-custom-color[^}]*appearance:\s*none/s);
+  assert.match(source, /Yellow", value: "#EFBF06"/);
+  assert.match(source, /branchInventoryDisclosure\("Remote-tracking branches"/);
+  assert.match(source, /currentProject = projectForEditDialog/);
+  assert.match(source, /bg-token-main-surface-primary/);
+  assert.match(source, /inventory\.refresh-github/);
+  assert.match(source, /MAX_INVENTORY_DEPTH = 4/);
+  assert.match(source, /MAX_INVENTORY_REPOS = 32/);
+  assert.doesNotMatch(source, /readFileSync\([^\n]*(?:\.env|\.npmrc|credentials)/);
+});
+
+test("the canonical entry evaluates under the renderer host contract and cleans up", async (t) => {
+  assert.equal(checkRendererEntry(), true, "the checked-in renderer entry stays fresh with its source modules");
+  const canonicalEntry = fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8");
+  const previousDocument = global.document;
+  const previousWindow = global.window;
+  const previousCustomEvent = global.CustomEvent;
+  const previousMutationObserver = global.MutationObserver;
+  const globalRequire = Object.getOwnPropertyDescriptor(globalThis, "require");
+  const document = new FakeDocument();
+  const windowListeners = new Map();
+  let pageDefinition = null;
+  let pageUnregistered = 0;
+  let hostObserverRemoved = 0;
+
+  global.document = document;
+  global.window = {
+    addEventListener(type, listener) { windowListeners.set(type, listener); },
+    removeEventListener(type, listener) { windowListeners.delete(type); },
+    dispatchEvent() {},
+    alert() {},
+  };
+  global.CustomEvent = class FakeCustomEvent {
+    constructor(type, init = {}) { this.type = type; this.detail = init.detail; }
+  };
+  global.MutationObserver = class FakeMutationObserver {
+    constructor(listener) { this.listener = listener; }
+    observe() {}
+    disconnect() {}
+  };
+  Object.defineProperty(globalThis, "require", { value: undefined, configurable: true, writable: true });
+  t.after(() => {
+    global.document = previousDocument;
+    global.window = previousWindow;
+    global.CustomEvent = previousCustomEvent;
+    global.MutationObserver = previousMutationObserver;
+    if (globalRequire) Object.defineProperty(globalThis, "require", globalRequire);
+    else delete globalThis.require;
+  });
+
+  const module = { exports: {} };
+  // This is the exact production host evaluation shape: no ambient require is
+  // supplied. Any renderer dependency on Node or relative require would throw.
+  const evaluate = new Function("module", "exports", "console", canonicalEntry);
+  evaluate(module, module.exports, console);
+  const page = module.exports.start({
+    process: "renderer",
+    ipc: {
+      on() { return () => {}; },
+      invoke(_channel, message) {
+        return Promise.resolve(message?.action === "get" ? { ok: false } : { ok: true });
+      },
+    },
+    settings: {
+      registerPage(definition) {
+        pageDefinition = definition;
+        return { unregister() { pageUnregistered += 1; } };
+      },
+      openPage: async () => ({ ok: true }),
+    },
+    react: {
+      host: {
+        observe() { return () => { hostObserverRemoved += 1; }; },
+        query: () => [],
+      },
+    },
+    log: { info() {}, warn() {} },
+  });
+  assert.equal(pageDefinition?.id, "projects");
+  assert.equal(typeof page?.unregister, "function");
+  await Promise.resolve();
+  module.exports.stop();
+  assert.equal(pageUnregistered, 1);
+  assert.equal(hostObserverRemoved, 1);
+  assert.equal(windowListeners.size, 0, "renderer cleanup removes its window listeners");
+});
+
+test("provider refresh shares renderer request cancellation, scoped progress, stale-paint protection, and recovery", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "projects-provider-lifecycle-"));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "projects-provider-workspace-"));
+  fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
+  t.after(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  });
+
+  const document = new FakeDocument();
+  const previousDocument = global.document;
+  global.document = document;
+  t.after(() => { global.document = previousDocument; });
+
+  const project = {
+    id: "project",
+    type: "project",
+    parentId: null,
+    name: "Project",
+    icon: { kind: "emoji", value: "📁" },
+    projectPath: workspace,
+    githubRepo: "owner/repo",
+    connections: { github: "gh:1234567890abcdef12345678" },
+  };
+  const state = { schemaVersion: 1, nodes: [project] };
+  const progress = [];
+  const progressListeners = new Set();
+  const rendererMessages = [];
+  const providerRuns = [];
+  const providerWaiters = [];
+  let providerMode = "delayed";
+  const branchResponse = () => ({
+    status: 0,
+    error: null,
+    stdout: JSON.stringify([[{ name: "main", protected: true, commit: { sha: "abcdef0123456789" } }]]),
+    stderr: "",
+  });
+  const nextProviderRun = (label) => new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const index = providerWaiters.indexOf(accept);
+      if (index >= 0) providerWaiters.splice(index, 1);
+      reject(new Error(`timed out waiting for mocked provider command: ${label}`));
+    }, 500);
+    const accept = (run) => {
+      clearTimeout(timeout);
+      resolve(run);
+    };
+    const queued = providerRuns.shift();
+    if (queued) accept(queued);
+    else providerWaiters.push(accept);
+  });
+  const announceProviderRun = (run) => {
+    const waiter = providerWaiters.shift();
+    if (waiter) waiter(run);
+    else providerRuns.push(run);
+  };
+  const runCommand = (command, argv, options = {}) => {
+    if (command === "git") {
+      const root = argv[1];
+      const operation = argv.slice(2);
+      if (operation[0] === "rev-parse" && operation[1] === "--show-toplevel") return { status: 0, error: null, stdout: `${root}\n`, stderr: "" };
+      if (operation[0] === "rev-parse") return { status: 0, error: null, stdout: "abcdef012345\n", stderr: "" };
+      if (operation[0] === "remote") return { status: 0, error: null, stdout: "origin https://github.com/owner/repo.git (fetch)\n", stderr: "" };
+      if (operation[0] === "for-each-ref") return { status: 0, error: null, stdout: "main\u0000abcdef012345\u0000origin/main\u0000*\n", stderr: "" };
+      if (operation[0] === "worktree") return { status: 0, error: null, stdout: `worktree ${root}\nHEAD abcdef012345\nbranch refs/heads/main\n\n`, stderr: "" };
+      throw new Error(`unexpected Git command: ${operation.join(" ")}`);
+    }
+    if (command !== "gh") throw new Error(`unexpected command: ${command}`);
+    if (argv[0] === "auth") return { status: 0, error: null, stdout: "test-token\n", stderr: "" };
+    if (argv[0] !== "api") throw new Error(`unexpected provider command: ${argv.join(" ")}`);
+    if (providerMode === "ready") return branchResponse();
+    const run = { signal: options.signal, aborted: false, resolve: null };
+    options.signal?.addEventListener?.("abort", () => { run.aborted = true; }, { once: true });
+    announceProviderRun(run);
+    return new Promise((resolve) => { run.resolve = resolve; });
+  };
+  const service = _test.createService({
+    fs: { dataDir },
+    ipc: {
+      send(channel, payload) {
+        if (channel !== "inventory.progress") return;
+        progress.push(payload);
+        for (const listener of progressListeners) listener(payload);
+      },
+    },
+  }, {
+    githubRefs: new Map([["gh:1234567890abcdef12345678", { host: "github.com", login: "octocat" }]]),
+    detectConnections: async () => ({}),
+    readNativeLocalProjects: () => [],
+    runCommand,
+    inventoryOptions: { runCommand, totalTimeoutMs: 500, commandTimeoutMs: 50 },
+  });
+  t.after(() => service.dispose());
+  assert.equal((await service.handle({ action: "save", state })).ok, true);
+  const localInventory = await service.handle({ action: "inventory.get", projectId: project.id, requestId: "local-seed" });
+  assert.equal(localInventory.status, "ready");
+
+  const rendererApi = {
+    ipc: {
+      on(channel, listener) {
+        assert.equal(channel, "inventory.progress");
+        progressListeners.add(listener);
+        return () => progressListeners.delete(listener);
+      },
+      invoke(channel, message) {
+        assert.equal(channel, "projects");
+        rendererMessages.push(message);
+        return service.handle(message);
+      },
+    },
+  };
+  const root = document.createElement("div");
+  const host = document.createElement("div");
+  root.append(host);
+  document.body.append(root);
+  const loader = _test.createInventoryLoader(rendererApi, root);
+  const githubPanelCount = () => {
+    const count = (node) => (node?.dataset?.tweakerGithubBranches ? 1 : 0)
+      + (node?.children || []).reduce((total, child) => total + count(child), 0);
+    return count(host);
+  };
+
+  const staleStarted = nextProviderRun("first renderer refresh");
+  const staleRefresh = loader.refreshGitHub(project, host, localInventory);
+  const staleRun = await staleStarted;
+  const staleRequest = rendererMessages.find((message) => message.action === "inventory.refresh-github")?.requestId;
+  assert.ok(staleRequest, "renderer sends a request token with provider refresh");
+  const cancellation = await loader.cancel();
+  assert.deepEqual(cancellation, { ok: true, cancelled: true, requestId: staleRequest });
+  assert.equal(staleRun.signal.aborted, true, "the delayed provider command receives the abort signal");
+  staleRun.resolve(branchResponse());
+  await staleRefresh;
+  assert.equal(githubPanelCount(), 0, "a stale provider completion cannot paint the detached request");
+  const scopedProgress = progress.filter((event) => event.provider === "github" && event.requestId === staleRequest);
+  assert.ok(scopedProgress.some((event) => event.remote === "github.com/owner/repo"));
+  assert.ok(scopedProgress.every((event) => event.projectId === project.id && event.requestId === staleRequest));
+  assert.ok(scopedProgress.every((event) => !event.remote || event.remote.length <= 360));
+
+  providerMode = "ready";
+  const recovered = await loader.refreshGitHub(project, host, localInventory);
+  assert.equal(recovered.status, "ready");
+  assert.equal(githubPanelCount(), 1, "a later request recovers and paints its current result");
+
+  assert.equal((await service.handle({ action: "save", state })).ok, true, "save invalidates the bounded provider cache before supersession coverage");
+  providerMode = "delayed";
+  const supersededStarted = nextProviderRun("superseded renderer refresh");
+  const supersededRefresh = loader.refreshGitHub(project, host, localInventory);
+  const supersededRun = await supersededStarted;
+  const supersededRequest = rendererMessages.filter((message) => message.action === "inventory.refresh-github").at(-1)?.requestId;
+  assert.ok(progress.some((event) => event.requestId === supersededRequest && event.provider === "github" && event.phase === "discovering"), "a provider-triggered local scan keeps its progress in the provider display channel");
+  const rescan = await service.handle({ action: "inventory.get", projectId: project.id, requestId: "rescan" });
+  assert.equal(rescan.ok, true);
+  assert.equal(supersededRun.signal.aborted, true, "a rescan supersedes an active provider job");
+  supersededRun.resolve(branchResponse());
+  await supersededRefresh;
+  assert.equal(githubPanelCount(), 1, "the superseded provider still cannot overwrite the current display");
+
+  const disposedStarted = nextProviderRun("dispose renderer refresh");
+  const disposedRefresh = loader.refreshGitHub(project, host, localInventory);
+  const disposedRun = await disposedStarted;
+  service.dispose();
+  assert.equal(disposedRun.signal.aborted, true, "service disposal aborts an active provider job");
+  disposedRun.resolve(branchResponse());
+  await disposedRefresh;
+  assert.equal(githubPanelCount(), 1);
+});
+
 class FakeDocument {
   constructor() {
     this.body = new FakeElement("body", this);
@@ -947,6 +1610,7 @@ class FakeElement {
     this.tagName = tag.toUpperCase();
     this.ownerDocument = ownerDocument;
     this.attributes = new Map();
+    this.dataset = {};
     this.children = [];
     this.parentElement = null;
     this.listeners = new Map();
@@ -970,6 +1634,12 @@ class FakeElement {
   hasAttribute(name) { return this.attributes.has(name); }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   append(...children) { for (const child of children) this.appendChild(child); }
+  prepend(...children) {
+    for (const child of children.reverse()) {
+      child.parentElement = this;
+      this.children.unshift(child);
+    }
+  }
   insertBefore(child, before) {
     child.parentElement = this;
     const index = this.children.indexOf(before);

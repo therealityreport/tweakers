@@ -13,7 +13,7 @@
  */
 
 import { ipcRenderer } from "electron";
-import { registerSection, registerPage, clearSections, setListedTweaks, updateListedTweakLifecycle } from "./settings-injector";
+import { registerSection, registerPage, openRegisteredPage, clearSections, setListedTweaks, updateListedTweakLifecycle } from "./settings-injector";
 import { fiberForNode } from "./react-hook";
 import { hostUiApi } from "./host-surfaces";
 import { DEFAULT_TWEAK_STARTUP_TIMEOUT_MS, runWithStartupTimeout } from "../tweak-lifecycle";
@@ -258,6 +258,7 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
       register: (s) => registerSection({ ...s, id: `${id}:${s.id}` }),
       registerPage: (p) =>
         registerPage(id, manifest, { ...p, id: `${id}:${p.id}` }),
+      openPage: (pageId) => openRegisteredPage(id, `${id}:${pageId}`),
     },
     react: {
       getFiber: (n) => fiberForNode(n) as ReactFiberNode | null,

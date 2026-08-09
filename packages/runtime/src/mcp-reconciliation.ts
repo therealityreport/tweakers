@@ -29,6 +29,7 @@ import {
   MCP_MANAGED_END,
   MCP_MANAGED_START,
   USER_QUESTIONS_MCP_SERVER_NAME,
+  hasStrayManagedMcpEndMarker,
   mcpServerNameFromTweakId,
   observeUserQuestionsApprovalPolicy,
   planManagedMcpReconciliation,
@@ -62,6 +63,13 @@ export interface McpSyncReceipt {
   preservedApprovalPolicy: PreservedApprovalPolicy | null;
   beforeFingerprint: string;
   afterFingerprint: string;
+  /**
+   * Raw-byte binding (afterFingerprint) breaks whenever the desktop app stamps
+   * volatile bookkeeping (marketplace `last_updated`) into config.toml after a
+   * reconcile. This canonical twin hashes the same content with those lines
+   * stripped so health probes can bind the receipt across app boots.
+   */
+  afterFingerprintCanonical?: string;
   plannedAfterFingerprint?: string;
   restartRequired: boolean;
   /**
@@ -378,6 +386,7 @@ function reconcileMcpConfigWithLock(
             preservedApprovalPolicy: plan.preservedApprovalPolicy,
             beforeFingerprint,
             afterFingerprint: beforeFingerprint,
+            afterFingerprintCanonical: canonicalConfigFingerprint(beforeBytes),
             plannedAfterFingerprint: fingerprint(plan.nextToml),
             restartRequired: false,
             managedConfigurationChangedAt: previousManagedConfigurationChangedAt,
@@ -486,6 +495,7 @@ function reconcileMcpConfigWithLock(
         : durablePreservedApprovalPolicy,
       beforeFingerprint,
       afterFingerprint: fingerprint(after),
+      afterFingerprintCanonical: canonicalConfigFingerprint(after),
       restartRequired: appliedPlanChange || recoveredRetiredEdit,
       managedConfigurationChangedAt,
     };
@@ -493,6 +503,7 @@ function reconcileMcpConfigWithLock(
     return receipt;
   } catch (error) {
     const completedAt = now().toISOString();
+    const errorConfigBytes = readBytesIfExists(options.configPath);
     const receipt: McpSyncReceipt = {
       schemaVersion: 2,
       phase: "complete",
@@ -511,7 +522,8 @@ function reconcileMcpConfigWithLock(
         ? plan.preservedApprovalPolicy
         : durablePreservedApprovalPolicy,
       beforeFingerprint,
-      afterFingerprint: fingerprint(readBytesIfExists(options.configPath)),
+      afterFingerprint: fingerprint(errorConfigBytes),
+      afterFingerprintCanonical: canonicalConfigFingerprint(errorConfigBytes),
       restartRequired: false,
       managedConfigurationChangedAt: appliedPlanChange || recoveredRetiredEdit
         ? completedAt
@@ -1069,6 +1081,20 @@ export function fingerprint(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * Stamp-immune fingerprint of a Codex config: identical to `fingerprint`
+ * except app-stamped volatile `last_updated` lines are removed first. Used
+ * only for the receipt's `afterFingerprintCanonical` binding; CAS/retired
+ * inode naming keeps raw `fingerprint` semantics.
+ */
+export function canonicalConfigFingerprint(value: string | Buffer): string {
+  const canonical = (typeof value === "string" ? value : value.toString("utf8"))
+    .split("\n")
+    .filter((line) => !/^\s*last_updated\s*=/.test(line))
+    .join("\n");
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
 export interface PlanMcpConfigReconciliationOptions {
   ownedTweaks?: McpSyncTweak[];
   preservedOptions?: Readonly<PreservedMcpOptionsByServerName>;
@@ -1115,6 +1141,11 @@ function managedBlocksDifferOnlyByLiveRoot(
   plannedToml: string,
   tweaks: McpSyncTweak[],
 ): boolean {
+  // stripManagedMcpBlock heals stray END markers, so a heal-only difference
+  // passes the stripped comparison below. Such a document is corrupt, not a
+  // live-root twin — suppressing its rewrite would plan the heal and discard
+  // it forever while prove reports healthy.
+  if (hasStrayManagedMcpEndMarker(currentToml)) return false;
   if (stripManagedMcpBlock(currentToml) !== stripManagedMcpBlock(plannedToml)) return false;
   const currentBlock = extractManagedBlock(currentToml);
   const plannedBlock = extractManagedBlock(plannedToml);

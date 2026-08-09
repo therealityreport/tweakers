@@ -770,6 +770,109 @@ test("an ad-hoc candidate is never promoted and a normal install rebuilds a prom
   }
 });
 
+// refresh-local prepares the candidate in one install() call (`--candidate-only`)
+// and promotes it from another (`repair --force`), so the promoting process has
+// no build-time health expectation. The candidate health probe only gets one
+// chance to rehydrate it from the durable receipt beside the candidate, so the
+// transaction must hand it the receipt's age bounds on EVERY probe — including
+// the resume of a candidate held while the app was running. Without them the
+// promote pass answers "unknown" before the probe ever launches and every held
+// candidate dead-ends at "candidate health: host health unknown".
+test("a candidate held for a running app is probed with durable receipt bounds when a later process promotes it", async () => {
+  const f = fixture();
+  try {
+    const building = adapters({ isAppRunning: () => true });
+    const held = await runInstallTransaction(options(f), building.adapters);
+    assert.equal(held.status, "held");
+    assert.equal(held.state.pendingReason, "app-running");
+    assert.equal(building.calls.includes("promoteCandidate"), false);
+
+    // A promote-time process cannot answer from build-time state; it passes
+    // only when the transaction supplies the bounds it needs to rehydrate.
+    let probeInput: { transactionCreatedAt?: unknown; maxCandidateAgeMs?: unknown } | null = null;
+    const promoting = adapters({
+      probeCandidateHealth: (input: { transactionCreatedAt?: unknown; maxCandidateAgeMs?: unknown }): Health => {
+        probeInput = input;
+        const rehydratable = typeof input.transactionCreatedAt === "string"
+          && typeof input.maxCandidateAgeMs === "number"
+          && input.maxCandidateAgeMs > 0;
+        return rehydratable
+          ? { host: "pass", session: "pass", permissions: { accessibility: "pass" } }
+          : { host: "unknown", session: "unknown", permissions: { accessibility: "unknown" } };
+      },
+    });
+    const promoted = await runInstallTransaction(
+      { ...options(f), now: new Date("2026-07-10T12:01:00.000Z") },
+      promoting.adapters,
+    );
+
+    assert.equal(promoted.status, "promoted");
+    assert.equal(promoting.calls.includes("buildCandidate"), false, "the held candidate must be reused, not rebuilt");
+    assert.ok(promoting.calls.includes("promoteCandidate"));
+    assert.equal((probeInput as { transactionCreatedAt?: unknown } | null)?.transactionCreatedAt, held.state.createdAt);
+    assert.equal((probeInput as { maxCandidateAgeMs?: unknown } | null)?.maxCandidateAgeMs, 24 * 60 * 60 * 1_000);
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("a promote-time probe rehydrates the durable candidate expectation, and reports unknown host health without it", async () => {
+  const promoteNow = new Date("2026-07-10T12:01:00.000Z");
+  const rehydratingProbe = (
+    expectationFile: string,
+  ) => (input: { transactionCreatedAt: string; maxCandidateAgeMs: number }): Health => {
+    // Exactly what install.ts does on a promote pass: no build-time
+    // expectation, so the durable twin beside the candidate is the only source.
+    const expectation = readCandidatePromotionHealthExpectation(expectationFile, {
+      transactionCreatedAt: input.transactionCreatedAt,
+      now: promoteNow,
+      maxAgeMs: input.maxCandidateAgeMs,
+    });
+    return expectation
+      ? { host: "pass", session: "pass", permissions: { accessibility: "pass" } }
+      : { host: "unknown", session: "unknown", permissions: { accessibility: "unknown" } };
+  };
+
+  const withTwin = fixture();
+  try {
+    const built = await runInstallTransaction(options(withTwin), adapters({ isAppRunning: () => true }).adapters);
+    assert.equal(built.status, "held");
+
+    const expectationFile = join(withTwin.workRoot, "candidate-user", "health", "expectation.json");
+    mkdirSync(join(withTwin.workRoot, "candidate-user", "health"), { recursive: true });
+    writeFileSync(expectationFile, `${JSON.stringify({
+      ...promotionExpectation(),
+      requestedAt: "2026-07-10T12:00:30.000Z",
+    }, null, 2)}\n`);
+    chmodSync(expectationFile, 0o600);
+
+    const promoting = adapters({ probeCandidateHealth: rehydratingProbe(expectationFile) });
+    const promoted = await runInstallTransaction({ ...options(withTwin), now: promoteNow }, promoting.adapters);
+    assert.equal(promoted.status, "promoted");
+    assert.ok(promoting.calls.includes("promoteCandidate"));
+  } finally {
+    clean(withTwin.root);
+  }
+
+  // The live 2026-08-09 failure signature: no expectation to rehydrate, so the
+  // probe never launches and the candidate is discarded with the app untouched.
+  const withoutTwin = fixture();
+  try {
+    const built = await runInstallTransaction(options(withoutTwin), adapters({ isAppRunning: () => true }).adapters);
+    assert.equal(built.status, "held");
+
+    const missing = join(withoutTwin.workRoot, "candidate-user", "health", "expectation.json");
+    const promoting = adapters({ probeCandidateHealth: rehydratingProbe(missing) });
+    const invalidated = await runInstallTransaction({ ...options(withoutTwin), now: promoteNow }, promoting.adapters);
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.state.failure, "candidate health: host health unknown");
+    assert.equal(promoting.calls.includes("promoteCandidate"), false);
+    assert.equal(readFileSync(join(withoutTwin.root, "sentinel"), "utf8"), "untouched");
+  } finally {
+    clean(withoutTwin.root);
+  }
+});
+
 test("production health receipt requires mode 0600, fresh matching app/runtime identity, and complete tri-state permissions", () => {
   const f = fixture();
   try {
@@ -806,6 +909,96 @@ test("production health receipt requires mode 0600, fresh matching app/runtime i
     assert.equal(PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS, 200_000);
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, runtimeHash: "changed" }).host, "unknown");
     assert.equal(readProductionHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "changed" } }).host, "unknown");
+  } finally {
+    clean(f.root);
+  }
+});
+
+// Every rejection above returns the same all-"unknown" values, and the rejected
+// receipt is deleted with the candidate before anyone can inspect it — which is
+// why the live 2026-08-09 "candidate health: host health unknown" failures could
+// not be attributed after the fact. Each refusal must name itself.
+test("a rejected promotion receipt says which check refused it", () => {
+  const f = fixture();
+  try {
+    const receipt = join(f.root, "health.json");
+    const expected = {
+      app: options(f).source,
+      runtimeHash: "runtime-hash",
+      requiredPermissions: ["accessibility"],
+    };
+    const valid = {
+      schemaVersion: 1,
+      observedAt: "2026-07-10T12:00:00.000Z",
+      app: expected.app,
+      runtimeHash: expected.runtimeHash,
+      hostReady: "pass",
+      authenticatedSession: "pass",
+      declaredPermissions: { accessibility: "pass" },
+    };
+    const now = new Date("2026-07-10T12:00:30.000Z");
+
+    assert.match(
+      readProductionHealthReceipt(join(f.root, "absent.json"), expected, { now }).detail ?? "",
+      /promotion receipt rejected: .*ENOENT/,
+    );
+
+    writeFileSync(receipt, JSON.stringify(valid), { mode: 0o600 });
+    chmodSync(receipt, 0o600);
+    // An accepted receipt carries no rejection note.
+    assert.equal(readProductionHealthReceipt(receipt, expected, { now }).detail, undefined);
+
+    chmodSync(receipt, 0o644);
+    assert.equal(
+      readProductionHealthReceipt(receipt, expected, { now }).detail,
+      "promotion receipt rejected: mode 644 is not 0600",
+    );
+    chmodSync(receipt, 0o600);
+
+    assert.equal(
+      readProductionHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "changed" } }, { now }).detail,
+      "promotion receipt rejected: app fingerprint does not match the expectation",
+    );
+    assert.equal(
+      readProductionHealthReceipt(receipt, expected, { now: new Date("2026-07-10T12:03:20.001Z") }).detail,
+      "promotion receipt rejected: observedAt 2026-07-10T12:00:00.000Z predates this promotion",
+    );
+    assert.equal(
+      readProductionHealthReceipt(receipt, { ...expected, runtimeHash: "changed" }, { now }).detail,
+      "promotion receipt rejected: legacy receipt failed validation",
+    );
+
+    writeFileSync(receipt, JSON.stringify({ ...promotionExpectation(), observedAt: valid.observedAt, app: expected.app }), { mode: 0o600 });
+    chmodSync(receipt, 0o600);
+    assert.equal(
+      readProductionHealthReceipt(receipt, { ...promotionExpectation(), app: expected.app }, { now }).detail,
+      "promotion receipt rejected: schema-v2 receipt failed validation",
+    );
+  } finally {
+    clean(f.root);
+  }
+});
+
+test("a candidate health failure carries the reason into the transaction record", async () => {
+  const f = fixture();
+  try {
+    const injected = adapters({
+      probeCandidateHealth: (): Health & { detail: string } => ({
+        host: "unknown",
+        session: "unknown",
+        permissions: { accessibility: "unknown" },
+        detail: "health probe did not answer: killed by SIGKILL",
+      }),
+    });
+    const result = await runInstallTransaction(options(f), injected.adapters);
+
+    assert.equal(result.status, "invalidated");
+    assert.equal(
+      result.state.failure,
+      "candidate health: host health unknown (health probe did not answer: killed by SIGKILL)",
+    );
+    assert.equal(injected.calls.includes("promoteCandidate"), false);
+    assert.equal(readFileSync(join(f.root, "sentinel"), "utf8"), "untouched");
   } finally {
     clean(f.root);
   }
@@ -1131,7 +1324,7 @@ test("receipt-bound prebuilt prepare and promotion reuse one exact candidate wit
       schemaVersion: authority.schemaVersion,
     };
 
-    const requestFile = join(f.workRoot, "candidate-user", "health", "request.json");
+    const requestFile = join(f.workRoot, "candidate-user", "health", "expectation.json");
     mkdirSync(join(f.workRoot, "candidate-user", "health"), { recursive: true });
     writeFileSync(requestFile, `${JSON.stringify({
       ...promotionExpectation(),
@@ -1396,7 +1589,7 @@ test("invalid durable candidate health-request times invalidate only bounded scr
       writeFileSync(f.stateFile, `${JSON.stringify(prepared, null, 2)}\n`);
 
       const candidateUserRoot = join(f.workRoot, "candidate-user");
-      const requestFile = join(candidateUserRoot, "health", "request.json");
+      const requestFile = join(candidateUserRoot, "health", "expectation.json");
       if (scenario.request !== null) {
         mkdirSync(join(candidateUserRoot, "health"), { recursive: true });
         writeFileSync(requestFile, scenario.request);

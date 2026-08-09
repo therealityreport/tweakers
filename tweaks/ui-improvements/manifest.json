@@ -1,7 +1,7 @@
 {
   "id": "co.tweakers.ui-improvements",
   "name": "UI Improvements",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "githubRepo": "therealityreport/tweakers",
   "description": "Four independent interface improvements with reversible lifecycle cleanup.",
   "author": "hulibrands",

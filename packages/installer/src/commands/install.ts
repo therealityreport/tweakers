@@ -33,7 +33,7 @@ import { ensureUserPaths, type UserPaths } from "../paths.js";
 import { backupOnce, patchAsar, readFileInAsar, readHeaderHash } from "../asar.js";
 import { setIntegrity, getIntegrity } from "../integrity.js";
 import { writeFuse } from "../fuses.js";
-import { clearQuarantine, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
+import { clearQuarantine, codeSigningKeychainArgs, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
 import { assertInternalStoragePath } from "../internal-storage.js";
 import { fingerprintAppContents } from "../environment-profile.js";
 import {
@@ -61,8 +61,10 @@ import {
   patchCodexWindowServicesSource,
   type CodexWindowServicesSourceDiagnostics,
 } from "../codex-window-services.js";
+import { patchCodexModelSelectionInExtractedApp } from "../codex-model-selection.js";
+import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
-import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
+import { getOpenReport, listProcesses, reportsMainProcessRunning, type OpenReport, type ProcessInfo } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
@@ -91,7 +93,7 @@ import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
 import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
-import { fingerprintPromotionPolicyPath } from "../promotion-policy.js";
+import { fingerprintPromotionCodexConfigPath, fingerprintPromotionPolicyPath } from "../promotion-policy.js";
 import {
   fingerprintPath,
   inspectUserQuestionsSource,
@@ -451,7 +453,7 @@ export function loadVerifiedSwapHost(
     throw new Error(`Swap host signing identity does not match its prepared evidence at ${evidence.path}`);
   }
   const require = createRequire(import.meta.url);
-  const nativeHost = require(evidence.path) as NativeAppIdentityHost;
+  const nativeHost = require(evidence.path) as { swapDirectories(first: string, second: string): void };
   return (first, second) => nativeHost.swapDirectories(first, second);
 }
 
@@ -483,6 +485,38 @@ export const HEALTH_PROBE_USER_DATA_RELATIVE_PATH = "electron-user-data";
 export const HEALTH_PROBE_ROOT_PREFIX = "probe-";
 export const HEALTH_PROBE_PROCESS_TIMEOUT_MS = 170_000;
 export const HEALTH_PROBE_RECEIPT_TIMEOUT_MS = 170_000;
+// Descendants are explicitly terminated before cleanup. These retries cover
+// only short filesystem settlement after the owned process tree is gone.
+export const HEALTH_PROBE_CLEANUP_MAX_RETRIES = 5;
+export const HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS = 100;
+export const HEALTH_PROBE_DESCENDANT_TERM_WAIT_MS = 2_000;
+export const HEALTH_PROBE_DESCENDANT_KILL_WAIT_MS = 2_000;
+export const HEALTH_PROBE_DESCENDANT_POLL_MS = 50;
+
+type HealthProbeRootRemover = (
+  path: string,
+  options: { recursive: true; force: true; maxRetries: number; retryDelay: number },
+) => void;
+
+/**
+ * Chromium and Codex helpers can finish a fraction after the synchronous app
+ * process exits. During that handoff they may create one last SQLite/WAL or
+ * plugin-cache file, making a single recursive rm race with ENOTEMPTY. Node's
+ * bounded retry support handles that transient writer without weakening the
+ * fail-closed check below: a root that still exists after the retry window is
+ * still a terminal health-probe cleanup failure.
+ */
+export function removeHealthProbeRoot(
+  probeRoot: string,
+  remove: HealthProbeRootRemover = rmSync,
+): void {
+  remove(probeRoot, {
+    recursive: true,
+    force: true,
+    maxRetries: HEALTH_PROBE_CLEANUP_MAX_RETRIES,
+    retryDelay: HEALTH_PROBE_CLEANUP_RETRY_DELAY_MS,
+  });
+}
 
 function requireRealDirectory(path: string, label: string): void {
   const stat = lstatSync(path);
@@ -507,6 +541,79 @@ interface HealthProbeLaunchDependencies {
   platform?: NodeJS.Platform;
   /** Internal test seam; production always removes the exact disposable root recursively. */
   removeProbeRoot?: (probeRoot: string) => void;
+  /** Internal seams for proving complete ownership and teardown of spawned helpers. */
+  listProcesses?: () => ProcessInfo[];
+  signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
+  sleep?: (milliseconds: number) => void;
+}
+
+function processIdentity(process: ProcessInfo): string {
+  return `${process.pid}\0${process.startedAtRaw ?? ""}\0${process.command}`;
+}
+
+function executableAppContentsRoot(executable: string): string | null {
+  const marker = ".app/Contents/";
+  const index = executable.indexOf(marker);
+  return index < 0 ? null : executable.slice(0, index + ".app/Contents".length);
+}
+
+/**
+ * Select only processes created during this probe and bound either to its
+ * random disposable root or to the exact app payload that launched it. The
+ * latter catches helpers such as bare-modifier-monitor that omit Chromium's
+ * user-data argument before being reparented to PID 1.
+ */
+export function ownedHealthProbeProcesses(
+  baseline: readonly ProcessInfo[],
+  observed: readonly ProcessInfo[],
+  executable: string,
+  probeRoot: string,
+): ProcessInfo[] {
+  const existing = new Set(baseline.map(processIdentity));
+  const appContentsRoot = executableAppContentsRoot(executable);
+  return observed.filter((process) => {
+    if (existing.has(processIdentity(process))) return false;
+    if (process.command.includes(probeRoot)) return true;
+    return appContentsRoot !== null && process.command.includes(`${appContentsRoot}/`);
+  });
+}
+
+function synchronousSleep(milliseconds: number): void {
+  if (milliseconds <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function terminateOwnedHealthProbeProcesses(
+  baseline: readonly ProcessInfo[],
+  executable: string,
+  probeRoot: string,
+  deps: HealthProbeLaunchDependencies,
+): void {
+  const inspect = deps.listProcesses ?? listProcesses;
+  const signal = deps.signalProcess ?? ((pid: number, value: NodeJS.Signals) => process.kill(pid, value));
+  const sleep = deps.sleep ?? synchronousSleep;
+  let owned = ownedHealthProbeProcesses(baseline, inspect(), executable, probeRoot);
+  for (const process of owned) {
+    try { signal(process.pid, "SIGTERM"); } catch { /* already exited */ }
+  }
+  const waitForExit = (timeoutMs: number): ProcessInfo[] => {
+    const deadline = Date.now() + timeoutMs;
+    let remaining = owned;
+    while (remaining.length > 0 && Date.now() < deadline) {
+      sleep(HEALTH_PROBE_DESCENDANT_POLL_MS);
+      const current = new Map(inspect().map((process) => [processIdentity(process), process]));
+      remaining = remaining.filter((process) => current.has(processIdentity(process)));
+    }
+    return remaining;
+  };
+  owned = waitForExit(HEALTH_PROBE_DESCENDANT_TERM_WAIT_MS);
+  for (const process of owned) {
+    try { signal(process.pid, "SIGKILL"); } catch { /* already exited */ }
+  }
+  owned = waitForExit(HEALTH_PROBE_DESCENDANT_KILL_WAIT_MS);
+  if (owned.length > 0) {
+    throw new Error(`Health probe descendants did not exit: ${owned.map((process) => process.pid).join(", ")}`);
+  }
 }
 
 function isStrictDescendant(parent: string, child: string): boolean {
@@ -587,7 +694,7 @@ function cleanupHealthProbeSandbox(
       throw new Error(`Refusing to clean health probe root that resolves outside containment: ${sandbox.root}`);
     }
   }
-  (removeProbeRoot ?? ((probeRoot) => rmSync(probeRoot, { recursive: true, force: true })))(sandbox.root);
+  (removeProbeRoot ?? removeHealthProbeRoot)(sandbox.root);
   if (existsSync(sandbox.root)) {
     throw new Error(`Health probe disposable root could not be removed: ${sandbox.root}`);
   }
@@ -668,15 +775,20 @@ function launchHealthProbe(
   deps: HealthProbeLaunchDependencies,
 ): ReturnType<typeof spawnSync> {
   const platform = deps.platform ?? process.platform;
+  const baseline = (deps.listProcesses ?? listProcesses)();
   const chromiumArgs = [
     `--user-data-dir=${sandbox.userDataRoot}`,
     ...(platform === "darwin" ? ["--use-mock-keychain"] : []),
   ];
-  return (deps.spawn ?? spawnSync)(executable, chromiumArgs, {
-    env: healthProbeEnvironment(userRoot, sandbox, platform, deps.environment ?? process.env),
-    stdio: "ignore",
-    timeout: HEALTH_PROBE_PROCESS_TIMEOUT_MS,
-  });
+  try {
+    return (deps.spawn ?? spawnSync)(executable, chromiumArgs, {
+      env: healthProbeEnvironment(userRoot, sandbox, platform, deps.environment ?? process.env),
+      stdio: "ignore",
+      timeout: HEALTH_PROBE_PROCESS_TIMEOUT_MS,
+    });
+  } finally {
+    terminateOwnedHealthProbeProcesses(baseline, executable, sandbox.root, deps);
+  }
 }
 
 function stageBoundedCodexInputs(sourceCodexHome: string, containedCodexHome: string): void {
@@ -815,7 +927,23 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const liveUserQuestionsReceiptFile = join(paths.transactionRoot, "user-questions", `${rolloutKey}.json`);
   const liveUserQuestionsArchiveRoot = join(paths.transactionRoot, "user-questions", rolloutKey);
   let candidateHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let candidatePromotionPreimages: PromotionSurfaceHashes | null = null;
   let liveHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  const rollbackHealthExpectationFile = join(paths.transactionRoot, "health", "rollback-expectation.json");
+  const promotedHealthExpectationFile = join(paths.transactionRoot, "health", "promoted-expectation.json");
+  const readDurableLiveHealthExpectation = (file: string): ProductionHealthExpectationV2 | null => {
+    try {
+      const state = recordValue(JSON.parse(readFileSync(paths.transactionStateFile, "utf8")) as unknown);
+      const transactionCreatedAt = typeof state?.createdAt === "string" ? state.createdAt : "";
+      return readCandidatePromotionHealthExpectation(file, {
+        transactionCreatedAt,
+        now: new Date(),
+        maxAgeMs: 24 * 60 * 60 * 1_000,
+      });
+    } catch {
+      return null;
+    }
+  };
   let liveUserQuestionsReceipt: UserQuestionsRolloutReceipt | null = null;
   let liveMcpConflictCount: number | null = null;
   const candidateSignedBackup = join(candidatePaths.backup, "Codex.app");
@@ -931,7 +1059,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           signedBackupMarker: signedBackupSnapshotState,
         });
         candidateHealthExpectation = readCandidatePromotionHealthExpectation(
-          join(candidateUserRoot, "health", "request.json"),
+          join(candidateUserRoot, "health", "expectation.json"),
           {
             transactionCreatedAt: state.createdAt,
             now: context.now,
@@ -941,11 +1069,23 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         if (!candidateHealthExpectation) {
           throw new Error("Prepared candidate schema-v2 health expectation is unavailable");
         }
+        // Promotion runs in a separate process from prepare, so the policy
+        // drift guard's preimages must be rehydrated from the durable
+        // expectation rather than the prepare-time module state.
+        candidatePromotionPreimages = promotionPreimageHashes(candidateHealthExpectation);
       }
       : undefined,
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
       resetCandidateUserRootForBuild(candidateUserRoot);
+      candidatePromotionPreimages = fingerprintPromotionSurfaces(promotionSurfaceRoots({
+        appHash: source.hash,
+        runtimeRoot: paths.runtime,
+        tweaksRoot: paths.tweaks,
+        userRoot: paths.root,
+        tweakersConfigPath: paths.configFile,
+        codexHome: liveCodexHome,
+      }));
       stageCandidateRolloutInputs({
         livePaths: paths,
         candidatePaths,
@@ -999,14 +1139,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       const candidate = locateCodex(candidateRoot);
       candidateHealthExpectation = buildPromotionHealthExpectation({
         app: fingerprintCodex(candidate),
-        before: promotionSurfaceRoots({
-          appHash: source.hash,
-          runtimeRoot: paths.runtime,
-          tweaksRoot: paths.tweaks,
-          userRoot: paths.root,
-          tweakersConfigPath: paths.configFile,
-          codexHome: liveCodexHome,
-        }),
+        before: candidatePromotionPreimages,
         after: promotionSurfaceRoots({
           appHash: fingerprintCodex(candidate).hash,
           runtimeRoot: candidatePaths.runtime,
@@ -1046,31 +1179,69 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       // full deep verify.
       return restored.platform === "darwin" ? signatureInfo(appRoot).ok : true;
     },
-    probeCandidateHealth: ({ candidateRoot }) => {
+    probeCandidateHealth: ({ candidateRoot, transactionCreatedAt, maxCandidateAgeMs }) => {
       try {
         const candidate = locateCodex(candidateRoot);
         validateMainRendererAsarEntrypoint(candidate.asarPath);
-        const expected = candidateHealthExpectation;
-        if (!expected || !sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
-          return unknownPromotionHealth(requiredPermissions);
+        const expectationFile = join(candidateUserRoot, "health", "expectation.json");
+        // The build-time expectation only exists in the process that built the
+        // candidate. Promotion routinely runs in a LATER install() call —
+        // refresh-local prepares with `--candidate-only`, then promotes through
+        // `repair --force` — so a null here is the normal promote case, not a
+        // failure. Rehydrate from the durable twin under the same age bounds
+        // the transaction applies to the candidate itself; without this every
+        // held candidate dead-ends at "candidate health: host health unknown"
+        // before the probe is ever launched.
+        const rehydrated = candidateHealthExpectation === null;
+        const expected = candidateHealthExpectation ?? readCandidatePromotionHealthExpectation(
+          expectationFile,
+          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs },
+        );
+        if (!expected) {
+          return unknownPromotionHealth(
+            requiredPermissions,
+            `no candidate health expectation: ${expectationFile} is absent, stale beyond ${maxCandidateAgeMs}ms, or not bound to this transaction`,
+          );
+        }
+        if (!sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
+          return unknownPromotionHealth(requiredPermissions, "candidate app fingerprint drifted from its health expectation");
+        }
+        if (rehydrated) {
+          // promoteCandidate reads both; a rehydrated promote must not fall
+          // back to the build-time nulls after the probe proved the candidate.
+          candidateHealthExpectation = expected;
+          candidatePromotionPreimages = promotionPreimageHashes(expected);
         }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
-        writeHealthRequest(join(candidateUserRoot, "health", "request.json"), {
+        const healthRequest = {
           ...expected,
           requestedAt: new Date().toISOString(),
-        });
+        };
+        // The probe consumes request.json as a one-shot (the runtime unlinks it
+        // after answering, so a receipt can only ever prove this launch).
+        // Promote runs in a later process and must re-read the expectation, so
+        // persist a durable twin the probe never touches. Only the building
+        // process writes that twin: re-stamping it on every rehydrated probe
+        // would renew its age bound forever.
+        if (!rehydrated) writeHealthRequest(expectationFile, healthRequest);
+        writeHealthRequest(join(candidateUserRoot, "health", "request.json"), healthRequest);
         const launched = spawnAuthenticatedHiddenHealthProbe(
           candidate.executable,
           candidateUserRoot,
           liveCodexHome,
           { candidateCodexHome },
         );
-        if (launched.error || launched.status !== 0) {
-          return unknownPromotionHealth(requiredPermissions);
+        if (launched.error || launched.status !== 0 || launched.signal !== null) {
+          return unknownPromotionHealth(requiredPermissions, formatHealthProbeLaunchFailure(launched));
         }
-        return readProductionHealthReceipt(receiptFile, expected);
-      } catch {
-        return unknownPromotionHealth(requiredPermissions);
+        // The reader explains its own rejections; only an accepted receipt that
+        // still reports nothing needs an account added here.
+        const observed = readProductionHealthReceipt(receiptFile, expected);
+        if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot);
+        if (observed.detail || observed.host !== "unknown" || observed.session !== "unknown") return observed;
+        return { ...observed, detail: `candidate probe answered from ${receiptFile} without observing host or session health` };
+      } catch (error) {
+        return unknownPromotionHealth(requiredPermissions, `candidate probe threw: ${errorMessage(error)}`);
       } finally {
         reconcileMacRegistrations({ garbageCollect: false });
       }
@@ -1093,6 +1264,32 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         rollbackDevSnapshot,
       } = await import("./dev-sync.js");
       try {
+        if (!candidatePromotionPreimages) throw new Error("Candidate promotion preimages are unavailable");
+        const outgoing = locateCodex(appRoot);
+        const outgoingRoots = promotionSurfaceRoots({
+          appHash: fingerprintCodex(outgoing).hash,
+          runtimeRoot: paths.runtime,
+          tweaksRoot: paths.tweaks,
+          userRoot: paths.root,
+          tweakersConfigPath: paths.configFile,
+          codexHome: liveCodexHome,
+        });
+        const rollbackExpectation = buildPromotionHealthExpectation({
+          app: fingerprintCodex(outgoing),
+          before: outgoingRoots,
+          after: outgoingRoots,
+          requiredPermissions,
+          userQuestionsRoot: join(paths.tweaks, USER_QUESTIONS_FOLDER),
+        });
+        writeHealthRequest(rollbackHealthExpectationFile, {
+          ...rollbackExpectation,
+          requestedAt: new Date().toISOString(),
+        });
+        liveHealthExpectation = rollbackExpectation;
+        const currentPolicy = fingerprintPromotionPolicyPath(join(liveCodexHome, ".codex-global-state.json"));
+        if (currentPolicy !== candidatePromotionPreimages.policy) {
+          throw new Error("Live promotion policy drifted after candidate preparation");
+        }
         prepareDevSnapshot(candidatePaths.tweaks, paths.tweaks);
         const existingRollout = readUserQuestionsRolloutReceipt(liveUserQuestionsReceiptFile);
         liveUserQuestionsReceipt = existingRollout ?? planUserQuestionsRollout(defaultUserQuestionsRolloutOptions({
@@ -1154,6 +1351,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           requiredPermissions,
           userQuestionsRoot: join(paths.tweaks, USER_QUESTIONS_FOLDER),
         });
+        writeHealthRequest(promotedHealthExpectationFile, {
+          ...liveHealthExpectation,
+          requestedAt: new Date().toISOString(),
+        });
       } catch (error) {
         signedBackupWiring.restoreLive();
         if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
@@ -1174,6 +1375,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         },
       });
       reconcileMacIdentityAfterPromotion();
+      liveHealthExpectation = readDurableLiveHealthExpectation(rollbackHealthExpectationFile);
+      if (!liveHealthExpectation) {
+        throw new Error("Schema-v2 rollback health expectation is unavailable");
+      }
     },
     restoreRuntime: (lastKnownGoodRuntimeRoot, runtimeRoot) => {
       if (existsSync(lastKnownGoodRuntimeRoot)) replaceDirectory(lastKnownGoodRuntimeRoot, runtimeRoot);
@@ -1181,12 +1386,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       signedBackupWiring.restoreLive();
     },
     probeHealth: async () => {
-      const expected = liveHealthExpectation;
-      if (!expected) return unknownPromotionHealth(requiredPermissions);
+      const expected = liveHealthExpectation ?? readDurableLiveHealthExpectation(promotedHealthExpectationFile);
+      if (!expected) return unknownPromotionHealth(requiredPermissions, "no live health expectation was built for this promotion");
       try {
         validateMainRendererAsarEntrypoint(locateCodex(codex.appRoot).asarPath);
-      } catch {
-        return unknownPromotionHealth(requiredPermissions);
+      } catch (error) {
+        return unknownPromotionHealth(requiredPermissions, `promoted app main renderer entrypoint is invalid: ${errorMessage(error)}`);
       }
       const receiptFile = join(paths.root, "health", "promotion.json");
       const deadline = Date.now() + HEALTH_PROBE_RECEIPT_TIMEOUT_MS;
@@ -1195,7 +1400,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      return readProductionHealthReceipt(receiptFile, expected);
+      const observed = readProductionHealthReceipt(receiptFile, expected);
+      if (observed.detail || observed.host !== "unknown" || observed.session !== "unknown") return observed;
+      return {
+        ...observed,
+        detail: `no usable promotion receipt at ${receiptFile} within ${HEALTH_PROBE_RECEIPT_TIMEOUT_MS}ms`,
+      };
     },
     acceptPromotion: async () => {
       if (!liveUserQuestionsReceipt || liveUserQuestionsReceipt.phase !== "sealed" || liveMcpConflictCount !== 0) {
@@ -1219,7 +1429,9 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       }
     },
     openApp: (appRoot) => {
-      const expected = liveHealthExpectation;
+      const expected = liveHealthExpectation
+        ?? readDurableLiveHealthExpectation(promotedHealthExpectationFile)
+        ?? readDurableLiveHealthExpectation(rollbackHealthExpectationFile);
       if (!expected) throw new Error("Schema-v2 live health expectation is unavailable");
       writeHealthRequest(join(paths.root, "health", "request.json"), {
         ...expected,
@@ -1240,7 +1452,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         liveCodexHome,
       );
       if (launched.error || launched.status !== 0 || launched.signal !== null) {
-        throw new Error("Post-promotion health process did not exit cleanly");
+        throw new Error(`Post-promotion ${formatHealthProbeLaunchFailure(launched)}`);
       }
     },
   });
@@ -1928,7 +2140,7 @@ function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSu
     runtime: fingerprintPromotionPath(roots.runtimeRoot),
     tweakTree: fingerprintPromotionPath(roots.tweaksRoot),
     tweakersConfig: fingerprintPromotionPath(roots.tweakersConfigPath),
-    codexConfig: fingerprintPromotionPath(roots.codexConfigPath),
+    codexConfig: fingerprintPromotionCodexConfigPath(roots.codexConfigPath),
     namespaceData: fingerprintPromotionPath(roots.namespaceDataPath),
     mainStorage: fingerprintPromotionPath(roots.mainStoragePath),
     policy: fingerprintPromotionPolicyPath(roots.policyPath),
@@ -2094,7 +2306,11 @@ export function reconcilePromotionMcpConfig(input: {
   }
   const config = readJsonRecord(input.tweakersConfigPath);
   const ownedTweaks = readdirSync(input.tweaksRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    // Dot-directories are lifecycle bookkeeping, not tweaks — notably
+    // .tweaker-dev-history, which prepareDevSnapshot creates INSIDE the live
+    // tweaks root earlier in this same promotion; treating it as a tweak made
+    // the manifest lstat throw ENOENT on every promote.
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith("."))
     .map((entry) => {
       const dir = join(input.tweaksRoot, entry.name);
       const manifestPath = join(dir, "manifest.json");
@@ -2168,13 +2384,32 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function unknownPromotionHealth(requiredPermissions: string[]) {
+function unknownPromotionHealth(requiredPermissions: string[], detail?: string) {
   return {
     host: "unknown" as const,
     session: "unknown" as const,
     permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])),
     promotionReady: "unknown" as const,
+    ...(detail ? { detail } : {}),
   };
+}
+
+/**
+ * Why a health probe process did not answer.
+ *
+ * `spawnSync` reports three different failures — it could not start the
+ * process, the process exited non-zero, or it was killed (a timeout arrives as
+ * `error` plus a signal). All three previously collapsed into a bare "unknown".
+ */
+export function formatHealthProbeLaunchFailure(
+  launched: { error?: Error | null; status?: number | null; signal?: NodeJS.Signals | null },
+): string {
+  const parts: string[] = [];
+  if (launched.error) parts.push(errorMessage(launched.error));
+  if (launched.signal) parts.push(`killed by ${launched.signal}`);
+  if (typeof launched.status === "number" && launched.status !== 0) parts.push(`exit ${launched.status}`);
+  if (launched.status === null && !launched.signal && !launched.error) parts.push("process did not exit");
+  return `health probe did not answer: ${parts.length > 0 ? parts.join("; ") : "unknown launch failure"}`;
 }
 
 function sameAppFingerprint(left: AppFingerprint, right: AppFingerprint): boolean {
@@ -2452,18 +2687,111 @@ function moveDirectoryAcrossVolumes(source: string, destination: string): void {
   }
 }
 
-type NativeAppIdentityHost = { swapDirectories(first: string, second: string): void };
+export const SWAP_HELPER_APP_NAME = "Tweakers Swap Helper.app";
+
+function swapHelperAssetRoot(): string {
+  return join(assetsDir, "swap-helper", SWAP_HELPER_APP_NAME);
+}
+
+function installedSwapHelperRoot(): string {
+  return join(ensureUserPaths().root, "bin", SWAP_HELPER_APP_NAME);
+}
+
+function swapHelperBinary(appRoot: string): string {
+  return join(appRoot, "Contents", "MacOS", "Tweakers Swap Helper");
+}
+
+function sameSwapHelperPayload(source: string, destination: string): boolean {
+  try {
+    return readFileSync(swapHelperBinary(source)).equals(readFileSync(swapHelperBinary(destination)))
+      && readFileSync(join(source, "Contents", "Info.plist")).equals(readFileSync(join(destination, "Contents", "Info.plist")));
+  } catch {
+    return false;
+  }
+}
+
+/** Install the native swap tool once at a stable, locally signed app identity. */
+export function ensureSwapHelperInstalled(): string {
+  const source = swapHelperAssetRoot();
+  const destination = installedSwapHelperRoot();
+  if (!existsSync(source)) throw new Error(`Tweakers swap helper asset is missing: ${source}`);
+  if (!sameSwapHelperPayload(source, destination) || !verifySignature(destination).ok) {
+    const staged = `${destination}.staged-${process.pid}`;
+    rmSync(staged, { recursive: true, force: true });
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(source, staged, { recursive: true, verbatimSymlinks: true });
+    clearQuarantine(staged);
+    const identity = prepareCodeSigning({});
+    execFileSync("codesign", [
+      "--force",
+      "--deep",
+      "--sign",
+      identity?.hash ?? "-",
+      ...codeSigningKeychainArgs(identity),
+      staged,
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    if (!verifySignature(staged).ok) {
+      rmSync(staged, { recursive: true, force: true });
+      throw new Error("Tweakers swap helper signature verification failed");
+    }
+    rmSync(destination, { recursive: true, force: true });
+    renameSync(staged, destination);
+  }
+  return destination;
+}
+
+function runSignedSwapHelper(first: string, second: string): void {
+  const helperRoot = ensureSwapHelperInstalled();
+  const result = spawnSync(swapHelperBinary(helperRoot), ["--swap-directories", first, second], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status === 0) return;
+  const detail = `${result.stderr ?? ""}${result.stdout ?? ""}`.trim()
+    || result.error?.message
+    || `exit ${result.status ?? "unknown"}`;
+  if (result.status === 77 || /operation not permitted|permission denied|errno=(?:1|13)/i.test(detail)) {
+    throw new Error(
+      `${macAppManagementFix(first, result.status === 77 ? "EPERM" : undefined)}`
+      + `The signed Tweakers swap helper could not exchange the protected app directories.\n`
+      + `Original error: ${detail}`,
+    );
+  }
+  throw new Error(`Tweakers signed swap helper failed: ${detail}`);
+}
+
+/**
+ * Exercise the real RENAME_SWAP operation inside the protected live app bundle
+ * before quitting it. Only disposable empty directories are exchanged.
+ */
+export function preflightAtomicAppBundleSwap(appRoot: string): void {
+  const first = join(appRoot, `.tweakers-swap-preflight-a-${process.pid}`);
+  const second = join(appRoot, `.tweakers-swap-preflight-b-${process.pid}`);
+  rmSync(first, { recursive: true, force: true });
+  rmSync(second, { recursive: true, force: true });
+  mkdirSync(first);
+  mkdirSync(second);
+  try {
+    runSignedSwapHelper(first, second);
+    runSignedSwapHelper(first, second);
+  } finally {
+    rmSync(first, { recursive: true, force: true });
+    rmSync(second, { recursive: true, force: true });
+  }
+}
 
 function prepareAtomicSwapDirectories(
   sourceContents: string,
   destinationContents: string,
 ): (first: string, second: string) => void {
   if (process.platform !== "darwin") throw new Error("Atomic app bundle exchange is available only on macOS");
-  const require = createRequire(import.meta.url);
+  // Verify the staged payload still carries the signed native host expected by
+  // this installer, but execute the protected filesystem mutation from the
+  // stable signed helper app rather than from the version-managed Node host.
   const evidence = resolveStagedSwapNativeHostEvidence(sourceContents, destinationContents);
   verifyNativeHostMatchesApp(evidence.containingAppRoot, evidence.hostPath);
-  const nativeHost = require(evidence.hostPath) as NativeAppIdentityHost;
-  return (first, second) => nativeHost.swapDirectories(first, second);
+  ensureSwapHelperInstalled();
+  return runSignedSwapHelper;
 }
 
 export interface StagedSwapNativeHostEvidence {
@@ -2974,6 +3302,30 @@ async function injectLoader(
     }
 
     patchCodexWindowServices(dir, originalMain, step);
+    const modelSelectionPatch = patchCodexModelSelectionInExtractedApp(dir);
+    if (modelSelectionPatch.status === "not-applicable") {
+      step(
+        `Codex model selector draft override not applicable (${modelSelectionPatch.scannedFiles} renderer files scanned)`,
+      );
+    } else {
+      step(
+        `${modelSelectionPatch.status === "patched" ? "Patched" : "Verified"} Codex model selector draft override in ${
+          kleur.dim(modelSelectionPatch.relativePath ?? "unknown renderer file")
+        } using ${kleur.cyan(modelSelectionPatch.strategy ?? "existing marker")}`,
+      );
+    }
+    const inactiveThreadRetentionPatch = patchCodexInactiveThreadRetentionInExtractedApp(dir);
+    if (inactiveThreadRetentionPatch.status === "not-applicable") {
+      step(
+        `Codex inactive-thread retention patch not applicable (${inactiveThreadRetentionPatch.scannedFiles} renderer files scanned)`,
+      );
+    } else {
+      step(
+        `${inactiveThreadRetentionPatch.status === "patched" ? "Patched" : "Verified"} Codex inactive-thread retention policy in ${
+          kleur.dim(inactiveThreadRetentionPatch.relativePath ?? "unknown renderer file")
+        } using ${kleur.cyan(inactiveThreadRetentionPatch.strategy ?? "existing policy")}`,
+      );
+    }
   });
   return originalMain;
 }

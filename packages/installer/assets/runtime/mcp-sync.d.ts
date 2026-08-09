@@ -83,6 +83,14 @@ export declare function sanitizePreservedApprovalPolicy(value: unknown): Preserv
 export declare function sanitizePreservedMcpOptions(value: unknown, allowedServerNames: Iterable<string>): PreservedMcpOptionsByServerName;
 export declare function mergeManagedMcpBlock(currentToml: string, managedBlock: string): string;
 export declare function stripManagedMcpBlock(toml: string): string;
+/**
+ * True when the document contains a stray managed END marker that
+ * stripManagedMcpBlock would heal — an END (current or legacy generation)
+ * appearing before any BEGIN. Callers that suppress rewrites when nothing
+ * "real" changed must treat such a document as needing a rewrite, or the
+ * heal is planned and discarded forever while the corruption persists.
+ */
+export declare function hasStrayManagedMcpEndMarker(toml: string): boolean;
 export declare function mcpServerNameFromTweakId(id: string): string;
 /**
  * Validate the complete document before MCP code inspects or rewrites any

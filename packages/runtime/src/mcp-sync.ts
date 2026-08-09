@@ -181,13 +181,54 @@ export function planManagedMcpReconciliation(
   const preservedOptions = sanitizePreservedMcpOptions(options.preservedOptions, ownedByName.keys());
   const allTables = findMcpServerTables(currentToml);
   let manualToml = stripManagedMcpBlock(currentToml);
-  const tables = findMcpServerTables(manualToml);
+  const manualTables = findMcpServerTables(manualToml);
   const desiredNames: string[] = [];
   const appliedNames: string[] = [];
   const migrations: Array<{ from: string; to: string }> = [];
   const conflicts: McpConflict[] = [];
   const entries: string[] = [];
   const rangesToRemove: McpTableRange[] = [];
+
+  // A lost BEGIN marker strands managed table content in the manual half
+  // (its orphan END is healed by stripManagedMcpBlock). Reserved env keys
+  // prove managed origin — normalizeMcpServer refuses them in tweak
+  // manifests — so a manual table carrying one is managed residue to
+  // reclaim, never user config to adopt. An exactly-owned inline table keeps
+  // the existing reclaim/migration path below; a nested-shape group (for
+  // example Codex normalizing env into a [mcp_servers.X.env] subtable) can
+  // never be reclaimed by that path — it reports canonical-collision forever
+  // — so reserved keys make the whole group residue here.
+  // Matches the key as a bare assignment (env subtable line) or inside the
+  // writer's inline env table ("env = { TWEAKER_TWEAK_ID = ... }").
+  const reservedKeyPattern = new RegExp(
+    `(^|[\\r\\n{,])\\s*(?:${RESERVED_MANAGED_MCP_ENV_KEYS.join("|")})\\s*=`,
+  );
+  const ownedLegacyNames = new Set<string>();
+  for (const tweak of ownedByName.values()) {
+    const legacy = legacyMcpServerName(tweak.manifest.id);
+    if (legacy) ownedLegacyNames.add(legacy);
+  }
+  const residueBaseNames = new Set<string>();
+  for (const table of manualTables) {
+    if (!reservedKeyPattern.test(table.body)) continue;
+    const dot = table.name.indexOf(".");
+    const baseName = dot === -1 ? table.name : table.name.slice(0, dot);
+    const owned = ownedByName.has(baseName) || ownedLegacyNames.has(baseName);
+    // Reserved keys inside a nested table (the writer's env normalized into
+    // [mcp_servers.X.env]) prove the nested shape itself is managed — purge
+    // even for owned bases, since the exactly-owned path can never match it.
+    // For an owned base with reserved keys only inline, a nested subtable
+    // may be a manual user extension: keep the existing reclaim/conflict
+    // paths, which preserve the document byte-for-byte on conflict.
+    if (owned && dot === -1) continue;
+    residueBaseNames.add(baseName);
+  }
+  for (const table of manualTables) {
+    if (residueBaseNames.has(table.name.split(".")[0]!)) rangesToRemove.push(table);
+  }
+  const tables = manualTables.filter(
+    (table) => !residueBaseNames.has(table.name.split(".")[0]!),
+  );
 
   for (const [canonicalName, tweak] of ownedByName) {
     const mcp = normalizeMcpServer(tweak.manifest.mcp);
@@ -493,6 +534,19 @@ export function stripManagedMcpBlock(toml: string): string {
   ]);
   const ranges: Array<{ start: number; end: number }> = [];
   let open: { start: number; end: string } | null = null;
+  let seenStartMarker = false;
+
+  const consumePrecedingNewline = (start: number): number => {
+    let rangeStart = start;
+    if (rangeStart > 0) {
+      if (toml[rangeStart - 1] === "\n") rangeStart -= 1;
+      else if (toml[rangeStart - 1] === "\r") {
+        rangeStart -= 1;
+        if (rangeStart > 0 && toml[rangeStart - 1] === "\n") rangeStart -= 1;
+      }
+    }
+    return rangeStart;
+  };
 
   for (const line of classifyTomlLines(toml)) {
     if (!line.structural) continue;
@@ -502,21 +556,28 @@ export function stripManagedMcpBlock(toml: string): string {
     if (startMarker) {
       if (open) throw malformedToml("managed MCP marker block is nested or missing its end marker");
       open = { start: line.start, end: startMarker };
+      seenStartMarker = true;
       continue;
     }
     if (!endMarker) continue;
-    if (!open || open.end !== marker) {
+    if (!open) {
+      // An END marker before any BEGIN is stray corruption left by an
+      // external writer that dropped the managed block. This reconciler runs
+      // inside environment commit, rollback, AND recover, so failing here
+      // makes the corruption unrecoverable by the machine itself — remove
+      // the stray line as part of the rewrite instead. An END after a
+      // completed block stays a hard failure: its BEGIN may have been lost
+      // between the markers, which would leak managed content as manual.
+      if (seenStartMarker) {
+        throw malformedToml("managed MCP marker block has an unmatched end marker");
+      }
+      ranges.push({ start: consumePrecedingNewline(line.start), end: line.end });
+      continue;
+    }
+    if (open.end !== marker) {
       throw malformedToml("managed MCP marker block has an unmatched end marker");
     }
-    let rangeStart = open.start;
-    if (rangeStart > 0) {
-      if (toml[rangeStart - 1] === "\n") rangeStart -= 1;
-      else if (toml[rangeStart - 1] === "\r") {
-        rangeStart -= 1;
-        if (rangeStart > 0 && toml[rangeStart - 1] === "\n") rangeStart -= 1;
-      }
-    }
-    ranges.push({ start: rangeStart, end: line.end });
+    ranges.push({ start: consumePrecedingNewline(open.start), end: line.end });
     open = null;
   }
   if (open) throw malformedToml("managed MCP marker block is missing its end marker");
@@ -526,6 +587,25 @@ export function stripManagedMcpBlock(toml: string): string {
     stripped = `${stripped.slice(0, range.start)}\n${stripped.slice(range.end)}`;
   }
   return stripped;
+}
+
+/**
+ * True when the document contains a stray managed END marker that
+ * stripManagedMcpBlock would heal — an END (current or legacy generation)
+ * appearing before any BEGIN. Callers that suppress rewrites when nothing
+ * "real" changed must treat such a document as needing a rewrite, or the
+ * heal is planned and discarded forever while the corruption persists.
+ */
+export function hasStrayManagedMcpEndMarker(toml: string): boolean {
+  const startMarkers = new Set([MCP_MANAGED_START, LEGACY_MCP_MANAGED_START]);
+  const endMarkers = new Set([MCP_MANAGED_END, LEGACY_MCP_MANAGED_END]);
+  for (const line of classifyTomlLines(toml)) {
+    if (!line.structural) continue;
+    const marker = line.text.trim();
+    if (startMarkers.has(marker)) return false;
+    if (endMarkers.has(marker)) return true;
+  }
+  return false;
 }
 
 export function mcpServerNameFromTweakId(id: string): string {

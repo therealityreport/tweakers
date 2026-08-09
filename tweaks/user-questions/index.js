@@ -10,6 +10,17 @@ const NONCE_PATTERN = /^[A-Za-z0-9._~-]{8,128}$/;
 const OTHER_VALUE = "__other__";
 const SKIP_VALUE = "__skip__";
 const CARRIER_OTHER_TEXT_PREFIX = "__tweakers_carrier_other_";
+const SAFE_RENDERER_ERROR_CODES = new Set([
+  "carrier_attach",
+  "generic_mount",
+  "host_empty_response",
+  "owned_mount",
+  "renderer_unavailable",
+  "request_failed",
+  "request_timeout",
+  "route_invalidated",
+  "tweak_stopped",
+]);
 
 module.exports = {
   async start(api) {
@@ -228,13 +239,13 @@ async function claimCarrier(api, state, nonce, attached) {
       restoreHostForm(controller.form, session.formSnapshot);
       await releaseSession(session);
       if (state.stopped) return;
-      api.log.warn("User Questions generic form was not visibly mounted; acknowledgement withheld", safeErrorCode(error));
+      api.log.warn("User Questions generic form was not visibly mounted; acknowledgement withheld", redactedErrorMetadata(error));
     } else if (session) {
       state.sessions.set(controller.form, session);
       try {
         await acknowledgeVisibleGenericFallback(session);
       } catch (fallbackError) {
-        api.log.warn("User Questions mount fallback was not visibly painted; acknowledgement withheld", safeErrorCode(fallbackError));
+        api.log.warn("User Questions mount fallback was not visibly painted; acknowledgement withheld", redactedErrorMetadata(fallbackError));
       }
       if (state.stopped) {
         await abandonStoppedSession(session);
@@ -250,7 +261,7 @@ async function claimCarrier(api, state, nonce, attached) {
         void scanForCarriers(api, state);
       });
     }
-    api.log.warn("User Questions owned card was not claimed; generic form preserved", safeErrorCode(error));
+    api.log.warn("User Questions owned card was not claimed; generic form preserved", redactedErrorMetadata(error));
   }
 }
 
@@ -429,6 +440,11 @@ function renderOption(session, question, answer, option) {
   input.name = `uq-${question.id}`;
   input.value = option.id;
   input.checked = answer.selected_option_ids.includes(option.id);
+  const limitDisabled = question.selection_mode === "multiple"
+    && !input.checked
+    && selectedChoiceCount(session, question, answer) >= question.max_selections;
+  input.disabled = limitDisabled;
+  if (limitDisabled) input.setAttribute("data-uq-selection-limit", "");
   input.className = "mt-1 shrink-0 accent-token-charts-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border";
   input.addEventListener("change", () => chooseOption(session, question, answer, option.id, input.checked));
   const content = element("div", "flex min-w-0 flex-1 flex-col gap-1");
@@ -478,6 +494,11 @@ function renderOther(session, question, answer) {
   input.name = `uq-${question.id}`;
   input.value = OTHER_VALUE;
   input.checked = selected;
+  const limitDisabled = question.selection_mode === "multiple"
+    && !selected
+    && selectedChoiceCount(session, question, answer) >= question.max_selections;
+  input.disabled = limitDisabled;
+  if (limitDisabled) input.setAttribute("data-uq-selection-limit", "");
   input.className = "shrink-0 accent-token-charts-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border";
   input.addEventListener("change", () => chooseOther(session, question, input.checked));
   label.append(input, document.createTextNode("Other"));
@@ -643,7 +664,7 @@ async function sendAction(session, action) {
     return result?.ok === true;
   } catch (error) {
     failSession(session, "Your answers are saved, but the question service stopped responding.", true);
-    session.api.log.warn("User Questions action delivery failed", safeErrorCode(error));
+    session.api.log.warn("User Questions action delivery failed", redactedErrorMetadata(error));
     return false;
   } finally {
     session.busy = false;
@@ -689,7 +710,7 @@ async function completeHostSubmission(session) {
       await releaseSession(session);
     } catch (error) {
       failSession(session, "Your choices are saved. Retry to finish sending them.", true);
-      session.api.log.warn("User Questions host submission failed", safeErrorCode(error));
+      session.api.log.warn("User Questions host submission failed", redactedErrorMetadata(error));
     }
   })();
   session.hostSubmissionPromise = completion;
@@ -703,68 +724,27 @@ async function completeHostSubmission(session) {
 function populateHostForm(session) {
   const names = new Set(session.identity.schemaPropertyNames);
   const carrier = carrierFieldName(session.identity.schemaPropertyNames);
-  if (carrier) {
-    const question = session.view.input.questions[0];
-    if (!question) throw new Error("carrier question is missing");
-    const answer = session.view.state.answers[question.id];
-    if (!answer) throw new Error("carrier answer is missing");
-    const values = answer.status === "skipped"
-      ? [SKIP_VALUE]
-      : [
-          ...answer.selected_option_ids,
-          ...(session.view.state.other_selected_question_ids.includes(question.id) ? [OTHER_VALUE] : []),
-        ];
-    if (question.selection_mode === "single") {
-      session.controller.setRadio(carrier, values[0]);
-    } else {
-      const allValues = [...question.options.map((option) => option.id), SKIP_VALUE, ...(question.allow_other ? [OTHER_VALUE] : [])];
-      for (const value of allValues) session.controller.setCheckbox(carrier, value, values.includes(value));
-    }
-    const otherField = carrierOtherTextField(carrier);
-    if (question.allow_other && names.has(otherField)) {
-      session.controller.setText(otherField, answer.other_text || "");
-    }
-    return;
+  if (!carrier) throw new Error("owned carrier field is missing");
+  const question = session.view.input.questions[0];
+  if (!question) throw new Error("carrier question is missing");
+  const answer = session.view.state.answers[question.id];
+  if (!answer) throw new Error("carrier answer is missing");
+  const values = answer.status === "skipped"
+    ? [SKIP_VALUE]
+    : [
+        ...answer.selected_option_ids,
+        ...(session.view.state.other_selected_question_ids.includes(question.id) ? [OTHER_VALUE] : []),
+      ];
+  if (question.selection_mode === "single") {
+    session.controller.setRadio(carrier, values[0]);
+  } else {
+    const allValues = [...question.options.map((option) => option.id), SKIP_VALUE, ...(question.allow_other ? [OTHER_VALUE] : [])];
+    for (const value of allValues) session.controller.setCheckbox(carrier, value, values.includes(value));
   }
-  for (const [index, question] of session.view.input.questions.entries()) {
-    const answer = session.view.state.answers[question.id];
-    const values = answer.status === "skipped"
-      ? [SKIP_VALUE]
-      : [
-          ...answer.selected_option_ids,
-          ...(session.view.state.other_selected_question_ids.includes(question.id) ? [OTHER_VALUE] : []),
-        ];
-    if (names.has(question.id)) {
-      if (question.selection_mode === "single") session.controller.setRadio(question.id, values[0]);
-      else {
-        const allValues = [...question.options.map((option) => option.id), SKIP_VALUE, ...(question.allow_other ? [OTHER_VALUE] : [])];
-        for (const value of allValues) session.controller.setCheckbox(question.id, value, values.includes(value));
-      }
-    } else {
-      populateLegacyQuestion(session, names, question, index, values);
-    }
-    const otherField = names.has(`${question.id}__other_text`)
-      ? `${question.id}__other_text`
-      : `__uq_q${index}_other_text`;
-    if (question.allow_other && names.has(otherField)) session.controller.setText(otherField, answer.other_text || "");
+  const otherField = carrierOtherTextField(carrier);
+  if (question.allow_other && names.has(otherField)) {
+    session.controller.setText(otherField, answer.other_text || "");
   }
-}
-
-function populateLegacyQuestion(session, names, question, index, values) {
-  if (question.selection_mode === "single" && names.has(question.id)) {
-    session.controller.setRadio(question.id, values[0]);
-    return;
-  }
-  if (question.selection_mode !== "multiple") throw new Error("host form question field drifted");
-  question.options.forEach((option, optionIndex) => {
-    const field = `__uq_q${index}_option_${optionIndex}`;
-    if (!names.has(field)) throw new Error("host form option field drifted");
-    session.controller.setCheckbox(field, option.id, values.includes(option.id));
-  });
-  const skip = `__uq_q${index}_skip`;
-  if (names.has(skip)) session.controller.setCheckbox(skip, SKIP_VALUE, values.includes(SKIP_VALUE));
-  const other = `__uq_q${index}_other_selected`;
-  if (names.has(other)) session.controller.setCheckbox(other, OTHER_VALUE, values.includes(OTHER_VALUE));
 }
 
 async function closeAndSave(session) {
@@ -825,14 +805,14 @@ function renderMountRetry(session, message) {
           await abandonStoppedSession(session);
           return;
         }
-        session.api.log.warn("User Questions retry fallback was not visibly painted; acknowledgement withheld", safeErrorCode(fallbackError));
+        session.api.log.warn("User Questions retry fallback was not visibly painted; acknowledgement withheld", redactedErrorMetadata(fallbackError));
       }
       if (session.closed || session.ownerState.stopped) {
         await abandonStoppedSession(session);
         return;
       }
       renderMountRetry(session, "The enhanced question card still could not confirm delivery.");
-      session.api.log.warn("User Questions mount retry failed", safeErrorCode(error));
+      session.api.log.warn("User Questions mount retry failed", redactedErrorMetadata(error));
     }
   });
 }
@@ -1145,7 +1125,9 @@ function restoreRequestFocus(session) {
 }
 
 function setBusy(session, busy) {
-  for (const control of session.card?.querySelectorAll?.("button, input, textarea") || []) control.disabled = busy;
+  for (const control of session.card?.querySelectorAll?.("button, input, textarea") || []) {
+    control.disabled = busy || control.hasAttribute?.("data-uq-selection-limit");
+  }
   session.card?.setAttribute?.("aria-busy", String(busy));
 }
 
@@ -1224,7 +1206,17 @@ function element(tag, className, text) {
 function preventDefault(event) { event.preventDefault(); }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null; }
 function safeDomId(value) { return String(value).replace(/[^A-Za-z0-9_-]/g, "-"); }
-function safeErrorCode(error) { return String(error?.code || error?.message || "request_failed").slice(0, 160); }
+function selectedChoiceCount(session, question, answer) {
+  return answer.selected_option_ids.length
+    + (session.view.state.other_selected_question_ids.includes(question.id) ? 1 : 0);
+}
+function safeErrorCode(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  return SAFE_RENDERER_ERROR_CODES.has(code) ? code : "request_failed";
+}
+function redactedErrorMetadata(error) {
+  return Object.freeze({ code: safeErrorCode(error), contentRedacted: true });
+}
 function carrierFieldName(propertyNames) {
   const matches = [...propertyNames].filter((name) => name.startsWith(CARRIER_NONCE_PREFIX));
   return matches.length === 1 ? matches[0] : null;

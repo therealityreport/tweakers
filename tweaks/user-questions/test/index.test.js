@@ -89,6 +89,39 @@ test("owned renderer is semantic, reducer-driven, accessible, and submits exact 
   await harness.stop();
 });
 
+test("owned multi-select disables additional choices at max_selections and re-enables them after deselection", async () => {
+  const harness = rendererHarness({ multipleMaxSelections: 1 });
+  await harness.start();
+  harness.card().querySelectorAll("input").find((input) => input.value === "built_in").click();
+  await flushDom();
+  findByText(harness.card(), "button", "Next").click();
+  await flushDom();
+
+  harness.card().querySelectorAll("input").find((input) => input.value === "email").click();
+  await flushDom();
+  assert.equal(harness.card().querySelectorAll("input").find((input) => input.value === "desktop").disabled, true);
+  assert.equal(harness.card().querySelectorAll("input").find((input) => input.value === "__other__").disabled, true);
+
+  harness.card().querySelectorAll("input").find((input) => input.value === "email").click();
+  await flushDom();
+  assert.equal(harness.card().querySelectorAll("input").find((input) => input.value === "desktop").disabled, false);
+  assert.equal(harness.card().querySelectorAll("input").find((input) => input.value === "__other__").disabled, false);
+  await harness.stop();
+});
+
+test("renderer diagnostics replace arbitrary host error content with structured redacted metadata", async () => {
+  const secret = "unique-question-answer-secret";
+  const harness = rendererHarness({
+    claimError: Object.assign(new Error(secret), { code: secret }),
+  });
+  await harness.start();
+  const emitted = harness.logs.join("\n");
+  assert.equal(emitted.includes(secret), false);
+  assert.match(emitted, /"code":"request_failed"/);
+  assert.match(emitted, /"contentRedacted":true/);
+  await harness.stop();
+});
+
 test("carrier discovery accepts a bounded deep host ancestry", async () => {
   const harness = rendererHarness({ fiberDepth: 48 });
   await harness.start();
@@ -487,6 +520,9 @@ function rendererHarness(options = {}) {
   dom.document.body.append(carrier);
 
   const input = questionInput(options.longCopy);
+  if (Number.isInteger(options.multipleMaxSelections)) {
+    input.questions[1].max_selections = options.multipleMaxSelections;
+  }
   let currentState = options.draft ? draftState(input) : claimState(input);
   let draft = options.draft
     ? { status: "available", resumable: true, expires_at: Date.now() + 10_000 }
@@ -565,7 +601,14 @@ function rendererHarness(options = {}) {
   }
   const api = {
     process: "renderer",
-    log: { warn(...args) { logs.push(args.map(String).join(" ")); }, debug() {}, info() {}, error() {} },
+    log: {
+      warn(...args) {
+        logs.push(args.map((value) => (
+          value && typeof value === "object" ? JSON.stringify(value) : String(value)
+        )).join(" "));
+      },
+      debug() {}, info() {}, error() {},
+    },
     settings: {
       registerPage(definition) {
         page = definition;
@@ -597,6 +640,7 @@ function rendererHarness(options = {}) {
     ipc: {
       async invoke(channel, ...args) {
         if (channel === "claim") {
+          if (options.claimError) throw options.claimError;
           if (options.deferClaim) {
             return new Promise((resolve) => {
               resolveDeferredClaim = () => resolve(view("claim-token", input, currentState, draft));

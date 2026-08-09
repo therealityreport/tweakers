@@ -15,3 +15,13 @@ export declare function promotionPolicyFingerprintFailureReason(error: unknown):
 export declare function trustedPromotionPolicyMode(mode: number): boolean;
 /** Semantic, bounded and no-follow policy proof used by runtime observation. */
 export declare function fingerprintPromotionPolicyPath(path: string, deps?: PromotionPolicyReadDependencies): string;
+/**
+ * Codex config promotion proof. The desktop app stamps volatile bookkeeping
+ * into config.toml on every boot (`last_updated = "…"` in marketplace
+ * tables), so a raw byte hash can never survive the candidate health probe,
+ * which must boot the app to observe the surface. Hash the content with those
+ * volatile lines removed; every substantive edit (servers, enabled flags,
+ * env, args) still changes the fingerprint. Paired with the installer twin in
+ * packages/installer/src/promotion-policy.ts — keep both byte-identical.
+ */
+export declare function fingerprintPromotionCodexConfigPath(path: string): string;

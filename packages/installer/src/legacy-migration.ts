@@ -18,7 +18,6 @@ import { LEGACY_DATA_DIR } from "./legacy-compat.js";
 export const CANONICAL_TWEAK_DIRS = Object.freeze([
   "co.tweakers.account-switcher",
   "co.tweakers.appshots",
-  "co.tweakers.browser-trust",
   "co.tweakers.developer-tools",
   "co.tweakers.shadcn-codex-ui",
   "followup",

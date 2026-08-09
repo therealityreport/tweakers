@@ -26,6 +26,15 @@ const helpers = {
   setToggleEnabled,
   pruneDetached,
   countMessageWords,
+  applySidebarLayout,
+  applyChatMultiSelect,
+  applyMessageMetrics,
+  sidebarChatRows,
+  selectedSidebarChatRows,
+  confirmAndCopySelectedSidebarChatTitles,
+  updateSidebarLayout,
+  startObserver,
+  stopObserver,
   installStyle,
 };
 
@@ -35,7 +44,22 @@ module.exports = {
     const stored = api?.storage?.get?.(STORAGE_KEY, null);
     const enabled = normalizeToggleState(stored);
     const savedLayout = api?.storage?.get?.(LAYOUT_KEY, null);
-    const state = { api, enabled, layout: { width: Math.min(420, Math.max(220, Number(savedLayout?.width) || 288)), density: ["compact", "comfortable"].includes(savedLayout?.density) ? savedLayout.density : "comfortable" }, mounts: [], listeners: [], styles: [], settings: null, disposed: false, observer: null, scanPending: null };
+    const state = {
+      api,
+      enabled,
+      layout: {
+        width: Math.min(420, Math.max(220, Number(savedLayout?.width) || 288)),
+        density: ["compact", "comfortable"].includes(savedLayout?.density) ? savedLayout.density : "comfortable",
+      },
+      mounts: [],
+      listeners: [],
+      styles: [],
+      settings: null,
+      settingsRoot: null,
+      disposed: false,
+      observer: null,
+      scanPending: null,
+    };
     instances.set(this, state);
     if (stored?.version !== STORAGE_VERSION) persistToggleState(state);
     state.settings = api?.settings?.registerPage?.({
@@ -58,8 +82,7 @@ module.exports = {
       window.clearTimeout?.(state.scanPending);
       state.scanPending = null;
     }
-    state.observer?.disconnect?.();
-    state.observer = null;
+    stopObserver(state);
     for (const id of TOGGLE_IDS) cleanupToggle(state, id, { keepEnabled: true });
     state.settings?.unregister?.();
     instances.delete(this);
@@ -70,12 +93,21 @@ module.exports = {
 };
 
 // One shared, rAF-debounced observer dispatches to every enabled behavior.
-// (Previously each toggle installed its own document-wide observer, so N
-// enabled toggles meant N full-document scans per mutation.)
+// It is disconnected when every improvement is off, so an idle tweak has no
+// host-observation work to perform.
 function startObserver(state) {
-  if (state.disposed) return;
+  if (state.disposed || state.observer || state.enabled.size === 0) return;
   const disposeHost = state.api?.react?.host?.observe?.(["projects", "assistant-turns", "composer", "command-menu", "settings-rows"], () => scheduleScanAll(state));
-  state.observer = disposeHost ? { disconnect: disposeHost } : null;
+  state.observer = typeof disposeHost === "function" ? { disconnect: disposeHost } : null;
+}
+
+function stopObserver(state) {
+  state?.observer?.disconnect?.();
+  if (state) state.observer = null;
+}
+
+function stopObserverWhenIdle(state) {
+  if (state?.enabled?.size === 0) stopObserver(state);
 }
 
 function scheduleScanAll(state) {
@@ -128,10 +160,13 @@ function setToggleEnabled(state, id, enabled, options = {}) {
   if (enabled) {
     state.enabled.add(id);
     activateToggle(state, id);
+    startObserver(state);
   } else {
     cleanupToggle(state, id);
+    stopObserverWhenIdle(state);
   }
   if (options.persist !== false) persistToggleState(state);
+  if (state.settingsRoot?.isConnected !== false) renderSettings(state.settingsRoot, state);
   return state.enabled.has(id);
 }
 
@@ -174,40 +209,108 @@ function applySidebarLayout(state) {
 }
 
 function applyChatMultiSelect(state) {
-  const matches = state.api?.react?.host?.query?.("assistant-turns") || [];
-  for (const message of matches.map((match) => match.element)) {
-    if (message.hasAttribute("data-tweaker-multiselect-ready")) continue;
-    message.setAttribute("data-tweaker-multiselect-ready", "true");
+  for (const row of sidebarChatRows()) {
+    if (row.hasAttribute("data-tweaker-sidebar-chat-multiselect-ready")) continue;
+    row.setAttribute("data-tweaker-sidebar-chat-multiselect-ready", "true");
     const onClick = (event) => {
       if (!event.metaKey && !event.ctrlKey) return;
+      if (event.button != null && event.button !== 0) return;
       event.preventDefault();
-      message.toggleAttribute("data-tweaker-message-selected");
-      renderSelectionToolbar(state);
+      event.stopPropagation?.();
+      row.toggleAttribute("data-tweaker-sidebar-chat-selected");
+      removeSidebarChatSelectionToolbar(state);
     };
-    message.addEventListener("click", onClick);
-    state.listeners.push({ id: "chat-multi-select", target: message, type: "click", listener: onClick });
+    const onContextMenu = (event) => {
+      if (!row.hasAttribute("data-tweaker-sidebar-chat-selected")) return;
+      event.preventDefault();
+      event.stopPropagation?.();
+      renderSidebarChatSelectionToolbar(state);
+    };
+    row.addEventListener("click", onClick);
+    row.addEventListener("contextmenu", onContextMenu);
+    state.listeners.push({ id: "chat-multi-select", target: row, type: "click", listener: onClick });
+    state.listeners.push({ id: "chat-multi-select", target: row, type: "contextmenu", listener: onContextMenu });
     ownMount(state, "chat-multi-select", () => {
-      message.removeAttribute("data-tweaker-multiselect-ready");
-      message.removeAttribute("data-tweaker-message-selected");
-    }, message);
+      row.removeAttribute("data-tweaker-sidebar-chat-multiselect-ready");
+      row.removeAttribute("data-tweaker-sidebar-chat-selected");
+    }, row);
   }
 }
 
-function renderSelectionToolbar(state) {
-  document.querySelector("[data-tweaker-selection-toolbar]")?.remove();
-  const selected = [...document.querySelectorAll("[data-tweaker-message-selected]")];
+// Sidebar chats have stable native row markers, unlike assistant messages in
+// the main transcript. Never infer chats from text or broad list-item scans.
+function sidebarChatRows(doc = typeof document === "undefined" ? null : document) {
+  const rows = new Set();
+  const candidates = doc?.querySelectorAll?.("[data-app-action-sidebar-thread-id], [data-app-action-sidebar-thread-pinned='true']") || [];
+  for (const candidate of candidates) {
+    const row = closestSidebarChatRow(candidate);
+    if (row) rows.add(row);
+  }
+  return [...rows];
+}
+
+function closestSidebarChatRow(candidate) {
+  const row = candidate?.closest?.("[data-app-action-sidebar-thread-row], [role='listitem']") || candidate;
+  const sidebar = row?.closest?.("aside, nav, [role='navigation']") || candidate?.closest?.("aside, nav, [role='navigation']");
+  return sidebar ? row : null;
+}
+
+function selectedSidebarChatRows(doc = typeof document === "undefined" ? null : document) {
+  return [...(doc?.querySelectorAll?.("[data-tweaker-sidebar-chat-selected]") || [])]
+    .filter((row) => row.hasAttribute?.("data-tweaker-sidebar-chat-multiselect-ready"));
+}
+
+function renderSidebarChatSelectionToolbar(state) {
+  removeSidebarChatSelectionToolbar(state);
+  const selected = selectedSidebarChatRows();
   if (!selected.length) return;
   const toolbar = document.createElement("div");
-  toolbar.setAttribute("data-tweaker-selection-toolbar", "true");
+  toolbar.setAttribute("data-tweaker-sidebar-chat-selection-toolbar", "true");
+  toolbar.setAttribute("role", "toolbar");
   toolbar.className = "fixed bottom-6 left-1/2 z-[9999] flex -translate-x-1/2 gap-2 rounded-lg border border-token-border bg-token-main-surface-primary p-2 shadow-lg";
+  const summary = document.createElement("span");
+  summary.className = "self-center px-1 text-sm text-token-text-secondary";
+  summary.textContent = `${selected.length} chat${selected.length === 1 ? "" : "s"} selected`;
   const copy = document.createElement("button");
-  copy.type = "button"; copy.className = "rounded-md bg-token-foreground/5 px-3 py-1.5 text-sm text-token-text-primary"; copy.textContent = `Copy ${selected.length}`;
-  copy.addEventListener("click", () => void navigator.clipboard?.writeText(selected.map((node) => node.textContent || "").join("\n\n")));
+  copy.type = "button"; copy.className = "rounded-md bg-token-foreground/5 px-3 py-1.5 text-sm text-token-text-primary"; copy.textContent = `Copy ${selected.length} title${selected.length === 1 ? "" : "s"}`;
+  copy.addEventListener("click", () => { void confirmAndCopySelectedSidebarChatTitles(state); });
   const clear = document.createElement("button");
   clear.type = "button"; clear.className = copy.className; clear.textContent = "Clear";
-  clear.addEventListener("click", () => { for (const node of selected) node.removeAttribute("data-tweaker-message-selected"); toolbar.remove(); });
-  toolbar.append(copy, clear); document.body.appendChild(toolbar);
+  clear.addEventListener("click", () => { clearSelectedSidebarChatRows(state); });
+  toolbar.append(summary, copy, clear); document.body.appendChild(toolbar);
   ownMount(state, "chat-multi-select", () => toolbar.remove(), toolbar);
+}
+
+function removeSidebarChatSelectionToolbar(state) {
+  if (typeof document !== "undefined") document.querySelector?.("[data-tweaker-sidebar-chat-selection-toolbar]")?.remove?.();
+  if (!Array.isArray(state?.mounts)) return;
+  state.mounts = state.mounts.filter((entry) => {
+    if (entry?.id !== "chat-multi-select" || entry?.node?.getAttribute?.("data-tweaker-sidebar-chat-selection-toolbar") !== "true") return true;
+    entry.remove?.();
+    return false;
+  });
+}
+
+function clearSelectedSidebarChatRows(state, doc = typeof document === "undefined" ? null : document) {
+  for (const row of selectedSidebarChatRows(doc)) row.removeAttribute("data-tweaker-sidebar-chat-selected");
+  removeSidebarChatSelectionToolbar(state);
+}
+
+async function confirmAndCopySelectedSidebarChatTitles(state) {
+  const titles = selectedSidebarChatRows().map((row) => String(row.textContent || "").replace(/\s+/g, " ").trim().slice(0, 240)).filter(Boolean);
+  if (!titles.length) return false;
+  const confirm = typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm.bind(window) : null;
+  if (!confirm?.(`Copy the titles of ${titles.length} selected chat${titles.length === 1 ? "" : "s"} to the clipboard?`)) return false;
+  try {
+    const clipboard = typeof navigator === "undefined" ? null : navigator.clipboard;
+    if (!clipboard?.writeText) return false;
+    await clipboard.writeText(titles.join("\n"));
+    removeSidebarChatSelectionToolbar(state);
+    return true;
+  } catch (error) {
+    state?.api?.log?.warn?.("UI Improvements could not copy selected chat titles", String(error));
+    return false;
+  }
 }
 
 function applySlashMenuImprovements(state) {
@@ -231,15 +334,22 @@ function applySlashMenuImprovements(state) {
 function applyMessageMetrics(state) {
   const matches = state.api?.react?.host?.query?.("assistant-turns") || [];
   for (const message of matches.map((match) => match.element)) {
-    if (message.querySelector("[data-tweaker-message-metrics]")) continue;
+    let metrics = message.querySelector?.("[data-tweaker-message-metrics]") || null;
     const words = countMessageWords(message);
-    if (!words) continue;
-    const metrics = document.createElement("span");
-    metrics.setAttribute("data-tweaker-message-metrics", "true");
-    metrics.className = "text-token-text-secondary text-xs";
+    if (!words) {
+      metrics?.remove?.();
+      continue;
+    }
+    if (!metrics) {
+      metrics = document.createElement("span");
+      metrics.setAttribute("data-tweaker-message-metrics", "true");
+      metrics.className = "text-token-text-secondary text-xs";
+      message.appendChild(metrics);
+    }
     metrics.textContent = `${words} word${words === 1 ? "" : "s"}`;
-    message.appendChild(metrics);
-    ownMount(state, "message-metrics", () => metrics.remove(), metrics);
+    if (!state.mounts.some((entry) => entry.id === "message-metrics" && entry.node === metrics)) {
+      ownMount(state, "message-metrics", () => metrics.remove(), metrics);
+    }
   }
 }
 
@@ -261,7 +371,7 @@ function countMessageWords(message) {
 function ownMount(state, id, remove, node) { state.mounts.push({ id, remove, node }); }
 
 const STYLE_CSS = Object.freeze({
-  "chat-multi-select": "[data-tweaker-message-selected] { outline: 2px solid var(--color-token-focus-border, #3b82f6); outline-offset: 2px; }",
+  "chat-multi-select": "[data-tweaker-sidebar-chat-selected] { outline: 2px solid var(--color-token-focus-border); outline-offset: 2px; }",
   "sidebar-layout": "[data-tweaker-sidebar-layout] { min-width: var(--tweaker-sidebar-width, 18rem); } [data-tweaker-sidebar-layout][data-tweaker-sidebar-density='compact'] [data-app-action-sidebar-project-id] { padding-block: .25rem; }",
 });
 
@@ -278,6 +388,7 @@ function installStyle(state, id) {
 
 function cleanupToggle(state, id, options = {}) {
   if (!state || !id) return state;
+  if (id === "chat-multi-select") removeSidebarChatSelectionToolbar(state);
   state.mounts = removeEntries(state.mounts, id, (entry) => entry?.remove?.());
   state.listeners = removeEntries(state.listeners, id, (entry) => {
     entry?.target?.removeEventListener?.(entry.type, entry.listener);
@@ -305,22 +416,28 @@ function entryId(entry) {
 
 function renderSettings(root, state) {
   if (!root) return;
+  state.settingsRoot = root;
   root.replaceChildren();
   root.className = "flex flex-col gap-2";
   const status = document.createElement("div");
   status.className = "mb-2 rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
   const projects = state.api?.react?.host?.snapshot?.("projects")?.count || 0;
   const messages = state.api?.react?.host?.snapshot?.("assistant-turns")?.count || 0;
-  status.textContent = `Live targets: ${projects} projects · ${messages} assistant turns.`;
+  const observerStatus = state.observer ? "Host observation is active." : "Host observation is idle while every improvement is off.";
+  status.textContent = `Host snapshots: ${projects} project anchors · ${messages} assistant turns. Cmd/Ctrl-click native sidebar chat rows, then right-click a selected row to copy titles after confirmation. ${observerStatus}`;
   root.appendChild(status);
   const layout = document.createElement("div");
   layout.className = "mb-2 grid gap-3 rounded-lg border border-token-border p-3";
+  const layoutEnabled = state.enabled.has("sidebar-layout");
+  layout.toggleAttribute("data-tweaker-sidebar-layout-disabled", !layoutEnabled);
   const widthLabel = document.createElement("label");
   widthLabel.className = "flex items-center justify-between gap-4 text-sm text-token-text-primary";
-  widthLabel.textContent = "Sidebar width";
+  widthLabel.textContent = "Minimum sidebar width";
   const width = document.createElement("input");
   width.type = "range"; width.min = "220"; width.max = "420"; width.step = "4"; width.value = String(state.layout.width);
   width.className = "accent-token-foreground";
+  width.disabled = !layoutEnabled;
+  width.setAttribute("aria-label", "Minimum sidebar width");
   width.addEventListener("input", () => updateSidebarLayout(state, { width: Number(width.value) }));
   widthLabel.append(width);
   const densityLabel = document.createElement("label");
@@ -329,6 +446,8 @@ function renderSettings(root, state) {
   density.className = "rounded-md border border-token-border bg-token-main-surface-primary px-2 py-1 text-sm text-token-text-primary";
   for (const value of ["comfortable", "compact"]) { const option = document.createElement("option"); option.value = value; option.textContent = value[0].toUpperCase() + value.slice(1); density.append(option); }
   density.value = state.layout.density;
+  density.disabled = !layoutEnabled;
+  density.setAttribute("aria-label", "Sidebar density");
   density.addEventListener("change", () => updateSidebarLayout(state, { density: density.value }));
   densityLabel.append(density); layout.append(widthLabel, densityLabel); root.append(layout);
   const controls = document.createElement("div");
@@ -351,10 +470,14 @@ function renderSettings(root, state) {
 }
 
 function updateSidebarLayout(state, patch) {
-  Object.assign(state.layout, patch);
+  if (Number.isFinite(Number(patch?.width))) state.layout.width = Math.min(420, Math.max(220, Number(patch.width)));
+  if (["compact", "comfortable"].includes(patch?.density)) state.layout.density = patch.density;
   state.api?.storage?.set?.(LAYOUT_KEY, state.layout);
-  for (const sidebar of document.querySelectorAll("[data-tweaker-sidebar-layout]")) {
+  if (!state.enabled.has("sidebar-layout")) return false;
+  const sidebars = typeof document === "undefined" ? [] : document.querySelectorAll("[data-tweaker-sidebar-layout]");
+  for (const sidebar of sidebars) {
     sidebar.style.setProperty("--tweaker-sidebar-width", `${state.layout.width}px`);
     sidebar.setAttribute("data-tweaker-sidebar-density", state.layout.density);
   }
+  return true;
 }

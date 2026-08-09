@@ -21,12 +21,15 @@ import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
+import { applyHealthProbeDialogSuppression } from "./health-probe-dialog";
 import { hashRawAsarHeader } from "./promotion-asar";
 import {
+  fingerprintPromotionCodexConfigPath,
   fingerprintPromotionPolicyPath,
   promotionPolicyFingerprintFailureReason,
 } from "./promotion-policy";
 import {
+  canonicalConfigFingerprint,
   createMcpReconciler,
   readMcpSyncState,
   resolveMcpRuntimePaths,
@@ -210,11 +213,36 @@ if (!userRoot || !runtimeDir) {
   );
 }
 
+const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+
+/**
+ * How long a health process may take to answer the promotion request AFTER its
+ * renderer proof has settled, before it exits on its own terms.
+ *
+ * Generous by three orders of magnitude against the ~47ms a real receipt takes,
+ * because the only thing this catches is a blocked main thread — and it must
+ * stay far below the installer's HEALTH_PROBE_PROCESS_TIMEOUT_MS (170s), whose
+ * expiry kills the probe with no receipt and fails the promotion outright.
+ */
+const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;
+
 // Install before OpenAI's original main module loads and captures `spawn`.
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
 const codexAppServerParent = installCodexAppServerParent();
+
+// Same seam, same reason: OpenAI's main captures `dialog` when it loads, so a
+// disposable health process has to be blinded to modal panels before that
+// happens. Deferred logging — `log` is hoisted but LOG_FILE is not yet
+// initialised here, and a suppressed dialog can only occur long after startup.
+applyHealthProbeDialogSuppression({
+  dialog,
+  healthCheckOnly,
+  onSuppressed: (record) => {
+    log("warn", "health process suppressed a modal dialog", record);
+  },
+});
 
 const PRELOAD_PATH = resolve(runtimeDir, "preload.js");
 const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-preload.js");
@@ -243,7 +271,6 @@ const TWEAK_CATALOG_FILE = join(runtimeDir, "catalog.json");
 const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
-const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
 const healthOriginalMain = healthCheckOnly
   && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
 
@@ -1553,7 +1580,7 @@ function promotionSurfaceHash(surface: PromotionSurfaceName): string {
     case "runtime": return fingerprintPromotionPath(runtimeDir!);
     case "tweakTree": return fingerprintPromotionPath(TWEAKS_DIR);
     case "tweakersConfig": return fingerprintPromotionPath(CONFIG_FILE);
-    case "codexConfig": return fingerprintPromotionPath(CODEX_CONFIG_FILE);
+    case "codexConfig": return fingerprintPromotionCodexConfigPath(CODEX_CONFIG_FILE);
     case "namespaceData": return fingerprintPromotionPath(join(userRoot!, "tweak-data", USER_QUESTIONS_TWEAK_ID));
     case "mainStorage": return fingerprintPromotionPath(join(userRoot!, "storage", `${USER_QUESTIONS_TWEAK_ID}.json`));
     case "policy": return promotionPolicySurfaceHash();
@@ -1674,7 +1701,14 @@ function userQuestionsMcpConflictCount(): number {
     throw new Error("MCP reconciliation receipt is incomplete");
   }
   const configBytes = existsSync(CODEX_CONFIG_FILE) ? readFileSync(CODEX_CONFIG_FILE) : Buffer.alloc(0);
-  if (receipt.afterFingerprint !== createHash("sha256").update(configBytes).digest("hex")) {
+  // The app stamps volatile marketplace `last_updated` lines into config.toml
+  // after the boot-time reconcile, so a raw-byte binding races every probe.
+  // Prefer the receipt's canonical binding; raw compare remains the fallback
+  // for receipts written before the canonical field existed.
+  const bound = receipt.afterFingerprintCanonical !== undefined
+    ? receipt.afterFingerprintCanonical === canonicalConfigFingerprint(configBytes)
+    : receipt.afterFingerprint === createHash("sha256").update(configBytes).digest("hex");
+  if (!bound) {
     throw new Error("MCP reconciliation receipt does not bind the observed Codex config");
   }
   if (!userQuestionsMcpReceiptMatchesEnabledState(receipt, isTweakEnabled(USER_QUESTIONS_TWEAK_ID))) {
@@ -2691,11 +2725,38 @@ app.whenReady().then(() => {
     }
   }
   void (async () => {
-    const rendererProof = healthOriginalMain
+    // Answering is a one-shot: it unlinks the installer's request and rewrites
+    // the receipt. Only a health process can produce a renderer proof, so an
+    // ordinary launch that answered could only ever write an all-"unknown"
+    // receipt — while consuming the request the real probe needs and replacing
+    // whatever that probe had already proven. Seen live 2026-08-09: the ordinary
+    // 10:45:48 launch overwrote the 10:42:57 passing proof with hostReady
+    // "unknown". Ordinary launches leave the request for the health process.
+    if (!healthCheckOnly) {
+      if (existsSync(join(userRoot!, "health", "request.json"))) {
+        log("info", "promotion health request left untouched; this launch is not a health process");
+      }
+      return;
+    }
+    const rendererProof: PromotionRendererProofResult = healthOriginalMain
       ? await originalMainPromotionProbe!.run()
-      : healthCheckOnly
-        ? await runPromotionRendererProof()
-      : { hostReady: "unknown", rendererStorageSelfTest: "unknown" } satisfies PromotionRendererProofResult;
+      : await runPromotionRendererProof();
+    // The renderer proof owns its own deadlines; nothing bounded the stretch
+    // AFTER it, which is exactly where probes hung. Writing the receipt is
+    // bounded hashing of small trees — measured at 47ms on a passing candidate
+    // probe (proof 14:30:04.541Z, receipt 14:30:04.588Z) — so anything past a
+    // few seconds here means the main thread is blocked, not busy. On
+    // 2026-08-09 that stretch ran 44.4s once and past the installer's 170s
+    // spawnSync timeout twice, and a probe killed by that timeout reports no
+    // receipt at all, failing the whole promotion. Exit on our own terms
+    // instead: a missing receipt fails safe (promotion blocked, app intact).
+    const receiptWatchdog = setTimeout(() => {
+      log("warn", "health-check receipt watchdog fired after the renderer proof; exiting", {
+        hostReady: rendererProof.hostReady,
+      });
+      app.exit(0);
+    }, HEALTH_RECEIPT_WATCHDOG_MS);
+    receiptWatchdog.unref?.();
     void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
       // Check the Codex account token FIRST: it is a fast, synchronous file read
@@ -2725,12 +2786,15 @@ app.whenReady().then(() => {
     userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
     }, { maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS }).then((answered) => {
       if (!answered) {
-        // No pending request file is the normal case on an ordinary launch;
-        // only a request that exists but fails validation deserves a warn.
+        // A health process is launched to answer exactly one request, so a
+        // request it could not use is always worth a warn — an absent one means
+        // the installer's one-shot was consumed or never landed.
         const requestPending = existsSync(join(userRoot!, "health", "request.json"));
-        log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
+        log("warn", requestPending
+          ? "promotion health request was present but invalid"
+          : "promotion health request was absent");
       }
-      if (healthCheckOnly) app.exit(0);
+      app.exit(0);
     }).catch((error) => {
       if (
         error === null
@@ -2739,7 +2803,7 @@ app.whenReady().then(() => {
       ) {
         log("warn", "promotion health receipt failed", error);
       }
-      if (healthCheckOnly) app.exit(0);
+      app.exit(0);
     });
   })().catch((error) => {
     log("warn", "promotion renderer bootstrap failed", error);
@@ -2821,7 +2885,46 @@ app.on("will-quit", () => {
   finishTweakLifecycleAttempt();
 });
 
+function openNativeSettingsFromApplicationMenu(owner?: BrowserWindow): boolean {
+  const applicationMenu = Menu.getApplicationMenu();
+  if (!applicationMenu) return false;
+  const candidates: Electron.MenuItem[] = [];
+  const visit = (items: readonly Electron.MenuItem[]): void => {
+    for (const item of items) {
+      if (item.submenu) visit(item.submenu.items);
+      if (item.enabled === false || item.visible === false || typeof item.click !== "function") continue;
+      const label = item.label.replace(/&/g, "").replace(/\.{3}|…/g, "").trim().toLowerCase();
+      const role = String(item.role ?? "").toLowerCase();
+      const accelerator = String(item.accelerator ?? "").replace(/\s/g, "").toLowerCase();
+      if (
+        role === "preferences" ||
+        label === "settings" ||
+        label === "preferences" ||
+        /^(commandorcontrol|cmdorctrl|command|cmd)\+,?$/.test(accelerator)
+      ) {
+        candidates.push(item);
+      }
+    }
+  };
+  visit(applicationMenu.items);
+  const unique = [...new Set(candidates)];
+  if (unique.length !== 1) return false;
+  try {
+    Reflect.apply(unique[0].click!, unique[0], [unique[0], owner, undefined]);
+    return true;
+  } catch (error) {
+    log("warn", "open settings application-menu action failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
 // 3. IPC: expose tweak metadata + reveal-in-finder.
+ipcMain.handle("tweaker:open-settings", (event) => {
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  return openNativeSettingsFromApplicationMenu(owner);
+});
 ipcMain.handle("tweaker:list-tweaks", async () => {
   await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
   const updateChecks = readState().tweakUpdateChecks ?? {};
@@ -6120,6 +6223,17 @@ function makeCodexApi(tweak: DiscoveredTweak) {
     runtime: {
       getInfo: async () => currentRuntimeInfo(),
       getCapabilities: async () => currentRuntimeCapabilities(),
+    },
+    settings: {
+      open: async (ownerWebContentsId?: number) => {
+        assertTweakPermission(tweak, "settings");
+        if (ownerWebContentsId !== undefined) {
+          const sender = ownedCodexRenderer(ownerWebContentsId);
+          if (!sender) return false;
+          return openNativeSettingsFromApplicationMenu(BrowserWindow.fromWebContents(sender) ?? undefined);
+        }
+        return openNativeSettingsFromApplicationMenu(getPrimaryCodexWindow() ?? undefined);
+      },
     },
     windows: {
       create: createCodexWindow,

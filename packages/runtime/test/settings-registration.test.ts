@@ -15,6 +15,15 @@ test("settings registration protects replacement pages and sections from stale h
   assert.match(source, /e\.registrationToken !== registrationToken/);
 });
 
+test("registered pages can request native Settings and activate after the surface mounts", () => {
+  assert.match(source, /export function openRegisteredPage/);
+  assert.match(source, /ipcRenderer\.invoke\("tweaker:open-settings"\)/);
+  assert.match(source, /reason: "not-registered"/);
+  assert.match(source, /reason: "settings-command-unavailable"/);
+  assert.match(source, /reason: "mount-timeout"/);
+  assert.match(source, /activatePendingRegisteredPageOpen\(\)/);
+});
+
 test("clearing tweak registrations removes the shared page group", () => {
   const clearStart = source.indexOf("export function clearSections");
   const clearEnd = source.indexOf("export function registerPage", clearStart);
@@ -40,6 +49,16 @@ test("registered page icons are constrained to the native sidebar size", () => {
   assert.match(helper, /setAttribute\("height", String\(size\)\)/);
   assert.match(helper, /style\.width = `\$\{size\}px`/);
   assert.match(helper, /classList\?\.add\("icon-sm", "inline-block", "shrink-0", "align-middle"\)/);
+});
+
+test("Tweaker settings pages own an opaque native main-surface background", () => {
+  assert.match(source, /panel\.className = "bg-token-main-surface-primary"/);
+  assert.match(source, /background-color:var\(--color-token-main-surface-primary, var\(--color-background-primary, #fff\)\)/);
+  const shellStart = source.indexOf("function panelShell");
+  const shellEnd = source.indexOf("function sectionTitle", shellStart);
+  const shell = source.slice(shellStart, shellEnd);
+  assert.match(shell, /main-surface bg-token-main-surface-primary/);
+  assert.match(shell, /scroll\.style\.backgroundColor = "var\(--color-token-main-surface-primary/);
 });
 
 test("Tweakers navigation shares native scrolling, hides Store, and joins settings search", () => {

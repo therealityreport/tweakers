@@ -17,7 +17,6 @@ exports.TWEAK_STORE_REVIEW_ISSUE_URL = "https://github.com/therealityreport/twea
 exports.BUNDLED_TWEAK_SOURCE_PATHS = Object.freeze({
     "co.tweakers.account-switcher": "tweaks/co.tweakers.account-switcher",
     "co.tweakers.appshots": "tweaks/co.tweakers.appshots",
-    "co.tweakers.browser-trust": "tweaks/co.tweakers.browser-trust",
     "co.tweakers.developer-tools": "tweaks/co.tweakers.developer-tools",
     "co.tweakers.shadcn-codex-ui": "tweaks/co.tweakers.shadcn-codex-ui",
     "co.tweakers.followup": "tweaks/followup",
