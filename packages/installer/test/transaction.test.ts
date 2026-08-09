@@ -1131,7 +1131,7 @@ test("receipt-bound prebuilt prepare and promotion reuse one exact candidate wit
       schemaVersion: authority.schemaVersion,
     };
 
-    const requestFile = join(f.workRoot, "candidate-user", "health", "request.json");
+    const requestFile = join(f.workRoot, "candidate-user", "health", "expectation.json");
     mkdirSync(join(f.workRoot, "candidate-user", "health"), { recursive: true });
     writeFileSync(requestFile, `${JSON.stringify({
       ...promotionExpectation(),
@@ -1396,7 +1396,7 @@ test("invalid durable candidate health-request times invalidate only bounded scr
       writeFileSync(f.stateFile, `${JSON.stringify(prepared, null, 2)}\n`);
 
       const candidateUserRoot = join(f.workRoot, "candidate-user");
-      const requestFile = join(candidateUserRoot, "health", "request.json");
+      const requestFile = join(candidateUserRoot, "health", "expectation.json");
       if (scenario.request !== null) {
         mkdirSync(join(candidateUserRoot, "health"), { recursive: true });
         writeFileSync(requestFile, scenario.request);

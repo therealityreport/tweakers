@@ -933,7 +933,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           signedBackupMarker: signedBackupSnapshotState,
         });
         candidateHealthExpectation = readCandidatePromotionHealthExpectation(
-          join(candidateUserRoot, "health", "request.json"),
+          join(candidateUserRoot, "health", "expectation.json"),
           {
             transactionCreatedAt: state.createdAt,
             now: context.now,
@@ -1058,10 +1058,16 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           return unknownPromotionHealth(requiredPermissions);
         }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
-        writeHealthRequest(join(candidateUserRoot, "health", "request.json"), {
+        const healthRequest = {
           ...expected,
           requestedAt: new Date().toISOString(),
-        });
+        };
+        // The probe consumes request.json as a one-shot (the runtime unlinks it
+        // after answering, so a receipt can only ever prove this launch).
+        // Promote runs in a later process and must re-read the expectation, so
+        // persist a durable twin the probe never touches.
+        writeHealthRequest(join(candidateUserRoot, "health", "expectation.json"), healthRequest);
+        writeHealthRequest(join(candidateUserRoot, "health", "request.json"), healthRequest);
         const launched = spawnAuthenticatedHiddenHealthProbe(
           candidate.executable,
           candidateUserRoot,
