@@ -51,9 +51,18 @@ import { userPaths } from "./paths.js";
 import { readPlist } from "./plist.js";
 import { readHeaderHash } from "./asar.js";
 import { acquireProcessLock, processAlive as isProcessAlive } from "./process-lock.js";
-import { assertLifecycleReceiptsIdle, withLifecycleLock } from "./lifecycle-lock.js";
+import {
+  assertLifecycleReceiptsIdle,
+  environmentReceiptBlocksLifecycle,
+  withLifecycleLock,
+} from "./lifecycle-lock.js";
 import { readState, writeState } from "./state.js";
-import { getLocalRefreshStatus, refreshLocal, type RefreshSource } from "./commands/refresh-local.js";
+import {
+  getLocalRefreshStatus,
+  preferredDesktopRefreshSource,
+  refreshLocal,
+  type RefreshSource,
+} from "./commands/refresh-local.js";
 import {
   observeCodexMainProcess,
   openCodex,
@@ -377,10 +386,9 @@ export function createDesktopUpdateTransaction(
       writeEnvironmentProfileRegistry(environmentRegistryFile, loaded.registry);
       return loaded.current;
     }),
-    selectRefreshSource: overrides.selectRefreshSource ?? (() => {
-      const status = getLocalRefreshStatus(root);
-      return status.source === "development" ? "development" : "stable";
-    }),
+    selectRefreshSource: overrides.selectRefreshSource ?? (() => (
+      preferredDesktopRefreshSource(getLocalRefreshStatus(root))
+    )),
     refreshTweakers: overrides.refreshTweakers ?? runSynchronousLocalRefresh,
     verifyFinal: overrides.verifyFinal ?? ((input) => verifyFinalDesktopReturn(
       input,
@@ -691,6 +699,39 @@ export function createDesktopUpdateTransaction(
   async function returnToRequestedEnvironment(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
     if (!initial.observed) throw new Error("Desktop update observation is missing");
     const observed = initial.observed;
+
+    // A resume may arrive after environment recovery proved the REQUESTED
+    // Tweakers environment live (the return leg's commit had landed before
+    // the original owner failed). The official app is not running in that
+    // state, so refreshing official truth or re-preparing the return would
+    // fabricate a safeOfficialMode failure that contradicts the published
+    // selection. Only the runtime refresh and final verification remain; run
+    // exactly those. This must precede the official-truth refresh below.
+    const recoveredCommit = initial.environmentTransactionId === null
+      ? null
+      : deps.environment.status();
+    if (recoveredCommit !== null
+      && recoveredCommit.transactionId === initial.environmentTransactionId
+      && recoveredCommit.phase === "committed"
+      && initial.source.appExperience === "tweakers"
+      && recoveredCommit.requested.appExperience === "tweakers") {
+      const receipt = initial.phase === "returning_to_tweakers" && initial.error === null
+        ? initial
+        : update(initial, { phase: "returning_to_tweakers", resumable: false, error: null });
+      try {
+        return await refreshRuntimeAndVerify(receipt, recoveredCommit.requested, recoveredCommit.newMainPid, observed);
+      } catch (error) {
+        // Tweakers is proven live, so this failure is explicitly NOT a safe
+        // official-mode state; fail closed for supervised recovery.
+        return update(status() ?? receipt, {
+          phase: "failed",
+          safeOfficialMode: false,
+          resumable: false,
+          error: errorMessage(error),
+        }, true);
+      }
+    }
+
     let refreshedOfficial: EnvironmentSelection | null = null;
     try {
       refreshedOfficial = (await deps.refreshEnvironmentTruth(initial.official)) ?? null;
@@ -732,32 +773,13 @@ export function createDesktopUpdateTransaction(
       receipt = update(receipt, { environmentTransactionId: returnTransactionId });
       const committed = await deps.environment.commit(returnTransactionId);
       if (committed.phase !== "committed") return environmentFailure(receipt, committed, true);
-      const refreshSource = await deps.selectRefreshSource();
-      receipt = update(receipt, {
-        phase: "refreshing_runtime",
-        source: committed.requested,
-        refreshSource,
-      });
-      await deps.refreshTweakers({ source: refreshSource, selection: committed.requested, observedDesktop: observed });
-      receipt = update(receipt, { phase: "verifying" });
-      const verification = await deps.verifyFinal({
-        expected: committed.requested,
-        baseline: receipt.baseline,
-        observed: receipt.observed!,
-        previousMainPid: committed.newMainPid,
-      });
-      if (!verification.ok) {
-        throw new Error(verification.error ?? "Desktop update verification failed");
-      }
-      return update(receipt, {
-        phase: "completed",
-        safeOfficialMode: false,
-        resumable: false,
-        error: null,
-        completedAt: deps.now(),
-      }, true);
+      return await refreshRuntimeAndVerify(receipt, committed.requested, committed.newMainPid, observed);
     } catch (error) {
       const reason = errorMessage(error);
+      // Refresh/verify transitions persist inside refreshRuntimeAndVerify;
+      // rebase the failure on the latest persisted receipt so those fields
+      // (refreshSource, phase progression) survive into the terminal write.
+      receipt = status() ?? receipt;
       if (returnTransactionId) {
         try {
           const rolledBack = await deps.environment.rollback(returnTransactionId);
@@ -781,6 +803,44 @@ export function createDesktopUpdateTransaction(
       }
       return update(receipt, { phase: "failed", safeOfficialMode: true, resumable: true, error: reason }, true);
     }
+  }
+
+  /**
+   * The shared tail of the return-to-Tweakers leg: rebuild the runtime for
+   * the requested selection, then verify the final state. Reached from the
+   * normal prepare/commit path and from a resume whose return-leg environment
+   * transaction was recovered as already committed.
+   */
+  async function refreshRuntimeAndVerify(
+    receiptIn: DesktopUpdateReceipt,
+    requestedSelection: EnvironmentSelection,
+    newMainPid: number | null,
+    observed: DesktopVersionIdentity,
+  ): Promise<DesktopUpdateReceipt> {
+    const refreshSource = await deps.selectRefreshSource();
+    let receipt = update(receiptIn, {
+      phase: "refreshing_runtime",
+      source: requestedSelection,
+      refreshSource,
+    });
+    await deps.refreshTweakers({ source: refreshSource, selection: requestedSelection, observedDesktop: observed });
+    receipt = update(receipt, { phase: "verifying" });
+    const verification = await deps.verifyFinal({
+      expected: requestedSelection,
+      baseline: receipt.baseline,
+      observed: receipt.observed!,
+      previousMainPid: newMainPid,
+    });
+    if (!verification.ok) {
+      throw new Error(verification.error ?? "Desktop update verification failed");
+    }
+    return update(receipt, {
+      phase: "completed",
+      safeOfficialMode: false,
+      resumable: false,
+      error: null,
+      completedAt: deps.now(),
+    }, true);
   }
 
   async function verifyAndComplete(
@@ -889,6 +949,78 @@ export function createDesktopUpdateTransaction(
         completedAt: null,
         rolledBackAt: null,
       };
+      // The requested Tweakers environment is proven live (its return-leg
+      // transaction committed), so official ChatGPT is NOT running: skip the
+      // official inspection — it would throw on the patched asar and stamp a
+      // false safeOfficialMode failure. Only the runtime refresh and final
+      // verification remain; hand off to the return leg's recovered-commit
+      // path.
+      const continueFromCommittedTweakers = (): DesktopUpdateReceipt => {
+        if (resumed.observed === null) {
+          return update(resumed, {
+            phase: "failed",
+            ownerPid: process.pid,
+            safeOfficialMode: false,
+            resumable: false,
+            error: `Environment recovery proved Tweakers live for ${existing.environmentTransactionId}, `
+              + "but the receipt never recorded the observed update version; recover the desktop update explicitly.",
+          }, true);
+        }
+        return update(resumed, {
+          phase: "returning_to_tweakers",
+          ownerPid: process.pid,
+          resumable: false,
+          error: null,
+        });
+      };
+      const coupledReceipt = existing.environmentTransactionId === null
+        ? null
+        : deps.environment.status();
+      const coupledEnvironment = coupledReceipt !== null
+        && coupledReceipt.transactionId === existing.environmentTransactionId
+        ? coupledReceipt
+        : null;
+      if (coupledEnvironment !== null
+        && environmentReceiptBlocksLifecycle(coupledEnvironment) !== null) {
+        // A prior failure stranded this update's own environment transaction
+        // mid-rollback. That receipt blocks every lifecycle gate — including
+        // the returning leg's fresh prepare — so recover it from live
+        // evidence first instead of dead-ending in a recover/resume deadlock
+        // where each command tells the user to run the other (hit live
+        // 2026-08-07).
+        try {
+          const recoveredReceipt = await deps.environment.recover(existing.environmentTransactionId!);
+          if (recoveredReceipt.phase === "committed"
+            && recoveredReceipt.requested.appExperience === "tweakers"
+            && resumed.source.appExperience === "tweakers") {
+            return continueFromCommittedTweakers();
+          }
+        } catch (error) {
+          // The environment error text usually quotes its own "rollback
+          // failed" diagnostic. Reproducing that phrase verbatim would make
+          // desktopReceiptBlocksLifecycle misclassify THIS receipt as a
+          // desktop-level rollback failure (permanently blocking after a
+          // cancel), so neutralize it before persisting.
+          const reason = errorMessage(error).replace(/\brollback failed\b/gi, "rollback unsuccessful");
+          return update(resumed, {
+            phase: "failed",
+            ownerPid: process.pid,
+            safeOfficialMode: true,
+            resumable: true,
+            error: `Could not recover environment transaction ${existing.environmentTransactionId} `
+              + `before resuming: ${reason}`,
+          }, true);
+        }
+      } else if (coupledEnvironment !== null
+        && coupledEnvironment.phase === "committed"
+        && coupledEnvironment.requested.appExperience === "tweakers"
+        && resumed.source.appExperience === "tweakers") {
+        // The user already ran `environment recover` standalone (the gate's
+        // coupling allowance exists exactly for that) and it proved the
+        // requested Tweakers environment live. Do not inspect official
+        // ChatGPT — the same false-safe failure as above would result.
+        return continueFromCommittedTweakers();
+      }
       let liveOfficial: LiveOfficialDesktopObservation;
       try {
         liveOfficial = await inspectLiveOfficialDesktopRelaunchingIfNeeded(resumed.official);
@@ -931,8 +1063,13 @@ export function createDesktopUpdateTransaction(
         error: null,
       });
     });
-    if (receipt.observed) return returnToRequestedEnvironment(receipt);
+    // Terminal failures from the lock section are final for this resume —
+    // check BEFORE observed: several failure writes (e.g. an unrecoverable
+    // environment transaction) keep the previously observed version, and
+    // re-entering the return leg would clobber their diagnostic with a
+    // lifecycle-gate error.
     if (receipt.phase === "failed") return receipt;
+    if (receipt.observed) return returnToRequestedEnvironment(receipt);
     return handoffAndAwaitNativeUpdate(receipt);
   }
 

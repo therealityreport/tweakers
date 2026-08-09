@@ -253,6 +253,85 @@ test("unsafe failed desktop receipts remain blocking until explicit recovery", (
   }
 });
 
+test("owning the environment transaction recorded by a blocked desktop receipt crosses both gates", () => {
+  // Live 2026-08-07 deadlock: desktop failed+resumable while its own
+  // environment transaction failed mid-rollback. Recovering exactly that
+  // environment transaction is a prerequisite of the desktop receipt's own
+  // continuation and must not be blocked by it.
+  const root = mkdtempSync(join(tmpdir(), "tweaker-lifecycle-coupled-"));
+  const transactions = join(root, "transactions");
+  mkdirSync(transactions, { recursive: true });
+  try {
+    writeFileSync(join(transactions, "environment.json"), JSON.stringify(environmentReceipt({
+      transactionId: "env-return",
+      error: "Rollback requested; rollback failed: watcher promotion race",
+    })));
+    writeFileSync(join(transactions, "desktop-update.json"), JSON.stringify(desktopReceipt({
+      resumable: true,
+      environmentTransactionId: "env-return",
+    })));
+
+    // Unrelated work stays blocked by both receipts.
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, { contextOwned: false }),
+      /env-return.*failed during rollback/i,
+    );
+    // Recovery of the coupled environment transaction crosses the environment
+    // gate by id and the desktop gate by coupling.
+    assert.doesNotThrow(() => assertLifecycleReceiptsIdle(root, {
+      contextOwned: false,
+      environmentTransactionId: "env-return",
+      environmentRecovery: true,
+    }));
+    // The same coupled ownership WITHOUT the recovery flag stays blocked:
+    // forward mutations (commit/rollback) of a coupled transaction must not
+    // cut over or swap bytes outside the desktop update's supervision.
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, {
+        contextOwned: false,
+        environmentTransactionId: "env-return",
+      }),
+      /desktop-1.*resume or cancel/i,
+    );
+
+    // An IDLE coupled environment receipt (terminal, nothing to recover) must
+    // not open the desktop gate either, even for recovery.
+    writeFileSync(join(transactions, "environment.json"), JSON.stringify(environmentReceipt({
+      transactionId: "env-return",
+      error: "refresh failed before any rollback was needed",
+    })));
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, {
+        contextOwned: false,
+        environmentTransactionId: "env-return",
+        environmentRecovery: true,
+      }),
+      /desktop-1.*resume or cancel/i,
+    );
+
+    // A desktop receipt recording a DIFFERENT environment transaction still
+    // blocks: the caller's transaction is unrelated to that receipt.
+    writeFileSync(join(transactions, "environment.json"), JSON.stringify(environmentReceipt({
+      transactionId: "env-other",
+      error: "Rollback requested; rollback failed: watcher promotion race",
+    })));
+    writeFileSync(join(transactions, "desktop-update.json"), JSON.stringify(desktopReceipt({
+      resumable: true,
+      environmentTransactionId: null,
+    })));
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, {
+        contextOwned: false,
+        environmentTransactionId: "env-other",
+        environmentRecovery: true,
+      }),
+      /desktop-1.*resume or cancel/i,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("malformed and unknown terminal receipts fail closed before lifecycle classification", () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-lifecycle-invalid-receipts-"));
   const transactions = join(root, "transactions");

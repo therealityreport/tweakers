@@ -40,11 +40,11 @@ interface StorageLike {
   removeItem(key: string): void;
 }
 
-test("canonical manifest, package, lifecycle, broker, and source proof stay at one 0.6.0 identity", () => {
+test("canonical manifest, package, lifecycle, broker, and source proof stay at one 0.6.1 identity", () => {
   const validation = validateTweakManifest(manifest);
   assert.equal(validation.ok, true, JSON.stringify(validation.errors));
   assert.equal(manifest.id, USER_QUESTIONS_TWEAK_ID);
-  assert.equal(manifest.version, "0.6.0");
+  assert.equal(manifest.version, "0.6.1");
   assert.equal(tweakPackage.version, manifest.version);
   assert.equal(manifest.scope, "both");
   assert.deepEqual(broker.REQUIRED_BROKER_PERMISSIONS, ["ipc", "network"]);

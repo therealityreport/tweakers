@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   codexMainProcessObservationFromReport,
@@ -420,7 +423,9 @@ test("native-update handoff records why the menu snapshot was unavailable", { sk
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.kind, "menu_item_not_found");
-  assert.match(result.message, /Observed app menu items: unavailable \(snapshot exec failed/);
+  // The unavailable reason must be the child's stderr (the real failure), not
+  // execFileSync's message, which echoes the whole osascript command line.
+  assert.match(result.message, /Observed app menu items: unavailable \(execution error: System Events got an error: osascript is not allowed assistive access\. \(-1719\)/);
 });
 
 test("native-update handoff reports a missing updater menu instead of swallowing it", { skip: process.platform !== "darwin" }, async () => {
@@ -440,6 +445,62 @@ test("native-update handoff reports a missing updater menu instead of swallowing
 
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.kind, "menu_item_not_found");
+});
+
+test("native-update handoff attempt script compiles as valid AppleScript", { skip: process.platform !== "darwin" }, async () => {
+  const clock = fakeClock();
+  let script = "";
+  await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: ((command: string, args: readonly string[]) => {
+      if (String(args[1]).includes("click updateItem")) script = String(args[1]);
+      throw Object.assign(new Error("capture only"), { stderr: "capture only", status: 1 });
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 1,
+  });
+
+  assert.notEqual(script, "");
+  // A syntax error here fails EVERY handoff attempt at compile time ("is at
+  // least" shipped exactly that), so compile the real script with osacompile.
+  const outDir = mkdtempSync(join(tmpdir(), "tweakers-osacompile-"));
+  try {
+    execFileSync("osacompile", ["-o", join(outDir, "attempt.scpt"), "-e", script], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test("native-update handoff ignores menu markers echoed back in the command line", { skip: process.platform !== "darwin" }, async () => {
+  // Real execFileSync failures embed the whole command line — including the
+  // script source with its TWEAKERS_MENU_NOT_FOUND literal — in error.message.
+  // Classification must read the streams, or every failure (even a compile
+  // error) would be misreported as a missing menu item.
+  const clock = fakeClock();
+  const result = await requestCodexNativeUpdate("/Applications/ChatGPT.app", 91, {
+    observe: () => ({ pid: 91, visibleWindow: true }),
+    readLocaleMessages: () => null,
+    exec: ((command: string, args: readonly string[]) => {
+      throw Object.assign(new Error(`Command failed: osascript -e ${String(args[1])}`), {
+        stderr: "1149:1151: script error: Expected “contained by”, “equal” or expression but found parameter name. (-2741)",
+        status: 1,
+      });
+    }) as typeof execFileSync,
+    nowMs: clock.nowMs,
+    sleep: clock.sleep,
+    deadlineMs: 1,
+  });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.kind, "script_failed");
+  assert.match(result.message, /script error/);
+  assert.doesNotMatch(result.message, /menu item could not be found/);
 });
 
 test("native-update handoff retries until the menu appears after app launch", { skip: process.platform !== "darwin" }, async () => {

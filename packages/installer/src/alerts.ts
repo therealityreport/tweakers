@@ -231,7 +231,7 @@ function attemptCodexNativeUpdate(
     "end repeat",
     "if updateItem is missing value then",
     "try",
-    "if (count of menu items of appMenu) is at least 5 then",
+    "if (count of menu items of appMenu) is greater than or equal to 5 then",
     "set beforeItem to menu item 2 of appMenu",
     "set orderedItem to menu item 4 of appMenu",
     "set afterItem to menu item 5 of appMenu",
@@ -258,7 +258,11 @@ function attemptCodexNativeUpdate(
     });
     return { ok: true };
   } catch (error) {
-    const detail = childProcessErrorText(error);
+    // Classify from the process streams, never from error.message: execFileSync
+    // failure messages echo the full command line, so the script's own
+    // TWEAKERS_MENU_* marker strings would match any failure — including
+    // compile errors — and misreport it as a missing menu item.
+    const detail = childProcessStreamText(error);
     if (isAutomationPermissionDenied(detail)) {
       return nativeUpdateHandoffFailure(
         "automation_permission_denied",
@@ -321,7 +325,7 @@ function captureAppMenuSnapshot(expectedPid: number, exec: typeof execFileSync):
     const text = String(output ?? "").trim();
     return text ? text.slice(0, APP_MENU_SNAPSHOT_MAX_CHARS) : "unavailable (empty snapshot)";
   } catch (error) {
-    return `unavailable (${firstLine(childProcessErrorText(error)).slice(0, APP_MENU_SNAPSHOT_MAX_CHARS)})`;
+    return `unavailable (${firstLine(childProcessStreamText(error)).slice(0, APP_MENU_SNAPSHOT_MAX_CHARS)})`;
   }
 }
 
@@ -366,13 +370,22 @@ function nativeUpdateMenuCandidates(messages: Record<string, unknown> | null): s
   return [...new Set(candidates)];
 }
 
-function childProcessErrorText(error: unknown): string {
+/**
+ * Text from the child's stderr/stdout only. Falls back to error.message when
+ * both streams are empty (e.g. spawn ENOENT). Never match markers against
+ * error.message: execFileSync's message embeds the full command line
+ * (including any script source passed via -e), so a script's own marker
+ * strings would match every failure.
+ */
+function childProcessStreamText(error: unknown): string {
   if (!(error instanceof Error)) return String(error ?? "");
-  const withOutput = error as Error & { stderr?: unknown; stdout?: unknown; status?: unknown; code?: unknown };
-  return [withOutput.message, withOutput.stderr, withOutput.stdout, withOutput.status, withOutput.code]
+  const withOutput = error as Error & { stderr?: unknown; stdout?: unknown };
+  const streams = [withOutput.stderr, withOutput.stdout]
     .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
     .map(String)
-    .join("\n");
+    .join("\n")
+    .trim();
+  return streams !== "" ? streams : withOutput.message;
 }
 
 function isAutomationPermissionDenied(detail: string): boolean {

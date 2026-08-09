@@ -11,6 +11,7 @@ import {
   handoffRefreshLocalToLaunchd,
   hashTree,
   npmCommand,
+  preferredDesktopRefreshSource,
   refreshCliPath,
   registerDevelopmentCheckout,
   resolveExplicitDevelopmentRoot,
@@ -53,8 +54,25 @@ test("smart refresh selects a changed registered development checkout", () => {
 });
 
 test("smart refresh prefers a registered development checkout over the stable stage", () => {
-  const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
-  assert.match(source, /current\.source === "development" \|\| current\.developmentSourceRoot !== null \? "development" : "stable"/);
+  const status = (source: "development" | "stable" | "current", developmentSourceRoot: string | null) => ({
+    available: false,
+    source,
+    phase: "idle" as const,
+    developmentSourceRoot,
+    detail: "",
+    error: null,
+    checkedAt: "2026-08-07T00:00:00.000Z",
+  });
+  assert.equal(preferredDesktopRefreshSource(status("development", "/repo")), "development");
+  // A hash-current checkout wins over "current": without a newer published
+  // release the stable path dead-ends with an empty stage.
+  assert.equal(preferredDesktopRefreshSource(status("current", "/repo")), "development");
+  // But when a newer published release is genuinely installable ("stable"),
+  // the stable path is viable and must stay reachable even with a registered
+  // checkout — otherwise coordinated updates can never take a release.
+  assert.equal(preferredDesktopRefreshSource(status("stable", "/repo")), "stable");
+  assert.equal(preferredDesktopRefreshSource(status("stable", null)), "stable");
+  assert.equal(preferredDesktopRefreshSource(status("current", null)), "stable");
 });
 
 test("explicit development root overrides registration without changing config bytes", () => {

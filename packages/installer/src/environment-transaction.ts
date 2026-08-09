@@ -4238,7 +4238,10 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
   async recover(transactionId?: string): Promise<EnvironmentTransactionReceipt> {
     return this.withMutationLock(
       () => this.recoverUnlocked(transactionId),
-      { continueTransaction: true, transactionId },
+      // `recovery` lets this cross the desktop-update gate when the blocked
+      // desktop receipt recorded exactly this environment transaction — the
+      // deadlock-breaking direction. Only recover() may claim it.
+      { continueTransaction: true, transactionId, recovery: true },
     );
   }
 
@@ -4520,7 +4523,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
 
   private async withMutationLock<T>(
     operation: () => Promise<T>,
-    allowance: { continueTransaction?: boolean; transactionId?: string } = {},
+    allowance: { continueTransaction?: boolean; transactionId?: string; recovery?: boolean } = {},
   ): Promise<T> {
     return withLifecycleLock(this.lifecycleLockFile, "environment transaction", async () => {
       if (!allowance.continueTransaction) this.reconcileDeadOwnerBeforeNewTransaction();
@@ -4529,6 +4532,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         : undefined;
       assertLifecycleReceiptsIdle(dirname(dirname(this.lifecycleLockFile)), {
         environmentTransactionId,
+        environmentRecovery: allowance.recovery === true,
       });
       const lock = acquireProcessLock(this.lockFile, {
         onContended: (owner) => new Error(
