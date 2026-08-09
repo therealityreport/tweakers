@@ -727,7 +727,14 @@ async function continuePendingPromotion(
     }
     try {
       await adapters.validatePreparedPrebuiltCombinedCandidateEvidence(state, {
-        now,
+        // A fresh clock, not the transaction-entry `now`: the promote flow
+        // re-probes the candidate mid-run and rewrites the health expectation
+        // with a live wall-clock requestedAt. Judging that against the frozen
+        // entry time trips the future-skew guard once hashing + probe boot
+        // exceed the 5s skew budget, which a gigabyte-scale candidate always
+        // does. The skew guard exists to catch clock drift, not our own
+        // elapsed runtime.
+        now: options.now ?? new Date(),
         maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
       });
     } catch (error) {
@@ -933,7 +940,14 @@ async function promoteAndVerify(
     }
     try {
       await adapters.validatePreparedPrebuiltCombinedCandidateEvidence(state, {
-        now,
+        // A fresh clock, not the transaction-entry `now`: the promote flow
+        // re-probes the candidate mid-run and rewrites the health expectation
+        // with a live wall-clock requestedAt. Judging that against the frozen
+        // entry time trips the future-skew guard once hashing + probe boot
+        // exceed the 5s skew budget, which a gigabyte-scale candidate always
+        // does. The skew guard exists to catch clock drift, not our own
+        // elapsed runtime.
+        now: options.now ?? new Date(),
         maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
       });
     } catch (error) {
