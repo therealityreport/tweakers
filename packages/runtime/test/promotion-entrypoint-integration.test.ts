@@ -36,7 +36,7 @@ test("main promotion responder maps the exact eight schema-v2 surfaces from cand
   assert.match(block, /fingerprintPromotionPath\(runtimeDir!\)/);
   assert.match(block, /fingerprintPromotionPath\(TWEAKS_DIR\)/);
   assert.match(block, /fingerprintPromotionPath\(CONFIG_FILE\)/);
-  assert.match(block, /fingerprintPromotionPath\(CODEX_CONFIG_FILE\)/);
+  assert.match(block, /fingerprintPromotionCodexConfigPath\(CODEX_CONFIG_FILE\)/);
   assert.match(block, /MCP_RUNTIME_PATHS\.codexHome/);
   assert.doesNotMatch(block, /homedir\(/);
 
