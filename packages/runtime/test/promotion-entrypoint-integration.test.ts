@@ -202,6 +202,21 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   assert.match(responder, /promotionSurface: promotionSurfaceHash/);
   assert.match(responder, /userQuestionsHealth: \(\) => promotionUserQuestionsHealth\(rendererProof\.rendererStorageSelfTest\)/);
   assert.match(responder, /maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS/);
+
+  // Answering unlinks the installer's one-shot request and rewrites the
+  // receipt, and only a health process can produce a renderer proof. An
+  // ordinary launch must therefore never reach the responder: on 2026-08-09 one
+  // did, replacing a passing proof with an all-"unknown" receipt and leaving
+  // the installer with "candidate health: host health unknown".
+  const guard = sourceBlock("void (async () => {", "void answerPromotionHealthRequest");
+  assert.match(guard, /if \(!healthCheckOnly\) \{[\s\S]*?return;\s*\}/);
+  assert.match(guard, /promotion health request left untouched; this launch is not a health process/);
+  // With the guard in place the proof is never the inert "unknown" placeholder.
+  assert.doesNotMatch(guard, /hostReady: "unknown"/);
+  assert.match(
+    guard,
+    /const rendererProof: PromotionRendererProofResult = healthOriginalMain\s*\?\s*await originalMainPromotionProbe!\.run\(\)\s*:\s*await runPromotionRendererProof\(\);/,
+  );
 });
 
 test("original-main health mode retains cleanup and sandbox safeguards", () => {

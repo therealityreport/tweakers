@@ -51,6 +51,17 @@ export interface TransactionHealth {
   permissions: Record<string, HealthValue>;
   /** Present only when a schema-v2 promotion receipt was requested and verified. */
   promotionReady?: HealthValue;
+  /**
+   * Why this observation is what it is, when the values alone cannot say.
+   *
+   * A probe that never launches, a probe that dies, and a probe that ran and
+   * reported nothing all collapse into "unknown". The candidate probe answers
+   * inside the transaction's candidate-user root, which the NEXT build wipes,
+   * so a bare "unknown" leaves no recoverable evidence — live 2026-08-09, a
+   * "candidate health: host health unknown" failure could not be attributed
+   * after the fact. Anything that returns a non-pass value should say why here.
+   */
+  detail?: string;
 }
 
 export const PROMOTION_SURFACE_NAMES = [
@@ -237,7 +248,20 @@ export interface TransactionAdapters {
   removeApp(path: string): void | Promise<void>;
   buildCandidate(pristineRoot: string, candidateRoot: string): void | Promise<void>;
   validateCandidate(candidateRoot: string): boolean | void | Promise<boolean | void>;
-  probeCandidateHealth(input: { candidateRoot: string; requiredPermissions: string[] }): TransactionHealth | Promise<TransactionHealth>;
+  /**
+   * `transactionCreatedAt`/`maxCandidateAgeMs` bound the durable candidate
+   * health expectation. Promotion routinely runs in a LATER install() call
+   * than the build (refresh-local prepares with `--candidate-only`, then
+   * promotes through `repair --force`), so the adapter cannot rely on
+   * build-time process state and must rehydrate the expectation from the
+   * candidate receipt within these bounds.
+   */
+  probeCandidateHealth(input: {
+    candidateRoot: string;
+    requiredPermissions: string[];
+    transactionCreatedAt: string;
+    maxCandidateAgeMs: number;
+  }): TransactionHealth | Promise<TransactionHealth>;
   fingerprintApp(appRoot: string): AppFingerprint | Promise<AppFingerprint>;
   isAppComplete(appRoot: string): boolean | Promise<boolean>;
   snapshotRuntime(runtimeRoot: string, destination: string): void | Promise<void>;
@@ -601,6 +625,8 @@ async function runLockedInstallTransaction(
     const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
       candidateRoot: state.candidateRoot,
       requiredPermissions: [...options.requiredPermissions],
+      transactionCreatedAt: state.createdAt,
+      maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
     }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
     if (candidateFailure) {
       await adapters.removeApp(state.candidateRoot);
@@ -639,6 +665,8 @@ async function runLockedInstallTransaction(
   const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
     candidateRoot: state.candidateRoot,
     requiredPermissions: [...options.requiredPermissions],
+    transactionCreatedAt: state.createdAt,
+    maxCandidateAgeMs: options.maxCandidateAgeMs ?? DEFAULT_MAX_CANDIDATE_AGE_MS,
   }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
   if (candidateFailure) {
     await adapters.removeApp(state.candidateRoot);
@@ -804,6 +832,8 @@ async function continuePendingPromotion(
   const candidateFailure = healthFailure(await adapters.probeCandidateHealth({
     candidateRoot: state.candidateRoot,
     requiredPermissions: [...options.requiredPermissions],
+    transactionCreatedAt: state.createdAt,
+    maxCandidateAgeMs: maxAge,
   }), options.requiredPermissions, options.requirePromotionHealthV2 === true);
   if (candidateFailure) {
     await adapters.removeApp(state.candidateRoot);
@@ -822,26 +852,28 @@ export function readProductionHealthReceipt(
 ): TransactionHealth {
   const v2Expected = isV2HealthExpectation(expected);
   const unknown = unknownHealth(expected.requiredPermissions, v2Expected);
+  // Every rejection below is indistinguishable in the returned values, and the
+  // rejected file is routinely deleted with the candidate before anyone can
+  // look at it. Say which check refused it.
+  const rejected = (reason: string): TransactionHealth => ({ ...unknown, detail: `promotion receipt rejected: ${reason}` });
   try {
     const stat = lstatSync(receiptFile);
-    if (
-      stat.isSymbolicLink() ||
-      !stat.isFile() ||
-      (stat.mode & 0o777) !== 0o600 ||
-      (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
-      stat.size > (options.maxBytes ?? 256 * 1024)
-    ) return unknown;
+    if (stat.isSymbolicLink() || !stat.isFile()) return rejected("not a regular file");
+    if ((stat.mode & 0o777) !== 0o600) return rejected(`mode ${(stat.mode & 0o777).toString(8)} is not 0600`);
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return rejected(`owned by uid ${stat.uid}`);
+    if (stat.size > (options.maxBytes ?? 256 * 1024)) return rejected(`size ${stat.size} exceeds the receipt limit`);
     const receipt = JSON.parse(readFileSync(receiptFile, "utf8")) as unknown;
-    if (!plainRecord(receipt) || !sameFingerprintValue(receipt.app, expected.app)) return unknown;
+    if (!plainRecord(receipt)) return rejected("not a JSON object");
+    if (!sameFingerprintValue(receipt.app, expected.app)) return rejected("app fingerprint does not match the expectation");
     const now = (options.now ?? new Date()).getTime();
     const observedAt = Date.parse(typeof receipt.observedAt === "string" ? receipt.observedAt : "");
-    if (
-      !Number.isFinite(observedAt)
-      || observedAt > now + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS
-      || now - observedAt > (options.maxAgeMs ?? PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS)
-    ) return unknown;
-    if (v2Expected) return readV2HealthReceipt(receipt, expected, unknown);
-    if (!validLegacyHealthReceipt(receipt, expected)) return unknown;
+    if (!Number.isFinite(observedAt)) return rejected("observedAt is not a timestamp");
+    if (observedAt > now + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS) return rejected(`observedAt ${receipt.observedAt as string} is in the future`);
+    if (now - observedAt > (options.maxAgeMs ?? PRODUCTION_HEALTH_RECEIPT_MAX_AGE_MS)) {
+      return rejected(`observedAt ${receipt.observedAt as string} predates this promotion`);
+    }
+    if (v2Expected) return readV2HealthReceipt(receipt, expected, rejected("schema-v2 receipt failed validation"));
+    if (!validLegacyHealthReceipt(receipt, expected)) return rejected("legacy receipt failed validation");
     return {
       host: validHealthValue(receipt.hostReady),
       session: validHealthValue(receipt.authenticatedSession),
@@ -850,8 +882,8 @@ export function readProductionHealthReceipt(
         validHealthValue(receipt.declaredPermissions?.[permission]),
       ])),
     };
-  } catch {
-    return unknown;
+  } catch (error) {
+    return rejected(errorMessage(error));
   }
 }
 
@@ -1255,14 +1287,21 @@ function healthFailure(
   requiredPermissions: string[],
   requirePromotionHealthV2 = false,
 ): string | null {
-  if (health.host !== "pass") return `host health ${health.host}`;
-  if (health.session !== "pass") return `session health ${health.session}`;
+  // The health VALUES say a promotion was refused; `detail` says why, and it is
+  // the only account that survives — the candidate probe's own artifacts live
+  // under a candidate-user root the next build wipes.
+  const explain = (failure: string): string => {
+    const detail = typeof health.detail === "string" ? health.detail.trim() : "";
+    return detail ? `${failure} (${detail})` : failure;
+  };
+  if (health.host !== "pass") return explain(`host health ${health.host}`);
+  if (health.session !== "pass") return explain(`session health ${health.session}`);
   for (const permission of requiredPermissions) {
     const value = health.permissions[permission] ?? "unknown";
-    if (value !== "pass") return `${permission} permission health ${value}`;
+    if (value !== "pass") return explain(`${permission} permission health ${value}`);
   }
   if (requirePromotionHealthV2 && health.promotionReady !== "pass") {
-    return `promotion proof ${health.promotionReady ?? "unknown"}`;
+    return explain(`promotion proof ${health.promotionReady ?? "unknown"}`);
   }
   return null;
 }
@@ -1337,9 +1376,9 @@ function validLegacyHealthReceipt(
 function readV2HealthReceipt(
   value: Record<string, unknown>,
   expected: ProductionHealthExpectationV2,
-  unknown: TransactionHealth,
+  rejected: TransactionHealth,
 ): TransactionHealth {
-  if (!validV2HealthReceipt(value, expected)) return unknown;
+  if (!validV2HealthReceipt(value, expected)) return rejected;
   return {
     host: value.hostReady,
     session: value.authenticatedSession,

@@ -2700,11 +2700,22 @@ app.whenReady().then(() => {
     }
   }
   void (async () => {
-    const rendererProof = healthOriginalMain
+    // Answering is a one-shot: it unlinks the installer's request and rewrites
+    // the receipt. Only a health process can produce a renderer proof, so an
+    // ordinary launch that answered could only ever write an all-"unknown"
+    // receipt — while consuming the request the real probe needs and replacing
+    // whatever that probe had already proven. Seen live 2026-08-09: the ordinary
+    // 10:45:48 launch overwrote the 10:42:57 passing proof with hostReady
+    // "unknown". Ordinary launches leave the request for the health process.
+    if (!healthCheckOnly) {
+      if (existsSync(join(userRoot!, "health", "request.json"))) {
+        log("info", "promotion health request left untouched; this launch is not a health process");
+      }
+      return;
+    }
+    const rendererProof: PromotionRendererProofResult = healthOriginalMain
       ? await originalMainPromotionProbe!.run()
-      : healthCheckOnly
-        ? await runPromotionRendererProof()
-      : { hostReady: "unknown", rendererStorageSelfTest: "unknown" } satisfies PromotionRendererProofResult;
+      : await runPromotionRendererProof();
     void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
       // Check the Codex account token FIRST: it is a fast, synchronous file read
@@ -2734,12 +2745,15 @@ app.whenReady().then(() => {
     userQuestionsHealth: () => promotionUserQuestionsHealth(rendererProof.rendererStorageSelfTest),
     }, { maxAgeMs: PROMOTION_HEALTH_REQUEST_MAX_AGE_MS }).then((answered) => {
       if (!answered) {
-        // No pending request file is the normal case on an ordinary launch;
-        // only a request that exists but fails validation deserves a warn.
+        // A health process is launched to answer exactly one request, so a
+        // request it could not use is always worth a warn — an absent one means
+        // the installer's one-shot was consumed or never landed.
         const requestPending = existsSync(join(userRoot!, "health", "request.json"));
-        log(requestPending ? "warn" : "info", "promotion health request was absent or invalid");
+        log("warn", requestPending
+          ? "promotion health request was present but invalid"
+          : "promotion health request was absent");
       }
-      if (healthCheckOnly) app.exit(0);
+      app.exit(0);
     }).catch((error) => {
       if (
         error === null
@@ -2748,7 +2762,7 @@ app.whenReady().then(() => {
       ) {
         log("warn", "promotion health receipt failed", error);
       }
-      if (healthCheckOnly) app.exit(0);
+      app.exit(0);
     });
   })().catch((error) => {
     log("warn", "promotion renderer bootstrap failed", error);

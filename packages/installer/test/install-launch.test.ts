@@ -11,6 +11,7 @@ import {
   HEALTH_PROBE_ROOT_PREFIX,
   HEALTH_PROBE_TEMP_RELATIVE_PATH,
   HEALTH_PROBE_USER_DATA_RELATIVE_PATH,
+  formatHealthProbeLaunchFailure,
   spawnAuthenticatedHiddenHealthProbe,
   spawnHiddenHealthProbe,
 } from "../src/commands/install";
@@ -364,4 +365,27 @@ test("health probe cleanup failure throws instead of retaining a disposable prof
     /disposable root could not be removed/,
   );
   assert.equal(existsSync(probeRoot), true);
+});
+
+// spawnSync reports three distinct failures. Collapsing them into one bare
+// "host health unknown" is what made the live 2026-08-09 candidate-probe
+// failures unattributable; a timeout in particular arrives as an error plus a
+// kill signal with a null status, and must not read as a clean exit.
+test("a health probe launch failure names how the probe died", () => {
+  assert.match(
+    formatHealthProbeLaunchFailure({ error: Object.assign(new Error("spawnSync ETIMEDOUT"), { code: "ETIMEDOUT" }), status: null, signal: "SIGTERM" }),
+    /^health probe did not answer: spawnSync ETIMEDOUT; killed by SIGTERM$/,
+  );
+  assert.equal(
+    formatHealthProbeLaunchFailure({ error: null, status: 3, signal: null }),
+    "health probe did not answer: exit 3",
+  );
+  assert.equal(
+    formatHealthProbeLaunchFailure({ error: null, status: null, signal: "SIGKILL" }),
+    "health probe did not answer: killed by SIGKILL",
+  );
+  assert.equal(
+    formatHealthProbeLaunchFailure({ error: null, status: null, signal: null }),
+    "health probe did not answer: process did not exit",
+  );
 });

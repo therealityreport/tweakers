@@ -1054,13 +1054,38 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       // full deep verify.
       return restored.platform === "darwin" ? signatureInfo(appRoot).ok : true;
     },
-    probeCandidateHealth: ({ candidateRoot }) => {
+    probeCandidateHealth: ({ candidateRoot, transactionCreatedAt, maxCandidateAgeMs }) => {
       try {
         const candidate = locateCodex(candidateRoot);
         validateMainRendererAsarEntrypoint(candidate.asarPath);
-        const expected = candidateHealthExpectation;
-        if (!expected || !sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
-          return unknownPromotionHealth(requiredPermissions);
+        const expectationFile = join(candidateUserRoot, "health", "expectation.json");
+        // The build-time expectation only exists in the process that built the
+        // candidate. Promotion routinely runs in a LATER install() call —
+        // refresh-local prepares with `--candidate-only`, then promotes through
+        // `repair --force` — so a null here is the normal promote case, not a
+        // failure. Rehydrate from the durable twin under the same age bounds
+        // the transaction applies to the candidate itself; without this every
+        // held candidate dead-ends at "candidate health: host health unknown"
+        // before the probe is ever launched.
+        const rehydrated = candidateHealthExpectation === null;
+        const expected = candidateHealthExpectation ?? readCandidatePromotionHealthExpectation(
+          expectationFile,
+          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs },
+        );
+        if (!expected) {
+          return unknownPromotionHealth(
+            requiredPermissions,
+            `no candidate health expectation: ${expectationFile} is absent, stale beyond ${maxCandidateAgeMs}ms, or not bound to this transaction`,
+          );
+        }
+        if (!sameAppFingerprint(expected.app, fingerprintCodex(candidate))) {
+          return unknownPromotionHealth(requiredPermissions, "candidate app fingerprint drifted from its health expectation");
+        }
+        if (rehydrated) {
+          // promoteCandidate reads both; a rehydrated promote must not fall
+          // back to the build-time nulls after the probe proved the candidate.
+          candidateHealthExpectation = expected;
+          candidatePromotionPreimages = promotionPreimageHashes(expected);
         }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
         const healthRequest = {
@@ -1070,8 +1095,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         // The probe consumes request.json as a one-shot (the runtime unlinks it
         // after answering, so a receipt can only ever prove this launch).
         // Promote runs in a later process and must re-read the expectation, so
-        // persist a durable twin the probe never touches.
-        writeHealthRequest(join(candidateUserRoot, "health", "expectation.json"), healthRequest);
+        // persist a durable twin the probe never touches. Only the building
+        // process writes that twin: re-stamping it on every rehydrated probe
+        // would renew its age bound forever.
+        if (!rehydrated) writeHealthRequest(expectationFile, healthRequest);
         writeHealthRequest(join(candidateUserRoot, "health", "request.json"), healthRequest);
         const launched = spawnAuthenticatedHiddenHealthProbe(
           candidate.executable,
@@ -1079,12 +1106,16 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           liveCodexHome,
           { candidateCodexHome },
         );
-        if (launched.error || launched.status !== 0) {
-          return unknownPromotionHealth(requiredPermissions);
+        if (launched.error || launched.status !== 0 || launched.signal !== null) {
+          return unknownPromotionHealth(requiredPermissions, formatHealthProbeLaunchFailure(launched));
         }
-        return readProductionHealthReceipt(receiptFile, expected);
-      } catch {
-        return unknownPromotionHealth(requiredPermissions);
+        // The reader explains its own rejections; only an accepted receipt that
+        // still reports nothing needs an account added here.
+        const observed = readProductionHealthReceipt(receiptFile, expected);
+        if (observed.detail || observed.host !== "unknown" || observed.session !== "unknown") return observed;
+        return { ...observed, detail: `candidate probe answered from ${receiptFile} without observing host or session health` };
+      } catch (error) {
+        return unknownPromotionHealth(requiredPermissions, `candidate probe threw: ${errorMessage(error)}`);
       } finally {
         reconcileMacRegistrations({ garbageCollect: false });
       }
@@ -1201,11 +1232,11 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     },
     probeHealth: async () => {
       const expected = liveHealthExpectation;
-      if (!expected) return unknownPromotionHealth(requiredPermissions);
+      if (!expected) return unknownPromotionHealth(requiredPermissions, "no live health expectation was built for this promotion");
       try {
         validateMainRendererAsarEntrypoint(locateCodex(codex.appRoot).asarPath);
-      } catch {
-        return unknownPromotionHealth(requiredPermissions);
+      } catch (error) {
+        return unknownPromotionHealth(requiredPermissions, `promoted app main renderer entrypoint is invalid: ${errorMessage(error)}`);
       }
       const receiptFile = join(paths.root, "health", "promotion.json");
       const deadline = Date.now() + HEALTH_PROBE_RECEIPT_TIMEOUT_MS;
@@ -1214,7 +1245,12 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         if (observed.host !== "unknown" || observed.session !== "unknown") return observed;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      return readProductionHealthReceipt(receiptFile, expected);
+      const observed = readProductionHealthReceipt(receiptFile, expected);
+      if (observed.detail || observed.host !== "unknown" || observed.session !== "unknown") return observed;
+      return {
+        ...observed,
+        detail: `no usable promotion receipt at ${receiptFile} within ${HEALTH_PROBE_RECEIPT_TIMEOUT_MS}ms`,
+      };
     },
     acceptPromotion: async () => {
       if (!liveUserQuestionsReceipt || liveUserQuestionsReceipt.phase !== "sealed" || liveMcpConflictCount !== 0) {
@@ -2191,13 +2227,32 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function unknownPromotionHealth(requiredPermissions: string[]) {
+function unknownPromotionHealth(requiredPermissions: string[], detail?: string) {
   return {
     host: "unknown" as const,
     session: "unknown" as const,
     permissions: Object.fromEntries(requiredPermissions.map((permission) => [permission, "unknown" as const])),
     promotionReady: "unknown" as const,
+    ...(detail ? { detail } : {}),
   };
+}
+
+/**
+ * Why a health probe process did not answer.
+ *
+ * `spawnSync` reports three different failures — it could not start the
+ * process, the process exited non-zero, or it was killed (a timeout arrives as
+ * `error` plus a signal). All three previously collapsed into a bare "unknown".
+ */
+export function formatHealthProbeLaunchFailure(
+  launched: { error?: Error | null; status?: number | null; signal?: NodeJS.Signals | null },
+): string {
+  const parts: string[] = [];
+  if (launched.error) parts.push(errorMessage(launched.error));
+  if (launched.signal) parts.push(`killed by ${launched.signal}`);
+  if (typeof launched.status === "number" && launched.status !== 0) parts.push(`exit ${launched.status}`);
+  if (launched.status === null && !launched.signal && !launched.error) parts.push("process did not exit");
+  return `health probe did not answer: ${parts.length > 0 ? parts.join("; ") : "unknown launch failure"}`;
 }
 
 function sameAppFingerprint(left: AppFingerprint, right: AppFingerprint): boolean {
