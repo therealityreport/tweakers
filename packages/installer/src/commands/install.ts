@@ -1295,7 +1295,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         liveCodexHome,
       );
       if (launched.error || launched.status !== 0 || launched.signal !== null) {
-        throw new Error("Post-promotion health process did not exit cleanly");
+        throw new Error(`Post-promotion ${formatHealthProbeLaunchFailure(launched)}`);
       }
     },
   });

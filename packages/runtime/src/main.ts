@@ -21,6 +21,7 @@ import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
+import { applyHealthProbeDialogSuppression } from "./health-probe-dialog";
 import { hashRawAsarHeader } from "./promotion-asar";
 import {
   fingerprintPromotionCodexConfigPath,
@@ -212,11 +213,36 @@ if (!userRoot || !runtimeDir) {
   );
 }
 
+const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+
+/**
+ * How long a health process may take to answer the promotion request AFTER its
+ * renderer proof has settled, before it exits on its own terms.
+ *
+ * Generous by three orders of magnitude against the ~47ms a real receipt takes,
+ * because the only thing this catches is a blocked main thread — and it must
+ * stay far below the installer's HEALTH_PROBE_PROCESS_TIMEOUT_MS (170s), whose
+ * expiry kills the probe with no receipt and fails the promotion outright.
+ */
+const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;
+
 // Install before OpenAI's original main module loads and captures `spawn`.
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
 const codexAppServerParent = installCodexAppServerParent();
+
+// Same seam, same reason: OpenAI's main captures `dialog` when it loads, so a
+// disposable health process has to be blinded to modal panels before that
+// happens. Deferred logging — `log` is hoisted but LOG_FILE is not yet
+// initialised here, and a suppressed dialog can only occur long after startup.
+applyHealthProbeDialogSuppression({
+  dialog,
+  healthCheckOnly,
+  onSuppressed: (record) => {
+    log("warn", "health process suppressed a modal dialog", record);
+  },
+});
 
 const PRELOAD_PATH = resolve(runtimeDir, "preload.js");
 const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-preload.js");
@@ -245,7 +271,6 @@ const TWEAK_CATALOG_FILE = join(runtimeDir, "catalog.json");
 const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
-const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
 const healthOriginalMain = healthCheckOnly
   && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
 
@@ -2716,6 +2741,22 @@ app.whenReady().then(() => {
     const rendererProof: PromotionRendererProofResult = healthOriginalMain
       ? await originalMainPromotionProbe!.run()
       : await runPromotionRendererProof();
+    // The renderer proof owns its own deadlines; nothing bounded the stretch
+    // AFTER it, which is exactly where probes hung. Writing the receipt is
+    // bounded hashing of small trees — measured at 47ms on a passing candidate
+    // probe (proof 14:30:04.541Z, receipt 14:30:04.588Z) — so anything past a
+    // few seconds here means the main thread is blocked, not busy. On
+    // 2026-08-09 that stretch ran 44.4s once and past the installer's 170s
+    // spawnSync timeout twice, and a probe killed by that timeout reports no
+    // receipt at all, failing the whole promotion. Exit on our own terms
+    // instead: a missing receipt fails safe (promotion blocked, app intact).
+    const receiptWatchdog = setTimeout(() => {
+      log("warn", "health-check receipt watchdog fired after the renderer proof; exiting", {
+        hostReady: rendererProof.hostReady,
+      });
+      app.exit(0);
+    }, HEALTH_RECEIPT_WATCHDOG_MS);
+    receiptWatchdog.unref?.();
     void answerPromotionHealthRequest(userRoot!, {
     authenticatedSession: async () => {
       // Check the Codex account token FIRST: it is a fast, synchronous file read

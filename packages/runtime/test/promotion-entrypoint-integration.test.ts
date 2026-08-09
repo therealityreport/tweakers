@@ -211,12 +211,36 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   const guard = sourceBlock("void (async () => {", "void answerPromotionHealthRequest");
   assert.match(guard, /if \(!healthCheckOnly\) \{[\s\S]*?return;\s*\}/);
   assert.match(guard, /promotion health request left untouched; this launch is not a health process/);
+  // Nothing bounded the stretch between a settled renderer proof and the
+  // receipt, which is exactly where probes blocked until the installer's 170s
+  // spawnSync timeout killed them and failed the promotion.
+  assert.match(guard, /setTimeout\([\s\S]*?health-check receipt watchdog fired[\s\S]*?app\.exit\(0\);[\s\S]*?\}, HEALTH_RECEIPT_WATCHDOG_MS\);/);
+  assert.match(guard, /receiptWatchdog\.unref\?\.\(\);/);
   // With the guard in place the proof is never the inert "unknown" placeholder.
   assert.doesNotMatch(guard, /hostReady: "unknown"/);
   assert.match(
     guard,
     /const rendererProof: PromotionRendererProofResult = healthOriginalMain\s*\?\s*await originalMainPromotionProbe!\.run\(\)\s*:\s*await runPromotionRendererProof\(\);/,
   );
+});
+
+// A hidden probe runs OpenAI's real bootstrap, and the promotion proof ends by
+// terminating the app-server that bootstrap spawned. OpenAI answers that death
+// with an app-modal NSAlert that no window-level containment reaches, so the
+// interception has to be installed at the same module-evaluation seam that
+// captures spawn — before the loader requires OpenAI's main entry.
+test("a health process is blinded to OpenAI's dialogs before its main entry loads", () => {
+  const seam = sourceBlock("const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY", "const PRELOAD_PATH");
+  assert.match(seam, /const codexAppServerParent = installCodexAppServerParent\(\);/);
+  assert.match(seam, /applyHealthProbeDialogSuppression\(\{[\s\S]*?dialog,[\s\S]*?healthCheckOnly,[\s\S]*?onSuppressed:/);
+  assert.match(seam, /health process suppressed a modal dialog/);
+  // Ordering is the whole point: suppression must precede the loader's require
+  // of OpenAI's main, which happens after this module finishes evaluating.
+  assert.ok(
+    seam.indexOf("installCodexAppServerParent()") < seam.indexOf("applyHealthProbeDialogSuppression"),
+    "dialog suppression belongs in the same pre-bootstrap seam as the app-server parent",
+  );
+  assert.match(mainSource, /const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;/);
 });
 
 test("original-main health mode retains cleanup and sandbox safeguards", () => {
