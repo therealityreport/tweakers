@@ -2112,7 +2112,11 @@ export function reconcilePromotionMcpConfig(input: {
   }
   const config = readJsonRecord(input.tweakersConfigPath);
   const ownedTweaks = readdirSync(input.tweaksRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    // Dot-directories are lifecycle bookkeeping, not tweaks — notably
+    // .tweaker-dev-history, which prepareDevSnapshot creates INSIDE the live
+    // tweaks root earlier in this same promotion; treating it as a tweak made
+    // the manifest lstat throw ENOENT on every promote.
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith("."))
     .map((entry) => {
       const dir = join(input.tweaksRoot, entry.name);
       const manifestPath = join(dir, "manifest.json");
