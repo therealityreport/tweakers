@@ -61,6 +61,7 @@ import {
   patchCodexWindowServicesSource,
   type CodexWindowServicesSourceDiagnostics,
 } from "../codex-window-services.js";
+import { patchCodexModelSelectionInExtractedApp } from "../codex-model-selection.js";
 import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
@@ -2996,6 +2997,18 @@ async function injectLoader(
     }
 
     patchCodexWindowServices(dir, originalMain, step);
+    const modelSelectionPatch = patchCodexModelSelectionInExtractedApp(dir);
+    if (modelSelectionPatch.status === "not-applicable") {
+      step(
+        `Codex model selector draft override not applicable (${modelSelectionPatch.scannedFiles} renderer files scanned)`,
+      );
+    } else {
+      step(
+        `${modelSelectionPatch.status === "patched" ? "Patched" : "Verified"} Codex model selector draft override in ${
+          kleur.dim(modelSelectionPatch.relativePath ?? "unknown renderer file")
+        } using ${kleur.cyan(modelSelectionPatch.strategy ?? "existing marker")}`,
+      );
+    }
     const inactiveThreadRetentionPatch = patchCodexInactiveThreadRetentionInExtractedApp(dir);
     if (inactiveThreadRetentionPatch.status === "not-applicable") {
       step(
