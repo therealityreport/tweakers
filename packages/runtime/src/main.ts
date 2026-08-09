@@ -28,6 +28,7 @@ import {
   promotionPolicyFingerprintFailureReason,
 } from "./promotion-policy";
 import {
+  canonicalConfigFingerprint,
   createMcpReconciler,
   readMcpSyncState,
   resolveMcpRuntimePaths,
@@ -1675,7 +1676,14 @@ function userQuestionsMcpConflictCount(): number {
     throw new Error("MCP reconciliation receipt is incomplete");
   }
   const configBytes = existsSync(CODEX_CONFIG_FILE) ? readFileSync(CODEX_CONFIG_FILE) : Buffer.alloc(0);
-  if (receipt.afterFingerprint !== createHash("sha256").update(configBytes).digest("hex")) {
+  // The app stamps volatile marketplace `last_updated` lines into config.toml
+  // after the boot-time reconcile, so a raw-byte binding races every probe.
+  // Prefer the receipt's canonical binding; raw compare remains the fallback
+  // for receipts written before the canonical field existed.
+  const bound = receipt.afterFingerprintCanonical !== undefined
+    ? receipt.afterFingerprintCanonical === canonicalConfigFingerprint(configBytes)
+    : receipt.afterFingerprint === createHash("sha256").update(configBytes).digest("hex");
+  if (!bound) {
     throw new Error("MCP reconciliation receipt does not bind the observed Codex config");
   }
   if (!userQuestionsMcpReceiptMatchesEnabledState(receipt, isTweakEnabled(USER_QUESTIONS_TWEAK_ID))) {

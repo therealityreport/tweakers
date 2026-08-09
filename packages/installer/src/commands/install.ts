@@ -943,6 +943,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         if (!candidateHealthExpectation) {
           throw new Error("Prepared candidate schema-v2 health expectation is unavailable");
         }
+        // Promotion runs in a separate process from prepare, so the policy
+        // drift guard's preimages must be rehydrated from the durable
+        // expectation rather than the prepare-time module state.
+        candidatePromotionPreimages = promotionPreimageHashes(candidateHealthExpectation);
       }
       : undefined,
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  canonicalConfigFingerprint,
   createMcpReconciler,
   fingerprint,
   type McpReconciler,
@@ -1523,3 +1524,33 @@ async function withTempDirAsync(fn: (root: string) => Promise<void>): Promise<vo
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
+
+test("receipt canonical binding survives app-stamped last_updated churn", () => {
+  withTempDir((root) => {
+    const configPath = join(root, "config.toml");
+    const statePath = join(root, "mcp-sync-state.json");
+    writeFileSync(configPath, [
+      "# user config",
+      "",
+      "[marketplaces.openai-bundled]",
+      'last_updated = "2026-08-09T00:49:47Z"',
+      'source_type = "local"',
+      "",
+    ].join("\n"));
+
+    const receipt = reconcileMcpConfig({ configPath, statePath, trigger: "startup", tweaks: [] });
+    assert.equal(typeof receipt.afterFingerprintCanonical, "string");
+    assert.equal(readMcpSyncState(statePath)?.afterFingerprintCanonical, receipt.afterFingerprintCanonical);
+
+    // The desktop app stamps a fresh last_updated after every boot-time
+    // reconcile: the raw binding breaks, the canonical binding must hold.
+    const stamped = readFileSync(configPath, "utf8").replace("2026-08-09T00:49:47Z", "2026-08-09T01:30:49Z");
+    writeFileSync(configPath, stamped);
+    assert.notEqual(fingerprint(stamped), receipt.afterFingerprint);
+    assert.equal(canonicalConfigFingerprint(stamped), receipt.afterFingerprintCanonical);
+
+    // A substantive edit must still break the canonical binding.
+    writeFileSync(configPath, `${stamped}[mcp_servers.rogue]\ncommand = "rogue"\n`);
+    assert.notEqual(canonicalConfigFingerprint(readFileSync(configPath, "utf8")), receipt.afterFingerprintCanonical);
+  });
+});
