@@ -61,6 +61,7 @@ import {
   patchCodexWindowServicesSource,
   type CodexWindowServicesSourceDiagnostics,
 } from "../codex-window-services.js";
+import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, reportsMainProcessRunning, type OpenReport } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
@@ -815,6 +816,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   const liveUserQuestionsReceiptFile = join(paths.transactionRoot, "user-questions", `${rolloutKey}.json`);
   const liveUserQuestionsArchiveRoot = join(paths.transactionRoot, "user-questions", rolloutKey);
   let candidateHealthExpectation: ProductionHealthExpectationV2 | null = null;
+  let candidatePromotionPreimages: PromotionSurfaceHashes | null = null;
   let liveHealthExpectation: ProductionHealthExpectationV2 | null = null;
   let liveUserQuestionsReceipt: UserQuestionsRolloutReceipt | null = null;
   let liveMcpConflictCount: number | null = null;
@@ -946,6 +948,14 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     isAppRunning: (appRoot) => reportsMainProcessRunning(getOpenReport(locateCodex(appRoot))),
     buildCandidate: async (_pristineRoot, candidateRoot) => {
       resetCandidateUserRootForBuild(candidateUserRoot);
+      candidatePromotionPreimages = fingerprintPromotionSurfaces(promotionSurfaceRoots({
+        appHash: source.hash,
+        runtimeRoot: paths.runtime,
+        tweaksRoot: paths.tweaks,
+        userRoot: paths.root,
+        tweakersConfigPath: paths.configFile,
+        codexHome: liveCodexHome,
+      }));
       stageCandidateRolloutInputs({
         livePaths: paths,
         candidatePaths,
@@ -999,14 +1009,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       const candidate = locateCodex(candidateRoot);
       candidateHealthExpectation = buildPromotionHealthExpectation({
         app: fingerprintCodex(candidate),
-        before: promotionSurfaceRoots({
-          appHash: source.hash,
-          runtimeRoot: paths.runtime,
-          tweaksRoot: paths.tweaks,
-          userRoot: paths.root,
-          tweakersConfigPath: paths.configFile,
-          codexHome: liveCodexHome,
-        }),
+        before: candidatePromotionPreimages,
         after: promotionSurfaceRoots({
           appHash: fingerprintCodex(candidate).hash,
           runtimeRoot: candidatePaths.runtime,
@@ -1093,6 +1096,11 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         rollbackDevSnapshot,
       } = await import("./dev-sync.js");
       try {
+        if (!candidatePromotionPreimages) throw new Error("Candidate promotion preimages are unavailable");
+        const currentPolicy = fingerprintPromotionPolicyPath(join(liveCodexHome, ".codex-global-state.json"));
+        if (currentPolicy !== candidatePromotionPreimages.policy) {
+          throw new Error("Live promotion policy drifted after candidate preparation");
+        }
         prepareDevSnapshot(candidatePaths.tweaks, paths.tweaks);
         const existingRollout = readUserQuestionsRolloutReceipt(liveUserQuestionsReceiptFile);
         liveUserQuestionsReceipt = existingRollout ?? planUserQuestionsRollout(defaultUserQuestionsRolloutOptions({
@@ -2974,6 +2982,18 @@ async function injectLoader(
     }
 
     patchCodexWindowServices(dir, originalMain, step);
+    const inactiveThreadRetentionPatch = patchCodexInactiveThreadRetentionInExtractedApp(dir);
+    if (inactiveThreadRetentionPatch.status === "not-applicable") {
+      step(
+        `Codex inactive-thread retention patch not applicable (${inactiveThreadRetentionPatch.scannedFiles} renderer files scanned)`,
+      );
+    } else {
+      step(
+        `${inactiveThreadRetentionPatch.status === "patched" ? "Patched" : "Verified"} Codex inactive-thread retention policy in ${
+          kleur.dim(inactiveThreadRetentionPatch.relativePath ?? "unknown renderer file")
+        } using ${kleur.cyan(inactiveThreadRetentionPatch.strategy ?? "existing policy")}`,
+      );
+    }
   });
   return originalMain;
 }

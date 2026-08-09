@@ -7,7 +7,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   assertInternalStoragePath,
+  bundledDerivedCandidateAppPathForReceipt,
   codexSource,
+  codexSourceTransactionPaths,
   createGitHubJsonFetcher,
   createProductionCodexSourceBuildAdapter,
   freezeCodexSourceCandidate,
@@ -141,6 +143,14 @@ test("edge fallback rejects completed alpha and bundled receipts and selects com
     selectLastKnownGoodCodexSourceFallback([stableAlpha, edgeAlpha, bundledAlpha], "edge"),
     null,
   );
+});
+
+test("bundled-derived consumption resolves the exact candidate app the build writes", () => {
+  const root = "/Users/example/Library/Application Support/Tweakers";
+  const receiptFile = join(root, "codex-source", "receipts", "tx-bundled.json");
+  const resolved = bundledDerivedCandidateAppPathForReceipt(receiptFile, "tx-bundled");
+  assert.equal(resolved, codexSourceTransactionPaths(root, "tx-bundled").candidateApp);
+  assert.equal(resolved, join(root, "codex-source", "transactions", "tx-bundled", "candidate", "ChatGPT.app"));
 });
 
 test("a prepared build receipt cannot be consumed before its isolated canary passes", () => {

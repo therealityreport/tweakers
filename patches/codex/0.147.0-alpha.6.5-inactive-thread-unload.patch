@@ -1,0 +1,16 @@
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+index f661fdd3120c9814d7ef412e5a6a15308366a246..2de9c31be30009d7c1bfb54cfccb5821f854a08d 100644
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -2,7 +2,10 @@ use super::*;
+ use crate::extensions::send_thread_warning;
+ use codex_protocol::config_types::MultiAgentMode;
+ 
+-pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
++// Desktop retains a complete per-thread MCP process fleet while a thread is
++// loaded. Once the last subscriber leaves and the thread is idle, keep only a
++// short handoff window instead of holding those subprocesses for 30 minutes.
++pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(60);
+ 
+ #[derive(Clone)]
+ pub(super) struct ListenerTaskContext {

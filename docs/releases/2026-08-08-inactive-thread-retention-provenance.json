@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "kind": "tweakers-release-provenance",
+  "release": "inactive-thread-retention",
+  "recordedAt": "2026-08-09T01:05:00Z",
+  "repo": {
+    "baseCommit": "191008d45cfc5fc8b4ebf5dea483a7cd058306fc",
+    "dirtyDeltaSha256": "3530872456fef43d4bb428cb6069770f2c4594e3ed281ecacf13fe52a9fb7bc1"
+  },
+  "renderer": {
+    "sourceSha256": "07a039d2049ca5f99cb352af607cc01169b018de1396a26cb071143760c56132",
+    "testSha256": "bd4ab4ed3281fd4244d065b58b55e9df5f37c6956f0fbc590fdf9ac9a7607518",
+    "policy": { "inactiveUnsubscribeMs": 60000, "maxInactiveOwnerThreads": 0 }
+  },
+  "backend": {
+    "patch": "patches/codex/0.147.0-alpha.6.5-inactive-thread-unload.patch",
+    "patchSha256": "9e27c2ff0f58011102590ed6efabd1b5779f793a2bd68918da4cf458d88c728f",
+    "upstreamTag": "rust-v0.147.0-alpha.6.5",
+    "sourceCommit": "618b8e9111da9f57fe380b09d0f6516e3f343536",
+    "patchedTree": "29d9e3e5ca3dc93b42cbbb515756f67105fc24cd",
+    "cargoLockSha256": "63f5785eeafa0ee15629926603b8dfc01c5cdb8d0a1888406c976d1a1a893b02",
+    "reviewedDiffSha256": "3ffe0c78f5662a35b14e405619b00aed3f22e92d84a222de961b7ff971e2bc06",
+    "lockNormalization": "135 local workspace package versions 0.0.0 -> 0.147.0-alpha.6.5; no third-party changes",
+    "binarySha256": "3c56a086cc10ce299c87c1289893070ae50b9c3e456d20c1395d6c4c610d34b1",
+    "threadUnloadingDelaySeconds": 60
+  },
+  "receipts": {
+    "acceptedBuildSha256": "28954d2ec1956eabae75f1a2942a66a84d8aea107b8e398a7f4b26e5b0dcd3d7",
+    "testEvidenceSha256": "6602ce272f2dd16e16eee9a2e715e005487717f0486d6ca6104560d1f7422497",
+    "store": "~/Library/Application Support/codex-plusplus/transactions/inactive-thread-retention-20260808"
+  },
+  "installedAppAtCandidate": {
+    "bundle": "ChatGPT.app",
+    "version": "26.803.41515",
+    "build": "6321",
+    "backendVersion": "0.147.0-alpha.6.5"
+  },
+  "headroom": {
+    "route": "~/.codex/config.toml [mcp_servers.headroom]",
+    "action": "enabled = false",
+    "preEditConfigSha256": "34d032532e999fc4850ffd338be548320d9e4def77d275f1d3992dc5d9acd0fa",
+    "backupPath": null,
+    "postEditConfigSha256": null
+  },
+  "deploymentLane": {
+    "kind": "prebuilt-combined-candidate",
+    "helper": "com.therealityreport.tweakers.retention-fix",
+    "rollbackFloors": [
+      "app-install pristine.app",
+      "app-install last-known-good.app + last-known-good-runtime",
+      "backup/Codex.app"
+    ]
+  }
+}
