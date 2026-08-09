@@ -95,8 +95,8 @@ part of this deployment (only that route; all other MCP entries untouched).
 | Field | Value |
 | --- | --- |
 | Pre-edit config sha256 | `34d032532e999fc4850ffd338be548320d9e4def77d275f1d3992dc5d9acd0fa` |
-| Backup | timestamped `~/.codex/config.toml.backup-<UTC>` (recorded in the JSON sidecar once taken) |
-| Post-edit config sha256 | recorded in the JSON sidecar once edited |
+| Backup | `~/.codex/config.toml.backup-20260809T011345Z` |
+| Post-edit config sha256 | `26b564fcfd7b759ba9f2d6803875e8c4eed8bb3cc86aa9f8cfa55bea351ff2c3` |
 
 ## Deployment lane
 

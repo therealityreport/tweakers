@@ -39,8 +39,8 @@
     "route": "~/.codex/config.toml [mcp_servers.headroom]",
     "action": "enabled = false",
     "preEditConfigSha256": "34d032532e999fc4850ffd338be548320d9e4def77d275f1d3992dc5d9acd0fa",
-    "backupPath": null,
-    "postEditConfigSha256": null
+    "backupPath": "~/.codex/config.toml.backup-20260809T011345Z",
+    "postEditConfigSha256": "26b564fcfd7b759ba9f2d6803875e8c4eed8bb3cc86aa9f8cfa55bea351ff2c3"
   },
   "deploymentLane": {
     "kind": "prebuilt-combined-candidate",
