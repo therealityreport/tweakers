@@ -1643,8 +1643,8 @@ test("default preparation stages immutable app/backend/rollback evidence and def
         signatureCheckedAt: "2026-07-17T02:00:00.000Z",
         officialBackendVersion: "0.144.0",
         officialBackendFingerprint: "official-backend-digest",
-        backendVersion: "0.144.0",
-        backendFingerprint: "rollback-backend-digest",
+        backendVersion: null,
+        backendFingerprint: null,
         pristineBackupPath: pristinePath,
         pristineBackupFingerprint: "pristine-digest",
         patchedPayloadPath: patchedPath,
@@ -1678,8 +1678,8 @@ test("default preparation stages immutable app/backend/rollback evidence and def
         signatureCheckedAt: "2026-07-17T02:00:00.000Z",
         officialBackendVersion: "0.144.0",
         officialBackendFingerprint: "official-backend-digest",
-        backendVersion: "0.144.0",
-        backendFingerprint: "rollback-backend-digest",
+        backendVersion: null,
+        backendFingerprint: null,
         pristineBackupPath: pristinePath,
         pristineBackupFingerprint: "pristine-digest",
         patchedPayloadPath: patchedPath,
@@ -1734,7 +1734,7 @@ test("default preparation stages immutable app/backend/rollback evidence and def
         designatedRequirement: 'designated => identifier "com.openai.codex"',
         teamIdentifier: null,
       }),
-      readBackendVersion: (path) => path.includes("rollback") ? "0.144.0" : "0.144.0",
+      readBackendVersion: (path) => path.includes("rollback") ? null : "0.144.0",
       replaceApp: (source, destination, validate) => {
         writes.push(`replace:${destination}`);
         liveMode = source.includes("rollback.app") ? "tweakers" : "chatgpt";

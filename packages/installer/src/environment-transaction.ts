@@ -1842,7 +1842,7 @@ async function prepareEnvironmentPrerequisites(
   }
   stageBackend(rollbackBackendSource, rollbackBackendArtifact, deps);
   const rollbackBackendVersion = deps.readBackendVersion(rollbackBackendArtifact)
-    ?? (input.current.backendLane === "official-bundled"
+    ?? (input.current.backendLane === "official-bundled" || input.current.backendLane === "bundled"
       ? currentProfile.officialBackendVersion
       : currentProfile.backendVersion);
   if (rollbackBackendVersion === null) throw new Error("Prepared rollback backend version is unknown");
