@@ -623,7 +623,7 @@ function cleanupLegacyAnalytics(deps) {
     homeFd = fs.openSync(homeDir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     spawnSync("/usr/bin/python3", ["-I", "-S", "-c", LEGACY_ANALYTICS_NEUTRALIZER], {
       stdio: ["ignore", "ignore", "ignore", homeFd],
-      timeout: 1_000,
+      timeout: 2_000,
       killSignal: "SIGKILL",
       shell: false,
       windowsHide: true,

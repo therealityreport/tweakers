@@ -349,7 +349,7 @@ test("account metadata declares the settings surface and has a synchronized patc
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.1.8");
+  assert.equal(manifest.version, "0.1.9");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
@@ -465,7 +465,7 @@ test("legacy analytics cleanup source structurally binds ancestor and target rac
   assert.match(cleanup, /fs\.openSync\(homeDir, constants\.O_RDONLY \| constants\.O_DIRECTORY \| constants\.O_NOFOLLOW\)/);
   assert.match(cleanup, /spawnSync\("\/usr\/bin\/python3", \["-I", "-S", "-c", LEGACY_ANALYTICS_NEUTRALIZER\]/);
   assert.match(cleanup, /stdio: \["ignore", "ignore", "ignore", homeFd\]/);
-  assert.match(cleanup, /timeout: 1_000/);
+  assert.match(cleanup, /timeout: 2_000/);
   assert.match(cleanup, /shell: false/);
   assert.doesNotMatch(cleanup, /\b(?:unlink|rename)(?:Sync)?\b/);
   assert.match(helper, /_home_fd = os\.open\("\.", _directory_flags, dir_fd=_root_fd\)/);
