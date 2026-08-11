@@ -9,7 +9,8 @@ import { existsSync, accessSync, constants } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { inspectChromeBridge } from "../chrome-bridge-health.js";
 import { readAsarMarker, readCodexVersion } from "./install.js";
-import { describeChatgptModeAsar } from "./status.js";
+import { describeChatgptModeAsar, describeRendererPatchCoverage, patchedPayloadAsarPath } from "./status.js";
+import { readRendererPatchRecord } from "../renderer-patch-outcome.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
 import { targetUserHome } from "../ownership.js";
 import {
@@ -132,6 +133,20 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
             : headerHash === state.originalAsarHash
               ? "matches ORIGINAL — Codex updated; run `tweaker repair`"
               : "drift from both original and patched",
+      });
+    }
+
+    // Absent record ⇒ no check at all: a payload built before this accounting
+    // never claimed anything, so warning about it would be a false alarm.
+    const coverage = describeRendererPatchCoverage(
+      readRendererPatchRecord(patchedPayloadAsarPath(paths.root, codex.asarPath)),
+      readCodexVersion(codex.metaPath ?? "") ?? null,
+    );
+    if (coverage) {
+      checks.push({
+        name: "renderer tweaks",
+        ok: coverage.tone === "green" ? true : "warn",
+        detail: coverage.label,
       });
     }
   }

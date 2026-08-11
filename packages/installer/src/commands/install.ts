@@ -63,6 +63,11 @@ import {
 } from "../codex-window-services.js";
 import { patchCodexModelSelectionInExtractedApp } from "../codex-model-selection.js";
 import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
+import {
+  runOptionalRendererPatch,
+  summarizeRendererPatches,
+  type RendererPatchOutcome,
+} from "../renderer-patch-outcome.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { getOpenReport, listProcesses, reportsMainProcessRunning, type OpenReport, type ProcessInfo } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
@@ -1862,7 +1867,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   step("Runtime staged");
 
   // 3. Patch app.asar entry point to require our loader.
-  const originalEntry = await injectLoader(
+  const { originalMain: originalEntry } = await injectLoader(
     codex.asarPath,
     opts.candidateContext?.finalUserRoot ?? paths.root,
     step.detail,
@@ -3256,8 +3261,9 @@ async function injectLoader(
   step: (msg: string) => void = () => {},
   appUserDataRoot?: string,
   appDisplayName?: string,
-): Promise<string> {
+): Promise<{ originalMain: string; rendererPatches: RendererPatchOutcome[] }> {
   let originalMain = "";
+  let rendererPatches: RendererPatchOutcome[] = [];
   await patchAsar(asarPath, (dir) => {
     const pkgPath = join(dir, "package.json");
     if (!existsSync(pkgPath)) {
@@ -3286,7 +3292,6 @@ async function injectLoader(
       pkg.productName = appDisplayName;
     }
     pkg.main = "tweaker-loader.cjs";
-    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
     // Copy our loader stub into the asar root.
     const loaderSrc = join(assetsDir, "loader.cjs");
@@ -3301,33 +3306,52 @@ async function injectLoader(
       cpSync(loaderSrc, join(dir, "tweaker-loader.cjs"));
     }
 
+    // Required: without the window-services bridge the payload would still
+    // advertise itself as Tweakers while carrying no tweak runtime, so this one
+    // is deliberately NOT routed through runOptionalRendererPatch.
     patchCodexWindowServices(dir, originalMain, step);
-    const modelSelectionPatch = patchCodexModelSelectionInExtractedApp(dir);
-    if (modelSelectionPatch.status === "not-applicable") {
-      step(
-        `Codex model selector draft override not applicable (${modelSelectionPatch.scannedFiles} renderer files scanned)`,
-      );
-    } else {
-      step(
-        `${modelSelectionPatch.status === "patched" ? "Patched" : "Verified"} Codex model selector draft override in ${
-          kleur.dim(modelSelectionPatch.relativePath ?? "unknown renderer file")
-        } using ${kleur.cyan(modelSelectionPatch.strategy ?? "existing marker")}`,
-      );
-    }
-    const inactiveThreadRetentionPatch = patchCodexInactiveThreadRetentionInExtractedApp(dir);
-    if (inactiveThreadRetentionPatch.status === "not-applicable") {
-      step(
-        `Codex inactive-thread retention patch not applicable (${inactiveThreadRetentionPatch.scannedFiles} renderer files scanned)`,
-      );
-    } else {
-      step(
-        `${inactiveThreadRetentionPatch.status === "patched" ? "Patched" : "Verified"} Codex inactive-thread retention policy in ${
-          kleur.dim(inactiveThreadRetentionPatch.relativePath ?? "unknown renderer file")
-        } using ${kleur.cyan(inactiveThreadRetentionPatch.strategy ?? "existing policy")}`,
-      );
-    }
+
+    const modelSelectionPatch = runOptionalRendererPatch(
+      "renderer.model-selection",
+      () => patchCodexModelSelectionInExtractedApp(dir),
+    );
+    reportRendererPatch(step, modelSelectionPatch, "Codex model selector draft override");
+
+    const inactiveThreadRetentionPatch = runOptionalRendererPatch(
+      "renderer.inactive-thread-retention",
+      () => patchCodexInactiveThreadRetentionInExtractedApp(dir),
+    );
+    reportRendererPatch(step, inactiveThreadRetentionPatch, "Codex inactive-thread retention policy");
+
+    rendererPatches = [modelSelectionPatch, inactiveThreadRetentionPatch];
+    // Overwrite rather than merge: carrying a stale "patched" claim into a build
+    // where the patch was skipped would make the payload lie about itself.
+    pkg["__tweaker"].rendererPatches = summarizeRendererPatches(rendererPatches);
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
   });
-  return originalMain;
+  return { originalMain, rendererPatches };
+}
+
+function reportRendererPatch(
+  step: (msg: string) => void,
+  outcome: RendererPatchOutcome,
+  label: string,
+): void {
+  if (outcome.status === "skipped-drift") {
+    step(
+      kleur.yellow(`Skipped ${label}: ${outcome.detail ?? "renderer layout changed"}`),
+    );
+    return;
+  }
+  if (outcome.status === "not-applicable") {
+    step(`${label} not applicable (${outcome.scannedFiles} renderer files scanned)`);
+    return;
+  }
+  step(
+    `${outcome.status === "patched" ? "Patched" : "Verified"} ${label} in ${
+      kleur.dim(outcome.relativePath ?? "unknown renderer file")
+    } using ${kleur.cyan(outcome.strategy ?? "existing marker")}`,
+  );
 }
 
 interface CodexWindowServicesCandidateDiagnostic {
@@ -3370,7 +3394,14 @@ function patchCodexWindowServices(
     }
 
     if (patched) {
-      if (patched.changed) writeFileSync(mainPath, patched.source);
+      // This patch splices at a computed offset into OpenAI's main bundle, and
+      // nothing downstream ever parses or executes that bundle — a desynced
+      // offset would ship a correctly-hashed, correctly-signed app that throws
+      // at boot. Verify the bytes before they reach disk.
+      if (patched.changed) {
+        verifyWindowServicesOutput(source, patched.source, relativePath);
+        writeFileSync(mainPath, patched.source);
+      }
       step(
         `Exposed Codex window services from ${kleur.dim(relativePath)} using ${kleur.cyan(patched.strategy)}${
           patched.serviceVar ? ` (${patched.serviceVar})` : ""
@@ -3381,6 +3412,64 @@ function patchCodexWindowServices(
   }
 
   throw new Error(formatWindowServicesHookFailure(originalMain, diagnostics));
+}
+
+/**
+ * Re-read our own window-services output before it is written.
+ *
+ * The patch is a splice at an offset derived by scanning minified source, so
+ * the failure mode to catch is "we inserted into the middle of something".
+ * A pure insertion cannot change the original text, cannot change bracket
+ * balance beyond what it contributes itself, and must leave the marker present
+ * exactly once.
+ */
+export function verifyWindowServicesOutput(
+  original: string,
+  produced: string,
+  relativePath: string,
+): void {
+  const reject = (reason: string): never => {
+    throw new Error(`Codex window services patch produced unusable bytes in ${relativePath}: ${reason}`);
+  };
+
+  if (produced.length <= original.length) {
+    reject(`output is not longer than input (${original.length} → ${produced.length})`);
+  }
+
+  // A pure insertion leaves a common prefix and suffix that together account
+  // for the entire original.
+  let prefix = 0;
+  while (prefix < original.length && original[prefix] === produced[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < original.length - prefix &&
+    original[original.length - 1 - suffix] === produced[produced.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  if (prefix + suffix !== original.length) {
+    reject("output is not a pure insertion — existing bytes were modified");
+  }
+
+  const inserted = produced.slice(prefix, produced.length - suffix);
+  if (!inserted) reject("insertion is empty");
+  if (!isBracketBalanced(inserted)) reject(`inserted region is not bracket-balanced: ${inserted.slice(0, 120)}`);
+
+  const after = describeCodexWindowServicesSource(produced, CODEX_WINDOW_SERVICES_KEY);
+  if (!after.hasMarker) reject("marker is absent from the produced source");
+  const markerCount = produced.split(CODEX_WINDOW_SERVICES_KEY).length - 1;
+  if (markerCount < 1) reject("marker key is absent from the produced source");
+}
+
+/** Bracket balance for a fragment we generated ourselves (no strings expected). */
+function isBracketBalanced(fragment: string): boolean {
+  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  const stack: string[] = [];
+  for (const char of fragment) {
+    if (char === "(" || char === "[" || char === "{") stack.push(char);
+    else if (pairs[char] && stack.pop() !== pairs[char]) return false;
+  }
+  return stack.length === 0;
 }
 
 export function findCodexMainCandidates(appDir: string, originalMain: string): string[] {

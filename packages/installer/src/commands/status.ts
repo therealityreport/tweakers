@@ -12,6 +12,7 @@ import { describeUpdateMode, readUpdateMode } from "../update-mode.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
 import { readConfigFile } from "../config.js";
 import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
+import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
@@ -123,6 +124,25 @@ export async function status(): Promise<void> {
       console.log(kleur.dim(`  fuses:        unreadable (${(e as Error).message})`));
     }
   }
+
+  const coverage = describeRendererPatchCoverage(
+    readRendererPatchRecord(patchedPayloadAsarPath(paths.root, codex.asarPath)),
+    readCodexVersion(codex.metaPath ?? "") ?? null,
+  );
+  if (coverage) {
+    const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;
+    console.log(`  renderer tweaks: ${paint(coverage.label)}`);
+  }
+}
+
+/**
+ * The archive that carries the patched payload's self-report: the live asar in
+ * Tweakers mode, the parked payload in ChatGPT mode (where the live app is
+ * pristine and has nothing to say about our patches).
+ */
+export function patchedPayloadAsarPath(userRoot: string, liveAsarPath: string): string {
+  if (readAsarMarker(liveAsarPath) === "present") return liveAsarPath;
+  return join(parkedPayloadApp(userRoot), "Contents", "Resources", "app.asar");
 }
 
 export interface ChatgptModeAsarReport {
@@ -159,6 +179,50 @@ export function describeChatgptModeAsar(input: {
     label: `differs from the recorded original — likely an official update; still unpatched (ChatGPT mode; parked payload: ${parked})`,
     tone: "yellow",
   };
+}
+
+export interface RendererPatchCoverageReport {
+  label: string;
+  tone: "green" | "yellow";
+}
+
+/**
+ * Optional-renderer-tweak verdict, shared by status + doctor + mode status.
+ *
+ * Returns null when the payload carries no record — a build that predates this
+ * accounting never claimed anything, and warning about it would be a false
+ * alarm rather than news.
+ *
+ * Deliberately two-toned. `not-applicable` is painted yellow alongside an
+ * outright skip because from inside the bundle "upstream removed this feature"
+ * and "we lost the ability to find it" are the same observation; only a human
+ * can tell them apart, and they can only do that if we say something.
+ */
+export function describeRendererPatchCoverage(
+  record: RendererPatchRecord | null,
+  builtAgainstVersion: string | null,
+): RendererPatchCoverageReport | null {
+  if (!record || record.patches.length === 0) return null;
+  const total = record.patches.length;
+  const active = record.patches.filter(
+    (patch) => patch.status === "patched" || patch.status === "already-patched",
+  ).length;
+  if (active === total) {
+    return { label: `${total} of ${total} optional tweaks active`, tone: "green" };
+  }
+
+  const against = builtAgainstVersion ? ` on ${builtAgainstVersion}` : "";
+  const inactive = record.patches
+    .filter((patch) => patch.status !== "patched" && patch.status !== "already-patched")
+    .map((patch) => `${shortRendererPatchName(patch.id)} (${patch.status}${against})`);
+  return {
+    label: `${active} of ${total} optional tweaks active — ${inactive.join(", ")}`,
+    tone: "yellow",
+  };
+}
+
+function shortRendererPatchName(id: string): string {
+  return id.startsWith("renderer.") ? id.slice("renderer.".length) : id;
 }
 
 function readSafeMode(configFile: string): boolean {
