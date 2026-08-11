@@ -3457,8 +3457,10 @@ export function verifyWindowServicesOutput(
 
   const after = describeCodexWindowServicesSource(produced, CODEX_WINDOW_SERVICES_KEY);
   if (!after.hasMarker) reject("marker is absent from the produced source");
-  const markerCount = produced.split(CODEX_WINDOW_SERVICES_KEY).length - 1;
-  if (markerCount < 1) reject("marker key is absent from the produced source");
+  // Exactly one assignment: a splice that duplicated the marker would leave two
+  // globals racing to own the bridge, and the last write would win silently.
+  const assignments = produced.split(`globalThis.${CODEX_WINDOW_SERVICES_KEY}=`).length - 1;
+  if (assignments !== 1) reject(`marker is assigned ${assignments} times, expected exactly once`);
 }
 
 /** Bracket balance for a fragment we generated ourselves (no strings expected). */

@@ -51,6 +51,19 @@ test("rejects an insertion that never lands the marker", () => {
   );
 });
 
+test("rejects an insertion that landed the marker twice", () => {
+  const patched = patchCodexWindowServicesSource(ORIGINAL, CODEX_WINDOW_SERVICES_KEY);
+  assert.ok(patched);
+  const doubled = patched.source.replace(
+    `globalThis.${CODEX_WINDOW_SERVICES_KEY}=M;`,
+    `globalThis.${CODEX_WINDOW_SERVICES_KEY}=M;globalThis.${CODEX_WINDOW_SERVICES_KEY}=M;`,
+  );
+  assert.throws(
+    () => verifyWindowServicesOutput(ORIGINAL, doubled, "main.js"),
+    /assigned 2 times, expected exactly once/,
+  );
+});
+
 test("rejects output that did not grow", () => {
   assert.throws(
     () => verifyWindowServicesOutput(ORIGINAL, ORIGINAL, "main.js"),
