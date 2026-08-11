@@ -53,6 +53,7 @@ import {
   type McpLifecycleRepairResult,
 } from "./mcp-lifecycle.js";
 import { targetUserHome } from "../ownership.js";
+import { readRendererPatchRecord, rendererPatchRetryWarranted } from "../renderer-patch-outcome.js";
 
 interface Opts {
   app?: string;
@@ -342,7 +343,12 @@ async function repairWithLifecycle(
     const runtimeMatches = dependencies.runtimeAssetsMatch ?? runtimeAssetsMatch;
     const { headerHash } = readHeader(codex.asarPath);
     const patchSchema = (dependencies.readAsarPatchSchema ?? readAsarPatchSchema)(codex.asarPath);
-    if (headerHash === state.patchedAsarHash && patchSchema !== "legacy") {
+    // A payload whose optional renderer patches gave up under an older matcher
+    // generation gets another attempt: falling through reaches install(), which
+    // re-runs every patcher. This is how a promoted matcher fix re-arms itself
+    // without waiting for the user to switch modes.
+    const rendererRetry = rendererPatchRetryWarranted(readRendererPatchRecord(codex.asarPath));
+    if (headerHash === state.patchedAsarHash && patchSchema !== "legacy" && !rendererRetry) {
       if (!appIsRunning(codex.appRoot)) {
         migrateLegacyTweakNamespaces(paths.root, paths.configFile);
       }

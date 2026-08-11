@@ -33,6 +33,8 @@ import {
   spawnHiddenHealthProbe,
   type AsarMarker,
 } from "./install.js";
+import { describeRendererPatchCoverage } from "./status.js";
+import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
 import { waitForMacAppUpdateToSettle } from "./repair.js";
 import { confirmModeSwitch, isCodexRunning, openCodex, quitCodex } from "../alerts.js";
 import { appendLifecycleAuditRecord } from "../desktop-update-log.js";
@@ -313,6 +315,11 @@ interface ModeStatusReport {
   backup: { present: boolean; developerIdValid: boolean; version: string | null };
   switcher: { installed: boolean; reason?: string };
   transition: { target: AppMode; phase: string; ownerPid: number } | null;
+  /**
+   * Additive and optional. Menu Bar decodes this report, so an older installer
+   * that omits the key must still decode cleanly.
+   */
+  rendererPatches?: RendererPatchRecord;
 }
 
 async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Promise<void> {
@@ -377,6 +384,13 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
     transition: journal ? { target: journal.target, phase: journal.phase, ownerPid: journal.ownerPid } : null,
   };
 
+  const rendererRecord = readRendererPatchRecord(
+    marker === "present" && codex
+      ? codex.asarPath
+      : join(parkedApp, "Contents", "Resources", "app.asar"),
+  );
+  if (rendererRecord) report.rendererPatches = rendererRecord;
+
   if (opts.json) {
     console.log(JSON.stringify(report));
     return;
@@ -388,6 +402,11 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
   console.log(`  parked payload: ${report.parkedPayload.present ? kleur.green(`present${report.parkedPayload.baseVersion ? ` (${report.parkedPayload.baseVersion})` : ""}`) : kleur.dim("none")}`);
   console.log(`  pristine backup: ${report.backup.present ? `${report.backup.developerIdValid ? kleur.green("Developer ID valid") : kleur.red("NOT Developer ID signed")}${report.backup.version ? ` (${report.backup.version})` : ""}` : kleur.red("missing")}`);
   console.log(`  mode controls: ${report.switcher.installed ? kleur.green("Menu Bar coordinator ready") : kleur.yellow(`unavailable${report.switcher.reason ? ` — ${report.switcher.reason}` : ""}`)}`);
+  const coverage = describeRendererPatchCoverage(report.rendererPatches ?? null, null);
+  if (coverage) {
+    const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;
+    console.log(`  renderer tweaks: ${paint(coverage.label)}`);
+  }
   if (report.transition) {
     console.log(kleur.yellow(`  transition:    switch to ${report.transition.target} in progress (phase ${report.transition.phase}, PID ${report.transition.ownerPid})`));
   }

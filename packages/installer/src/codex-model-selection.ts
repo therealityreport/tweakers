@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { RendererPatchDeclined, type RendererPatchApplication } from "./renderer-patch-outcome.js";
 
 export const CODEX_MODEL_SELECTION_DRAFT_OVERRIDE_MARKER =
   "__tweaker_model_selection_draft_override__";
@@ -10,10 +11,7 @@ export interface CodexModelSelectionPatch {
   strategy: "already-patched" | "new-draft-explicit-selection";
 }
 
-export interface CodexModelSelectionAppPatch {
-  status: "patched" | "already-patched" | "not-applicable";
-  relativePath?: string;
-  scannedFiles: number;
+export interface CodexModelSelectionAppPatch extends RendererPatchApplication {
   strategy?: CodexModelSelectionPatch["strategy"];
 }
 
@@ -159,9 +157,12 @@ function inspectCandidatePhase(appDir: string, candidates: string[]): CandidateP
       const patch = patchCodexModelSelectionSource(source);
       return { path, source, patch, incompatible: !patch && looksLikeIncompatibleSelector(source) };
     } catch (error) {
-      throw new Error(
-        `Codex model selector patch rejected ${relative(appDir, path)}: ${errorMessage(error)}`,
-      );
+      const relativePath = relative(appDir, path);
+      const message = `Codex model selector patch rejected ${relativePath}: ${errorMessage(error)}`;
+      if (error instanceof RendererPatchDeclined) {
+        throw new RendererPatchDeclined({ message, reasonCode: error.reasonCode, relativePath });
+      }
+      throw new Error(message);
     }
   });
   return { sources };
@@ -177,10 +178,15 @@ function selectCandidatePatch(
     .map((candidate) => relative(appDir, candidate.path));
 
   if (incompatibleCandidates.length > 0) {
-    throw new Error(
-      "Codex model selector was recognized but its initializer layout changed in " +
+    // Upstream moved the site we key on. Declining records a skip and lets the
+    // rest of the payload build; every other refusal below still fails it.
+    throw new RendererPatchDeclined({
+      reasonCode: "layout-drift",
+      relativePath: incompatibleCandidates[0],
+      message:
+        "Codex model selector was recognized but its initializer layout changed in " +
         `${incompatibleCandidates.join(", ")}; refusing an unverified renderer change`,
-    );
+    });
   }
   if (patches.length > 1) {
     throw new Error(
