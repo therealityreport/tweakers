@@ -2482,9 +2482,11 @@ function runGit(args: readonly string[], cwd?: string): string {
 }
 
 function probeCodexBinaryVersion(binary: string): string {
+  // First execution of a freshly built or copied binary can stall for several
+  // seconds behind macOS Gatekeeper/XProtect assessment; 5s flakes there.
   const output = execFileSync(binary, ["--version"], {
     encoding: "utf8",
-    timeout: 5_000,
+    timeout: 60_000,
     maxBuffer: 64 * 1024,
   }).trim();
   const version = /^codex-cli (.+)$/.exec(output)?.[1];
