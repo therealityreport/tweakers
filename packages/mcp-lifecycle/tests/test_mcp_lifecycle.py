@@ -1049,6 +1049,22 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertEqual("observed", updated[0].state)
         self.assertFalse(updated[0].actionable)
         self.assertEqual(30, updated[0].helper_family_counts["computer_use"])
+        status = updated[0].to_status()
+        self.assertEqual("detached_wrapper", status["lifecycle_lane"])
+        self.assertEqual("observation_only", status["lane_mode"])
+
+    def test_gsd_pi_requires_the_exact_entrypoint_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "gsd-pi" / "packages" / "mcp-server" / "dist"
+            root.mkdir(parents=True)
+            entrypoint = root / "cli.js"
+            entrypoint.write_text("// MCP entrypoint\n", encoding="utf-8")
+            exact = self.proc(12, 11, "/usr/bin/node", f"node {entrypoint}")
+            near_miss = self.proc(13, 11, "/usr/bin/node", f"node {root / 'cli-dev.js'}")
+            tree = self.classify([self.wrapper(), self.app_server(), exact, near_miss])[0]
+
+        self.assertEqual({"gsd_pi": 1}, tree.helper_family_counts)
+        self.assertEqual([13], [blocker.identity.pid for blocker in tree.blockers])
 
     def test_exact_detached_and_wrapper_like_false_positive(self):
         detached = self.classify([self.wrapper(), self.app_server()])[0]
@@ -1297,6 +1313,82 @@ class SharedLifecycleTests(unittest.TestCase):
             self.assertIsNone(lifecycle._mcp_descriptor(wrong_arg))
             config.write_text(duplicate, encoding="utf-8")
             self.assertIsNone(lifecycle._mcp_descriptor(exact))
+
+    def test_project_local_modal_ops_tolerates_symlinked_project_root_aliases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            real_root = Path(temp) / "Development" / "Projects"
+            project = real_root / "TRR"
+            python = project / "TRR-Backend" / ".venv" / "bin" / "python"
+            framework_python = Path(temp) / "homebrew" / "Python"
+            script = project / "TRR-Backend" / "scripts" / "modal" / "modal_ops_mcp.py"
+            python.parent.mkdir(parents=True)
+            framework_python.parent.mkdir(parents=True)
+            script.parent.mkdir(parents=True)
+            framework_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.symlink_to(framework_python)
+            script.write_text("# modal MCP\n", encoding="utf-8")
+            alias_root = Path(temp) / "Projects"
+            alias_root.symlink_to(real_root)
+            aliased_python = alias_root / "TRR" / "TRR-Backend" / ".venv" / "bin" / "python"
+            aliased_script = (
+                alias_root / "TRR" / "TRR-Backend" / "scripts" / "modal" / "modal_ops_mcp.py"
+            )
+            config = project / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[mcp_servers.modal-ops]\n"
+                f'command = "{aliased_python}"\n'
+                f'args = ["{aliased_script}"]\n',
+                encoding="utf-8",
+            )
+            exact = self.proc(
+                35, 11, str(framework_python), f"{framework_python} {script}", cwd=str(project),
+            )
+            self.assertEqual("modal", lifecycle._mcp_descriptor(exact).family)
+
+            outside_script = Path(temp) / "elsewhere" / "modal_ops_mcp.py"
+            outside_script.parent.mkdir()
+            outside_script.write_text("# rogue\n", encoding="utf-8")
+            config.write_text(
+                "[mcp_servers.modal-ops]\n"
+                f'command = "{aliased_python}"\n'
+                f'args = ["{outside_script}"]\n',
+                encoding="utf-8",
+            )
+            self.assertIsNone(lifecycle._mcp_descriptor(exact))
+
+            missing_parent = alias_root / "TRR" / "missing" / "modal_ops_mcp.py"
+            config.write_text(
+                "[mcp_servers.modal-ops]\n"
+                f'command = "{aliased_python}"\n'
+                f'args = ["{missing_parent}"]\n',
+                encoding="utf-8",
+            )
+            self.assertIsNone(lifecycle._mcp_descriptor(exact))
+
+    def test_homebrew_python_distribution_accepts_both_framework_launch_shapes(self):
+        stub = (
+            "/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/"
+            "Versions/3.11/Resources/Python.app/Contents/MacOS/Python"
+        )
+        shim = (
+            "/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/"
+            "Versions/3.11/bin/python3.11"
+        )
+        self.assertIsNotNone(lifecycle.HOMEBREW_PYTHON_DISTRIBUTION.fullmatch(stub))
+        self.assertIsNotNone(lifecycle.HOMEBREW_PYTHON_DISTRIBUTION.fullmatch(shim))
+        # The stricter process-executable regex still admits only the app stub.
+        self.assertIsNotNone(lifecycle.HOMEBREW_PYTHON_EXECUTABLE.fullmatch(stub))
+        self.assertIsNone(lifecycle.HOMEBREW_PYTHON_EXECUTABLE.fullmatch(shim))
+        for rejected in (
+            "/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/"
+            "Versions/3.11/bin/idle3.11",
+            "/opt/homebrew/bin/python3.11",
+            "/usr/bin/python3",
+            "/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/"
+            "Versions/3.11/bin/python3.11/extra",
+        ):
+            self.assertIsNone(lifecycle.HOMEBREW_PYTHON_DISTRIBUTION.fullmatch(rejected))
 
     def test_headroom_uv_tool_symlink_resolves_under_the_exact_trusted_root(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1548,11 +1640,13 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertNotIn("NODE_OPTIONS", encoded)
         self.assertNotIn("raw_argv", encoded)
         self.assertEqual(2, status["schema_version"])
-        self.assertEqual("strict-detached-v4", status["cleanup_policy_version"])
-        self.assertEqual("mcp-family-descriptors-v4", status["matcher_registry_version"])
+        self.assertEqual("strict-detached-v5", status["cleanup_policy_version"])
+        self.assertEqual("mcp-family-descriptors-v5", status["matcher_registry_version"])
         self.assertEqual("automatic", status["lane_modes"]["exact_standalone_app_server"])
         self.assertEqual("observation_only", status["lane_modes"]["standalone_orphan"])
         self.assertEqual("observation_only", status["lane_modes"]["claude_idle"])
+        self.assertEqual("detached_wrapper", status["trees"][0]["lifecycle_lane"])
+        self.assertEqual("automatic", status["trees"][0]["lane_mode"])
 
         signals = []
         snapshots = iter([processes, processes])
@@ -1606,7 +1700,7 @@ class SharedLifecycleTests(unittest.TestCase):
         planned = instance.detached_plans[tree.tree_key]
         self.assertEqual({10, 11, 12, 13}, set(planned))
 
-    def test_each_signal_revalidates_identity_and_publishes_terminating_first(self):
+    def test_root_identity_change_aborts_before_terminating_or_signal(self):
         clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
         tree = self.classify(clean.values())[0]
         _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
@@ -1616,7 +1710,7 @@ class SharedLifecycleTests(unittest.TestCase):
             10, 1, "/usr/bin/python3", "python3 /Users/test/private-work.py",
             birth="reused-wrapper",
         )
-        snapshots = iter([clean, clean, clean, reused])
+        snapshots = iter([clean, reused])
         events, signals = [], []
         instance = reaper.Reaper(
             snapshot_provider=lambda: next(snapshots),
@@ -1634,15 +1728,14 @@ class SharedLifecycleTests(unittest.TestCase):
         signaled, _tags = instance.execute_detached()
 
         self.assertEqual(0, signaled)
-        self.assertEqual([(11, reaper.signal.SIGTERM)], signals)
-        self.assertEqual(("status", "terminating"), events[0])
+        self.assertEqual([], signals)
+        self.assertEqual([], events)
         self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
-        self.assertIn("immediately before TERM", instance.lifecycle_trees[0].error or "")
+        self.assertIn("root or app-server identity changed", instance.lifecycle_trees[0].error or "")
 
-    def test_recognized_mcp_spawned_after_planning_aborts_before_any_signal(self):
-        # A recognized-MCP descendant is neither a blocker nor part of the
-        # generation hash; if it sprouts between planning and revalidation the
-        # plan must abort, or killing its parents would leak it as an orphan.
+    def test_recognized_mcp_spawned_after_planning_is_boundedly_adopted(self):
+        # v5 adopts an exact MCP root that sprouts between plan and TERM so a
+        # dying parent cannot leave that helper orphaned.
         clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
         tree = self.classify(clean.values())[0]
         _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
@@ -1652,7 +1745,7 @@ class SharedLifecycleTests(unittest.TestCase):
             12, 11, "/usr/bin/npm",
             "npm exec chrome-devtools-mcp --browserUrl http://127.0.0.1:9422",
         )
-        snapshots = iter([clean, sprouted])
+        snapshots = iter([clean, sprouted, {}, {}])
         signals = []
         instance = reaper.Reaper(
             snapshot_provider=lambda: next(snapshots),
@@ -1663,10 +1756,55 @@ class SharedLifecycleTests(unittest.TestCase):
         instance.plan_detached_wrappers(prior)
         signaled, _tags = instance.execute_detached()
 
-        self.assertEqual(0, signaled)
-        self.assertEqual([], signals)
+        self.assertEqual(3, signaled)
+        self.assertEqual(
+            [(12, reaper.signal.SIGTERM), (11, reaper.signal.SIGTERM), (10, reaper.signal.SIGTERM)],
+            signals,
+        )
+        self.assertEqual("verified_gone", instance.lifecycle_trees[0].state)
+
+    def test_changed_or_exited_non_root_pid_is_skipped_without_widening_the_plan(self):
+        helper = self.proc(12, 11, "/usr/bin/npm", "npm exec chrome-devtools-mcp")
+        before = {proc.pid: proc for proc in [self.wrapper(), self.app_server(), helper]}
+        tree = self.classify(before.values())[0]
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _eligible, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_600)
+        after = {pid: proc for pid, proc in before.items() if pid != helper.pid}
+        receipts, signals = [], []
+        instance = reaper.Reaper(
+            snapshot_provider=iter([before, after, {}, {}]).__next__, clock=lambda: 1_600,
+            signal_sender=lambda pid, sig: signals.append((pid, sig)), sleeper=lambda _seconds: None,
+            receipt_writer=lambda _path, payload: receipts.append(payload),
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, _tags = instance.execute_detached()
+
+        self.assertEqual(2, signaled)
+        self.assertEqual([(11, reaper.signal.SIGTERM), (10, reaper.signal.SIGTERM)], signals)
+        self.assertEqual([12], receipts[0]["skipped_pids"])
+        self.assertEqual("verified_gone", instance.lifecycle_trees[0].state)
+
+    def test_same_identity_survivors_preserve_idle_since_for_bounded_retry(self):
+        clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
+        tree = self.classify(clean.values())[0]
+        _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        _eligible, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_600)
+        writes, receipts = [], []
+        instance = reaper.Reaper(
+            snapshot_provider=lambda: clean, clock=lambda: 1_600,
+            signal_sender=lambda _pid, _sig: None, sleeper=lambda _seconds: None,
+            lifecycle_state_writer=lambda _path, payload: writes.append(json.loads(json.dumps(payload))),
+            receipt_writer=lambda _path, payload: receipts.append(payload),
+        )
+        instance.plan_detached_wrappers(prior)
+        signaled, _tags = instance.execute_detached()
+
+        self.assertEqual(2, signaled)
         self.assertEqual("partial_failure", instance.lifecycle_trees[0].state)
-        self.assertIn("appeared after planning", instance.lifecycle_trees[0].error or "")
+        self.assertEqual(1_000, writes[-1]["trees"][tree.tree_key]["idle_since"])
+        self.assertEqual(1, writes[-1]["trees"][tree.tree_key]["retry_attempts"])
+        self.assertEqual(1_000, receipts[0]["retry_idle_since"])
+        self.assertEqual(1, receipts[0]["retry_attempt"])
 
     def test_abort_clears_persisted_timer_and_next_clean_cycle_restarts_grace(self):
         clean = {proc.pid: proc for proc in [self.wrapper(), self.app_server()]}
@@ -1708,7 +1846,7 @@ class SharedLifecycleTests(unittest.TestCase):
         tree = self.classify(clean.values())[0]
         _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
         _eligible, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_600)
-        snapshots = iter([clean, clean, clean, clean, {}, {}])
+        snapshots = iter([clean, clean, {}, {}])
         receipts, state_writes, status_writes, signals = [], [], [], []
         with tempfile.TemporaryDirectory() as directory:
             temp_state = Path(directory) / "state.json"
@@ -1738,7 +1876,7 @@ class SharedLifecycleTests(unittest.TestCase):
 
 
 class SoftBlockerLifecycleTests(unittest.TestCase):
-    """strict-detached-v4: idle soft blockers stop starving the detached lane."""
+    """strict-detached-v5: idle soft blockers stop starving the detached lane."""
 
     uid = 501
     wrapper_executable = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
@@ -1822,7 +1960,7 @@ class SoftBlockerLifecycleTests(unittest.TestCase):
         self.assertEqual("eligible", eligible[0].state)
         self.assertTrue(eligible[0].actionable)
 
-        snapshots = iter([processes] * 5 + [{}, {}])
+        snapshots = iter([processes, processes, {}, {}])
         signals = []
         # Rewind to the persisted pre-eligibility state, as a real cycle would.
         _pending, prior = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
@@ -1918,7 +2056,7 @@ class SoftBlockerLifecycleTests(unittest.TestCase):
         _pending, prior = lifecycle.advance_lifecycle_state([tree], prior, 1_060)
 
         signals = []
-        snapshots = iter([idle] * 5 + [{}, {}])
+        snapshots = iter([idle, idle, {}, {}])
         instance = reaper.Reaper(
             snapshot_provider=lambda: next(snapshots),
             clock=lambda: 1_660,

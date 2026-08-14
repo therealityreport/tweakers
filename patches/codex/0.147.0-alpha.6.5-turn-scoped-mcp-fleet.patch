@@ -1,5 +1,1219 @@
+diff --git a/codex-rs/app-server/src/request_processors/apps_processor/installed.rs b/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
+index e2360f4..7d03ed1 100644
+--- a/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
++++ b/codex-rs/app-server/src/request_processors/apps_processor/installed.rs
+@@ -106,6 +106,7 @@ impl AppsRequestProcessor {
+                         codex_apps_auth_manager,
+                         elicitation_reviewer: None,
+                         elicitation_lifecycle: None,
++                        deferred_startup: false,
+                     })
+                     .await;
+ 
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+index 2de9c31..7b9366d 100644
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -157,22 +157,27 @@ pub(super) async fn ensure_conversation_listener(
+             )));
+         }
+     };
+-    let thread_state = {
++    let (thread_state, subscriber_count, subscription_seq) = {
+         let pending_thread_unloads = listener_task_context.pending_thread_unloads.lock().await;
+         if pending_thread_unloads.contains(&conversation_id) {
+             return Err(invalid_request(format!(
+                 "thread {conversation_id} is closing; retry after the thread is closed"
+             )));
+         }
+-        let Some(thread_state) = listener_task_context
++        let Some((thread_state, subscriber_count, subscription_seq)) = listener_task_context
+             .thread_state_manager
+-            .try_ensure_connection_subscribed(conversation_id, connection_id, raw_events_enabled)
++            .try_ensure_connection_subscribed_with_count(
++                conversation_id,
++                connection_id,
++                raw_events_enabled,
++            )
+             .await
+         else {
+             return Ok(EnsureConversationListenerResult::ConnectionClosed);
+         };
+-        thread_state
++        (thread_state, subscriber_count, subscription_seq)
+     };
++    conversation.note_mcp_subscriber_count(subscriber_count, subscription_seq);
+     if let Err(error) = ensure_listener_task_running(
+         listener_task_context.clone(),
+         conversation_id,
+@@ -647,17 +652,18 @@ pub(super) async fn handle_pending_thread_resume_request(
+                 .await;
+             return;
+         }
+-        if !thread_state_manager
+-            .try_add_connection_to_thread(conversation_id, connection_id)
++        let Some((subscriber_count, subscription_seq)) = thread_state_manager
++            .try_add_connection_to_thread_with_count(conversation_id, connection_id)
+             .await
+-        {
++        else {
+             tracing::debug!(
+                 thread_id = %conversation_id,
+                 connection_id = ?connection_id,
+                 "skipping running thread resume for closed connection"
+             );
+             return;
+-        }
++        };
++        conversation.note_mcp_subscriber_count(subscriber_count, subscription_seq);
+     }
+ 
+     let (turns_backwards_cursor, items_backwards_cursor) = if let Some(thread_store) =
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 2b3b5fa..22850a1 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -891,19 +891,28 @@ impl ThreadRequestProcessor {
+         let thread_id = ThreadId::from_string(&params.thread_id)
+             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+ 
+-        if self.thread_manager.get_thread(thread_id).await.is_err() {
++        let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+             self.finalize_thread_teardown(thread_id).await;
+             return Ok(ThreadUnsubscribeResponse {
+                 status: ThreadUnsubscribeStatus::NotLoaded,
+             });
+         };
+ 
+-        let was_subscribed = self
++        let mutation = self
+             .thread_state_manager
+-            .unsubscribe_connection_from_thread(thread_id, connection_id)
++            .unsubscribe_connection_from_thread_with_count(thread_id, connection_id)
+             .await;
++        thread.note_mcp_subscriber_count(mutation.subscriber_count, mutation.seq);
++        if mutation.changed && mutation.subscriber_count == 0 {
++            thread
++                .schedule_mcp_retirement_after_final_unsubscribe(
++                    mutation.subscriber_count,
++                    mutation.seq,
++                )
++                .await;
++        }
+ 
+-        let status = if was_subscribed {
++        let status = if mutation.changed {
+             ThreadUnsubscribeStatus::Unsubscribed
+         } else {
+             ThreadUnsubscribeStatus::NotSubscribed
+@@ -2986,11 +2995,19 @@ impl ThreadRequestProcessor {
+     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+         let thread_ids = self
+             .thread_state_manager
+-            .remove_connection(connection_id)
++            .remove_connection_with_counts(connection_id)
+             .await;
+ 
+-        for thread_id in thread_ids {
+-            if self.thread_manager.get_thread(thread_id).await.is_err() {
++        for (thread_id, subscriber_count, subscription_seq) in thread_ids {
++            if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
++                thread.note_mcp_subscriber_count(subscriber_count, subscription_seq);
++                thread
++                    .schedule_mcp_retirement_after_final_unsubscribe(
++                        subscriber_count,
++                        subscription_seq,
++                    )
++                    .await;
++            } else {
+                 // Reconcile stale app-server bookkeeping when the thread has already been
+                 // removed from the core manager.
+                 self.finalize_thread_teardown(thread_id).await;
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index cf491c8..316f3cd 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -1520,4 +1520,84 @@ mod thread_processor_behavior_tests {
+         );
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn mcp_retirement_subscriber_count_transitions_are_exact() -> Result<()> {
++        let manager = ThreadStateManager::new();
++        let thread_id = ThreadId::from_string("c431c733-af0e-425b-aed0-0ca9fa08d01f")?;
++        let connection_a = ConnectionId(1);
++        let connection_b = ConnectionId(2);
++        manager
++            .connection_initialized(connection_a, ConnectionCapabilities::default())
++            .await;
++        manager
++            .connection_initialized(connection_b, ConnectionCapabilities::default())
++            .await;
++
++        let (_, initial_count, initial_seq) = manager
++            .try_ensure_connection_subscribed_with_count(
++                thread_id,
++                connection_a,
++                /*experimental_raw_events*/ false,
++            )
++            .await
++            .expect("first live connection should subscribe");
++        assert_eq!(initial_count, 1);
++        let (_, duplicate_count, duplicate_seq) = manager
++            .try_ensure_connection_subscribed_with_count(
++                thread_id,
++                connection_a,
++                /*experimental_raw_events*/ false,
++            )
++            .await
++            .expect("duplicate live connection should remain subscribed");
++        assert_eq!(duplicate_count, 1);
++        let (second_count, second_seq) = manager
++            .try_add_connection_to_thread_with_count(thread_id, connection_b)
++            .await
++            .expect("second live connection should subscribe");
++        assert_eq!(second_count, 2);
++
++        let non_final = manager
++            .unsubscribe_connection_from_thread_with_count(thread_id, connection_a)
++            .await;
++        assert!(non_final.changed);
++        assert_eq!(non_final.subscriber_count, 1);
++        let final_unsubscribe = manager
++            .unsubscribe_connection_from_thread_with_count(thread_id, connection_b)
++            .await;
++        assert!(final_unsubscribe.changed);
++        assert_eq!(final_unsubscribe.subscriber_count, 0);
++
++        let (resubscribe_count, resubscribe_seq) = manager
++            .try_add_connection_to_thread_with_count(thread_id, connection_b)
++            .await
++            .expect("resubscribe must publish the exact positive count that cancels retirement");
++        assert_eq!(resubscribe_count, 1);
++        let removed = manager.remove_connection_with_counts(connection_b).await;
++        assert_eq!(removed.len(), 1);
++        let (removed_thread_id, removed_count, removed_seq) = removed[0];
++        assert_eq!(
++            (removed_thread_id, removed_count),
++            (thread_id, 0),
++            "connection close must nominate retirement only after the exact final count"
++        );
++
++        // Every publication carries a strictly increasing mutation sequence so
++        // stale publications can never clobber newer counts.
++        let seqs = [
++            initial_seq,
++            duplicate_seq,
++            second_seq,
++            non_final.seq,
++            final_unsubscribe.seq,
++            resubscribe_seq,
++            removed_seq,
++        ];
++        assert!(
++            seqs.windows(2).all(|pair| pair[0] < pair[1]),
++            "mutation sequences must be strictly increasing in mutation order: {seqs:?}"
++        );
++        Ok(())
++    }
+ }
+diff --git a/codex-rs/app-server/src/thread_state.rs b/codex-rs/app-server/src/thread_state.rs
+index 72dc7e1..390ba3b 100644
+--- a/codex-rs/app-server/src/thread_state.rs
++++ b/codex-rs/app-server/src/thread_state.rs
+@@ -304,6 +304,17 @@ struct ThreadStateManagerInner {
+     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
+     threads: HashMap<ThreadId, ThreadEntry>,
+     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
++    /// Assigns the sequence carried by every subscriber-count publication.
++    /// Incremented only while the manager lock is held, so sequence order
++    /// equals mutation order.
++    mcp_subscription_seq: u64,
++}
++
++impl ThreadStateManagerInner {
++    fn next_mcp_subscription_seq(&mut self) -> u64 {
++        self.mcp_subscription_seq += 1;
++        self.mcp_subscription_seq
++    }
+ }
+ 
+ #[derive(Clone, Copy, Default)]
+@@ -311,6 +322,16 @@ pub(crate) struct ConnectionCapabilities {
+     pub(crate) request_attestation: bool,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct SubscriptionMutation {
++    pub(crate) changed: bool,
++    pub(crate) subscriber_count: usize,
++    /// Monotonically increasing mutation sequence assigned while the
++    /// ThreadStateManager lock is held. Consumers reject stale sequences so a
++    /// publication delayed past the lock release cannot clobber a newer count.
++    pub(crate) seq: u64,
++}
++
+ #[derive(Clone, Default)]
+ pub(crate) struct ThreadStateManager {
+     state: Arc<Mutex<ThreadStateManagerInner>>,
+@@ -474,33 +495,62 @@ impl ThreadStateManager {
+         thread_id: ThreadId,
+         connection_id: ConnectionId,
+     ) -> bool {
+-        {
+-            let mut state = self.state.lock().await;
+-            if !state.threads.contains_key(&thread_id) {
+-                return false;
+-            }
++        self.unsubscribe_connection_from_thread_with_count(thread_id, connection_id)
++            .await
++            .changed
++    }
+ 
+-            if !state
+-                .thread_ids_by_connection
+-                .get(&connection_id)
+-                .is_some_and(|thread_ids| thread_ids.contains(&thread_id))
+-            {
+-                return false;
+-            }
++    pub(crate) async fn unsubscribe_connection_from_thread_with_count(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++    ) -> SubscriptionMutation {
++        let mut state = self.state.lock().await;
++        if !state.threads.contains_key(&thread_id) {
++            let seq = state.next_mcp_subscription_seq();
++            return SubscriptionMutation {
++                changed: false,
++                subscriber_count: 0,
++                seq,
++            };
++        }
+ 
+-            if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
+-                thread_ids.remove(&thread_id);
+-                if thread_ids.is_empty() {
+-                    state.thread_ids_by_connection.remove(&connection_id);
+-                }
+-            }
+-            if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
+-                thread_entry.connection_ids.remove(&connection_id);
+-                thread_entry.update_has_connections();
++        if !state
++            .thread_ids_by_connection
++            .get(&connection_id)
++            .is_some_and(|thread_ids| thread_ids.contains(&thread_id))
++        {
++            let subscriber_count = state
++                .threads
++                .get(&thread_id)
++                .map_or(0, |entry| entry.connection_ids.len());
++            let seq = state.next_mcp_subscription_seq();
++            return SubscriptionMutation {
++                changed: false,
++                subscriber_count,
++                seq,
++            };
++        }
++
++        if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
++            thread_ids.remove(&thread_id);
++            if thread_ids.is_empty() {
++                state.thread_ids_by_connection.remove(&connection_id);
+             }
++        }
++        let subscriber_count = if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
++            thread_entry.connection_ids.remove(&connection_id);
++            thread_entry.update_has_connections();
++            thread_entry.connection_ids.len()
++        } else {
++            0
+         };
+-
+-        true
++        let seq = state.next_mcp_subscription_seq();
++        SubscriptionMutation {
++            changed: true,
++            subscriber_count,
++            seq,
++        }
+     }
+ 
+     #[cfg(test)]
+@@ -513,12 +563,28 @@ impl ThreadStateManager {
+             .is_some_and(|thread_entry| !thread_entry.connection_ids.is_empty())
+     }
+ 
++    #[cfg(test)]
+     pub(crate) async fn try_ensure_connection_subscribed(
+         &self,
+         thread_id: ThreadId,
+         connection_id: ConnectionId,
+         experimental_raw_events: bool,
+     ) -> Option<Arc<Mutex<ThreadState>>> {
++        self.try_ensure_connection_subscribed_with_count(
++            thread_id,
++            connection_id,
++            experimental_raw_events,
++        )
++        .await
++        .map(|(state, _subscriber_count, _seq)| state)
++    }
++
++    pub(crate) async fn try_ensure_connection_subscribed_with_count(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++        experimental_raw_events: bool,
++    ) -> Option<(Arc<Mutex<ThreadState>>, usize, u64)> {
+         let thread_state = {
+             let mut state = self.state.lock().await;
+             if !state.live_connections.contains_key(&connection_id) {
+@@ -532,10 +598,13 @@ impl ThreadStateManager {
+             let thread_entry = state.threads.entry(thread_id).or_default();
+             thread_entry.connection_ids.insert(connection_id);
+             thread_entry.update_has_connections();
+-            thread_entry.state.clone()
++            let entry_state = thread_entry.state.clone();
++            let subscriber_count = thread_entry.connection_ids.len();
++            let seq = state.next_mcp_subscription_seq();
++            (entry_state, subscriber_count, seq)
+         };
+         {
+-            let mut thread_state_guard = thread_state.lock().await;
++            let mut thread_state_guard = thread_state.0.lock().await;
+             if experimental_raw_events {
+                 thread_state_guard.set_experimental_raw_events(/*enabled*/ true);
+             }
+@@ -543,14 +612,25 @@ impl ThreadStateManager {
+         Some(thread_state)
+     }
+ 
++    #[cfg(test)]
+     pub(crate) async fn try_add_connection_to_thread(
+         &self,
+         thread_id: ThreadId,
+         connection_id: ConnectionId,
+     ) -> bool {
++        self.try_add_connection_to_thread_with_count(thread_id, connection_id)
++            .await
++            .is_some()
++    }
++
++    pub(crate) async fn try_add_connection_to_thread_with_count(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++    ) -> Option<(usize, u64)> {
+         let mut state = self.state.lock().await;
+         if !state.live_connections.contains_key(&connection_id) {
+-            return false;
++            return None;
+         }
+         state
+             .thread_ids_by_connection
+@@ -560,33 +640,52 @@ impl ThreadStateManager {
+         let thread_entry = state.threads.entry(thread_id).or_default();
+         thread_entry.connection_ids.insert(connection_id);
+         thread_entry.update_has_connections();
+-        true
++        let subscriber_count = thread_entry.connection_ids.len();
++        let seq = state.next_mcp_subscription_seq();
++        Some((subscriber_count, seq))
+     }
+ 
++    #[cfg(test)]
+     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
+-        {
+-            let mut state = self.state.lock().await;
+-            state.live_connections.remove(&connection_id);
+-            let thread_ids = state
+-                .thread_ids_by_connection
+-                .remove(&connection_id)
+-                .unwrap_or_default();
+-            for thread_id in &thread_ids {
+-                if let Some(thread_entry) = state.threads.get_mut(thread_id) {
+-                    thread_entry.connection_ids.remove(&connection_id);
+-                    thread_entry.update_has_connections();
+-                }
++        self.remove_connection_with_counts(connection_id)
++            .await
++            .into_iter()
++            .map(|(thread_id, _subscriber_count, _seq)| thread_id)
++            .collect()
++    }
++
++    pub(crate) async fn remove_connection_with_counts(
++        &self,
++        connection_id: ConnectionId,
++    ) -> Vec<(ThreadId, usize, u64)> {
++        let mut state = self.state.lock().await;
++        state.live_connections.remove(&connection_id);
++        let thread_ids = state
++            .thread_ids_by_connection
++            .remove(&connection_id)
++            .unwrap_or_default();
++        for thread_id in &thread_ids {
++            if let Some(thread_entry) = state.threads.get_mut(thread_id) {
++                thread_entry.connection_ids.remove(&connection_id);
++                thread_entry.update_has_connections();
+             }
+-            thread_ids
+-                .into_iter()
+-                .filter(|thread_id| {
+-                    state
+-                        .threads
+-                        .get(thread_id)
+-                        .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
+-                })
+-                .collect::<Vec<_>>()
+         }
++        let mut retired = Vec::new();
++        for thread_id in thread_ids {
++            let Some(subscriber_count) = state
++                .threads
++                .get(&thread_id)
++                .map(|thread_entry| thread_entry.connection_ids.len())
++            else {
++                continue;
++            };
++            if subscriber_count != 0 {
++                continue;
++            }
++            let seq = state.next_mcp_subscription_seq();
++            retired.push((thread_id, subscriber_count, seq));
++        }
++        retired
+     }
+ 
+     pub(crate) async fn subscribe_to_has_connections(
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+index 810ab71..f17a3b2 100644
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -128,6 +128,10 @@ struct McpServerView {
+     tool_filter: ToolFilter,
+     tool_timeout: Option<Duration>,
+     catalog_item_limit: usize,
++    /// True when this server's eager startup driver was skipped: its startup
++    /// future stays un-polled until a demand path awaits it. Only local stdio
++    /// servers in deferred (subagent) sets are marked.
++    deferred: bool,
+ }
+ 
+ impl McpServerView {
+@@ -185,6 +189,7 @@ impl McpConnectionSet {
+             codex_apps_auth_manager,
+             elicitation_reviewer,
+             elicitation_lifecycle,
++            deferred_startup,
+         } = input;
+         let store_mode = config.mcp_oauth_credentials_store_mode;
+         let keyring_backend_kind = config.auth_keyring_backend_kind;
+@@ -257,6 +262,17 @@ impl McpConnectionSet {
+             };
+             let metadata = McpServerMetadata::from(&server);
+             let configured_config = server.config().clone();
++            // Deferral is restricted to LOCAL STDIO servers: they are the ones
++            // whose eager startup spawns a local process. HTTP/streamable-http
++            // servers spawn no local process, and their tool catalogs are never
++            // cacheable (no transport identity), so deferring them would only
++            // hide their tools — they stay eager even in deferred sets.
++            let defer_this_server = deferred_startup
++                && configured_config.is_local_environment()
++                && matches!(
++                    configured_config.transport,
++                    McpServerTransportConfig::Stdio { .. }
++                );
+             let configured_tool_filter = ToolFilter::from_config(&configured_config);
+             let configured_tool_timeout = Some(
+                 configured_config
+@@ -355,6 +371,7 @@ impl McpConnectionSet {
+                             tool_filter: configured_tool_filter,
+                             tool_timeout: configured_tool_timeout,
+                             catalog_item_limit,
++                            deferred: defer_this_server,
+                         },
+                     );
+                     reused_ready.push(server_name);
+@@ -407,8 +424,17 @@ impl McpConnectionSet {
+                     tool_filter: configured_tool_filter,
+                     tool_timeout: configured_tool_timeout,
+                     catalog_item_limit,
++                    deferred: defer_this_server,
+                 },
+             );
++            // Deferred servers skip the eager startup driver: the shared
++            // startup future stays un-polled until a demand path first awaits
++            // this server, so no local process is spawned for servers the
++            // session never uses. Deferred servers intentionally emit no
++            // startup status events and are absent from the startup summary.
++            if defer_this_server {
++                continue;
++            }
+             let tx_event = tx_event.clone();
+             let submit_id = startup_submit_id.clone();
+             let publication_gate = publication_gate.clone();
+@@ -602,6 +628,12 @@ impl McpConnectionSet {
+ 
+     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+     pub async fn shutdown(&self) {
++        // Cancel every startup token before any client future is awaited so a
++        // sibling still mid-startup stops racing while earlier connections are
++        // torn down, and never-begun deferred startups observe cancellation.
++        for view in self.servers.values() {
++            view.connection.client.cancel_token.cancel();
++        }
+         let connections = self
+             .servers
+             .values()
+diff --git a/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs b/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
+index b5c27c9..220508d 100644
+--- a/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
++++ b/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
+@@ -172,6 +172,16 @@ impl McpConnectionSet {
+                 if !must_wait_for_startup && has_cached_tools {
+                     return;
+                 }
++                if !must_wait_for_startup && view.deferred {
++                    // Deferred stdio server with a cold tool-catalog cache:
++                    // binding construction IS the demand — poll the startup so
++                    // this server's tools are captured instead of silently
++                    // dropped. The first-ever run per server is eager-warm;
++                    // later runs return above via the warmed cache without
++                    // polling.
++                    let _ = view.connection.client.client().await;
++                    return;
++                }
+                 if !must_wait_for_startup {
+                     let startup_deadline = view
+                         .connection
+diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+index 4510983..59cbfd8 100644
+--- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
++++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+@@ -125,6 +125,7 @@ impl McpConnectionSet {
+                 },
+                 tool_timeout: None,
+                 catalog_item_limit: crate::pagination::MAX_MCP_CATALOG_ITEMS,
++                deferred: false,
+             },
+         );
+     }
+@@ -428,6 +429,7 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
+         codex_apps_tools_cache_context: None,
+         tool_catalog_cache_context: None,
+         startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++        startup_begun: Arc::new(AtomicBool::new(true)),
+         startup_reconnect: None,
+         cancel_token: CancellationToken::new(),
+     }
+@@ -461,6 +463,7 @@ fn create_gated_async_managed_client(
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete,
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -527,6 +530,7 @@ async fn create_test_manager_with_ready_apps_client(
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -578,6 +582,7 @@ fn create_test_manager_with_failed_apps_startup(
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(reconnect_factory))),
+             cancel_token: CancellationToken::new(),
+         },
+@@ -1346,6 +1351,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         ElicitationRequestRouter::default(),
+     )
+@@ -1398,6 +1404,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -1456,6 +1463,7 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -1715,6 +1723,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -1811,6 +1820,7 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete,
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -1903,6 +1913,7 @@ async fn capture_binding_skips_pending_optional_servers_after_one_shared_startup
+                 codex_apps_tools_cache_context: None,
+                 tool_catalog_cache_context: None,
+                 startup_complete: Arc::new(AtomicBool::new(false)),
++                startup_begun: Arc::new(AtomicBool::new(true)),
+                 startup_reconnect: None,
+                 cancel_token: CancellationToken::new(),
+             },
+@@ -1992,6 +2003,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets()
+                 codex_apps_tools_cache_context: None,
+                 tool_catalog_cache_context: Some(cache_context.clone()),
+                 startup_complete: Arc::new(AtomicBool::new(false)),
++                startup_begun: Arc::new(AtomicBool::new(true)),
+                 startup_reconnect: None,
+                 cancel_token: CancellationToken::new(),
+             },
+@@ -2253,6 +2265,7 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -2307,6 +2320,7 @@ async fn shutdown_cancels_pending_tool_listing() {
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token,
+         },
+@@ -2353,6 +2367,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -2405,6 +2420,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -2457,6 +2473,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
+             codex_apps_tools_cache_context: Some(cache_context),
+             tool_catalog_cache_context: None,
+             startup_complete,
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -3051,6 +3068,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
+                 codex_apps_auth_manager: None,
+                 elicitation_reviewer: None,
+                 elicitation_lifecycle: None,
++                deferred_startup: false,
+             },
+             ElicitationRequestRouter::default(),
+         )
+@@ -3168,6 +3186,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         ElicitationRequestRouter::default(),
+     )
+@@ -3450,6 +3469,7 @@ async fn manager_with_reusable_ready_server(
+             tool_filter: ToolFilter::from_config(config),
+             tool_timeout: Some(config.tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT)),
+             catalog_item_limit: crate::pagination::MAX_MCP_CATALOG_ITEMS,
++            deferred: false,
+         },
+     );
+     manager
+@@ -3489,6 +3509,7 @@ async fn reconcile_reusable_server(
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         ElicitationRequestRouter::default(),
+     )
+@@ -3573,6 +3594,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
+                     codex_apps_tools_cache_context: None,
+                     tool_catalog_cache_context: None,
+                     startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++                    startup_begun: Arc::new(AtomicBool::new(true)),
+                     startup_reconnect: None,
+                     cancel_token: CancellationToken::new(),
+                 },
+@@ -3581,6 +3603,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
+             tool_filter: ToolFilter::from_config(&config),
+             tool_timeout: Some(config.tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT)),
+             catalog_item_limit: crate::pagination::MAX_MCP_CATALOG_ITEMS,
++            deferred: false,
+         },
+     );
+     let previous = Arc::new(previous);
+@@ -3710,6 +3733,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         ElicitationRequestRouter::default(),
+     )
+@@ -3767,6 +3791,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         ElicitationRequestRouter::default(),
+     )
+@@ -3877,6 +3902,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
+             codex_apps_tools_cache_context: None,
+             tool_catalog_cache_context: None,
+             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++            startup_begun: Arc::new(AtomicBool::new(true)),
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
+@@ -4094,3 +4120,244 @@ async fn view_only_changes_reuse_connection_and_preserve_the_old_step() {
+     );
+     assert_eq!(new_call.tool_approval_mode(), AppToolApproval::Approve);
+ }
++
++fn deferred_stdio_server_config() -> McpServerConfig {
++    let mut config = reusable_server_config("http://127.0.0.1:1");
++    config.transport = McpServerTransportConfig::Stdio {
++        command: "codex-test-deferred-server".to_string(),
++        args: Vec::new(),
++        env: None,
++        env_vars: Vec::new(),
++        cwd: None,
++    };
++    config
++}
++
++fn deferred_reconcile_input(
++    codex_home: PathBuf,
++    runtime_context: McpRuntimeContext,
++    tx_event: Option<async_channel::Sender<Event>>,
++    mcp_servers: HashMap<String, EffectiveMcpServer>,
++) -> McpRuntimeInput {
++    McpRuntimeInput {
++        config: Arc::new(crate::mcp::tests::test_mcp_config(codex_home)),
++        plugins_available: false,
++        ready_selected_capability_roots: Vec::new(),
++        mcp_servers,
++        submit_id: "deferred".to_string(),
++        tx_event,
++        startup_cancellation_token: CancellationToken::new(),
++        runtime_context,
++        codex_apps_tools_cache: ConnectorRuntimeManager::default(),
++        tool_catalog_cache: McpToolCatalogCache::default(),
++        codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(
++            /*account_id*/ None,
++            /*chatgpt_user_id*/ None,
++        ),
++        supports_openai_form_elicitation: false,
++        auth: None,
++        codex_apps_auth_manager: None,
++        elicitation_reviewer: None,
++        elicitation_lifecycle: None,
++        deferred_startup: true,
++    }
++}
++
++async fn deferred_stdio_manager(
++    tx_event: Option<async_channel::Sender<Event>>,
++    codex_home: PathBuf,
++) -> Arc<McpConnectionSet> {
++    let runtime_context = reusable_server_runtime_context();
++    Arc::new(
++        McpConnectionSet::new(
++            /*previous*/ None,
++            McpPublicationGate::already_published(),
++            deferred_reconcile_input(
++                codex_home,
++                runtime_context,
++                tx_event,
++                HashMap::from([
++                    (
++                        "alpha".to_string(),
++                        EffectiveMcpServer::configured(deferred_stdio_server_config()),
++                    ),
++                    (
++                        "beta".to_string(),
++                        EffectiveMcpServer::configured(deferred_stdio_server_config()),
++                    ),
++                ]),
++            ),
++            ElicitationRequestRouter::default(),
++        )
++        .await,
++    )
++}
++
++fn assert_startup_untouched(manager: &McpConnectionSet, server: &str, context: &str) {
++    assert!(
++        !manager
++            .test_client(server)
++            .startup_begun
++            .load(Ordering::Acquire),
++        "{context}: `{server}` startup future must stay un-polled"
++    );
++    assert!(
++        !manager
++            .test_client(server)
++            .startup_complete
++            .load(Ordering::Acquire),
++        "{context}: `{server}` startup must not run"
++    );
++}
++
++#[tokio::test]
++async fn deferred_reconcile_does_not_initiate_any_server_startup() {
++    let (tx_event, rx_event) = async_channel::unbounded();
++    let codex_home = tempdir().expect("tempdir");
++    let manager = deferred_stdio_manager(Some(tx_event), codex_home.path().to_path_buf()).await;
++
++    // The eager reconcile would have spawned startup drivers that immediately
++    // poll each server's shared startup future and emit per-server
++    // McpStartupUpdate events. Deferred reconcile must leave every stdio
++    // startup future un-polled and emit no per-server startup status.
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    for server in ["alpha", "beta"] {
++        assert_startup_untouched(&manager, server, "deferred reconcile");
++    }
++    while let Ok(event) = rx_event.try_recv() {
++        assert!(
++            !matches!(event.msg, EventMsg::McpStartupUpdate(_)),
++            "deferred reconcile must not emit per-server startup events, got {event:?}"
++        );
++    }
++}
++
++#[tokio::test]
++async fn deferred_demand_starts_exactly_the_demanded_server() {
++    let codex_home = tempdir().expect("tempdir");
++    let manager = deferred_stdio_manager(/*tx_event*/ None, codex_home.path().to_path_buf()).await;
++    for server in ["alpha", "beta"] {
++        assert_startup_untouched(&manager, server, "deferred reconcile");
++    }
++
++    // Demanding one server polls exactly that server's shared startup future,
++    // driving its startup to completion (here: a fast failure because the test
++    // environment provides no local stdio runtime). The sibling stays
++    // un-polled.
++    let _server_ready = tokio::time::timeout(
++        Duration::from_secs(60),
++        manager.wait_for_server_startup("alpha"),
++    )
++    .await
++    .expect("demand-poll must drive the deferred startup to completion");
++    assert!(
++        manager
++            .test_client("alpha")
++            .startup_begun
++            .load(Ordering::Acquire),
++        "demand path must poll the demanded deferred server"
++    );
++    assert!(
++        manager
++            .test_client("alpha")
++            .startup_complete
++            .load(Ordering::Acquire),
++        "demand path must drive the demanded deferred server to a startup outcome"
++    );
++    assert_startup_untouched(&manager, "beta", "demand for alpha");
++}
++
++#[tokio::test]
++async fn deferred_binding_capture_ignites_cold_catalog_stdio_servers() {
++    let codex_home = tempdir().expect("tempdir");
++    let manager = deferred_stdio_manager(/*tx_event*/ None, codex_home.path().to_path_buf()).await;
++    for server in ["alpha", "beta"] {
++        assert_startup_untouched(&manager, server, "deferred reconcile");
++    }
++
++    // With a cold tool-catalog cache, binding construction is the demand that
++    // ignites deferred stdio servers so their tools are captured rather than
++    // silently dropped.
++    let _binding = tokio::time::timeout(Duration::from_secs(60), capture_binding(&manager))
++        .await
++        .expect("binding capture must complete");
++    for server in ["alpha", "beta"] {
++        assert!(
++            manager
++                .test_client(server)
++                .startup_complete
++                .load(Ordering::Acquire),
++            "binding capture must drive cold-catalog deferred `{server}` to a startup outcome"
++        );
++    }
++}
++
++#[tokio::test]
++async fn deferred_set_keeps_http_servers_eager() {
++    let runtime_context = reusable_server_runtime_context();
++    let codex_home = tempdir().expect("tempdir");
++    let manager = Arc::new(
++        McpConnectionSet::new(
++            /*previous*/ None,
++            McpPublicationGate::already_published(),
++            deferred_reconcile_input(
++                codex_home.path().to_path_buf(),
++                runtime_context,
++                /*tx_event*/ None,
++                HashMap::from([
++                    (
++                        "alpha".to_string(),
++                        EffectiveMcpServer::configured(deferred_stdio_server_config()),
++                    ),
++                    (
++                        "web".to_string(),
++                        EffectiveMcpServer::configured(reusable_server_config(
++                            "http://127.0.0.1:1",
++                        )),
++                    ),
++                ]),
++            ),
++            ElicitationRequestRouter::default(),
++        )
++        .await,
++    );
++
++    // HTTP servers spawn no local process and have no cacheable tool catalog:
++    // they keep their eager startup driver even in deferred sets.
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
++    while !manager
++        .test_client("web")
++        .startup_complete
++        .load(Ordering::Acquire)
++    {
++        assert!(
++            tokio::time::Instant::now() < deadline,
++            "eager HTTP startup driver must run in a deferred set"
++        );
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    assert_startup_untouched(&manager, "alpha", "eager HTTP sibling startup");
++}
++
++#[tokio::test]
++async fn deferred_shutdown_does_not_ignite_never_started_servers() {
++    let codex_home = tempdir().expect("tempdir");
++    let manager = deferred_stdio_manager(/*tx_event*/ None, codex_home.path().to_path_buf()).await;
++    for server in ["alpha", "beta"] {
++        assert_startup_untouched(&manager, server, "deferred reconcile");
++    }
++
++    // Teardown must never first-poll a never-demanded startup future: doing so
++    // could transiently spawn the stdio server exactly when the fleet is
++    // supposed to quiesce.
++    tokio::time::timeout(Duration::from_secs(10), manager.shutdown())
++        .await
++        .expect("deferred shutdown must complete without polling startups");
++    for server in ["alpha", "beta"] {
++        assert_startup_untouched(&manager, server, "deferred shutdown");
++        assert!(
++            manager.test_client(server).cancel_token.is_cancelled(),
++            "deferred shutdown must cancel `{server}`'s startup token"
++        );
++    }
++}
+diff --git a/codex-rs/codex-mcp/src/mcp/mod.rs b/codex-rs/codex-mcp/src/mcp/mod.rs
+index 1eddf6a..565fbdb 100644
+--- a/codex-rs/codex-mcp/src/mcp/mod.rs
++++ b/codex-rs/codex-mcp/src/mcp/mod.rs
+@@ -354,6 +354,7 @@ pub async fn read_mcp_resource(
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         crate::elicitation::ElicitationRequestRouter::default(),
+     )
+@@ -431,6 +432,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
+             codex_apps_auth_manager: None,
+             elicitation_reviewer: None,
+             elicitation_lifecycle: None,
++            deferred_startup: false,
+         },
+         crate::elicitation::ElicitationRequestRouter::default(),
+     )
+diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
+index 39ceb0e..5046ad2 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client.rs
+@@ -289,6 +289,7 @@ struct ManagedClientStartup {
+     catalog_item_limit: usize,
+     cancel_token: CancellationToken,
+     startup_complete: Arc<AtomicBool>,
++    startup_begun: Arc<AtomicBool>,
+ }
+ 
+ impl ManagedClientStartup {
+@@ -311,6 +312,7 @@ impl ManagedClientStartup {
+             catalog_item_limit,
+             cancel_token,
+             startup_complete,
++            startup_begun,
+         } = self.clone();
+         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
+         let startup_timeout = server
+@@ -322,6 +324,15 @@ impl ManagedClientStartup {
+             .as_ref()
+             .map(McpToolCatalogCacheContext::begin_fetch);
+         async move {
++            startup_begun.store(true, Ordering::Release);
++            // A cancelled-before-begun startup must never reach the transport:
++            // the or_cancel select below is unbiased, so without this check the
++            // first post-cancel poll (e.g. from a teardown path) could spawn
++            // the stdio server process before cancellation is observed.
++            if cancel_token_for_fut.is_cancelled() {
++                startup_complete.store(true, Ordering::Release);
++                return Err(StartupOutcomeError::Cancelled);
++            }
+             let refresh_start = is_codex_apps_mcp_server.then(Instant::now);
+             let outcome = match async {
+                 if let Err(error) = validate_mcp_server_name(&server_name) {
+@@ -401,6 +412,9 @@ pub(crate) struct AsyncManagedClient {
+     pub(crate) codex_apps_tools_cache_context: Option<ConnectorRuntimeContext<ToolInfo>>,
+     pub(crate) tool_catalog_cache_context: Option<McpToolCatalogCacheContext>,
+     pub(crate) startup_complete: Arc<AtomicBool>,
++    /// Set on the first poll of the startup future. Deferred servers that were
++    /// never demanded keep this false, and teardown must not poll them.
++    pub(crate) startup_begun: Arc<AtomicBool>,
+     pub(crate) startup_reconnect: Option<Arc<CodexAppsStartupReconnect>>,
+     pub(crate) cancel_token: CancellationToken,
+ }
+@@ -440,6 +454,7 @@ impl AsyncManagedClient {
+             None
+         };
+         let startup_complete = Arc::new(AtomicBool::new(false));
++        let startup_begun = Arc::new(AtomicBool::new(false));
+         let startup = Arc::new(ManagedClientStartup {
+             server_name,
+             server,
+@@ -458,6 +473,7 @@ impl AsyncManagedClient {
+             catalog_item_limit,
+             cancel_token: cancel_token.clone(),
+             startup_complete: Arc::clone(&startup_complete),
++            startup_begun: Arc::clone(&startup_begun),
+         });
+         let client = startup.start();
+         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
+@@ -478,6 +494,7 @@ impl AsyncManagedClient {
+             codex_apps_tools_cache_context,
+             tool_catalog_cache_context,
+             startup_complete,
++            startup_begun,
+             startup_reconnect,
+             cancel_token,
+         }
+@@ -508,6 +525,12 @@ impl AsyncManagedClient {
+ 
+     pub(crate) async fn shutdown(&self) {
+         self.cancel_token.cancel();
++        // Never first-poll a never-begun startup future during teardown: there
++        // is no transport or process to close, and the first poll could
++        // transiently spawn the server before cancellation is observed.
++        if !self.startup_begun.load(Ordering::Acquire) {
++            return;
++        }
+         match self.client().await {
+             Ok(client) => client.client.shutdown().await,
+             Err(StartupOutcomeError::Cancelled) => {}
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+index 4d1746c..6ebb75f 100644
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -64,6 +64,11 @@ pub struct McpRuntimeInput {
+     pub codex_apps_auth_manager: Option<Arc<AuthManager>>,
+     pub elicitation_reviewer: Option<ElicitationReviewerHandle>,
+     pub elicitation_lifecycle: Option<ElicitationLifecycle>,
++    /// When true, reconciliation does not spawn eager startup drivers: each
++    /// server's shared startup future stays un-polled until a demand path
++    /// (required-server binding or tool call) first awaits it. Used for
++    /// subagent sessions so refresh never eagerly spawns local MCP processes.
++    pub deferred_startup: bool,
+ }
+ 
+ /// Owns all mutable MCP state for one Codex thread.
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index 5bb0228..081c37e 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -232,6 +232,28 @@ impl CodexThread {
+         self.session.services.session_telemetry.clone()
+     }
+ 
++    /// Arms MCP retirement for an AppServer thread only after app-server observed
++    /// an exact subscriber count of zero in the serialized subscription mutation.
++    /// `seq` is the mutation sequence assigned under the ThreadStateManager lock;
++    /// stale sequences are rejected.
++    pub async fn schedule_mcp_retirement_after_final_unsubscribe(
++        &self,
++        subscriber_count: usize,
++        seq: u64,
++    ) {
++        self.session
++            .schedule_app_server_mcp_retirement(subscriber_count, seq)
++            .await;
++    }
++
++    /// Publishes the exact post-subscription count and cancels any stale retirement
++    /// timer. `seq` is the mutation sequence assigned under the ThreadStateManager
++    /// lock; stale sequences are rejected.
++    pub fn note_mcp_subscriber_count(&self, subscriber_count: usize, seq: u64) {
++        self.session
++            .note_app_server_mcp_subscribers(subscriber_count, seq);
++    }
++
+     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+         self.io.shutdown_and_wait().await
+     }
+diff --git a/codex-rs/core/src/connectors.rs b/codex-rs/core/src/connectors.rs
+index 8b1a01d..d6e6463 100644
+--- a/codex-rs/core/src/connectors.rs
++++ b/codex-rs/core/src/connectors.rs
+@@ -264,6 +264,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+         codex_apps_auth_manager,
+         elicitation_reviewer: None,
+         elicitation_lifecycle: None,
++        deferred_startup: false,
+     })
+     .await;
+ 
 diff --git a/codex-rs/core/src/guardian/review.rs b/codex-rs/core/src/guardian/review.rs
-index e9d8f8af23..4c1df35a6b 100644
+index e9d8f8a..4c1df35 100644
 --- a/codex-rs/core/src/guardian/review.rs
 +++ b/codex-rs/core/src/guardian/review.rs
 @@ -25,6 +25,7 @@ use tokio::time::Instant;
@@ -21,59 +1235,53 @@ index e9d8f8af23..4c1df35a6b 100644
      });
  }
 diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
-index 8ed7a7badd..37b1dd58b0 100644
+index 8ed7a7b..0f13b62 100644
 --- a/codex-rs/core/src/session/handlers.rs
 +++ b/codex-rs/core/src/session/handlers.rs
-@@ -598,6 +598,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
-         warn!("failed to shutdown code mode session: {err}");
-     }
-     sess.stop_mcp_prewarm_worker().await;
+@@ -585,6 +585,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
+ }
+ 
+ async fn shutdown_session_runtime(sess: &Arc<Session>) {
 +    sess.abort_idle_mcp_shutdown();
-     {
-         let _refresh = sess.mcp_refresh.acquire().await;
-         sess.mcp_refresh.close();
+     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
+         startup_prewarm.abort().await;
+     }
 diff --git a/codex-rs/core/src/session/mcp_idle.rs b/codex-rs/core/src/session/mcp_idle.rs
 new file mode 100644
-index 0000000000..8a56e67ddb
+index 0000000..1673287
 --- /dev/null
 +++ b/codex-rs/core/src/session/mcp_idle.rs
-@@ -0,0 +1,119 @@
-+//! Turn-scoped MCP fleets for subagent threads.
+@@ -0,0 +1,357 @@
++//! Turn-idle MCP fleet retirement.
 +//!
-+//! Subagent threads stay loaded and subscribed for the lifetime of their
-+//! parent, so their MCP servers would otherwise remain resident long after the
-+//! last turn finished. Once a turn has been idle for the delay below, the
-+//! thread's servers are shut down and the runtime is marked dirty; the next
-+//! tool call or turn start respawns them through `refresh_mcp_if_dirty`.
-+//!
-+//! The scheduled teardown retries instead of firing once: a thread that is busy
-+//! when its deadline lands would otherwise keep its fleet until the parent
-+//! exits, because the paths that disarm the timer (turn start, interrupt,
-+//! guardian abort) vastly outnumber the ones that arm it.
++//! Only explicit subagent sessions are eligible after a terminal turn. App-server
++//! roots use the explicit retirement entry point, which requires the exact
++//! subscriber count observed by app-server while mutating its subscription set.
 +
++use std::sync::atomic::Ordering;
 +use std::time::Duration;
 +
 +use super::*;
 +
-+/// How long a subagent thread's turn must stay idle before its MCP servers
-+/// are shut down.
 +pub(crate) const MCP_TURN_IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
 +
-+/// Counter incremented once per reclaimed subagent MCP fleet.
-+const MCP_TURN_IDLE_SHUTDOWN_METRIC: &str = "codex.mcp.turn_idle_shutdown";
-+/// Counter incremented when an idle deadline lands on a thread that is still busy.
-+const MCP_TURN_IDLE_SHUTDOWN_SKIPPED_METRIC: &str = "codex.mcp.turn_idle_shutdown.skipped";
-+
 +impl Session {
-+    pub(super) async fn is_non_root_agent_thread(&self) -> bool {
-+        let state = self.state.lock().await;
-+        state
-+            .session_configuration
-+            .session_source
-+            .is_non_root_agent()
++    async fn idle_mcp_source_is_subagent(&self) -> bool {
++        matches!(
++            self.state.lock().await.session_configuration.session_source,
++            SessionSource::SubAgent(_)
++        )
++    }
++
++    async fn idle_mcp_source_is_app_server(&self) -> bool {
++        matches!(
++            self.state.lock().await.session_configuration.session_source,
++            SessionSource::Mcp
++        )
 +    }
 +
 +    pub(crate) fn abort_idle_mcp_shutdown(&self) {
++        self.mcp_idle_generation.fetch_add(1, Ordering::AcqRel);
 +        let handle = self
 +            .mcp_idle_shutdown
 +            .lock()
@@ -85,21 +1293,82 @@ index 0000000000..8a56e67ddb
 +    }
 +
 +    pub(crate) async fn schedule_idle_mcp_shutdown(self: &Arc<Self>, delay: Duration) {
-+        if !self.is_non_root_agent_thread().await {
++        if !self.idle_mcp_source_is_subagent().await {
 +            return;
 +        }
-+        let session = Arc::downgrade(self);
++        self.schedule_idle_mcp_shutdown_inner(delay).await;
++    }
++
++    pub(crate) async fn schedule_app_server_mcp_retirement(
++        self: &Arc<Self>,
++        subscriber_count: usize,
++        seq: u64,
++    ) {
++        if !self.publish_app_server_mcp_subscribers(subscriber_count, seq) {
++            return;
++        }
++        if subscriber_count != 0 || !self.idle_mcp_source_is_app_server().await {
++            return;
++        }
++        self.schedule_idle_mcp_shutdown_inner(MCP_TURN_IDLE_SHUTDOWN_DELAY)
++            .await;
++    }
++
++    pub(crate) fn note_app_server_mcp_subscribers(&self, subscriber_count: usize, seq: u64) {
++        if !self.publish_app_server_mcp_subscribers(subscriber_count, seq) {
++            return;
++        }
++        if subscriber_count != 0 {
++            self.abort_idle_mcp_shutdown();
++        }
++    }
++
++    /// Applies one exact app-server subscriber publication, rejecting stale
++    /// sequences.
++    ///
++    /// Sequences are assigned inside app-server's `ThreadStateManager` lock, so
++    /// publications that arrive out of lock order after the lock is released
++    /// cannot clobber a newer count (a stale 0 must never arm retirement over a
++    /// live subscriber, and a stale positive count must never disarm it). An
++    /// equal sequence re-publishes the same mutation (`note` and `schedule`
++    /// share one mutation) and is accepted idempotently.
++    fn publish_app_server_mcp_subscribers(&self, subscriber_count: usize, seq: u64) -> bool {
++        let count = u64::try_from(subscriber_count).unwrap_or(u64::MAX);
++        let mut published = self
++            .app_server_mcp_subscribers
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if seq < published.0 {
++            return false;
++        }
++        *published = (seq, count);
++        true
++    }
++
++    fn app_server_mcp_subscriber_count(&self) -> u64 {
++        self.app_server_mcp_subscribers
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .1
++    }
++
++    async fn schedule_idle_mcp_shutdown_inner(self: &Arc<Self>, delay: Duration) {
++        self.abort_idle_mcp_shutdown();
++        let generation = self.mcp_idle_generation.load(Ordering::Acquire);
++        let weak = Arc::downgrade(self);
 +        let handle = self
 +            .services
 +            .runtime_handle
 +            .spawn(async move {
 +                loop {
 +                    tokio::time::sleep(delay).await;
-+                    // Only hold the session across the check, never across the sleep.
-+                    let Some(session) = session.upgrade() else {
++                    let Some(session) = weak.upgrade() else {
 +                        return;
 +                    };
-+                    if session.shutdown_mcp_if_turn_idle().await {
++                    if session.mcp_idle_generation.load(Ordering::Acquire) != generation {
++                        return;
++                    }
++                    if session.shutdown_mcp_if_turn_idle(generation).await {
 +                        return;
 +                    }
 +                }
@@ -115,69 +1384,271 @@ index 0000000000..8a56e67ddb
 +        }
 +    }
 +
-+    pub(crate) async fn shutdown_mcp_if_turn_idle(self: &Arc<Self>) -> bool {
-+        // New work may have raced with the idle delay; keep a busy thread's fleet.
-+        let busy_reason = if self.active_turn.lock().await.is_some() {
-+            Some("active_turn")
-+        } else if self.input_queue.has_trigger_turn_mailbox_items().await {
-+            Some("mailbox")
-+        } else {
-+            None
++    async fn shutdown_mcp_if_turn_idle(&self, generation: u64) -> bool {
++        // Serialize retirement with runtime publication: while this permit is
++        // held, `refresh_mcp_if_dirty` (and the other publishers that share the
++        // gate) cannot reconcile against — and reuse clients from — a set this
++        // teardown is closing.
++        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
++            // The gate closes only during session-runtime shutdown, which
++            // performs its own MCP teardown; stop retrying.
++            return true;
 +        };
-+        if let Some(reason) = busy_reason {
-+            self.services.session_telemetry.counter(
-+                MCP_TURN_IDLE_SHUTDOWN_SKIPPED_METRIC,
-+                /*inc*/ 1,
-+                &[("reason", reason)],
-+            );
-+            // The caller retries every delay, so a long turn would emit one line per
-+            // minute at info level; the counter carries the signal for aggregates.
-+            debug!(
-+                thread_id = %self.thread_id,
-+                reason,
-+                "keeping subagent MCP servers; thread is not idle"
-+            );
++        // Check every refusal gate only after the permit is held: a turn may
++        // have started or new input arrived while the acquire waited.
++        let is_app_server = self.idle_mcp_source_is_app_server().await;
++        if self.mcp_idle_generation.load(Ordering::Acquire) != generation
++            || self.active_turn.lock().await.is_some()
++            || self.input_queue.has_trigger_turn_mailbox_items().await
++            || self.input_queue.has_pending_input(&self.active_turn).await
++            || (is_app_server && self.app_server_mcp_subscriber_count() != 0)
++        {
 +            return false;
 +        }
-+        let configured_servers = self
-+            .services
-+            .mcp_runtime
-+            .current_config()
-+            .map_or(0, |config| codex_mcp::configured_mcp_servers(&config).len());
-+        self.services.mcp_runtime.shutdown().await;
++
++        // Invalidate BEFORE initiating teardown: the timer task can be aborted
++        // at any await inside `shutdown()` while the detached cleanup keeps
++        // closing clients, and a clean refresh flag would let the next turn
++        // reuse closed clients. All refusal gates passed above, so neither flag
++        // is ever set for a refused shutdown. `reconnect_on_next_refresh`
++        // guarantees the next publication builds fresh connections even if a
++        // refresh races the tail of the detached cleanup after an abort
++        // releases the permit. Marking dirty without scheduling a prewarm
++        // keeps the rebuild lazy: the next demand transparently rebuilds via
++        // `refresh_mcp_if_dirty`.
 +        self.mark_mcp_runtime_dirty();
-+        self.services
-+            .session_telemetry
-+            .counter(MCP_TURN_IDLE_SHUTDOWN_METRIC, /*inc*/ 1, &[]);
-+        info!(
-+            thread_id = %self.thread_id,
-+            configured_servers,
-+            "shut down idle subagent MCP servers"
-+        );
++        self.services.mcp_runtime.reconnect_on_next_refresh();
++        self.services.mcp_runtime.shutdown().await;
 +        true
 +    }
 +}
-diff --git a/codex-rs/core/src/session/mcp_prewarm.rs b/codex-rs/core/src/session/mcp_prewarm.rs
-index f4b45b6e21..c0fb531bc7 100644
---- a/codex-rs/core/src/session/mcp_prewarm.rs
-+++ b/codex-rs/core/src/session/mcp_prewarm.rs
-@@ -42,6 +42,14 @@ impl Session {
-                 if auth_changed {
-                     session.mark_mcp_runtime_dirty();
-                 }
-+                // Auth revisions fan out to every live session, so an idle subagent
-+                // would prewarm a fleet that turn-idle teardown just reclaimed and
-+                // then never re-arm. Leave the runtime dirty for its next turn.
-+                if session.is_non_root_agent_thread().await
-+                    && session.active_turn.lock().await.is_none()
-+                {
-+                    continue;
-+                }
-                 tokio::select! {
-                     biased;
-                     _ = shutdown.cancelled() => break,
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_protocol::AgentPath;
++    use codex_protocol::ThreadId;
++    use codex_protocol::protocol::SessionSource;
++    use codex_protocol::protocol::SubAgentSource;
++    use std::sync::atomic::Ordering;
++
++    async fn make_subagent_session() -> Arc<Session> {
++        let (session, _turn_context, _events) =
++            crate::session::tests::make_session_and_context_with_rx().await;
++        session
++            .state
++            .lock()
++            .await
++            .session_configuration
++            .session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++            parent_thread_id: ThreadId::new(),
++            depth: 1,
++            agent_path: None,
++            agent_nickname: None,
++            agent_role: None,
++        });
++        session
++    }
++
++    async fn make_app_server_session() -> Arc<Session> {
++        let (session, _turn_context, _events) =
++            crate::session::tests::make_session_and_context_with_rx().await;
++        session
++            .state
++            .lock()
++            .await
++            .session_configuration
++            .session_source = SessionSource::Mcp;
++        session
++    }
++
++    /// The session fixtures mark the runtime dirty during construction, so
++    /// clear the pending refresh to make post-shutdown dirtiness observable.
++    fn reset_refresh_dirty(session: &Session) {
++        let _ = session.mcp_refresh.claim();
++    }
++
++    #[tokio::test]
++    async fn mcp_idle_subagent_root_busy_mailbox_retry_and_shutdown_transitions() {
++        let (root, _turn_context, _events) =
++            crate::session::tests::make_session_and_context_with_rx().await;
++        root.schedule_idle_mcp_shutdown(Duration::ZERO).await;
++        assert!(
++            root.mcp_idle_shutdown
++                .lock()
++                .expect("root idle lock")
++                .is_none()
++        );
++
++        let scheduled = make_subagent_session().await;
++        scheduled
++            .schedule_idle_mcp_shutdown(Duration::from_secs(3600))
++            .await;
++        let generation = scheduled.mcp_idle_generation.load(Ordering::Acquire);
++        assert!(
++            scheduled
++                .mcp_idle_shutdown
++                .lock()
++                .expect("subagent idle lock")
++                .is_some()
++        );
++        scheduled.abort_idle_mcp_shutdown();
++        assert!(scheduled.mcp_idle_generation.load(Ordering::Acquire) > generation);
++        assert!(
++            scheduled
++                .mcp_idle_shutdown
++                .lock()
++                .expect("aborted idle lock")
++                .is_none()
++        );
++
++        let busy = make_subagent_session().await;
++        reset_refresh_dirty(&busy);
++        *busy.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
++        assert!(!busy.shutdown_mcp_if_turn_idle(0).await);
++        assert!(!busy.mcp_refresh.is_pending());
++
++        let mailbox = make_subagent_session().await;
++        reset_refresh_dirty(&mailbox);
++        mailbox
++            .input_queue
++            .enqueue_mailbox_communication(
++                InterAgentCommunication::new(
++                    AgentPath::root(),
++                    AgentPath::root(),
++                    Vec::new(),
++                    "keep MCP runtime for pending child work".to_string(),
++                    /*trigger_turn*/ true,
++                ),
++                /*parent_turn_id*/ None,
++            )
++            .await;
++        assert!(!mailbox.shutdown_mcp_if_turn_idle(0).await);
++        assert!(!mailbox.mcp_refresh.is_pending());
++
++        let terminal = make_subagent_session().await;
++        reset_refresh_dirty(&terminal);
++        assert!(terminal.shutdown_mcp_if_turn_idle(0).await);
++        assert!(terminal.mcp_refresh.is_pending());
++    }
++
++    #[tokio::test]
++    async fn mcp_idle_app_server_subscriber_gate_requires_final_unsubscribe() {
++        let session = make_app_server_session().await;
++        reset_refresh_dirty(&session);
++        session.note_app_server_mcp_subscribers(1, /*seq*/ 1);
++        let generation = session.mcp_idle_generation.load(Ordering::Acquire);
++        assert!(!session.shutdown_mcp_if_turn_idle(generation).await);
++        assert!(!session.mcp_refresh.is_pending());
++        session.note_app_server_mcp_subscribers(0, /*seq*/ 2);
++        assert!(session.shutdown_mcp_if_turn_idle(generation).await);
++        assert!(session.mcp_refresh.is_pending());
++    }
++
++    #[tokio::test]
++    async fn mcp_idle_app_server_stale_sequence_is_rejected() {
++        let session = make_app_server_session().await;
++        reset_refresh_dirty(&session);
++        session.note_app_server_mcp_subscribers(1, /*seq*/ 2);
++        let generation = session.mcp_idle_generation.load(Ordering::Acquire);
++
++        // A stale final-unsubscribe publication must neither clobber the newer
++        // count nor arm retirement.
++        session
++            .schedule_app_server_mcp_retirement(0, /*seq*/ 1)
++            .await;
++        assert!(
++            session
++                .mcp_idle_shutdown
++                .lock()
++                .expect("idle lock")
++                .is_none(),
++            "stale retirement publication must not arm the timer"
++        );
++        assert!(!session.shutdown_mcp_if_turn_idle(generation).await);
++        assert!(!session.mcp_refresh.is_pending());
++
++        // A stale note must not clobber the newer count either.
++        session.note_app_server_mcp_subscribers(0, /*seq*/ 1);
++        assert!(!session.shutdown_mcp_if_turn_idle(generation).await);
++        assert!(!session.mcp_refresh.is_pending());
++
++        // The genuinely newest final unsubscribe retires the fleet.
++        session
++            .schedule_app_server_mcp_retirement(0, /*seq*/ 3)
++            .await;
++        let generation = session.mcp_idle_generation.load(Ordering::Acquire);
++        assert!(session.shutdown_mcp_if_turn_idle(generation).await);
++        assert!(session.mcp_refresh.is_pending());
++    }
++
++    #[tokio::test]
++    async fn mcp_idle_shutdown_waits_for_refresh_gate() {
++        let session = make_subagent_session().await;
++        reset_refresh_dirty(&session);
++        let permit = session
++            .mcp_refresh
++            .acquire()
++            .await
++            .expect("refresh gate open");
++
++        let shutdown = session.shutdown_mcp_if_turn_idle(0);
++        tokio::pin!(shutdown);
++        assert!(
++            tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
++                .await
++                .is_err(),
++            "retirement must wait for the refresh publication permit"
++        );
++
++        drop(permit);
++        let retired = tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
++            .await
++            .expect("retirement must proceed once the permit is released");
++        assert!(retired);
++        assert!(session.mcp_refresh.is_pending());
++    }
++}
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+index 9a68c55..6f22946 100644
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -18,6 +18,9 @@ pub(super) struct McpDesiredState {
+     pub(super) originator: String,
+     pub(super) environments: TurnEnvironmentSnapshot,
+     pub(super) windows_sandbox_level: WindowsSandboxLevel,
++    /// Subagent sessions defer MCP server startup until a demand path first
++    /// needs a server; root/UI sessions keep eager startup.
++    pub(super) deferred_startup: bool,
+ }
+ 
+ impl McpDesiredState {
+@@ -77,6 +80,7 @@ impl Session {
+             originator: session_configuration.originator.clone(),
+             environments,
+             windows_sandbox_level: session_configuration.windows_sandbox_level,
++            deferred_startup: session_configuration.session_source.is_non_root_agent(),
+         }
+     }
+ 
+@@ -99,6 +103,7 @@ impl Session {
+             originator: session_configuration.originator.clone(),
+             environments: resolved_environments.clone(),
+             windows_sandbox_level: session_configuration.windows_sandbox_level,
++            deferred_startup: session_configuration.session_source.is_non_root_agent(),
+         };
+         self.publish_mcp_runtime(
+             &desired,
+@@ -193,6 +198,7 @@ impl Session {
+             codex_apps_auth_manager,
+             elicitation_reviewer,
+             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
++            deferred_startup: desired.deferred_startup,
+         }
+     }
+ }
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 4b3aadf7ae..3efb8f5e43 100644
+index 4b3aadf..3efb8f5 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -206,6 +206,7 @@ mod handlers;
@@ -197,280 +1668,59 @@ index 4b3aadf7ae..3efb8f5e43 100644
  use self::session::AppServerClientMetadata;
  use self::session::Session;
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index 29bd0af114..bac08866e2 100644
+index 29bd0af..7819bdd 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -52,6 +52,7 @@ pub(crate) struct Session {
+@@ -52,6 +52,13 @@ pub(crate) struct Session {
      pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
      pub(super) mcp_prewarm_shutdown: CancellationToken,
      pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 +    pub(super) mcp_idle_shutdown: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
++    pub(super) mcp_idle_generation: AtomicU64,
++    /// Latest exact app-server subscriber publication as `(seq, count)`.
++    /// The sequence is assigned inside app-server's ThreadStateManager lock;
++    /// stale sequences are rejected so out-of-order publication can never
++    /// clobber a newer count. Never held across an await.
++    pub(super) app_server_mcp_subscribers: std::sync::Mutex<(u64, u64)>,
      pub(crate) conversation: Arc<RealtimeConversationManager>,
      pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
      pub(crate) pending_user_message_admissions:
-@@ -1192,6 +1193,7 @@ impl Session {
+@@ -1192,6 +1199,9 @@ impl Session {
                  mcp_prewarm_tx,
                  mcp_prewarm_shutdown: CancellationToken::new(),
                  mcp_prewarm_task: std::sync::Mutex::new(None),
 +                mcp_idle_shutdown: std::sync::Mutex::new(None),
++                mcp_idle_generation: AtomicU64::new(0),
++                app_server_mcp_subscribers: std::sync::Mutex::new((0, 0)),
                  conversation: Arc::new(RealtimeConversationManager::new()),
                  active_turn: Mutex::new(None),
                  pending_user_message_admissions: Default::default(),
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index b8a91c4b34..667243e375 100644
+index b8a91c4..1c0e65a 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5844,6 +5844,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5844,6 +5844,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
          mcp_prewarm_tx: async_channel::bounded(1).0,
          mcp_prewarm_shutdown: CancellationToken::new(),
          mcp_prewarm_task: std::sync::Mutex::new(None),
 +        mcp_idle_shutdown: std::sync::Mutex::new(None),
++        mcp_idle_generation: AtomicU64::new(0),
++        app_server_mcp_subscribers: std::sync::Mutex::new((0, 0)),
          conversation: Arc::new(RealtimeConversationManager::new()),
          active_turn: Mutex::new(None),
          pending_user_message_admissions: Default::default(),
-@@ -8047,6 +8048,7 @@ where
+@@ -8047,6 +8050,9 @@ where
          mcp_prewarm_tx: async_channel::bounded(1).0,
          mcp_prewarm_shutdown: CancellationToken::new(),
          mcp_prewarm_task: std::sync::Mutex::new(None),
 +        mcp_idle_shutdown: std::sync::Mutex::new(None),
++        mcp_idle_generation: AtomicU64::new(0),
++        app_server_mcp_subscribers: std::sync::Mutex::new((0, 0)),
          conversation: Arc::new(RealtimeConversationManager::new()),
          active_turn: Mutex::new(None),
          pending_user_message_admissions: Default::default(),
-@@ -8198,6 +8200,232 @@ async fn refreshed_mcp_binding_captures_current_approval_authority() {
-     assert_eq!(old_turn.approval_policy.value(), previous_policy);
- }
- 
-+async fn mark_session_as_subagent(session: &Session) {
-+    let mut state = session.state.lock().await;
-+    state.session_configuration.session_source =
-+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-+            parent_thread_id: ThreadId::new(),
-+            depth: 1,
-+            agent_path: None,
-+            agent_nickname: None,
-+            agent_role: None,
-+        });
-+}
-+
-+fn idle_mcp_shutdown_is_armed(session: &Session) -> bool {
-+    session
-+        .mcp_idle_shutdown
-+        .lock()
-+        .unwrap_or_else(std::sync::PoisonError::into_inner)
-+        .is_some()
-+}
-+
-+/// Yields enough times to let every ready task on the current-thread runtime make
-+/// progress. Yielding rather than sleeping keeps the scheduler busy, so the paused
-+/// clock cannot auto-advance into a later deadline while draining.
-+async fn drain_paused_runtime() {
-+    for _ in 0..64 {
-+        tokio::task::yield_now().await;
-+    }
-+}
-+
-+/// Fires exactly one `MCP_TURN_IDLE_SHUTDOWN_DELAY` deadline on the paused clock and
-+/// reports whether `settled` observed the teardown.
-+async fn advance_past_idle_mcp_deadline(settled: impl Fn() -> bool) -> bool {
-+    // The scheduled task must be polled once so its sleep is registered with the timer
-+    // driver; advancing first would move the clock past a deadline that does not exist
-+    // yet and silently turn this into a no-op.
-+    drain_paused_runtime().await;
-+    tokio::time::advance(MCP_TURN_IDLE_SHUTDOWN_DELAY + Duration::from_secs(1)).await;
-+    for _ in 0..64 {
-+        if settled() {
-+            return true;
-+        }
-+        tokio::task::yield_now().await;
-+    }
-+    settled()
-+}
-+
-+/// Regression test for a one-shot teardown: a thread that is busy when its deadline
-+/// lands must be retried, not abandoned until the parent exits.
-+#[tokio::test(start_paused = true)]
-+async fn scheduled_idle_mcp_shutdown_retries_until_the_thread_is_idle() {
-+    let (session, _turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    mark_session_as_subagent(&session).await;
-+    session.refresh_mcp_if_dirty().await;
-+    assert!(!session.mcp_refresh.is_pending());
-+    *session.active_turn.lock().await = Some(ActiveTurn::default());
-+
-+    session
-+        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
-+        .await;
-+
-+    assert!(
-+        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
-+        "a busy thread must keep its MCP fleet"
-+    );
-+
-+    *session.active_turn.lock().await = None;
-+    assert!(
-+        advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
-+        "the teardown must retry once the thread goes idle"
-+    );
-+}
-+
-+/// Interrupts skip `on_task_finished`, so the abort path owns re-arming the teardown.
-+#[tokio::test(start_paused = true)]
-+async fn interrupted_turn_rearms_idle_mcp_shutdown() {
-+    let (session, turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    mark_session_as_subagent(&session).await;
-+    session.refresh_mcp_if_dirty().await;
-+    assert!(!session.mcp_refresh.is_pending());
-+
-+    session
-+        .spawn_task(
-+            Arc::new(turn_context),
-+            Vec::new(),
-+            NeverEndingTask {
-+                kind: TaskKind::Regular,
-+                listen_to_cancellation_token: true,
-+            },
-+        )
-+        .await;
-+    assert!(
-+        !idle_mcp_shutdown_is_armed(&session),
-+        "starting a turn disarms the teardown"
-+    );
-+
-+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
-+
-+    assert!(
-+        advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
-+        "an interrupted turn must still release its MCP fleet"
-+    );
-+}
-+
-+/// Drives the prewarm worker through one full loop body. The bounded channel supplies
-+/// the happens-after edge: the third send can only land once the worker has taken the
-+/// second, which it does only after it finished handling the first.
-+async fn settle_mcp_prewarm(prewarm_tx: &async_channel::Sender<()>) {
-+    for _ in 0..3 {
-+        prewarm_tx.send(()).await.expect("prewarm worker running");
-+    }
-+}
-+
-+/// Auth revisions fan out to every live session, so prewarm must not respawn the fleet
-+/// that turn-idle teardown just reclaimed.
-+#[tokio::test]
-+async fn mcp_prewarm_skips_idle_subagent_threads() {
-+    let (session, _turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    let (prewarm_tx, prewarm_rx) = async_channel::bounded(1);
-+    let (_auth_tx, auth_rx) = tokio::sync::watch::channel(0u64);
-+    session.start_mcp_prewarm_worker(prewarm_rx, auth_rx);
-+
-+    session.mark_mcp_runtime_dirty();
-+    settle_mcp_prewarm(&prewarm_tx).await;
-+    assert!(
-+        !session.mcp_refresh.is_pending(),
-+        "root threads still prewarm while idle"
-+    );
-+
-+    mark_session_as_subagent(&session).await;
-+    session.mark_mcp_runtime_dirty();
-+    settle_mcp_prewarm(&prewarm_tx).await;
-+    assert!(
-+        session.mcp_refresh.is_pending(),
-+        "an idle subagent must leave its runtime dirty for the next turn"
-+    );
-+
-+    *session.active_turn.lock().await = Some(ActiveTurn::default());
-+    settle_mcp_prewarm(&prewarm_tx).await;
-+    assert!(
-+        !session.mcp_refresh.is_pending(),
-+        "a subagent with real work still prewarms"
-+    );
-+
-+    session.stop_mcp_prewarm_worker().await;
-+}
-+
-+#[tokio::test]
-+async fn idle_turn_shuts_down_mcp_runtime_and_refresh_respawns_it() {
-+    let (session, _turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    mark_session_as_subagent(&session).await;
-+    session.refresh_mcp_if_dirty().await;
-+    let config_before = session
-+        .services
-+        .mcp_runtime
-+        .current_config()
-+        .expect("published MCP config");
-+    assert!(!session.mcp_refresh.is_pending());
-+
-+    assert!(session.shutdown_mcp_if_turn_idle().await);
-+    assert!(
-+        session.mcp_refresh.is_pending(),
-+        "idle shutdown must mark the runtime dirty"
-+    );
-+
-+    session.refresh_mcp_if_dirty().await;
-+    let config_after = session
-+        .services
-+        .mcp_runtime
-+        .current_config()
-+        .expect("republished MCP config");
-+    assert!(!session.mcp_refresh.is_pending());
-+    assert!(
-+        !Arc::ptr_eq(&config_before, &config_after),
-+        "refresh after idle shutdown should publish a fresh runtime"
-+    );
-+}
-+
-+#[tokio::test]
-+async fn idle_mcp_shutdown_keeps_runtime_while_turn_is_active() {
-+    let (session, _turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    mark_session_as_subagent(&session).await;
-+    session.refresh_mcp_if_dirty().await;
-+    *session.active_turn.lock().await = Some(ActiveTurn::default());
-+
-+    assert!(!session.shutdown_mcp_if_turn_idle().await);
-+    assert!(!session.mcp_refresh.is_pending());
-+}
-+
-+#[tokio::test(start_paused = true)]
-+async fn idle_mcp_shutdown_is_scheduled_only_for_subagent_threads() {
-+    let (session, _turn_context) = make_session_and_context().await;
-+    let session = Arc::new(session);
-+    session.refresh_mcp_if_dirty().await;
-+    assert!(!session.mcp_refresh.is_pending());
-+
-+    session
-+        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
-+        .await;
-+    assert!(
-+        !idle_mcp_shutdown_is_armed(&session),
-+        "root threads keep their MCP fleet warm"
-+    );
-+    assert!(
-+        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
-+        "root threads must never have their MCP fleet torn down"
-+    );
-+
-+    mark_session_as_subagent(&session).await;
-+    session
-+        .schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
-+        .await;
-+    assert!(idle_mcp_shutdown_is_armed(&session));
-+
-+    session.abort_idle_mcp_shutdown();
-+    assert!(!idle_mcp_shutdown_is_armed(&session));
-+    assert!(
-+        !advance_past_idle_mcp_deadline(|| session.mcp_refresh.is_pending()).await,
-+        "an aborted teardown must not fire"
-+    );
-+}
-+
- #[tokio::test]
- async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
-     let (session, old_turn, rx) = make_session_and_context_with_rx().await;
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index bfd18ef09d..5a2e126118 100644
+index bfd18ef..472ee5e 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
 @@ -27,6 +27,7 @@ use crate::context::ContextualUserFragment;
@@ -489,18 +1739,16 @@ index bfd18ef09d..5a2e126118 100644
          let task: Arc<dyn AnySessionTask> = Arc::new(task);
          let task_kind = task.kind();
          let span_name = task.span_name();
-@@ -821,6 +823,10 @@ impl Session {
-         }
+@@ -813,6 +815,8 @@ impl Session {
+         };
          if cleared_active_turn {
-             self.maybe_start_turn_for_pending_work().await;
-+            // Arm last so a queued turn started just above disarms this from `start_task`
-+            // instead of racing an arm that was placed before it.
+             self.emit_thread_idle_lifecycle_if_idle().await;
 +            self.schedule_idle_mcp_shutdown(MCP_TURN_IDLE_SHUTDOWN_DELAY)
 +                .await;
          }
-     }
- 
-@@ -849,6 +855,11 @@ impl Session {
+         // Regular items were flushed before this terminal event was appended; buffering
+         // thread writers may not flush it without another explicit barrier.
+@@ -849,6 +853,11 @@ impl Session {
  
      async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
          let sub_id = task.turn_context.sub_id.clone();
@@ -512,3 +1760,42 @@ index bfd18ef09d..5a2e126118 100644
          if task.cancellation_token.is_cancelled() {
              return;
          }
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index c636ace..738443e 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -896,6 +896,22 @@ impl ThreadManager {
+         supports_openai_form_elicitation: bool,
+     ) -> CodexResult<NewThread> {
+         let agent_control = self.agent_control_for_config(&config);
++        // Known tradeoff: a rollout persisted by a subagent (/review,
++        // ThreadSpawn agents) resumes with its recorded SubAgent source even
++        // when a root manager (CLI/VSCode/app-server) drives it interactively,
++        // so the resumed session keeps subagent MCP semantics: deferred local
++        // stdio startup, no per-server startup status events, and 60s turn-idle
++        // fleet retirement. This is accepted rather than fixed because
++        // rewriting the source here would change resumed session-id derivation
++        // (legacy subagent rollouts synthesize session_id from the thread id),
++        // rollout trace-tree shape, telemetry tags, and guardian prompt-cache
++        // keys, while gating only the MCP behavior would require threading the
++        // resuming manager's source through the spawn pipeline. Impact is
++        // bounded: reaching this requires resuming a subagent thread by
++        // explicit id (the default pickers exclude them), deferred servers
++        // still ignite on demand (binding capture ignites cold-catalog stdio
++        // servers and HTTP servers stay eager), and retirement rebuilds
++        // transparently via the dirty-refresh flag on the next turn.
+         let (session_source, thread_source) = initial_history
+             .get_resumed_session_sources()
+             .unwrap_or_else(|| (self.state.session_source.clone(), None));
+diff --git a/codex-rs/core/tests/suite/mcp_auth_refresh.rs b/codex-rs/core/tests/suite/mcp_auth_refresh.rs
+index 931407f..8a8ab42 100644
+--- a/codex-rs/core/tests/suite/mcp_auth_refresh.rs
++++ b/codex-rs/core/tests/suite/mcp_auth_refresh.rs
+@@ -107,6 +107,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
+         codex_apps_auth_manager: Some(Arc::clone(&auth_manager)),
+         elicitation_reviewer: None,
+         elicitation_lifecycle: None,
++        deferred_startup: false,
+     })
+     .await;
+     // The model-provider test covers AuthManager reload behavior. Keep this

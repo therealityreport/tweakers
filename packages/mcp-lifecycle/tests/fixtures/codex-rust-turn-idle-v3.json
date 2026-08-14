@@ -1,0 +1,124 @@
+{
+    "schema_version": 1,
+    "policy_id": "managed-turn-idle-v3",
+    "pinned_head": "618b8e9111da9f57fe380b09d0f6516e3f343536",
+    "patch": "patches/codex/0.147.0-alpha.6.5-turn-scoped-mcp-fleet.patch",
+    "required_paths": [
+        "codex-rs/core/src/session/mcp_idle.rs",
+        "codex-rs/core/src/tasks/mod.rs",
+        "codex-rs/core/src/guardian/review.rs",
+        "codex-rs/core/src/session/handlers.rs",
+        "codex-rs/core/src/codex_thread.rs",
+        "codex-rs/core/src/session/mcp_runtime.rs",
+        "codex-rs/codex-mcp/src/runtime.rs",
+        "codex-rs/codex-mcp/src/connection_manager.rs",
+        "codex-rs/app-server/src/thread_state.rs",
+        "codex-rs/app-server/src/request_processors/thread_lifecycle.rs",
+        "codex-rs/app-server/src/request_processors/thread_processor.rs"
+    ],
+    "required_test_paths": [
+        "codex-rs/core/src/session/mcp_idle.rs",
+        "codex-rs/app-server/src/request_processors/thread_processor_tests.rs",
+        "codex-rs/codex-mcp/src/connection_manager_tests.rs"
+    ],
+    "cargo_test_receipts": [
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_subagent_root_busy_mailbox_retry_and_shutdown_transitions",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_app_server_subscriber_gate_requires_final_unsubscribe",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_app_server_stale_sequence_is_rejected",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_shutdown_waits_for_refresh_gate",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-app-server",
+            "test": "request_processors::thread_processor::thread_processor_tests::thread_processor_behavior_tests::mcp_retirement_subscriber_count_transitions_are_exact",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_reconcile_does_not_initiate_any_server_startup",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_demand_starts_exactly_the_demanded_server",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_binding_capture_ignites_cold_catalog_stdio_servers",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_set_keeps_http_servers_eager",
+            "result": "PASS"
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers",
+            "result": "PASS"
+        }
+    ],
+    "required_source_markers": [
+        "SessionSource::SubAgent(_)",
+        "SessionSource::Mcp",
+        "Duration::from_secs(60)",
+        "mcp_idle_generation",
+        "has_trigger_turn_mailbox_items",
+        "has_pending_input(&self.active_turn)",
+        "schedule_idle_mcp_shutdown",
+        "abort_idle_mcp_shutdown",
+        "schedule_app_server_mcp_retirement",
+        "unsubscribe_connection_from_thread_with_count",
+        "try_ensure_connection_subscribed_with_count",
+        "try_add_connection_to_thread_with_count",
+        "remove_connection_with_counts",
+        "schedule_mcp_retirement_after_final_unsubscribe",
+        "note_mcp_subscriber_count",
+        "services.mcp_runtime",
+        "mark_mcp_runtime_dirty",
+        ".shutdown()",
+        "deferred_startup",
+        "is_non_root_agent",
+        "app_server_mcp_subscribers",
+        "SubscriptionMutation",
+        "reconnect_on_next_refresh",
+        "startup_begun"
+    ],
+    "required_test_markers": [
+        "mcp_idle_subagent_root_busy_mailbox_retry_and_shutdown_transitions",
+        "mcp_idle_app_server_subscriber_gate_requires_final_unsubscribe",
+        "mcp_retirement_subscriber_count_transitions_are_exact",
+        "deferred_reconcile_does_not_initiate_any_server_startup",
+        "deferred_demand_starts_exactly_the_demanded_server",
+        "mcp_idle_app_server_stale_sequence_is_rejected",
+        "mcp_idle_shutdown_waits_for_refresh_gate",
+        "deferred_binding_capture_ignites_cold_catalog_stdio_servers",
+        "deferred_set_keeps_http_servers_eager",
+        "deferred_shutdown_does_not_ignite_never_started_servers"
+    ],
+    "forbidden_source_markers": [
+        "is_non_root_agent_thread",
+        "core/src/session/mcp_prewarm.rs",
+        "std::process::Command",
+        "libc::kill",
+        "SIGTERM",
+        "SIGKILL",
+        "pending_mcp_server_refresh_config",
+        "latest_mcp_runtime()"
+    ]
+}

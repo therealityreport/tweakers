@@ -24,10 +24,10 @@ from typing import Any, Callable, Iterable
 
 SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
-PRODUCER_VERSION = "0.4.1"
-CLEANUP_POLICY_VERSION = "strict-detached-v4"
-MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v4"
-# Soft-blocker policy (strict-detached-v4): inside a *detached* tree, an
+PRODUCER_VERSION = "0.5.0"
+CLEANUP_POLICY_VERSION = "strict-detached-v5"
+MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v5"
+# Soft-blocker policy (strict-detached-v5): inside a *detached* tree, an
 # unrecognized node/node_repl process -- or a node/npm/npx/python launcher
 # whose arguments mention "mcp" -- is presumed to be an MCP helper that the
 # dead UI can no longer retire.  Such a process blocks cleanup only while it
@@ -38,6 +38,12 @@ SOFT_BLOCKER_LAUNCHER_BASENAMES = {"node", "npm", "npx", "python", "python3"}
 SOFT_BLOCKER_LAUNCHER_PATTERN = re.compile(r"python3\.\d+")
 # Minimum per-cycle CPU accrual (seconds) that proves a soft blocker is active.
 SOFT_BLOCKER_CPU_DELTA = 0.5
+# A reaper plan is frozen before signalling.  A short-lived MCP child may be
+# spawned after that point, but we only adopt exact, identity-proven MCP
+# subtrees and put a hard ceiling on churn.  This is intentionally a small
+# safety bound, not a discovery mechanism.
+MAX_DETACHED_CHURN_ADOPTIONS = 32
+MAX_DETACHED_RETRY_ATTEMPTS = 2
 LANE_MODES = {
     "detached_wrapper": "automatic",
     # Only a kernel-proven, direct app-server orphan can enter this lane.
@@ -124,6 +130,14 @@ TRUSTED_PLUGIN_CACHE_ROOTS = {
 HOMEBREW_PYTHON_EXECUTABLE = re.compile(
     r"^/(?:opt/homebrew|usr/local)/Cellar/python@[^/]+/[^/]+/Frameworks/"
     r"Python\.framework/Versions/[^/]+/Resources/Python\.app/Contents/MacOS/Python$"
+)
+# The same framework distribution exposes two launch shapes: the app stub that
+# the kernel reports for running processes (above) and the CLI shim a venv's
+# ``python`` symlink resolves to.  Distribution equivalence must accept both.
+HOMEBREW_PYTHON_DISTRIBUTION = re.compile(
+    r"^/(?:opt/homebrew|usr/local)/Cellar/python@[^/]+/[^/]+/Frameworks/"
+    r"Python\.framework/Versions/[^/]+/"
+    r"(?:Resources/Python\.app/Contents/MacOS/Python|bin/python[0-9][^/]*)$"
 )
 MCP_SIGNATURES = (
     "chrome-devtools-mcp",
@@ -478,6 +492,18 @@ class TreeClassification:
     error: str | None = None
 
     def to_status(self) -> dict[str, Any]:
+        if self.ownership == "ui_owned":
+            lifecycle_lane = "detached_wrapper" if self.root_identity != self.app_server_identity else "exact_standalone_app_server"
+            lane_mode = "observation_only"
+        elif self.root_identity != self.app_server_identity:
+            lifecycle_lane = "detached_wrapper"
+            lane_mode = LANE_MODES["detached_wrapper"]
+        elif self.root_identity is not None and self.app_server_identity is not None:
+            lifecycle_lane = "exact_standalone_app_server"
+            lane_mode = LANE_MODES["exact_standalone_app_server"]
+        else:
+            lifecycle_lane = "unknown"
+            lane_mode = "unknown"
         return {
             "tree_key": self.tree_key,
             "root_identity": self.root_identity.to_json() if self.root_identity else None,
@@ -490,6 +516,8 @@ class TreeClassification:
             "eligible_at": self.eligible_at,
             "remaining_seconds": self.remaining_seconds,
             "helper_family_counts": dict(self.helper_family_counts),
+            "lifecycle_lane": lifecycle_lane,
+            "lane_mode": lane_mode,
             "rss_kib": self.rss_kib,
             "last_action": self.last_action,
             "last_verified_action_receipt": self.last_verified_action_receipt,
@@ -998,12 +1026,20 @@ def _project_modal_ops_descriptor(process: ProcessInfo, tokens: list[str]) -> MC
     if cwd is None:
         return None
     # The declaration itself must remain project-owned.  A venv interpreter is
-    # normally a symlink to Homebrew's framework executable, so enforce this on
-    # the lexical configured paths before resolving symlinks.
-    if not _is_under(configured_executable, {cwd}) or not _is_under(configured_script, {cwd}):
-        return None
+    # normally a symlink to Homebrew's framework executable, so containment is
+    # checked with only the parent directories resolved: a symlinked project
+    # root (e.g. ~/Projects -> ~/Development/Projects) normalizes to the kernel
+    # cwd, while the final interpreter/script component stays unresolved so a
+    # venv symlink cannot escape the project root before this gate.
     try:
         cwd = cwd.resolve(strict=True)
+        anchored_executable = configured_executable.parent.resolve(strict=True) / configured_executable.name
+        anchored_script = configured_script.parent.resolve(strict=True) / configured_script.name
+    except OSError:
+        return None
+    if not _is_under(anchored_executable, {cwd}) or not _is_under(anchored_script, {cwd}):
+        return None
+    try:
         actual_executable = executable.resolve(strict=True)
         actual_argv_executable = argv_executable.resolve(strict=True)
         actual_argv_script = argv_script.resolve(strict=True)
@@ -1013,13 +1049,58 @@ def _project_modal_ops_descriptor(process: ProcessInfo, tokens: list[str]) -> MC
         return None
     if not expected_executable.is_file() or not expected_script.is_file() or not _is_under(expected_script, {cwd}):
         return None
+    def same_homebrew_distribution(left: Path, right: Path) -> bool:
+        """Allow only the same resolved Homebrew Python distribution.
+
+        A project venv commonly resolves to a Homebrew framework interpreter.
+        Its configured lexical path is still required to be inside the project
+        root above; this narrow equivalence only accounts for that one proven
+        distribution layout and never widens script-root trust.
+        """
+        if not (
+            HOMEBREW_PYTHON_DISTRIBUTION.fullmatch(str(left))
+            and HOMEBREW_PYTHON_DISTRIBUTION.fullmatch(str(right))
+            and "/Cellar/" in str(left)
+            and "/Cellar/" in str(right)
+        ):
+            return False
+        return (
+            str(left).split("/Cellar/", 1)[1].split("/Frameworks/", 1)[0]
+            == str(right).split("/Cellar/", 1)[1].split("/Frameworks/", 1)[0]
+        )
+
     if (
-        actual_executable != expected_executable
-        or actual_argv_executable != expected_executable
+        not (actual_executable == expected_executable or same_homebrew_distribution(actual_executable, expected_executable))
+        or not (actual_argv_executable == expected_executable or same_homebrew_distribution(actual_argv_executable, expected_executable))
         or actual_argv_script != expected_script
     ):
         return None
     return MCPDescriptor("project.modal-ops", "modal")
+
+
+def _gsd_pi_descriptor(process: ProcessInfo, tokens: list[str]) -> MCPDescriptor | None:
+    """Recognize only the exact gsd-pi local MCP entrypoint.
+
+    gsd-pi is intentionally not recognized by a substring or package-name
+    heuristic: the kernel executable must be a trusted Node launcher and the
+    one absolute script path must end in the canonical package entrypoint.
+    This admits project worktrees without granting trust to adjacent scripts.
+    """
+    if len(tokens) != 2 or _trusted_launcher(process, tokens, {"node"}) is None:
+        return None
+    script = _lexical_absolute_path(tokens[1])
+    if script is None:
+        return None
+    try:
+        script = script.resolve(strict=True)
+    except OSError:
+        return None
+    expected = ("gsd-pi", "packages", "mcp-server", "dist", "cli.js")
+    if len(script.parts) < len(expected) or tuple(script.parts[-len(expected):]) != expected:
+        return None
+    if not script.is_file():
+        return None
+    return MCPDescriptor("project.gsd-pi", "gsd_pi")
 
 
 def _context7_wrapper_descriptor(process: ProcessInfo, tokens: list[str]) -> MCPDescriptor | None:
@@ -1058,6 +1139,9 @@ def _mcp_descriptor(process: ProcessInfo) -> MCPDescriptor | None:
     project_modal_descriptor = _project_modal_ops_descriptor(process, tokens)
     if project_modal_descriptor is not None:
         return project_modal_descriptor
+    gsd_pi_descriptor = _gsd_pi_descriptor(process, tokens)
+    if gsd_pi_descriptor is not None:
+        return gsd_pi_descriptor
     modal_descriptor = _modal_wrapper_descriptor(process, tokens)
     if modal_descriptor is not None:
         return modal_descriptor
@@ -1520,6 +1604,18 @@ def advance_lifecycle_state(
             error=error,
         )
         updated.append(current)
+        retry_attempts = 0
+        last_retry_at: float | None = None
+        if (
+            isinstance(old, dict)
+            and old.get("generation") == tree.generation
+            and isinstance(old.get("retry_attempts"), int)
+            and not isinstance(old.get("retry_attempts"), bool)
+            and 0 <= old["retry_attempts"] <= MAX_DETACHED_RETRY_ATTEMPTS
+        ):
+            retry_attempts = old["retry_attempts"]
+            if isinstance(old.get("last_retry_at"), (int, float)):
+                last_retry_at = float(old["last_retry_at"])
         next_trees[tree.tree_key] = {
             "root_identity": tree.root_identity.to_json() if tree.root_identity else None,
             "app_server_identity": tree.app_server_identity.to_json() if tree.app_server_identity else None,
@@ -1530,6 +1626,11 @@ def advance_lifecycle_state(
             # Compatible schema extension: absent in old state files, in which
             # case every soft blocker fails closed for one cycle.
             "soft_blocker_baselines": soft_blocker_baselines(tree),
+            # Retry metadata is only for a same-identity detached survivor.
+            # It preserves the original idle window while bounding repeated
+            # action receipts; a new generation intentionally starts clean.
+            "retry_attempts": retry_attempts,
+            "last_retry_at": last_retry_at,
         }
 
     return updated, {

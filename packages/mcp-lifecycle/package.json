@@ -1,6 +1,6 @@
 {
   "name": "@therealityreport/tweakers-mcp-lifecycle",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Canonical, source-verified Codex MCP lifecycle assets",
   "type": "module",

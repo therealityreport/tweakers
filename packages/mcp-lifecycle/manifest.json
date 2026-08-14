@@ -2,16 +2,20 @@
   "schema_version": 1,
   "package": {
     "name": "@therealityreport/tweakers-mcp-lifecycle",
-    "version": "0.4.1"
+    "version": "0.5.0"
   },
   "lifecycle_schema_version": 2,
-  "policy_version": "strict-detached-v4",
-  "matcher_registry_version": "mcp-family-descriptors-v4",
+  "policy_version": "strict-detached-v5",
+  "matcher_registry_version": "mcp-family-descriptors-v5",
   "policy": {
     "detached_stable_grace_seconds": 600,
     "termination_order": "children-first-term",
+    "termination_sequence": "children-first-term-grace-kill-verify",
     "term_grace_seconds": 5,
     "kill_scope": "same-identity-survivors",
+    "execution_plan": "identity-frozen-bounded-descendant-adoption",
+    "descendant_churn_adoption_cap": 32,
+    "retry_attempt_cap": 2,
     "automatic_signal_owner": "reaper",
     "guard_mode": "notification-only",
     "lane_modes": {
@@ -36,7 +40,7 @@
       "source": "assets/lib/codex_mcp_lifecycle.py",
       "destination": "{{HOME}}/.codex/lib/codex_mcp_lifecycle.py",
       "mode": "0644",
-      "source_sha256": "d70b1813b50082e19a71c0c392341caa9e584f66ee42e336c2966c7161b6f6a7"
+      "source_sha256": "08433cca3cd85be83eeb41c8f9ebbce3c1a8a7ffa3b95b983e0e0732bf3f8900"
     },
     {
       "id": "idle-reaper",
@@ -44,7 +48,7 @@
       "source": "assets/bin/codex-mcp-idle-reaper.py",
       "destination": "{{HOME}}/.codex/bin/codex-mcp-idle-reaper.py",
       "mode": "0755",
-      "source_sha256": "60e801e3e5c6b230cee593f5bb5171d28c84e6ad1b83ceb4f955e845463e24f8"
+      "source_sha256": "b71268fa64c51005849e8dde031a9a4b0d508abe2e72a2072439bdf4012d1cf9"
     },
     {
       "id": "guard",
@@ -80,8 +84,9 @@
     }
   ],
   "tests": {
-    "baseline_count": 74,
+    "baseline_count": 79,
     "path": "tests/test_mcp_lifecycle.py",
-    "fixtures": "tests/fixtures/lifecycle-scenarios.json"
+    "fixtures": "tests/fixtures/lifecycle-scenarios.json",
+    "rust_patch_fixture": "tests/fixtures/codex-rust-turn-idle-v3.json"
   }
 }
