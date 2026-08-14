@@ -517,12 +517,12 @@ function assertFrozenRustLifecycleTests(receipt: CodexDerivedReceipt, candidateS
     throw new Error("Frozen Rust lifecycle output evidence drifted before cutover");
   }
   const required = [
-    /on_demand_tests::in_flight_cleanup_releases_after_timeout$/,
-    /on_demand_tests::in_flight_cleanup_releases_after_task_cancellation$/,
-    /on_demand_tests::shutdown_waits_for_guard_drop_then_becomes_idle$/,
-    /connection_manager_tests::shutdown_continues_after_caller_is_aborted$/,
-    /connection_manager_tests::verified_on_demand_catalog_lists_tools_without_launching_process$/,
-    /connection_manager_tests::on_demand_first_startup_failure_returns_dormant_and_reaps_process_group$/,
+    /connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers$/,
+    /connection_manager::tests::cancelled_startup_never_reaches_the_transport$/,
+    /connection_manager::tests::shutdown_continues_after_caller_is_aborted$/,
+    /connection_manager::tests::capture_binding_exposes_cached_tools_before_startup$/,
+    /connection_manager::tests::cancelling_startup_does_not_disable_a_ready_client$/,
+    /connection_manager::tests::shutdown_cancels_pending_tool_listing$/,
   ];
   if (required.some((pattern) => !tests.passedTests.some((name) => pattern.test(name)))) {
     throw new Error("Frozen Rust lifecycle receipt is missing a required fault or shutdown proof");
