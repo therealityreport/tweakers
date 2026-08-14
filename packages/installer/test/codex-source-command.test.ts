@@ -6,9 +6,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  CODEX_SOURCE_CARGO_JOBS,
   assertInternalStoragePath,
   bundledDerivedCandidateAppPathForReceipt,
   codexSource,
+  codexSourceCargoEnvironment,
   codexSourceTransactionPaths,
   createGitHubJsonFetcher,
   createProductionCodexSourceBuildAdapter,
@@ -24,6 +26,17 @@ import type { CodexDerivedReceipt, CodexResolutionCheckpoint } from "../src/code
 const published = "2026-07-19T12:00:00.000Z";
 const commit = "a".repeat(40);
 const digest = (scope: string) => ({ algorithm: "sha256" as const, value: "d".repeat(64), scope });
+
+test("source-derived Cargo work is thermally bounded while preserving its environment", () => {
+  const env = codexSourceCargoEnvironment({
+    PATH: "/example/bin",
+    CARGO_BUILD_JOBS: "10",
+  });
+
+  assert.equal(env.PATH, "/example/bin");
+  assert.equal(CODEX_SOURCE_CARGO_JOBS, "2");
+  assert.equal(env.CARGO_BUILD_JOBS, "2");
+});
 
 test("CLI source resolution defaults to the exact installed desktop-bundled backend", async () => {
   const output: string[] = [];

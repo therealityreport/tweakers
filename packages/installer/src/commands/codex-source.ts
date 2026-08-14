@@ -111,6 +111,23 @@ const DAILY_CHECK_MS = 24 * 60 * 60 * 1_000;
 const STOCK_CHATGPT_APP = "/Applications/ChatGPT.app";
 const MINIMUM_BUILD_FREE_BYTES = 40n * 1024n * 1024n * 1024n;
 
+/**
+ * Keep source-derived Codex builds responsive on developer machines. Cargo's
+ * default is one job per logical CPU, which can thermally saturate a laptop
+ * while large release/LTO crates link. Two jobs preserve useful parallelism
+ * without allowing this maintenance command to occupy the whole machine.
+ */
+export const CODEX_SOURCE_CARGO_JOBS = "2";
+
+export function codexSourceCargoEnvironment(
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...inherited,
+    CARGO_BUILD_JOBS: CODEX_SOURCE_CARGO_JOBS,
+  };
+}
+
 export type CodexSourceAction = "build" | "canary-pass" | "freeze" | "cutover" | "rollback" | "detect" | "resolve" | "status";
 
 export interface CodexSourceOptions {
@@ -1288,6 +1305,7 @@ export function createProductionCodexSourceBuildAdapter(
       });
       execFileSync("cargo", ["build", "--locked", "--release", "--package", "codex-cli", "--bin", "codex"], {
         cwd: cargoRoot,
+        env: codexSourceCargoEnvironment(),
         stdio: "inherit",
         timeout: 60 * 60 * 1_000,
       });
@@ -1399,6 +1417,7 @@ function runRustLifecycleReceiptTests(input: {
   const startedAt = new Date().toISOString();
   const result = spawnSync("cargo", [...args], {
     cwd: input.cargoRoot,
+    env: codexSourceCargoEnvironment(),
     encoding: "utf8",
     timeout: 60 * 60 * 1_000,
     maxBuffer: 32 * 1024 * 1024,
