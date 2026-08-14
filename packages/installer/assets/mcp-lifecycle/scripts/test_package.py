@@ -65,20 +65,24 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("schema_version") != 1:
         fail("manifest schema_version must be 1")
     package = manifest.get("package")
-    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.4.1"}:
+    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.5.0"}:
         fail("manifest package identity/version changed")
     if (
         manifest.get("lifecycle_schema_version") != 2
-        or manifest.get("policy_version") != "strict-detached-v4"
+        or manifest.get("policy_version") != "strict-detached-v5"
     ):
         fail("manifest lifecycle/policy schema changed")
-    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v4":
+    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v5":
         fail("manifest matcher registry version changed")
     expected_policy = {
         "detached_stable_grace_seconds": 600,
         "termination_order": "children-first-term",
+        "termination_sequence": "children-first-term-grace-kill-verify",
         "term_grace_seconds": 5,
         "kill_scope": "same-identity-survivors",
+        "execution_plan": "identity-frozen-bounded-descendant-adoption",
+        "descendant_churn_adoption_cap": 32,
+        "retry_attempt_cap": 2,
         "automatic_signal_owner": "reaper",
         "guard_mode": "notification-only",
         "lane_modes": {
@@ -156,14 +160,99 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("launchd labels must be exact and unique")
 
     tests = manifest.get("tests")
-    if not isinstance(tests, dict) or tests.get("baseline_count") != 74:
-        fail("manifest must declare the 74-test baseline")
+    if not isinstance(tests, dict) or tests.get("baseline_count") != 79:
+        fail("manifest must declare the 79-test baseline")
     fixture = PACKAGE_ROOT / checked_relative(str(tests.get("fixtures", "")), label="fixture")
     fixture_payload = json.loads(fixture.read_text(encoding="utf-8"))
     scenarios = fixture_payload.get("scenarios") if isinstance(fixture_payload, dict) else None
     scenario_ids = {entry.get("id") for entry in scenarios if isinstance(entry, dict)} if isinstance(scenarios, list) else set()
     if scenario_ids != EXPECTED_SCENARIOS:
         fail("lifecycle fixture coverage is incomplete")
+
+
+def validate_codex_rust_patch(manifest: dict[str, Any]) -> None:
+    tests = manifest["tests"]
+    fixture_path = PACKAGE_ROOT / checked_relative(
+        str(tests.get("rust_patch_fixture", "")), label="Rust patch fixture"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    if fixture.get("schema_version") != 1 or fixture.get("policy_id") != "managed-turn-idle-v3":
+        fail("Rust lifecycle fixture identity changed")
+    if fixture.get("pinned_head") != "618b8e9111da9f57fe380b09d0f6516e3f343536":
+        fail("Rust lifecycle fixture must bind the accepted pinned source HEAD")
+
+    repository_root = PACKAGE_ROOT.parents[1]
+    patch_path = repository_root / checked_relative(str(fixture.get("patch", "")), label="Rust patch")
+    patch = patch_path.read_text(encoding="utf-8")
+    for source_path in fixture.get("required_paths", []):
+        if f"a/{source_path}" not in patch or f"b/{source_path}" not in patch:
+            fail(f"Rust lifecycle patch does not bind required source path: {source_path}")
+    for source_path in fixture.get("required_test_paths", []):
+        if f"a/{source_path}" not in patch or f"b/{source_path}" not in patch:
+            fail(f"Rust lifecycle patch does not bind required test source path: {source_path}")
+    for marker in fixture.get("required_source_markers", []):
+        if marker not in patch:
+            fail(f"Rust lifecycle patch is missing required source marker: {marker}")
+    for marker in fixture.get("required_test_markers", []):
+        if marker not in patch:
+            fail(f"Rust lifecycle patch is missing required executable test marker: {marker}")
+    expected_receipts = [
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_subagent_root_busy_mailbox_retry_and_shutdown_transitions",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_app_server_subscriber_gate_requires_final_unsubscribe",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_app_server_stale_sequence_is_rejected",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-core",
+            "test": "session::mcp_idle::tests::mcp_idle_shutdown_waits_for_refresh_gate",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-app-server",
+            "test": "request_processors::thread_processor::thread_processor_tests::thread_processor_behavior_tests::mcp_retirement_subscriber_count_transitions_are_exact",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_reconcile_does_not_initiate_any_server_startup",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_demand_starts_exactly_the_demanded_server",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_binding_capture_ignites_cold_catalog_stdio_servers",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_set_keeps_http_servers_eager",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers",
+            "result": "PASS",
+        },
+    ]
+    if fixture.get("cargo_test_receipts") != expected_receipts:
+        fail("Rust lifecycle fixture must bind the exact named cargo test receipts")
+    for marker in fixture.get("forbidden_source_markers", []):
+        if marker in patch:
+            fail(f"Rust lifecycle patch contains forbidden source marker: {marker}")
 
 
 def compile_python_assets(manifest: dict[str, Any]) -> None:
@@ -218,10 +307,11 @@ def run_baseline(manifest: dict[str, Any]) -> None:
 def main() -> int:
     manifest = read_manifest()
     validate_manifest(manifest)
+    validate_codex_rust_patch(manifest)
     compile_python_assets(manifest)
     validate_plists_if_available(manifest)
     run_baseline(manifest)
-    print("mcp-lifecycle package validation passed (74 baseline tests; no live writes)")
+    print("mcp-lifecycle package validation passed (79 baseline tests; no live writes)")
     return 0
 
 

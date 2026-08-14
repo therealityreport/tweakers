@@ -81,6 +81,8 @@ export interface CodexSparkleBridgeOptions {
     /** Rechecks signed-backup continuity without mutating the live app. */
     /** Return null when actionable, a safe reason string when blocked, or an explicit result. */
     getInstallPrerequisite?: () => SparkleInstallPrerequisite | string | null;
+    /** Protected shells may prohibit every autonomous update until fresh authority exists. */
+    assertProtectedUpdateAllowed?: () => void;
     fetch?: SparkleFetch;
     now?: () => Date;
     appcastTimeoutMs?: number;
@@ -159,6 +161,7 @@ export declare class CodexSparkleBridge {
     private fetchBoundedAppcast;
     private observeLifecycle;
     private installPrerequisite;
+    private assertUpdateAllowed;
     private refreshActionability;
     private fail;
 }

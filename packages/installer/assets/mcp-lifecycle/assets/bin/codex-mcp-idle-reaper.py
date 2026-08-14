@@ -22,7 +22,7 @@ Rules (each 60s cycle)
                      blocks cleanup; a soft blocker (node/node_repl, or a
                      node/npm/npx/python launcher mentioning "mcp") blocks only
                      while it accrues CPU vs the prior cycle's baseline
-                     (strict-detached-v4). Once the same stable tree generation
+                    (strict-detached-v5). Once the same stable tree generation
                      has been free of active blockers for 600 seconds,
                      revalidate identities and terminate the detached tree
                      children-first.
@@ -74,6 +74,8 @@ if str(LIB) not in sys.path:
 
 from codex_mcp_lifecycle import (  # noqa: E402
     LANE_MODES,
+    MAX_DETACHED_CHURN_ADOPTIONS,
+    MAX_DETACHED_RETRY_ATTEMPTS,
     ProcessIdentity,
     ProcessInfo as LifecycleProcess,
     TreeClassification,
@@ -86,6 +88,7 @@ from codex_mcp_lifecycle import (  # noqa: E402
     children_index,
     classify_codex_trees,
     load_process_snapshot,
+    _is_mcp_root as lifecycle_is_mcp_root,
     subtree_ids,
 )
 
@@ -370,6 +373,7 @@ class Reaper:
         self.lifecycle_trees: list[TreeClassification] = []
         self.lifecycle_state: dict = {}
         self.detached_plans: dict[str, dict[int, ProcessIdentity]] = {}
+        self.detached_roots: dict[str, tuple[ProcessIdentity, ProcessIdentity]] = {}
 
     def mark_tree(self, root: int, tag: str) -> None:
         # Inert in v2: no lane calls this; the strict detached lane plans
@@ -408,6 +412,7 @@ class Reaper:
             state_valid=state_valid,
         )
         self.detached_plans = {}
+        self.detached_roots = {}
         self.detached_generations: dict[str, str] = {}
         for tree in self.lifecycle_trees:
             if not tree.actionable or tree.state != "eligible":
@@ -433,6 +438,10 @@ class Reaper:
                 continue
             self.detached_plans[tree.tree_key] = planned
             self.detached_generations[tree.tree_key] = tree.generation
+            self.detached_roots[tree.tree_key] = (
+                tree.root_identity,
+                tree.app_server_identity,
+            )
             self.actionable_orphans.add(tree.root_identity.pid)
             for pid in planned:
                 self.victims.setdefault(pid, "detached-app-server-tree")
@@ -442,14 +451,97 @@ class Reaper:
     def _identity_matches(process: LifecycleProcess | None, expected: ProcessIdentity) -> bool:
         return process is not None and process.identity == expected
 
+    @staticmethod
+    def _is_descendant_of(
+        process: LifecycleProcess,
+        roots: set[int],
+        snapshot: dict[int, LifecycleProcess],
+    ) -> bool:
+        current, seen = process.ppid, set()
+        while current > 1 and current not in seen:
+            if current in roots:
+                return True
+            seen.add(current)
+            parent = snapshot.get(current)
+            if parent is None:
+                return False
+            current = parent.ppid
+        return False
+
+    @staticmethod
+    def _has_recognized_ancestor(
+        process: LifecycleProcess,
+        planned: dict[int, ProcessIdentity],
+        snapshot: dict[int, LifecycleProcess],
+    ) -> bool:
+        current, seen = process.ppid, set()
+        while current > 1 and current not in seen:
+            seen.add(current)
+            parent = snapshot.get(current)
+            if parent is None:
+                return False
+            if current in planned and lifecycle_is_mcp_root(parent):
+                return True
+            current = parent.ppid
+        return False
+
+    def _adopt_descendant_churn(
+        self,
+        baseline: dict[int, LifecycleProcess],
+        current: dict[int, LifecycleProcess],
+        planned: dict[int, ProcessIdentity],
+    ) -> tuple[dict[int, ProcessIdentity] | None, str | None]:
+        """Adopt only bounded, identity-proven MCP descendant churn.
+
+        A new root must itself be an exact descriptor.  Its children may be
+        adopted only because they are fully inside that descriptor's subtree;
+        likewise a child of a previously planned descriptor is accepted.  Any
+        other new child is unowned work and aborts the detached action.
+        """
+        candidate_ids = {
+            process.pid
+            for process in current.values()
+            if (baseline.get(process.pid) is None or baseline[process.pid].identity != process.identity)
+            and self._is_descendant_of(process, set(planned), current)
+        }
+        if not candidate_ids:
+            return {}, None
+        if len(candidate_ids) > MAX_DETACHED_CHURN_ADOPTIONS:
+            return None, "descendant churn exceeds bounded adoption cap"
+        adopted: dict[int, ProcessIdentity] = {}
+        for pid in sorted(candidate_ids):
+            process = current[pid]
+            identity = process.identity
+            if identity is None:
+                return None, f"new descendant pid {pid} lacks stable identity"
+            if not (
+                lifecycle_is_mcp_root(process)
+                or self._has_recognized_ancestor(process, planned, current)
+                or self._has_recognized_ancestor(process, adopted, current)
+            ):
+                return None, f"new unrecognized descendant pid {pid} appeared after planning"
+            adopted[pid] = identity
+        return adopted, None
+
     def _revalidate_detached_plan(
         self, tree_key: str, planned: dict[int, ProcessIdentity]
-    ) -> tuple[dict[int, LifecycleProcess] | None, str | None]:
+    ) -> tuple[dict[int, LifecycleProcess] | None, dict[int, ProcessIdentity], list[int], str | None]:
         current = self.snapshot_provider()
+        root_identity, app_identity = self.detached_roots[tree_key]
+        if (
+            not self._identity_matches(current.get(root_identity.pid), root_identity)
+            or not self._identity_matches(current.get(app_identity.pid), app_identity)
+        ):
+            return None, {}, [], "root or app-server identity changed before signal"
         trees = classify_codex_trees(current, uid=os.getuid(), orphan_min_age=ORPHAN_MIN_AGE)
         match = next((tree for tree in trees if tree.tree_key == tree_key), None)
         if match is None:
-            return None, "tree identity no longer exists"
+            return None, {}, [], "tree identity no longer exists"
+        if (
+            match.root_identity != root_identity
+            or match.app_server_identity != app_identity
+        ):
+            return None, {}, [], "root or app-server identity changed before signal"
         # Apply the same soft-blocker filter as advance_lifecycle_state: an
         # idle soft blocker must not cancel an armed kill at signal time, while
         # hard blockers and CPU-active (or baseline-less) soft blockers abort.
@@ -462,20 +554,28 @@ class Reaper:
             or match.error
             or active_blockers(match, prior_tree_state)
         ):
-            return None, "tree is no longer an unblocked exact detached tree"
+            return None, {}, [], "tree is no longer an unblocked exact detached tree"
         if match.generation != self.detached_generations.get(tree_key):
-            return None, "tree process generation changed before signal"
+            return None, {}, [], "tree process generation changed before signal"
+        runnable: dict[int, ProcessIdentity] = {}
+        skipped: list[int] = []
+        root_pids = {root_identity.pid, app_identity.pid}
         for pid, identity in planned.items():
-            if not self._identity_matches(current.get(pid), identity):
-                return None, f"pid {pid} identity changed before signal"
-        # Baseline against the PLAN-time snapshot, not this revalidation one: a
-        # recognized-MCP descendant spawned between planning and revalidation is
-        # neither a blocker nor part of the generation hash, and killing its
-        # planned parents would leak it as an unowned orphan.
-        new_descendant = self._new_descendant_since(self.lifecycle_snapshot, current, planned)
-        if new_descendant is not None:
-            return None, f"new descendant pid {new_descendant.pid} appeared after planning"
-        return current, None
+            if self._identity_matches(current.get(pid), identity):
+                runnable[pid] = identity
+            elif pid in root_pids:
+                return None, {}, [], "root or app-server identity changed before signal"
+            else:
+                skipped.append(pid)
+        adopted, adoption_error = self._adopt_descendant_churn(
+            self.lifecycle_snapshot, current, runnable,
+        )
+        if adoption_error is not None:
+            return None, {}, [], adoption_error
+        runnable.update(adopted or {})
+        if not root_pids.issubset(runnable):
+            return None, {}, [], "root or app-server is not identity-proven before signal"
+        return current, runnable, skipped, None
 
     @staticmethod
     def _children_first_order(
@@ -497,7 +597,15 @@ class Reaper:
         return sorted(planned, key=lambda pid: (depth(pid), pid), reverse=True)
 
     def _record_tree_result(
-        self, tree_key: str, state: str, pids: list[int], error: str | None = None
+        self,
+        tree_key: str,
+        state: str,
+        pids: list[int],
+        error: str | None = None,
+        *,
+        skipped_pids: list[int] | None = None,
+        retry_idle_since: float | None = None,
+        retry_attempt: int | None = None,
     ) -> None:
         timestamp = self.clock()
         action = {
@@ -508,6 +616,9 @@ class Reaper:
             "tree_key": tree_key,
             "state": state,
             "pids": pids,
+            "skipped_pids": skipped_pids or [],
+            "retry_idle_since": retry_idle_since,
+            "retry_attempt": retry_attempt,
             "error": error,
         }
         self.receipt_writer(LIFECYCLE_ACTIONS, action)
@@ -531,6 +642,29 @@ class Reaper:
             trees.pop(tree_key, None)
         self.lifecycle_state["last_now"] = self.clock()
         self.lifecycle_state_writer(LIFECYCLE_STATE, self.lifecycle_state)
+
+    def _preserve_tree_retry(self, tree_key: str) -> tuple[float | None, int | None]:
+        """Keep the original idle window for a small, receipt-visible retry budget."""
+        trees = self.lifecycle_state.get("trees")
+        if not isinstance(trees, dict) or not isinstance(trees.get(tree_key), dict):
+            return None, None
+        state = trees[tree_key]
+        idle_since = state.get("idle_since")
+        if not isinstance(idle_since, (int, float)):
+            self._clear_tree_timer(tree_key)
+            return None, None
+        attempts = state.get("retry_attempts", 0)
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+            attempts = 0
+        attempts += 1
+        if attempts > MAX_DETACHED_RETRY_ATTEMPTS:
+            self._clear_tree_timer(tree_key)
+            return float(idle_since), attempts
+        state["retry_attempts"] = attempts
+        state["last_retry_at"] = self.clock()
+        self.lifecycle_state["last_now"] = self.clock()
+        self.lifecycle_state_writer(LIFECYCLE_STATE, self.lifecycle_state)
+        return float(idle_since), attempts
 
     def _publish_terminating(self, tree_key: str) -> None:
         prior = self.lifecycle_trees
@@ -578,12 +712,12 @@ class Reaper:
             }
         signaled = 0
         for tree_key, planned in list(self.detached_plans.items()):
-            current, error = self._revalidate_detached_plan(tree_key, planned)
+            current, active_plan, skipped, error = self._revalidate_detached_plan(tree_key, planned)
             if current is None:
                 self._clear_tree_timer(tree_key)
                 self._record_tree_result(tree_key, "partial_failure", [], error)
                 continue
-            order = self._children_first_order(planned, current)
+            order = self._children_first_order(active_plan, current)
             sent: list[int] = []
             try:
                 self._publish_terminating(tree_key)
@@ -596,70 +730,49 @@ class Reaper:
                     f"could not publish terminating status: {type(exc).__name__}",
                 )
                 continue
-            abort_error: str | None = None
+            # The immediately preceding revalidation froze this exact plan.
+            # Do not discover a new target while signalling; vanished or reused
+            # non-root PIDs are simply skipped. Roots were already required to
+            # match before the first TERM and are never substituted.
             for pid in order:
-                live = self.snapshot_provider()
-                if not self._identity_matches(live.get(pid), planned[pid]):
-                    abort_error = f"pid {pid} identity changed immediately before TERM"
-                    break
-                new_descendant = self._new_descendant_since(self.lifecycle_snapshot, live, planned)
-                if new_descendant is not None:
-                    abort_error = (
-                        f"new descendant pid {new_descendant.pid} appeared immediately before TERM"
-                    )
-                    break
                 try:
                     self.signal_sender(pid, signal.SIGTERM)
                     sent.append(pid)
                 except (ProcessLookupError, PermissionError):
-                    pass
-            if abort_error is not None:
-                self._clear_tree_timer(tree_key)
-                self._record_tree_result(tree_key, "partial_failure", sent, abort_error)
-                continue
+                    skipped.append(pid)
             self.sleeper(TERM_GRACE_SECS)
             survivors: list[int] = []
             refreshed = self.snapshot_provider()
-            for pid, identity in planned.items():
+            for pid, identity in active_plan.items():
                 if self._identity_matches(refreshed.get(pid), identity):
                     survivors.append(pid)
             for pid in self._children_first_order(
-                {pid: planned[pid] for pid in survivors}, refreshed
+                {pid: active_plan[pid] for pid in survivors}, refreshed
             ):
-                live = self.snapshot_provider()
-                if not self._identity_matches(live.get(pid), planned[pid]):
-                    continue
-                new_descendant = self._new_descendant_since(self.lifecycle_snapshot, live, planned)
-                if new_descendant is not None:
-                    abort_error = (
-                        f"new descendant pid {new_descendant.pid} appeared immediately before KILL"
-                    )
-                    break
                 try:
                     self.signal_sender(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
-                    pass
-            if abort_error is not None:
-                self._clear_tree_timer(tree_key)
-                self._record_tree_result(tree_key, "partial_failure", sent, abort_error)
-                continue
+                    skipped.append(pid)
             final = self.snapshot_provider()
             remaining = [
-                pid for pid, identity in planned.items()
+                pid for pid, identity in active_plan.items()
                 if self._identity_matches(final.get(pid), identity)
             ]
             signaled += len(sent)
             if remaining:
-                self._clear_tree_timer(tree_key)
+                idle_since, retry_attempt = self._preserve_tree_retry(tree_key)
                 self._record_tree_result(
                     tree_key,
                     "partial_failure",
                     sent,
                     f"same-identity survivors remain: {remaining}",
+                    skipped_pids=skipped,
+                    retry_idle_since=idle_since,
+                    retry_attempt=retry_attempt,
                 )
             else:
                 self._clear_tree_timer(tree_key)
-                self._record_tree_result(tree_key, "verified_gone", sent)
+                self._record_tree_result(tree_key, "verified_gone", sent, skipped_pids=skipped)
         return signaled, {"detached-app-server-tree": signaled} if signaled else {}
 
     # -- rule 4: idle claude sessions -----------------------------------------

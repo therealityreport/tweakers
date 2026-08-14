@@ -297,6 +297,7 @@ class CodexSparkleBridge {
             const bridge = this;
             addon.checkForUpdates = function tweakerManualUpdateCheck() {
                 try {
+                    bridge.assertUpdateAllowed();
                     const result = bridge.options.requestManualCheck?.();
                     if (result && typeof result.then === "function") {
                         void Promise.resolve(result).catch(() => {
@@ -315,6 +316,7 @@ class CodexSparkleBridge {
             const bridge = this;
             addon.checkForUpdatesInBackground = function tweakerBackgroundUpdateCheck() {
                 try {
+                    bridge.assertUpdateAllowed();
                     const result = bridge.options.requestBackgroundCheck?.();
                     if (result && typeof result.then === "function") {
                         void Promise.resolve(result).catch(() => {
@@ -589,6 +591,7 @@ class CodexSparkleBridge {
     }
     installPrerequisite() {
         try {
+            this.assertUpdateAllowed();
             const result = this.options.getInstallPrerequisite?.();
             if (result === undefined || result === null)
                 return { ok: true };
@@ -596,9 +599,13 @@ class CodexSparkleBridge {
                 return { ok: false, reason: result };
             return result;
         }
-        catch {
-            return { ok: false, reason: "Signed Codex.app backup verification failed." };
+        catch (error) {
+            const message = error instanceof Error ? error.message.trim() : "";
+            return { ok: false, reason: message || "Signed Codex.app backup verification failed." };
         }
+    }
+    assertUpdateAllowed() {
+        this.options.assertProtectedUpdateAllowed?.();
     }
     refreshActionability() {
         const nativeInstall = typeof this.native?.installLatestUpdate === "function"
