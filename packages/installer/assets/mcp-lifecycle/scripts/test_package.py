@@ -178,7 +178,7 @@ def validate_codex_rust_patch(manifest: dict[str, Any]) -> None:
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     if fixture.get("schema_version") != 1 or fixture.get("policy_id") != "managed-turn-idle-v3":
         fail("Rust lifecycle fixture identity changed")
-    if fixture.get("pinned_head") != "618b8e9111da9f57fe380b09d0f6516e3f343536":
+    if fixture.get("pinned_head") != "9392c3fa5bcda342b5b96a1a04d67b2f781617c2":
         fail("Rust lifecycle fixture must bind the accepted pinned source HEAD")
 
     repository_root = PACKAGE_ROOT.parents[1]
@@ -224,27 +224,12 @@ def validate_codex_rust_patch(manifest: dict[str, Any]) -> None:
         },
         {
             "package": "codex-mcp",
-            "test": "connection_manager::tests::deferred_reconcile_does_not_initiate_any_server_startup",
-            "result": "PASS",
-        },
-        {
-            "package": "codex-mcp",
-            "test": "connection_manager::tests::deferred_demand_starts_exactly_the_demanded_server",
-            "result": "PASS",
-        },
-        {
-            "package": "codex-mcp",
-            "test": "connection_manager::tests::deferred_binding_capture_ignites_cold_catalog_stdio_servers",
-            "result": "PASS",
-        },
-        {
-            "package": "codex-mcp",
-            "test": "connection_manager::tests::deferred_set_keeps_http_servers_eager",
-            "result": "PASS",
-        },
-        {
-            "package": "codex-mcp",
             "test": "connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers",
+            "result": "PASS",
+        },
+        {
+            "package": "codex-mcp",
+            "test": "connection_manager::tests::cancelled_startup_never_reaches_the_transport",
             "result": "PASS",
         },
     ]
