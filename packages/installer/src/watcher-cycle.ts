@@ -8,6 +8,7 @@ import {
 import type { RepairOutcome } from "./commands/repair.js";
 import { desktopReceiptBlocksLifecycle } from "./desktop-update-state.js";
 import { readDesktopUpdateReceipt } from "./desktop-update-transaction.js";
+import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
 
 export interface WatcherCycleOptions {
   userRoot: string;
@@ -38,6 +39,14 @@ export async function runWatcherCycle(
   });
   const cycleId = (dependencies.randomId ?? randomUUID)();
   const startedAt = now().toISOString();
+  try {
+    assertInstallerUpdateQuarantineClear(options.userRoot, "watcher-cycle");
+  } catch (error) {
+    return persistDeferredWatcherReceipt(
+      options.userRoot, cycleId, startedAt, now().toISOString(),
+      `protected-update-quarantine:${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const desktopReceiptPath = join(options.userRoot, "transactions", "desktop-update.json");
   let desktopReceipt;
   try {

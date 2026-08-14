@@ -15,7 +15,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   adoptMcpLifecycle,
@@ -26,12 +27,18 @@ import {
 import type { McpLifecycleHealthReport } from "../src/mcp-lifecycle-health";
 import {
   MCP_LIFECYCLE_LABELS,
-  defaultMcpLifecycleSourceRoot,
   installMcpLifecyclePackage,
   verifyMcpLifecyclePackage,
 } from "../src/mcp-lifecycle-install";
 import { lifecycleLockFile } from "../src/lifecycle-lock";
 import { acquireProcessLock } from "../src/process-lock";
+
+// T5 intentionally validates canonical source before T8 regenerates the
+// installer asset copy. Keeping this explicit makes the upgrade proof immune
+// to whichever bundled asset an active installer build currently carries.
+const CANONICAL_MCP_LIFECYCLE_SOURCE_ROOT = join(
+  dirname(fileURLToPath(import.meta.url)), "..", "..", "mcp-lifecycle",
+);
 
 const PREDECESSOR_DIGESTS = {
   "lifecycle-module": "ea11134783f411b3a88880f2eec61e4012cfa7c378ebf1f81f89d233c82ab81b",
@@ -65,15 +72,23 @@ const VERSION_040_DIGESTS = {
   "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
 };
 
+const VERSION_041_DIGESTS = {
+  "lifecycle-module": "d70b1813b50082e19a71c0c392341caa9e584f66ee42e336c2966c7161b6f6a7",
+  "idle-reaper": "60e801e3e5c6b230cee593f5bb5171d28c84e6ad1b83ceb4f955e845463e24f8",
+  guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
+  "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+  "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+};
+
 test("explicit adopt upgrades exactly the recognized v2 managed receipt", () => {
   withFixture((fixture) => {
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
     assert.equal(result.status, "installed");
     assert.equal(fixture.reloads(), 1);
     const receipt = fixture.receipt();
-    assert.equal(receipt.packageVersion, "0.4.1");
-    assert.equal(receipt.policyVersion, "strict-detached-v4");
-    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v4");
+    assert.equal(receipt.packageVersion, "0.5.0");
+    assert.equal(receipt.policyVersion, "strict-detached-v5");
+    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v5");
     assert.deepEqual(receipt.labels, MCP_LIFECYCLE_LABELS);
   });
 });
@@ -91,8 +106,8 @@ test("explicit adopt upgrades exactly the recognized 0.3.0 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.4.1");
-    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v4");
+    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v5");
   });
 });
 
@@ -109,8 +124,8 @@ test("explicit adopt upgrades exactly the recognized 0.3.1 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.4.1");
-    assert.equal(fixture.receipt().policyVersion, "strict-detached-v4");
+    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
   });
 });
 
@@ -127,8 +142,27 @@ test("explicit adopt upgrades exactly the recognized 0.4.0 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.4.1");
-    assert.equal(fixture.receipt().policyVersion, "strict-detached-v4");
+    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
+  });
+});
+
+test("explicit adopt upgrades exactly the recognized 0.4.1 managed receipt", () => {
+  withFixture((fixture) => {
+    fixture.writeReceipt({
+      packageVersion: "0.4.1",
+      lifecycleSchemaVersion: 2,
+      policyVersion: "strict-detached-v4",
+      matcherRegistryVersion: "mcp-family-descriptors-v4",
+      assetDigests: VERSION_041_DIGESTS,
+    });
+
+    const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
+
+    assert.equal(result.status, "installed");
+    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
+    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v5");
   });
 });
 
@@ -400,7 +434,7 @@ function withFixture(run: (fixture: Fixture) => void): void {
   const counts = new Map(MCP_LIFECYCLE_LABELS.map((label) => [label, 0]));
   let reloadCount = 0;
   try {
-    cpSync(defaultMcpLifecycleSourceRoot(), sourceRoot, { recursive: true });
+    cpSync(CANONICAL_MCP_LIFECYCLE_SOURCE_ROOT, sourceRoot, { recursive: true });
     writeStatus(home);
     installMcpLifecyclePackage({ sourceRoot, targetHome: home, temporaryRoot: home, labelInstances: () => 0 });
     const assets = verifyMcpLifecyclePackage({ sourceRoot, targetHome: home }).assets;
@@ -504,7 +538,7 @@ async function withFixtureAsync(run: (fixture: Fixture) => Promise<void>): Promi
   const sourceRoot = join(root, "source");
   const receiptPath = join(root, "mcp-lifecycle-managed.json");
   try {
-    cpSync(defaultMcpLifecycleSourceRoot(), sourceRoot, { recursive: true });
+    cpSync(CANONICAL_MCP_LIFECYCLE_SOURCE_ROOT, sourceRoot, { recursive: true });
     mkdirSync(root, { recursive: true });
     writeFileSync(receiptPath, `${JSON.stringify({
       schemaVersion: 1,

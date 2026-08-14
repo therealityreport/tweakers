@@ -16,6 +16,7 @@ import {
   type ManagedMcpProcessSnapshot,
   type ManagedMcpRouteStatusObservation,
 } from "../src/managed-mcp-canary-runner.ts";
+import { adjudicateManagedMcpCanary } from "../src/managed-mcp-canary-adjudicator.ts";
 import {
   MACOS_LOCAL_STDIO_INHERITED_ENV_POLICY,
   mcpCatalogFingerprint,
@@ -88,6 +89,47 @@ test("rejects a launched process root whose executable digest is absent from the
       runManagedMcpCanary(input, createManagedMcpCanaryObservationAdapter(new FakeObservationAdapter(input.expectedRoutes))),
       /process root executable is not receipt-bound/i,
     );
+  } finally {
+    fixture.remove();
+  }
+});
+
+test("canonical adjudicator keeps schema-v1 runner evidence inconclusive rather than promoting it", async () => {
+  const fixture = createFixture();
+  try {
+    const input = fixture.input();
+    const evidence = await runManagedMcpCanary(
+      input,
+      createManagedMcpCanaryObservationAdapter(new FakeObservationAdapter(input.expectedRoutes)),
+    );
+    const adjudication = adjudicateManagedMcpCanary({
+      evidence,
+      expected: input,
+      adjudicatedAt: "2026-08-12T20:00:00.000Z",
+    });
+    assert.equal(adjudication.verdict, "INCONCLUSIVE");
+    assert.deepEqual(adjudication.reasons, ["CANARY_SCHEMA_V2_REQUIRED"]);
+    assert.equal(adjudication.evidence.candidateSha256, input.candidateSha256);
+  } finally {
+    fixture.remove();
+  }
+});
+
+test("canonical adjudicator fails a receipt that does not bind to its prepared candidate", async () => {
+  const fixture = createFixture();
+  try {
+    const input = fixture.input();
+    const evidence = await runManagedMcpCanary(
+      input,
+      createManagedMcpCanaryObservationAdapter(new FakeObservationAdapter(input.expectedRoutes)),
+    );
+    const adjudication = adjudicateManagedMcpCanary({
+      evidence: { ...evidence, candidate: { ...evidence.candidate, sha256: "0".repeat(64) } },
+      expected: input,
+      adjudicatedAt: "2026-08-12T20:00:00.000Z",
+    });
+    assert.equal(adjudication.verdict, "FAIL");
+    assert.equal(adjudication.reasons[0], "CANDIDATE_BINDING_MISMATCH");
   } finally {
     fixture.remove();
   }

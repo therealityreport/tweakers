@@ -105,6 +105,7 @@ import {
   type LaunchdSubmitOptions,
 } from "./installed-cli-launch";
 import { createDesktopUpdateStartupReconciler } from "./desktop-update-startup";
+import { assertProtectedUpdateQuarantine } from "./protected-bootstrap";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import {
   answerPromotionHealthRequest,
@@ -1343,6 +1344,11 @@ function configureCodexSparkleForProcess(): void {
   }
 
   configureCodexSparkleBridge({
+    assertProtectedUpdateAllowed: () => {
+      const authorityRoot = process.env.TWEAKERS_PROTECTED_AUTHORITY_ROOT;
+      if (!authorityRoot) return;
+      assertProtectedUpdateQuarantine({ authorityRoot, route: "Sparkle" });
+    },
     requestManualCheck: async () => {
       await requestCodexDesktopManualCheck("native-sparkle");
     },

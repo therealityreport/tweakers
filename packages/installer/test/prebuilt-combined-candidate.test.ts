@@ -216,6 +216,11 @@ test("prepare and promote CLI actions require the same complete caller-owned evi
   const promote = resolvePrebuiltCombinedCandidateCliInput("promote", options);
   assert.equal(prepare.candidateOnly, true);
   assert.equal(promote.candidateOnly, false);
+  assert.equal(prepare.uiFeatures, "on");
+  assert.equal(resolvePrebuiltCombinedCandidateCliInput("prepare", {
+    ...options,
+    "ui-features": "off",
+  }).uiFeatures, "off");
   assert.deepEqual(prepare.input, promote.input);
   assert.throws(
     () => resolvePrebuiltCombinedCandidateCliInput("promote", { ...options, transaction: undefined }),
@@ -224,6 +229,10 @@ test("prepare and promote CLI actions require the same complete caller-owned evi
   assert.throws(
     () => resolvePrebuiltCombinedCandidateCliInput("stage", options),
     /prepare or promote/,
+  );
+  assert.throws(
+    () => resolvePrebuiltCombinedCandidateCliInput("prepare", { ...options, "ui-features": "disabled" }),
+    /UI features must be off or on/,
   );
 });
 

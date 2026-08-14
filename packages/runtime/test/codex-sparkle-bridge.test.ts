@@ -101,6 +101,31 @@ test("manual and background checks use safe callbacks while native checks and in
   assert.equal(bridge.getSnapshot().installPrerequisiteFailure, "Native desktop updates are paused while Tweakers is active; use the signed-app refresh flow.");
 });
 
+test("protected quarantine prevents Sparkle from requesting checks or a durable install", async () => {
+  const { addon, calls, sinks } = fakeAddon();
+  const requested: string[] = [];
+  const bridge = new CodexSparkleBridge({
+    requestManualCheck: () => { requested.push("manual"); },
+    requestBackgroundCheck: () => { requested.push("background"); },
+    requestInstall: () => { requested.push("install"); },
+    getInstallPrerequisite: () => ({ ok: true }),
+    assertProtectedUpdateAllowed: () => { throw new Error("fresh authority required"); },
+  });
+  bridge.wrapExports(addon);
+  addon.init?.("https://updates.example.test/feed.xml");
+  addon.setUpdateReadySink?.(() => {});
+  bridge.setSafeUpdateAvailable(true);
+
+  assert.equal(addon.checkForUpdates?.(), false);
+  assert.equal(addon.checkForUpdatesInBackground?.(), false);
+  assert.equal(await bridge.installUpdate(), false);
+  sinks.ready(true);
+  assert.equal(addon.installLatestUpdate?.(), false);
+  assert.deepEqual(requested, []);
+  assert.deepEqual(calls, ["init:1"]);
+  assert.match(bridge.getSnapshot().installPrerequisiteFailure ?? "", /fresh authority required/);
+});
+
 test("health-probe options keep every native updater action inert after initialization", async () => {
   const rawCalls: string[] = [];
   const networkCalls: string[] = [];

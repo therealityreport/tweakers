@@ -93,6 +93,8 @@ export interface CodexSparkleBridgeOptions {
   /** Rechecks signed-backup continuity without mutating the live app. */
   /** Return null when actionable, a safe reason string when blocked, or an explicit result. */
   getInstallPrerequisite?: () => SparkleInstallPrerequisite | string | null;
+  /** Protected shells may prohibit every autonomous update until fresh authority exists. */
+  assertProtectedUpdateAllowed?: () => void;
   fetch?: SparkleFetch;
   now?: () => Date;
   appcastTimeoutMs?: number;
@@ -417,6 +419,7 @@ export class CodexSparkleBridge {
       const bridge = this;
       addon.checkForUpdates = function tweakerManualUpdateCheck() {
         try {
+          bridge.assertUpdateAllowed();
           const result = bridge.options.requestManualCheck?.();
           if (result && typeof (result as PromiseLike<void>).then === "function") {
             void Promise.resolve(result).catch(() => {
@@ -434,6 +437,7 @@ export class CodexSparkleBridge {
       const bridge = this;
       addon.checkForUpdatesInBackground = function tweakerBackgroundUpdateCheck() {
         try {
+          bridge.assertUpdateAllowed();
           const result = bridge.options.requestBackgroundCheck?.();
           if (result && typeof (result as PromiseLike<void>).then === "function") {
             void Promise.resolve(result).catch(() => {
@@ -705,13 +709,19 @@ export class CodexSparkleBridge {
 
   private installPrerequisite(): SparkleInstallPrerequisite {
     try {
+      this.assertUpdateAllowed();
       const result = this.options.getInstallPrerequisite?.();
       if (result === undefined || result === null) return { ok: true };
       if (typeof result === "string") return { ok: false, reason: result };
       return result;
-    } catch {
-      return { ok: false, reason: "Signed Codex.app backup verification failed." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message.trim() : "";
+      return { ok: false, reason: message || "Signed Codex.app backup verification failed." };
     }
+  }
+
+  private assertUpdateAllowed(): void {
+    this.options.assertProtectedUpdateAllowed?.();
   }
 
   private refreshActionability(): void {

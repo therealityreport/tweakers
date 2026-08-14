@@ -27,6 +27,7 @@ import {
   defaultEnvironmentProfileRegistry,
   inspectEnvironmentProfile,
   isEnvironmentSelection,
+  normalizeEnvironmentSelection,
   loadEnvironmentState,
   migrateLegacyEnvironmentSelection,
   publishEnvironmentSelection,
@@ -48,6 +49,7 @@ import {
   type EnvironmentTransactionReceipt,
 } from "./environment-transaction.js";
 import { userPaths } from "./paths.js";
+import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
 import { readPlist } from "./plist.js";
 import { readHeaderHash } from "./asar.js";
 import { acquireProcessLock, processAlive as isProcessAlive } from "./process-lock.js";
@@ -498,6 +500,7 @@ export function createDesktopUpdateTransaction(
   }
 
   async function startUnlocked(): Promise<DesktopUpdateReceipt> {
+    assertInstallerUpdateQuarantineClear(root, "desktop-update");
     assertLifecycleReceiptsIdle(root, { contextOwned: false });
     const receipt = await withDesktopUpdateLock(lockFile, async () => {
       const existing = status();
@@ -924,6 +927,7 @@ export function createDesktopUpdateTransaction(
   }
 
   async function resumeUnlocked(): Promise<DesktopUpdateReceipt> {
+    assertInstallerUpdateQuarantineClear(root, "desktop-update-resume");
     const receipt = await withDesktopUpdateLock(lockFile, async () => {
       const existing = status();
       if (!existing) throw new Error("No desktop update exists to resume");
@@ -1772,8 +1776,28 @@ export function readDesktopUpdateReceipt(file: string): DesktopUpdateReceipt | n
   } catch (error) {
     throw new Error(`Desktop update receipt is unreadable at ${file}: ${errorMessage(error)}`);
   }
-  if (!isDesktopUpdateReceipt(value)) throw new Error(`Desktop update receipt is invalid at ${file}`);
-  return value;
+  const normalized = normalizeNonResumableDesktopUpdateReceipt(value);
+  if (!isDesktopUpdateReceipt(normalized)) throw new Error(`Desktop update receipt is invalid at ${file}`);
+  return normalized;
+}
+
+/**
+ * A non-resumable terminal desktop receipt is history only. Normalize its two
+ * embedded schema-1 selections so an abandoned legacy update cannot poison
+ * unrelated lifecycle work. Resumable and in-flight receipts stay byte-strict
+ * because their selections may still control live recovery.
+ */
+function normalizeNonResumableDesktopUpdateReceipt(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const receipt = value as Record<string, unknown>;
+  const terminal = receipt.phase === "completed"
+    || receipt.phase === "rolled_back"
+    || (receipt.phase === "failed" && receipt.resumable === false);
+  if (!terminal) return value;
+  const source = normalizeEnvironmentSelection(receipt.source);
+  const official = normalizeEnvironmentSelection(receipt.official);
+  if (source === null || official === null) return value;
+  return { ...receipt, source, official };
 }
 
 export function writeDesktopUpdateReceipt(file: string, receipt: DesktopUpdateReceipt): void {

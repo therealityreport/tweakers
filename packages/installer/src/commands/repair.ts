@@ -54,6 +54,7 @@ import {
 } from "./mcp-lifecycle.js";
 import { targetUserHome } from "../ownership.js";
 import { readRendererPatchRecord, rendererPatchRetryWarranted } from "../renderer-patch-outcome.js";
+import { assertInstallerUpdateQuarantineClear } from "../protected-update-quarantine.js";
 
 interface Opts {
   app?: string;
@@ -131,6 +132,7 @@ export async function repairWithOutcome(
   dependencies: RepairDependencies = {},
 ): Promise<RepairOutcome> {
   const preliminaryPaths = userPaths();
+  assertInstallerUpdateQuarantineClear(preliminaryPaths.root, "repair");
   const watcherRepair = isWatcherRepair(opts);
   if (watcherRepair) {
     const block = classifyRepairTransactionBlock(

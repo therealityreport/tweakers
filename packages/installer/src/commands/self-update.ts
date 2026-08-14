@@ -29,6 +29,7 @@ import {
 } from "../self-update-state.js";
 import { readConfigFile } from "../config.js";
 import { LEGACY_REF_ENV, LEGACY_REPO_ENV } from "../legacy-compat.js";
+import { assertInstallerUpdateQuarantineClear } from "../protected-update-quarantine.js";
 
 interface Opts {
   repo?: string;
@@ -115,6 +116,7 @@ export function resolveUpdateRepo(
 
 export async function selfUpdate(opts: Opts = {}): Promise<void> {
   const paths = ensureUserPaths();
+  assertInstallerUpdateQuarantineClear(paths.root, "self-update");
   const config = readRuntimeConfig(paths.configFile);
   const repo = resolveUpdateRepo(opts, config);
   const developmentSourceRoot = findSourceRoot(here);

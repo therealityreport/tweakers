@@ -21,7 +21,14 @@ import { userPaths } from "./paths.js";
 import { locateCodexAtExactPath, type CodexInstall } from "./platform.js";
 import { readPlist } from "./plist.js";
 
-export const ENVIRONMENT_PROFILE_SCHEMA_VERSION = 1 as const;
+/**
+ * Version two makes the safety provider and recovery posture explicit.  The
+ * old `appExperience`/`backendLane` pair remains as compatibility metadata
+ * for the pre-existing UI and command surfaces; it is not sufficient to
+ * authorize a normal protected launch.
+ */
+export const ENVIRONMENT_PROFILE_SCHEMA_VERSION = 2 as const;
+export const PROTECTED_ENVIRONMENT_SCHEMA_VERSION = 2 as const;
 export const OPENAI_TEAM_IDENTIFIER = "2DC432GLL2" as const;
 export const STABLE_DESKTOP_PATH = "/Applications/ChatGPT.app" as const;
 export const ALPHA_DESKTOP_PATH = "/Applications/ChatGPT (Beta).app" as const;
@@ -31,6 +38,16 @@ export type AppExperience = "chatgpt" | "tweakers";
 export type ReleaseProfile = "stable" | "alpha";
 export type BackendLane = "official-bundled" | "bundled" | "managed-alpha";
 export type LegacyBackendLane = "bundled" | "beta";
+
+export type EnvironmentUiFeatures = "off" | "on";
+export type McpSafetyProvider = "managed-turn-idle" | "official-bundled-degraded";
+export type RecoveryState = "normal-protected" | "pristine-openai-recovery";
+/**
+ * `migration-blocked` is deliberately distinct from a healthy normal state:
+ * an old Tweakers selection has no v2 receipt chain and must be prepared
+ * again. `quarantined` is the only outcome for ambiguous legacy coupling.
+ */
+export type EnvironmentMigrationState = "requested" | "migration-blocked" | "verified" | "quarantined";
 
 export type EnvironmentBackendChannel = "bundled" | "managed-alpha";
 
@@ -76,6 +93,13 @@ export interface EnvironmentSelection {
   releaseProfile: ReleaseProfile;
   appExperience: AppExperience;
   backendLane: BackendLane;
+  /** Canonical v2 protection axes. Never infer a normal protected state from legacy UI metadata. */
+  uiFeatures: EnvironmentUiFeatures;
+  mcpSafetyProvider: McpSafetyProvider;
+  recoveryState: RecoveryState;
+  migrationState: EnvironmentMigrationState;
+  /** A bounded machine-readable explanation is required only while quarantined. */
+  quarantineReason: string | null;
   requestedAt: string;
   appliedAt: string | null;
 }
@@ -162,8 +186,22 @@ export interface LoadedEnvironmentState {
 export interface CreateEnvironmentSelectionInput {
   profile: EnvironmentProfileRecord;
   appExperience: AppExperience;
+  uiFeatures?: EnvironmentUiFeatures;
+  mcpSafetyProvider?: McpSafetyProvider;
+  recoveryState?: RecoveryState;
+  migrationState?: EnvironmentMigrationState;
+  quarantineReason?: string | null;
   requestedAt?: string;
   appliedAt?: string | null;
+}
+
+export interface CreateProtectedEnvironmentSelectionInput {
+  profile: EnvironmentProfileRecord;
+  uiFeatures: EnvironmentUiFeatures;
+  requestedAt?: string;
+  appliedAt?: string | null;
+  /** Only the terminal receipt publisher may use `verified`. */
+  migrationState?: Extract<EnvironmentMigrationState, "requested" | "verified">;
 }
 
 export interface LegacyEnvironmentState {
@@ -443,6 +481,11 @@ export function inspectEnvironmentProfile(
         releaseProfile: profile.releaseProfile,
         appExperience: "chatgpt",
         backendLane: "official-bundled",
+        uiFeatures: "off",
+        mcpSafetyProvider: "official-bundled-degraded",
+        recoveryState: "pristine-openai-recovery",
+        migrationState: "verified",
+        quarantineReason: null,
         requestedAt: now,
         appliedAt: null,
       };
@@ -583,6 +626,11 @@ export function registerAlphaDesktopProfile(
     releaseProfile: "alpha",
     appExperience: "chatgpt",
     backendLane: "official-bundled",
+    uiFeatures: "off",
+    mcpSafetyProvider: "official-bundled-degraded",
+    recoveryState: "pristine-openai-recovery",
+    migrationState: "verified",
+    quarantineReason: null,
     requestedAt: deps.now?.() ?? new Date().toISOString(),
     appliedAt: null,
   };
@@ -638,15 +686,125 @@ export function createEnvironmentSelection(
   input: CreateEnvironmentSelectionInput,
 ): EnvironmentSelection {
   const backendLane = deriveBackendLane(input.appExperience, input.profile.releaseProfile);
+  const canonical = defaultProtectedEnvironmentState(input.appExperience);
+  const uiFeatures = input.uiFeatures ?? canonical.uiFeatures;
+  const mcpSafetyProvider = input.mcpSafetyProvider ?? canonical.mcpSafetyProvider;
+  const recoveryState = input.recoveryState ?? canonical.recoveryState;
+  const migrationState = input.migrationState ?? canonical.migrationState;
+  const quarantineReason = input.quarantineReason ?? null;
+  assertProtectedEnvironmentState({
+    uiFeatures,
+    mcpSafetyProvider,
+    recoveryState,
+    migrationState,
+    quarantineReason,
+  });
   return {
     selectedDesktopPath: input.profile.selectedDesktopPath,
     selectedDesktopBundleId: input.profile.selectedDesktopBundleId,
     releaseProfile: input.profile.releaseProfile,
     appExperience: input.appExperience,
     backendLane,
+    uiFeatures,
+    mcpSafetyProvider,
+    recoveryState,
+    migrationState,
+    quarantineReason,
     requestedAt: input.requestedAt ?? new Date().toISOString(),
     appliedAt: input.appliedAt ?? null,
   };
+}
+
+/**
+ * Construct a new normal-protected intent without using a renderer-owned
+ * selection.  Compatibility fields deliberately retain `tweakers`, while
+ * `uiFeatures` is the sole source of truth for whether UI additions may load.
+ * A request starts unverified and cannot be published as healthy until the
+ * v2 launch-grant, preflight, active-backend, and canary receipts agree.
+ */
+export function createProtectedEnvironmentSelection(
+  input: CreateProtectedEnvironmentSelectionInput,
+): EnvironmentSelection {
+  return createEnvironmentSelection({
+    profile: input.profile,
+    appExperience: "tweakers",
+    uiFeatures: input.uiFeatures,
+    mcpSafetyProvider: "managed-turn-idle",
+    recoveryState: "normal-protected",
+    migrationState: input.migrationState ?? "requested",
+    requestedAt: input.requestedAt,
+    appliedAt: input.appliedAt,
+  });
+}
+
+export function isNormalProtectedEnvironment(selection: Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState"
+>): boolean {
+  return hasNormalProtectedAxes(selection);
+}
+
+export function isPristineOpenAiRecoveryEnvironment(selection: Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState"
+>): boolean {
+  return hasPristineOpenAiRecoveryAxes(selection);
+}
+
+function hasNormalProtectedAxes(value: Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState"
+> | Record<string, unknown>): boolean {
+  return (value.uiFeatures === "off" || value.uiFeatures === "on")
+    && value.mcpSafetyProvider === "managed-turn-idle"
+    && value.recoveryState === "normal-protected";
+}
+
+function hasPristineOpenAiRecoveryAxes(value: Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState"
+> | Record<string, unknown>): boolean {
+  return value.uiFeatures === "off"
+    && value.mcpSafetyProvider === "official-bundled-degraded"
+    && value.recoveryState === "pristine-openai-recovery";
+}
+
+/** True only after the terminal publisher binds the complete v2 receipt chain. */
+export function isEnvironmentSelectionHealthy(selection: EnvironmentSelection): boolean {
+  return selection.migrationState === "verified"
+    && (isNormalProtectedEnvironment(selection) || isPristineOpenAiRecoveryEnvironment(selection));
+}
+
+function defaultProtectedEnvironmentState(appExperience: AppExperience): Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState" | "migrationState"
+> {
+  if (appExperience === "chatgpt") {
+    return {
+      uiFeatures: "off",
+      mcpSafetyProvider: "official-bundled-degraded",
+      recoveryState: "pristine-openai-recovery",
+      migrationState: "verified",
+    };
+  }
+  return {
+    uiFeatures: "on",
+    mcpSafetyProvider: "managed-turn-idle",
+    recoveryState: "normal-protected",
+    migrationState: "migration-blocked",
+  };
+}
+
+function assertProtectedEnvironmentState(state: Pick<EnvironmentSelection,
+  "uiFeatures" | "mcpSafetyProvider" | "recoveryState" | "migrationState" | "quarantineReason"
+>): void {
+  const validNormal = (state.uiFeatures === "off" || state.uiFeatures === "on")
+    && state.mcpSafetyProvider === "managed-turn-idle"
+    && state.recoveryState === "normal-protected";
+  const validRecovery = state.uiFeatures === "off"
+    && state.mcpSafetyProvider === "official-bundled-degraded"
+    && state.recoveryState === "pristine-openai-recovery";
+  if (!validNormal && !validRecovery) {
+    throw new Error("Environment protection axes do not form an accepted normal or pristine recovery state");
+  }
+  if (state.migrationState === "quarantined" || state.quarantineReason !== null) {
+    throw new Error("Use a quarantined environment selection for invalid protection coupling");
+  }
 }
 
 export function deriveBackendLane(
@@ -778,6 +936,11 @@ function environmentSelectionsMatch(first: EnvironmentSelection, second: Environ
     && first.releaseProfile === second.releaseProfile
     && first.appExperience === second.appExperience
     && first.backendLane === second.backendLane
+    && first.uiFeatures === second.uiFeatures
+    && first.mcpSafetyProvider === second.mcpSafetyProvider
+    && first.recoveryState === second.recoveryState
+    && first.migrationState === second.migrationState
+    && first.quarantineReason === second.quarantineReason
     && first.requestedAt === second.requestedAt
     && first.appliedAt === second.appliedAt;
 }
@@ -971,10 +1134,11 @@ export function readEnvironmentProfileRegistry(
   } catch (error) {
     throw new Error(`Environment profile registry is unreadable at ${sourceFile}: ${errorMessage(error)}`);
   }
-  if (!isEnvironmentProfileRegistry(value)) {
+  const normalized = normalizeEnvironmentProfileRegistry(value);
+  if (normalized === null) {
     throw new Error(`Environment profile registry is invalid at ${sourceFile}`);
   }
-  return value;
+  return normalized;
 }
 
 export function writeEnvironmentProfileRegistry(
@@ -1219,7 +1383,7 @@ export function writeEnvironmentSelection(file: string, selection: EnvironmentSe
 }
 
 /**
- * Publish a pre-verified schema-1 registry and selection as one journaled,
+ * Publish a pre-verified schema-2 registry and selection as one journaled,
  * rollback-safe document pair.  Callers that have already assembled both
  * documents must not independently rewrite either file afterwards.
  */
@@ -1242,7 +1406,7 @@ export function publishEnvironmentSnapshot(
   commitEnvironmentDocumentsAtomically(registryFile, registry, selectionFile, selection, {});
 }
 
-/** Publish one verified selection to both schema-1 documents as one rollback-safe pair. */
+/** Publish one verified selection to both schema-2 documents as one rollback-safe pair. */
 export function publishEnvironmentSelection(
   registryFile: string,
   selectionFile: string,
@@ -1265,7 +1429,7 @@ export function isEnvironmentSelection(value: unknown): value is EnvironmentSele
   if (value.appExperience !== "chatgpt" && value.appExperience !== "tweakers") return false;
   if (value.releaseProfile !== "stable" && value.releaseProfile !== "alpha") return false;
   const expectedBundle = value.releaseProfile === "stable" ? "com.openai.codex" : "com.openai.codex.beta";
-  return typeof value.selectedDesktopPath === "string"
+  const identityIsValid = typeof value.selectedDesktopPath === "string"
     && isAbsolute(value.selectedDesktopPath)
     && normalize(value.selectedDesktopPath) === value.selectedDesktopPath
     && value.selectedDesktopBundleId === expectedBundle
@@ -1274,14 +1438,77 @@ export function isEnvironmentSelection(value: unknown): value is EnvironmentSele
     && Number.isFinite(Date.parse(value.requestedAt))
     && (value.appliedAt === null
       || (typeof value.appliedAt === "string" && Number.isFinite(Date.parse(value.appliedAt))));
+  if (!identityIsValid
+    || (value.uiFeatures !== "off" && value.uiFeatures !== "on")
+    || (value.mcpSafetyProvider !== "managed-turn-idle" && value.mcpSafetyProvider !== "official-bundled-degraded")
+    || (value.recoveryState !== "normal-protected" && value.recoveryState !== "pristine-openai-recovery")
+    || (value.migrationState !== "requested" && value.migrationState !== "migration-blocked"
+      && value.migrationState !== "verified" && value.migrationState !== "quarantined")
+    || (value.quarantineReason !== null
+      && (typeof value.quarantineReason !== "string" || value.quarantineReason.trim().length === 0))) {
+    return false;
+  }
+  const isNormal = hasNormalProtectedAxes(value);
+  const isRecovery = hasPristineOpenAiRecoveryAxes(value);
+  if (!isNormal && !isRecovery) return false;
+  if (value.migrationState === "quarantined") return value.quarantineReason !== null;
+  return value.quarantineReason === null;
 }
 
-function normalizeEnvironmentSelection(value: unknown): EnvironmentSelection | null {
+export function normalizeEnvironmentSelection(value: unknown): EnvironmentSelection | null {
   if (!isRecord(value)) return null;
   const backendLane = normalizeBackendLane(value.backendLane);
   if (backendLane === null) return null;
-  const normalized = { ...value, backendLane };
+  const normalized: Record<string, unknown> = { ...value, backendLane };
+  const axesPresent = "uiFeatures" in value
+    || "mcpSafetyProvider" in value
+    || "recoveryState" in value
+    || "migrationState" in value
+    || "quarantineReason" in value;
+  if (!axesPresent) {
+    // The only safe v1 migrations are the exact coupled pairs published by
+    // the old owner. Every other historical combination is invalid rather
+    // than being guessed into protection or recovery.
+    if (value.appExperience === "chatgpt" && backendLane === "official-bundled") {
+      Object.assign(normalized, {
+        uiFeatures: "off",
+        mcpSafetyProvider: "official-bundled-degraded",
+        recoveryState: "pristine-openai-recovery",
+        migrationState: "verified",
+        quarantineReason: null,
+      });
+    } else if (value.appExperience === "tweakers"
+      && (backendLane === "bundled" || backendLane === "managed-alpha")) {
+      Object.assign(normalized, {
+        uiFeatures: "on",
+        mcpSafetyProvider: "managed-turn-idle",
+        recoveryState: "normal-protected",
+        migrationState: "migration-blocked",
+        quarantineReason: null,
+      });
+    } else {
+      return null;
+    }
+  }
   return isEnvironmentSelection(normalized) ? normalized : null;
+}
+
+function normalizeEnvironmentProfileRegistry(value: unknown): EnvironmentProfileRegistry | null {
+  if (!isRecord(value) || !isRecord(value.profiles)) return null;
+  if (value.schemaVersion !== ENVIRONMENT_PROFILE_SCHEMA_VERSION && value.schemaVersion !== 1) return null;
+  const selected = value.selected === null ? null : normalizeEnvironmentSelection(value.selected);
+  const lastKnownWorkingSelection = value.lastKnownWorkingSelection === null
+    ? null
+    : normalizeEnvironmentSelection(value.lastKnownWorkingSelection);
+  if ((value.selected !== null && selected === null)
+    || (value.lastKnownWorkingSelection !== null && lastKnownWorkingSelection === null)) return null;
+  const normalized = {
+    ...value,
+    schemaVersion: ENVIRONMENT_PROFILE_SCHEMA_VERSION,
+    selected,
+    lastKnownWorkingSelection,
+  };
+  return isEnvironmentProfileRegistry(normalized) ? normalized : null;
 }
 
 function isEnvironmentProfileRegistry(value: unknown): value is EnvironmentProfileRegistry {

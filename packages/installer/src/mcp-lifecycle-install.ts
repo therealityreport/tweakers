@@ -25,11 +25,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME_TOKEN = "{{HOME}}";
 
 export const MCP_LIFECYCLE_PACKAGE_NAME = "@therealityreport/tweakers-mcp-lifecycle";
-export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.4.1";
+export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.5.0";
 export const MCP_LIFECYCLE_MANIFEST_SCHEMA_VERSION = 1;
 export const MCP_LIFECYCLE_SCHEMA_VERSION = 2;
-export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v4";
-export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v4";
+export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v5";
+export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v5";
 export const MCP_LIFECYCLE_LABELS = [
   "com.thomashulihan.codex-mcp-idle-reaper",
   "com.thomashulihan.codex-mcp-guard",
@@ -67,8 +67,12 @@ export interface McpLifecycleManifest {
   policy: {
     detached_stable_grace_seconds: number;
     termination_order: string;
+    termination_sequence: string;
     term_grace_seconds: number;
     kill_scope: string;
+    execution_plan: string;
+    descendant_churn_adoption_cap: number;
+    retry_attempt_cap: number;
     automatic_signal_owner: string;
     guard_mode: string;
     lane_modes: {
@@ -646,8 +650,12 @@ function validateManifest(raw: unknown): McpLifecycleManifest {
   if (!isRecord(policy)
     || typeof policy.detached_stable_grace_seconds !== "number"
     || typeof policy.termination_order !== "string"
+    || typeof policy.termination_sequence !== "string"
     || typeof policy.term_grace_seconds !== "number"
     || typeof policy.kill_scope !== "string"
+    || typeof policy.execution_plan !== "string"
+    || typeof policy.descendant_churn_adoption_cap !== "number"
+    || typeof policy.retry_attempt_cap !== "number"
     || typeof policy.automatic_signal_owner !== "string"
     || typeof policy.guard_mode !== "string"
     || !isRecord(policy.lane_modes)
@@ -681,8 +689,12 @@ function validateManifest(raw: unknown): McpLifecycleManifest {
     policy: {
       detached_stable_grace_seconds: policy.detached_stable_grace_seconds,
       termination_order: policy.termination_order,
+      termination_sequence: policy.termination_sequence,
       term_grace_seconds: policy.term_grace_seconds,
       kill_scope: policy.kill_scope,
+      execution_plan: policy.execution_plan,
+      descendant_churn_adoption_cap: policy.descendant_churn_adoption_cap,
+      retry_attempt_cap: policy.retry_attempt_cap,
       automatic_signal_owner: policy.automatic_signal_owner,
       guard_mode: policy.guard_mode,
       lane_modes: {
@@ -738,15 +750,19 @@ function validatePolicy(manifest: McpLifecycleManifest): void {
   const policy = manifest.policy;
   if (policy.detached_stable_grace_seconds !== 600
     || policy.termination_order !== "children-first-term"
+    || policy.termination_sequence !== "children-first-term-grace-kill-verify"
     || policy.term_grace_seconds !== 5
     || policy.kill_scope !== "same-identity-survivors"
+    || policy.execution_plan !== "identity-frozen-bounded-descendant-adoption"
+    || policy.descendant_churn_adoption_cap !== 32
+    || policy.retry_attempt_cap !== 2
     || policy.automatic_signal_owner !== "reaper"
     || policy.guard_mode !== "notification-only"
     || policy.lane_modes.detached_wrapper !== "automatic"
     || policy.lane_modes.exact_standalone_app_server !== "automatic"
     || policy.lane_modes.standalone_orphan !== "observation_only"
     || policy.lane_modes.claude_idle !== "observation_only") {
-    throw new McpLifecycleInstallError("MCP lifecycle manifest violates the frozen v3 safety policy");
+    throw new McpLifecycleInstallError("MCP lifecycle manifest violates the frozen v5 safety policy");
   }
 }
 

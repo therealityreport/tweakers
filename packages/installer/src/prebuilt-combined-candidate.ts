@@ -63,6 +63,8 @@ export interface PrebuiltCombinedCandidateCliOptions {
   "source-app-fingerprint"?: string;
   bundleId?: string;
   "bundle-id"?: string;
+  uiFeatures?: string;
+  "ui-features"?: string;
 }
 
 export interface AcceptedPrebuiltCodexBuildReceipt {
@@ -191,6 +193,8 @@ export function resolvePrebuiltCombinedCandidateCliInput(
   action: PrebuiltCombinedCandidateAction;
   app?: string;
   candidateOnly: boolean;
+  /** Both normal-protected variants use the same validated backend authority. */
+  uiFeatures: "off" | "on";
   input: PrebuiltCombinedCandidateInput;
 } {
   if (action !== "prepare" && action !== "promote") {
@@ -208,10 +212,15 @@ export function resolvePrebuiltCombinedCandidateCliInput(
   if (bundleId !== "com.openai.codex" && bundleId !== "com.openai.codex.beta") {
     throw new Error("Prebuilt combined candidate bundle ID is unsupported");
   }
+  const uiFeatures = options.uiFeatures ?? options["ui-features"] ?? "on";
+  if (uiFeatures !== "off" && uiFeatures !== "on") {
+    throw new Error("Prebuilt combined candidate UI features must be off or on");
+  }
   return {
     action,
     app: options.app,
     candidateOnly: action === "prepare",
+    uiFeatures,
     input: {
       transactionId: requireCliValue(options.transaction, "--transaction"),
       binaryPath: requireCliValue(options.binary, "--binary"),

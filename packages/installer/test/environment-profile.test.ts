@@ -8,6 +8,7 @@ import test from "node:test";
 import { userPaths } from "../src/paths";
 import {
   createEnvironmentSelection,
+  createProtectedEnvironmentSelection,
   createEnvironmentProfileRegistry,
   defaultEnvironmentProfileRegistry,
   createRequestedEnvironmentSelection,
@@ -15,6 +16,9 @@ import {
   loadEnvironmentState,
   migrateLegacyEnvironmentFiles,
   migrateLegacyEnvironmentSelection,
+  isEnvironmentSelectionHealthy,
+  isNormalProtectedEnvironment,
+  isPristineOpenAiRecoveryEnvironment,
   normalizeBackendLane,
   publishEnvironmentSnapshot,
   registerAlphaDesktopProfile,
@@ -85,7 +89,7 @@ test("profile registry records stable and alpha as exact desktop selections", ()
     environmentRoot: "/tmp/tweaker-environments",
   });
 
-  assert.equal(registry.schemaVersion, 1);
+  assert.equal(registry.schemaVersion, 2);
   assert.equal(registry.selected, null);
   assert.equal(registry.lastKnownWorkingSelection, null);
   assert.equal(registry.profiles.stable.selectedDesktopPath, "/Applications/ChatGPT.app");
@@ -399,9 +403,53 @@ test("legacy persisted mode migrates to the stable release profile", () => {
     appExperience: "tweakers",
     releaseProfile: "stable",
     backendLane: "bundled",
+    uiFeatures: "on",
+    mcpSafetyProvider: "managed-turn-idle",
+    recoveryState: "normal-protected",
+    migrationState: "migration-blocked",
+    quarantineReason: null,
     requestedAt: "2026-07-17T01:00:00.000Z",
     appliedAt: "2026-07-17T01:00:00.000Z",
   });
+});
+
+test("schema-2 distinguishes normal protection, degraded pristine recovery, and a receipt-blocked legacy intent", () => {
+  const registry = createEnvironmentProfileRegistry({
+    stableDesktopPath: "/Applications/ChatGPT.app",
+    alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+  });
+  const uiOff = createProtectedEnvironmentSelection({
+    profile: registry.profiles.stable,
+    uiFeatures: "off",
+    requestedAt: "2026-08-12T19:00:00.000Z",
+  });
+  const legacyManaged = createEnvironmentSelection({
+    profile: registry.profiles.alpha,
+    appExperience: "tweakers",
+    requestedAt: "2026-08-12T19:00:00.000Z",
+    appliedAt: "2026-08-12T19:00:01.000Z",
+  });
+  const recovery = createEnvironmentSelection({
+    profile: registry.profiles.stable,
+    appExperience: "chatgpt",
+    requestedAt: "2026-08-12T19:00:00.000Z",
+    appliedAt: "2026-08-12T19:00:01.000Z",
+  });
+
+  assert.equal(isNormalProtectedEnvironment(uiOff), true);
+  assert.equal(uiOff.mcpSafetyProvider, "managed-turn-idle");
+  assert.equal(uiOff.recoveryState, "normal-protected");
+  assert.equal(uiOff.migrationState, "requested");
+  assert.equal(isEnvironmentSelectionHealthy(uiOff), false);
+
+  assert.equal(isNormalProtectedEnvironment(legacyManaged), true);
+  assert.equal(legacyManaged.migrationState, "migration-blocked");
+  assert.equal(isEnvironmentSelectionHealthy(legacyManaged), false);
+
+  assert.equal(isPristineOpenAiRecoveryEnvironment(recovery), true);
+  assert.equal(recovery.mcpSafetyProvider, "official-bundled-degraded");
+  assert.equal(recovery.recoveryState, "pristine-openai-recovery");
+  assert.equal(isEnvironmentSelectionHealthy(recovery), true);
 });
 
 test("profile registry persists and reads through its schema-versioned public API", () => {
@@ -621,7 +669,90 @@ test("selection reader upgrades the legacy beta lane on read", () => {
       requestedAt: "2026-07-17T01:00:00.000Z",
       appliedAt: null,
     }));
-    assert.equal(readEnvironmentSelection(file)?.backendLane, "managed-alpha");
+    const selection = readEnvironmentSelection(file);
+    assert.equal(selection?.backendLane, "managed-alpha");
+    assert.equal(selection?.uiFeatures, "on");
+    assert.equal(selection?.mcpSafetyProvider, "managed-turn-idle");
+    assert.equal(selection?.recoveryState, "normal-protected");
+    assert.equal(selection?.migrationState, "migration-blocked");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("schema-2 reader refuses missing or mismatched legacy coupling instead of inferring normal protection", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-invalid-coupling-"));
+  const file = join(root, "environment-selection.json");
+  try {
+    writeFileSync(file, JSON.stringify({
+      selectedDesktopPath: "/Applications/ChatGPT.app",
+      selectedDesktopBundleId: "com.openai.codex",
+      appExperience: "chatgpt",
+      releaseProfile: "stable",
+      backendLane: "bundled",
+      requestedAt: "2026-08-12T19:00:00.000Z",
+      appliedAt: null,
+    }));
+    assert.throws(() => readEnvironmentSelection(file), /invalid/);
+
+    writeFileSync(file, JSON.stringify({
+      selectedDesktopPath: "/Applications/ChatGPT.app",
+      selectedDesktopBundleId: "com.openai.codex",
+      appExperience: "tweakers",
+      releaseProfile: "stable",
+      backendLane: "bundled",
+      uiFeatures: "off",
+      mcpSafetyProvider: "official-bundled-degraded",
+      recoveryState: "normal-protected",
+      migrationState: "verified",
+      quarantineReason: null,
+      requestedAt: "2026-08-12T19:00:00.000Z",
+      appliedAt: null,
+    }));
+    assert.throws(() => readEnvironmentSelection(file), /invalid/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registry reader upgrades a schema-1 document in memory without rewriting its source bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-environment-registry-v1-"));
+  const file = join(root, "environment-registry.json");
+  try {
+    const current = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: root,
+    });
+    const legacy = {
+      ...current,
+      schemaVersion: 1,
+      selected: {
+        selectedDesktopPath: "/Applications/ChatGPT.app",
+        selectedDesktopBundleId: "com.openai.codex",
+        releaseProfile: "stable",
+        appExperience: "tweakers",
+        backendLane: "bundled",
+        requestedAt: "2026-08-12T19:00:00.000Z",
+        appliedAt: "2026-08-12T19:00:01.000Z",
+      },
+      lastKnownWorkingSelection: {
+        selectedDesktopPath: "/Applications/ChatGPT.app",
+        selectedDesktopBundleId: "com.openai.codex",
+        releaseProfile: "stable",
+        appExperience: "tweakers",
+        backendLane: "bundled",
+        requestedAt: "2026-08-12T19:00:00.000Z",
+        appliedAt: "2026-08-12T19:00:01.000Z",
+      },
+    };
+    const bytes = `${JSON.stringify(legacy, null, 2)}\n`;
+    writeFileSync(file, bytes);
+    const migrated = readEnvironmentProfileRegistry(file)!;
+    assert.equal(migrated.schemaVersion, 2);
+    assert.equal(migrated.selected?.migrationState, "migration-blocked");
+    assert.equal(migrated.lastKnownWorkingSelection?.migrationState, "migration-blocked");
+    assert.equal(readFileSync(file, "utf8"), bytes);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

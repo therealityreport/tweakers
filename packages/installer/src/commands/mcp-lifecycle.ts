@@ -129,6 +129,20 @@ const ADOPTABLE_PREDECESSOR_RECEIPTS = [{
   },
   compatibility: "current labels and paths preserved; rename deferred",
 }, {
+  packageVersion: "0.4.1",
+  lifecycleSchemaVersion: 2,
+  policyVersion: "strict-detached-v4",
+  matcherRegistryVersion: "mcp-family-descriptors-v4",
+  labels: [...MCP_LIFECYCLE_LABELS],
+  assetDigests: {
+    "lifecycle-module": "d70b1813b50082e19a71c0c392341caa9e584f66ee42e336c2966c7161b6f6a7",
+    "idle-reaper": "60e801e3e5c6b230cee593f5bb5171d28c84e6ad1b83ceb4f955e845463e24f8",
+    guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
+    "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+    "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+  },
+  compatibility: "current labels and paths preserved; rename deferred",
+}, {
   packageVersion: "0.4.0",
   lifecycleSchemaVersion: 2,
   policyVersion: "strict-detached-v4",
@@ -137,6 +151,24 @@ const ADOPTABLE_PREDECESSOR_RECEIPTS = [{
   assetDigests: {
     "lifecycle-module": "4021016ed4a6e9883377e5cf07c47111f069ea665ff50e2e35584ba3c20aae6f",
     "idle-reaper": "9cdca57a1c612be0dadd1e8b70e0cd068998815ca88b70bf5e2470573e34db8e",
+    guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
+    "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
+    "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+  },
+  compatibility: "current labels and paths preserved; rename deferred",
+}, {
+  // Interim 0.5.0 cut adopted while the modal-ops matcher repair was split
+  // across releases (symlink-alias containment landed; the Homebrew framework
+  // CLI-shim distribution equivalence had not).  Superseded by the repaired
+  // same-version lib.
+  packageVersion: "0.5.0",
+  lifecycleSchemaVersion: 2,
+  policyVersion: "strict-detached-v5",
+  matcherRegistryVersion: "mcp-family-descriptors-v5",
+  labels: [...MCP_LIFECYCLE_LABELS],
+  assetDigests: {
+    "lifecycle-module": "4c21b8967f7b34c84665300b6bc120636e204cf1ad12b140012fd41f1f35e52f",
+    "idle-reaper": "b71268fa64c51005849e8dde031a9a4b0d508abe2e72a2072439bdf4012d1cf9",
     guard: "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9",
     "idle-reaper-launch-agent": "181fde0af89fda70eddc4dba5a6a13e2057e0d5a534a60e9147bf875c8a6f1ac",
     "guard-launch-agent": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",

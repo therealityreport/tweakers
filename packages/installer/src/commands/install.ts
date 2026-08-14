@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   openSync,
   closeSync,
+  fsyncSync,
   unlinkSync,
   readdirSync,
   readlinkSync,
@@ -84,11 +85,17 @@ import {
   PROMOTION_SURFACE_NAMES,
   runInstallTransaction,
   readProductionHealthReceipt,
+  readTransactionState,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
   type ProductionHealthExpectationV2,
   type TransactionResult,
 } from "../transaction.js";
+import {
+  acceptProtectedEnvironmentPublication,
+  collectProtectedPostMainEvidence,
+  recordProtectedPostPromotionHealthProbe,
+} from "../protected-acceptance-coordinator.js";
 import { migrateAutomatically } from "./migrate.js";
 import { readDevTweaksRoot } from "../config.js";
 import { ensureManagedRuntime, reconcileManagedCliShims } from "../managed-runtime.js";
@@ -143,6 +150,15 @@ interface Opts {
   };
   /** Private receipt-bound prebuilt backend and reviewed-runtime candidate input. */
   prebuiltCombinedCandidate?: PrebuiltCombinedCandidateInput;
+  /**
+   * The only route that may install the protected loader.  This is carried
+   * from the receipt-bound prebuilt command; ordinary installs retain the
+   * established Tweakers loader and cannot accidentally become protected.
+   */
+  protectedShell?: {
+    transactionId: string;
+    uiFeatures: "off" | "on";
+  };
   /** Promotion action: consume the exact held candidate and never rebuild it. */
   requirePreparedCandidate?: boolean;
   /** Internal only: repair already reconciles shims before its fast paths. */
@@ -874,6 +890,10 @@ export async function prebuiltCombinedCandidate(
     candidateOnly: resolved.candidateOnly,
     candidateOnlyReason: "coordinated-refresh",
     prebuiltCombinedCandidate: resolved.input,
+    protectedShell: {
+      transactionId: resolved.input.transactionId,
+      uiFeatures: resolved.uiFeatures,
+    },
     requirePreparedCandidate: resolved.action === "promote",
     reconcileCliShims: false,
   });
@@ -1116,6 +1136,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
             },
           } : {}),
         },
+        ...(opts.protectedShell ? { protectedShell: opts.protectedShell } : {}),
       });
       stageBundledTweaks(candidatePaths.tweaks, candidatePaths.runtime);
       const candidateRolloutOptions = defaultUserQuestionsRolloutOptions({
@@ -1230,6 +1251,17 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         // would renew its age bound forever.
         if (!rehydrated) writeHealthRequest(expectationFile, healthRequest);
         writeHealthRequest(join(candidateUserRoot, "health", "request.json"), healthRequest);
+        if (opts.protectedShell) {
+          if (!prebuiltAuthority) {
+            return unknownPromotionHealth(requiredPermissions, "protected candidate has no receipt-bound backend authority");
+          }
+          stageProtectedHealthLaunchGrant({
+            candidate,
+            authorityRoot: candidateUserRoot,
+            protectedShell: opts.protectedShell,
+            acceptedBuildReceiptSha256: prebuiltAuthority.acceptedBuildReceipt.sha256,
+          });
+        }
         const launched = spawnAuthenticatedHiddenHealthProbe(
           candidate.executable,
           candidateUserRoot,
@@ -1268,6 +1300,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         readDevSnapshotReceipt,
         rollbackDevSnapshot,
       } = await import("./dev-sync.js");
+      let protectedLaunchGrantFile: string | null = null;
       try {
         if (!candidatePromotionPreimages) throw new Error("Candidate promotion preimages are unavailable");
         const outgoing = locateCodex(appRoot);
@@ -1342,6 +1375,19 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         reconcileMacIdentityAfterPromotion();
         const promoted = locateCodex(appRoot);
         if (!candidateHealthExpectation) throw new Error("Candidate promotion preimages are unavailable");
+        if (opts.protectedShell) {
+          if (!prebuiltAuthority) throw new Error("Protected promotion has no receipt-bound backend authority");
+          // The launch grant is authority over the applied bundle, not the
+          // disposable candidate. Re-read every bound byte only after the
+          // app/runtime promotion has completed so a later swap cannot leave a
+          // grant that mixes final paths with candidate hashes.
+          protectedLaunchGrantFile = stageProtectedHealthLaunchGrant({
+            candidate: promoted,
+            authorityRoot: paths.root,
+            protectedShell: opts.protectedShell,
+            acceptedBuildReceiptSha256: prebuiltAuthority.acceptedBuildReceipt.sha256,
+          });
+        }
         liveHealthExpectation = buildPromotionHealthExpectation({
           app: fingerprintCodex(promoted),
           before: promotionPreimageHashes(candidateHealthExpectation),
@@ -1361,6 +1407,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           requestedAt: new Date().toISOString(),
         });
       } catch (error) {
+        if (protectedLaunchGrantFile) rmSync(protectedLaunchGrantFile, { force: true });
         signedBackupWiring.restoreLive();
         if (liveUserQuestionsReceipt && !["planned", "held", "rolled_back"].includes(liveUserQuestionsReceipt.phase)) {
           try { liveUserQuestionsReceipt = rollbackUserQuestionsRollout(liveUserQuestionsReceipt); } catch { /* outer recovery reports any persistent drift */ }
@@ -1413,6 +1460,31 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       };
     },
     acceptPromotion: async () => {
+      if (opts.protectedShell) {
+        // This is the terminal publication boundary of the real app-install
+        // transaction. Missing or mismatched protected post-main evidence is
+        // an acceptance failure, so runInstallTransaction rolls the promoted
+        // app/runtime back rather than writing its healthy terminal state.
+        const transactionState = readTransactionState(paths.transactionStateFile);
+        const protectedAcceptance = {
+          authorityRoot: paths.root,
+          transactionId: opts.protectedShell.transactionId,
+          attempt: 1,
+          environment: {
+            uiFeatures: opts.protectedShell.uiFeatures,
+            mcpSafetyProvider: "managed-turn-idle",
+            recoveryState: "normal-protected",
+          },
+          acceptedBuildReceiptSha256: prebuiltAuthority?.acceptedBuildReceipt.sha256
+            ?? (() => { throw new Error("Protected promotion has no accepted build receipt"); })(),
+          rollbackAppRoot: transactionState?.lastKnownGoodRoot
+            ?? (() => { throw new Error("Protected promotion has no receipt-owned rollback root"); })(),
+          rollbackAttempted: transactionState?.rollbackAttempted
+            ?? (() => { throw new Error("Protected promotion has no receipt-owned rollback state"); })(),
+        } as const;
+        collectProtectedPostMainEvidence(protectedAcceptance);
+        acceptProtectedEnvironmentPublication(protectedAcceptance);
+      }
       if (!liveUserQuestionsReceipt || liveUserQuestionsReceipt.phase !== "sealed" || liveMcpConflictCount !== 0) {
         throw new Error("User Questions rollout is not sealed with zero MCP conflicts");
       }
@@ -1451,11 +1523,46 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       // gets a distinct singleton and always runs far enough to answer. The
       // user-visible relaunch is handled separately by the reopen-after-patch
       // path; this launch is only for the receipt.
+      const probeStartedAt = new Date().toISOString();
+      const probeInitialProcesses = listProcesses();
       const launched = spawnAuthenticatedHiddenHealthProbe(
         locateCodex(appRoot).executable,
         paths.root,
         liveCodexHome,
       );
+      const probeCompletedAt = new Date().toISOString();
+      const probeFinalProcesses = listProcesses();
+      if (opts.protectedShell) {
+        // This is a real execution receipt, emitted by the transaction owner
+        // immediately around the actual hidden health process.  The terminal
+        // collector joins it to managed lifecycle/full-quit/UI/perf evidence;
+        // it never invents a successful canary when those later measurements
+        // have not been supplied by their production owners.
+        recordProtectedPostPromotionHealthProbe({
+          authorityRoot: paths.root,
+          transactionId: opts.protectedShell.transactionId,
+          attempt: 1,
+          executable: locateCodex(appRoot).executable,
+          pid: launched.pid ?? null,
+          status: launched.status,
+          signal: launched.signal,
+          error: launched.error?.message ?? null,
+          initialProcesses: probeInitialProcesses.map((process) => ({
+            pid: process.pid,
+            ppid: process.ppid,
+            startedAt: process.startedAt,
+            command: process.command,
+          })),
+          finalProcesses: probeFinalProcesses.map((process) => ({
+            pid: process.pid,
+            ppid: process.ppid,
+            startedAt: process.startedAt,
+            command: process.command,
+          })),
+          startedAt: probeStartedAt,
+          completedAt: probeCompletedAt,
+        });
+      }
       if (launched.error || launched.status !== 0 || launched.signal !== null) {
         throw new Error(`Post-promotion ${formatHealthProbeLaunchFailure(launched)}`);
       }
@@ -1867,13 +1974,21 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   step("Runtime staged");
 
   // 3. Patch app.asar entry point to require our loader.
-  const { originalMain: originalEntry } = await injectLoader(
-    codex.asarPath,
-    opts.candidateContext?.finalUserRoot ?? paths.root,
-    step.detail,
-    opts.macAppIdentity?.appUserDataRoot,
-    opts.macAppIdentity?.displayName,
-  );
+  const { originalMain: originalEntry } = opts.protectedShell
+    ? await injectProtectedLoader(
+      codex.asarPath,
+      opts.protectedShell,
+      opts.candidateContext?.finalUserRoot ?? paths.root,
+      join(paths.runtime, "main.js"),
+      step.detail,
+    )
+    : await injectLoader(
+      codex.asarPath,
+      opts.candidateContext?.finalUserRoot ?? paths.root,
+      step.detail,
+      opts.macAppIdentity?.appUserDataRoot,
+      opts.macAppIdentity?.displayName,
+    );
   const { headerHash: patchedAsarHash } = readHeaderHash(codex.asarPath);
   step.detail(`Patched app.asar (entry was ${kleur.dim(originalEntry)})`);
 
@@ -3029,11 +3144,11 @@ export function hasTweakerAsarMarker(asarPath: string): boolean {
 }
 
 export type AsarMarker = "present" | "absent" | "unreadable";
-export type AsarPatchSchema = "current" | "legacy" | "absent" | "unreadable";
+export type AsarPatchSchema = "current" | "legacy" | "protected" | "absent" | "unreadable";
 
 export function readAsarMarker(asarPath: string): AsarMarker {
   const schema = readAsarPatchSchema(asarPath);
-  return schema === "current" || schema === "legacy" ? "present" : schema;
+  return schema === "current" || schema === "legacy" || schema === "protected" ? "present" : schema;
 }
 
 export function readAsarPatchSchema(asarPath: string): AsarPatchSchema {
@@ -3043,6 +3158,7 @@ export function readAsarPatchSchema(asarPath: string): AsarPatchSchema {
       __tweaker?: unknown;
       [LEGACY_ASAR_META_KEY]?: unknown;
     };
+    if (pkg.main === "protected-loader.cjs" && typeof pkg.__tweakersProtected === "object") return "protected";
     if (pkg.main === "tweaker-loader.cjs" || typeof pkg.__tweaker === "object") return "current";
     if (pkg.main === LEGACY_LOADER_FILE || typeof pkg[LEGACY_ASAR_META_KEY] === "object") return "legacy";
     return "absent";
@@ -3090,14 +3206,36 @@ export function validateMainRendererAsarEntrypoint(asarPath: string): void {
 
   const current = recordValue(pkg.__tweaker);
   const legacy = recordValue(pkg[LEGACY_ASAR_META_KEY]);
-  const metadata = current ?? legacy;
-  const loaderEntry = current ? "tweaker-loader.cjs" : legacy ? LEGACY_LOADER_FILE : null;
+  const protectedMetadata = recordValue(pkg.__tweakersProtected);
+  const metadata = protectedMetadata ?? current ?? legacy;
+  const loaderEntry = protectedMetadata
+    ? "protected-loader.cjs"
+    : current ? "tweaker-loader.cjs" : legacy ? LEGACY_LOADER_FILE : null;
   const originalMain = metadata?.originalMain;
   if (!loaderEntry || pkg.main !== loaderEntry || typeof originalMain !== "string") {
     throw new Error("candidate app.asar loader metadata is incomplete");
   }
+  if (protectedMetadata) {
+    const uiFeatures = protectedMetadata.uiFeatures;
+    if (protectedMetadata.kind !== "tweakers-protected-shell"
+      || protectedMetadata.schemaVersion !== 1
+      || (uiFeatures !== "off" && uiFeatures !== "on")
+      || typeof protectedMetadata.transactionId !== "string"
+      || typeof protectedMetadata.authorityRoot !== "string"
+      || !isAbsolute(protectedMetadata.authorityRoot)
+      || resolve(protectedMetadata.authorityRoot) !== protectedMetadata.authorityRoot
+      || typeof protectedMetadata.grantFile !== "string"
+      || typeof protectedMetadata.preflightReceiptFile !== "string"
+      || typeof protectedMetadata.updateQuarantineFile !== "string") {
+      throw new Error("candidate protected shell metadata is incomplete");
+    }
+  }
   const normalizedOriginalMain = normalizeContainedAsarPath(originalMain, "original main entry");
   readEntry(loaderEntry, MAX_ASAR_PACKAGE_BYTES);
+  if (protectedMetadata) {
+    readEntry("protected-bootstrap.cjs", MAX_MAIN_PROCESS_ENTRY_BYTES);
+    readEntry("tweakers-protected.json", MAX_ASAR_PACKAGE_BYTES);
+  }
   readEntry(normalizedOriginalMain, MAX_MAIN_PROCESS_ENTRY_BYTES);
 
   const rendererBytes = readEntry(MAIN_RENDERER_ASAR_ENTRY, MAX_MAIN_RENDERER_ENTRY_BYTES);
@@ -3330,6 +3468,229 @@ async function injectLoader(
     writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
   });
   return { originalMain, rendererPatches };
+}
+
+/**
+ * Install the normal-protected entrypoint into a disposable candidate.  This
+ * deliberately shares none of the renderer patching path above: a protected
+ * UI-off candidate contains the small loader, its immutable metadata, and a
+ * copy of the reviewed bootstrap only.  Mutable grant/receipt state is
+ * addressed under the final transaction root, never written into app.asar.
+ */
+async function injectProtectedLoader(
+  asarPath: string,
+  protectedShell: NonNullable<Opts["protectedShell"]>,
+  finalUserRoot: string,
+  runtimeMainSource: string,
+  step: (msg: string) => void = () => {},
+): Promise<{ originalMain: string; rendererPatches: RendererPatchOutcome[] }> {
+  // Candidate builders pass the final Tweakers root through their normal
+  // isolated context.  The metadata must be bound to the same root that owns
+  // the later applied-pending grant, rather than the disposable candidate root.
+  const finalRoot = resolve(finalUserRoot);
+  if (!isAbsolute(finalUserRoot) || finalRoot !== finalUserRoot) {
+    throw new Error("Protected shell authority root is invalid");
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(protectedShell.transactionId)) {
+    throw new Error("Protected shell transaction ID is invalid");
+  }
+  requireInternalExactFile(runtimeMainSource, "Protected UI runtime main");
+  let originalMain = "";
+  await patchAsar(asarPath, (dir) => {
+    const pkgPath = join(dir, "package.json");
+    if (!existsSync(pkgPath)) throw new Error("app.asar has no package.json — Codex layout changed?");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+    originalMain = String(pkg.main ?? "");
+    const existing = pkg["__tweakersProtected"] as Record<string, unknown> | undefined;
+    if (existing && typeof existing.originalMain === "string") originalMain = existing.originalMain;
+    if (!originalMain || originalMain === "protected-loader.cjs") {
+      throw new Error("Protected shell cannot determine the recorded OpenAI main entry");
+    }
+    const loaderSource = join(assetsDir, "protected-loader.cjs");
+    const bootstrapSource = join(assetsDir, "runtime", "protected-bootstrap.js");
+    if (!existsSync(loaderSource)) throw new Error(`Protected loader source is missing: ${loaderSource}`);
+    if (!existsSync(bootstrapSource)) {
+      throw new Error(
+        `Protected bootstrap artifact is missing: ${bootstrapSource}. Build the reviewed runtime before preparing a protected candidate.`,
+      );
+    }
+    cpSync(loaderSource, join(dir, "protected-loader.cjs"));
+    cpSync(bootstrapSource, join(dir, "protected-bootstrap.cjs"));
+    const metadata = {
+      schemaVersion: 1,
+      kind: "tweakers-protected-shell",
+      originalMain,
+      authorityRoot: finalRoot,
+      grantFile: join("transactions", "protected", protectedShell.transactionId, "launch-grant.json"),
+      preflightReceiptFile: join("transactions", "protected", protectedShell.transactionId, "preflight.json"),
+      updateQuarantineFile: join("transactions", "protected", protectedShell.transactionId, "update-quarantine.json"),
+      runtimeLoadTraceFile: join("transactions", "protected", protectedShell.transactionId, "runtime-load-trace.json"),
+      runtimeMain: join("runtime", "main.js"),
+      runtimeMainSha256: sha256RegularFile(runtimeMainSource),
+      transactionId: protectedShell.transactionId,
+      attempt: 1,
+      uiFeatures: protectedShell.uiFeatures,
+    };
+    pkg["__tweakersProtected"] = metadata;
+    delete pkg["__tweaker"];
+    delete pkg[LEGACY_ASAR_META_KEY];
+    pkg.main = "protected-loader.cjs";
+    writeFileSync(join(dir, "tweakers-protected.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  });
+  step(`Installed protected ${protectedShell.uiFeatures === "off" ? "UI-off" : "UI-on"} shell entrypoint`);
+  return { originalMain, rendererPatches: [] };
+}
+
+/**
+ * Stage the one-use authority consumed by a disposable protected health
+ * launch. The health root is deleted by the surrounding candidate
+ * transaction, so this never publishes installed/runtime authority.
+ */
+export function stageProtectedHealthLaunchGrant(input: {
+  candidate: CodexInstall;
+  authorityRoot: string;
+  protectedShell: NonNullable<Opts["protectedShell"]>;
+  acceptedBuildReceiptSha256: string;
+  now?: Date;
+  /** Injectable filesystem/probe seam for focused final-byte binding tests. */
+  dependencies?: ProtectedLaunchGrantDependencies;
+}): string {
+  const dependencies = input.dependencies ?? {};
+  const root = resolve(input.authorityRoot);
+  if (!isAbsolute(input.authorityRoot) || root !== input.authorityRoot) {
+    throw new Error("Protected health authority root is invalid");
+  }
+  const backendPath = join(input.candidate.appRoot, "Contents", "Resources", "codex");
+  const runtimeMainPath = join(root, "runtime", "main.js");
+  (dependencies.requireBackend ?? requireInternalExactFile)(backendPath, "Protected health backend");
+  (dependencies.requireBackend ?? requireInternalExactFile)(runtimeMainPath, "Protected reviewed runtime main");
+  const metadataBytes = (dependencies.readAsarEntry ?? readFileInAsar)(input.candidate.asarPath, "tweakers-protected.json");
+  const loaderBytes = (dependencies.readAsarEntry ?? readFileInAsar)(input.candidate.asarPath, "protected-loader.cjs");
+  const { headerHash } = (dependencies.readAsarHeader ?? readHeaderHash)(input.candidate.asarPath);
+  const backendVersion = (dependencies.probeBackendVersion ?? probeCodexCliVersion)(backendPath);
+  if (!backendVersion) throw new Error("Protected health backend version is unavailable");
+  const now = input.now ?? new Date();
+  const issuedAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + 5 * 60_000).toISOString();
+  const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const signature = (dependencies.readSignature ?? signatureInfo)(input.candidate.appRoot);
+  if (!signature.ok) throw new Error("Protected health candidate signature is unavailable");
+  const grant = {
+    schemaVersion: 1,
+    kind: "applied-pending-launch-grant",
+    transactionId: input.protectedShell.transactionId,
+    attempt: 1,
+    nonce: createHash("sha256").update(`${input.protectedShell.transactionId}:${issuedAt}:${input.candidate.appRoot}`).digest("hex"),
+    issuedAt,
+    expiresAt,
+    authoritySha256: digest(`${input.protectedShell.transactionId}:${input.acceptedBuildReceiptSha256}:health`),
+    acceptedBuildReceiptSha256: input.acceptedBuildReceiptSha256,
+    environment: {
+      schemaVersion: 2,
+      uiFeatures: input.protectedShell.uiFeatures,
+      mcpSafetyProvider: "managed-turn-idle",
+      recoveryState: "normal-protected",
+    },
+    identity: {
+      // Every identity comes from this exact app tree. Candidate-health calls
+      // pass their disposable app, while normal promotion calls only after the
+      // final app has replaced the live bundle.
+      appPath: input.candidate.appRoot,
+      appContentsSha256: (dependencies.fingerprintAppContents ?? fingerprintAppContents)(input.candidate.appRoot),
+      appAsarSha256: (dependencies.fingerprintFile ?? sha256RegularFile)(input.candidate.asarPath),
+      asarHeaderSha256: headerHash,
+      loaderPath: `${input.candidate.asarPath}/protected-loader.cjs`,
+      loaderSha256: digest(loaderBytes),
+      metadataSha256: digest(metadataBytes),
+      runtimeMainPath,
+      runtimeMainSha256: (dependencies.fingerprintFile ?? sha256RegularFile)(runtimeMainPath),
+      backendPath,
+      backendSha256: (dependencies.fingerprintFile ?? sha256RegularFile)(backendPath),
+      backendVersion,
+      backendArchitecture: "arm64",
+      signatureReceiptSha256: digest(signature.output),
+      policyDigest: digest(JSON.stringify({ schemaVersion: 2, provider: "managed-turn-idle", uiFeatures: input.protectedShell.uiFeatures })),
+    },
+    consumedBy: null,
+  };
+  if (!/^[a-f0-9]{64}$/.test(input.acceptedBuildReceiptSha256)) {
+    throw new Error("Protected health accepted build receipt digest is invalid");
+  }
+  const grantDirectory = join(root, "transactions", "protected", input.protectedShell.transactionId);
+  const grantFile = join(grantDirectory, "launch-grant.json");
+  (dependencies.writeAuthority ?? writeProtectedAuthorityJsonAtomically)(grantFile, grant);
+  return grantFile;
+}
+
+export interface ProtectedLaunchGrantDependencies {
+  requireBackend?: (path: string, label: string) => void;
+  readAsarEntry?: (asarPath: string, entryPath: string) => Buffer;
+  readAsarHeader?: (asarPath: string) => { headerHash: string };
+  probeBackendVersion?: (path: string) => string | null;
+  readSignature?: (appRoot: string) => { ok: boolean; output: string };
+  fingerprintAppContents?: (appRoot: string) => string;
+  fingerprintFile?: (path: string) => string;
+  writeAuthority?: (file: string, value: unknown) => void;
+}
+
+/**
+ * Write protected launch authority with durable file *and parent-directory*
+ * persistence. A successful rename alone is not durable across power loss:
+ * the directory entry must be synced after the rename as well. This helper is
+ * deliberately used by the production grant issuer, rather than being a
+ * test-only receipt utility.
+ */
+export function writeProtectedAuthorityJsonAtomically(
+  file: string,
+  value: unknown,
+  deps: ProtectedAuthorityWriteDependencies = {},
+): void {
+  const mkdir = deps.mkdir ?? ((path: string) => mkdirSync(path, { recursive: true, mode: 0o700 }));
+  const open = deps.open ?? ((path: string, flags: string, mode?: number) => openSync(path, flags, mode));
+  const write = deps.write ?? ((fd: number, bytes: string) => writeFileSync(fd, bytes, "utf8"));
+  const sync = deps.fsync ?? fsyncSync;
+  const close = deps.close ?? closeSync;
+  const rename = deps.rename ?? renameSync;
+  const chmod = deps.chmod ?? chmodSync;
+  const remove = deps.remove ?? ((path: string) => rmSync(path, { force: true }));
+  const directory = dirname(file);
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  let descriptor: number | null = null;
+  let directoryDescriptor: number | null = null;
+  try {
+    mkdir(directory);
+    descriptor = open(temporary, "wx", 0o600);
+    write(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+    sync(descriptor);
+    close(descriptor);
+    descriptor = null;
+    rename(temporary, file);
+    chmod(file, 0o600);
+    directoryDescriptor = open(directory, "r");
+    sync(directoryDescriptor);
+    close(directoryDescriptor);
+    directoryDescriptor = null;
+  } finally {
+    if (descriptor !== null) {
+      try { close(descriptor); } catch { /* preserve the original write error */ }
+    }
+    if (directoryDescriptor !== null) {
+      try { close(directoryDescriptor); } catch { /* preserve the original write error */ }
+    }
+    try { remove(temporary); } catch { /* cleanup cannot make a failed write pass */ }
+  }
+}
+
+export interface ProtectedAuthorityWriteDependencies {
+  mkdir?: (path: string) => unknown;
+  open?: (path: string, flags: string, mode?: number) => number;
+  write?: (descriptor: number, bytes: string) => void;
+  fsync?: (descriptor: number) => void;
+  close?: (descriptor: number) => void;
+  rename?: (source: string, destination: string) => void;
+  chmod?: (path: string, mode: number) => void;
+  remove?: (path: string) => void;
 }
 
 function reportRendererPatch(

@@ -141,6 +141,34 @@ test("additive terminal chronology remains compatible with legacy schema-v1 rece
   });
 });
 
+test("abandoned legacy desktop updates normalize terminal selections without making resumable history valid", async () => {
+  await withFixture(async (fixture) => {
+    const abandoned = persistedReceipt({
+      phase: "failed",
+      safeOfficialMode: true,
+      resumable: false,
+      error: "legacy continuation abandoned",
+      continuationAbandonedAt: NOW,
+    });
+    for (const embedded of [abandoned.source, abandoned.official]) {
+      for (const axis of ["uiFeatures", "mcpSafetyProvider", "recoveryState", "migrationState", "quarantineReason"]) {
+        delete (embedded as unknown as Record<string, unknown>)[axis];
+      }
+    }
+    fs.mkdirSync(join(fixture.root, "transactions"), { recursive: true });
+    fs.writeFileSync(fixture.stateFile, `${JSON.stringify(abandoned)}\n`);
+
+    const decoded = readDesktopUpdateReceipt(fixture.stateFile);
+    assert.equal(decoded?.phase, "failed");
+    assert.equal(decoded?.resumable, false);
+    assert.equal(decoded?.source.migrationState, "migration-blocked");
+    assert.equal(decoded?.official.migrationState, "verified");
+
+    fs.writeFileSync(fixture.stateFile, `${JSON.stringify({ ...abandoned, resumable: true })}\n`);
+    assert.throws(() => readDesktopUpdateReceipt(fixture.stateFile), /invalid/);
+  });
+});
+
 function selection(appExperience: "chatgpt" | "tweakers" = "tweakers"): EnvironmentSelection {
   return createEnvironmentSelection({
     profile: resolveEnvironmentProfile(defaultEnvironmentProfileRegistry(), "stable"),

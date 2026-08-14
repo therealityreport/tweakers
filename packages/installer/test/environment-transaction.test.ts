@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import {
   createEnvironmentProfileRegistry,
+  createProtectedEnvironmentSelection,
   createEnvironmentSelection,
   fingerprintAppContents,
   writeEnvironmentProfileRegistry,
@@ -14,9 +15,12 @@ import {
 } from "../src/environment-profile";
 import {
   createEnvironmentCoordinator,
+  createActiveBackendIdentityReceipt,
+  createProtectedEnvironmentPublicationEvidence,
   createDefaultEnvironmentAdapters,
   createManagedAlphaBackendPreparer,
   defaultCodexMcpConfigFile,
+  assertProtectedEnvironmentPublication,
   ENVIRONMENT_TRANSACTION_PHASES,
   environmentPreparationCapabilities,
   fingerprintDirectoryTree,
@@ -39,6 +43,77 @@ test("default MCP ownership path targets the user's Codex config", () => {
   assert.equal(
     defaultCodexMcpConfigFile("/Users/example"),
     "/Users/example/.codex/config.toml",
+  );
+});
+
+test("protected terminal publication requires one bound grant, preflight, active backend, and passing installed canary", () => {
+  const registry = createEnvironmentProfileRegistry({
+    stableDesktopPath: "/Applications/ChatGPT.app",
+    alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+  });
+  const requested = createProtectedEnvironmentSelection({
+    profile: registry.profiles.stable,
+    uiFeatures: "off",
+    requestedAt: "2026-08-12T19:00:00.000Z",
+  });
+  const active = createActiveBackendIdentityReceipt({
+    transactionId: "protected-publication-1",
+    attempt: 1,
+    preflightReceiptSha256: "a".repeat(64),
+    environment: {
+      uiFeatures: "off",
+      mcpSafetyProvider: "managed-turn-idle",
+      recoveryState: "normal-protected",
+    },
+    desktop: {
+      pid: 401,
+      kernelStart: "desktop-kernel-start",
+      executablePath: "/candidate/ChatGPT.app/Contents/MacOS/ChatGPT",
+      appAsarSha256: "b".repeat(64),
+    },
+    appServer: {
+      pid: 402,
+      kernelStart: "app-server-kernel-start",
+      uid: 501,
+      executablePath: "/candidate/ChatGPT.app/Contents/Resources/codex",
+      executableSha256: "c".repeat(64),
+      version: "0.147.0-alpha.6.5",
+      architecture: "arm64",
+      parentDesktopPid: 401,
+      parentDesktopKernelStart: "desktop-kernel-start",
+    },
+    acceptedBuildReceiptSha256: "d".repeat(64),
+    observedAt: "2026-08-12T19:01:00.000Z",
+  });
+  const publication = createProtectedEnvironmentPublicationEvidence({
+    transactionId: active.transactionId,
+    attempt: active.attempt,
+    appliedPendingLaunchGrantSha256: "e".repeat(64),
+    preflightReceiptSha256: active.preflightReceiptSha256,
+    activeBackend: active,
+    installedCanary: {
+      transactionId: active.transactionId,
+      attempt: active.attempt,
+      preflightReceiptSha256: active.preflightReceiptSha256,
+      activeBackendReceiptSha256: active.receiptSha256,
+      verdict: "PASS",
+      receiptSha256: "f".repeat(64),
+    },
+    signingReceiptSha256: "1".repeat(64),
+    rollbackEvidenceSha256: "2".repeat(64),
+  });
+
+  assert.doesNotThrow(() => assertProtectedEnvironmentPublication(publication, requested));
+  assert.throws(
+    () => assertProtectedEnvironmentPublication(publication, { ...requested, migrationState: "migration-blocked" }),
+    /Legacy or quarantined selection/,
+  );
+  assert.throws(
+    () => createProtectedEnvironmentPublicationEvidence({
+      ...publication,
+      installedCanary: { ...publication.installedCanary, verdict: "INCONCLUSIVE" },
+    }),
+    /receipt order or binding/,
   );
 });
 
@@ -3927,10 +4002,22 @@ test("legacy receipts without asar integrity evidence stay readable when termina
       rolledBackAt: null,
       cancelledAt: null,
     };
+    const protectionAxes = ["uiFeatures", "mcpSafetyProvider", "recoveryState", "migrationState", "quarantineReason"];
+    for (const selection of [
+      receipt.source,
+      receipt.requested,
+      (receipt.prepared as PreparedEnvironmentEvidence).rollback.selection,
+      (receipt.applied as EnvironmentAppliedEvidence).selection,
+    ]) {
+      for (const axis of protectionAxes) delete (selection as unknown as Record<string, unknown>)[axis];
+    }
     writeFileSync(file, `${JSON.stringify(receipt)}\n`);
     // A committed legacy receipt is terminal history; the lifecycle gate must
     // treat it as idle instead of poisoning every refresh with "invalid".
-    assert.equal(readEnvironmentTransactionReceipt(file)?.phase, "committed");
+    const normalized = readEnvironmentTransactionReceipt(file);
+    assert.equal(normalized?.phase, "committed");
+    assert.equal(normalized?.source.migrationState, "migration-blocked");
+    assert.equal(normalized?.requested.migrationState, "migration-blocked");
 
     // The same evidence in an in-flight phase cannot be verified and must
     // stay invalid (fail closed).

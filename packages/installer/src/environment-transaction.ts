@@ -38,6 +38,7 @@ import {
 } from "./alerts.js";
 import {
   isEnvironmentSelection,
+  normalizeEnvironmentSelection,
   ALPHA_DESKTOP_PATH,
   loadEnvironmentState,
   fingerprintAppContents,
@@ -98,6 +99,7 @@ import {
 import { getLocalRefreshStatus, hashTree } from "./commands/refresh-local.js";
 import { readRuntimeFingerprintEvidence, type RuntimeTreeFingerprint } from "./runtime-fingerprint.js";
 import { findSourceRoot } from "./source-root.js";
+import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
 
 export const ENVIRONMENT_TRANSACTION_SCHEMA_VERSION = 1 as const;
 
@@ -343,6 +345,317 @@ export interface EnvironmentVerification {
   appliedSelection: EnvironmentSelection | null;
   appliedEvidence: EnvironmentAppliedEvidence | null;
   error: string | null;
+}
+
+/**
+ * The post-main half of the protected launch protocol.  This is deliberately
+ * separate from the pre-main grant: it records process-bound evidence only
+ * after the protected loader has consumed its one-use authority.  An app
+ * inventory, a shell `which`, or a candidate file cannot substitute for this
+ * receipt.
+ */
+export const ACTIVE_BACKEND_IDENTITY_RECEIPT_SCHEMA_VERSION = 1 as const;
+export const PROTECTED_ENVIRONMENT_PUBLICATION_SCHEMA_VERSION = 1 as const;
+
+export interface ActiveBackendIdentityReceiptV1 {
+  schemaVersion: typeof ACTIVE_BACKEND_IDENTITY_RECEIPT_SCHEMA_VERSION;
+  kind: "active-backend-identity";
+  transactionId: string;
+  attempt: number;
+  preflightReceiptSha256: string;
+  environment: {
+    uiFeatures: "off" | "on";
+    mcpSafetyProvider: "managed-turn-idle" | "official-bundled-degraded";
+    recoveryState: "normal-protected" | "pristine-openai-recovery";
+  };
+  desktop: {
+    pid: number;
+    kernelStart: string;
+    executablePath: string;
+    appAsarSha256: string;
+  };
+  appServer: {
+    pid: number;
+    kernelStart: string;
+    uid: number;
+    executablePath: string;
+    executableSha256: string;
+    version: string;
+    architecture: "arm64";
+    parentDesktopPid: number;
+    parentDesktopKernelStart: string;
+  };
+  acceptedBuildReceiptSha256: string;
+  observedAt: string;
+  receiptSha256: string;
+}
+
+export type ActiveBackendIdentityInput = Omit<
+  ActiveBackendIdentityReceiptV1,
+  "schemaVersion" | "kind" | "receiptSha256"
+>;
+
+export interface ProtectedEnvironmentPublicationEvidenceV1 {
+  schemaVersion: typeof PROTECTED_ENVIRONMENT_PUBLICATION_SCHEMA_VERSION;
+  kind: "protected-environment-publication";
+  transactionId: string;
+  attempt: number;
+  /** The grant hash binds the candidate/loader/backend/signature policy preimage. */
+  appliedPendingLaunchGrantSha256: string;
+  preflightReceiptSha256: string;
+  activeBackend: ActiveBackendIdentityReceiptV1;
+  installedCanary: {
+    transactionId: string;
+    attempt: number;
+    preflightReceiptSha256: string;
+    activeBackendReceiptSha256: string;
+    verdict: "PASS" | "FAIL" | "INCONCLUSIVE";
+    receiptSha256: string;
+  };
+  signingReceiptSha256: string;
+  rollbackEvidenceSha256: string;
+  receiptSha256: string;
+}
+
+export type ProtectedEnvironmentPublicationInput = Omit<
+  ProtectedEnvironmentPublicationEvidenceV1,
+  "schemaVersion" | "kind" | "receiptSha256"
+>;
+
+/** Build an immutable, process-bound post-main receipt. */
+export function createActiveBackendIdentityReceipt(
+  input: ActiveBackendIdentityInput,
+): ActiveBackendIdentityReceiptV1 {
+  assertActiveBackendIdentityInput(input);
+  const unsigned = {
+    schemaVersion: ACTIVE_BACKEND_IDENTITY_RECEIPT_SCHEMA_VERSION,
+    kind: "active-backend-identity" as const,
+    ...canonicalActiveBackendIdentityInput(input),
+  };
+  return { ...unsigned, receiptSha256: canonicalReceiptDigest(unsigned) };
+}
+
+export function isActiveBackendIdentityReceipt(value: unknown): value is ActiveBackendIdentityReceiptV1 {
+  if (!isRecord(value)
+    || value.schemaVersion !== ACTIVE_BACKEND_IDENTITY_RECEIPT_SCHEMA_VERSION
+    || value.kind !== "active-backend-identity"
+    || !sha256(value.receiptSha256)) return false;
+  try {
+    const { schemaVersion: _schemaVersion, kind: _kind, receiptSha256, ...input } = value;
+    assertActiveBackendIdentityInput(input as ActiveBackendIdentityInput);
+    return receiptSha256.toLowerCase() === canonicalReceiptDigest({
+      schemaVersion: ACTIVE_BACKEND_IDENTITY_RECEIPT_SCHEMA_VERSION,
+      kind: "active-backend-identity",
+      ...canonicalActiveBackendIdentityInput(input as ActiveBackendIdentityInput),
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build and validate the only evidence that authorizes terminal selection
+ * publication.  This helper is pure: the transaction owner persists it, and
+ * callers must invoke `assertProtectedEnvironmentPublication` immediately
+ * before publishing a normal-protected selection.
+ */
+export function createProtectedEnvironmentPublicationEvidence(
+  input: ProtectedEnvironmentPublicationInput,
+): ProtectedEnvironmentPublicationEvidenceV1 {
+  assertProtectedEnvironmentPublicationInput(input);
+  const unsigned = {
+    schemaVersion: PROTECTED_ENVIRONMENT_PUBLICATION_SCHEMA_VERSION,
+    kind: "protected-environment-publication" as const,
+    ...canonicalProtectedEnvironmentPublicationInput(input),
+  };
+  return { ...unsigned, receiptSha256: canonicalReceiptDigest(unsigned) };
+}
+
+export function assertProtectedEnvironmentPublication(
+  evidence: unknown,
+  requested: EnvironmentSelection,
+): asserts evidence is ProtectedEnvironmentPublicationEvidenceV1 {
+  if (!isProtectedEnvironmentPublicationEvidence(evidence)) {
+    throw new Error("Protected environment publication evidence is invalid");
+  }
+  if (requested.recoveryState !== "normal-protected"
+    || requested.mcpSafetyProvider !== "managed-turn-idle") {
+    throw new Error("Only a normal protected managed-provider selection may use protected publication evidence");
+  }
+  if (requested.migrationState !== "requested" && requested.migrationState !== "verified") {
+    throw new Error("Legacy or quarantined selection cannot publish as a healthy protected environment");
+  }
+  if (evidence.activeBackend.environment.uiFeatures !== requested.uiFeatures
+    || evidence.activeBackend.environment.mcpSafetyProvider !== requested.mcpSafetyProvider
+    || evidence.activeBackend.environment.recoveryState !== requested.recoveryState) {
+    throw new Error("Protected publication active backend environment does not match the requested selection");
+  }
+}
+
+export function isProtectedEnvironmentPublicationEvidence(
+  value: unknown,
+): value is ProtectedEnvironmentPublicationEvidenceV1 {
+  if (!isRecord(value)
+    || value.schemaVersion !== PROTECTED_ENVIRONMENT_PUBLICATION_SCHEMA_VERSION
+    || value.kind !== "protected-environment-publication"
+    || !sha256(value.receiptSha256)) return false;
+  try {
+    const { schemaVersion: _schemaVersion, kind: _kind, receiptSha256, ...input } = value;
+    assertProtectedEnvironmentPublicationInput(input as ProtectedEnvironmentPublicationInput);
+    return receiptSha256.toLowerCase() === canonicalReceiptDigest({
+      schemaVersion: PROTECTED_ENVIRONMENT_PUBLICATION_SCHEMA_VERSION,
+      kind: "protected-environment-publication",
+      ...canonicalProtectedEnvironmentPublicationInput(input as ProtectedEnvironmentPublicationInput),
+    });
+  } catch {
+    return false;
+  }
+}
+
+function assertActiveBackendIdentityInput(value: unknown): asserts value is ActiveBackendIdentityInput {
+  if (!isRecord(value)
+    || !validProtectedTransactionId(value.transactionId)
+    || !positiveInteger(value.attempt)
+    || !sha256(value.preflightReceiptSha256)
+    || !isProtectedEnvironmentAxes(value.environment)
+    || !isRecord(value.desktop)
+    || !positiveInteger(value.desktop.pid)
+    || !nonEmpty(value.desktop.kernelStart)
+    || !exactAbsolutePath(value.desktop.executablePath)
+    || !sha256(value.desktop.appAsarSha256)
+    || !isRecord(value.appServer)
+    || !positiveInteger(value.appServer.pid)
+    || !nonEmpty(value.appServer.kernelStart)
+    || !nonNegativeInteger(value.appServer.uid)
+    || !exactAbsolutePath(value.appServer.executablePath)
+    || !sha256(value.appServer.executableSha256)
+    || !nonEmpty(value.appServer.version)
+    || value.appServer.architecture !== "arm64"
+    || value.appServer.parentDesktopPid !== value.desktop.pid
+    || value.appServer.parentDesktopKernelStart !== value.desktop.kernelStart
+    || !sha256(value.acceptedBuildReceiptSha256)
+    || !validIso(value.observedAt)) {
+    throw new Error("Active backend identity receipt fields are invalid");
+  }
+}
+
+function canonicalActiveBackendIdentityInput(
+  input: ActiveBackendIdentityInput,
+): ActiveBackendIdentityInput {
+  return {
+    transactionId: input.transactionId,
+    attempt: input.attempt,
+    preflightReceiptSha256: input.preflightReceiptSha256.toLowerCase(),
+    environment: { ...input.environment },
+    desktop: {
+      pid: input.desktop.pid,
+      kernelStart: input.desktop.kernelStart,
+      executablePath: input.desktop.executablePath,
+      appAsarSha256: input.desktop.appAsarSha256.toLowerCase(),
+    },
+    appServer: {
+      pid: input.appServer.pid,
+      kernelStart: input.appServer.kernelStart,
+      uid: input.appServer.uid,
+      executablePath: input.appServer.executablePath,
+      executableSha256: input.appServer.executableSha256.toLowerCase(),
+      version: input.appServer.version,
+      architecture: "arm64",
+      parentDesktopPid: input.appServer.parentDesktopPid,
+      parentDesktopKernelStart: input.appServer.parentDesktopKernelStart,
+    },
+    acceptedBuildReceiptSha256: input.acceptedBuildReceiptSha256.toLowerCase(),
+    observedAt: input.observedAt,
+  };
+}
+
+function assertProtectedEnvironmentPublicationInput(
+  value: unknown,
+): asserts value is ProtectedEnvironmentPublicationInput {
+  if (!isRecord(value)
+    || !validProtectedTransactionId(value.transactionId)
+    || !positiveInteger(value.attempt)
+    || !sha256(value.appliedPendingLaunchGrantSha256)
+    || !sha256(value.preflightReceiptSha256)
+    || !isActiveBackendIdentityReceipt(value.activeBackend)
+    || !isRecord(value.installedCanary)
+    || !sha256(value.signingReceiptSha256)
+    || !sha256(value.rollbackEvidenceSha256)) {
+    throw new Error("Protected environment publication fields are invalid");
+  }
+  const canary = value.installedCanary;
+  if (!validProtectedTransactionId(canary.transactionId)
+    || !positiveInteger(canary.attempt)
+    || !sha256(canary.preflightReceiptSha256)
+    || !sha256(canary.activeBackendReceiptSha256)
+    || (canary.verdict !== "PASS" && canary.verdict !== "FAIL" && canary.verdict !== "INCONCLUSIVE")
+    || !sha256(canary.receiptSha256)) {
+    throw new Error("Protected environment publication canary is invalid");
+  }
+  if (value.activeBackend.transactionId !== value.transactionId
+    || value.activeBackend.attempt !== value.attempt
+    || canary.transactionId !== value.transactionId
+    || canary.attempt !== value.attempt
+    || value.activeBackend.preflightReceiptSha256.toLowerCase() !== value.preflightReceiptSha256.toLowerCase()
+    || canary.preflightReceiptSha256.toLowerCase() !== value.preflightReceiptSha256.toLowerCase()
+    || canary.activeBackendReceiptSha256.toLowerCase() !== value.activeBackend.receiptSha256.toLowerCase()
+    || canary.verdict !== "PASS") {
+    throw new Error("Protected environment publication receipt order or binding is invalid");
+  }
+}
+
+function canonicalProtectedEnvironmentPublicationInput(
+  input: ProtectedEnvironmentPublicationInput,
+): ProtectedEnvironmentPublicationInput {
+  return {
+    transactionId: input.transactionId,
+    attempt: input.attempt,
+    appliedPendingLaunchGrantSha256: input.appliedPendingLaunchGrantSha256.toLowerCase(),
+    preflightReceiptSha256: input.preflightReceiptSha256.toLowerCase(),
+    activeBackend: createActiveBackendIdentityReceipt({
+      transactionId: input.activeBackend.transactionId,
+      attempt: input.activeBackend.attempt,
+      preflightReceiptSha256: input.activeBackend.preflightReceiptSha256,
+      environment: input.activeBackend.environment,
+      desktop: input.activeBackend.desktop,
+      appServer: input.activeBackend.appServer,
+      acceptedBuildReceiptSha256: input.activeBackend.acceptedBuildReceiptSha256,
+      observedAt: input.activeBackend.observedAt,
+    }),
+    installedCanary: {
+      transactionId: input.installedCanary.transactionId,
+      attempt: input.installedCanary.attempt,
+      preflightReceiptSha256: input.installedCanary.preflightReceiptSha256.toLowerCase(),
+      activeBackendReceiptSha256: input.installedCanary.activeBackendReceiptSha256.toLowerCase(),
+      verdict: input.installedCanary.verdict,
+      receiptSha256: input.installedCanary.receiptSha256.toLowerCase(),
+    },
+    signingReceiptSha256: input.signingReceiptSha256.toLowerCase(),
+    rollbackEvidenceSha256: input.rollbackEvidenceSha256.toLowerCase(),
+  };
+}
+
+function isProtectedEnvironmentAxes(value: unknown): value is ActiveBackendIdentityReceiptV1["environment"] {
+  return isRecord(value)
+    && (value.uiFeatures === "off" || value.uiFeatures === "on")
+    && ((value.mcpSafetyProvider === "managed-turn-idle" && value.recoveryState === "normal-protected")
+      || (value.uiFeatures === "off"
+        && value.mcpSafetyProvider === "official-bundled-degraded"
+        && value.recoveryState === "pristine-openai-recovery"));
+}
+
+function validProtectedTransactionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+}
+
+function canonicalReceiptDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(sortReceiptValue(value))).digest("hex");
+}
+
+function sortReceiptValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortReceiptValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortReceiptValue(value[key])]));
 }
 
 export interface EnvironmentCoordinator {
@@ -4108,6 +4421,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
   }
 
   private async rollbackUnlocked(transactionId?: string): Promise<EnvironmentTransactionReceipt> {
+    assertInstallerUpdateQuarantineClear(this.environmentRoot, "environment-rollback");
     let receipt = this.requireReceipt(transactionId);
     if (receipt.phase === "rolled-back") return receipt;
     if (receipt.phase === "preparing" || receipt.phase === "prepared") {
@@ -4252,6 +4566,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
    * resolved honestly by adopting what is actually installed.
    */
   private async recoverUnlocked(transactionId?: string): Promise<EnvironmentTransactionReceipt> {
+    assertInstallerUpdateQuarantineClear(this.environmentRoot, "environment-recovery");
     const receipt = await this.ensureSwapHostEvidence(this.requireReceipt(transactionId));
     if (isTerminalEnvironmentPhase(receipt.phase) && receipt.phase !== "failed") return receipt;
     const prepared = receipt.prepared;
@@ -4655,10 +4970,50 @@ export function readEnvironmentTransactionReceipt(file: string): EnvironmentTran
   } catch (error) {
     throw new Error(`Environment transaction receipt is unreadable at ${file}: ${errorMessage(error)}`);
   }
-  if (!isEnvironmentTransactionReceipt(value)) {
+  const normalized = normalizeTerminalEnvironmentTransactionReceipt(value);
+  if (!isEnvironmentTransactionReceipt(normalized)) {
     throw new Error(`Environment transaction receipt is invalid at ${file}`);
   }
-  return value;
+  return normalized;
+}
+
+/**
+ * Terminal schema-1 receipts are durable history, not resumable authority.
+ * Normalize only their embedded selections through the same narrow legacy
+ * mapping used by the environment registry. In-flight receipts deliberately
+ * remain byte-strict because inventing protection axes there could authorize
+ * an unverifiable continuation.
+ */
+function normalizeTerminalEnvironmentTransactionReceipt(value: unknown): unknown {
+  if (!isRecord(value)
+    || (value.phase !== "committed"
+      && value.phase !== "rolled-back"
+      && value.phase !== "failed"
+      && value.phase !== "cancelled")) return value;
+
+  const source = normalizeEnvironmentSelection(value.source);
+  const requested = normalizeEnvironmentSelection(value.requested);
+  if (source === null || requested === null) return value;
+
+  let prepared = value.prepared;
+  if (isRecord(prepared)) {
+    if (!isRecord(prepared.rollback)) return value;
+    const rollbackSelection = normalizeEnvironmentSelection(prepared.rollback.selection);
+    if (rollbackSelection === null) return value;
+    prepared = {
+      ...prepared,
+      rollback: { ...prepared.rollback, selection: rollbackSelection },
+    };
+  }
+
+  let applied = value.applied;
+  if (isRecord(applied)) {
+    const appliedSelection = normalizeEnvironmentSelection(applied.selection);
+    if (appliedSelection === null) return value;
+    applied = { ...applied, selection: appliedSelection };
+  }
+
+  return { ...value, source, requested, prepared, applied };
 }
 
 export function writeEnvironmentTransactionReceipt(
@@ -5055,6 +5410,11 @@ function selectionsMatch(
     && applied.appExperience === requested.appExperience
     && applied.releaseProfile === requested.releaseProfile
     && applied.backendLane === requested.backendLane
+    && applied.uiFeatures === requested.uiFeatures
+    && applied.mcpSafetyProvider === requested.mcpSafetyProvider
+    && applied.recoveryState === requested.recoveryState
+    && applied.migrationState === requested.migrationState
+    && applied.quarantineReason === requested.quarantineReason
     && applied.requestedAt === requested.requestedAt
     && (!includeAppliedAt || applied.appliedAt === requested.appliedAt);
 }

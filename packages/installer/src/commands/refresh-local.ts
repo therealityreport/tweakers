@@ -13,6 +13,7 @@ import { repair } from "./repair.js";
 import { acquireProcessLock, processAlive, readLockOwner, type ProcessLock } from "../process-lock.js";
 import { readState, resolveMode } from "../state.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
+import { assertInstallerUpdateQuarantineClear } from "../protected-update-quarantine.js";
 
 export type RefreshSource = "development" | "stable" | "current";
 export type RefreshPhase = "idle" | "preparing" | "quitting" | "promoting" | "complete" | "failed";
@@ -119,6 +120,7 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
   // consult or update the co-owned config.json development registration.
   const explicitDevelopmentRoot = resolveExplicitDevelopmentRoot(opts);
   const paths = ensureUserPaths();
+  assertInstallerUpdateQuarantineClear(paths.root, "refresh-local");
   // The detached launchd run has no console; any failure that never reaches
   // refresh-state.json strands the UI on "preparing" forever. Every throw
   // below must land in the state file unless the workflow already recorded a
