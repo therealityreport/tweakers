@@ -96,7 +96,7 @@ import {
   stageManagedRuntime,
   type ManagedRuntimeProvenance,
 } from "./managed-runtime.js";
-import { getLocalRefreshStatus, hashTree } from "./commands/refresh-local.js";
+import { getLocalRefreshStatus, hashTree, nodeAugmentedEnvironment, npmCommand } from "./commands/refresh-local.js";
 import { readRuntimeFingerprintEvidence, type RuntimeTreeFingerprint } from "./runtime-fingerprint.js";
 import { findSourceRoot } from "./source-root.js";
 import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
@@ -1834,9 +1834,13 @@ async function prepareManagedRuntimeSourcePlan(
 }
 
 function buildDevelopmentSource(sourceRoot: string): void {
-  const command = process.platform === "win32" ? "npm.cmd" : "npm";
+  // Detached owners (launchd, the native-updater handoff) run with a minimal
+  // PATH: resolve npm next to the running node and give the build a PATH that
+  // can re-resolve `node` for npm scripts and shebangs.
+  const command = npmCommand();
   const result = spawnSync(command, ["run", "build"], {
     cwd: sourceRoot,
+    env: nodeAugmentedEnvironment(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 10 * 60_000,

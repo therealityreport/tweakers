@@ -182,7 +182,7 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           }
           runChecked(process.execPath, [stagedCli, "install", "--app", appRoot, "--candidate-only", "--coordinated-refresh", "--no-watcher"], process.cwd(), process.env);
         } else {
-          runChecked(npmCommand(), ["run", "build"], sourceRoot);
+          runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment());
           await install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true });
         }
       },
@@ -409,6 +409,26 @@ export function npmCommand(platform = process.platform, execPath = process.execP
   const name = platform === "win32" ? "npm.cmd" : "npm";
   const sibling = join(dirname(execPath), name);
   return existsSync(sibling) ? sibling : name;
+}
+
+/**
+ * An absolute npm alone is not enough in those contexts: npm's scripts and
+ * shebangs re-resolve `node` through PATH, which the minimal launchd
+ * environment does not provide (seen live 2026-08-15: `env: node: No such
+ * file or directory`). Every child build must run with the current node's
+ * own directory prepended to PATH.
+ */
+export function nodeAugmentedEnvironment(
+  parentEnvironment: NodeJS.ProcessEnv = process.env,
+  execPath = process.execPath,
+): NodeJS.ProcessEnv {
+  const nodeDir = dirname(execPath);
+  const currentPath = parentEnvironment.PATH ?? "";
+  const alreadyPresent = currentPath.split(":").includes(nodeDir);
+  return {
+    ...parentEnvironment,
+    PATH: alreadyPresent ? currentPath : `${nodeDir}${currentPath === "" ? "" : ":"}${currentPath}`,
+  };
 }
 
 /**
