@@ -1,0 +1,210 @@
+{
+  "taskId": "ask-uq-audit-correctness",
+  "taskName": "correctness_architecture_performance",
+  "role": "implementation_reviewer",
+  "rolePolicy": {
+    "scope": "global_managed",
+    "catalogSchemaVersion": 3,
+    "projectShadows": []
+  },
+  "objective": "Audit User Questions correctness, state machines, async races, resource cleanup, architecture, maintainability, duplication, and performance.",
+  "purpose": "Find evidence-backed functional and structural defects across the canonical implementation.",
+  "dependencies": [],
+  "routeReason": "The coupled renderer, MCP, broker, persistence, and policy state machines need an independent high-context implementation review with a moderate source/test oracle.",
+  "ownershipBoundary": "Read-only correctness, architecture, maintainability, and performance review of canonical User Questions code and direct callers; no security ownership, edits, or final acceptance.",
+  "escalationEvidence": {},
+  "routingInputs": {
+    "responsibility": "review_integration",
+    "ambiguity": "medium",
+    "blastRadius": "low",
+    "reversibility": "easy",
+    "verificationStrength": "moderate",
+    "failureCost": "high",
+    "frozenSpec": false,
+    "latencySensitivity": "medium",
+    "contextPressure": "high",
+    "ownershipParallelProfile": {
+      "mode": "isolated",
+      "independentWorkstreams": 4
+    }
+  },
+  "idealRoute": {
+    "model": "gpt-5.6-terra",
+    "effort": "xhigh",
+    "agentType": "terra_xhigh",
+    "routeBinding": "registered_agent_type",
+    "dispatch": "spawn_agent",
+    "width": 1,
+    "rationale": "Independent review of coupled stateful implementation with substantial context.",
+    "policySource": "subagent-routing/references/routing-matrix.md"
+  },
+  "capabilitySnapshot": {
+    "backendGeneration": "codex-desktop-current-turn",
+    "registeredAgentTypes": {
+      "terra_xhigh": {
+        "model": "gpt-5.6-terra",
+        "effort": "xhigh",
+        "status": "proven",
+        "evidence": [
+          "Current spawn_agent schema exposes terra_xhigh.",
+          "2026-08-12 universal-role doctor reported schema 3, 18 semantic roles, 16 route profiles, and zero drift."
+        ],
+        "fingerprint": "99801a8eb501c970cefd39a65f1242f1bbe2531bc823d40e4f9cc05feb6b7f6d"
+      }
+    },
+    "maxChildConcurrency": 5,
+    "observedAt": "2026-08-12T00:19:58Z",
+    "discoveryExpiresAt": "2026-08-12T04:20:01Z",
+    "fingerprint": "99801a8eb501c970cefd39a65f1242f1bbe2531bc823d40e4f9cc05feb6b7f6d"
+  },
+  "appliedRoute": {
+    "model": "gpt-5.6-terra",
+    "effort": "xhigh",
+    "agentType": "terra_xhigh",
+    "routeBinding": "registered_agent_type",
+    "dispatch": "spawn_agent",
+    "width": 1,
+    "forkTurns": "none",
+    "capabilityFingerprint": "99801a8eb501c970cefd39a65f1242f1bbe2531bc823d40e4f9cc05feb6b7f6d",
+    "status": "ready"
+  },
+  "resolutionEvents": [],
+  "ownership": {
+    "writable": [
+      "/Users/thomashulihan/Projects/tweakers/advisor-plans/agent-scratch/correctness_architecture_performance"
+    ],
+    "readOnly": [
+      "/Users/thomashulihan/Projects/tweakers/tweaks/user-questions",
+      "/Users/thomashulihan/Projects/tweakers/packages/runtime/src",
+      "/Users/thomashulihan/Projects/tweakers/packages/installer/src"
+    ],
+    "forbidden": [
+      "Repository source, generated output, Git state, installed configuration, processes, provider state, and other reviewer/report paths"
+    ],
+    "liveWriters": [
+      "/root writes only advisor-plans recon, assignment records, and final report; children must not write."
+    ]
+  },
+  "inputs": {
+    "requiredDocuments": [
+      "/Users/thomashulihan/Projects/tweakers/AGENTS.md",
+      "/Users/thomashulihan/Projects/tweakers/tweaks/AGENTS.md",
+      "/Users/thomashulihan/Projects/tweakers/advisor-plans/recon.md",
+      "/Users/thomashulihan/.codex/plugins/cache/local-plugins/improve-more/1.2.0/skills/improve-more/references/audit-playbook.md"
+    ],
+    "priorFindings": [],
+    "assumptions": [
+      "Canonical tweak source is tweaks/user-questions; catalog and installer runtime assets are synchronized derivatives.",
+      "The task is a read-only audit; source, generated output, installed state, configuration, processes, Git state, and external services must not be mutated.",
+      "The parent owns vetting, severity calibration, final acceptance, and final synthesis."
+    ]
+  },
+  "acceptance": {
+    "commands": [],
+    "manualChecks": [
+      {
+        "check": "Return findings only, each with severity, category, exact current file:line evidence, impact, effort, fix risk, confidence, and fix sketch; include by-design/rejected candidates.",
+        "expectedResult": "A complete read-only evidence report with no files changed."
+      }
+    ]
+  },
+  "constraints": {
+    "branchWorktreeAuthority": "No branch, worktree, staging, commit, push, tag, stash, reset, or Git mutation authority.",
+    "scopeBoundary": "Read-only audit of the explicitly assigned User Questions surfaces and direct evidence only.",
+    "destructiveActionBoundary": "No edits, installs, builds, formatters, synchronization writes, policy changes, app control, restart, promotion, credential reads, or external writes.",
+    "capabilityInheritance": {
+      "mode": "inherit_parent",
+      "restrictions": []
+    }
+  },
+  "stopConditions": [
+    "A conclusion requires changing repository, installed, live, provider, or user configuration state.",
+    "Evidence falls outside the assigned dimension or the target has drifted.",
+    "The exact assigned route is unavailable.",
+    "A potential secret is encountered; report only credential type and file location without reproducing the value."
+  ],
+  "escalationPolicy": {
+    "diagnosisFirst": "Return the evidence gap and safest read-only next check; do not broaden authority or substitute route."
+  },
+  "parentResponsibilities": {
+    "userDecisions": true,
+    "finalIntegration": true,
+    "finalAcceptance": true,
+    "finalSynthesis": true
+  },
+  "childResponsibilities": {
+    "userDecisions": false,
+    "finalIntegration": false,
+    "finalAcceptance": false,
+    "finalSynthesis": false
+  },
+  "fallback": {
+    "status": "none"
+  },
+  "failurePolicy": {
+    "maxSameRouteRetries": 1,
+    "stopAfterEquivalentFailures": 2,
+    "preserveEvidence": true,
+    "diagnoseBeforeReassignment": true
+  },
+  "lifecycle": {
+    "status": "completed",
+    "history": [
+      {
+        "status": "ready",
+        "at": "2026-08-12T00:19:58Z"
+      },
+      {
+        "status": "completed",
+        "at": "2026-08-12T00:36:07Z"
+      }
+    ]
+  },
+  "returnContract": {
+    "statuses": [
+      "COMPLETED",
+      "BLOCKED",
+      "FAILED",
+      "CANCELLED",
+      "TIMED_OUT"
+    ],
+    "requiredFields": [
+      "status",
+      "result",
+      "actualModel",
+      "actualEffort",
+      "filesRead",
+      "filesChanged",
+      "commands",
+      "evidence",
+      "blockers",
+      "fallbackEvents",
+      "escalationEvents",
+      "lifecycleEvents",
+      "risks",
+      "followUp",
+      "telemetry"
+    ]
+  },
+  "tracking": {
+    "selectedModel": "gpt-5.6-terra",
+    "selectedEffort": "xhigh",
+    "assignedPurpose": "Correctness, architecture, maintainability, and performance audit",
+    "status": "completed",
+    "result": "Completed read-only correctness, architecture, maintainability, and performance audit with malformed-message, abandoned-lock, async-teardown, and carrier-contract findings. Actual route: gpt-5.6-terra/xhigh; no files changed."
+  },
+  "telemetry": {
+    "wallTimeMs": null,
+    "tokens": null,
+    "context": null,
+    "price": null,
+    "credit": null,
+    "unavailableReasons": {
+      "wallTimeMs": "Not exposed before dispatch.",
+      "tokens": "Not exposed before dispatch.",
+      "context": "Not exposed before dispatch.",
+      "price": "Not exposed before dispatch.",
+      "credit": "Not exposed before dispatch."
+    }
+  }
+}
