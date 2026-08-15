@@ -525,6 +525,37 @@ function exactNativeProjectPath(project) {
   return roots.length === 1 ? roots[0] : null;
 }
 
+/**
+ * Seed directly from the native local-project registry when no sidebar
+ * surface is available. Surface seeding runs only on the settings page, but
+ * the settings page replaces the sidebar in current app builds, so an empty
+ * store could otherwise never seed itself (live 2026-08-15).
+ */
+function seedProjectsFromNativeRegistry(nativeProjects) {
+  const native = Array.isArray(nativeProjects) ? nativeProjects : [];
+  const nodes = [];
+  const seen = new Set();
+  for (const [index, candidate] of native.entries()) {
+    if (!isRecord(candidate) || seen.has(candidate.id)) continue;
+    const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+    if (!name || name.length > 80) continue;
+    const projectPath = exactNativeProjectPath(candidate);
+    nodes.push({
+      id: seededNativeProjectId(candidate.id, index),
+      type: "project",
+      parentId: null,
+      name,
+      icon: { kind: "emoji", value: "📁" },
+      colorMode: "auto",
+      overlayIntensity: "medium",
+      ...(projectPath ? { projectPath } : {}),
+      connections: {},
+    });
+    seen.add(candidate.id);
+  }
+  return normalizeState({ schemaVersion: 1, nodes });
+}
+
 function seededNativeProjectId(identity, index) {
   let hash = 2166136261;
   for (const char of String(identity || "project")) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
@@ -566,5 +597,6 @@ module.exports = {
   projectNativeNames,
   projectForNativeIdentity,
   seedProjectsFromNativeSurface,
+  seedProjectsFromNativeRegistry,
   exactNativeProjectPath,
 };

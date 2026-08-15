@@ -671,19 +671,44 @@ test("legacy color import waits for native project discovery before completing",
     "sidebar-project-backgrounds:colors": { alpha: "violet" },
   }));
   const api = { fs: { dataDir }, ipc: { send() {} } };
-  const emptyService = _test.createService(api);
+  const emptyService = _test.createService(api, { readNativeLocalProjects: () => [] });
   assert.equal(fs.existsSync(path.join(dataDir, ".legacy-project-colors-imported-v1")), false);
   const projectState = _test.normalizeState({ schemaVersion: 1, nodes: [
     { id: "p", type: "project", parentId: null, name: "Alpha", icon: { kind: "emoji", value: "📁" }, connections: {} },
   ] });
   assert.equal((await emptyService.handle({ action: "save", state: projectState })).ok, true);
   emptyService.dispose();
-  const discoveredService = _test.createService(api);
+  const discoveredService = _test.createService(api, { readNativeLocalProjects: () => [] });
   const imported = await discoveredService.handle({ action: "get" });
   assert.equal(imported.state.nodes[0].colorMode, "manual");
   assert.equal(imported.state.nodes[0].color, "#6d28d9");
   assert.equal(fs.existsSync(path.join(dataDir, ".legacy-project-colors-imported-v1")), true);
   discoveredService.dispose();
+});
+
+test("an empty store seeds from the native registry and legacy colors land on it", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "projects-native-seed-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dataDir = path.join(root, "tweak-data", "co.tweakers.projects");
+  const storageDir = path.join(root, "storage");
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(path.join(storageDir, "co.bennett.ui-improvements.json"), JSON.stringify({
+    "sidebar-project-backgrounds:colors": { alpha: "violet" },
+  }));
+  const api = { fs: { dataDir }, ipc: { send() {} } };
+  const service = _test.createService(api, { readNativeLocalProjects: () => [
+    { id: "native-a", name: "Alpha", rootPaths: ["/tmp/example/alpha"] },
+    { id: "native-b", name: "Beta", rootPaths: ["/tmp/example/beta"] },
+  ] });
+  const seeded = await service.handle({ action: "get" });
+  assert.equal(seeded.ok, true);
+  const names = seeded.state.nodes.filter((node) => node.type === "project").map((node) => node.name).sort();
+  assert.deepEqual(names, ["Alpha", "Beta"], "both native projects seed as nodes");
+  const alpha = seeded.state.nodes.find((node) => node.name === "Alpha");
+  assert.equal(alpha.colorMode, "manual", "legacy color import applies to the seeded node");
+  assert.equal(alpha.color, "#6d28d9");
+  assert.equal(alpha.projectPath, "/tmp/example/alpha");
+  service.dispose();
 });
 
 test("project storage rejects secrets and absolute paths", () => {
@@ -833,7 +858,7 @@ test("save and migration emit revision events", async (t) => {
 test("save enforces optimistic concurrency via base revision", async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "projects-concurrency-"));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
-  const service = _test.createService({ fs: { dataDir }, ipc: { send() {} } });
+  const service = _test.createService({ fs: { dataDir }, ipc: { send() {} } }, { readNativeLocalProjects: () => [] });
 
   const rev0 = _test.revisionForState(_test.normalizeState({ schemaVersion: 1, nodes: [] }));
   const node = { id: "g-1", type: "group", parentId: null, name: "Work", icon: { kind: "emoji", value: "📁" }, connections: {} };

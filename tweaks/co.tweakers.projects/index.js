@@ -617,6 +617,37 @@ function exactNativeProjectPath(project) {
   return roots.length === 1 ? roots[0] : null;
 }
 
+/**
+ * Seed directly from the native local-project registry when no sidebar
+ * surface is available. Surface seeding runs only on the settings page, but
+ * the settings page replaces the sidebar in current app builds, so an empty
+ * store could otherwise never seed itself (live 2026-08-15).
+ */
+function seedProjectsFromNativeRegistry(nativeProjects) {
+  const native = Array.isArray(nativeProjects) ? nativeProjects : [];
+  const nodes = [];
+  const seen = new Set();
+  for (const [index, candidate] of native.entries()) {
+    if (!isRecord(candidate) || seen.has(candidate.id)) continue;
+    const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+    if (!name || name.length > 80) continue;
+    const projectPath = exactNativeProjectPath(candidate);
+    nodes.push({
+      id: seededNativeProjectId(candidate.id, index),
+      type: "project",
+      parentId: null,
+      name,
+      icon: { kind: "emoji", value: "📁" },
+      colorMode: "auto",
+      overlayIntensity: "medium",
+      ...(projectPath ? { projectPath } : {}),
+      connections: {},
+    });
+    seen.add(candidate.id);
+  }
+  return normalizeState({ schemaVersion: 1, nodes });
+}
+
 function seededNativeProjectId(identity, index) {
   let hash = 2166136261;
   for (const char of String(identity || "project")) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
@@ -658,6 +689,7 @@ module.exports = {
   projectNativeNames,
   projectForNativeIdentity,
   seedProjectsFromNativeSurface,
+  seedProjectsFromNativeRegistry,
   exactNativeProjectPath,
 };
 
@@ -1551,6 +1583,7 @@ const {
   mergeLegacyProjectColors,
   readLegacyProjectColorPreferences,
   readNativeLocalProjects,
+  seedProjectsFromNativeRegistry,
 } = require("./state");
 const {
   revisionForState,
@@ -1566,14 +1599,31 @@ const {
 function createProjectService(api, dependencies = {}) {
   const store = createSecureProjectStore(api.fs.dataDir);
   const loaded = store.read();
+  // A store with no projects can never seed through the settings surface
+  // (that page replaces the sidebar rows it would read), so seed from the
+  // native registry here before the one-time legacy color import runs.
+  // Seeding and import stay IN MEMORY for an empty store: startup writes race
+  // the installer's sealed tweak_data acceptance window (a health-probe boot
+  // mutating the store fails the whole promotion, live 2026-08-15). The first
+  // explicit save persists the seeded state along with the user's change.
+  const startedEmpty = !loaded.state.nodes.some((node) => node.type === "project");
+  const readNativeEarly = typeof dependencies.readNativeLocalProjects === "function"
+    ? dependencies.readNativeLocalProjects
+    : readNativeLocalProjects;
+  if (startedEmpty) {
+    try {
+      const seeded = seedProjectsFromNativeRegistry(readNativeEarly());
+      if (seeded.nodes.length) loaded.state = seeded;
+    } catch {}
+  }
   const legacyMigration = createLegacyProjectColorMigration(api.fs.dataDir);
   const legacyColors = legacyMigration.isComplete()
     ? { found: false, preferences: {} }
     : readLegacyProjectColorPreferences(api.fs.dataDir);
   const imported = mergeLegacyProjectColors(loaded.state, legacyColors.preferences);
   const state = imported.state;
-  if (imported.changed) store.write(state);
-  if (legacyColors.found && state.nodes.some((node) => node.type === "project")) legacyMigration.complete();
+  if (imported.changed && !startedEmpty) store.write(state);
+  if (legacyColors.found && !startedEmpty && state.nodes.some((node) => node.type === "project")) legacyMigration.complete();
 
   const now = typeof dependencies.now === "function" ? dependencies.now : Date.now;
   const readNative = typeof dependencies.readNativeLocalProjects === "function"
@@ -1607,6 +1657,12 @@ function createProjectService(api, dependencies = {}) {
 
   function save(next) {
     store.write(next);
+    // The first persist of an in-memory seeded store also settles the
+    // one-time legacy color import that startup applied but deferred writing.
+    if (startedEmpty && legacyColors.found && imported.changed
+      && next.nodes.some((node) => node.type === "project")) {
+      try { legacyMigration.complete(); } catch {}
+    }
     replaceObject(state, next);
     inventory.clear();
     githubBranchesCache.clear();
