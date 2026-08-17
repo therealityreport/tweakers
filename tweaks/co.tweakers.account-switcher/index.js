@@ -5,6 +5,20 @@ const SERVICE_KEY = "__tweakersAccountServiceV1";
 const HANDLER_KEY = "__tweakersAccountHandlerV1";
 const MAX_AUTH_BYTES = 1024 * 1024;
 const INTENT_TTL_MS = 30_000;
+const PLUGIN_PROFILE_KEY = "remote-plugin-profile-v1";
+const PLUGIN_RECEIPTS_KEY = "remote-plugin-receipts-v1";
+const PLUGIN_PROFILE_SCHEMA_VERSION = 1;
+const PLUGIN_RECEIPT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
+const PLUGIN_PROBE_TIMEOUT_MS = 8_000;
+const PLUGIN_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+// These are stable remote package identifiers returned by Codex's experimental
+// app-server `plugin/installed` reconciliation endpoint. Keep this list free of
+// private/created-by-me plugins: a local account switcher must never assume it
+// can safely provision, copy, or even enumerate another account's private work.
+const DEFAULT_REQUIRED_PLUGINS = Object.freeze([
+  { id: "app-693b20fccbac8191bdc178bb493de3e5@openai-curated-remote", name: "Mailchimp" },
+  { id: "app-6a3c407853888191beddc2151c2b6f8b@openai-curated-remote", name: "Resend" },
+]);
 // Kept inline so the only program, script, and arguments passed to the helper
 // are fixed by this source. The inherited fd 3 is a descriptor for the already
 // opened home root; no filesystem path crosses the process boundary.
@@ -81,6 +95,8 @@ module.exports = {
     validateReferenceName, validateAuthObject, redact, createAccountService,
     stableRef, authPaths, displayLabelFromAuth, syncActiveSnapshot,
     cleanupLegacyAnalytics, accountMenuTargetFromCandidates, startRenderer, disposeRenderer,
+    defaultPluginProfile, normalizePluginProfile, profileHash, evaluatePluginReceipt,
+    makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
   },
 };
 
@@ -98,6 +114,10 @@ function startMain(api) {
     });
     globalThis[HANDLER_KEY] = typeof unregister === "function" ? unregister : true;
   }
+  // Deliberately advisory: startup/update observation consults stored receipts
+  // only. Codex's official inventory call can reconcile the active account's
+  // remote bundle cache, so it is never invoked automatically here.
+  void service.observeStartup();
   api.log.info("Account switcher service ready");
 }
 
@@ -109,28 +129,46 @@ function createAccountService(api, options = {}) {
   let disposed = false;
   let queue = Promise.resolve();
 
-  const enqueueIntent = (message) => {
-    const task = () => executeIntent(deps, paths, refs, intents, message, options, api);
+  const enqueue = (task) => {
     const result = queue.then(task, task);
     queue = result.then(() => undefined, () => undefined);
     return result;
   };
+  const enqueueIntent = (message) => enqueue(() => executeIntent(deps, paths, refs, intents, message, options, api));
   const service = {
     handle(message) {
       if (disposed) return Promise.resolve(safeFailure("unavailable"));
       if (message?.action === "list") return service.list();
-      if (message?.action === "prepare-switch") return service.prepareSwitch(message.ref);
+      if (message?.action === "plugin-protection-status") return service.pluginProtectionStatus();
+      if (message?.action === "plugin-protection-verify-current") return service.verifyCurrentPlugins();
+      if (message?.action === "plugin-protection-configure") return service.configurePluginProtection(message);
+      if (message?.action === "prepare-switch") return service.prepareSwitch(message.ref, false);
+      if (message?.action === "prepare-switch-bypass") return service.prepareSwitch(message.ref, true);
       if (message?.action === "prepare-save") return service.prepareSave(message.name);
       if (message?.action === "switch") return service.switch(message.intent);
       if (message?.action === "save") return service.save(message.intent);
       return Promise.resolve(safeFailure("invalid-request"));
     },
-    list() { return Promise.resolve(listAccounts(deps, paths, refs)); },
-    prepareSwitch(ref) { return Promise.resolve(prepareIntent(deps, paths, refs, intents, "switch", ref)); },
+    async list() { return listAccounts(deps, paths, refs, await pluginProtectionSnapshot(api, deps, paths)); },
+    async pluginProtectionStatus() { return pluginProtectionSnapshot(api, deps, paths); },
+    // Verification may invoke Codex's reconciliation endpoint. Serialize it
+    // with auth-changing operations, then re-check active auth immediately
+    // before receipt persistence so a receipt can never be written for the
+    // account that was active only when the probe began.
+    verifyCurrentPlugins() { return enqueue(() => verifyCurrentPluginReceipt(api, deps, paths, options)); },
+    configurePluginProtection(message) { return enqueue(() => configurePluginProtection(api, message)); },
+    async prepareSwitch(ref, bypass) {
+      return prepareSwitchWithPluginGuard(api, deps, paths, refs, intents, ref, bypass, options);
+    },
     prepareSave(name) { return Promise.resolve(prepareIntent(deps, paths, refs, intents, "save", name)); },
     switch(intent) { return enqueueIntent({ action: "switch", intent }); },
     save(intent) { return enqueueIntent({ action: "save", intent }); },
     dispose() { disposed = true; stopSnapshotSync(); intents.clear(); refs.clear(); },
+    async observeStartup() {
+      const result = await pluginProtectionSnapshot(api, deps, paths);
+      if (!result.active.valid) api.log?.warn?.("remote plugin protection receipt is not current", result.active.code);
+      return { ok: true, pluginProtection: publicPluginProtection(result) };
+    },
   };
 
   // Refresh tokens rotate on every renewal, so a saved snapshot goes stale
@@ -207,7 +245,7 @@ function authAccountId(value) {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-function listAccounts(deps, paths, refs) {
+function listAccounts(deps, paths, refs, protection = null) {
   try {
     refs.clear();
     const accountsDirectoryExists = deps.fs.existsSync(paths.accountsDir);
@@ -235,6 +273,15 @@ function listAccounts(deps, paths, refs) {
             active: current.value === entry.name
               && Boolean(liveAccountId)
               && authAccountId(auth.value) === liveAccountId,
+            pluginProtection: publicReceiptStatus(
+              evaluatePluginReceipt(
+                protection?.receipts?.[authAccountId(auth.value)],
+                protection?.profile,
+                authAccountId(auth.value),
+                protection?.runtimeBinding,
+                deps.now(),
+              ),
+            ),
           }));
           refs.set(opaque, entry.name);
           accounts.push(account);
@@ -245,7 +292,7 @@ function listAccounts(deps, paths, refs) {
     const markerStatus = current.value && !accounts.some((item) => item.active)
       ? (accounts.some((item) => refs.get(item.ref) === current.value) ? "identity-mismatch" : "dangling-reference")
       : current.status;
-    return redact({ ok: true, accounts, markerStatus });
+    return redact({ ok: true, accounts, markerStatus, pluginProtection: publicPluginProtection(protection) });
   } catch {
     return safeFailure("account-list-unavailable");
   }
@@ -279,11 +326,55 @@ function prepareIntent(deps, paths, refs, intents, action, rawValue) {
   }
 }
 
+async function prepareSwitchWithPluginGuard(api, deps, paths, refs, intents, ref, bypass, options) {
+  try {
+    const target = refs.get(ref);
+    if (!target) throw coded("unknown-reference");
+    const targetAccountId = withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, target), (auth) => authAccountId(auth.value));
+    if (!targetAccountId) throw coded("plugin-protection-account-unknown");
+    const protection = await pluginProtectionSnapshot(api, deps, paths);
+    const receipt = evaluatePluginReceipt(
+      protection.receipts[targetAccountId], protection.profile, targetAccountId, protection.runtimeBinding, deps.now(),
+    );
+    if (protection.profile.enforcement && !receipt.valid && !bypass) {
+      return {
+        ok: false,
+        error: { code: "plugin-protection-receipt-required", message: "A current remote plugin receipt is required before switching." },
+        pluginProtection: publicReceiptStatus(receipt),
+      };
+    }
+    // A bypass can only be minted by this fresh target-specific preparation.
+    // It lives inside the single-use, short-lived switch intent and is consumed
+    // before any write is attempted in executeIntent.
+    const prepared = prepareIntent(deps, paths, refs, intents, "switch", ref);
+    if (!prepared.ok) return prepared;
+    const intent = intents.get(prepared.intent);
+    intent.pluginProtection = {
+      accountId: targetAccountId,
+      profileHash: profileHash(protection.profile),
+      bypass: Boolean(bypass && protection.profile.enforcement && !receipt.valid),
+    };
+    return {
+      ...prepared,
+      confirmation: intent.pluginProtection.bypass
+        ? "Switch once without a current plugin receipt? This bypass is only valid for this one switch."
+        : prepared.confirmation,
+      pluginProtection: publicReceiptStatus(receipt),
+    };
+  } catch (error) {
+    return safeFailure(errorCode(error));
+  }
+}
+
 async function executeIntent(deps, paths, refs, intents, message, options = {}, api) {
   const intent = intents.get(message.intent);
   intents.delete(message.intent);
   if (!intent || intent.action !== message.action || intent.expiresAt < deps.now()) return safeFailure("invalid-or-expired-intent");
   try {
+    if (intent.action === "switch") {
+      const guard = await recheckPluginGuard(api, deps, paths, intent, options);
+      if (!guard.ok) return guard;
+    }
     if (intent.action === "switch") switchAccount(deps, paths, intent.target, intent.snapshot);
     else saveCurrent(deps, paths, intent.target);
     refs.clear();
@@ -292,6 +383,335 @@ async function executeIntent(deps, paths, refs, intents, message, options = {}, 
   } catch (error) {
     return safeFailure(errorCode(error));
   }
+}
+
+async function recheckPluginGuard(api, deps, paths, intent) {
+  const bound = intent.pluginProtection;
+  // Intents made before this version, or a profile that remains in observation
+  // mode, retain the pre-existing switch behavior.
+  if (!bound) return { ok: true };
+  const protection = await pluginProtectionSnapshot(api, deps, paths);
+  if (!protection.profile.enforcement) return { ok: true };
+  if (profileHash(protection.profile) !== bound.profileHash) return safeFailure("plugin-protection-profile-changed");
+  if (bound.bypass) return { ok: true, bypassed: true };
+  const receipt = evaluatePluginReceipt(
+    protection.receipts[bound.accountId], protection.profile, bound.accountId, protection.runtimeBinding, deps.now(),
+  );
+  if (!receipt.valid) {
+    return {
+      ok: false,
+      error: { code: "plugin-protection-receipt-required", message: "A current remote plugin receipt is required before switching." },
+      pluginProtection: publicReceiptStatus(receipt),
+    };
+  }
+  return { ok: true };
+}
+
+function defaultPluginProfile() {
+  return {
+    schemaVersion: PLUGIN_PROFILE_SCHEMA_VERSION,
+    requiredBaseline: DEFAULT_REQUIRED_PLUGINS.map((plugin) => ({ id: plugin.id, name: plugin.name })),
+    accountAdditions: {},
+    enforcement: false,
+  };
+}
+
+function normalizePluginProfile(value) {
+  const fallback = defaultPluginProfile();
+  if (!isRecord(value) || value.schemaVersion !== PLUGIN_PROFILE_SCHEMA_VERSION) return fallback;
+  // The profile is deliberately not a way to weaken the global protection
+  // contract. Mailchimp and Resend remain required for every account; account
+  // additions may only add public curated remote plugin IDs.
+  const requiredBaseline = fallback.requiredBaseline;
+  const accountAdditions = {};
+  if (isRecord(value.accountAdditions)) {
+    for (const [accountId, ids] of Object.entries(value.accountAdditions)) {
+      if (!validAccountId(accountId) || !Array.isArray(ids)) continue;
+      const allowed = ids.filter((id) => typeof id === "string" && isPublicRemotePluginId(id));
+      if (allowed.length) accountAdditions[accountId] = [...new Set(allowed)].sort();
+    }
+  }
+  return { schemaVersion: PLUGIN_PROFILE_SCHEMA_VERSION, requiredBaseline, accountAdditions, enforcement: value.enforcement === true };
+}
+
+function validAccountId(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 160
+    && !/[\s@/\\\u0000-\u001f\u007f]/.test(value);
+}
+
+function isPublicRemotePluginId(value) {
+  // A profile may name public remote plugins only. Created-by-me remote IDs are
+  // intentionally not accepted as a target-account prerequisite.
+  return typeof value === "string"
+    && /^app-[a-zA-Z0-9-]+@openai-curated-remote$/.test(value);
+}
+
+function profileHash(profile) {
+  const { createHash } = require("node:crypto");
+  const normalized = normalizePluginProfile(profile);
+  const canonical = {
+    schemaVersion: normalized.schemaVersion,
+    requiredBaseline: normalized.requiredBaseline.map((plugin) => plugin.id).sort(),
+    accountAdditions: Object.fromEntries(Object.entries(normalized.accountAdditions).sort().map(([accountId, ids]) => [accountId, [...ids].sort()])),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function requiredPluginIds(profile, accountId) {
+  const normalized = normalizePluginProfile(profile);
+  const additions = validAccountId(accountId) ? (normalized.accountAdditions[accountId] || []) : [];
+  return [...new Set([...normalized.requiredBaseline.map((plugin) => plugin.id), ...additions])].sort();
+}
+
+function evaluatePluginReceipt(receipt, profile, accountId, runtimeBinding, now = Date.now()) {
+  const required = requiredPluginIds(profile, accountId);
+  if (!validAccountId(accountId)) return { valid: false, code: "account-unknown", required };
+  if (!validRuntimeBinding(runtimeBinding)) return { valid: false, code: "build-unavailable", required };
+  if (!isRecord(receipt) || receipt.schemaVersion !== PLUGIN_PROFILE_SCHEMA_VERSION) return { valid: false, code: "missing", required };
+  if (receipt.accountId !== accountId) return { valid: false, code: "wrong-account", required };
+  if (receipt.profileHash !== profileHash(profile)) return { valid: false, code: "wrong-profile", required };
+  if (receipt.desktopVersion !== runtimeBinding.desktopVersion || receipt.buildFlavor !== runtimeBinding.buildFlavor || receipt.bundledCliVersion !== runtimeBinding.bundledCliVersion) return { valid: false, code: "wrong-build", required };
+  if (!Number.isFinite(receipt.verifiedAt) || receipt.verifiedAt > now || now - receipt.verifiedAt > PLUGIN_RECEIPT_MAX_AGE_MS) return { valid: false, code: "stale", required };
+  const installed = new Map(Array.isArray(receipt.plugins) ? receipt.plugins.map((plugin) => [plugin?.id, plugin]) : []);
+  const missing = required.filter((id) => !installed.get(id)?.installed || !installed.get(id)?.enabled);
+  if (missing.length) return { valid: false, code: "plugins-missing", required, missing };
+  return { valid: true, code: "current", required };
+}
+
+function publicReceiptStatus(status) {
+  return { valid: Boolean(status?.valid), code: status?.code || "missing", required: Array.isArray(status?.required) ? status.required : [], missing: Array.isArray(status?.missing) ? status.missing : [] };
+}
+
+async function readPluginProfile(api) {
+  try { return normalizePluginProfile(await api?.storage?.get?.(PLUGIN_PROFILE_KEY)); } catch { return defaultPluginProfile(); }
+}
+
+async function readPluginReceipts(api) {
+  try {
+    const value = await api?.storage?.get?.(PLUGIN_RECEIPTS_KEY);
+    if (!isRecord(value) || value.schemaVersion !== PLUGIN_PROFILE_SCHEMA_VERSION || !isRecord(value.receipts)) return {};
+    const receipts = {};
+    for (const [accountId, receipt] of Object.entries(value.receipts)) if (validAccountId(accountId) && isRecord(receipt)) receipts[accountId] = receipt;
+    return receipts;
+  } catch { return {}; }
+}
+
+async function pluginProtectionSnapshot(api, deps, paths) {
+  const [profile, receipts] = await Promise.all([readPluginProfile(api), readPluginReceipts(api)]);
+  let accountId = null;
+  try { accountId = withSecureAuth(deps.fs, paths.authFile, (auth) => authAccountId(auth.value)); } catch {}
+  const runtimeBinding = await runtimeCodexBinding(api, deps);
+  return { profile, receipts, accountId, runtimeBinding, active: publicReceiptStatus(evaluatePluginReceipt(receipts[accountId], profile, accountId, runtimeBinding, deps.now())) };
+}
+
+function publicPluginProtection(protection) {
+  if (!protection) return { mode: "observation", baseline: DEFAULT_REQUIRED_PLUGINS.map((plugin) => ({ id: plugin.id, name: plugin.name })), active: { valid: false, code: "unavailable", required: [] } };
+  return {
+    mode: protection.profile.enforcement ? "enforcement" : "observation",
+    baseline: protection.profile.requiredBaseline.map((plugin) => ({ id: plugin.id, name: plugin.name })),
+    active: protection.active,
+    desktopVersion: protection.runtimeBinding?.desktopVersion || null,
+    bundledCliVersion: protection.runtimeBinding?.bundledCliVersion || null,
+  };
+}
+
+async function configurePluginProtection(api, message) {
+  if (typeof message?.enforcement !== "boolean") return safeFailure("invalid-plugin-protection-config");
+  const profile = await readPluginProfile(api);
+  const next = { ...profile, enforcement: message.enforcement };
+  try {
+    if (typeof api?.storage?.set !== "function") throw new Error("storage unavailable");
+    await api.storage.set(PLUGIN_PROFILE_KEY, next);
+    await api.storage.flush?.();
+    return { ok: true, pluginProtection: publicPluginProtection({ profile: next, receipts: {}, accountId: null, runtimeBinding: null, active: { valid: false, code: "missing", required: [] } }) };
+  } catch { return safeFailure("plugin-protection-storage-unavailable"); }
+}
+
+async function verifyCurrentPluginReceipt(api, deps, paths, options = {}) {
+  let active;
+  try {
+    active = withSecureAuth(deps.fs, paths.authFile, (auth) => ({ accountId: authAccountId(auth.value), hash: auth.hash, identity: auth.identity }));
+  } catch { return safeFailure("plugin-protection-account-unknown"); }
+  const accountId = active.accountId;
+  if (!validAccountId(accountId)) return safeFailure("plugin-protection-account-unknown");
+  const profile = await readPluginProfile(api);
+  const runtimeBinding = await runtimeCodexBinding(api, deps);
+  if (!validRuntimeBinding(runtimeBinding)) return safeFailure("plugin-protection-build-unavailable");
+  let plugins;
+  try { plugins = await (options.inventory || ((probeDeps) => readOfficialPluginInventory(api, probeDeps, runtimeBinding)))(deps); } catch { return safeFailure("plugin-protection-inventory-unavailable"); }
+  const inventory = validateOfficialInventory(plugins, requiredPluginIds(profile, accountId));
+  if (!inventory.valid) {
+    return { ok: false, error: { code: "plugin-protection-verification-incomplete", message: "The current account did not prove one unambiguous installed and enabled row for each required remote plugin." }, pluginProtection: { valid: false, code: inventory.code, required: requiredPluginIds(profile, accountId), missing: inventory.missing } };
+  }
+  const receipt = makePluginReceipt(profile, accountId, runtimeBinding, plugins, deps.now());
+  const status = evaluatePluginReceipt(receipt, profile, accountId, runtimeBinding, deps.now());
+  // Missing or incomplete remote rows are not proof. Preserve any last known
+  // good receipt rather than laundering a degraded inventory into freshness.
+  if (!status.valid) {
+    return { ok: false, error: { code: "plugin-protection-verification-incomplete", message: "The current account did not prove all required remote plugins are installed and enabled." }, pluginProtection: publicReceiptStatus(status) };
+  }
+  try {
+    if (typeof api?.storage?.get !== "function" || typeof api?.storage?.set !== "function") throw new Error("storage unavailable");
+    const latestProfile = await readPluginProfile(api);
+    if (profileHash(latestProfile) !== profileHash(profile)) return safeFailure("plugin-protection-profile-changed");
+    const receipts = await readPluginReceipts(api);
+    // This is intentionally the final operation before persistence. A manual
+    // login/token rotation while Codex reconciles plugins leaves no new receipt
+    // behind for the earlier snapshot.
+    const current = withSecureAuth(deps.fs, paths.authFile, (auth) => ({ accountId: authAccountId(auth.value), hash: auth.hash, identity: auth.identity }));
+    if (current.accountId !== active.accountId || current.hash !== active.hash || current.identity !== active.identity) {
+      return safeFailure("plugin-protection-account-changed");
+    }
+    receipts[accountId] = receipt;
+    await api.storage.set(PLUGIN_RECEIPTS_KEY, { schemaVersion: PLUGIN_PROFILE_SCHEMA_VERSION, receipts });
+    await api.storage.flush?.();
+    return { ok: true, pluginProtection: publicReceiptStatus(status) };
+  } catch { return safeFailure("plugin-protection-storage-unavailable"); }
+}
+
+function makePluginReceipt(profile, accountId, runtimeBinding, plugins, verifiedAt = Date.now()) {
+  const inventory = new Map(inventoryPlugins(plugins).map((plugin) => [plugin.id, plugin]));
+  const required = requiredPluginIds(profile, accountId);
+  return {
+    schemaVersion: PLUGIN_PROFILE_SCHEMA_VERSION,
+    accountId,
+    profileHash: profileHash(profile),
+    desktopVersion: runtimeBinding?.desktopVersion || null,
+    buildFlavor: runtimeBinding?.buildFlavor || null,
+    bundledCliVersion: runtimeBinding?.bundledCliVersion || null,
+    verifiedAt,
+    plugins: required.map((id) => {
+      const plugin = inventory.get(id);
+      return { id, installed: plugin?.installed === true, enabled: plugin?.enabled === true, version: typeof plugin?.version === "string" ? plugin.version.slice(0, 100) : null };
+    }),
+  };
+}
+
+function inventoryPlugins(response) {
+  const marketplaces = Array.isArray(response?.marketplaces) ? response.marketplaces : [];
+  const plugins = [];
+  for (const marketplace of marketplaces) {
+    const marketplaceName = typeof marketplace?.name === "string" ? marketplace.name : marketplace?.id;
+    if (marketplaceName !== "openai-curated-remote") continue;
+    for (const plugin of Array.isArray(marketplace?.plugins) ? marketplace.plugins : []) {
+      if (!isRecord(plugin)) continue;
+      const sourceType = typeof plugin?.source?.type === "string" ? plugin.source.type : "";
+      if (sourceType !== "remote") continue;
+      const id = typeof plugin.id === "string" && plugin.id.endsWith(`@${marketplaceName}`)
+        ? plugin.id
+        : null;
+      if (typeof id !== "string") continue;
+      if (!isPublicRemotePluginId(id)) continue;
+      plugins.push({
+        id,
+        installed: plugin.installed,
+        enabled: plugin.enabled,
+        version: typeof plugin.version === "string" ? plugin.version : (typeof plugin.localVersion === "string" ? plugin.localVersion : null),
+      });
+    }
+  }
+  return plugins;
+}
+
+function validateOfficialInventory(response, requiredIds) {
+  if (!isRecord(response) || !Array.isArray(response.marketplaces) || !Array.isArray(response.marketplaceLoadErrors) || response.marketplaceLoadErrors.length !== 0) {
+    return { valid: false, code: "inventory-incomplete", missing: requiredIds };
+  }
+  const rows = inventoryPlugins(response);
+  const missing = [];
+  for (const id of requiredIds) {
+    const matches = rows.filter((plugin) => plugin.id === id);
+    if (matches.length !== 1 || matches[0].installed !== true || matches[0].enabled !== true) missing.push(id);
+  }
+  return missing.length ? { valid: false, code: "inventory-incomplete", missing } : { valid: true, code: "current", missing: [] };
+}
+
+function validRuntimeBinding(value) {
+  return isRecord(value)
+    && typeof value.desktopVersion === "string" && value.desktopVersion.length > 0
+    && typeof value.buildFlavor === "string" && value.buildFlavor.length > 0
+    && typeof value.bundledCliVersion === "string" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value.bundledCliVersion)
+    && typeof value.executable === "string" && value.executable.length > 0;
+}
+
+function bundledCliVersion(deps, executable) {
+  try {
+    const injected = deps?.probeBundledCliVersion?.(executable);
+    if (typeof injected === "string" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(injected)) return injected;
+    const probe = deps.spawnSync?.(executable, ["--version"], { encoding: "utf8", timeout: 2_000, shell: false, windowsHide: true });
+    const text = `${probe?.stdout || ""}\n${probe?.stderr || ""}`;
+    return text.match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/)?.[1] || null;
+  } catch { return null; }
+}
+
+async function runtimeCodexBinding(api, deps) {
+  let info;
+  try { info = await api?.codex?.runtime?.getInfo?.(); } catch { return null; }
+  const desktopVersion = typeof info?.codexVersion === "string" ? info.codexVersion.trim() : "";
+  const buildFlavor = typeof info?.buildFlavor === "string" ? info.buildFlavor.trim() : "";
+  const resourcesPath = typeof info?.resourcesPath === "string" ? info.resourcesPath.trim() : "";
+  if (!desktopVersion || !buildFlavor || !resourcesPath) return null;
+  const root = deps.path.resolve(resourcesPath);
+  const executable = deps.path.resolve(root, "codex");
+  if (deps.path.dirname(executable) !== root) return null;
+  try { if (!deps.fs.statSync(executable).isFile()) return null; } catch { return null; }
+  const cliVersion = bundledCliVersion(deps, executable);
+  if (!cliVersion) return null;
+  return { desktopVersion, buildFlavor, bundledCliVersion: cliVersion, executable };
+}
+
+async function readOfficialPluginInventory(api, deps, binding) {
+  const executable = binding?.executable;
+  if (!validRuntimeBinding(binding) || !executable || typeof deps?.spawn !== "function") return Promise.reject(coded("plugin-protection-inventory-unavailable"));
+  return new Promise((resolve, reject) => {
+    let child;
+    let settled = false;
+    let output = "";
+    let initialized = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child?.kill?.("SIGKILL"); } catch {}
+      if (error) reject(coded("plugin-protection-inventory-unavailable"));
+      else resolve(value);
+    };
+    const send = (message) => {
+      try { child.stdin.write(`${JSON.stringify(message)}\n`); } catch { finish(new Error("write failed")); }
+    };
+    const consume = (chunk) => {
+      output += String(chunk);
+      if (Buffer.byteLength(output, "utf8") > PLUGIN_PROBE_MAX_OUTPUT_BYTES) return finish(new Error("output limit"));
+      const lines = output.split("\n");
+      output = lines.pop();
+      for (const line of lines) {
+        let message;
+        try { message = JSON.parse(line); } catch { continue; }
+        if (message?.id === 1 && message?.result && !initialized) {
+          initialized = true;
+          send({ jsonrpc: "2.0", method: "initialized", params: {} });
+          send({ jsonrpc: "2.0", id: 2, method: "plugin/installed", params: { cwds: [], installSuggestionPluginNames: [] } });
+        } else if (message?.id === 2 && message?.result) {
+          finish(null, message.result);
+        } else if (message?.id === 2 && message?.error) {
+          finish(new Error("inventory error"));
+        }
+      }
+    };
+    const timer = setTimeout(() => finish(new Error("timeout")), PLUGIN_PROBE_TIMEOUT_MS);
+    try {
+      child = deps.spawn(executable, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], shell: false, windowsHide: true });
+      child.on("error", () => finish(new Error("spawn failed")));
+      child.on("exit", () => { if (!settled) finish(new Error("exited")); });
+      child.stdout?.on("data", consume);
+      send({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { clientInfo: { name: "tweakers-account-switcher", version: "0.1.10" }, capabilities: { experimentalApi: true } },
+      });
+    } catch { finish(new Error("spawn failed")); }
+  });
 }
 
 function scheduleHostRestart(api) {
@@ -654,14 +1074,14 @@ function validLabel(value) {
 
 function nodeDeps() {
   const { randomUUID } = require("node:crypto");
-  const { spawnSync } = require("node:child_process");
+  const { spawn, spawnSync } = require("node:child_process");
   return {
     fs: require("node:fs"),
     path: require("node:path"),
     homedir: require("node:os").homedir,
     codexHome: typeof process !== "undefined" ? (process.env.CODEX_HOME || null) : null,
     getuid: typeof process !== "undefined" && typeof process.getuid === "function" ? () => process.getuid() : null,
-    spawnSync,
+    spawn, spawnSync,
     randomUUID,
     now: Date.now,
   };
@@ -700,6 +1120,7 @@ function renderAccountsPage(state, root) {
     if (disposed) return;
     root.replaceChildren();
     if (!response?.ok) { root.textContent = "Accounts are unavailable."; return; }
+    state.pluginProtectionMode = response.pluginProtection?.mode || "observation";
     const card = document.createElement("div");
     card.className = "border-token-border divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border";
     for (const account of response.accounts) {
@@ -707,7 +1128,7 @@ function renderAccountsPage(state, root) {
       row.className = "flex items-center justify-between gap-4 p-3";
       const copy = document.createElement("div");
       copy.className = "min-w-0";
-      copy.innerHTML = `<div class="truncate text-sm text-token-text-primary"></div><div class="text-sm text-token-text-secondary">${account.active ? "Current account" : "Saved account"}</div>`;
+      copy.innerHTML = `<div class="truncate text-sm text-token-text-primary"></div><div class="text-sm text-token-text-secondary">${account.active ? "Current account" : "Saved account"}${account.pluginProtection ? ` · Plugin receipt: ${pluginStatusLabel(account.pluginProtection)}` : ""}</div>`;
       copy.firstElementChild.textContent = account.label;
       row.append(copy, accountButton(state, account));
       card.append(row);
@@ -717,6 +1138,7 @@ function renderAccountsPage(state, root) {
     status.className = "rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
     status.textContent = response.accounts.some((account) => account.active) ? "Ready. The current account is marked below." : "No saved account matches the current session.";
     state.statusElement = status;
+    const protection = pluginProtectionCard(state, response.pluginProtection);
     const save = document.createElement("button");
     save.type = "button";
     save.className = "self-start rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
@@ -726,9 +1148,72 @@ function renderAccountsPage(state, root) {
       const saved = await saveCurrentFromMenu(state);
       if (!disposed) status.textContent = saved ? "Current account saved. Reopen this page to refresh the list." : "Save cancelled or unavailable; no success was recorded.";
     });
+    root.append(protection);
     root.append(status, save, card);
   }).catch(() => { if (!disposed) root.textContent = "Accounts are unavailable."; });
   return () => { disposed = true; root.replaceChildren(); };
+}
+
+function pluginProtectionCard(state, protection) {
+  const info = protection || { mode: "observation", baseline: DEFAULT_REQUIRED_PLUGINS, active: { valid: false, code: "unavailable" } };
+  const card = document.createElement("div");
+  card.className = "border-token-border mb-3 flex flex-col divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border";
+  const summary = document.createElement("div");
+  summary.className = "flex flex-col gap-1 p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Remote plugin protection";
+  const description = document.createElement("div");
+  description.className = "text-sm text-token-text-secondary";
+  const names = (info.baseline || []).map((plugin) => plugin.name || plugin.id).join(", ");
+  description.textContent = `Required baseline: ${names || "None"}. Current receipt: ${pluginStatusLabel(info.active)}.`;
+  summary.append(title, description);
+  const actions = document.createElement("div");
+  actions.className = "flex flex-wrap items-center justify-between gap-3 p-3";
+  const note = document.createElement("div");
+  note.className = "max-w-xl text-sm text-token-text-secondary";
+  note.textContent = info.mode === "enforcement"
+    ? "Enforcement blocks switches to accounts without a current receipt."
+    : "Observation mode shows receipt status and warns before switching, but does not block it.";
+  const controls = document.createElement("div");
+  controls.className = "flex items-center gap-2";
+  const verify = document.createElement("button");
+  verify.type = "button";
+  verify.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
+  verify.textContent = "Reconcile & Verify";
+  verify.title = "Codex will reconcile the current account's remote plugin bundles. It may add or remove locally cached bundles; it does not change server-installed plugins or OAuth connections.";
+  verify.addEventListener("click", async () => {
+    if (!window.confirm("Reconcile and verify the current account’s remote plugins? Codex may add or remove locally cached remote bundles for this account. This does not change the server-installed profile or OAuth connections.")) return;
+    if (state.statusElement) state.statusElement.textContent = "Verifying the current account’s remote plugin inventory…";
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "plugin-protection-verify-current" });
+      if (state.statusElement) state.statusElement.textContent = result?.ok
+        ? "Current account receipt verified. Reopen this page to refresh status."
+        : "Verification did not prove the required remote plugins; no receipt was refreshed.";
+    } catch { if (state.statusElement) state.statusElement.textContent = "Verification was unavailable; no receipt was refreshed."; }
+  });
+  const mode = document.createElement("button");
+  mode.type = "button";
+  mode.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
+  mode.textContent = info.mode === "enforcement" ? "Use Observation" : "Enable Enforcement";
+  mode.addEventListener("click", async () => {
+    const enabling = info.mode !== "enforcement";
+    if (enabling && !window.confirm("Enable enforcement? A target account without a current plugin receipt will be blocked, but you can explicitly bypass one switch.")) return;
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "plugin-protection-configure", enforcement: enabling });
+      if (state.statusElement) state.statusElement.textContent = result?.ok ? "Protection setting saved. Reopen this page to refresh status." : "Protection setting could not be saved.";
+    } catch { if (state.statusElement) state.statusElement.textContent = "Protection setting could not be saved."; }
+  });
+  controls.append(verify, mode);
+  actions.append(note, controls);
+  card.append(summary, actions);
+  return card;
+}
+
+function pluginStatusLabel(status) {
+  if (status?.valid) return "current";
+  const code = status?.code || "unavailable";
+  return code.replace(/-/g, " ");
 }
 
 async function injectAccountMenus(state) {
@@ -743,6 +1228,7 @@ async function injectAccountMenus(state) {
     response = await state.api.ipc.invoke(IPC, { action: "list" });
   } catch { return; }
   if (!response?.ok || state.disposed) return;
+  state.pluginProtectionMode = response.pluginProtection?.mode || "observation";
   const currentTarget = accountMenuTargetFromCandidates(state.accountMenus || []);
   if (currentTarget !== targetMenu) {
     cleanupAccountSwitcherPanels(currentTarget);
@@ -772,9 +1258,27 @@ function accountButton(state, account) {
   button.disabled = account.active;
   button.addEventListener("click", async () => {
     try {
+      if (state.pluginProtectionMode === "observation" && account.pluginProtection && !account.pluginProtection.valid) {
+        const proceed = window.confirm(`This saved account has no current remote-plugin receipt (${pluginStatusLabel(account.pluginProtection)}). Switch anyway? Observation mode will not block this switch.`);
+        if (!proceed) return;
+      }
       if (state.statusElement) state.statusElement.textContent = `Preparing to switch to ${account.label}…`;
       const prepared = await state.api.ipc.invoke(IPC, { action: "prepare-switch", ref: account.ref });
-      if (!prepared?.ok) { alertFailure(state, "The account could not be switched safely.", prepared); return; }
+      if (!prepared?.ok) {
+        if (prepared?.error?.code === "plugin-protection-receipt-required") {
+          const bypass = window.confirm("This account does not have a current plugin receipt. Switch once anyway? This bypass is only for this one confirmed switch.");
+          if (!bypass) return;
+          const bypassPrepared = await state.api.ipc.invoke(IPC, { action: "prepare-switch-bypass", ref: account.ref });
+          if (!bypassPrepared?.ok) { alertFailure(state, "The account could not be switched safely.", bypassPrepared); return; }
+          if (!window.confirm(bypassPrepared.confirmation)) return;
+          const bypassResult = await state.api.ipc.invoke(IPC, { action: "switch", intent: bypassPrepared.intent });
+          if (!bypassResult?.ok) { alertFailure(state, "The account could not be switched safely.", bypassResult); return; }
+          if (state.statusElement) state.statusElement.textContent = `Switching to ${account.label}; ChatGPT will restart to finish.`;
+          if (!bypassResult.restartScheduled) window.alert("The account was changed. Restart ChatGPT to finish switching.");
+          return;
+        }
+        alertFailure(state, "The account could not be switched safely.", prepared); return;
+      }
       if (!window.confirm(prepared.confirmation)) return;
       const result = await state.api.ipc.invoke(IPC, { action: "switch", intent: prepared.intent });
       if (result?.ok) {

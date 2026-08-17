@@ -13,6 +13,11 @@ const PROJECT_COLOR_MENU_ATTR = "data-tweaker-project-color-menu";
 const PROJECT_COLOR_STYLE_ID = "tweaker-project-colors";
 const PROJECT_COLOR_DISPOSE = Symbol("projectColorDispose");
 
+function isRemoveProjectMenuItem(item) {
+  const label = String(item?.textContent || "").replace(/\s+/g, " ").trim();
+  return /^(?:remove|delete)(?: (?:local )?project)?$/i.test(label) || /^remove from\b/i.test(label);
+}
+
 function injectProjectColorMenu(doc, nativeMenu, context, onSelect) {
   if (!doc?.createElement || !nativeMenu || nativeMenu.querySelector?.(`[${PROJECT_COLOR_MENU_ATTR}="trigger"]`)) return null;
   const nativeItems = [...new Set([
@@ -20,7 +25,7 @@ function injectProjectColorMenu(doc, nativeMenu, context, onSelect) {
     ...(nativeMenu.querySelectorAll?.("button") || []),
     ...(nativeMenu.querySelectorAll?.("[data-radix-collection-item]") || []),
   ])];
-  const removeItem = nativeItems.find((item) => /^remove$/i.test(String(item.textContent || "").trim())) || null;
+  const removeItem = nativeItems.find(isRemoveProjectMenuItem) || null;
   const template = nativeItems[0];
   const trigger = doc.createElement("div");
   trigger.setAttribute("role", "menuitem");
@@ -278,7 +283,7 @@ function findNativeProjectMenu(doc, context = {}) {
   const menus = [...(doc?.querySelectorAll?.('[role="menu"]') || [])]
     .filter((menu) => menu.getAttribute?.("data-state") === "open" && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR))
     .filter((menu) => [...(menu.querySelectorAll?.('[role="menuitem"]') || [])]
-      .some((item) => /^(?:remove|delete)$|remove from/i.test(String(item.textContent || "").trim())))
+      .some(isRemoveProjectMenuItem))
     .map((menu) => ({ menu, rect: menu.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0);
   const x = Number.isFinite(context.x) ? context.x : 0;

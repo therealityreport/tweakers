@@ -79,14 +79,14 @@ test("legacy UI Improvements color preferences import by normalized project name
   assert.equal(result.state.nodes[0].overlayIntensity, "strong");
 });
 
-test("native project menu receives one working Project color item before Remove", () => {
+test("current native project menu receives one working Project color item before Remove local project", () => {
   const document = new FakeDocument();
   document.defaultView = { innerHeight: 800, innerWidth: 400 };
   const menu = document.createElement("div");
   menu.setAttribute("role", "menu");
   const remove = document.createElement("div");
   remove.setAttribute("role", "menuitem");
-  remove.textContent = "Remove";
+  remove.textContent = "Remove local project";
   menu.appendChild(remove);
   const selections = [];
   const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
@@ -301,7 +301,7 @@ test("native menu targeting chooses the nearest visible open project menu", () =
     menu.rect = { left, top, right: left + width, bottom: top + height, width, height };
     const remove = document.createElement("div");
     remove.setAttribute("role", "menuitem");
-    remove.textContent = "Remove";
+    remove.textContent = "Remove local project";
     menu.appendChild(remove);
     document.body.appendChild(menu);
     return menu;

@@ -27,7 +27,10 @@ function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tweakers-account-"));
   const codexDir = path.join(root, ".codex");
   const accountsDir = path.join(codexDir, "auth_accounts");
+  const resourcesPath = path.join(root, "runtime-resources");
   fs.mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(resourcesPath, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(resourcesPath, "codex"), "test executable", { mode: 0o700 });
   if (!options.withoutAccountsDirectory) fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
   const paths = {
     codexDir,
@@ -49,10 +52,19 @@ function fixture(options = {}) {
     spawnSync: options.spawnSync || spawnSync,
     randomUUID: crypto.randomUUID,
     now: options.now || Date.now,
+    probeBundledCliVersion: options.probeBundledCliVersion || (() => "0.148.0-alpha.9"),
   };
   const log = options.log || { info() {}, warn() {} };
-  const service = _test.createAccountService({ log }, { deps, paths, onSwitched: options.onSwitched });
-  return { root, paths, service, deps, log };
+  const store = options.store || new Map();
+  const storage = {
+    async get(key) { return store.get(key); },
+    async set(key, value) { store.set(key, value); },
+    async flush() {},
+  };
+  const runtimeInfo = options.runtimeInfo || { codexVersion: "26.810.52044", buildFlavor: "prod", resourcesPath };
+  const api = { log, storage, codex: { runtime: { async getInfo() { return runtimeInfo; } } } };
+  const service = _test.createAccountService(api, { deps, paths, onSwitched: options.onSwitched, inventory: options.inventory });
+  return { root, paths, service, deps, log, store, storage, api };
 }
 
 function disposeFixture(t, setup) {
@@ -60,6 +72,32 @@ function disposeFixture(t, setup) {
     setup.service?.dispose?.();
     fs.rmSync(setup.root, { recursive: true, force: true });
   });
+}
+
+function requiredInventory(overrides = {}) {
+  return {
+    marketplaceLoadErrors: [],
+    marketplaces: [{
+      name: "openai-curated-remote",
+      plugins: [
+        {
+          id: "app-693b20fccbac8191bdc178bb493de3e5@openai-curated-remote",
+          remotePluginId: "plugin_mailchimp_different_internal_id",
+          source: { type: "remote" }, installed: true, enabled: true, version: "6.0.0",
+        },
+        {
+          id: "app-6a3c407853888191beddc2151c2b6f8b@openai-curated-remote",
+          remotePluginId: "plugin_resend_different_internal_id",
+          source: { type: "remote" }, installed: true, enabled: true, version: "2.0.0",
+        },
+      ],
+    }],
+    ...overrides,
+  };
+}
+
+function testRuntimeBinding(overrides = {}) {
+  return { desktopVersion: "26.810.52044", buildFlavor: "prod", bundledCliVersion: "0.148.0-alpha.9", executable: "/runtime/codex", ...overrides };
 }
 
 test("list is redacted, side-effect-free, and reports a dangling marker", async (t) => {
@@ -79,7 +117,10 @@ test("first use lists an absent snapshot directory as empty and saves safely", a
   disposeFixture(t, setup);
 
   const listed = await setup.service.handle({ action: "list" });
-  assert.deepEqual(listed, { ok: true, accounts: [], markerStatus: "dangling-reference" });
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.accounts, []);
+  assert.equal(listed.markerStatus, "dangling-reference");
+  assert.equal(listed.pluginProtection.mode, "observation");
   assert.equal(fs.existsSync(setup.paths.accountsDir), false, "listing must not create state");
 
   const prepared = await setup.service.handle({ action: "prepare-save", name: "first-use" });
@@ -349,10 +390,207 @@ test("account metadata declares the settings surface and has a synchronized patc
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.1.9");
+  assert.equal(manifest.version, "0.1.10");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
+});
+
+test("experimental inventory maps package IDs and excludes created-by-me plugins", () => {
+  const response = requiredInventory({
+    marketplaces: [
+      ...requiredInventory().marketplaces,
+      { name: "created-by-me-remote", plugins: [{ id: "app-private@created-by-me-remote", source: { type: "remote" }, installed: true, enabled: true }] },
+    ],
+  });
+  const plugins = _test.inventoryPlugins(response);
+  assert.deepEqual(plugins.map((plugin) => plugin.id).sort(), [
+    "app-693b20fccbac8191bdc178bb493de3e5@openai-curated-remote",
+    "app-6a3c407853888191beddc2151c2b6f8b@openai-curated-remote",
+  ]);
+});
+
+test("plugin receipt validity rejects missing, stale, wrong-account, wrong-profile, and wrong-build records", () => {
+  const profile = _test.defaultPluginProfile();
+  const binding = testRuntimeBinding();
+  const receipt = _test.makePluginReceipt(profile, "account-work", binding, requiredInventory(), 10_000);
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "account-work", binding, 10_001).valid, true);
+  assert.equal(_test.evaluatePluginReceipt(null, profile, "account-work", binding, 10_001).code, "missing");
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "other-account", binding, 10_001).code, "wrong-account");
+  assert.equal(_test.evaluatePluginReceipt(receipt, { ...profile, accountAdditions: { "account-work": ["app-extra@openai-curated-remote"] } }, "account-work", binding, 10_001).code, "wrong-profile");
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "account-work", testRuntimeBinding({ desktopVersion: "26.810.52045" }), 10_001).code, "wrong-build");
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "account-work", testRuntimeBinding({ bundledCliVersion: "0.149.0" }), 10_001).code, "wrong-build");
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "account-work", binding, 10_000 + 31 * 24 * 60 * 60 * 1_000).code, "stale");
+  assert.equal(_test.evaluatePluginReceipt(receipt, profile, "account-work", null, 10_001).code, "build-unavailable");
+});
+
+test("profile retains both mandatory baseline plugins and rejects email-like account keys", () => {
+  const profile = _test.normalizePluginProfile({
+    schemaVersion: 1,
+    requiredBaseline: [{ id: "app-693b20fccbac8191bdc178bb493de3e5@openai-curated-remote", name: "Mailchimp" }],
+    accountAdditions: { "person@example.com": ["app-extra@openai-curated-remote"], "account-ok": ["app-extra@openai-curated-remote"] },
+    enforcement: true,
+  });
+  assert.deepEqual(profile.requiredBaseline.map((plugin) => plugin.name), ["Mailchimp", "Resend"]);
+  assert.equal(Object.hasOwn(profile.accountAdditions, "person@example.com"), false);
+  assert.deepEqual(profile.accountAdditions["account-ok"], ["app-extra@openai-curated-remote"]);
+});
+
+test("runtime binding combines the desktop build with the exact bundled CLI version", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const binding = await _test.runtimeCodexBinding(setup.api, setup.deps);
+  assert.equal(binding.desktopVersion, "26.810.52044");
+  assert.equal(binding.buildFlavor, "prod");
+  assert.equal(binding.bundledCliVersion, "0.148.0-alpha.9");
+  assert.match(binding.executable, /runtime-resources\/codex$/);
+});
+
+test("verification writes only non-secret positive proof for the current active account", async (t) => {
+  const setup = fixture({ inventory: async () => requiredInventory() });
+  disposeFixture(t, setup);
+  const result = await setup.service.handle({ action: "plugin-protection-verify-current" });
+  assert.equal(result.ok, true);
+  const saved = setup.store.get("remote-plugin-receipts-v1");
+  const receipt = saved.receipts["account-current"];
+  assert.equal(receipt.accountId, "account-current");
+  assert.equal(receipt.plugins.length, 2);
+  assert.equal(JSON.stringify(saved).includes("access_token"), false);
+  assert.equal(JSON.stringify(saved).includes("refresh-current"), false);
+  assert.equal(JSON.stringify(saved).includes("id-current"), false);
+});
+
+test("incomplete inventory never refreshes a receipt and observation mode keeps switching available", async (t) => {
+  const setup = fixture({ inventory: async () => requiredInventory({ marketplaces: [{ name: "openai-curated-remote", plugins: [] }] }) });
+  disposeFixture(t, setup);
+  const verified = await setup.service.handle({ action: "plugin-protection-verify-current" });
+  assert.equal(verified.ok, false);
+  assert.equal(verified.error.code, "plugin-protection-verification-incomplete");
+  assert.equal(setup.store.has("remote-plugin-receipts-v1"), false);
+  const list = await setup.service.handle({ action: "list" });
+  const prepared = await setup.service.handle({ action: "prepare-switch", ref: list.accounts[0].ref });
+  assert.equal(prepared.ok, true);
+});
+
+test("marketplace errors and duplicate required rows never mint a receipt", async (t) => {
+  const base = requiredInventory();
+  for (const response of [
+    requiredInventory({ marketplaceLoadErrors: [{ marketplace: "openai-curated-remote", message: "unavailable" }] }),
+    requiredInventory({ marketplaces: [{ ...base.marketplaces[0], plugins: [...base.marketplaces[0].plugins, base.marketplaces[0].plugins[0]] }] }),
+  ]) {
+    const setup = fixture({ inventory: async () => response });
+    disposeFixture(t, setup);
+    const result = await setup.service.handle({ action: "plugin-protection-verify-current" });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "plugin-protection-verification-incomplete");
+    assert.equal(setup.store.has("remote-plugin-receipts-v1"), false);
+  }
+});
+
+test("a malformed package ID cannot fall back to remotePluginId and mint a receipt", async (t) => {
+  const malformed = requiredInventory();
+  malformed.marketplaces[0].plugins[0] = {
+    ...malformed.marketplaces[0].plugins[0],
+    id: "app-malformed@openai-curated-remote",
+    remotePluginId: "app-693b20fccbac8191bdc178bb493de3e5",
+  };
+  const setup = fixture({ inventory: async () => malformed });
+  disposeFixture(t, setup);
+  const result = await setup.service.handle({ action: "plugin-protection-verify-current" });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "plugin-protection-verification-incomplete");
+  assert.equal(setup.store.has("remote-plugin-receipts-v1"), false);
+});
+
+test("enforcement blocks before auth mutation, while fresh single-use bypass allows exactly one switch", async (t) => {
+  let restarts = 0;
+  const setup = fixture({ onSwitched: () => { restarts += 1; return true; } });
+  disposeFixture(t, setup);
+  assert.equal((await setup.service.handle({ action: "plugin-protection-configure", enforcement: true })).ok, true);
+  const list = await setup.service.handle({ action: "list" });
+  const before = fs.readFileSync(setup.paths.authFile);
+  const blocked = await setup.service.handle({ action: "prepare-switch", ref: list.accounts[0].ref });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error.code, "plugin-protection-receipt-required");
+  assert.deepEqual(fs.readFileSync(setup.paths.authFile), before);
+  assert.equal(restarts, 0);
+
+  const bypass = await setup.service.handle({ action: "prepare-switch-bypass", ref: list.accounts[0].ref });
+  assert.equal(bypass.ok, true);
+  const switched = await setup.service.handle({ action: "switch", intent: bypass.intent });
+  assert.equal(switched.ok, true);
+  assert.equal(restarts, 1);
+  const reused = await setup.service.handle({ action: "switch", intent: bypass.intent });
+  assert.equal(reused.ok, false);
+  assert.equal(reused.error.code, "invalid-or-expired-intent");
+});
+
+test("a valid target receipt preserves enforcement switching without a bypass", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const profile = _test.defaultPluginProfile();
+  setup.store.set("remote-plugin-receipts-v1", {
+    schemaVersion: 1,
+    receipts: { "account-work": _test.makePluginReceipt(profile, "account-work", testRuntimeBinding(), requiredInventory(), Date.now()) },
+  });
+  assert.equal((await setup.service.handle({ action: "plugin-protection-configure", enforcement: true })).ok, true);
+  const list = await setup.service.handle({ action: "list" });
+  const prepared = await setup.service.handle({ action: "prepare-switch", ref: list.accounts[0].ref });
+  assert.equal(prepared.ok, true);
+  const result = await setup.service.handle({ action: "switch", intent: prepared.intent });
+  assert.equal(result.ok, true);
+});
+
+test("startup observation uses stored receipt status and never invokes inventory or schedules restart", async (t) => {
+  let inventoryCalls = 0;
+  let restarts = 0;
+  const setup = fixture({ inventory: async () => { inventoryCalls += 1; return requiredInventory(); }, onSwitched: () => { restarts += 1; return true; } });
+  disposeFixture(t, setup);
+  const result = await setup.service.observeStartup();
+  assert.equal(result.ok, true);
+  assert.equal(inventoryCalls, 0);
+  assert.equal(restarts, 0);
+});
+
+test("verification rechecks the exact active auth snapshot before storing a receipt", async (t) => {
+  let setup;
+  setup = fixture({
+    inventory: async () => {
+      fs.writeFileSync(setup.paths.authFile, auth("rotated", "account-current"), { mode: 0o600 });
+      return requiredInventory();
+    },
+  });
+  disposeFixture(t, setup);
+  const result = await setup.service.handle({ action: "plugin-protection-verify-current" });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "plugin-protection-account-changed");
+  assert.equal(setup.store.has("remote-plugin-receipts-v1"), false);
+});
+
+test("verification is serialized ahead of a queued switch, so its receipt binds the account it reconciled", async (t) => {
+  let releaseInventory;
+  const setup = fixture({ inventory: () => new Promise((resolve) => { releaseInventory = resolve; }) });
+  disposeFixture(t, setup);
+  const list = await setup.service.handle({ action: "list" });
+  const prepared = await setup.service.handle({ action: "prepare-switch", ref: list.accounts[0].ref });
+  const verifying = setup.service.handle({ action: "plugin-protection-verify-current" });
+  const switching = setup.service.handle({ action: "switch", intent: prepared.intent });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof releaseInventory, "function");
+  releaseInventory(requiredInventory());
+  assert.equal((await verifying).ok, true);
+  assert.equal((await switching).ok, true);
+  assert.equal(setup.store.get("remote-plugin-receipts-v1").receipts["account-current"].accountId, "account-current");
+  assert.equal(JSON.parse(fs.readFileSync(setup.paths.authFile)).tokens.account_id, "account-work");
+});
+
+test("inventory probe enables the experimental API and rejects PATH binary discovery", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  assert.match(source, /experimentalApi: true/);
+  assert.doesNotMatch(source, /\["codex"\]/);
+  assert.doesNotMatch(source, /CODEX_BIN|\/Applications\/ChatGPT/);
+  assert.match(source, /info\?\.resourcesPath/);
+  assert.doesNotMatch(source, /remotePluginId.*\$\{/);
 });
 
 test("legacy analytics cleanup neutralizes only the exact trusted fixture through stable descriptors", (t) => {

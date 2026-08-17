@@ -1,9 +1,9 @@
 {
   "id": "co.tweakers.account-switcher",
   "name": "Easy Account Switcher",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Switch existing local Codex sessions from the account menu without duplicating credentials.",
+  "description": "Switch existing local Codex sessions with optional remote plugin receipt protection, without duplicating credentials.",
   "author": "hulibrands",
   "tags": [
     "accounts",

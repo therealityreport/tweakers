@@ -1,7 +1,7 @@
 {
   "id": "co.tweakers.projects",
   "name": "Projects",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "githubRepo": "therealityreport/tweakers",
   "description": "Project-colored sidebar rows, project settings, connection references, and read-only repository inventory.",
   "author": "hulibrands",
