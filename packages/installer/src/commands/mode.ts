@@ -56,6 +56,13 @@ import {
   type TransactionPhase,
 } from "../transaction.js";
 import { isUpdateModeFresh, readUpdateMode } from "../update-mode.js";
+import {
+  createEnvironmentSelection,
+  defaultEnvironmentProfileRegistry,
+  publishEnvironmentSelection,
+  resolveEnvironmentProfile,
+  type EnvironmentSelection,
+} from "../environment-profile.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import {
   clearModeTransition,
@@ -127,6 +134,11 @@ export interface ModeCommandDeps {
   removeStandaloneSwitcher?: typeof removeStandaloneSwitcher;
   installApp?: typeof install;
   environmentCommand?: typeof environment;
+  /** Reconciliation seam: republish the selection from the proven live experience. */
+  republishSelection?: (
+    selected: EnvironmentSelection,
+    liveExperience: "chatgpt" | "tweakers",
+  ) => EnvironmentSelection;
   /** @internal Keeps legacy bundle-swap unit fixtures reachable, never production CLI flow. */
   legacyModeEngineForTests?: boolean;
   /** Test seam for the instant immediately following a deliberate confirmation. */
@@ -201,6 +213,38 @@ async function runNotifiedSwitch(
  * visible window before reporting success. The old bundle-swap engine remains
  * reachable only through the explicit test seam above.
  */
+/**
+ * Republish environment-selection.json (and the registry's selected record)
+ * from the PROVEN live experience. Live bytes outrank a stale publication:
+ * a swap-at-quit flow can change the live app without republishing, after
+ * which every selection-trusting flow (mode switching, repair intent,
+ * update-recovery adoption) works from fiction until reconciled.
+ */
+function republishSelectionFromLiveExperience(
+  selected: EnvironmentSelection,
+  liveExperience: "chatgpt" | "tweakers",
+): EnvironmentSelection {
+  const paths = ensureUserPaths();
+  const now = new Date().toISOString();
+  const profile = resolveEnvironmentProfile(defaultEnvironmentProfileRegistry(), selected.releaseProfile);
+  const selection = createEnvironmentSelection({
+    profile: {
+      ...profile,
+      selectedDesktopPath: selected.selectedDesktopPath,
+      selectedDesktopBundleId: selected.selectedDesktopBundleId,
+    },
+    appExperience: liveExperience,
+    requestedAt: now,
+    appliedAt: now,
+  });
+  publishEnvironmentSelection(
+    join(paths.root, "environment-registry.json"),
+    join(paths.root, "environment-selection.json"),
+    selection,
+  );
+  return selection;
+}
+
 async function switchEnvironmentExperience(
   target: "chatgpt" | "tweakers",
   opts: ModeCommandOptions,
@@ -230,19 +274,27 @@ async function switchEnvironmentExperience(
       `Cannot verify the live app experience at ${status.selected.selectedDesktopPath}; run tweaker repair before switching modes`,
     );
   }
-  if (observedExperience !== status.selected.appExperience) {
-    throw new Error(
-      `Environment selection says ${status.selected.appExperience}, but the live app proves ${observedExperience}; run tweaker repair before switching modes`,
-    );
+  let selected = status.selected;
+  if (observedExperience !== selected.appExperience) {
+    // A swap-at-quit flow can change the live experience without
+    // republishing the selection (observed stale live 2026-08-20, where the
+    // previously prescribed `tweaker repair` treated the stale selection as
+    // INTENT and could not reconcile either). The live bytes are the truth:
+    // republish the selection from the proven live experience, then continue
+    // the switch from reconciled reality instead of dead-ending.
+    selected = (deps.republishSelection ?? republishSelectionFromLiveExperience)(selected, observedExperience);
+    console.log(kleur.yellow(
+      `Reconciled the published environment selection to the proven live experience (${observedExperience}).`,
+    ));
   }
-  if (status.selected.appExperience === target) {
+  if (selected.appExperience === target) {
     console.log(kleur.green(`Already in ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
     return;
   }
 
   const prepared = await runEnvironment("prepare", {
     appExperience: target,
-    releaseProfile: status.selected.releaseProfile,
+    releaseProfile: selected.releaseProfile,
     quiet: true,
   });
   const receipt = requirePreparedEnvironmentReceipt(prepared);
@@ -250,7 +302,7 @@ async function switchEnvironmentExperience(
     || (deps.confirm ?? confirmModeSwitch)({
       target,
       appRoot: receipt.kind === "v2"
-        ? status.selected.selectedDesktopPath
+        ? selected.selectedDesktopPath
         : receipt.receipt.requested.selectedDesktopPath,
     });
   if (!confirmed) {

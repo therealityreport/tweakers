@@ -352,7 +352,7 @@ test("production mode keeps the chatgpt/tweakers command names while carrying a 
   });
 });
 
-test("production mode refuses a persisted-selection and live-marker drift before no-op", async () => {
+test("production mode reconciles a persisted-selection and live-marker drift from live truth", async () => {
   await withTweakersHome(async () => {
     const status = compatibilityEnvironmentResult("status") as Extract<
       EnvironmentCommandResult,
@@ -363,18 +363,24 @@ test("production mode refuses a persisted-selection and live-marker drift before
       appExperience: "chatgpt",
       selectionDrift: true,
     };
+    const republished: Array<{ from: string; to: string }> = [];
     const { deps } = makeDeps({
       legacyModeEngineForTests: false,
       environmentCommand: async (action) => {
         if (action === "status") return status;
         throw new Error(`unexpected environment action ${action}`);
       },
+      republishSelection: (selected, liveExperience) => {
+        republished.push({ from: selected.appExperience, to: liveExperience });
+        return { ...selected, appExperience: liveExperience, appliedAt: "2026-08-20T17:00:00.000Z" };
+      },
     });
 
-    await assert.rejects(
-      () => mode("tweakers", {}, deps),
-      /selection says tweakers.*live app proves chatgpt.*tweaker repair/i,
-    );
+    // The live bytes prove chatgpt while the stale publication says tweakers:
+    // the switch republishes from live truth and then recognizes the target
+    // as already live instead of dead-ending on "run tweaker repair".
+    await mode("chatgpt", {}, deps);
+    assert.deepEqual(republished, [{ from: "tweakers", to: "chatgpt" }]);
   });
 });
 
