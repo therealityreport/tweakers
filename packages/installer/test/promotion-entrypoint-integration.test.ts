@@ -21,6 +21,7 @@ import {
   CANDIDATE_HEALTH_RECEIPT_REUSE_MS,
   fingerprintPromotionPath,
   promotionSurfaceRoots,
+  readCandidatePromotionHealthExpectation,
   reuseCandidateHealthReceipt,
   spawnHiddenHealthProbe,
   stageCandidateCodexAuth,
@@ -138,6 +139,60 @@ test("a rehydrated promotion reuses only a fresh, fully passing candidate health
     write();
     assert.equal(
       reuseCandidateHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "drifted" } }, { now: fresh }),
+      null,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a held candidate's expectation twin rehydrates across transactions only when explicitly allowed", () => {
+  const root = mkdtempSync(join(tmpdir(), "expectation-rebind-"));
+  const file = join(root, "health", "expectation.json");
+  const hash = "a".repeat(64);
+  const expectation = {
+    schemaVersion: 2,
+    app: { version: "26.818.22352", build: "6872", hash },
+    requiredPermissions: [],
+    surfaces: {
+      app: { preimageHash: hash, afterHash: hash },
+      runtime: { preimageHash: hash, afterHash: hash },
+      tweakTree: { preimageHash: hash, afterHash: hash },
+      tweakersConfig: { preimageHash: hash, afterHash: hash },
+      codexConfig: { preimageHash: hash, afterHash: hash },
+      namespaceData: { preimageHash: hash, afterHash: hash },
+      mainStorage: { preimageHash: hash, afterHash: hash },
+      policy: { preimageHash: hash, afterHash: hash },
+    },
+    userQuestions: { id: "co.tweakers.user-questions", version: "1.0.0", payloadHash: hash },
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    // repair built and held the candidate at 12:00; a NEW install transaction
+    // adopting it starts at 12:30 (live failure 2026-08-20).
+    writeFileSync(file, JSON.stringify({ ...expectation, requestedAt: "2026-08-20T12:00:00.000Z" }), { mode: 0o600 });
+    chmodSync(file, 0o600);
+    const bounds = {
+      transactionCreatedAt: "2026-08-20T12:30:00.000Z",
+      now: new Date("2026-08-20T12:35:00.000Z"),
+      maxAgeMs: 24 * 60 * 60 * 1_000,
+    };
+
+    // Strict callers (same-record continuations) still reject the earlier twin.
+    assert.equal(readCandidatePromotionHealthExpectation(file, bounds), null);
+    // The adoption path accepts it; the caller re-binds via the candidate
+    // app-fingerprint check immediately afterwards.
+    const adopted = readCandidatePromotionHealthExpectation(file, { ...bounds, allowEarlierRequest: true });
+    assert.ok(adopted);
+    assert.equal(adopted.app.build, "6872");
+
+    // The age bound still applies even with adoption allowed.
+    assert.equal(
+      readCandidatePromotionHealthExpectation(file, {
+        ...bounds,
+        allowEarlierRequest: true,
+        now: new Date("2026-08-21T12:00:00.001Z"),
+      }),
       null,
     );
   } finally {

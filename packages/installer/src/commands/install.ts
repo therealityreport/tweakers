@@ -1303,7 +1303,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         const rehydrated = candidateHealthExpectation === null;
         const expected = candidateHealthExpectation ?? readCandidatePromotionHealthExpectation(
           expectationFile,
-          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs },
+          // allowEarlierRequest: this transaction may adopt a candidate an
+          // earlier transaction built and held; the fingerprint check just
+          // below re-binds the expectation to the exact on-disk candidate.
+          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs, allowEarlierRequest: true },
         );
         if (!expected) {
           return unknownPromotionHealth(
@@ -2658,6 +2661,18 @@ export function readCandidatePromotionHealthExpectation(
     transactionCreatedAt: string;
     now: Date;
     maxAgeMs: number;
+    /**
+     * Accept a twin written BEFORE this transaction was created. Only for
+     * callers that adopt a held candidate from an earlier transaction (e.g.
+     * `repair` holds while the app runs, a later `install` promotes) AND
+     * separately re-verify the candidate's app fingerprint against the
+     * expectation - fingerprint equality, not the created-at ordering, is
+     * what stops a stale twin from vouching for different bytes. Without
+     * this, adoption invalidated the transaction, cleanup deleted the held
+     * candidate, and the same-payload record blocked rebuilds behind the
+     * retry backoff (live failure 2026-08-20).
+     */
+    allowEarlierRequest?: boolean;
   },
 ): ProductionHealthExpectationV2 | null {
   try {
@@ -2685,7 +2700,7 @@ export function readCandidatePromotionHealthExpectation(
       || !Number.isFinite(bounds.maxAgeMs)
       || bounds.maxAgeMs < 0
       || requestedAtMs > nowMs + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS
-      || requestedAtMs < transactionCreatedAtMs
+      || (bounds.allowEarlierRequest !== true && requestedAtMs < transactionCreatedAtMs)
       || requestAgeMs > bounds.maxAgeMs
       || !isValidProductionHealthExpectationV2(expected)
     ) return null;
