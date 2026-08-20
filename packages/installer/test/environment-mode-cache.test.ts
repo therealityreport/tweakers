@@ -23,6 +23,7 @@ import {
   assertEnvironmentModeCacheSameDevice,
   assertEnvironmentModeCacheSteadyState,
   assertEnvironmentModePairContentsExchangeable,
+  assertEnvironmentModeCacheLiveTreeSeal,
   assertEnvironmentModeCacheTreeSeal,
   assertEnvironmentModeCacheTreeStatSealAfterRename,
   cancelStaleEnvironmentModePair,
@@ -448,6 +449,45 @@ test("stat seals are deterministic and reject arbitrary nested leaf changes even
     );
   } finally {
     cleanup(fixture.root);
+  }
+});
+
+test("the live tree seal tolerates macOS stat churn but rejects shape and payload changes", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-mode-cache-live-"));
+  try {
+    const live = join(root, "ChatGPT.app");
+    mkdirSync(join(live, "Contents"), { recursive: true });
+    writeFileSync(join(live, "Contents", "app.bin"), "live-payload-bytes\n");
+    const seal = sealEnvironmentModeCacheTree(live);
+
+    // First-launch provenance xattrs mutate ctime without touching content
+    // (live failure 2026-08-20). Both live-tree variants must tolerate it.
+    const xattr = spawnSync("xattr", ["-w", "com.test.provenance", "stamped", join(live, "Contents", "app.bin")]);
+    assert.equal(xattr.status, 0);
+    assert.doesNotThrow(() => assertEnvironmentModeCacheLiveTreeSeal(live, seal));
+    assert.doesNotThrow(() => assertEnvironmentModeCacheLiveTreeSeal(live, seal, { verifyContent: true }));
+    // The strict cache seal still rejects the same churn - cache-resident
+    // trees keep the full stat pin.
+    assert.throws(() => assertEnvironmentModeCacheTreeSeal(live, seal), /stat seal mismatch/);
+
+    // A same-size payload edit passes the byte-free shape check but the
+    // full-validator context still rejects it through the payload digests.
+    const before = statSync(join(live, "Contents", "app.bin"));
+    writeFileSync(join(live, "Contents", "app.bin"), "live-payload-bytez\n"); // exactly the original byte count
+    utimesSync(join(live, "Contents", "app.bin"), before.atime, before.mtime);
+    assert.doesNotThrow(() => assertEnvironmentModeCacheLiveTreeSeal(live, seal));
+    assert.throws(
+      () => assertEnvironmentModeCacheLiveTreeSeal(live, seal, { verifyContent: true }),
+      /live tree seal mismatch/,
+    );
+
+    // Size and topology changes fail both variants.
+    writeFileSync(join(live, "Contents", "app.bin"), "grown");
+    assert.throws(() => assertEnvironmentModeCacheLiveTreeSeal(live, seal), /live tree seal mismatch/);
+    writeFileSync(join(live, "Contents", "extra.bin"), "new-entry");
+    assert.throws(() => assertEnvironmentModeCacheLiveTreeSeal(live, seal), /live tree seal mismatch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

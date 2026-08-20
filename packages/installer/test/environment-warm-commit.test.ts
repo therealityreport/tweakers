@@ -632,14 +632,18 @@ test("two successful warm commits alternate one sealed pair without preparation 
 test("a pre-approval arbitrary nested app mutation is stale_requires_prepare before watcher pause or exact quit", async () => {
   await withFixture(async (fixture) => {
     const events: string[] = [];
-    mutateNestedLeafWithRestoredMtime(fixture.liveLeaf);
+    // The byte-free pre-approval check pins the live tree's shape; a
+    // size-changing nested mutation must go stale before pause or quit.
+    // (A same-size stat-restored live mutation is deferred to the full
+    // validator's payload digests - covered by the warm-seal test below.)
+    writeFileSync(fixture.liveLeaf, `${readFileSync(fixture.liveLeaf, "utf8")}grown`);
 
     const receipt = await commit(fixture, warmDeps(fixture, events));
 
     assert.equal(receipt.phase, "stale_requires_prepare");
     assert.equal(receipt.exchangeCount, 0);
     assert.deepEqual(events, ["full-validate-stale"]);
-    assert.match(receipt.error ?? "", /tree stat seal mismatch/);
+    assert.match(receipt.error ?? "", /live tree seal mismatch/);
     const current = readCurrentEnvironmentModePair(fixture.paths);
     assert.equal(current?.pin.state, "stale_requires_prepare");
     assert.equal(current?.pin.releaseReason, "invalidated");
@@ -687,20 +691,24 @@ test("a late arbitrary nested app mutation after shutdown refuses before the sol
     const receipt = await commit(fixture, warmDeps(fixture, events, {
       recheckSourceAfterShutdown: () => {
         events.push("recheck");
-        mutateNestedLeafWithRestoredMtime(fixture.liveLeaf);
+        // The byte-free warm recheck pins the live tree's shape (topology,
+        // type, mode, size, symlink targets) but tolerates stat churn; a
+        // size-changing late mutation must still refuse before the exchange.
+        writeFileSync(fixture.liveLeaf, `${readFileSync(fixture.liveLeaf, "utf8")}grown`);
       },
     }));
 
     assert.equal(receipt.phase, "failed");
     assert.equal(receipt.exchangeCount, 0);
     assert.deepEqual(events, ["preflight", "pause", "stop:101", "recheck", "reopen", "resume-watcher"]);
-    assert.match(receipt.error ?? "", /tree stat seal mismatch/);
+    assert.match(receipt.error ?? "", /live tree seal mismatch/);
     assert.equal(receipt.stamps.some((entry) => entry.phase === "source-watcher-resumed"), true);
   });
 });
 
 test("warm stat seals reject arbitrary nested app, runtime, and managed-runtime mutation with restored mtime", async () => {
-  for (const target of ["liveLeaf", "inactiveLeaf", "runtimeLeaf", "managedRuntimeLeaf"] as const) {
+  // Cache-resident trees keep the full stat pin on the byte-free warm path.
+  for (const target of ["inactiveLeaf", "runtimeLeaf", "managedRuntimeLeaf"] as const) {
     await withFixture((fixture) => {
       mutateNestedLeafWithRestoredMtime(fixture[target]);
       assert.throws(
@@ -710,6 +718,17 @@ test("warm stat seals reject arbitrary nested app, runtime, and managed-runtime 
       );
     });
   }
+  // The live tree tolerates a same-size stat-restored mutation on the
+  // byte-free warm path (macOS churns its stat tuples); the full validator's
+  // payload digests still reject it before any cutover trusts those bytes.
+  await withFixture((fixture) => {
+    mutateNestedLeafWithRestoredMtime(fixture.liveLeaf);
+    assert.doesNotThrow(() => assertEnvironmentModePairWarmCommitMaterialized(fixture.paths, fixture.receipt));
+    assert.throws(
+      () => assertEnvironmentModePairMaterialized(fixture.paths, fixture.receipt),
+      /live tree seal mismatch/,
+    );
+  });
 });
 
 test("a post-swap failure immediately exchanges Contents back and restores the projection", async () => {

@@ -748,6 +748,55 @@ export function assertEnvironmentModeCacheTreeStatSealOnly(
 }
 
 /**
+ * Verify the LIVE role's app tree. The live bundle is not cache-resident:
+ * macOS legitimately rewrites ctime across it on first launch (Gatekeeper
+ * provenance xattrs) and Sparkle activity touches it, so pinning the full
+ * stat tuple turned successful cutovers into failed transactions (live
+ * failure 2026-08-20: "stat seal mismatch at /Applications/ChatGPT.app"
+ * seconds after a clean cutover). Ordered topology, entry type, mode, size,
+ * and symlink targets stay pinned; dev/ino/mtime/ctime do not. With
+ * `verifyContent` (the full-validator context, where the strict seal also
+ * read bytes) the stat-independent payload digests are verified too, so a
+ * same-size content edit is still rejected there. The warm path stays
+ * byte-free by doctrine; its residual same-size-edit exposure on the live
+ * tree is closed by the full validator before cutover and by the role
+ * identity digests.
+ */
+export function assertEnvironmentModeCacheLiveTreeSeal(
+  rootPath: string,
+  expected: EnvironmentModeCacheTreeStatSeal,
+  options: { verifyContent?: boolean } = {},
+): void {
+  if (!isEnvironmentModeCacheTreeStatSeal(expected)) {
+    throw new Error("Environment mode cache tree seal is invalid");
+  }
+  const root = assertCanonicalAbsolutePath(rootPath, "environment mode cache tree root");
+  if (expected.rootPath !== root) {
+    throw new Error("Environment mode cache tree seal root does not match its expected canonical path");
+  }
+  const shape = (entries: EnvironmentModeCacheStatSealRecord[]) => entries.map((entry) => ({
+    relativePath: entry.relativePath,
+    type: entry.type,
+    mode: entry.mode,
+    size: entry.size,
+    symlinkTarget: entry.symlinkTarget,
+  }));
+  if (options.verifyContent === true) {
+    const actual = sealEnvironmentModeCacheTree(root);
+    if (!sameJson(shape(actual.entries), shape(expected.entries))
+      || actual.contentDigest !== expected.contentDigest
+      || !sameJson(actual.contentEntries, expected.contentEntries)) {
+      throw new Error(`Environment mode cache live tree seal mismatch at ${root}`);
+    }
+    return;
+  }
+  const actual = collectEnvironmentModeCacheTreeStatSeal(root);
+  if (!sameJson(shape(actual.entries), shape(expected.entries))) {
+    throw new Error(`Environment mode cache live tree seal mismatch at ${root}`);
+  }
+}
+
+/**
  * Verify a prepared directory after one same-filesystem rename. APFS preserves
  * the directory and descendant inodes, but legitimately advances the moved
  * root directory's ctime. No descendant stat field may change.
@@ -2232,7 +2281,9 @@ export function assertEnvironmentModePairMaterialized(
   for (const root of roots) assertRealDirectory(root, "environment mode pair artifact root");
   assertEnvironmentModeCacheSameDevice(roots);
   assertEnvironmentModePairContentsExchangeable(receipt);
-  assertEnvironmentModeCacheTreeSeal(receipt.roles.live.appPath, receipt.seals.liveApp);
+  // The live tree tolerates macOS stat churn but still proves its payloads;
+  // cache-resident trees keep the strict full seal.
+  assertEnvironmentModeCacheLiveTreeSeal(receipt.roles.live.appPath, receipt.seals.liveApp, { verifyContent: true });
   assertEnvironmentModeCacheTreeSeal(receipt.paths.inactiveAppPath, receipt.seals.inactiveApp);
   assertEnvironmentModeCacheTreeSeal(receipt.paths.runtimeRoot, receipt.seals.runtime);
   assertEnvironmentModeCacheTreeSeal(receipt.paths.managedRuntimeRoot, receipt.seals.managedRuntime);
@@ -2270,7 +2321,10 @@ export function assertEnvironmentModePairWarmCommitMaterialized(
   for (const root of roots) assertRealDirectory(root, "environment mode pair artifact root");
   assertEnvironmentModeCacheSameDevice(roots);
   assertEnvironmentModePairContentsExchangeable(receipt);
-  assertEnvironmentModeCacheTreeStatSealOnly(receipt.roles.live.appPath, receipt.seals.liveApp);
+  // Byte-free by doctrine; the live tree additionally tolerates macOS stat
+  // churn (first-launch provenance xattrs, Sparkle activity) while its
+  // topology, modes, sizes, and symlink targets stay pinned.
+  assertEnvironmentModeCacheLiveTreeSeal(receipt.roles.live.appPath, receipt.seals.liveApp);
   assertEnvironmentModeCacheTreeStatSealOnly(receipt.paths.inactiveAppPath, receipt.seals.inactiveApp);
   assertEnvironmentModeCacheTreeStatSealOnly(receipt.paths.runtimeRoot, receipt.seals.runtime);
   assertEnvironmentModeCacheTreeStatSealOnly(receipt.paths.managedRuntimeRoot, receipt.seals.managedRuntime);
