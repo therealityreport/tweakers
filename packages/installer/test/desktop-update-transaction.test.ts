@@ -541,6 +541,68 @@ test("cancel and recover resolves an orphaned v2 switch from sealed-pair proof w
   });
 });
 
+test("cancel of a failed unsafe v2 update proves the source by bytes when the grant is released history", async () => {
+  const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+  const source = selection("tweakers");
+  const historyAdapter = (marker: "present" | "absent") => {
+    const pair = { ...modeCachePair("mode-generation-1", "tweakers", baseline), pinState: "stale_requires_prepare" as const };
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => pair,
+      switchCurrent: async () => { throw new Error("unexpected v2 switch"); },
+      prepareAndSwitch: async () => { throw new Error("unexpected v2 preparation"); },
+      recover: async (transactionId) => ({
+        transactionId,
+        phase: "ready",
+        error: null,
+        selection: source,
+        targetMainPid: null,
+        pair,
+      }),
+    };
+    return dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => source,
+      readDesktopVersion: () => baseline,
+      readDesktopBundleIdentifier: () => source.selectedDesktopBundleId,
+      readDesktopAsarMarker: () => marker,
+    });
+  };
+  const failedUnsafeReceipt = () => persistedReceipt({
+    phase: "failed",
+    source,
+    baseline,
+    safeOfficialMode: false,
+    resumable: false,
+    error: "Desktop update sealed pair does not bind the requested environment transition",
+    environmentTransactionId: "mode-generation-1",
+    environmentTransactionKind: "mode-cache-v2",
+  });
+
+  await withFixture(async (fixture) => {
+    writeDesktopUpdateReceipt(fixture.stateFile, failedUnsafeReceipt());
+    const transaction = createDesktopUpdateTransaction(fixture, historyAdapter("present").deps);
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.equal(receipt.resumable, false);
+    assert.match(receipt.error ?? "", /proven live by its published selection, patch marker, and version identity/i);
+  });
+
+  await withFixture(async (fixture) => {
+    // A marker that contradicts the source experience must keep failing closed.
+    writeDesktopUpdateReceipt(fixture.stateFile, failedUnsafeReceipt());
+    const transaction = createDesktopUpdateTransaction(fixture, historyAdapter("absent").deps);
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.match(receipt.error ?? "", /did not prove either bound environment live/i);
+  });
+});
+
 test("desktop update transaction logs one ordered event per persisted phase transition", async () => {
   await withFixture(async (fixture) => {
     const { deps } = dependencies();

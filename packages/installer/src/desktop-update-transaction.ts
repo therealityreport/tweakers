@@ -80,7 +80,7 @@ import {
   type NativeUpdateHandoffFailureKind,
   type NativeUpdateHandoffResult,
 } from "./alerts.js";
-import { isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
+import { type AsarMarker, isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
@@ -249,6 +249,8 @@ export interface DesktopUpdateDependencies {
   readCurrentSelection(): EnvironmentSelection | null | Promise<EnvironmentSelection | null>;
   readDesktopVersion(appPath: string): DesktopVersionIdentity | Promise<DesktopVersionIdentity>;
   readDesktopBundleIdentifier(appPath: string): string | null | Promise<string | null>;
+  /** Owner-dead recovery seam; defaults to reading the live bundle's asar patch marker. */
+  readDesktopAsarMarker?(appPath: string): AsarMarker;
   /** Prove the exact live desktop is pristine, OpenAI-signed, visible, and version-readable. */
   inspectLiveOfficialDesktop(
     selection: EnvironmentSelection,
@@ -541,6 +543,9 @@ export function createDesktopUpdateTransaction(
     readDesktopVersion: overrides.readDesktopVersion ?? readDesktopVersion,
     readDesktopBundleIdentifier: overrides.readDesktopBundleIdentifier ?? ((appPath) => (
       readDesktopBundleIdentity(appPath).bundleId
+    )),
+    readDesktopAsarMarker: overrides.readDesktopAsarMarker ?? ((appPath) => (
+      readAsarMarker(join(appPath, "Contents", "Resources", "app.asar"))
     )),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
     launchOfficialDesktop: overrides.launchOfficialDesktop ?? ((selection) => {
@@ -1692,6 +1697,23 @@ export function createDesktopUpdateTransaction(
           returning && existing.observed !== null ? existing.observed : existing.baseline,
         );
         if (!liveOfficial && !liveSource) {
+          // A released sealed pair can never prove liveness through its grant.
+          // When the recovery returned terminal history and the update never
+          // reached the official leg, prove the untouched source payload
+          // directly from durable bytes: the published selection, the bundle
+          // identity, the recorded baseline version, and the asar patch
+          // marker together rule out a half-swapped desktop (live wedge
+          // 2026-08-20 behind a stale invalidated grant).
+          if (!returning && await sourceSelectionProvenByBytes(existing, recovered.selection, deps)) {
+            return update(existing, {
+              phase: "rolled_back",
+              ownerPid: process.pid,
+              safeOfficialMode: existing.source.appExperience === "chatgpt",
+              resumable: false,
+              error: "Desktop update owner exited; the sealed pair was terminal history and the source payload was proven live by its published selection, patch marker, and version identity.",
+              rolledBackAt: deps.now(),
+            }, true);
+          }
           return unsafeRecoveryFailure(existing, "sealed-pair recovery did not prove either bound environment live");
         }
         return update(existing, {
@@ -2234,6 +2256,27 @@ async function verifyFinalDesktopReturn(
     if (poll + 1 < 240) await new Promise<void>((resolve) => setTimeout(resolve, 250));
   }
   return { ok: false, error: lastError };
+}
+
+async function sourceSelectionProvenByBytes(
+  existing: DesktopUpdateReceipt,
+  selection: EnvironmentSelection | null,
+  deps: DesktopUpdateDependencies,
+): Promise<boolean> {
+  if (selection === null || !sameEnvironmentSelection(selection, existing.source) || selection.appliedAt === null) {
+    return false;
+  }
+  const bundleId = await deps.readDesktopBundleIdentifier(existing.source.selectedDesktopPath);
+  if (bundleId !== existing.source.selectedDesktopBundleId) return false;
+  const version = await deps.readDesktopVersion(existing.source.selectedDesktopPath);
+  if (existing.baseline.marketingVersion !== null && version.marketingVersion !== existing.baseline.marketingVersion) {
+    return false;
+  }
+  if (existing.baseline.build !== null && version.build !== existing.baseline.build) return false;
+  const readMarker = deps.readDesktopAsarMarker
+    ?? ((appPath: string) => readAsarMarker(join(appPath, "Contents", "Resources", "app.asar")));
+  const marker = readMarker(existing.source.selectedDesktopPath);
+  return existing.source.appExperience === "tweakers" ? marker === "present" : marker === "absent";
 }
 
 function sameEnvironmentSelection(first: EnvironmentSelection, second: EnvironmentSelection): boolean {
