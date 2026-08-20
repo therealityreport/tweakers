@@ -708,9 +708,13 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
 
       (deps.openApp ?? defaultOpenApp)(codex.appRoot);
 
-      const post = (deps.verifyDeep ?? verifySignature)(codex.appRoot);
+      // The destination was deep-verified moments ago inside the swap's
+      // validateDestination (a failure would have rolled back and thrown), so
+      // this display-only line needs just the cheap identity read, not a
+      // third full-bundle codesign walk.
+      const post = readSignature(codex.appRoot);
       console.log(kleur.green().bold("✓ Switched to ChatGPT mode."));
-      console.log(`  Live app:       pristine official ChatGPT (team ${OPENAI_TEAM_ID})${post.ok ? "" : kleur.red(" — post-swap signature verification FAILED")}`);
+      console.log(`  Live app:       pristine official ChatGPT (team ${OPENAI_TEAM_ID})${post.ok && post.teamIdentifier === OPENAI_TEAM_ID ? "" : kleur.red(" — post-swap signature identity check FAILED")}`);
       console.log(`  Parked payload: ${kleur.cyan(parkedApp)}${parkedVersion ? ` (${parkedVersion})` : ""}`);
       printTccReminder(paths.configFile);
       return;

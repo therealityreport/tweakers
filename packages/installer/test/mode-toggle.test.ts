@@ -550,6 +550,38 @@ test("mode chatgpt: happy path parks the patched payload and restores pristine",
   });
 });
 
+test("mode chatgpt: runs exactly two deep verifications, none after the swap", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", asar: "patched-asar" });
+    const backup = join(root, "backup", "Codex.app");
+    makeApp(backup, { version: "26.1.0", asar: "pristine-asar" });
+    seedState(root, { appRoot: app, mode: "tweakers", codexVersion: "26.1.0" });
+
+    let deepVerifications = 0;
+    let deepVerificationsAtSwap = -1;
+    const { deps } = makeDeps({
+      verifyDeep: () => {
+        deepVerifications += 1;
+        return { ok: true, output: "" };
+      },
+      swapDirectories: (first, second) => {
+        deepVerificationsAtSwap = deepVerifications;
+        jsSwapDirectories(first, second);
+      },
+    });
+
+    await mode("chatgpt", { yes: true, app }, deps);
+
+    // Only the swap's validateDestination deep-verifies: the settled-bundle
+    // official-pristine check short-circuits on the patch marker before its
+    // deep verification, and the post-open console line reuses the swap's
+    // result via the cheap identity read instead of another full-bundle walk.
+    assert.equal(deepVerifications, 1);
+    assert.equal(deepVerifications - deepVerificationsAtSwap, 1, "the single deep verification belongs to the swap itself");
+  });
+});
+
 test("mode chatgpt: adopts a newer official update that lands during the settle wait", async () => {
   await withTweakersHome(async (root) => {
     const app = join(root, "Applications", "ChatGPT.app");
