@@ -684,6 +684,9 @@ export function createDesktopUpdateTransaction(
         jobLabel: options.jobLabel
           ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL
           ?? null,
+        phaseElapsedMs: previous === null || previous.transactionId !== receipt.transactionId
+          ? null
+          : Date.parse(receipt.updatedAt) - Date.parse(previous.updatedAt),
       }, {
         now: deps.now,
         userRoot: root,

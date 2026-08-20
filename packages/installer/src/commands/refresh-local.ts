@@ -26,6 +26,9 @@ export interface LocalRefreshStatus {
   detail: string;
   error: string | null;
   checkedAt: string;
+  /** Milliseconds per completed workflow phase and sub-step (e.g. "preparing",
+   * "preparing.build"); additive diagnostics for benchmark readers. */
+  phaseTimings?: Record<string, number>;
 }
 
 interface WorkflowAdapters {
@@ -144,6 +147,20 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
   const lock = acquireRefreshLock(lockFile);
   const stableStageRoot = join(paths.root, "refresh-stable-stage");
   let preparedStableSource: string | null = null;
+  const phaseTimings: Record<string, number> = {};
+  let activePhase: RefreshPhase | null = null;
+  let activePhaseStarted = performance.now();
+  const finishActivePhase = (): void => {
+    if (activePhase !== null) phaseTimings[activePhase] = Math.round(performance.now() - activePhaseStarted);
+  };
+  const timed = async <T>(name: string, run: () => T | Promise<T>): Promise<T> => {
+    const started = performance.now();
+    try {
+      return await run();
+    } finally {
+      phaseTimings[name] = Math.round(performance.now() - started);
+    }
+  };
   const writePhase = (phase: RefreshPhase, error: string | null = null): void => writeRefreshState(paths.root, {
     available: phase === "failed",
     source: selected,
@@ -152,11 +169,17 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
     detail: phase === "complete" ? "Local ChatGPT refresh completed" : `Local refresh ${phase}`,
     error,
     checkedAt: new Date().toISOString(),
+    ...(Object.keys(phaseTimings).length === 0 ? {} : { phaseTimings }),
   });
   try {
     const appRoot = locateCodex(opts.app).appRoot;
     await runRefreshWorkflow({
-      phase: (phase) => writePhase(phase),
+      phase: (phase) => {
+        finishActivePhase();
+        activePhase = phase === "complete" || phase === "failed" ? null : phase;
+        activePhaseStarted = performance.now();
+        writePhase(phase);
+      },
       prepare: async () => {
         if (selected === "stable") {
           rmSync(stableStageRoot, { recursive: true, force: true });
@@ -182,8 +205,8 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           }
           runChecked(process.execPath, [stagedCli, "install", "--app", appRoot, "--candidate-only", "--coordinated-refresh", "--no-watcher"], process.cwd(), process.env);
         } else {
-          runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment());
-          await install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true });
+          await timed("preparing.build", () => runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment()));
+          await timed("preparing.candidate", () => install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true }));
         }
       },
       quit: () => {
@@ -203,15 +226,19 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           runChecked(process.execPath, [managedCliPath(stableStageRoot), "repair", "--app", appRoot, "--force", "--quiet"], process.cwd(), process.env);
           installManagedRuntime(preparedStableSource, paths.root);
         } else {
-          await repair({ app: appRoot, force: true, quiet: true });
-          const managed = installManagedRuntime(sourceRoot, paths.root);
-          writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
+          await timed("promoting.repair", () => repair({ app: appRoot, force: true, quiet: true }));
+          await timed("promoting.managedRuntime", () => {
+            const managed = installManagedRuntime(sourceRoot, paths.root);
+            writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
+          });
         }
         await restoreModeCoordinatorMetadata();
       },
       reopen: () => openCodex(appRoot, { detached: true, delayMs: 750 }),
     });
   } catch (error) {
+    finishActivePhase();
+    activePhase = null;
     writePhase("failed", error instanceof Error ? error.message : String(error));
     workflowFailureWritten = true;
     throw error;

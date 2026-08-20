@@ -337,7 +337,7 @@ test("both promote branches restore coordinator metadata after the runtime insta
     /promote: async \(\) => \{/.source,
     /[\s\S]*?installManagedRuntime\(preparedStableSource, paths\.root\);/.source,
     /[\s\S]*?writeDevelopmentProvenanceHash\(managed, hashTree\(sourceRoot, false\)\);/.source,
-    /\s*\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
+    /[\s\S]*?\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
   ].join("")));
 });
 

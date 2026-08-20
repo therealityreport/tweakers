@@ -661,6 +661,7 @@ test("recovery transaction logs redact the user root and end with handled failur
       ownerGeneration: "owner-generation-1",
       event: "handled_failure",
       error: "refresh failed under [user-root]/managed-runtime",
+      phaseElapsedMs: 0,
     });
   });
 });
