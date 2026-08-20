@@ -450,23 +450,30 @@ function projectDesktopUpdateModeCachePair(pair: EnvironmentModePairReceipt): De
   };
 }
 
+function desktopUpdateModeCachePairBinds(
+  pair: DesktopUpdateModeCachePair | null,
+  current: EnvironmentSelection,
+  requested: EnvironmentSelection,
+): pair is DesktopUpdateModeCachePair {
+  return pair !== null
+    && pair.pinState === "prepared"
+    && pair.releaseProfile === current.releaseProfile
+    && requested.releaseProfile === current.releaseProfile
+    && pair.live.appPath === current.selectedDesktopPath
+    && requested.selectedDesktopPath === current.selectedDesktopPath
+    && pair.live.bundleId === current.selectedDesktopBundleId
+    && pair.inactive.bundleId === requested.selectedDesktopBundleId
+    && pair.live.experience === current.appExperience
+    && pair.inactive.experience === requested.appExperience;
+}
+
 function assertDesktopUpdateModeCacheTransition(
   pair: DesktopUpdateModeCachePair | null,
   current: EnvironmentSelection,
   requested: EnvironmentSelection,
   transactionId: string,
 ): asserts pair is DesktopUpdateModeCachePair {
-  if (pair === null
-    || pair.generationId !== transactionId
-    || pair.pinState !== "prepared"
-    || pair.releaseProfile !== current.releaseProfile
-    || requested.releaseProfile !== current.releaseProfile
-    || pair.live.appPath !== current.selectedDesktopPath
-    || requested.selectedDesktopPath !== current.selectedDesktopPath
-    || pair.live.bundleId !== current.selectedDesktopBundleId
-    || pair.inactive.bundleId !== requested.selectedDesktopBundleId
-    || pair.live.experience !== current.appExperience
-    || pair.inactive.experience !== requested.appExperience) {
+  if (!desktopUpdateModeCachePairBinds(pair, current, requested) || pair.generationId !== transactionId) {
     throw new Error("Desktop update sealed pair does not bind the requested environment transition");
   }
 }
@@ -870,26 +877,31 @@ export function createDesktopUpdateTransaction(
         }
       }
 
+      // A refresh (or any invalidation) releases the current generation's
+      // grant, and a released or mismatched pair can never bind this
+      // transition — failing on it made every post-refresh update dead on
+      // arrival (live failures 2026-08-19/20). Reuse the current pair only
+      // when it still binds; otherwise prepare a fresh sealed pair, exactly
+      // as the return leg already does.
       const pair = deps.modeCacheV2.current();
-      if (pair === null) {
-        return update(receipt, {
-          phase: "failed",
-          safeOfficialMode: false,
-          resumable: false,
-          error: "Environment mode cache v2 is enabled but no current sealed pair is available",
-        }, true);
-      }
+      const reusableGenerationId = desktopUpdateModeCachePairBinds(pair, receipt.source, receipt.official)
+        ? pair.generationId
+        : null;
+      const generationId = reusableGenerationId ?? deps.createModeCacheGenerationId();
       receipt = update(receipt, {
-        environmentTransactionId: pair.generationId,
+        environmentTransactionId: generationId,
         environmentTransactionKind: "mode-cache-v2",
       });
       try {
-        const switched = await deps.modeCacheV2.switchCurrent({
+        const request = {
           current: receipt.source,
           requested: receipt.official,
-          transactionId: pair.generationId,
+          transactionId: generationId,
           approvalAt: receipt.createdAt,
-        });
+        };
+        const switched = reusableGenerationId !== null
+          ? await deps.modeCacheV2.switchCurrent(request)
+          : await deps.modeCacheV2.prepareAndSwitch(request);
         if (switched.phase !== "ready"
           || switched.selection === null
           || switched.targetMainPid === null) {

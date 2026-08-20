@@ -548,6 +548,61 @@ test("cancel and recover resolves an orphaned v2 switch from sealed-pair proof w
   });
 });
 
+test("a stale or missing sealed pair prepares fresh on the outbound leg instead of failing", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+    const observed = { marketingVersion: "26.814.41957", build: "6744" };
+    let currentSelection = selection("tweakers");
+    // The live wedge (2026-08-19/20): a refresh invalidated the current
+    // generation, so its grant is released and can never bind a transition.
+    let currentPair: DesktopUpdateModeCachePair | null = {
+      ...modeCachePair("stale-generation", "tweakers", baseline),
+      pinState: "stale_requires_prepare" as const,
+    };
+    const modeCalls: string[] = [];
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => currentPair,
+      switchCurrent: async ({ transactionId }) => {
+        throw new Error(`a released pair must never be switched (${transactionId})`);
+      },
+      prepareAndSwitch: async ({ requested, transactionId }) => {
+        modeCalls.push(`prepare-and-switch:${transactionId}:${requested.appExperience}`);
+        currentSelection = { ...requested, appliedAt: NOW };
+        currentPair = modeCachePair(
+          transactionId,
+          requested.appExperience,
+          requested.appExperience === "chatgpt" ? baseline : observed,
+        );
+        return readyModeCacheResult(transactionId, requested, currentPair);
+      },
+      recover: async (transactionId) => {
+        throw new Error(`unexpected mode-cache recovery for ${transactionId}`);
+      },
+    };
+    const generationIds = ["fresh-outbound", "fresh-return"];
+    const { deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => currentSelection,
+      readDesktopVersion: () => baseline,
+      waitForVersionChange: async () => observed,
+      createModeCacheGenerationId: () => generationIds.shift() ?? "exhausted",
+      refreshTweakers: async () => {
+        throw new Error("legacy runtime refresh must not run for a prepared v2 pair");
+      },
+      verifyFinal: async () => ({ ok: true, error: null }),
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(modeCalls, [
+      "prepare-and-switch:fresh-outbound:chatgpt",
+      "prepare-and-switch:fresh-return:tweakers",
+    ]);
+  });
+});
+
 test("an unambiguous current appcast completes the update before any environment swap", async () => {
   await withFixture(async (fixture) => {
     const { calls, deps } = dependencies({
