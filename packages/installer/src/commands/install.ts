@@ -88,7 +88,9 @@ import {
   readTransactionState,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
+  type ProductionHealthExpectation,
   type ProductionHealthExpectationV2,
+  type TransactionHealth,
   type TransactionResult,
 } from "../transaction.js";
 import {
@@ -552,6 +554,39 @@ export const HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH = "codex-home";
 export const HEALTH_PROBE_USER_DATA_RELATIVE_PATH = "electron-user-data";
 export const HEALTH_PROBE_ROOT_PREFIX = "probe-";
 export const HEALTH_PROBE_PROCESS_TIMEOUT_MS = 170_000;
+/**
+ * How fresh a candidate build's durable health receipt must be for a
+ * rehydrated promotion to reuse it instead of launching a second probe.
+ * Deliberately far tighter than the candidate age bound itself.
+ */
+export const CANDIDATE_HEALTH_RECEIPT_REUSE_MS = 15 * 60_000;
+
+/**
+ * Accept a candidate build's durable health receipt for a rehydrated
+ * promotion only when it fully passed: the reader already enforces receipt
+ * privacy, app-fingerprint and runtime identity, and the reuse age bound;
+ * this adds the strict pass gate (host, session, and - for schema-v2
+ * receipts - promotion readiness). Anything else returns null so the caller
+ * launches a live probe.
+ */
+export function reuseCandidateHealthReceipt(
+  receiptFile: string,
+  expected: ProductionHealthExpectation,
+  options: { now?: Date } = {},
+): TransactionHealth | null {
+  const prior = readProductionHealthReceipt(receiptFile, expected, {
+    now: options.now,
+    maxAgeMs: CANDIDATE_HEALTH_RECEIPT_REUSE_MS,
+  });
+  if (prior.host !== "pass" || prior.session !== "pass") return null;
+  if (prior.promotionReady !== undefined && prior.promotionReady !== "pass") return null;
+  return {
+    ...prior,
+    detail: prior.detail
+      ? `${prior.detail}; reused the candidate build's health receipt`
+      : "reused the candidate build's health receipt",
+  };
+}
 export const HEALTH_PROBE_RECEIPT_TIMEOUT_MS = 170_000;
 // Descendants are explicitly terminated before cleanup. These retries cover
 // only short filesystem settlement after the owned process tree is gone.
@@ -1286,6 +1321,21 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           candidatePromotionPreimages = promotionPreimageHashes(expected);
         }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
+        if (rehydrated) {
+          // The candidate-only build already launched a real probe against
+          // these exact bytes: the durable receipt is fingerprint-bound (the
+          // expectation was just re-verified against the on-disk candidate)
+          // and one-shot per launch, so a fresh, fully passing receipt proves
+          // this promotion's candidate without a second Electron boot. Any
+          // stale, unknown, or rejected receipt falls through to a live probe
+          // exactly as before; the promotion-surface preimage and policy
+          // drift guards still run at promotion either way.
+          const prior = reuseCandidateHealthReceipt(receiptFile, expected);
+          if (prior !== null) {
+            if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot);
+            return prior;
+          }
+        }
         const healthRequest = {
           ...expected,
           requestedAt: new Date().toISOString(),

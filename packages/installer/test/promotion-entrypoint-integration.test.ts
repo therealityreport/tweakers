@@ -13,13 +13,15 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import asar from "@electron/asar";
 import {
   buildPromotionHealthExpectation,
+  CANDIDATE_HEALTH_RECEIPT_REUSE_MS,
   fingerprintPromotionPath,
   promotionSurfaceRoots,
+  reuseCandidateHealthReceipt,
   spawnHiddenHealthProbe,
   stageCandidateCodexAuth,
   validateMainRendererAsarEntrypoint,
@@ -89,6 +91,59 @@ const VALID_RENDERER_HTML = `<!doctype html>
 `;
 
 const installSource = readFileSync(new URL("../src/commands/install.ts", import.meta.url), "utf8");
+
+test("a rehydrated promotion reuses only a fresh, fully passing candidate health receipt", () => {
+  const root = mkdtempSync(join(tmpdir(), "candidate-receipt-reuse-"));
+  const receipt = join(root, "health", "promotion.json");
+  const expected = {
+    app: { version: "1.0.0", build: "100", hash: "app-hash" },
+    runtimeHash: "runtime-hash",
+    requiredPermissions: ["accessibility"],
+  };
+  const observedAt = "2026-08-20T12:00:00.000Z";
+  const write = (overrides: Record<string, unknown> = {}) => {
+    mkdirSync(dirname(receipt), { recursive: true });
+    writeFileSync(receipt, JSON.stringify({
+      schemaVersion: 1,
+      observedAt,
+      app: expected.app,
+      runtimeHash: expected.runtimeHash,
+      hostReady: "pass",
+      authenticatedSession: "pass",
+      declaredPermissions: { accessibility: "pass" },
+      ...overrides,
+    }), { mode: 0o600 });
+    chmodSync(receipt, 0o600);
+  };
+  try {
+    const fresh = new Date("2026-08-20T12:05:00.000Z");
+    write();
+    const reused = reuseCandidateHealthReceipt(receipt, expected, { now: fresh });
+    assert.ok(reused);
+    assert.equal(reused.host, "pass");
+    assert.match(reused.detail ?? "", /reused the candidate build's health receipt/);
+
+    // Stale beyond the reuse bound: a live probe must run.
+    assert.equal(
+      reuseCandidateHealthReceipt(receipt, expected, { now: new Date("2026-08-20T12:15:00.001Z") }),
+      null,
+    );
+    assert.equal(CANDIDATE_HEALTH_RECEIPT_REUSE_MS, 15 * 60_000);
+
+    // A failed or unknown session never qualifies.
+    write({ authenticatedSession: "fail" });
+    assert.equal(reuseCandidateHealthReceipt(receipt, expected, { now: fresh }), null);
+
+    // A drifted candidate fingerprint invalidates the receipt outright.
+    write();
+    assert.equal(
+      reuseCandidateHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "drifted" } }, { now: fresh }),
+      null,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("post-promotion health requires a clean probe exit before its receipt can be accepted", () => {
   const start = installSource.indexOf("openApp: (appRoot) => {");
