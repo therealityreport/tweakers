@@ -76,7 +76,7 @@ import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
-import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
+import { cloneOrCopyDirectoryPreservingModes, copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
@@ -1335,7 +1335,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       rmSync(destination, { recursive: true, force: true });
       if (existsSync(runtimeRoot)) {
         mkdirSync(dirname(destination), { recursive: true });
-        copyDirectoryPreservingModes(runtimeRoot, destination);
+        cloneOrCopyDirectoryPreservingModes(runtimeRoot, destination);
       }
       signedBackupWiring.snapshotLive();
     },
@@ -2687,7 +2687,7 @@ function replaceDirectory(source: string, destination: string): void {
   const previous = `${destination}.tweakers-previous-${process.pid}`;
   rmSync(temporary, { recursive: true, force: true });
   rmSync(previous, { recursive: true, force: true });
-  copyDirectoryPreservingModes(source, temporary);
+  cloneOrCopyDirectoryPreservingModes(source, temporary);
   if (existsSync(destination)) renameDirectory(destination, previous);
   try {
     renameDirectory(temporary, destination);
@@ -2744,7 +2744,7 @@ export function stageAppBundleReplacement(
   const incoming = `${destination}.tweakers-contents-swap`;
   const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   const copy = adapters.copyDirectory
-    ?? ((from: string, to: string) => copyDirectoryPreservingModes(from, to));
+    ?? ((from: string, to: string) => cloneOrCopyDirectoryPreservingModes(from, to));
   remove(incoming);
   copy(sourceContents, incoming);
   if (!existsSync(incoming)) throw new Error("Prepared app Contents staging copy is missing");
@@ -3142,7 +3142,7 @@ export function snapshotSignedBackup(liveBackup: string, snapshot: string, marke
   // transaction's marker before copying so an interruption cannot replay it.
   rmSync(marker, { force: true });
   const existed = existsSync(liveBackup);
-  if (existed) copyDirectoryPreservingModes(liveBackup, snapshot);
+  if (existed) cloneOrCopyDirectoryPreservingModes(liveBackup, snapshot);
   const temporary = `${marker}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, existed })}\n`, { mode: 0o600 });
   renameSync(temporary, marker);

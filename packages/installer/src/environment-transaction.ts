@@ -21,7 +21,7 @@ import {
 import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readHeaderHash } from "./asar.js";
-import { copyDirectoryPreservingModes, isMacOsJunkName } from "./fs-copy.js";
+import { cloneOrCopyDirectoryPreservingModes, isMacOsJunkName } from "./fs-copy.js";
 import { desktopVersionAdvanced } from "./desktop-version.js";
 import {
   commitVerifiedOfficialDesktop,
@@ -2613,7 +2613,7 @@ function cloneDirectorySnapshot(source: string, destination: string): void {
   if (!pathEntryExists(source)) throw new Error(`Directory snapshot source is missing at ${source}`);
   rmSync(destination, { recursive: true, force: true });
   mkdirSync(dirname(destination), { recursive: true });
-  copyDirectoryPreservingModes(source, destination);
+  cloneOrCopyDirectoryPreservingModes(source, destination);
 }
 
 function replaceDirectoryAtomically(source: string, destination: string): void {
@@ -2627,7 +2627,7 @@ function replaceDirectoryAtomically(source: string, destination: string): void {
   let replacementMoved = false;
   let previousReleasedOrRestored = false;
   try {
-    copyDirectoryPreservingModes(source, temporary);
+    cloneOrCopyDirectoryPreservingModes(source, temporary);
     if (existsSync(destination)) {
       renameSync(destination, previous);
       previousMoved = true;
