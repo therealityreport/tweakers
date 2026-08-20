@@ -1767,6 +1767,32 @@ export function createDesktopUpdateTransaction(
               rolledBackAt: deps.now(),
             }, true);
           }
+          // The update may equally have died AFTER its cutover to the
+          // official desktop (live failure 2026-08-20: post-cutover stat-seal
+          // validation broke while Sparkle mutated the fresh bundle). Official
+          // liveness is proven by bytes alone - pristine, OpenAI-signed,
+          // marker-absent, visible - because the published selection can
+          // legitimately lag a legacy mode switch (observed stale on the same
+          // live failure). The selection is adopted only when it agrees.
+          try {
+            const live = await deps.inspectLiveOfficialDesktop(existing.official);
+            const selection = recovered.selection;
+            const publishedOfficial = selection !== null
+              && sameEnvironmentSelection(selection, existing.official)
+              && selection.appliedAt !== null;
+            return update(existing, {
+              phase: "rolled_back",
+              ownerPid: process.pid,
+              official: publishedOfficial ? selection : existing.official,
+              officialMainPid: live.mainPid,
+              safeOfficialMode: true,
+              resumable: false,
+              error: "Desktop update owner exited; the live official desktop was proven directly after the sealed pair was released.",
+              rolledBackAt: deps.now(),
+            }, true);
+          } catch {
+            // Fall through to the unsafe conclusion below.
+          }
           return unsafeRecoveryFailure(existing, "sealed-pair recovery did not prove either bound environment live");
         }
         return update(existing, {

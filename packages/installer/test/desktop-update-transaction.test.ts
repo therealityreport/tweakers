@@ -671,6 +671,7 @@ test("cancel of a failed unsafe v2 update proves the source by bytes when the gr
       readDesktopVersion: () => baseline,
       readDesktopBundleIdentifier: () => source.selectedDesktopBundleId,
       readDesktopAsarMarker: () => marker,
+      inspectLiveOfficialDesktop: () => { throw new Error("no pristine official desktop observed"); },
     });
   };
   const failedUnsafeReceipt = () => persistedReceipt({
@@ -700,6 +701,81 @@ test("cancel of a failed unsafe v2 update proves the source by bytes when the gr
     // A marker that contradicts the source experience must keep failing closed.
     writeDesktopUpdateReceipt(fixture.stateFile, failedUnsafeReceipt());
     const transaction = createDesktopUpdateTransaction(fixture, historyAdapter("absent").deps);
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.match(receipt.error ?? "", /did not prove either bound environment live/i);
+  });
+});
+
+test("cancel of a failed unsafe v2 update proves the live official desktop after a cutover", async () => {
+  const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+  const official = selection("chatgpt");
+  const officialDeps = (inspect: () => { version: typeof baseline; mainPid: number }) => {
+    const pair = { ...modeCachePair("mode-generation-1", "chatgpt", baseline), pinState: "stale_requires_prepare" as const };
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => pair,
+      switchCurrent: async () => { throw new Error("unexpected v2 switch"); },
+      prepareAndSwitch: async () => { throw new Error("unexpected v2 preparation"); },
+      recover: async (transactionId) => ({
+        transactionId,
+        phase: "ready",
+        error: null,
+        selection: official,
+        targetMainPid: null,
+        pair,
+      }),
+    };
+    return dependencies({
+      modeCacheV2,
+      // The published selection legitimately lags a legacy mode switch
+      // (observed live 2026-08-20): it still says tweakers while the official
+      // desktop is provably live. The proof must not depend on it.
+      readCurrentSelection: () => selection("tweakers"),
+      readDesktopVersion: () => ({ marketingVersion: "26.810.52044", build: "6662" }),
+      readDesktopAsarMarker: () => "absent",
+      inspectLiveOfficialDesktop: inspect,
+    });
+  };
+  const failedUnsafeReceipt = () => persistedReceipt({
+    phase: "failed",
+    source: selection("tweakers"),
+    official,
+    baseline,
+    safeOfficialMode: false,
+    resumable: false,
+    error: "Environment mode cache tree stat seal mismatch at /Applications/ChatGPT.app",
+    environmentTransactionId: "mode-generation-1",
+    environmentTransactionKind: "mode-cache-v2",
+  });
+
+  await withFixture(async (fixture) => {
+    // The live wedge (2026-08-20): cutover to official succeeded, post-cutover
+    // validation failed, and recovery could not prove the tweakers source
+    // because official mode is genuinely live.
+    writeDesktopUpdateReceipt(fixture.stateFile, failedUnsafeReceipt());
+    const transaction = createDesktopUpdateTransaction(
+      fixture,
+      officialDeps(() => ({ version: { marketingVersion: "26.810.52044", build: "6662" }, mainPid: 101 })).deps,
+    );
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.equal(receipt.resumable, false);
+    assert.match(receipt.error ?? "", /live official desktop was proven directly/i);
+  });
+
+  await withFixture(async (fixture) => {
+    // An unprovable official desktop still fails closed.
+    writeDesktopUpdateReceipt(fixture.stateFile, failedUnsafeReceipt());
+    const transaction = createDesktopUpdateTransaction(
+      fixture,
+      officialDeps(() => { throw new Error("no pristine official desktop observed"); }).deps,
+    );
 
     const receipt = await transaction.cancel();
 
