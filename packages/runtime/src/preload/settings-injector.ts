@@ -55,6 +55,7 @@ import {
   createEnvironmentConfigController,
   desktopUpdateStatusPresentation,
   restoreEnvironmentFocus,
+  preparedEnvironmentReceiptNeedsFreshV2Preparation,
   type EnvironmentConfirmationDecision,
 } from "./environment-config-controller";
 import {
@@ -198,6 +199,8 @@ interface EnvironmentStatus {
   schemaVersion: 1;
   selected: EnvironmentSelection;
   channels: Record<EnvironmentReleaseProfile, EnvironmentChannelStatus>;
+  /** Optional sealed-pair evidence from newer installer status readers. */
+  cacheV2?: EnvironmentModeCacheStatus;
   observation?: {
     appExperience: EnvironmentAppExperience | null;
     selectionDrift: boolean;
@@ -206,6 +209,39 @@ interface EnvironmentStatus {
     transitionJournalPresent: boolean;
     freshness: "current" | "contended";
   };
+}
+
+interface EnvironmentModeCacheStatus {
+  schemaVersion: 2;
+  state: "ready" | "preparing" | "stale" | "unavailable";
+  generationId: string | null;
+  roles: {
+    live: { role: "live"; experience: EnvironmentAppExperience; appPath?: string };
+    inactive: { role: "inactive"; experience: EnvironmentAppExperience; appPath?: string };
+  } | null;
+  invalidationReasons: string[];
+  preparation: {
+    generationId: string | null;
+    phase: "idle" | "reserved" | "receipt-published" | "unavailable";
+  };
+  pin: {
+    state: string;
+    pinnedAt: string;
+    releasedAt: string | null;
+    releaseReason: string | null;
+  } | null;
+  supersession: {
+    supersededAt: string | null;
+    replacementGenerationId: string | null;
+  } | null;
+  timings: {
+    preparedAt: string;
+    validatedAt: string;
+    publishedAt: string | null;
+    lastSuccessfulSwitchAt: string | null;
+    lastPreCutoverCancellationAt: string | null;
+    terminalAt: string | null;
+  } | null;
 }
 
 interface EnvironmentHelperSubmission {
@@ -229,8 +265,9 @@ interface EnvironmentHelperStatus {
 }
 
 interface EnvironmentTransaction {
-  schemaVersion?: 1;
+  schemaVersion?: 1 | 2;
   transactionId: string;
+  generationId?: string;
   phase: string;
   error: string | null;
   source?: EnvironmentSelection;
@@ -1824,7 +1861,10 @@ function renderEnvironmentSection(
     const update = cardUpdates.begin("environment-transaction");
     let result: unknown;
     try {
-      result = await ipcRenderer.invoke("tweaker:commit-environment", { transactionId: receipt.transactionId });
+      result = await ipcRenderer.invoke("tweaker:commit-environment", {
+        transactionId: receipt.transactionId,
+        approvalAt: new Date().toISOString(),
+      });
     } catch (error) {
       const detail = `Could not submit environment change: ${safeUiError(error)}`;
       transaction = { ...receipt, error: detail };
@@ -1951,9 +1991,19 @@ function renderEnvironmentSection(
     const receipt = transaction;
     const requested = environmentTransactionRequestedSelection(receipt);
     const helperInFlight = environmentHelperIsInFlight(receipt);
+    const stalePreparedGeneration = preparedEnvironmentReceiptNeedsFreshV2Preparation(
+      receipt,
+      environment?.cacheV2,
+    );
+    if (stalePreparedGeneration) {
+      card.appendChild(rowSimple(
+        "Fresh preparation required",
+        "The submitted confirmation refers to a stale sealed-pair generation. Cancel it and prepare again; it will not switch automatically.",
+      ));
+    }
     card.appendChild(environmentTransactionRow(receipt, {
       busy: isEnvironmentBusy(),
-      onResume: receipt.phase === "prepared" && requested && !helperInFlight
+      onResume: receipt.phase === "prepared" && requested && !helperInFlight && !stalePreparedGeneration
         ? () => openPreparedEnvironmentConfirmation(requested, receipt)
         : undefined,
       onCancel: (receipt.phase === "preparing" || receipt.phase === "prepared") && !helperInFlight
@@ -1970,6 +2020,7 @@ function renderEnvironmentSection(
     const selected = currentSelection();
     if (!selected || !environment) {
       card.appendChild(rowSimple("Environment unavailable", "The current environment selection could not be loaded."));
+      if (environment?.cacheV2) card.appendChild(environmentModeCacheRow(environment.cacheV2));
       appendEnvironmentTransactionRow();
       if (environmentActionError && environmentActionError !== transaction?.error) {
         card.appendChild(rowSimple("Environment action failed", environmentActionError));
@@ -1998,6 +2049,8 @@ function renderEnvironmentSection(
           : `Saved mode is ${environmentExperienceLabel(selected.appExperience)}, but the live app proves ${environmentExperienceLabel(observedExperience)}. Run tweaker repair in Terminal.`;
       card.appendChild(rowSimple("Environment needs repair", detail));
     }
+
+    if (environment.cacheV2) card.appendChild(environmentModeCacheRow(environment.cacheV2));
 
     const pendingAvailability = environmentSelectionAvailability(environment, pending);
     const chatgptAvailability = environmentSelectionAvailability(environment, {
@@ -2151,7 +2204,7 @@ function renderEnvironmentSection(
       const previous = transaction;
       transaction = normalizeEnvironmentTransaction(result);
       if (
-        transaction?.phase === "prepared"
+        transaction
         && !transaction.helper
         && previous?.transactionId === transaction.transactionId
         && previous.helper
@@ -2254,7 +2307,16 @@ function environmentTransactionRequestedSelection(
 }
 
 function environmentTransactionIsTerminal(phase: string): boolean {
-  return ["committed", "completed", "rolled-back", "rolled_back", "failed", "cancelled"].includes(phase);
+  return [
+    "committed",
+    "completed",
+    "rolled-back",
+    "rolled_back",
+    "ready",
+    "stale_requires_prepare",
+    "failed",
+    "cancelled",
+  ].includes(phase);
 }
 
 function environmentChoiceRow(
@@ -2320,6 +2382,43 @@ function environmentProfileLabel(value: EnvironmentReleaseProfile): string {
   return value === "alpha" ? "Alpha (Pre-release)" : "Stable";
 }
 
+function environmentModeCacheRow(cache: EnvironmentModeCacheStatus): HTMLElement {
+  const roles = cache.roles
+    ? `Live: ${environmentExperienceLabel(cache.roles.live.experience)}; inactive: ${environmentExperienceLabel(cache.roles.inactive.experience)}.`
+    : null;
+  const generation = cache.generationId ? `Generation ${cache.generationId}.` : "No published generation.";
+  const preparation = cache.preparation.generationId
+    ? `Preparation ${cache.preparation.phase} for ${cache.preparation.generationId}.`
+    : null;
+  const pin = cache.pin
+    ? `Pin ${cache.pin.state}${cache.pin.releasedAt ? `; released ${cache.pin.releasedAt}` : `; pinned ${cache.pin.pinnedAt}`}.`
+    : null;
+  const supersession = cache.supersession?.supersededAt
+    ? `Superseded ${cache.supersession.supersededAt}${cache.supersession.replacementGenerationId ? ` by ${cache.supersession.replacementGenerationId}` : ""}.`
+    : null;
+  const timings = cache.timings
+    ? `Prepared ${cache.timings.preparedAt}; validated ${cache.timings.validatedAt}${cache.timings.lastSuccessfulSwitchAt ? `; last ready ${cache.timings.lastSuccessfulSwitchAt}` : ""}.`
+    : null;
+  const reason = cache.invalidationReasons[0] ?? null;
+  const staleSafety = cache.state === "stale"
+    ? " This prepared generation is stale and requires fresh preparation; it will not switch automatically."
+    : "";
+  const row = actionRow(
+    "Sealed pair cache",
+    [cache.state, generation, roles, preparation, pin, supersession, timings, reason].filter((value): value is string => Boolean(value)).join(" · ") + staleSafety,
+  );
+  const left = row.firstElementChild as HTMLElement | null;
+  if (left) {
+    left.prepend(statusBadge(
+      cache.state === "ready" ? "ok" : cache.state === "unavailable" ? "warn" : "warn",
+      cache.state === "ready" ? "Ready" : environmentTransactionLabel(cache.state),
+    ));
+  }
+  row.setAttribute("role", "status");
+  row.setAttribute("aria-live", "polite");
+  return row;
+}
+
 function normalizeEnvironmentStatus(value: unknown): EnvironmentStatus | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<EnvironmentStatus>;
@@ -2327,6 +2426,7 @@ function normalizeEnvironmentStatus(value: unknown): EnvironmentStatus | null {
   if (!selected || (selected.appExperience !== "chatgpt" && selected.appExperience !== "tweakers") || (selected.releaseProfile !== "stable" && selected.releaseProfile !== "alpha")) return null;
   const channels = candidate.channels as Partial<Record<EnvironmentReleaseProfile, EnvironmentChannelStatus>> | undefined;
   const rawObservation = candidate.observation;
+  const cacheV2 = normalizeEnvironmentModeCacheStatus(candidate.cacheV2);
   const observation = rawObservation
     && (rawObservation.appExperience === null
       || rawObservation.appExperience === "chatgpt"
@@ -2348,7 +2448,45 @@ function normalizeEnvironmentStatus(value: unknown): EnvironmentStatus | null {
       alpha: channels?.alpha ?? { available: false, unavailableReasons: ["Alpha (Pre-release) availability was not reported."], releaseProfile: "alpha" },
     },
     ...(observation ? { observation } : {}),
+    ...(cacheV2 ? { cacheV2 } : {}),
   };
+}
+
+function normalizeEnvironmentModeCacheStatus(value: unknown): EnvironmentModeCacheStatus | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<EnvironmentModeCacheStatus>;
+  if (candidate.schemaVersion !== 2
+    || !["ready", "preparing", "stale", "unavailable"].includes(candidate.state ?? "")
+    || (candidate.generationId !== null && typeof candidate.generationId !== "string")
+    || !Array.isArray(candidate.invalidationReasons)
+    || !candidate.invalidationReasons.every((reason) => typeof reason === "string")
+    || !candidate.preparation
+    || !["idle", "reserved", "receipt-published", "unavailable"].includes(candidate.preparation.phase)
+    || (candidate.preparation.generationId !== null && typeof candidate.preparation.generationId !== "string")) return undefined;
+  const roles = candidate.roles;
+  if (roles !== null && roles !== undefined
+    && (roles.live?.role !== "live"
+      || roles.inactive?.role !== "inactive"
+      || !isEnvironmentModeExperience(roles.live?.experience)
+      || !isEnvironmentModeExperience(roles.inactive?.experience))) return undefined;
+  return {
+    schemaVersion: 2,
+    state: candidate.state as EnvironmentModeCacheStatus["state"],
+    generationId: candidate.generationId ?? null,
+    roles: roles ?? null,
+    invalidationReasons: candidate.invalidationReasons,
+    preparation: {
+      generationId: candidate.preparation.generationId ?? null,
+      phase: candidate.preparation.phase as EnvironmentModeCacheStatus["preparation"]["phase"],
+    },
+    pin: candidate.pin ?? null,
+    supersession: candidate.supersession ?? null,
+    timings: candidate.timings ?? null,
+  };
+}
+
+function isEnvironmentModeExperience(value: unknown): value is EnvironmentAppExperience {
+  return value === "chatgpt" || value === "tweakers";
 }
 
 function normalizeEnvironmentTransaction(value: unknown): EnvironmentTransaction | null {
@@ -2386,7 +2524,10 @@ function environmentHelperIsInFlight(transaction: EnvironmentTransaction): boole
 }
 
 function environmentTransactionCanRecover(transaction: EnvironmentTransaction): boolean {
-  if (transaction.phase === "failed") return transaction.prepared !== null && transaction.prepared !== undefined;
+  if (transaction.phase === "failed") {
+    return transaction.schemaVersion === 2
+      || (transaction.prepared !== null && transaction.prepared !== undefined);
+  }
   return ["committing", "applying", "reopening", "verifying", "rolling-back"].includes(transaction.phase);
 }
 

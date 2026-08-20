@@ -356,6 +356,7 @@ prog
   .option("--release-profile", "Release profile: stable or alpha")
   .option("--bundled-derived-receipt", "Validated bundled-derived Codex receipt (prepare only)")
   .option("--transaction", "Durable environment transaction ID")
+  .option("--approval-at", "Deliberate approval timestamp forwarded to the detached mode helper")
   .option("--app-path", "Exact absolute path to a user-selected OpenAI Beta .app (register-alpha only)")
   .option("--app", "Alias for --app-path")
   .option("--observe", "Read persisted and observed environment state without taking the lifecycle lock")

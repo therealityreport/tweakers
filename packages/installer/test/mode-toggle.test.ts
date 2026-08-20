@@ -280,6 +280,78 @@ test("production mode compatibility prepares before one confirmation and commits
   });
 });
 
+test("production mode records approval immediately before its environment commit", async () => {
+  await withTweakersHome(async () => {
+    const observed: Array<{ action: string; approvalAt?: string }> = [];
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      now: () => "2026-08-18T12:00:00.000Z",
+      environmentCommand: async (action, options) => {
+        observed.push({ action, approvalAt: options.approvalAt });
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "commit") return compatibilityEnvironmentResult("committed");
+        throw new Error(`unexpected environment action ${action}`);
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+    assert.deepEqual(observed.map(({ action, approvalAt }) => ({ action, approvalAt })), [
+      { action: "status", approvalAt: undefined },
+      { action: "prepare", approvalAt: undefined },
+      { action: "commit", approvalAt: "2026-08-18T12:00:00.000Z" },
+    ]);
+  });
+});
+
+test("production mode keeps the chatgpt/tweakers command names while carrying a v2 generation through confirmation and warm commit", async () => {
+  await withTweakersHome(async () => {
+    const sequence: string[] = [];
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      now: () => "2026-08-18T12:00:00.000Z",
+      environmentCommand: async (action, options) => {
+        if (action === "status") {
+          sequence.push("status");
+          return compatibilityEnvironmentResult("status");
+        }
+        if (action === "prepare") {
+          sequence.push(`prepare:${options.appExperience}:${options.releaseProfile}`);
+          return {
+            state: "ready",
+            receipt: { generationId: "mode-v2-generation" },
+          } as unknown as EnvironmentCommandResult;
+        }
+        if (action === "commit") {
+          sequence.push(`commit:${options.transaction}:${options.approvalAt}`);
+          return {
+            kind: "environment-warm-commit",
+            transactionId: "mode-v2-generation",
+            phase: "ready",
+            sourceMainPid: 101,
+            targetMainPid: 202,
+            error: null,
+          } as unknown as EnvironmentCommandResult;
+        }
+        throw new Error(`unexpected environment action ${action}`);
+      },
+      confirm: ({ target, appRoot }) => {
+        sequence.push(`confirm:${target}:${appRoot}`);
+        return true;
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+
+    assert.deepEqual(sequence, [
+      "status",
+      "prepare:chatgpt:stable",
+      "confirm:chatgpt:/Applications/ChatGPT.app",
+      "commit:mode-v2-generation:2026-08-18T12:00:00.000Z",
+    ]);
+  });
+});
+
 test("production mode refuses a persisted-selection and live-marker drift before no-op", async () => {
   await withTweakersHome(async () => {
     const status = compatibilityEnvironmentResult("status") as Extract<

@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import {
+  bindVerifiedPreparedContentsExchange,
   loadVerifiedSwapHost,
   readSwapHostIdentity,
   replaceAppBundlePreservingIdentity,
@@ -187,6 +188,59 @@ test("the atomic bundle exchange uses the caller's verified swap function", () =
     // refused; the injected receipt-owned helper is what makes this possible.
     assert.equal(swapped.length, 1);
     assert.equal(swapped[0][1], join(destination, "Contents"));
+  });
+});
+
+test("the warm exchange primitive binds one verified native host to the exact prepared Contents pair", () => {
+  withTempRoot("tweaker-warm-native-exchange-", (root) => {
+    const live = join(root, "live.app", "Contents");
+    const inactive = join(root, "inactive.app", "Contents");
+    mkdirSync(live, { recursive: true });
+    mkdirSync(inactive, { recursive: true });
+    const calls: string[] = [];
+    const exchange = bindVerifiedPreparedContentsExchange(
+      live,
+      inactive,
+      {
+        path: join(root, "prepared", "swap.node"),
+        digest: "a".repeat(64),
+        strict: true,
+        designatedRequirement: "designated => example",
+        teamIdentifier: "2DC432GLL2",
+        authority: ["Developer ID Application: Example"],
+        certificateLeafHash: "abc123",
+      },
+      {
+        loadSwapHost: () => {
+          calls.push("load-verified-host");
+          return (first, second) => { calls.push(`native:${first}:${second}`); };
+        },
+      },
+    );
+
+    exchange(live, inactive);
+    assert.deepEqual(calls, ["load-verified-host", `native:${live}:${inactive}`]);
+    assert.throws(
+      () => exchange(inactive, live),
+      /bound to its exact prepared live\/inactive paths/,
+    );
+    assert.throws(
+      () => bindVerifiedPreparedContentsExchange(
+        live,
+        join(root, "missing.app", "Contents"),
+        {
+          path: join(root, "prepared", "swap.node"),
+          digest: "a".repeat(64),
+          strict: true,
+          designatedRequirement: "designated => example",
+          teamIdentifier: "2DC432GLL2",
+          authority: [],
+          certificateLeafHash: null,
+        },
+        { loadSwapHost: () => () => undefined },
+      ),
+      /must be a real directory/,
+    );
   });
 });
 

@@ -13,6 +13,7 @@ import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../m
 import { readConfigFile } from "../config.js";
 import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
@@ -34,6 +35,31 @@ export async function status(): Promise<void> {
   console.log(`  receipt:      ${desktopUpdate.receiptPath}`);
   console.log(`  log:          ${desktopUpdate.logPath}`);
   if (desktopUpdate.receiptError) console.log(`  error:        ${kleur.red(desktopUpdate.receiptError)}`);
+  console.log();
+
+  // Status never prepares a sealed pair or writes cache metadata. It only
+  // renders the last atomically published receipt, when one exists.
+  const cacheV2 = observeEnvironmentModeCache(environmentModeCachePaths(paths.root));
+  console.log(kleur.bold("environment mode cache"));
+  console.log(`  state:        ${cacheV2.state}`);
+  console.log(`  generation:   ${cacheV2.generationId ?? "(none)"}`);
+  if (cacheV2.roles) {
+    console.log(`  roles:        live ${cacheV2.roles.live.experience}; inactive ${cacheV2.roles.inactive.experience}`);
+  }
+  console.log(`  preparation:  ${cacheV2.preparation.phase}${cacheV2.preparation.generationId ? ` (${cacheV2.preparation.generationId})` : ""}`);
+  if (cacheV2.pin) {
+    console.log(`  pin:          ${cacheV2.pin.state}${cacheV2.pin.releasedAt ? ` (released ${cacheV2.pin.releasedAt})` : ` (pinned ${cacheV2.pin.pinnedAt})`}`);
+  }
+  if (cacheV2.supersession?.supersededAt) {
+    console.log(`  superseded:   ${cacheV2.supersession.supersededAt}${cacheV2.supersession.replacementGenerationId ? ` by ${cacheV2.supersession.replacementGenerationId}` : ""}`);
+  }
+  if (cacheV2.timings) {
+    console.log(`  prepared:     ${cacheV2.timings.preparedAt}; validated ${cacheV2.timings.validatedAt}`);
+    if (cacheV2.timings.lastSuccessfulSwitchAt) console.log(`  last switch:  ${cacheV2.timings.lastSuccessfulSwitchAt}`);
+  }
+  if (cacheV2.invalidationReasons.length > 0) {
+    console.log(`  evidence:     ${cacheV2.invalidationReasons.join("; ")}`);
+  }
   console.log();
 
   if (!state) {

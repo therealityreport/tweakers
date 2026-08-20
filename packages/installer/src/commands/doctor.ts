@@ -18,6 +18,7 @@ import {
   type McpLifecycleHealthReport,
 } from "../mcp-lifecycle-health.js";
 import { loadEnvironmentState } from "../environment-profile.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
 
 interface Check {
   name: string;
@@ -53,13 +54,22 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     detail: item.detail,
   })));
 
+  // This is a presentation-only read. In particular it must not create the
+  // default-off cache directory while doctor is checking an ordinary install.
+  const cacheV2 = observeEnvironmentModeCache(environmentModeCachePaths(paths.root));
+  checks.push({
+    name: "environment mode cache",
+    ok: environmentModeCacheDoctorStatus(cacheV2),
+    detail: describeEnvironmentModeCache(cacheV2),
+  });
+
   if (!state) {
     checks.push({
       name: "installed",
       ok: false,
       detail: "no state file — run `tweaker install`",
     });
-    print(checks, options, lifecycle);
+    print(checks, options, lifecycle, cacheV2);
     return;
   }
 
@@ -95,7 +105,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
       ok: false,
       detail: (e as Error).message,
     });
-    print(checks, options, lifecycle);
+    print(checks, options, lifecycle, cacheV2);
     return;
   }
 
@@ -194,7 +204,26 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     });
   }
 
-  print(checks, options, lifecycle);
+  print(checks, options, lifecycle, cacheV2);
+}
+
+function describeEnvironmentModeCache(cache: ReturnType<typeof observeEnvironmentModeCache>): string {
+  const generation = cache.generationId ? `generation ${cache.generationId}` : "no generation";
+  const reason = cache.invalidationReasons[0];
+  return `${cache.state}; ${generation}${reason ? `; ${reason}` : ""}`;
+}
+
+function environmentModeCacheDoctorStatus(
+  cache: ReturnType<typeof observeEnvironmentModeCache>,
+): Check["ok"] {
+  // The sealed pair is default-off. A clean install that has never prepared
+  // one is healthy, not a warning. Only evidence of an attempted pair that
+  // became stale/unreadable needs operator attention.
+  if (cache.state === "ready") return true;
+  if (cache.state === "unavailable"
+    && cache.invalidationReasons.length === 1
+    && cache.invalidationReasons[0] === "no environment mode cache has been published") return true;
+  return "warn";
 }
 
 function hasCodexStorageKeychainItem(): boolean {
@@ -219,6 +248,7 @@ function print(
   checks: Check[],
   options: DoctorOptions,
   lifecycle: McpLifecycleHealthReport,
+  cacheV2: ReturnType<typeof observeEnvironmentModeCache>,
 ): void {
   const failed = checks.filter((c) => c.ok === false).length;
   if (options.json) {
@@ -231,6 +261,7 @@ function print(
         detail: item.detail,
       })),
       mcpLifecycle: lifecycle,
+      cacheV2,
     }));
     if (failed > 0) process.exitCode = 1;
     return;

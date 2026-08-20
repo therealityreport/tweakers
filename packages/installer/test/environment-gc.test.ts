@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +16,17 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
 import { runEnvironmentTransactionGc } from "../src/environment-gc";
+import {
+  acquireCurrentEnvironmentModePairWarmCommitLease,
+  environmentModeCacheGenerationPaths,
+  environmentModeCachePaths,
+  finalizeEnvironmentModePairReceipt,
+  publishEnvironmentModePair,
+  sealEnvironmentModeCacheTree,
+  type EnvironmentModeCacheContentsIdentity,
+  type EnvironmentModeCacheOuterAppEvidence,
+  type EnvironmentModePairReceipt,
+} from "../src/environment-mode-cache";
 import {
   createEnvironmentProfileRegistry,
   createEnvironmentSelection,
@@ -23,6 +38,11 @@ import {
   type EnvironmentTransactionReceipt,
   type PreparedEnvironmentEvidence,
 } from "../src/environment-transaction";
+import {
+  captureEnvironmentModeCacheContentsIdentity,
+  writeEnvironmentWarmCommitReceipt,
+} from "../src/environment-warm-commit";
+import { createEnvironmentTiming } from "../src/environment-timing";
 
 const BASE = "2026-07-17T01:00:00.000Z";
 
@@ -149,7 +169,184 @@ function fixture() {
   return { root, receiptRoot, transactionFile, add };
 }
 
-test("dry run keeps active, non-terminal, live-owner, symlinked roots, and newest rollback artifacts", () => {
+/** Build one fully materialized, terminally proved v2 pair in this disposable GC fixture. */
+function makeProvedCurrentV2Pair(root: string): ReturnType<typeof environmentModeCachePaths> {
+  const physicalRoot = realpathSync(root);
+  const paths = environmentModeCachePaths(physicalRoot);
+  const generation = environmentModeCacheGenerationPaths(paths, "proved-v2-generation");
+  const liveAppPath = join(physicalRoot, "v2-live", "ChatGPT.app");
+  const writeApp = (appPath: string, marker: string): void => {
+    mkdirSync(join(appPath, "Contents", "Resources"), { recursive: true });
+    mkdirSync(join(appPath, "outer-only"), { recursive: true });
+    writeFileSync(join(appPath, "Contents", "Resources", "app.asar"), `${marker}-asar`);
+    writeFileSync(join(appPath, "Contents", "Resources", "payload.txt"), marker);
+    writeFileSync(join(appPath, "outer-only", "retained.txt"), marker);
+  };
+  const writeTree = (path: string, marker: string): void => {
+    mkdirSync(join(path, "nested"), { recursive: true });
+    writeFileSync(join(path, "artifact.txt"), marker);
+    writeFileSync(join(path, "nested", "leaf.txt"), marker);
+  };
+  writeApp(liveAppPath, "v2-source");
+  writeApp(generation.inactiveAppPath, "v2-target");
+  writeTree(generation.runtimeRoot, "v2-runtime");
+  writeTree(generation.managedRuntimeRoot, "v2-managed-runtime");
+  const backendRoot = join(physicalRoot, "v2-backend");
+  const nativeHostRoot = join(physicalRoot, "v2-native-host");
+  writeTree(backendRoot, "v2-backend");
+  writeTree(nativeHostRoot, "v2-native-host");
+  writeFileSync(join(nativeHostRoot, "host"), "native-host");
+
+  const hash = "a".repeat(64);
+  const evidence = (appPath: string, marker: "source" | "target") => ({
+    bundleId: "com.openai.codex" as const,
+    version: "26.818.1",
+    build: "9001",
+    appDigest: marker === "source" ? "b".repeat(64) : "c".repeat(64),
+    asarPath: join(appPath, "Contents", "Resources", "app.asar"),
+    asarDigest: marker === "source" ? "d".repeat(64) : "e".repeat(64),
+    asarHeaderDigest: marker === "source" ? "f".repeat(64) : "1".repeat(64),
+    signature: {
+      strict: true,
+      gatekeeper: true,
+      teamIdentifier: "2DC432GLL2",
+      designatedRequirement: 'designated => identifier "com.openai.codex"',
+      signatureDigest: marker === "source" ? "2".repeat(64) : "3".repeat(64),
+    },
+  });
+  const artifact = (rootPath: string, digest = hash) => ({ rootPath, digest, fileCount: 3, provenanceDigest: digest });
+  const raw: EnvironmentModePairReceipt = {
+    schemaVersion: 2,
+    kind: "environment-mode-pair",
+    generationId: generation.generationId,
+    releaseProfile: "stable",
+    paths: {
+      cacheRoot: paths.cacheRoot,
+      currentFile: paths.currentFile,
+      generationRoot: generation.generationRoot,
+      receiptFile: generation.receiptFile,
+      inactiveAppPath: generation.inactiveAppPath,
+      runtimeRoot: generation.runtimeRoot,
+      managedRuntimeRoot: generation.managedRuntimeRoot,
+    },
+    roles: {
+      live: { role: "live", experience: "chatgpt", appPath: liveAppPath, evidence: evidence(liveAppPath, "source") },
+      inactive: { role: "inactive", experience: "tweakers", appPath: generation.inactiveAppPath, evidence: evidence(generation.inactiveAppPath, "target") },
+    },
+    tweakers: {
+      buildDigest: hash,
+      patchPayloadDigest: hash,
+      sourceControlDigest: hash,
+      runtime: artifact(generation.runtimeRoot, "4".repeat(64)),
+      managedRuntime: artifact(generation.managedRuntimeRoot, "5".repeat(64)),
+      backend: { ...artifact(backendRoot, "6".repeat(64)), lane: "bundled", version: "0.145.0" },
+      nativeHost: { ...artifact(nativeHostRoot, "7".repeat(64)), executablePath: join(nativeHostRoot, "host") },
+    },
+    seals: {
+      liveApp: sealEnvironmentModeCacheTree(liveAppPath),
+      inactiveApp: sealEnvironmentModeCacheTree(generation.inactiveAppPath),
+      runtime: sealEnvironmentModeCacheTree(generation.runtimeRoot),
+      managedRuntime: sealEnvironmentModeCacheTree(generation.managedRuntimeRoot),
+    },
+    invalidation: {
+      official: {
+        version: "26.818.1", build: "9001", trustDigest: hash, signatureDigest: hash,
+        asarDigest: hash, asarHeaderDigest: hash, backendDigest: hash, updaterDigest: hash,
+      },
+      tweakers: {
+        sourceDigest: hash, buildDigest: hash, patchPayloadDigest: hash, runtimeDigest: "4".repeat(64),
+        managedRuntimeDigest: "5".repeat(64), backendDigest: "6".repeat(64), nativeHostDigest: "7".repeat(64),
+      },
+      environment: {
+        profileDigest: hash,
+        pathsDigest: hash,
+        contentsDevice: statSync(join(liveAppPath, "Contents")).dev.toString(),
+        statSealDigest: hash,
+        mcpHelperDigest: hash,
+        lifecycleJournalDigest: hash,
+      },
+      receiptDigest: hash,
+    },
+    timestamps: {
+      preparedAt: BASE,
+      validatedAt: BASE,
+      publishedAt: null,
+      lastSuccessfulSwitchAt: null,
+      lastPreCutoverCancellationAt: null,
+      terminalAt: null,
+    },
+    pin: { state: "prepared", pinnedAt: BASE, releasedAt: null, releaseReason: null },
+    supersession: { supersededAt: null, replacementGenerationId: null },
+  };
+  publishEnvironmentModePair(paths, finalizeEnvironmentModePairReceipt(raw), { now: () => BASE });
+  const lease = acquireCurrentEnvironmentModePairWarmCommitLease(paths);
+  try {
+    const pair = lease.receipt;
+    const contents = (appPath: string): EnvironmentModeCacheContentsIdentity =>
+      captureEnvironmentModeCacheContentsIdentity(join(appPath, "Contents"));
+    const outer = (appPath: string): EnvironmentModeCacheOuterAppEvidence => {
+      const stat = lstatSync(appPath, { bigint: true });
+      return {
+        path: appPath,
+        stat: {
+          relativePath: "", type: "directory", dev: stat.dev.toString(), ino: stat.ino.toString(),
+          size: stat.size.toString(), mode: stat.mode.toString(), mtimeNs: stat.mtimeNs.toString(),
+          ctimeNs: stat.ctimeNs.toString(), symlinkTarget: null,
+        },
+        uid: stat.uid.toString(), gid: stat.gid.toString(),
+        aclDigest: hash, xattrDigest: hash, quarantineDigest: hash,
+      };
+    };
+    const before = {
+      liveContentsBefore: contents(pair.roles.live.appPath),
+      inactiveContentsBefore: contents(pair.paths.inactiveAppPath),
+      liveOuterBefore: outer(pair.roles.live.appPath),
+      inactiveOuterBefore: outer(pair.paths.inactiveAppPath),
+    };
+    const temporary = join(physicalRoot, "v2-contents-swap-temporary");
+    renameSync(before.liveContentsBefore.path, temporary);
+    renameSync(before.inactiveContentsBefore.path, before.liveContentsBefore.path);
+    renameSync(temporary, before.inactiveContentsBefore.path);
+    lease.completeContentsExchange({
+      ...before,
+      liveContentsAfter: contents(pair.roles.live.appPath),
+      inactiveContentsAfter: contents(pair.paths.inactiveAppPath),
+      liveOuterAfter: outer(pair.roles.live.appPath),
+      inactiveOuterAfter: outer(pair.paths.inactiveAppPath),
+    }, "2026-07-17T03:00:00.000Z");
+    const terminal = lease.completeTerminalTargetProof();
+    writeEnvironmentWarmCommitReceipt(join(terminal.paths.generationRoot, "warm-commit.json"), {
+      schemaVersion: 1,
+      kind: "environment-warm-commit",
+      transactionId: "proved-v2-warm-commit",
+      generationId: terminal.generationId,
+      pairReceiptDigest: terminal.invalidation.receiptDigest,
+      sourceAppPath: terminal.roles.live.appPath,
+      sourceProjection: null,
+      targetExperience: terminal.roles.live.experience,
+      sourceMainPid: 101,
+      targetMainPid: 202,
+      phase: "ready",
+      error: null,
+      exchangeCount: 1,
+      exchangeBefore: null,
+      recoveryExchangeBefore: null,
+      stamps: [
+        { phase: "terminal-target-proven", at: "2026-07-17T03:00:00.000Z", detail: null },
+        { phase: "ready", at: "2026-07-17T03:00:00.000Z", detail: null },
+      ],
+      timing: { ...createEnvironmentTiming(BASE), readyAt: "2026-07-17T03:00:00.000Z" },
+      createdAt: BASE,
+      updatedAt: "2026-07-17T03:00:00.000Z",
+      terminalAt: "2026-07-17T03:00:00.000Z",
+    });
+  } finally {
+    lease.release();
+  }
+  return paths;
+}
+
+test("dry run keeps active, non-terminal, recovery-owned, unsafe, and newest v1 rollback roots until v2 proof exists", () => {
   const f = fixture();
   try {
     f.add("old-committed", "committed", "2026-07-17T02:01:00.000Z");
@@ -195,13 +392,12 @@ test("dry run keeps active, non-terminal, live-owner, symlinked roots, and newes
     const byId = new Map(result.entries.map((entry) => [entry.transactionId, entry]));
 
     assert.equal(byId.get("current-failed")?.action, "keep");
-    assert.match(byId.get("current-failed")?.reason ?? "", /current environment transaction/);
+    assert.match(byId.get("current-failed")?.reason ?? "", /only copy of its rollback evidence/);
     assert.equal(byId.get("non-terminal")?.action, "keep");
     assert.match(byId.get("non-terminal")?.reason ?? "", /non-terminal/);
     assert.equal(byId.get("new-committed")?.action, "keep");
-    assert.match(byId.get("new-committed")?.reason ?? "", /newest committed rollback/);
-    assert.equal(byId.get("live-owner")?.action, "keep");
-    assert.match(byId.get("live-owner")?.reason ?? "", /still alive/);
+    assert.match(byId.get("new-committed")?.reason ?? "", /newest committed schema-v1 rollback evidence/);
+    assert.equal(byId.get("live-owner")?.action, "delete");
     assert.equal(byId.get("symlinked")?.action, "keep");
     assert.match(byId.get("symlinked")?.reason ?? "", /symlink/);
     assert.equal(byId.get("symlinked-transaction")?.action, "keep");
@@ -210,13 +406,14 @@ test("dry run keeps active, non-terminal, live-owner, symlinked roots, and newes
     assert.equal(byId.get("terminal")?.action, "delete");
     assert.equal(existsSync(join(outside, "sentinel")), true);
     assert.equal(existsSync(join(transactionOutside, "prepared", "sentinel")), true);
-    assert.equal(result.reclaimedBytes, 0);
+    assert.equal(result.reclaimedBytes, 0, "dry-run never reclaims payload bytes");
+    assert.equal(result.retainedRollbackTransactionId, "new-committed");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
 
-test("dry run marks superseded terminal artifacts eligible without deleting them", () => {
+test("dry run retains only the newest committed v1 rollback candidate without deleting it", () => {
   const f = fixture();
   try {
     f.add("old-committed", "committed", "2026-07-17T02:01:00.000Z", 50);
@@ -234,8 +431,67 @@ test("dry run marks superseded terminal artifacts eligible without deleting them
     assert.equal(byId.get("old-committed")?.action, "delete");
     assert.equal(byId.get("terminal")?.action, "delete");
     assert.equal(byId.get("new-committed")?.action, "keep");
+    assert.equal(result.retainedRollbackTransactionId, "new-committed");
     assert.equal(existsSync(join(f.receiptRoot, "old-committed", "prepared")), true);
     assert.ok(result.eligibleBytes > 0);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("an unsafe newer committed v1 tree cannot displace the newest usable rollback evidence", () => {
+  const f = fixture();
+  try {
+    f.add("usable-committed", "committed", "2026-07-17T02:01:00.000Z", 50);
+    const unsafe = f.add("unsafe-newer-committed", "committed", "2026-07-17T02:02:00.000Z", 50);
+    writeEnvironmentTransactionReceipt(f.transactionFile, unsafe);
+    const outside = join(f.root, "unsafe-v1-outside");
+    mkdirSync(outside);
+    rmSync(join(f.receiptRoot, "unsafe-newer-committed", "prepared"), { recursive: true });
+    symlinkSync(outside, join(f.receiptRoot, "unsafe-newer-committed", "prepared"));
+
+    const result = runEnvironmentTransactionGc({
+      receiptRoot: f.receiptRoot,
+      transactionFile: f.transactionFile,
+      mode: "dry-run",
+      processAlive: () => false,
+    });
+    const byId = new Map(result.entries.map((entry) => [entry.transactionId, entry]));
+    assert.equal(result.retainedRollbackTransactionId, "usable-committed");
+    assert.equal(byId.get("usable-committed")?.action, "keep");
+    assert.equal(byId.get("unsafe-newer-committed")?.action, "keep");
+    assert.match(byId.get("unsafe-newer-committed")?.reason ?? "", /symlink/);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a fully materialized current v2 pair with terminal journal proof safely supersedes the newest v1 rollback evidence", () => {
+  const f = fixture();
+  try {
+    f.add("old-committed", "committed", "2026-07-17T02:01:00.000Z", 50);
+    const newest = f.add("new-committed", "committed", "2026-07-17T02:02:00.000Z", 50);
+    writeEnvironmentTransactionReceipt(f.transactionFile, newest);
+    const beforeV2Proof = runEnvironmentTransactionGc({
+      receiptRoot: f.receiptRoot,
+      transactionFile: f.transactionFile,
+      mode: "dry-run",
+      processAlive: () => false,
+    });
+    assert.equal(beforeV2Proof.retainedRollbackTransactionId, "new-committed");
+    assert.equal(beforeV2Proof.entries.find((entry) => entry.transactionId === "new-committed")?.action, "keep");
+
+    const cachePaths = makeProvedCurrentV2Pair(f.root);
+    const afterV2Proof = runEnvironmentTransactionGc({
+      receiptRoot: f.receiptRoot,
+      transactionFile: f.transactionFile,
+      cachePaths,
+      mode: "dry-run",
+      processAlive: () => false,
+    });
+    assert.equal(afterV2Proof.retainedRollbackTransactionId, null);
+    assert.equal(afterV2Proof.entries.find((entry) => entry.transactionId === "old-committed")?.action, "delete");
+    assert.equal(afterV2Proof.entries.find((entry) => entry.transactionId === "new-committed")?.action, "delete");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -349,6 +605,7 @@ test("apply deletes only after revalidation and refuses a phase drift", () => {
   try {
     const drifting = f.add("drifting", "cancelled", "2026-07-17T02:01:00.000Z");
     const newest = f.add("new-committed", "committed", "2026-07-17T02:02:00.000Z");
+    f.add("other-terminal", "cancelled", "2026-07-17T02:02:30.000Z");
     writeEnvironmentTransactionReceipt(f.transactionFile, newest);
     let changed = false;
 
@@ -372,7 +629,7 @@ test("apply deletes only after revalidation and refuses a phase drift", () => {
     assert.equal(entry?.action, "keep");
     assert.match(entry?.reason ?? "", /revalidation refused.*non-terminal/);
     assert.equal(existsSync(join(f.receiptRoot, "drifting", "prepared")), true);
-    assert.equal(result.reclaimedBytes, 0);
+    assert.ok(result.reclaimedBytes > 0, "the unrelated terminal payload is reclaimed");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -383,6 +640,7 @@ test("apply revalidation refuses a nested symlink that drifts outside prepared",
   try {
     f.add("drifting-link", "cancelled", "2026-07-17T02:01:00.000Z");
     const newest = f.add("new-committed", "committed", "2026-07-17T02:02:00.000Z");
+    f.add("other-terminal", "cancelled", "2026-07-17T02:02:30.000Z");
     writeEnvironmentTransactionReceipt(f.transactionFile, newest);
     const preparedRoot = join(f.receiptRoot, "drifting-link", "prepared");
     const link = join(preparedRoot, "payload-link");
@@ -410,7 +668,7 @@ test("apply revalidation refuses a nested symlink that drifts outside prepared",
     assert.match(entry?.reason ?? "", /revalidation refused.*outside the canonical prepared directory/);
     assert.equal(existsSync(preparedRoot), true);
     assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "keep");
-    assert.equal(result.reclaimedBytes, 0);
+    assert.ok(result.reclaimedBytes > 0, "the unrelated terminal payload is reclaimed");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

@@ -478,6 +478,53 @@ export function loadVerifiedSwapHost(
   return (first, second) => nativeHost.swapDirectories(first, second);
 }
 
+/**
+ * Bind the already-prepared native swap host to exactly one pair of live and
+ * inactive `Contents` directories. This intentionally has no staging,
+ * helper-installation, copy, build, or canary capability: all of that belongs
+ * to preparation, before deliberate approval.
+ */
+export function bindVerifiedPreparedContentsExchange(
+  liveContents: string,
+  inactiveContents: string,
+  swapHost: SwapHostIdentityEvidence & { path: string },
+  deps: {
+    loadSwapHost?: typeof loadVerifiedSwapHost;
+  } = {},
+): (first: string, second: string) => void {
+  assertDirectContentsExchangePath(liveContents, "live Contents");
+  assertDirectContentsExchangePath(inactiveContents, "inactive Contents");
+  if (lstatSync(liveContents, { bigint: true }).dev !== lstatSync(inactiveContents, { bigint: true }).dev) {
+    throw new Error("Prepared Contents exchange directories must share one filesystem device");
+  }
+  const nativeExchange = (deps.loadSwapHost ?? loadVerifiedSwapHost)(swapHost);
+  return (first, second) => {
+    if (first !== liveContents || second !== inactiveContents) {
+      throw new Error("Verified Contents exchange is bound to its exact prepared live/inactive paths");
+    }
+    // Recheck only the directory shape immediately before the one native call;
+    // cache stat seals and the warm adapter own the stronger identity proof.
+    assertDirectContentsExchangePath(first, "live Contents");
+    assertDirectContentsExchangePath(second, "inactive Contents");
+    nativeExchange(first, second);
+  };
+}
+
+function assertDirectContentsExchangePath(path: string, label: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path || basename(path) !== "Contents") {
+    throw new Error(`Prepared ${label} path must be an exact absolute Contents directory: ${path}`);
+  }
+  let entry: ReturnType<typeof lstatSync>;
+  try {
+    entry = lstatSync(path, { bigint: true });
+  } catch {
+    throw new Error(`Prepared ${label} path must be a real directory: ${path}`);
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new Error(`Prepared ${label} path must be a real directory: ${path}`);
+  }
+}
+
 const HEALTH_PROBE_ENV_KEYS = [
   "PATH",
   "LANG",

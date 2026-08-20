@@ -42,6 +42,12 @@ export interface UserPaths {
   environmentReceiptRoot?: string;
   environmentLockFile?: string;
   environmentRuntimeProofFile?: string;
+  /** Schema-v2 sealed inactive-pair cache paths; no transaction uses these until T3. */
+  environmentModeCacheRoot?: string;
+  environmentModeCacheCurrentFile?: string;
+  environmentModeCacheGenerationsRoot?: string;
+  environmentModeCachePreparationRoot?: string;
+  environmentModeCacheLockFile?: string;
   desktopUpdateReceiptFile?: string;
   desktopUpdateArchiveRoot?: string;
   desktopUpdateLockFile?: string;
@@ -61,6 +67,11 @@ export interface EnvironmentUserPaths {
   environmentLockFile: string;
   environmentRuntimeProofFile: string;
   environmentWatcherPromotionFile: string;
+  environmentModeCacheRoot: string;
+  environmentModeCacheCurrentFile: string;
+  environmentModeCacheGenerationsRoot: string;
+  environmentModeCachePreparationRoot: string;
+  environmentModeCacheLockFile: string;
 }
 
 export interface DesktopUpdateUserPaths {
@@ -107,6 +118,11 @@ export function userPaths(): ResolvedUserPaths {
     desktopUpdateHeartbeatFile: join(root, "transactions", "desktop-update.heartbeat.json"),
     desktopUpdateLogFile: join(root, "log", "desktop-update.log"),
     environmentWatcherPromotionFile: join(root, "transactions", "environment-watcher.json"),
+    environmentModeCacheRoot: join(root, "environment-cache"),
+    environmentModeCacheCurrentFile: join(root, "environment-cache", "current.json"),
+    environmentModeCacheGenerationsRoot: join(root, "environment-cache", "generations"),
+    environmentModeCachePreparationRoot: join(root, "environment-cache", "next"),
+    environmentModeCacheLockFile: join(root, "environment-cache", "environment-mode-cache.lock"),
   };
   return paths;
 }

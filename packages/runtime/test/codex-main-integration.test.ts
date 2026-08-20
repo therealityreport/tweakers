@@ -120,9 +120,10 @@ test("environment IPC stages fixed selections and submits only a validated durab
   );
 
   const commit = extractHandlerBody(mainSource, "tweaker:commit-environment");
-  assert.match(commit, /assertEnvironmentTransactionRequest\(payload\)/);
+  assert.match(commit, /assertEnvironmentCommitRequest\(payload\)/);
   assert.match(commit, /"submit"/);
   assert.match(commit, /"--transaction",\s*payload\.transactionId/);
+  assert.match(commit, /"--approval-at",\s*payload\.approvalAt/);
   const cancel = extractHandlerBody(mainSource, "tweaker:cancel-environment");
   assert.match(cancel, /assertEnvironmentTransactionRequest\(payload\)/);
   assert.match(cancel, /"cancel"/);

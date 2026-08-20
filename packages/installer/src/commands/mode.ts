@@ -86,7 +86,12 @@ import {
   type EnvironmentCommandResult,
   type EnvironmentStatusResult,
 } from "./environment.js";
-import type { EnvironmentTransactionReceipt } from "../environment-transaction.js";
+import type {
+  EnvironmentModeCacheV2PreparationResult,
+  EnvironmentTransactionReceipt,
+} from "../environment-transaction.js";
+import type { EnvironmentWarmCommitReceipt } from "../environment-warm-commit.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache, type EnvironmentModeCacheStatus } from "../environment-mode-cache.js";
 
 export interface ModeCommandOptions {
   json?: boolean;
@@ -124,6 +129,8 @@ export interface ModeCommandDeps {
   environmentCommand?: typeof environment;
   /** @internal Keeps legacy bundle-swap unit fixtures reachable, never production CLI flow. */
   legacyModeEngineForTests?: boolean;
+  /** Test seam for the instant immediately following a deliberate confirmation. */
+  now?: () => string;
 }
 
 export async function mode(
@@ -242,13 +249,18 @@ async function switchEnvironmentExperience(
   const confirmed = opts.yes === true
     || (deps.confirm ?? confirmModeSwitch)({
       target,
-      appRoot: receipt.requested.selectedDesktopPath,
+      appRoot: receipt.kind === "v2"
+        ? status.selected.selectedDesktopPath
+        : receipt.receipt.requested.selectedDesktopPath,
     });
   if (!confirmed) {
     await runEnvironment("cancel", { transaction: receipt.transactionId, quiet: true });
     console.log(kleur.yellow("Mode switch cancelled."));
     return;
   }
+  // This is the only production caller that supplies approvalAt. It is captured
+  // after deliberate user confirmation and before the commit IPC/helper path.
+  const approvalAt = (deps.now ?? (() => new Date().toISOString()))();
   appendLifecycleAuditRecord(ensureUserPaths().desktopUpdateLogFile, {
     event: "user_approval",
     action: `mode-switch:${target}`,
@@ -258,8 +270,25 @@ async function switchEnvironmentExperience(
 
   const committed = await runEnvironment("commit", {
     transaction: receipt.transactionId,
+    approvalAt,
     quiet: true,
   });
+  if (receipt.kind === "v2") {
+    if (!isEnvironmentWarmCommitReceipt(committed) || committed.phase !== "ready") {
+      const phase = isEnvironmentWarmCommitReceipt(committed) ? committed.phase : "invalid";
+      const detail = isEnvironmentWarmCommitReceipt(committed) && committed.error
+        ? `: ${committed.error}`
+        : "";
+      throw new Error(`Environment mode switch did not commit (phase ${phase})${detail}`);
+    }
+    console.log(kleur.green().bold(`✓ Switched to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
+    console.log(
+      kleur.dim(
+        `  Restart verified: PID ${committed.sourceMainPid ?? "unknown"} → ${committed.targetMainPid ?? "unknown"}; activated window at ${status.selected.selectedDesktopPath}`,
+      ),
+    );
+    return;
+  }
   if (!isEnvironmentTransactionReceipt(committed) || committed.phase !== "committed") {
     const phase = isEnvironmentTransactionReceipt(committed) ? committed.phase : "invalid";
     const detail = isEnvironmentTransactionReceipt(committed) && committed.error
@@ -295,12 +324,39 @@ function isEnvironmentTransactionReceipt(
 
 function requirePreparedEnvironmentReceipt(
   value: EnvironmentCommandResult,
-): EnvironmentTransactionReceipt {
+): { kind: "v1"; transactionId: string; receipt: EnvironmentTransactionReceipt } | {
+  kind: "v2";
+  transactionId: string;
+  receipt: NonNullable<EnvironmentModeCacheV2PreparationResult["receipt"]>;
+} {
+  if (isEnvironmentModeCacheV2PreparationResult(value)) {
+    if (value.state !== "ready" || value.receipt === null) {
+      throw new Error(`Environment mode switch preparation did not complete (phase ${value.state})`);
+    }
+    return { kind: "v2", transactionId: value.receipt.generationId, receipt: value.receipt };
+  }
   if (!isEnvironmentTransactionReceipt(value) || value.phase !== "prepared") {
     const phase = isEnvironmentTransactionReceipt(value) ? value.phase : "invalid";
     throw new Error(`Environment mode switch preparation did not complete (phase ${phase})`);
   }
-  return value;
+  return { kind: "v1", transactionId: value.transactionId, receipt: value };
+}
+
+function isEnvironmentModeCacheV2PreparationResult(
+  value: EnvironmentCommandResult,
+): value is EnvironmentModeCacheV2PreparationResult {
+  return "state" in value
+    && (value.state === "disabled" || value.state === "ready")
+    && "receipt" in value;
+}
+
+function isEnvironmentWarmCommitReceipt(
+  value: EnvironmentCommandResult,
+): value is EnvironmentWarmCommitReceipt {
+  return "kind" in value
+    && value.kind === "environment-warm-commit"
+    && "transactionId" in value
+    && typeof value.transactionId === "string";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -320,6 +376,8 @@ interface ModeStatusReport {
    * that omits the key must still decode cleanly.
    */
   rendererPatches?: RendererPatchRecord;
+  /** Additive sealed-pair observation; it does not enable warm switching. */
+  cacheV2: EnvironmentModeCacheStatus;
 }
 
 async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Promise<void> {
@@ -382,6 +440,7 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
       ...(coordinator.reason ? { reason: coordinator.reason } : {}),
     },
     transition: journal ? { target: journal.target, phase: journal.phase, ownerPid: journal.ownerPid } : null,
+    cacheV2: observeEnvironmentModeCache(environmentModeCachePaths(paths.root)),
   };
 
   const rendererRecord = readRendererPatchRecord(
@@ -402,6 +461,17 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
   console.log(`  parked payload: ${report.parkedPayload.present ? kleur.green(`present${report.parkedPayload.baseVersion ? ` (${report.parkedPayload.baseVersion})` : ""}`) : kleur.dim("none")}`);
   console.log(`  pristine backup: ${report.backup.present ? `${report.backup.developerIdValid ? kleur.green("Developer ID valid") : kleur.red("NOT Developer ID signed")}${report.backup.version ? ` (${report.backup.version})` : ""}` : kleur.red("missing")}`);
   console.log(`  mode controls: ${report.switcher.installed ? kleur.green("Menu Bar coordinator ready") : kleur.yellow(`unavailable${report.switcher.reason ? ` — ${report.switcher.reason}` : ""}`)}`);
+  console.log(`  sealed pair:  ${report.cacheV2.state}${report.cacheV2.generationId ? ` (${report.cacheV2.generationId})` : ""}`);
+  console.log(`  pair prepare: ${report.cacheV2.preparation.phase}${report.cacheV2.preparation.generationId ? ` (${report.cacheV2.preparation.generationId})` : ""}`);
+  if (report.cacheV2.pin) {
+    console.log(`  pair pin:     ${report.cacheV2.pin.state}${report.cacheV2.pin.releasedAt ? ` (released ${report.cacheV2.pin.releasedAt})` : ""}`);
+  }
+  if (report.cacheV2.supersession?.supersededAt) {
+    console.log(`  pair superseded: ${report.cacheV2.supersession.supersededAt}${report.cacheV2.supersession.replacementGenerationId ? ` by ${report.cacheV2.supersession.replacementGenerationId}` : ""}`);
+  }
+  if (report.cacheV2.invalidationReasons.length > 0) {
+    console.log(kleur.dim(`  pair evidence: ${report.cacheV2.invalidationReasons.join("; ")}`));
+  }
   const coverage = describeRendererPatchCoverage(report.rendererPatches ?? null, null);
   if (coverage) {
     const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;

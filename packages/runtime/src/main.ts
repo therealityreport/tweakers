@@ -7,7 +7,7 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, Notification, protocol, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
+import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, MenuItem, Notification, protocol, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
 import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as originalFs from "original-fs";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
@@ -178,7 +178,13 @@ import {
   type CodexDesktopUpdateMetadata,
   type CodexDesktopUpdateTarget,
 } from "./codex-desktop-update-service";
-import { syncCodexDesktopUpdateMenuLabel as syncCodexDesktopUpdateMenu } from "./codex-desktop-update-menu";
+import {
+  environmentModeCacheMenuInputFromStatus,
+  syncCodexDesktopUpdateMenuLabel as syncCodexDesktopUpdateMenu,
+  syncEnvironmentModeCacheMenuItem,
+  type CodexDesktopUpdateMenuLike,
+  type EnvironmentModeCacheMenuInput,
+} from "./codex-desktop-update-menu";
 import {
   activeVerifiedCodexDesktopProfileIdentity,
   codexDesktopUpdateTargetForProfile,
@@ -601,6 +607,7 @@ if (!healthCheckOnly) codexCliManager.recover();
 
 const CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
 let lastPublishedCodexDesktopUpdate: CodexDesktopUpdateCheckResult | null = null;
+let lastObservedEnvironmentModeCache: EnvironmentModeCacheMenuInput | null = null;
 let originalSetApplicationMenu: typeof Menu.setApplicationMenu | null = null;
 
 function desktopUpdateResultWithNativeState(
@@ -656,9 +663,28 @@ function syncCodexDesktopUpdateMenuBeforeAttach(
   menu: Electron.Menu,
   result: CodexDesktopUpdateCheckResult | null,
 ): void {
-  syncCodexDesktopUpdateMenu(menu, result?.status === "update-available", () => {
+  syncCodexDesktopUpdateMenu(menu as unknown as CodexDesktopUpdateMenuLike, result?.status === "update-available", () => {
     void requestCodexDesktopManualCheck("application-menu");
   }, !!result?.setupRequired);
+  if (lastObservedEnvironmentModeCache) {
+    syncEnvironmentModeCacheMenuItem(
+      menu as unknown as CodexDesktopUpdateMenuLike,
+      lastObservedEnvironmentModeCache,
+      (item) => new MenuItem(item) as unknown as CodexDesktopUpdateMenuLike["items"][number],
+    );
+  }
+}
+
+function publishEnvironmentModeCacheMenuStatus(input: EnvironmentModeCacheMenuInput): void {
+  lastObservedEnvironmentModeCache = input;
+  const applicationMenu = Menu.getApplicationMenu();
+  if (!applicationMenu || !originalSetApplicationMenu) return;
+  if (!syncEnvironmentModeCacheMenuItem(
+    applicationMenu as unknown as CodexDesktopUpdateMenuLike,
+    input,
+    (item) => new MenuItem(item) as unknown as CodexDesktopUpdateMenuLike["items"][number],
+  )) return;
+  Reflect.apply(originalSetApplicationMenu, Menu, [applicationMenu]);
 }
 
 function rebuildCodexDesktopUpdateMenu(result: CodexDesktopUpdateCheckResult): void {
@@ -3472,6 +3498,16 @@ function assertEnvironmentTransactionRequest(payload: unknown): asserts payload 
   }
 }
 
+function assertEnvironmentCommitRequest(payload: unknown): asserts payload is { transactionId: string; approvalAt: string } {
+  assertExactObjectKeys(payload, ["transactionId", "approvalAt"], "environment commit request");
+  if (typeof payload.transactionId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(payload.transactionId)
+    || typeof payload.approvalAt !== "string"
+    || !Number.isFinite(Date.parse(payload.approvalAt))) {
+    throw new Error("Invalid environment commit request");
+  }
+}
+
 async function ensureManagedAlphaEnvironmentBackend(): Promise<void> {
   let validation = await codexCliManager.validateCurrent();
   if (!validation.valid || !validation.binary) {
@@ -3565,10 +3601,13 @@ ipcMain.handle("tweaker:cancel-codex-desktop-update", async (_e, ...args: unknow
 
 ipcMain.handle("tweaker:get-environment-status", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-environment-status");
-  return runInstalledCliJson(
+  const status = await runInstalledCliJson(
     ["environment", "status", "--observe", "--json"],
     ENVIRONMENT_STATUS_TIMEOUT_MS,
   );
+  const cache = environmentModeCacheMenuInputFromStatus(status);
+  if (cache) publishEnvironmentModeCacheMenuStatus(cache);
+  return status;
 });
 
 // The native runtime owns the file chooser. Renderer code receives only the
@@ -3620,12 +3659,14 @@ ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
 });
 
 ipcMain.handle("tweaker:commit-environment", async (_e, payload: unknown) => {
-  assertEnvironmentTransactionRequest(payload);
+  assertEnvironmentCommitRequest(payload);
   return runInstalledCliJson([
     "environment",
     "submit",
     "--transaction",
     payload.transactionId,
+    "--approval-at",
+    payload.approvalAt,
     "--json",
   ], ENVIRONMENT_ACTION_TIMEOUT_MS);
 });
@@ -5046,7 +5087,9 @@ function attachEnvironmentHelperDiagnostics(value: unknown): unknown {
   const transaction = value as Record<string, unknown>;
   const transactionId = typeof transaction.transactionId === "string" ? transaction.transactionId : "";
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(transactionId)) return value;
-  const helperRoot = join(userRoot!, "transactions", "environment", transactionId);
+  const helperRoot = transaction.schemaVersion === 2
+    ? join(userRoot!, "environment-cache", "generations", transactionId)
+    : join(userRoot!, "transactions", "environment", transactionId);
   const label = `co.tweakers.environment.${transactionId}`;
   const readJson = (file: string): unknown => {
     try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
@@ -5076,13 +5119,16 @@ function attachEnvironmentHelperDiagnostics(value: unknown): unknown {
       };
     }
   }
+  const stdout = readLogTail(join(helperRoot, `${label}.stdout.log`));
+  const stderr = readLogTail(join(helperRoot, `${label}.stderr.log`));
+  if (submission === null && outcome === null && stdout === "" && stderr === "") return value;
   return {
     ...transaction,
     helper: {
       submission,
       outcome,
-      stdout: readLogTail(join(helperRoot, `${label}.stdout.log`)),
-      stderr: readLogTail(join(helperRoot, `${label}.stderr.log`)),
+      stdout,
+      stderr,
     },
   };
 }

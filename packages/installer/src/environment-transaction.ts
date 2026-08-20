@@ -100,6 +100,34 @@ import { getLocalRefreshStatus, hashTree, nodeAugmentedEnvironment, npmCommand }
 import { readRuntimeFingerprintEvidence, type RuntimeTreeFingerprint } from "./runtime-fingerprint.js";
 import { findSourceRoot } from "./source-root.js";
 import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
+import {
+  environmentModeCachePaths,
+  type EnvironmentModePairReceipt,
+} from "./environment-mode-cache.js";
+import {
+  createEnvironmentModeProductionBindings,
+  type EnvironmentModeV2Control,
+  type EnvironmentModeV2PreparedCommitCli,
+  type EnvironmentModeProductionBindings,
+} from "./environment-mode-production.js";
+import {
+  commitPreparedEnvironmentModePairWarm,
+  type EnvironmentWarmCommitDeps,
+  type EnvironmentWarmCommitReceipt,
+} from "./environment-warm-commit.js";
+import {
+  recoverEnvironmentModePairWarm,
+  type EnvironmentWarmRecoveryDeps,
+  type RecoverEnvironmentModePairWarmInput,
+} from "./environment-warm-recovery.js";
+import {
+  createEnvironmentTiming,
+  ENVIRONMENT_TIMING_PHASES,
+  EnvironmentTimingRecorder,
+  systemEnvironmentTimingClock,
+  type EnvironmentTimingClock,
+  type EnvironmentTimingEvidence,
+} from "./environment-timing.js";
 
 export const ENVIRONMENT_TRANSACTION_SCHEMA_VERSION = 1 as const;
 
@@ -147,6 +175,8 @@ export interface EnvironmentTransactionReceipt {
    * and legacy binaries that rebuild receipts as fresh literals may drop it.
    */
   applyProgress?: string | null;
+  /** Optional additive schema-v1 lifecycle timing evidence. */
+  timing?: EnvironmentTimingEvidence;
   createdAt: string;
   updatedAt: string;
   committedAt: string | null;
@@ -157,6 +187,32 @@ export interface EnvironmentTransactionReceipt {
 export interface PrepareEnvironmentInput {
   current: EnvironmentSelection;
   requested: EnvironmentSelection;
+}
+
+/**
+ * T3-only pre-confirmation seam.  It has no commit, quit, watcher, helper,
+ * or app-switch capability; the later warm-exchange owner must consume only
+ * the receipt it returns.
+ */
+export interface PrepareEnvironmentModeCacheV2Input extends PrepareEnvironmentInput {
+  generationId: string;
+}
+
+export interface EnvironmentModeCacheV2PreparationResult {
+  state: "disabled" | "ready";
+  receipt: EnvironmentModePairReceipt | null;
+}
+
+/** Deliberate approval input for the isolated, default-off warm commit API. */
+export interface CommitEnvironmentModeCacheV2Input {
+  transactionId: string;
+  /** Captured by the confirmation owner before any post-approval work begins. */
+  approvalAt: string;
+}
+
+/** Default-off T5 recovery input for an already-created schema-v2 journal. */
+export interface RecoverEnvironmentModeCacheV2Input {
+  transactionId?: string;
 }
 
 export interface EnvironmentDesktopObservation extends CodexMainProcessObservation {}
@@ -660,7 +716,7 @@ function sortReceiptValue(value: unknown): unknown {
 
 export interface EnvironmentCoordinator {
   prepare(input: PrepareEnvironmentInput): Promise<EnvironmentTransactionReceipt>;
-  commit(transactionId?: string): Promise<EnvironmentTransactionReceipt>;
+  commit(transactionId?: string, approvalAt?: string): Promise<EnvironmentTransactionReceipt>;
   status(): EnvironmentTransactionReceipt | null;
   verify(transactionId?: string): Promise<EnvironmentVerification>;
   rollback(transactionId?: string): Promise<EnvironmentTransactionReceipt>;
@@ -672,6 +728,18 @@ export interface EnvironmentCoordinator {
    * the official desktop has updated underneath a failed transaction.
    */
   recover(transactionId?: string): Promise<EnvironmentTransactionReceipt>;
+  /** Default-off T3 preparation seam; it intentionally does not perform a mode commit. */
+  prepareModeCacheV2?(input: PrepareEnvironmentModeCacheV2Input): Promise<EnvironmentModeCacheV2PreparationResult>;
+  /** Default-off T4 commit seam; it never delegates into legacy commit(). */
+  commitModeCacheV2?(input: CommitEnvironmentModeCacheV2Input): Promise<EnvironmentWarmCommitReceipt>;
+  /** Default-off pre-cutover cancellation seam for a generation-bound pair. */
+  cancelModeCacheV2?(input: { transactionId: string; cancelledAt?: string }): Promise<EnvironmentModePairReceipt>;
+  /** Resolve only the cache generation's durable helper/control plane. */
+  resolvePreparedModeCacheV2CommitCli?(transactionId: string): EnvironmentModeV2PreparedCommitCli;
+  /** Default-off T5 recovery seam; nonterminal v1 receipts stay on v1 recovery. */
+  recoverModeCacheV2?(
+    input?: RecoverEnvironmentModeCacheV2Input,
+  ): Promise<EnvironmentWarmCommitReceipt | EnvironmentTransactionReceipt>;
 }
 
 export interface EnvironmentCoordinatorOptions {
@@ -692,10 +760,13 @@ export interface EnvironmentCoordinatorOptions {
   bundledDerivedReceiptFile?: string;
   verificationPolls?: number;
   verificationIntervalMs?: number;
+  /** T3 is inert unless this exact option is deliberately enabled by a later owner. */
+  environmentModeCacheV2?: boolean;
 }
 
 export interface EnvironmentCoordinatorDeps {
   now?: () => string;
+  timingClock?: EnvironmentTimingClock;
   createId?: () => string;
   preparePrerequisites?: (input: {
     transactionId: string;
@@ -778,6 +849,21 @@ export interface EnvironmentCoordinatorDeps {
     prepared: PreparedEnvironmentEvidence;
   }) => void | Promise<void>;
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * Bounded pre-confirmation preparation delegate. The default is a fail-closed
+   * refusal so merely enabling a future flag cannot accidentally invoke legacy
+   * switching or live mutation.
+   */
+  prepareModeCacheV2?: (
+    input: PrepareEnvironmentModeCacheV2Input,
+  ) => EnvironmentModeCacheV2PreparationResult | Promise<EnvironmentModeCacheV2PreparationResult>;
+  /**
+   * An explicitly injected, fully bounded warm adapter. No default adapter is
+   * supplied: enabling the gate without this dependency must fail closed.
+   */
+  warmCommitModeCacheV2?: EnvironmentWarmCommitDeps;
+  /** Explicit, persistent recovery adapter; no default adapter is supplied. */
+  warmRecoverModeCacheV2?: EnvironmentWarmRecoveryDeps;
 }
 
 export interface DefaultEnvironmentAdapterOptions {
@@ -961,6 +1047,8 @@ export interface EnvironmentCommitHelperReceipt {
   schemaVersion: 1;
   kind: "environment-commit-helper";
   transactionId: string;
+  /** Deliberate approval captured before detached helper submission. */
+  approvalAt?: string;
   label: string;
   cliPath: string;
   /** Additive schema-v1 binding for the receipt-owned commit control plane. */
@@ -993,6 +1081,8 @@ export interface EnvironmentCommitHelperOutcome {
 
 export interface SubmitEnvironmentCommitHelperInput {
   transactionId: string;
+  /** Required by schema-v2; omitted by legacy schema-v1 callers. */
+  approvalAt?: string;
   cliPath: string;
   cliArtifactDigest: string;
   managedRuntimeArtifactPath: string;
@@ -1121,6 +1211,9 @@ function submitEnvironmentCommitHelperUnlocked(
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.transactionId)) {
     throw new Error("Environment helper transaction ID is invalid");
   }
+  if (input.approvalAt !== undefined && !validIso(input.approvalAt)) {
+    throw new Error("Environment helper approval time is invalid");
+  }
   if (!exactAbsolutePath(input.cliPath)) throw new Error("Environment helper CLI path must be exact and absolute");
   if (!sha256(input.cliArtifactDigest)) {
     throw new Error("Environment helper CLI digest must be a SHA-256 value");
@@ -1176,6 +1269,7 @@ function submitEnvironmentCommitHelperUnlocked(
   const existing = readEnvironmentCommitHelperReceipt(input.receiptFile);
   if (existing !== null) {
     if (existing.transactionId !== input.transactionId
+      || existing.approvalAt !== input.approvalAt
       || existing.cliPath !== input.cliPath
       || existing.cliArtifactDigest !== cliArtifactDigest
       || existing.managedRuntimeArtifactPath !== input.managedRuntimeArtifactPath
@@ -1233,6 +1327,7 @@ function submitEnvironmentCommitHelperUnlocked(
   writeJsonObjectAtomically(outcomeFile, initialOutcome);
   writeEnvironmentCommitHelperWrapper({
     transactionId: input.transactionId,
+    approvalAt: input.approvalAt,
     label,
     cliPath: input.cliPath,
     cliArtifactDigest,
@@ -1276,6 +1371,7 @@ function submitEnvironmentCommitHelperUnlocked(
     schemaVersion: 1,
     kind: "environment-commit-helper",
     transactionId: input.transactionId,
+    ...(input.approvalAt === undefined ? {} : { approvalAt: input.approvalAt }),
     label,
     cliPath: input.cliPath,
     cliArtifactDigest,
@@ -1368,6 +1464,7 @@ const ENVIRONMENT_COMMIT_TREE_VERIFIER_SOURCE = [
 
 function writeEnvironmentCommitHelperWrapper(input: {
   transactionId: string;
+  approvalAt?: string;
   label: string;
   cliPath: string;
   cliArtifactDigest: string;
@@ -1390,6 +1487,7 @@ function writeEnvironmentCommitHelperWrapper(input: {
     "commit",
     "--transaction",
     input.transactionId,
+    ...(input.approvalAt === undefined ? [] : ["--approval-at", input.approvalAt]),
   ]
     .map(shellSingleQuote)
     .join(" ");
@@ -3930,8 +4028,13 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
   readonly watcherPromotionFile: string;
   readonly verificationPolls: number;
   readonly verificationIntervalMs: number;
+  readonly environmentModeCacheV2: boolean;
 
-  private readonly deps: Required<EnvironmentCoordinatorDeps>;
+  private readonly deps: Required<Omit<EnvironmentCoordinatorDeps, "warmCommitModeCacheV2" | "warmRecoverModeCacheV2">>;
+  private readonly productionModeCacheV2: EnvironmentModeProductionBindings | null;
+  private readonly warmCommitModeCacheV2: EnvironmentWarmCommitDeps | null;
+  private readonly warmRecoverModeCacheV2: EnvironmentWarmRecoveryDeps | null;
+  private readonly timing: EnvironmentTimingRecorder;
 
   constructor(options: EnvironmentCoordinatorOptions = {}, deps: EnvironmentCoordinatorDeps = {}) {
     const paths = userPaths();
@@ -3981,6 +4084,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     // deterministic through the configurable poll count/interval.
     this.verificationPolls = Math.max(1, options.verificationPolls ?? 240);
     this.verificationIntervalMs = Math.max(0, options.verificationIntervalMs ?? 250);
+    this.environmentModeCacheV2 = options.environmentModeCacheV2 === true;
     const defaultAdapters = createDefaultEnvironmentAdapters({
       registryFile: this.registryFile,
       receiptRoot: this.receiptRoot,
@@ -4005,8 +4109,125 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         );
       }
     };
+    const coordinatorNow = deps.now ?? (() => new Date().toISOString());
+    const v2OfficialProofs = new Map<string, {
+      input: {
+        selection: EnvironmentSelection;
+        baseline: { marketingVersion: string | null; build: string | null };
+        excludedMainPid: number | null;
+      };
+      proof: VerifiedOfficialDesktopProof;
+    }>();
+    const v2OfficialSelection = (control: EnvironmentModeV2Control): EnvironmentSelection => {
+      const selection = control.source.appExperience === "chatgpt" ? control.source : control.requested;
+      if (selection.appExperience !== "chatgpt" || selection.backendLane !== "official-bundled") {
+        throw new Error("Environment mode v2 control does not bind an official ChatGPT recovery selection");
+      }
+      return selection;
+    };
+    const v2OfficialFiles = () => ({
+      root: this.environmentRoot,
+      installerStateFile: this.stateFile,
+      environmentRegistryFile: this.registryFile,
+      environmentSelectionFile: this.selectionFile,
+      runtimeProofFile: this.runtimeProofFile,
+      mcpConfigFile: this.mcpConfigFile,
+      mcpStateFile: this.mcpStateFile,
+      tweaksRoot: this.tweaksRoot,
+      tweakersConfigFile: this.configFile,
+      now: coordinatorNow(),
+    });
+    const proveV2Official = async (input: {
+      selection: EnvironmentSelection;
+      baseline: { marketingVersion: string | null; build: string | null };
+      excludedMainPid: number | null;
+    }): Promise<VerifiedOfficialDesktopProof | null> => {
+      if (deps.proveOfficialDesktop) return deps.proveOfficialDesktop(input);
+      assertDefaultAdoptionScope();
+      return proveVerifiedOfficialDesktop(input, v2OfficialFiles());
+    };
+    const commitV2Official = async (input: {
+      selection: EnvironmentSelection;
+      baseline: { marketingVersion: string | null; build: string | null };
+      excludedMainPid: number | null;
+      proof: VerifiedOfficialDesktopProof;
+    }): Promise<AdoptedOfficialDesktop> => {
+      if (deps.commitOfficialDesktop) return deps.commitOfficialDesktop(input);
+      assertDefaultAdoptionScope();
+      return commitVerifiedOfficialDesktop(input, input.proof, v2OfficialFiles());
+    };
+    // This construction is behind the sole explicit flag. In the normal
+    // default-off route no cache root, pin, helper, MCP bridge, or process
+    // adapter is constructed or touched.
+    const productionModeCacheV2 = this.environmentModeCacheV2
+      ? createEnvironmentModeProductionBindings({
+        environmentRoot: this.environmentRoot,
+        registryFile: this.registryFile,
+        selectionFile: this.selectionFile,
+        configFile: this.configFile,
+        stateFile: this.stateFile,
+        runtimeProofFile: this.runtimeProofFile,
+        mcpConfigFile: this.mcpConfigFile,
+        mcpStateFile: this.mcpStateFile,
+        tweaksRoot: this.tweaksRoot,
+        watcherPromotionFile: this.watcherPromotionFile,
+        preparePrerequisites: deps.preparePrerequisites ?? defaultAdapters.preparePrerequisites,
+      }, {
+        checkForVerifiedNewerOfficial: async ({ pair, journal, control }) => {
+          const selection = v2OfficialSelection(control);
+          const officialRole = pair.roles.live.experience === "chatgpt"
+            ? pair.roles.live
+            : pair.roles.inactive;
+          // The inactive official Contents live under the generation cache,
+          // while its recovered selection always targets the fixed outer app
+          // path. Bind those two authorities explicitly instead of requiring
+          // the cache payload path to equal /Applications/ChatGPT.app.
+          if (pair.roles.live.appPath !== selection.selectedDesktopPath
+            || officialRole.evidence.bundleId !== selection.selectedDesktopBundleId) {
+            throw new Error("Environment mode v2 official recovery selection does not bind the sealed official role");
+          }
+          const input = {
+            selection,
+            baseline: {
+              marketingVersion: officialRole.evidence.version,
+              build: officialRole.evidence.build,
+            },
+            excludedMainPid: journal.sourceMainPid,
+          };
+          const proof = await proveV2Official(input);
+          if (proof === null) return { state: "unchanged" as const };
+          v2OfficialProofs.set(pair.generationId, { input, proof });
+          return { state: "newer_verified_official" as const, selection: proof.selection };
+        },
+        adoptVerifiedNewerOfficial: async ({ pair, update }) => {
+          const stored = v2OfficialProofs.get(pair.generationId);
+          if (stored === undefined || update.state !== "newer_verified_official"
+            || update.selection === undefined
+            || stored.proof.selection.selectedDesktopPath !== update.selection.selectedDesktopPath
+            || stored.proof.selection.selectedDesktopBundleId !== update.selection.selectedDesktopBundleId) {
+            throw new Error("Environment mode v2 official recovery proof is not bound to the current generation");
+          }
+          const adopted = await commitV2Official({ ...stored.input, proof: stored.proof });
+          if (adopted.mainPid !== stored.proof.mainPid
+            || adopted.selection.selectedDesktopPath !== stored.proof.selection.selectedDesktopPath
+            || adopted.selection.selectedDesktopBundleId !== stored.proof.selection.selectedDesktopBundleId) {
+            throw new Error("Environment mode v2 official recovery adoption changed its proven process or selection");
+          }
+          v2OfficialProofs.delete(pair.generationId);
+          return { pid: adopted.mainPid, visibleWindow: true, selection: adopted.selection };
+        },
+      })
+      : null;
+    this.productionModeCacheV2 = productionModeCacheV2;
+    this.warmCommitModeCacheV2 = deps.warmCommitModeCacheV2
+      ?? productionModeCacheV2?.warmCommit
+      ?? null;
+    this.warmRecoverModeCacheV2 = deps.warmRecoverModeCacheV2
+      ?? productionModeCacheV2?.warmRecovery
+      ?? null;
     this.deps = {
       now: deps.now ?? (() => new Date().toISOString()),
+      timingClock: deps.timingClock ?? systemEnvironmentTimingClock,
       createId: deps.createId ?? randomUUID,
       preparePrerequisites: deps.preparePrerequisites ?? defaultAdapters.preparePrerequisites,
       validatePreparedEnvironment: deps.validatePreparedEnvironment
@@ -4038,6 +4259,12 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       bindWatcherTarget: deps.bindWatcherTarget ?? (deps.proveAppliedEnvironment
         ? (() => undefined)
         : defaultAdapters.bindWatcherTarget),
+      prepareModeCacheV2: deps.prepareModeCacheV2 ?? productionModeCacheV2?.prepare ?? (() => {
+        throw new Error(
+          "environmentModeCacheV2 requires a bound pre-confirmation preparation adapter; "
+          + "legacy environment switching is not a cache preparation fallback",
+        );
+      }),
       publishSelection: deps.publishSelection ?? ((selection) => {
         if (existsSync(this.registryFile)) {
           publishEnvironmentSelection(this.registryFile, this.selectionFile, selection);
@@ -4079,6 +4306,137 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       }),
       sleep: deps.sleep ?? sleep,
     };
+    this.timing = new EnvironmentTimingRecorder(this.deps.timingClock);
+  }
+
+  /**
+   * The feature remains default-off.  Its enabled path delegates only to the
+   * explicit T3 preparer and never enters commit(), watcher, helper, or
+   * process-control code.
+   */
+  async prepareModeCacheV2(
+    input: PrepareEnvironmentModeCacheV2Input,
+  ): Promise<EnvironmentModeCacheV2PreparationResult> {
+    if (!this.environmentModeCacheV2) return { state: "disabled", receipt: null };
+    const active = this.status();
+    if (active !== null && !isTerminalEnvironmentPhase(active.phase)) {
+      throw new Error(
+        `Cannot prepare environmentModeCacheV2 while schema-v1 environment transaction ${active.transactionId} is ${active.phase}; recover it through the existing v1 artifacts/swap host first`,
+      );
+    }
+    return this.deps.prepareModeCacheV2(input);
+  }
+
+  /**
+   * Release only the exact pre-cutover v2 generation. This never falls back
+   * to schema-v1 cancellation, because a generation-bound cache grant is not
+   * a v1 transaction receipt.
+   */
+  async cancelModeCacheV2(
+    input: { transactionId: string; cancelledAt?: string },
+  ): Promise<EnvironmentModePairReceipt> {
+    if (!this.environmentModeCacheV2) {
+      throw new Error("environmentModeCacheV2 cancellation is disabled by default");
+    }
+    const production = this.productionModeCacheV2;
+    if (production === null) {
+      throw new Error("environmentModeCacheV2 cancellation requires an explicitly bound production adapter");
+    }
+    const legacy = this.status();
+    if (legacy !== null && !isTerminalEnvironmentPhase(legacy.phase)) {
+      throw new Error(
+        `environmentModeCacheV2 refuses mixed-version cancellation while schema-v1 transaction ${legacy.transactionId} is ${legacy.phase}`,
+      );
+    }
+    return this.withWarmCommitAuthority(async () => production.cancel({
+      transactionId: input.transactionId,
+      ...(input.cancelledAt === undefined ? {} : { cancelledAt: input.cancelledAt }),
+    }));
+  }
+
+  resolvePreparedModeCacheV2CommitCli(transactionId: string): EnvironmentModeV2PreparedCommitCli {
+    if (!this.environmentModeCacheV2) {
+      throw new Error("environmentModeCacheV2 submit is disabled by default");
+    }
+    const production = this.productionModeCacheV2;
+    if (production === null) {
+      throw new Error("environmentModeCacheV2 submit requires an explicitly bound production adapter");
+    }
+    const legacy = this.status();
+    if (legacy !== null && !isTerminalEnvironmentPhase(legacy.phase)) {
+      throw new Error(
+        `environmentModeCacheV2 refuses mixed-version submit while schema-v1 transaction ${legacy.transactionId} is ${legacy.phase}`,
+      );
+    }
+    return production.resolvePreparedCommitCli(transactionId);
+  }
+
+  /**
+   * The only coordinator entrypoint for a prepared schema-v2 warm exchange.
+   * It deliberately has no legacy transaction, build, clone, copy, canary,
+   * or migration fallback. Command wiring stays absent while this feature is
+   * default-off; a future approval owner must bind the narrow adapter.
+   */
+  async commitModeCacheV2(
+    input: CommitEnvironmentModeCacheV2Input,
+  ): Promise<EnvironmentWarmCommitReceipt> {
+    if (!this.environmentModeCacheV2) {
+      throw new Error("environmentModeCacheV2 warm commit is disabled by default");
+    }
+    const warmCommit = this.warmCommitModeCacheV2;
+    if (warmCommit === null) {
+      throw new Error("environmentModeCacheV2 warm commit requires an explicitly bound adapter");
+    }
+    const legacy = this.status();
+    if (legacy !== null && !isTerminalEnvironmentPhase(legacy.phase)) {
+      // This must run before lifecycle authority, watcher pause, quit, or the
+      // v2 cache lease. Nonterminal v1 is never interpreted as a pair cache.
+      throw new Error(
+        `environmentModeCacheV2 refuses mixed-version commit while schema-v1 transaction ${legacy.transactionId} is ${legacy.phase}; recover it through the existing v1 artifacts/swap host first`,
+      );
+    }
+    return this.withWarmCommitAuthority(async () => {
+      // This is intentionally inside lifecycle authority and before the cache
+      // lease/preflight. A protected updater marker is a hard stop, not a
+      // reason to enter a source-side preparation or legacy switching path.
+      assertInstallerUpdateQuarantineClear(this.environmentRoot, "environment-mode-warm-commit");
+      return commitPreparedEnvironmentModePairWarm({
+        transactionId: input.transactionId,
+        approvalAt: input.approvalAt,
+        cachePaths: environmentModeCachePaths(this.environmentRoot),
+      }, warmCommit);
+    });
+  }
+
+  /**
+   * T5 keeps the Environment coordinator as the only public owner. Schema-v1
+   * receipts are never interpreted or recovered through this v2 route; the
+   * caller must use the existing v1 route while the feature is disabled.
+   */
+  async recoverModeCacheV2(
+    input: RecoverEnvironmentModeCacheV2Input = {},
+  ): Promise<EnvironmentWarmCommitReceipt | EnvironmentTransactionReceipt> {
+    if (!this.environmentModeCacheV2) {
+      throw new Error("environmentModeCacheV2 warm recovery is disabled by default");
+    }
+    const legacy = this.status();
+    if (legacy !== null && !isTerminalEnvironmentPhase(legacy.phase)) {
+      throw new Error(
+        `environmentModeCacheV2 refuses mixed-version recovery while schema-v1 transaction ${legacy.transactionId} is ${legacy.phase}`,
+      );
+    }
+    const recovery = this.warmRecoverModeCacheV2;
+    if (recovery === null) {
+      throw new Error("environmentModeCacheV2 warm recovery requires an explicitly bound persistent recovery adapter");
+    }
+    return this.withWarmCommitAuthority(async () => {
+      assertInstallerUpdateQuarantineClear(this.environmentRoot, "environment-mode-warm-recovery");
+      const recoveryInput: RecoverEnvironmentModePairWarmInput = {
+        cachePaths: environmentModeCachePaths(this.environmentRoot),
+        ...(input.transactionId === undefined ? {} : { transactionId: input.transactionId }),
+      };
+      return recoverEnvironmentModePairWarm(recoveryInput, recovery);
+    });
   }
 
   async prepare(input: PrepareEnvironmentInput): Promise<EnvironmentTransactionReceipt> {
@@ -4120,9 +4478,11 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       committedAt: null,
       rolledBackAt: null,
       cancelledAt: null,
+      timing: this.timing.completeInstant(createEnvironmentTiming(), "cache-inspection"),
     };
     this.persist(receipt);
     try {
+      receipt = this.withTiming(receipt, "preparation", "start");
       const prepared = await this.deps.preparePrerequisites({
         transactionId,
         current: input.current,
@@ -4141,7 +4501,11 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         },
         prepared,
       });
-      receipt = this.update(receipt, { phase: "prepared", prepared });
+      receipt = this.update(receipt, {
+        phase: "prepared",
+        prepared,
+        timing: this.timing.complete(receipt.timing!, "preparation"),
+      });
       return receipt;
     } catch (error) {
       receipt = this.update(receipt, { phase: "failed", error: errorMessage(error) }, true);
@@ -4149,11 +4513,11 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     }
   }
 
-  async commit(transactionId?: string): Promise<EnvironmentTransactionReceipt> {
+  async commit(transactionId?: string, approvalAt?: string): Promise<EnvironmentTransactionReceipt> {
     for (let attempt = 0; attempt < 25; attempt += 1) {
       try {
         return await this.withMutationLock(
-          () => this.commitUnlocked(transactionId),
+          () => this.commitUnlocked(transactionId, approvalAt),
           { continueTransaction: true, transactionId },
         );
       } catch (error) {
@@ -4166,7 +4530,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     throw new Error("Environment commit could not acquire the lifecycle lease");
   }
 
-  private async commitUnlocked(transactionId?: string): Promise<EnvironmentTransactionReceipt> {
+  private async commitUnlocked(transactionId?: string, approvalAt?: string): Promise<EnvironmentTransactionReceipt> {
     let receipt = this.requireReceipt(transactionId);
     if (receipt.phase !== "prepared") {
       throw new Error(`Environment transaction ${receipt.transactionId} cannot commit from phase ${receipt.phase}`);
@@ -4183,23 +4547,36 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         `Environment transaction ${receipt.transactionId} cannot commit before cutover: ${errorMessage(error)}`,
       );
     }
-    receipt = this.update(receipt, { phase: "committing", error: null, ownerPid: process.pid });
+    receipt = this.update(receipt, {
+      phase: "committing",
+      error: null,
+      ownerPid: process.pid,
+      timing: this.timing.start(
+        { ...(receipt.timing ?? createEnvironmentTiming()), approvalAt: approvalAt ?? receipt.timing?.approvalAt ?? null },
+        "approval-helper-launch",
+      ),
+    });
     let sourceObservedAfterStopFailure = false;
     let watcherPaused = false;
     const reopenFailures: string[] = [];
     try {
+      receipt = this.withTiming(receipt, "approval-helper-launch", "complete");
+      receipt = this.withTiming(receipt, "watcher-pause", "start");
       await this.deps.pauseWatcher({
         transactionId: receipt.transactionId,
         sourceAppRoot: receipt.source.selectedDesktopPath,
         requestedAppRoot: receipt.requested.selectedDesktopPath,
         sourceExpectedFingerprint: prepared.rollback.desktopArtifactDigest,
       });
+      receipt = this.withTiming(receipt, "watcher-pause", "complete");
       watcherPaused = true;
+      receipt = this.withTiming(receipt, "projection", "start");
       await this.deps.stagePreparedEnvironment({
         direction: "requested",
         receipt,
         prepared,
       });
+      receipt = this.withTiming(receipt, "projection", "complete");
       if (receipt.oldMainPid === null) {
         // The app was closed at preparation. Re-observe immediately before
         // cutover: if it appeared, bind only a process that proves the exact
@@ -4207,7 +4584,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         const appeared = await this.proveReplacementSourcePid(receipt, prepared);
         if (appeared.pid !== null) {
           receipt = this.update(receipt, { oldMainPid: appeared.pid, error: null });
-          await this.stopAndClean(receipt.source.selectedDesktopPath, appeared.pid);
+          receipt = await this.stopAndCleanTimed(receipt, receipt.source.selectedDesktopPath, appeared.pid);
         } else if (appeared.sourceObserved) {
           sourceObservedAfterStopFailure = true;
           throw new Error(
@@ -4216,7 +4593,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         }
       } else {
         try {
-          await this.stopAndClean(receipt.source.selectedDesktopPath, receipt.oldMainPid);
+          receipt = await this.stopAndCleanTimed(receipt, receipt.source.selectedDesktopPath, receipt.oldMainPid);
         } catch (stopError) {
           // Preparation can take long enough for Electron to replace its main
           // process. Rebind only when the replacement process proves the exact
@@ -4228,10 +4605,11 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
             throw stopError;
           }
           receipt = this.update(receipt, { oldMainPid: replacement.pid, error: null });
-          await this.stopAndClean(receipt.source.selectedDesktopPath, replacement.pid);
+          receipt = await this.stopAndCleanTimed(receipt, receipt.source.selectedDesktopPath, replacement.pid);
         }
       }
       receipt = this.update(receipt, { phase: "applying", applyProgress: null });
+      receipt = this.withTiming(receipt, "exchange-apply", "start");
       await this.deps.applyPreparedEnvironment({
         direction: "requested",
         receipt,
@@ -4242,10 +4620,12 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
           receipt = this.update(receipt, { applyProgress: `requested:${step}` });
         },
       });
+      receipt = this.withTiming(receipt, "exchange-apply", "complete");
 
       let lastVerification: EnvironmentVerification | null = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
         receipt = this.update(receipt, { phase: "reopening", attempt, newMainPid: null });
+        receipt = this.withTiming(receipt, "reopen", "start");
         let reopenError: string | null = null;
         try {
           await this.deps.reopenDesktop(receipt.requested.selectedDesktopPath);
@@ -4253,12 +4633,16 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
           reopenError = errorMessage(error);
           reopenFailures.push(`attempt ${attempt}: ${reopenError}`);
         }
+        receipt = this.withTiming(receipt, "reopen", "complete");
         receipt = this.update(receipt, { phase: "verifying", error: reopenError });
+        receipt = this.withTiming(receipt, "readiness-proof", "start");
         lastVerification = await this.verify(receipt.transactionId);
+        receipt = this.withTiming(receipt, "readiness-proof", "complete");
         if (lastVerification.ok
           && lastVerification.appliedSelection !== null
           && lastVerification.appliedEvidence !== null
           && lastVerification.observedPid !== null) {
+          receipt = this.withTiming(receipt, "watcher-publication", "start");
           await this.deps.bindWatcherTarget({
             direction: "requested",
             applied: lastVerification.appliedEvidence,
@@ -4270,6 +4654,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
             targetAppRoot: receipt.requested.selectedDesktopPath,
             targetExpectedFingerprint: lastVerification.appliedEvidence.desktopArtifactDigest,
           });
+          receipt = this.withTiming(receipt, "watcher-publication", "complete");
           watcherPaused = false;
           receipt = this.update(receipt, {
             phase: "committed",
@@ -4868,6 +5253,30 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     });
   }
 
+  /**
+   * A warm commit must reject every overlapping durable lifecycle receipt but
+   * must not reconcile, cancel, or otherwise adopt a legacy transaction. It
+   * borrows the same lifecycle and environment mutexes so it cannot overlap a
+   * normal install/update/transaction writer.
+   */
+  private async withWarmCommitAuthority<T>(operation: () => Promise<T>): Promise<T> {
+    return withLifecycleLock(this.lifecycleLockFile, "environment mode warm commit", async () => {
+      assertLifecycleReceiptsIdle(this.environmentRoot);
+      const lock = acquireProcessLock(this.lockFile, {
+        onContended: (owner) => new Error(
+          owner === null
+            ? "Another environment transaction holds the installer lock"
+            : `Another environment transaction holds the installer lock (PID ${owner})`,
+        ),
+      });
+      try {
+        return await operation();
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
   private reconcileDeadOwnerBeforeNewTransaction(): void {
     const receipt = this.status();
     if (receipt === null
@@ -4896,8 +5305,48 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     patch: Partial<EnvironmentTransactionReceipt>,
     terminal = false,
   ): EnvironmentTransactionReceipt {
-    const next = { ...receipt, ...patch, updatedAt: this.deps.now() };
-    this.persist(next, terminal);
+    let next = { ...receipt, ...patch, updatedAt: this.deps.now() };
+    if (!terminal || next.timing === undefined) {
+      this.persist(next, terminal);
+      return next;
+    }
+    // Persist an in-progress terminal stamp first. Only after that durable
+    // receipt exists can readyAt truthfully describe a completed mode switch.
+    const terminalTiming = this.timing.start(next.timing, "terminal-persist");
+    next = { ...next, timing: terminalTiming };
+    this.persist(next, true);
+    const completedTiming = this.timing.complete(terminalTiming, "terminal-persist");
+    next = {
+      ...next,
+      timing: (next.phase === "committed" || next.phase === "rolled-back")
+        ? this.timing.markReady(completedTiming)
+        : completedTiming,
+      updatedAt: this.deps.now(),
+    };
+    this.persist(next, true);
+    return next;
+  }
+
+  private withTiming(
+    receipt: EnvironmentTransactionReceipt,
+    phase: Parameters<EnvironmentTimingRecorder["start"]>[1],
+    operation: "start" | "complete",
+  ): EnvironmentTransactionReceipt {
+    const current = receipt.timing ?? createEnvironmentTiming();
+    const timing = operation === "start"
+      ? this.timing.start(current, phase)
+      : this.timing.complete(current, phase);
+    return this.update(receipt, { timing });
+  }
+
+  private async stopAndCleanTimed(
+    receipt: EnvironmentTransactionReceipt,
+    path: string,
+    expectedPid: number,
+  ): Promise<EnvironmentTransactionReceipt> {
+    let next = this.withTiming(receipt, "quit", "start");
+    await this.stopAndClean(path, expectedPid);
+    next = this.withTiming(next, "quit", "complete");
     return next;
   }
 
@@ -5077,6 +5526,7 @@ function isEnvironmentTransactionReceipt(value: unknown): value is EnvironmentTr
     && (value.applyProgress === undefined
       || value.applyProgress === null
       || typeof value.applyProgress === "string")
+    && (value.timing === undefined || isEnvironmentTimingEvidence(value.timing))
     && validIso(value.createdAt)
     && validIso(value.updatedAt)
     && nullableIso(value.committedAt)
@@ -5123,6 +5573,22 @@ function isEnvironmentTransactionReceipt(value: unknown): value is EnvironmentTr
   return true;
 }
 
+function isEnvironmentTimingEvidence(value: unknown): value is EnvironmentTimingEvidence {
+  if (!isRecord(value)
+    || value.schemaVersion !== 1
+    || !nullableIso(value.approvalAt)
+    || !nullableIso(value.readyAt)
+    || !isRecord(value.phases)) return false;
+  return Object.entries(value.phases).every(([phase, evidence]) =>
+    (ENVIRONMENT_TIMING_PHASES as readonly string[]).includes(phase)
+    && isRecord(evidence)
+    && validIso(evidence.startedAt)
+    && nullableIso(evidence.completedAt)
+    && (evidence.durationMs === null
+      || (typeof evidence.durationMs === "number" && Number.isFinite(evidence.durationMs) && evidence.durationMs >= 0)),
+  );
+}
+
 function phaseRequiresPreparedEvidence(phase: EnvironmentTransactionPhase): boolean {
   return phase === "prepared"
     || phase === "committing"
@@ -5147,6 +5613,7 @@ function isEnvironmentCommitHelperReceipt(value: unknown): value is EnvironmentC
     && value.schemaVersion === 1
     && value.kind === "environment-commit-helper"
     && nonEmpty(value.transactionId)
+    && (value.approvalAt === undefined || validIso(value.approvalAt))
     && nonEmpty(value.label)
     && exactAbsolutePath(value.cliPath)
     && (value.cliArtifactDigest === undefined || sha256(value.cliArtifactDigest))

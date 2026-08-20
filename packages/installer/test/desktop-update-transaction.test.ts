@@ -10,8 +10,11 @@ import {
   pristineBackupProvesObservedDesktop,
   readDesktopUpdateReceipt,
   runSynchronousLocalRefresh,
+  sealedModeCachePairProvesObservedDesktop,
   writeDesktopUpdateReceipt,
   type DesktopUpdateDependencies,
+  type DesktopUpdateModeCacheAdapter,
+  type DesktopUpdateModeCachePair,
   type DesktopUpdateReceipt,
   type DesktopVersionIdentity,
 } from "../src/desktop-update-transaction";
@@ -89,6 +92,40 @@ test("pristine backup proof rejects incomplete observed desktop identity", () =>
       },
     ), false);
   }
+});
+
+test("sealed pair proof requires the exact updated Tweakers and strict official roles", () => {
+  const observed = { marketingVersion: "26.814.41957", build: "6744" };
+  const expected = selection("tweakers");
+  const pair = modeCachePair("generation-updated", "tweakers", observed);
+
+  assert.equal(sealedModeCachePairProvesObservedDesktop(
+    pair,
+    expected,
+    observed,
+    "generation-updated",
+  ), true);
+  assert.equal(sealedModeCachePairProvesObservedDesktop(
+    { ...pair, generationId: "stale-generation" },
+    expected,
+    observed,
+    "generation-updated",
+  ), false);
+  assert.equal(sealedModeCachePairProvesObservedDesktop(
+    { ...pair, inactive: { ...pair.inactive, strictSignature: false } },
+    expected,
+    observed,
+    "generation-updated",
+  ), false);
+  assert.equal(sealedModeCachePairProvesObservedDesktop(
+    modeCachePair("generation-updated", "tweakers", {
+      marketingVersion: "26.814.41407",
+      build: "6720",
+    }),
+    expected,
+    observed,
+    "generation-updated",
+  ), false);
 });
 
 test("desktop receipt publication fsyncs its parent directory", async () => {
@@ -260,6 +297,7 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
   const initial = selection("tweakers");
   const deps: DesktopUpdateDependencies = {
     environment: fakeCoordinator(calls),
+    modeCacheV2: null,
     readCurrentSelection: () => initial,
     readDesktopVersion: () => ({ marketingVersion: "1.0.0", build: "100" }),
     readDesktopBundleIdentifier: () => initial.selectedDesktopBundleId,
@@ -280,6 +318,7 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
     now: () => NOW,
     createId: () => "desktop-1",
     createOwnerGeneration: () => "owner-generation-1",
+    createModeCacheGenerationId: () => "mode-generation-2",
     ...overrides,
   };
   return { calls, deps };
@@ -300,6 +339,7 @@ function persistedReceipt(overrides: Partial<DesktopUpdateReceipt> = {}): Deskto
     nativeUpdateHandoffAt: null,
     refreshSource: null,
     environmentTransactionId: null,
+    environmentTransactionKind: null,
     safeOfficialMode: false,
     resumable: false,
     error: null,
@@ -310,6 +350,52 @@ function persistedReceipt(overrides: Partial<DesktopUpdateReceipt> = {}): Deskto
     completedAt: null,
     rolledBackAt: null,
     ...overrides,
+  };
+}
+
+function modeCachePair(
+  generationId: string,
+  liveExperience: "chatgpt" | "tweakers",
+  version: DesktopVersionIdentity,
+): DesktopUpdateModeCachePair {
+  assert.ok(version.marketingVersion);
+  assert.ok(version.build);
+  const inactiveExperience = liveExperience === "chatgpt" ? "tweakers" : "chatgpt";
+  const selected = selection(liveExperience);
+  return {
+    generationId,
+    releaseProfile: "stable",
+    pinState: "prepared",
+    live: {
+      experience: liveExperience,
+      appPath: selected.selectedDesktopPath,
+      bundleId: selected.selectedDesktopBundleId,
+      version: version.marketingVersion,
+      build: version.build,
+    },
+    inactive: {
+      experience: inactiveExperience,
+      appPath: `/tmp/environment-mode-cache/${generationId}/${inactiveExperience}.app`,
+      bundleId: selected.selectedDesktopBundleId,
+      version: version.marketingVersion,
+      build: version.build,
+      strictSignature: true,
+    },
+  };
+}
+
+function readyModeCacheResult(
+  transactionId: string,
+  requested: EnvironmentSelection,
+  pair: DesktopUpdateModeCachePair,
+) {
+  return {
+    transactionId,
+    phase: "ready" as const,
+    error: null,
+    selection: { ...requested, appliedAt: NOW },
+    targetMainPid: requested.appExperience === "chatgpt" ? 201 : 301,
+    pair,
   };
 }
 
@@ -340,6 +426,118 @@ test("a real official version change returns to Tweakers, refreshes the chosen s
     ]);
     assert.equal(transaction.status()?.phase, "completed");
     assert.equal(readdirSync(fixture.receiptRoot).length, 1);
+  });
+});
+
+test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a fresh updated pair", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+    const observed = { marketingVersion: "26.814.41957", build: "6744" };
+    let currentSelection = selection("tweakers");
+    let currentPair = modeCachePair("mode-generation-1", "tweakers", baseline);
+    const modeCalls: string[] = [];
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => currentPair,
+      switchCurrent: async ({ requested, transactionId }) => {
+        modeCalls.push(`switch:${transactionId}:${requested.appExperience}`);
+        assert.equal(transactionId, "mode-generation-1");
+        currentSelection = { ...requested, appliedAt: NOW };
+        currentPair = modeCachePair(transactionId, "chatgpt", baseline);
+        return readyModeCacheResult(transactionId, requested, currentPair);
+      },
+      prepareAndSwitch: async ({ requested, transactionId }) => {
+        modeCalls.push(`prepare-and-switch:${transactionId}:${requested.appExperience}`);
+        assert.equal(transactionId, "mode-generation-2");
+        currentSelection = { ...requested, appliedAt: NOW };
+        currentPair = modeCachePair(transactionId, "tweakers", observed);
+        return readyModeCacheResult(transactionId, requested, currentPair);
+      },
+      recover: async (transactionId) => {
+        throw new Error(`unexpected mode-cache recovery for ${transactionId}`);
+      },
+    };
+    let verificationKind: string | null = null;
+    let verificationPair: DesktopUpdateModeCachePair | null = null;
+    const { calls, deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => currentSelection,
+      readDesktopVersion: () => baseline,
+      waitForVersionChange: async () => observed,
+      refreshTweakers: async () => {
+        throw new Error("legacy runtime refresh must not run for a prepared v2 pair");
+      },
+      verifyFinal: async (input) => {
+        verificationKind = input.environmentTransactionKind;
+        verificationPair = input.modeCachePair;
+        return { ok: true, error: null };
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.environmentTransactionKind, "mode-cache-v2");
+    assert.equal(receipt.environmentTransactionId, "mode-generation-2");
+    assert.equal(receipt.source.appExperience, "tweakers");
+    assert.equal(receipt.refreshSource, "development");
+    assert.equal(verificationKind, "mode-cache-v2");
+    assert.equal(verificationPair?.generationId, "mode-generation-2");
+    assert.deepEqual(modeCalls, [
+      "switch:mode-generation-1:chatgpt",
+      "prepare-and-switch:mode-generation-2:tweakers",
+    ]);
+    assert.deepEqual(calls, [
+      "refresh-environment-truth",
+      "native-update-handoff",
+      "refresh-environment-truth",
+    ]);
+  });
+});
+
+test("cancel and recover resolves an orphaned v2 switch from sealed-pair proof without legacy rollback", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+    const source = selection("tweakers");
+    const pair = modeCachePair("mode-generation-1", "tweakers", baseline);
+    const recoveryCalls: string[] = [];
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => pair,
+      switchCurrent: async () => { throw new Error("unexpected v2 switch"); },
+      prepareAndSwitch: async () => { throw new Error("unexpected v2 preparation"); },
+      recover: async (transactionId) => {
+        recoveryCalls.push(transactionId);
+        return {
+          transactionId,
+          phase: "stale_requires_prepare",
+          error: "owner exited before cutover",
+          selection: source,
+          targetMainPid: null,
+          pair,
+        };
+      },
+    };
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "switching_to_chatgpt",
+      source,
+      baseline,
+      environmentTransactionId: "mode-generation-1",
+      environmentTransactionKind: "mode-cache-v2",
+    }));
+    const { calls, deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => source,
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.cancel();
+
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.equal(receipt.resumable, false);
+    assert.match(receipt.error ?? "", /sealed-pair recovery proved the source environment live/i);
+    assert.deepEqual(recoveryCalls, ["mode-generation-1"]);
+    assert.deepEqual(calls, []);
   });
 });
 
