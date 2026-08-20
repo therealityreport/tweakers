@@ -301,6 +301,13 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
     readCurrentSelection: () => initial,
     readDesktopVersion: () => ({ marketingVersion: "1.0.0", build: "100" }),
     readDesktopBundleIdentifier: () => initial.selectedDesktopBundleId,
+    probeAppcast: () => ({
+      state: "unavailable",
+      latestMarketingVersion: null,
+      latestBuild: null,
+      feedUrl: null,
+      detail: "stubbed probe",
+    }),
     inspectLiveOfficialDesktop: () => ({
       version: { marketingVersion: "1.0.0", build: "100" },
       mainPid: 101,
@@ -541,6 +548,50 @@ test("cancel and recover resolves an orphaned v2 switch from sealed-pair proof w
   });
 });
 
+test("an unambiguous current appcast completes the update before any environment swap", async () => {
+  await withFixture(async (fixture) => {
+    const { calls, deps } = dependencies({
+      probeAppcast: () => ({
+        state: "current",
+        latestMarketingVersion: "1.0.0",
+        latestBuild: "100",
+        feedUrl: "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
+        detail: "appcast latest 1.0.0 (100) is not newer than installed 1.0.0 (100)",
+      }),
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.error, null);
+    assert.deepEqual(calls, [], "no environment swap, handoff, or refresh may run for a current appcast");
+    const log = readFileSync(join(fixture.root, "log", "desktop-update.log"), "utf8");
+    assert.match(log, /"event":"appcast_probe"/);
+    assert.match(log, /is not newer than installed/);
+  });
+
+  await withFixture(async (fixture) => {
+    // An available update must run the full flow exactly as before.
+    const { calls, deps } = dependencies({
+      probeAppcast: () => ({
+        state: "update-available",
+        latestMarketingVersion: "1.1.0",
+        latestBuild: "110",
+        feedUrl: null,
+        detail: "appcast latest 1.1.0 (110) is newer than installed 1.0.0 (100)",
+      }),
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(calls.includes("refresh-environment-truth"), true);
+    assert.equal(calls.includes("native-update-handoff"), true);
+  });
+});
+
 test("cancel of a failed unsafe v2 update proves the source by bytes when the grant is released history", async () => {
   const baseline = { marketingVersion: "26.814.41407", build: "6720" };
   const source = selection("tweakers");
@@ -621,6 +672,7 @@ test("desktop update transaction logs one ordered event per persisted phase tran
       records.map(({ event, phase }) => `${event}:${phase}`),
       [
         "owner_started:preparing",
+        "appcast_probe:preparing",
         "phase_transition:switching_to_chatgpt",
         "phase_transition:awaiting_native_update",
         "handoff_result:awaiting_native_update",

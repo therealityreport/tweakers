@@ -81,6 +81,7 @@ import {
   type NativeUpdateHandoffResult,
 } from "./alerts.js";
 import { type AsarMarker, isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
+import { probeDesktopAppcast, type DesktopAppcastProbeResult } from "./desktop-appcast-probe.js";
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
@@ -251,6 +252,15 @@ export interface DesktopUpdateDependencies {
   readDesktopBundleIdentifier(appPath: string): string | null | Promise<string | null>;
   /** Owner-dead recovery seam; defaults to reading the live bundle's asar patch marker. */
   readDesktopAsarMarker?(appPath: string): AsarMarker;
+  /**
+   * Advisory pre-check of the signed Sparkle appcast before any environment
+   * swap. Only an unambiguous "current" result short-circuits the update;
+   * "unavailable" always fails open into the native updater flow.
+   */
+  probeAppcast?(input: {
+    appPath: string;
+    baseline: DesktopVersionIdentity;
+  }): DesktopAppcastProbeResult | Promise<DesktopAppcastProbeResult>;
   /** Prove the exact live desktop is pristine, OpenAI-signed, visible, and version-readable. */
   inspectLiveOfficialDesktop(
     selection: EnvironmentSelection,
@@ -499,7 +509,7 @@ export function createDesktopUpdateTransaction(
   const lifecycleLockFile = join(root, "transactions", "lifecycle.lock");
   const installerStateFile = join(root, "state.json");
   const configFile = join(root, "config.json");
-  const timeoutMs = Math.max(1, options.timeoutMs ?? 30 * 60 * 1_000);
+  const timeoutMs = Math.max(1, options.timeoutMs ?? configuredNativeUpdateTimeoutMs(configFile));
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 2_000);
   const resumeLaunchWaitMs = Math.max(0, options.resumeLaunchWaitMs ?? 30_000);
   const now = overrides.now ?? (() => new Date().toISOString());
@@ -547,6 +557,7 @@ export function createDesktopUpdateTransaction(
     readDesktopAsarMarker: overrides.readDesktopAsarMarker ?? ((appPath) => (
       readAsarMarker(join(appPath, "Contents", "Resources", "app.asar"))
     )),
+    probeAppcast: overrides.probeAppcast ?? ((input) => probeDesktopAppcast(input)),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
     launchOfficialDesktop: overrides.launchOfficialDesktop ?? ((selection) => {
       openCodex(selection.selectedDesktopPath);
@@ -764,7 +775,13 @@ export function createDesktopUpdateTransaction(
       if (!ownerToken) {
         throw new Error(`Cannot establish a stable process identity for desktop update owner PID ${process.pid}`);
       }
-      return persist({
+      // Advisory appcast pre-check before any environment swap: when the
+      // signed feed unambiguously proves the installed build is current, the
+      // whole update (two environment swaps + a native wait + a runtime
+      // refresh) is a no-op and completes here in seconds. Every ambiguous or
+      // failed probe falls open into the unchanged native updater flow.
+      const probe = await deps.probeAppcast!({ appPath: source.selectedDesktopPath, baseline });
+      const created = persist({
         schemaVersion: DESKTOP_UPDATE_SCHEMA_VERSION,
         kind: "desktop-update",
         transactionId: deps.createId(),
@@ -791,7 +808,28 @@ export function createDesktopUpdateTransaction(
         completedAt: null,
         rolledBackAt: null,
       });
+      appendDesktopUpdateLog(logFile, {
+        transactionId: created.transactionId,
+        phase: created.phase,
+        ownerPid: created.ownerPid,
+        ownerToken: created.ownerToken ?? null,
+        ownerGeneration: created.ownerGeneration ?? null,
+        event: "appcast_probe",
+        detail: probe.detail,
+        jobLabel: options.jobLabel ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL ?? null,
+      }, { now: deps.now, userRoot: root });
+      if (probe.state === "current") {
+        return update(created, {
+          phase: "completed",
+          safeOfficialMode: created.source.appExperience === "chatgpt",
+          resumable: false,
+          error: null,
+          completedAt: deps.now(),
+        }, true);
+      }
+      return created;
     });
+    if (receipt.phase === "completed") return receipt;
     return switchToOfficial(receipt);
   }
 
@@ -2259,6 +2297,26 @@ async function verifyFinalDesktopReturn(
     if (poll + 1 < 240) await new Promise<void>((resolve) => setTimeout(resolve, 250));
   }
   return { ok: false, error: lastError };
+}
+
+const DEFAULT_NATIVE_UPDATE_TIMEOUT_MS = 10 * 60 * 1_000;
+
+/**
+ * Native-wait ceiling for the Sparkle handoff. Ten minutes covers a real
+ * download+install with margin; a phased-rollout build the updater refuses to
+ * surface should cost minutes, not the historical half hour, and the timeout
+ * already lands resumable in safe official mode. `tweaker.desktopUpdateTimeoutMinutes`
+ * (clamped 2-30) overrides it.
+ */
+function configuredNativeUpdateTimeoutMs(configFile: string): number {
+  const section = readConfigFile(configFile).tweaker;
+  const minutes = section !== null && typeof section === "object" && !Array.isArray(section)
+    ? (section as Record<string, unknown>).desktopUpdateTimeoutMinutes
+    : undefined;
+  if (typeof minutes === "number" && Number.isFinite(minutes)) {
+    return Math.min(30, Math.max(2, Math.round(minutes))) * 60_000;
+  }
+  return DEFAULT_NATIVE_UPDATE_TIMEOUT_MS;
 }
 
 async function sourceSelectionProvenByBytes(

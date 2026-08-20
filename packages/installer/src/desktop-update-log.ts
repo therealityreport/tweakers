@@ -25,6 +25,7 @@ export type DesktopUpdateLogEvent =
   | "handoff_attempt"
   | "handoff_result"
   | "native_wait_progress"
+  | "appcast_probe"
   | "user_approval"
   | "manual_recovery";
 
