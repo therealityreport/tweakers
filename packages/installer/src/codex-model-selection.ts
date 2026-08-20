@@ -38,7 +38,7 @@ const REQUIRED_NEARBY_FINGERPRINTS = [
 const RENDERER_INDEX = "webview/index.html";
 const JAVASCRIPT_MODULE_EXTENSION = /\.[cm]?js$/i;
 const RELATIVE_JAVASCRIPT_MODULE_REFERENCE =
-  /["'`]((?:\.{1,2}\/)[^"'`?#]+?\.[cm]?js)(?:[?#][^"'`]*)?["'`]/gi;
+  /(?:\bimport\s*(?:\(\s*)?|\b(?:import|export)\s+[^"'`;\n]*?\bfrom\s+|\brequire\s*\(\s*)["'`]((?:\.{1,2}\/)[^"'`?#]+?\.[cm]?js)(?:[?#][^"'`]*)?["'`]/gi;
 
 /**
  * Keep a user's explicit model/effort selection attached to a new, unsent
