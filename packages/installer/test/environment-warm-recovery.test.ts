@@ -708,6 +708,17 @@ test("terminal stale and ready journals remain history without a new mutation", 
     assert.equal(ready.phase, "ready");
     assert.deepEqual(readyEvents, []);
   });
+  await withFixture(async (fixture) => {
+    // A completed warm commit whose grant is invalidated afterwards is
+    // history too: recovery must return the terminal ready journal instead
+    // of failing on the released grant (live wedge 2026-08-20).
+    writeJournal(fixture, journal(fixture.pair, "ready"));
+    invalidateCurrentEnvironmentModePair(fixture.paths, fixture.pair.generationId, APPLIED_AT);
+    const events: string[] = [];
+    const recovered = await recoverEnvironmentModePairWarm({ cachePaths: fixture.paths }, recoveryDeps(fixture, events));
+    assert.equal(recovered.phase, "ready");
+    assert.deepEqual(events, []);
+  });
 });
 
 test("verified newer official adoption invalidates the grant before any Contents exchange", async () => {

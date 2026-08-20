@@ -181,6 +181,14 @@ export async function recoverEnvironmentModePairWarm(
     // A stale pre-cutover journal never paused or replaced the source. Its
     // released grant is terminal history; a later prepare must start v2 fresh.
     if (journal.phase === "stale_requires_prepare" && pair.pin.state === "stale_requires_prepare") return journal;
+    // A terminal ready journal whose grant was invalidated afterwards is
+    // equally history: the cutover completed and its pair receipt was
+    // published before the pin release. Failing here wedged the desktop
+    // updater's owner-dead recovery behind an unrecoverable stale grant
+    // (live failure 2026-08-20).
+    if (journal.phase === "ready" && journal.terminalAt !== null && pair.pin.state === "stale_requires_prepare") {
+      return journal;
+    }
     // Cache invalidation and official adoption were durably recorded, but the
     // process died before the terminal stale fsync. No adapter or exchange is
     // needed (or permitted) to finish that journal publication.
