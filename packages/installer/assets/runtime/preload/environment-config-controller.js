@@ -1,11 +1,24 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ConfigCardUpdateCoordinator = void 0;
+exports.preparedEnvironmentReceiptNeedsFreshV2Preparation = preparedEnvironmentReceiptNeedsFreshV2Preparation;
 exports.createEnvironmentConfigController = createEnvironmentConfigController;
 exports.humanizeCodexPhase = humanizeCodexPhase;
 exports.desktopUpdatePresentation = desktopUpdatePresentation;
 exports.desktopUpdateStatusPresentation = desktopUpdateStatusPresentation;
 exports.restoreEnvironmentFocus = restoreEnvironmentFocus;
+/**
+ * Legacy schema-v1 receipts are not generation-bound and must remain
+ * resumable when an unrelated optional v2 cache is stale. Only a schema-v2
+ * receipt naming the exact stale generation requires fresh preparation.
+ */
+function preparedEnvironmentReceiptNeedsFreshV2Preparation(receipt, cache) {
+    return receipt.phase === "prepared"
+        && receipt.schemaVersion === 2
+        && typeof receipt.generationId === "string"
+        && cache?.state === "stale"
+        && cache.generationId === receipt.generationId;
+}
 function createEnvironmentConfigController(selected, effects, options = {}) {
     let selectedValue = copySelection(selected);
     let pendingValue = copySelection(selected);

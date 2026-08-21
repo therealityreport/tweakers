@@ -407,6 +407,8 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   global.HTMLElement = FakeElement;
   t.after(() => { global.document = previousDocument; global.HTMLElement = previousHTMLElement; });
 
+  const sidebar = document.createElement("nav");
+  sidebar.rect = { left: 0, top: 0, right: 552, bottom: 900, width: 552, height: 900 };
   const project = document.createElement("div");
   project.setAttribute("role", "listitem");
   project.setAttribute("aria-label", "TRR");
@@ -415,6 +417,7 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   header.setAttribute("aria-label", "TRR");
   header.setAttribute("data-app-action-sidebar-project-id", "/Users/example/TRR");
   header.setAttribute("aria-current", "page");
+  header.rect = { left: 16, top: 0, right: 552, bottom: 30, width: 536, height: 30 };
   const projectIcon = document.createElement("svg");
   const title = document.createElement("span");
   title.textContent = "TRR";
@@ -448,7 +451,8 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   const unrelated = document.createElement("div");
   unrelated.setAttribute("role", "listitem");
   unrelated.textContent = "Chats";
-  document.body.append(project, unrelated);
+  sidebar.appendChild(project);
+  document.body.append(sidebar, unrelated);
   const api = { react: { host: { query: () => [{ element: header }] } } };
   const state = { nodes: [{ id: "trr", type: "project", name: "TRR", projectPath: "/Users/example/TRR", color: "#6d28d9", overlayIntensity: "medium" }] };
 
@@ -473,12 +477,12 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   assert.equal(unrelated.getAttribute("data-tweaker-project-color-task"), null);
   assert.equal(header.style.values.get("--tweaker-project-foreground"), "var(--gray-0)");
   assert.equal(selectedTask.style.values.get("--tweaker-project-foreground"), "var(--gray-0)");
+  assert.equal(project.style.values.get("--tweaker-project-row-end-inset"), "16px");
 
   const css = document.getElementById("tweaker-project-colors").textContent;
-  assert.match(css, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*100%\s*!important/s);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*calc\(100% - var\(--tweaker-project-row-end-inset,\s*0px\)\)\s*!important/s);
   assert.match(css, /\[data-tweaker-project-color-group\][^}]*min-inline-size:\s*0/s);
-  assert.match(css, /\[data-tweaker-project-color-group\][^}]*max-inline-size:\s*100%/s);
-  assert.doesNotMatch(css, /--tweaker-project-row-end-inset/);
+  assert.match(css, /\[data-tweaker-project-color-group\][^}]*max-inline-size:\s*calc\(100% - var\(--tweaker-project-row-end-inset,\s*0px\)\)/s);
   assert.match(css, /\[data-tweaker-project-color-group\][^}]*contain:\s*inline-size/s);
   assert.doesNotMatch(css, /\[data-tweaker-project-color-group\][^}]*margin-inline-end/s);
   assert.doesNotMatch(css, /\[data-tweaker-project-color-group\][^}]*padding-inline-end/s);
@@ -513,7 +517,7 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
 
   document.getElementById("tweaker-project-colors").textContent = "/* stale hot-reload stylesheet */";
   _test.applyNativeProjectColors(api, state);
-  assert.match(document.getElementById("tweaker-project-colors").textContent, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*100%\s*!important/s);
+  assert.match(document.getElementById("tweaker-project-colors").textContent, /\[data-tweaker-project-color-group\][^}]*inline-size:\s*calc\(100% - var\(--tweaker-project-row-end-inset,\s*0px\)\)\s*!important/s);
   assert.equal(project.querySelectorAll("[data-tweaker-project-color-row]").length, 1);
   assert.equal(project.querySelectorAll("[data-tweaker-project-color-task]").length, 2);
 
@@ -533,6 +537,7 @@ test("project hierarchy uses bold full-color headers and contrast-safe selected 
   assert.equal(selectedTaskAction.getAttribute("data-tweaker-project-task-label"), null);
   assert.equal(header.style.values.has("--tweaker-project-foreground"), false);
   assert.equal(selectedTask.style.values.has("--tweaker-project-foreground"), false);
+  assert.equal(project.style.values.has("--tweaker-project-row-end-inset"), false);
   assert.equal(selectedTask.getAttribute("data-tweaker-project-selected"), null);
   assert.equal(showMore.getAttribute("data-tweaker-project-show-more"), null);
   assert.equal(document.getElementById("tweaker-project-colors"), null);
@@ -1308,6 +1313,139 @@ test("session row geometry copies the native collapsed project row size and gap"
     makeGroup(64, { left: 12, top: 64, width: 440, height: 30 }),
   ]);
   assert.deepEqual(geometry, { gap: 2, blockSize: 30, inlineSize: 440 });
+});
+
+test("project row end inset mirrors native geometry at compact, default, and widened sidebar widths", () => {
+  const projectsHeading = {
+    textContent: "Projects",
+    getBoundingClientRect: () => ({ left: 16, top: 300, bottom: 320, width: 64, height: 20 }),
+  };
+  const projectsHeadingWrapper = {
+    textContent: "Projects",
+    getBoundingClientRect: () => ({ left: 0, top: 300, bottom: 320, width: 464, height: 20 }),
+  };
+  const unrelatedProjectsHeading = {
+    textContent: "Projects",
+    getBoundingClientRect: () => ({ left: 200, top: 100, bottom: 120, width: 64, height: 20 }),
+  };
+  const document = {
+    querySelectorAll(selector) {
+      return selector === "h1, h2, h3, div, span" ? [unrelatedProjectsHeading, projectsHeadingWrapper, projectsHeading] : [];
+    },
+  };
+  const navigation = {
+    tagName: "NAV",
+    parentElement: null,
+    rect: { left: 0, right: 552, width: 552 },
+    getBoundingClientRect() { return this.rect; },
+    contains() { return false; },
+  };
+  const values = new Map();
+  const group = {
+    ownerDocument: document,
+    parentElement: navigation,
+    style: {
+      setProperty(name, value) { values.set(name, value); },
+      removeProperty(name) { values.delete(name); },
+    },
+  };
+  const header = {
+    rect: { left: 16, top: 340, right: 552, width: 536 },
+    getBoundingClientRect() { return this.rect; },
+  };
+
+  assert.equal(_test.measureNativeProjectRowEndInset(group, header), 16);
+  assert.equal(_test.applyProjectGroupEndInset(group, header), 16);
+  assert.equal(values.get("--tweaker-project-row-end-inset"), "16px");
+
+  navigation.rect = { left: 0, right: 464, width: 464 };
+  header.rect = { left: 0, top: 340, right: 464, width: 464 };
+  assert.equal(_test.measureNativeProjectRowEndInset(group, header), 16, "compact rows use the nearest visible Projects heading even when it is a DOM sibling");
+  assert.equal(_test.applyProjectGroupEndInset(group, header), 16);
+  assert.equal(values.get("--tweaker-project-row-end-inset"), "16px");
+  assert.equal(header.rect.width - 16, 448, "compact calculated width leaves the mirrored right gutter inside the border");
+
+  navigation.rect = { left: 0, right: 760, width: 760 };
+  header.rect = { left: 16, top: 340, right: 760, width: 744 };
+  assert.equal(_test.measureNativeProjectRowEndInset(group, header), 16, "manual widening preserves the native gutter");
+
+  header.rect = { left: 200, top: 340, right: 760, width: 560 };
+  assert.equal(_test.measureNativeProjectRowEndInset(group, header), 64, "unexpected native geometry is bounded");
+});
+
+test("session and Show more rows inherit the corrected project header geometry", () => {
+  const makeRow = (left) => {
+    const values = new Map();
+    return {
+      values,
+      style: { setProperty(name, value) { values.set(name, value); } },
+      getBoundingClientRect: () => ({ left, width: 536, height: 30 }),
+      setAttribute() {},
+    };
+  };
+  const session = makeRow(0);
+  const showMore = makeRow(0);
+  const list = { setAttribute() {} };
+  const group = {
+    querySelectorAll(selector) {
+      if (selector === "[data-tweaker-project-color-task], [data-tweaker-project-show-more]") return [session, showMore];
+      if (selector === '[role="list"]') return [list];
+      return [];
+    },
+  };
+  const header = { getBoundingClientRect: () => ({ left: 16, width: 520, height: 30 }) };
+
+  _test.applyProjectTaskGeometry(group, header, { blockSize: 30, inlineSize: 520 });
+
+  for (const row of [session, showMore]) {
+    assert.equal(row.values.get("--tweaker-project-native-row-inline-size"), "520px");
+    assert.equal(row.values.get("--tweaker-project-native-row-block-size"), "30px");
+    assert.equal(row.values.get("--tweaker-project-native-row-offset"), "16px");
+  }
+});
+
+test("project sidebar resize observation reapplies geometry and disconnects cleanly", (t) => {
+  const document = new FakeDocument();
+  const previous = {
+    document: global.document,
+    ResizeObserver: global.ResizeObserver,
+    requestAnimationFrame: global.requestAnimationFrame,
+    cancelAnimationFrame: global.cancelAnimationFrame,
+  };
+  global.document = document;
+  let observer = null;
+  global.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.observed = new Set(); observer = this; }
+    observe(node) { this.observed.add(node); }
+    unobserve(node) { this.observed.delete(node); }
+    disconnect() { this.disconnected = true; this.observed.clear(); }
+  };
+  let frame = null;
+  global.requestAnimationFrame = (callback) => { frame = callback; return 7; };
+  global.cancelAnimationFrame = (id) => { assert.equal(id, 7); frame = null; };
+  t.after(() => {
+    global.document = previous.document;
+    global.ResizeObserver = previous.ResizeObserver;
+    global.requestAnimationFrame = previous.requestAnimationFrame;
+    global.cancelAnimationFrame = previous.cancelAnimationFrame;
+  });
+
+  const navigation = document.createElement("nav");
+  const group = document.createElement("div");
+  group.setAttribute("data-tweaker-project-color-group", "true");
+  navigation.appendChild(group);
+  document.body.appendChild(navigation);
+  let applies = 0;
+  const resize = _test.installProjectSidebarResizeObserver(() => { applies += 1; });
+  resize.sync();
+  assert.equal(observer.observed.has(navigation), true);
+
+  observer.callback();
+  assert.equal(applies, 0, "resize work is deferred out of the observer callback");
+  frame();
+  assert.equal(applies, 1);
+  resize.dispose();
+  assert.equal(observer.disconnected, true);
 });
 
 test("active project session counts prefer explicit totals and deduplicate active session records", () => {

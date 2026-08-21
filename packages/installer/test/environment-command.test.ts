@@ -19,6 +19,8 @@ import type {
   EnvironmentTransactionPhase,
   EnvironmentTransactionReceipt,
 } from "../src/environment-transaction.js";
+import type { EnvironmentModePairReceipt } from "../src/environment-mode-cache.js";
+import type { EnvironmentWarmCommitReceipt } from "../src/environment-warm-commit.js";
 import type { ResolvedUserPaths } from "../src/paths.js";
 import { lifecycleLockFile } from "../src/lifecycle-lock.js";
 import { acquireProcessLock } from "../src/process-lock.js";
@@ -253,6 +255,9 @@ test("status is read-only and reports per-app-experience availability from recom
   });
   assert.equal(result.schemaVersion, 1);
   assert.ok("channels" in result);
+  assert.equal(result.cacheV2.schemaVersion, 2);
+  assert.equal(result.cacheV2.state, "unavailable");
+  assert.deepEqual(result.cacheV2.invalidationReasons, ["no environment mode cache has been published"]);
   assert.equal(result.channels.alpha.availability.chatgpt.available, true);
   assert.equal(result.channels.alpha.availability.tweakers.available, true);
   assert.equal(fixture.printed.length, 1);
@@ -508,6 +513,149 @@ test("submit fails closed for missing, mismatched, non-prepared, or unsafe trans
     assert.equal(submits.length, 0);
     assert.equal(fixture.printed.length, 0);
   }
+});
+
+test("explicit v2 flag projects prepare and polls the v2 pair control plane without legacy status", async () => {
+  const calls: string[] = [];
+  const prepared: Array<{ generationId: string; current: unknown; requested: unknown }> = [];
+  const pair = {
+    generationId: "v2-generation-exact",
+    releaseProfile: "alpha",
+    roles: {
+      live: { role: "live", experience: "chatgpt" },
+      inactive: { role: "inactive", experience: "tweakers" },
+    },
+    pin: { state: "prepared", releasedAt: null },
+    timestamps: {
+      preparedAt: NOW,
+      validatedAt: NOW,
+      publishedAt: NOW,
+      lastSuccessfulSwitchAt: null,
+      lastPreCutoverCancellationAt: null,
+      terminalAt: null,
+    },
+  } as EnvironmentModePairReceipt;
+  const coordinator = fakeCoordinator({
+    prepare: async () => { throw new Error("legacy prepare must not run"); },
+    commit: async () => { throw new Error("legacy commit must not run"); },
+    cancel: async () => { throw new Error("legacy cancel must not run"); },
+    recover: async () => { throw new Error("legacy recover must not run"); },
+    status: () => { throw new Error("legacy status must not run"); },
+    prepareModeCacheV2: async (input) => {
+      calls.push(`prepare:${input.generationId}`);
+      prepared.push(input);
+      return { state: "ready", receipt: pair };
+    },
+    resolvePreparedModeCacheV2CommitCli: (transactionId) => {
+      calls.push(`resolve:${transactionId}`);
+      return {
+        transactionId,
+        cliPath: `${ROOT}/environment-cache/generations/${transactionId}/managed-runtime/packages/installer/dist/cli.js`,
+        cliArtifactDigest: "c".repeat(64),
+        managedRuntimeArtifactPath: `${ROOT}/environment-cache/generations/${transactionId}/managed-runtime`,
+        managedRuntimeArtifactDigest: "d".repeat(64),
+        receiptFile: `${ROOT}/environment-cache/generations/${transactionId}/commit-helper.json`,
+      };
+    },
+    commitModeCacheV2: async ({ transactionId, approvalAt }) => {
+      calls.push(`commit:${transactionId}:${approvalAt}`);
+      return { kind: "environment-warm-commit", phase: "ready" } as EnvironmentWarmCommitReceipt;
+    },
+    cancelModeCacheV2: async ({ transactionId }) => {
+      calls.push(`cancel:${transactionId}`);
+      return { kind: "environment-mode-pair", pin: { state: "cancelled" } } as EnvironmentModePairReceipt;
+    },
+    recoverModeCacheV2: async ({ transactionId } = {}) => {
+      calls.push(`recover:${transactionId ?? "current"}`);
+      return { kind: "environment-warm-commit", phase: "ready" } as EnvironmentWarmCommitReceipt;
+    },
+  });
+  const fixture = dependencies({
+    environmentModeCacheV2Enabled: () => true,
+    createModeCacheGenerationId: () => "v2-generation-exact",
+    createCoordinator: () => coordinator,
+    observeModeCacheV2Transaction: (environmentRoot) => {
+      calls.push(`poll:${environmentRoot}`);
+      return {
+        schemaVersion: 2,
+        kind: "environment-mode-v2-transaction",
+        transactionId: "v2-generation-exact",
+        generationId: "v2-generation-exact",
+        phase: "prepared",
+        error: null,
+        timing: null,
+        createdAt: NOW,
+        updatedAt: NOW,
+        terminalAt: null,
+        pinState: "prepared",
+        requested: { appExperience: "tweakers", releaseProfile: "alpha" },
+      };
+    },
+  });
+
+  const preparation = await environment(
+    "prepare",
+    { appExperience: "tweakers", releaseProfile: "alpha", json: true },
+    fixture.deps,
+  );
+  assert.equal("transactionId" in preparation ? preparation.transactionId : null, "v2-generation-exact");
+  assert.equal("generationId" in preparation ? preparation.generationId : null, "v2-generation-exact");
+  assert.equal("phase" in preparation ? preparation.phase : null, "prepared");
+
+  const submission = await environment("submit", {
+    transaction: "v2-generation-exact",
+    "approval-at": NOW,
+    json: true,
+  }, fixture.deps);
+  assert.equal("transactionId" in submission ? submission.transactionId : null, "v2-generation-exact");
+  assert.equal("phase" in submission ? submission.phase : null, "submitted");
+
+  const polled = await environment("transaction", { json: true }, fixture.deps);
+  assert.deepEqual(polled, {
+    schemaVersion: 2,
+    kind: "environment-mode-v2-transaction",
+    transactionId: "v2-generation-exact",
+    generationId: "v2-generation-exact",
+    phase: "prepared",
+    error: null,
+    timing: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    terminalAt: null,
+    pinState: "prepared",
+    requested: { appExperience: "tweakers", releaseProfile: "alpha" },
+  });
+
+  await environment("commit", {
+    transaction: "v2-generation-exact",
+    "approval-at": NOW,
+    json: true,
+  }, fixture.deps);
+  await environment("cancel", { transaction: "v2-generation-exact", json: true }, fixture.deps);
+  await environment("recover", { transaction: "v2-generation-exact", json: true }, fixture.deps);
+
+  assert.equal(fixture.coordinators.every((options) => options.environmentModeCacheV2 === true), true);
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0]?.generationId, "v2-generation-exact");
+  assert.deepEqual(calls, [
+    "prepare:v2-generation-exact",
+    "resolve:v2-generation-exact",
+    `poll:${ROOT}`,
+    `commit:v2-generation-exact:${NOW}`,
+    "cancel:v2-generation-exact",
+    `poll:${ROOT}`,
+    "recover:v2-generation-exact",
+  ]);
+  assert.deepEqual(fixture.submits, [{
+    transactionId: "v2-generation-exact",
+    approvalAt: NOW,
+    cliPath: `${ROOT}/environment-cache/generations/v2-generation-exact/managed-runtime/packages/installer/dist/cli.js`,
+    cliArtifactDigest: "c".repeat(64),
+    managedRuntimeArtifactPath: `${ROOT}/environment-cache/generations/v2-generation-exact/managed-runtime`,
+    managedRuntimeArtifactDigest: "d".repeat(64),
+    userRoot: ROOT,
+    receiptFile: `${ROOT}/environment-cache/generations/v2-generation-exact/commit-helper.json`,
+  }]);
 });
 
 test("transaction returns schema-1 idle JSON and commit/verify/rollback/recover/cancel delegate exact IDs", async () => {

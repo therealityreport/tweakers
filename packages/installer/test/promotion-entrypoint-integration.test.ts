@@ -13,13 +13,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import asar from "@electron/asar";
 import {
   buildPromotionHealthExpectation,
+  CANDIDATE_HEALTH_RECEIPT_REUSE_MS,
   fingerprintPromotionPath,
   promotionSurfaceRoots,
+  readCandidatePromotionHealthExpectation,
+  reuseCandidateHealthReceipt,
   spawnHiddenHealthProbe,
   stageCandidateCodexAuth,
   validateMainRendererAsarEntrypoint,
@@ -89,6 +92,113 @@ const VALID_RENDERER_HTML = `<!doctype html>
 `;
 
 const installSource = readFileSync(new URL("../src/commands/install.ts", import.meta.url), "utf8");
+
+test("a rehydrated promotion reuses only a fresh, fully passing candidate health receipt", () => {
+  const root = mkdtempSync(join(tmpdir(), "candidate-receipt-reuse-"));
+  const receipt = join(root, "health", "promotion.json");
+  const expected = {
+    app: { version: "1.0.0", build: "100", hash: "app-hash" },
+    runtimeHash: "runtime-hash",
+    requiredPermissions: ["accessibility"],
+  };
+  const observedAt = "2026-08-20T12:00:00.000Z";
+  const write = (overrides: Record<string, unknown> = {}) => {
+    mkdirSync(dirname(receipt), { recursive: true });
+    writeFileSync(receipt, JSON.stringify({
+      schemaVersion: 1,
+      observedAt,
+      app: expected.app,
+      runtimeHash: expected.runtimeHash,
+      hostReady: "pass",
+      authenticatedSession: "pass",
+      declaredPermissions: { accessibility: "pass" },
+      ...overrides,
+    }), { mode: 0o600 });
+    chmodSync(receipt, 0o600);
+  };
+  try {
+    const fresh = new Date("2026-08-20T12:05:00.000Z");
+    write();
+    const reused = reuseCandidateHealthReceipt(receipt, expected, { now: fresh });
+    assert.ok(reused);
+    assert.equal(reused.host, "pass");
+    assert.match(reused.detail ?? "", /reused the candidate build's health receipt/);
+
+    // Stale beyond the reuse bound: a live probe must run.
+    assert.equal(
+      reuseCandidateHealthReceipt(receipt, expected, { now: new Date("2026-08-20T12:15:00.001Z") }),
+      null,
+    );
+    assert.equal(CANDIDATE_HEALTH_RECEIPT_REUSE_MS, 15 * 60_000);
+
+    // A failed or unknown session never qualifies.
+    write({ authenticatedSession: "fail" });
+    assert.equal(reuseCandidateHealthReceipt(receipt, expected, { now: fresh }), null);
+
+    // A drifted candidate fingerprint invalidates the receipt outright.
+    write();
+    assert.equal(
+      reuseCandidateHealthReceipt(receipt, { ...expected, app: { ...expected.app, hash: "drifted" } }, { now: fresh }),
+      null,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a held candidate's expectation twin rehydrates across transactions only when explicitly allowed", () => {
+  const root = mkdtempSync(join(tmpdir(), "expectation-rebind-"));
+  const file = join(root, "health", "expectation.json");
+  const hash = "a".repeat(64);
+  const expectation = {
+    schemaVersion: 2,
+    app: { version: "26.818.22352", build: "6872", hash },
+    requiredPermissions: [],
+    surfaces: {
+      app: { preimageHash: hash, afterHash: hash },
+      runtime: { preimageHash: hash, afterHash: hash },
+      tweakTree: { preimageHash: hash, afterHash: hash },
+      tweakersConfig: { preimageHash: hash, afterHash: hash },
+      codexConfig: { preimageHash: hash, afterHash: hash },
+      namespaceData: { preimageHash: hash, afterHash: hash },
+      mainStorage: { preimageHash: hash, afterHash: hash },
+      policy: { preimageHash: hash, afterHash: hash },
+    },
+    userQuestions: { id: "co.tweakers.user-questions", version: "1.0.0", payloadHash: hash },
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    // repair built and held the candidate at 12:00; a NEW install transaction
+    // adopting it starts at 12:30 (live failure 2026-08-20).
+    writeFileSync(file, JSON.stringify({ ...expectation, requestedAt: "2026-08-20T12:00:00.000Z" }), { mode: 0o600 });
+    chmodSync(file, 0o600);
+    const bounds = {
+      transactionCreatedAt: "2026-08-20T12:30:00.000Z",
+      now: new Date("2026-08-20T12:35:00.000Z"),
+      maxAgeMs: 24 * 60 * 60 * 1_000,
+    };
+
+    // Strict callers (same-record continuations) still reject the earlier twin.
+    assert.equal(readCandidatePromotionHealthExpectation(file, bounds), null);
+    // The adoption path accepts it; the caller re-binds via the candidate
+    // app-fingerprint check immediately afterwards.
+    const adopted = readCandidatePromotionHealthExpectation(file, { ...bounds, allowEarlierRequest: true });
+    assert.ok(adopted);
+    assert.equal(adopted.app.build, "6872");
+
+    // The age bound still applies even with adoption allowed.
+    assert.equal(
+      readCandidatePromotionHealthExpectation(file, {
+        ...bounds,
+        allowEarlierRequest: true,
+        now: new Date("2026-08-21T12:00:00.001Z"),
+      }),
+      null,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("post-promotion health requires a clean probe exit before its receipt can be accepted", () => {
   const start = installSource.indexOf("openApp: (appRoot) => {");

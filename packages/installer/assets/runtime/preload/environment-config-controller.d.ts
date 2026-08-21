@@ -46,6 +46,21 @@ export interface EnvironmentConfigController<Receipt> {
 export interface EnvironmentConfigControllerOptions {
     onChange?: (snapshot: EnvironmentConfigSnapshot) => void;
 }
+export interface PreparedEnvironmentGenerationReceipt {
+    schemaVersion?: number;
+    generationId?: string;
+    phase: string;
+}
+export interface EnvironmentModeCacheGenerationObservation {
+    state: "ready" | "preparing" | "stale" | "unavailable";
+    generationId: string | null;
+}
+/**
+ * Legacy schema-v1 receipts are not generation-bound and must remain
+ * resumable when an unrelated optional v2 cache is stale. Only a schema-v2
+ * receipt naming the exact stale generation requires fresh preparation.
+ */
+export declare function preparedEnvironmentReceiptNeedsFreshV2Preparation(receipt: PreparedEnvironmentGenerationReceipt, cache: EnvironmentModeCacheGenerationObservation | null | undefined): boolean;
 export declare function createEnvironmentConfigController<Receipt>(selected: EnvironmentSelectionPair, effects: EnvironmentConfigEffects<Receipt>, options?: EnvironmentConfigControllerOptions): EnvironmentConfigController<Receipt>;
 export type DesktopUpdateStatus = "update-available" | "current" | "stale" | "unavailable" | "error";
 export declare function humanizeCodexPhase(value: string): string;

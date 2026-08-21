@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { readHeaderHash } from "../asar.js";
 import { ensureUserPaths } from "../paths.js";
 import { ensureModeCoordinatorConfigured } from "../switcher-setup.js";
 import { readConfigFile, updateConfigFile } from "../config.js";
@@ -26,6 +27,9 @@ export interface LocalRefreshStatus {
   detail: string;
   error: string | null;
   checkedAt: string;
+  /** Milliseconds per completed workflow phase and sub-step (e.g. "preparing",
+   * "preparing.build"); additive diagnostics for benchmark readers. */
+  phaseTimings?: Record<string, number>;
 }
 
 interface WorkflowAdapters {
@@ -40,6 +44,8 @@ export interface RefreshLocalOptions {
   source?: "smart" | "development" | "stable";
   app?: string;
   developmentRoot?: string;
+  /** Bypass the accepted-refresh no-op gate and always run the full workflow. */
+  force?: boolean;
 }
 
 export interface RefreshSelection {
@@ -144,6 +150,20 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
   const lock = acquireRefreshLock(lockFile);
   const stableStageRoot = join(paths.root, "refresh-stable-stage");
   let preparedStableSource: string | null = null;
+  const phaseTimings: Record<string, number> = {};
+  let activePhase: RefreshPhase | null = null;
+  let activePhaseStarted = performance.now();
+  const finishActivePhase = (): void => {
+    if (activePhase !== null) phaseTimings[activePhase] = Math.round(performance.now() - activePhaseStarted);
+  };
+  const timed = async <T>(name: string, run: () => T | Promise<T>): Promise<T> => {
+    const started = performance.now();
+    try {
+      return await run();
+    } finally {
+      phaseTimings[name] = Math.round(performance.now() - started);
+    }
+  };
   const writePhase = (phase: RefreshPhase, error: string | null = null): void => writeRefreshState(paths.root, {
     available: phase === "failed",
     source: selected,
@@ -152,11 +172,39 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
     detail: phase === "complete" ? "Local ChatGPT refresh completed" : `Local refresh ${phase}`,
     error,
     checkedAt: new Date().toISOString(),
+    ...(Object.keys(phaseTimings).length === 0 ? {} : { phaseTimings }),
   });
   try {
     const appRoot = locateCodex(opts.app).appRoot;
+    // No-op gate, deliberately inside the lifecycle lock and after
+    // assertLifecycleReceiptsIdle: skip the whole workflow only when a
+    // terminal accepted-refresh receipt still binds the exact current source
+    // tree, live app asar, runtime fingerprint, managed-runtime provenance,
+    // and build toolchain. Any drift - including a rollback that changed the
+    // live app since acceptance - recomputes differently and runs in full.
+    if (selected === "development" && opts.force !== true) {
+      const accepted = readAcceptedRefreshReceipt(paths.root);
+      const binding = accepted === null ? null : computeRefreshBinding(sourceRoot, appRoot, paths.root);
+      if (accepted !== null && binding !== null && refreshBindingMatches(accepted, binding)) {
+        writeRefreshState(paths.root, {
+          available: false,
+          source: selected,
+          phase: "complete",
+          developmentSourceRoot: selection.developmentSourceRoot,
+          detail: "No runtime changes since the last accepted refresh",
+          error: null,
+          checkedAt: new Date().toISOString(),
+        });
+        return;
+      }
+    }
     await runRefreshWorkflow({
-      phase: (phase) => writePhase(phase),
+      phase: (phase) => {
+        finishActivePhase();
+        activePhase = phase === "complete" || phase === "failed" ? null : phase;
+        activePhaseStarted = performance.now();
+        writePhase(phase);
+      },
       prepare: async () => {
         if (selected === "stable") {
           rmSync(stableStageRoot, { recursive: true, force: true });
@@ -182,8 +230,8 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           }
           runChecked(process.execPath, [stagedCli, "install", "--app", appRoot, "--candidate-only", "--coordinated-refresh", "--no-watcher"], process.cwd(), process.env);
         } else {
-          runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment());
-          await install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true });
+          await timed("preparing.build", () => runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment()));
+          await timed("preparing.candidate", () => install({ app: appRoot, candidateOnly: true, candidateOnlyReason: "coordinated-refresh", watcher: false, quiet: true }));
         }
       },
       quit: () => {
@@ -203,15 +251,23 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
           runChecked(process.execPath, [managedCliPath(stableStageRoot), "repair", "--app", appRoot, "--force", "--quiet"], process.cwd(), process.env);
           installManagedRuntime(preparedStableSource, paths.root);
         } else {
-          await repair({ app: appRoot, force: true, quiet: true });
-          const managed = installManagedRuntime(sourceRoot, paths.root);
-          writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
+          await timed("promoting.repair", () => repair({ app: appRoot, force: true, quiet: true }));
+          await timed("promoting.managedRuntime", () => {
+            const managed = installManagedRuntime(sourceRoot, paths.root);
+            writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
+          });
+          // Bind the freshly promoted state for the no-op gate. Never fail a
+          // successful refresh over an unreadable binding input.
+          const binding = computeRefreshBinding(sourceRoot, appRoot, paths.root);
+          if (binding !== null) writeAcceptedRefreshReceipt(paths.root, binding);
         }
         await restoreModeCoordinatorMetadata();
       },
       reopen: () => openCodex(appRoot, { detached: true, delayMs: 750 }),
     });
   } catch (error) {
+    finishActivePhase();
+    activePhase = null;
     writePhase("failed", error instanceof Error ? error.message : String(error));
     workflowFailureWritten = true;
     throw error;
@@ -339,6 +395,120 @@ export function refreshCliPath(userRoot: string, status = getLocalRefreshStatus(
     return join(status.developmentSourceRoot, "packages", "installer", "dist", "cli.js");
   }
   return managedCliPath(userRoot);
+}
+
+/**
+ * Hash every refresh-relevant source input. Unlike `hashTree(root, false)` —
+ * which exists to compare against the managed runtime's provenance and so
+ * excludes `tweaks/` — this hash includes the tweak sources: a tweak-only
+ * edit must invalidate the accepted-refresh receipt. Build outputs
+ * (`packages/installer/assets/runtime`) stay excluded so the hash does not
+ * invalidate itself.
+ */
+export function hashRefreshSourceTree(root: string): string {
+  const hash = createHash("sha256");
+  if (!existsSync(root)) return hash.digest("hex");
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if ([".git", "node_modules", "dist", ".DS_Store"].includes(entry.name)) continue;
+      const path = join(dir, entry.name);
+      const rel = relative(root, path).replaceAll("\\", "/");
+      if (rel.startsWith("packages/installer/assets/runtime")) continue;
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) { hash.update(rel); hash.update(readFileSync(path)); }
+    }
+  };
+  visit(root);
+  return hash.digest("hex");
+}
+
+export interface AcceptedRefreshReceipt {
+  schemaVersion: 1;
+  kind: "refresh-accepted";
+  sourceRoot: string;
+  sourceRefreshHash: string;
+  appRoot: string;
+  appAsarHeaderHash: string;
+  runtimeFingerprintSha256: string;
+  managedProvenanceSha256: string;
+  toolchainKey: string;
+  acceptedAt: string;
+}
+
+export type RefreshBinding = Omit<AcceptedRefreshReceipt, "schemaVersion" | "kind" | "acceptedAt">;
+
+function acceptedRefreshReceiptFile(userRoot: string): string {
+  return join(userRoot, "refresh-accepted.json");
+}
+
+function sha256File(path: string): string | null {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bind the current dev-source and live installation identities: the full
+ * source tree hash, the live app's asar header, the live runtime fingerprint
+ * document, the managed runtime's provenance, and the build toolchain (node
+ * version + lockfile). Null whenever any input is unreadable — an unreadable
+ * binding always disables the no-op gate, never skips work.
+ */
+export function computeRefreshBinding(sourceRoot: string, appRoot: string, userRoot: string): RefreshBinding | null {
+  const appAsarHeaderHash = (() => {
+    try {
+      return readHeaderHash(join(appRoot, "Contents", "Resources", "app.asar")).headerHash;
+    } catch {
+      return null;
+    }
+  })();
+  const runtimeFingerprintSha256 = sha256File(join(userRoot, "runtime", "runtime-fingerprint.json"));
+  const managedProvenanceSha256 = sha256File(join(managedSourceRoot(userRoot), ".tweakers-provenance.json"));
+  const lockfileSha256 = sha256File(join(sourceRoot, "package-lock.json"));
+  if (appAsarHeaderHash === null || runtimeFingerprintSha256 === null
+    || managedProvenanceSha256 === null || lockfileSha256 === null) return null;
+  return {
+    sourceRoot,
+    sourceRefreshHash: hashRefreshSourceTree(sourceRoot),
+    appRoot,
+    appAsarHeaderHash,
+    runtimeFingerprintSha256,
+    managedProvenanceSha256,
+    toolchainKey: `${process.version}:${lockfileSha256}`,
+  };
+}
+
+export function readAcceptedRefreshReceipt(userRoot: string): AcceptedRefreshReceipt | null {
+  const value = readJson<Partial<AcceptedRefreshReceipt>>(acceptedRefreshReceiptFile(userRoot));
+  if (value === null || value.schemaVersion !== 1 || value.kind !== "refresh-accepted") return null;
+  const fields = [
+    value.sourceRoot, value.sourceRefreshHash, value.appRoot, value.appAsarHeaderHash,
+    value.runtimeFingerprintSha256, value.managedProvenanceSha256, value.toolchainKey, value.acceptedAt,
+  ];
+  if (fields.some((field) => typeof field !== "string" || field.length === 0)) return null;
+  return value as AcceptedRefreshReceipt;
+}
+
+export function writeAcceptedRefreshReceipt(userRoot: string, binding: RefreshBinding): void {
+  const receipt: AcceptedRefreshReceipt = {
+    schemaVersion: 1,
+    kind: "refresh-accepted",
+    ...binding,
+    acceptedAt: new Date().toISOString(),
+  };
+  writeFileSync(acceptedRefreshReceiptFile(userRoot), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
+}
+
+export function refreshBindingMatches(receipt: AcceptedRefreshReceipt, binding: RefreshBinding): boolean {
+  return receipt.sourceRoot === binding.sourceRoot
+    && receipt.sourceRefreshHash === binding.sourceRefreshHash
+    && receipt.appRoot === binding.appRoot
+    && receipt.appAsarHeaderHash === binding.appAsarHeaderHash
+    && receipt.runtimeFingerprintSha256 === binding.runtimeFingerprintSha256
+    && receipt.managedProvenanceSha256 === binding.managedProvenanceSha256
+    && receipt.toolchainKey === binding.toolchainKey;
 }
 
 export function hashTree(root: string, tweaksOnly: boolean): string {

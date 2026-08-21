@@ -56,6 +56,13 @@ import {
   type TransactionPhase,
 } from "../transaction.js";
 import { isUpdateModeFresh, readUpdateMode } from "../update-mode.js";
+import {
+  createEnvironmentSelection,
+  defaultEnvironmentProfileRegistry,
+  publishEnvironmentSelection,
+  resolveEnvironmentProfile,
+  type EnvironmentSelection,
+} from "../environment-profile.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import {
   clearModeTransition,
@@ -86,7 +93,12 @@ import {
   type EnvironmentCommandResult,
   type EnvironmentStatusResult,
 } from "./environment.js";
-import type { EnvironmentTransactionReceipt } from "../environment-transaction.js";
+import type {
+  EnvironmentModeCacheV2PreparationResult,
+  EnvironmentTransactionReceipt,
+} from "../environment-transaction.js";
+import type { EnvironmentWarmCommitReceipt } from "../environment-warm-commit.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache, type EnvironmentModeCacheStatus } from "../environment-mode-cache.js";
 
 export interface ModeCommandOptions {
   json?: boolean;
@@ -122,8 +134,15 @@ export interface ModeCommandDeps {
   removeStandaloneSwitcher?: typeof removeStandaloneSwitcher;
   installApp?: typeof install;
   environmentCommand?: typeof environment;
+  /** Reconciliation seam: republish the selection from the proven live experience. */
+  republishSelection?: (
+    selected: EnvironmentSelection,
+    liveExperience: "chatgpt" | "tweakers",
+  ) => EnvironmentSelection;
   /** @internal Keeps legacy bundle-swap unit fixtures reachable, never production CLI flow. */
   legacyModeEngineForTests?: boolean;
+  /** Test seam for the instant immediately following a deliberate confirmation. */
+  now?: () => string;
 }
 
 export async function mode(
@@ -194,6 +213,38 @@ async function runNotifiedSwitch(
  * visible window before reporting success. The old bundle-swap engine remains
  * reachable only through the explicit test seam above.
  */
+/**
+ * Republish environment-selection.json (and the registry's selected record)
+ * from the PROVEN live experience. Live bytes outrank a stale publication:
+ * a swap-at-quit flow can change the live app without republishing, after
+ * which every selection-trusting flow (mode switching, repair intent,
+ * update-recovery adoption) works from fiction until reconciled.
+ */
+function republishSelectionFromLiveExperience(
+  selected: EnvironmentSelection,
+  liveExperience: "chatgpt" | "tweakers",
+): EnvironmentSelection {
+  const paths = ensureUserPaths();
+  const now = new Date().toISOString();
+  const profile = resolveEnvironmentProfile(defaultEnvironmentProfileRegistry(), selected.releaseProfile);
+  const selection = createEnvironmentSelection({
+    profile: {
+      ...profile,
+      selectedDesktopPath: selected.selectedDesktopPath,
+      selectedDesktopBundleId: selected.selectedDesktopBundleId,
+    },
+    appExperience: liveExperience,
+    requestedAt: now,
+    appliedAt: now,
+  });
+  publishEnvironmentSelection(
+    join(paths.root, "environment-registry.json"),
+    join(paths.root, "environment-selection.json"),
+    selection,
+  );
+  return selection;
+}
+
 async function switchEnvironmentExperience(
   target: "chatgpt" | "tweakers",
   opts: ModeCommandOptions,
@@ -223,32 +274,45 @@ async function switchEnvironmentExperience(
       `Cannot verify the live app experience at ${status.selected.selectedDesktopPath}; run tweaker repair before switching modes`,
     );
   }
-  if (observedExperience !== status.selected.appExperience) {
-    throw new Error(
-      `Environment selection says ${status.selected.appExperience}, but the live app proves ${observedExperience}; run tweaker repair before switching modes`,
-    );
+  let selected = status.selected;
+  if (observedExperience !== selected.appExperience) {
+    // A swap-at-quit flow can change the live experience without
+    // republishing the selection (observed stale live 2026-08-20, where the
+    // previously prescribed `tweaker repair` treated the stale selection as
+    // INTENT and could not reconcile either). The live bytes are the truth:
+    // republish the selection from the proven live experience, then continue
+    // the switch from reconciled reality instead of dead-ending.
+    selected = (deps.republishSelection ?? republishSelectionFromLiveExperience)(selected, observedExperience);
+    console.log(kleur.yellow(
+      `Reconciled the published environment selection to the proven live experience (${observedExperience}).`,
+    ));
   }
-  if (status.selected.appExperience === target) {
+  if (selected.appExperience === target) {
     console.log(kleur.green(`Already in ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
     return;
   }
 
   const prepared = await runEnvironment("prepare", {
     appExperience: target,
-    releaseProfile: status.selected.releaseProfile,
+    releaseProfile: selected.releaseProfile,
     quiet: true,
   });
   const receipt = requirePreparedEnvironmentReceipt(prepared);
   const confirmed = opts.yes === true
     || (deps.confirm ?? confirmModeSwitch)({
       target,
-      appRoot: receipt.requested.selectedDesktopPath,
+      appRoot: receipt.kind === "v2"
+        ? selected.selectedDesktopPath
+        : receipt.receipt.requested.selectedDesktopPath,
     });
   if (!confirmed) {
     await runEnvironment("cancel", { transaction: receipt.transactionId, quiet: true });
     console.log(kleur.yellow("Mode switch cancelled."));
     return;
   }
+  // This is the only production caller that supplies approvalAt. It is captured
+  // after deliberate user confirmation and before the commit IPC/helper path.
+  const approvalAt = (deps.now ?? (() => new Date().toISOString()))();
   appendLifecycleAuditRecord(ensureUserPaths().desktopUpdateLogFile, {
     event: "user_approval",
     action: `mode-switch:${target}`,
@@ -258,8 +322,25 @@ async function switchEnvironmentExperience(
 
   const committed = await runEnvironment("commit", {
     transaction: receipt.transactionId,
+    approvalAt,
     quiet: true,
   });
+  if (receipt.kind === "v2") {
+    if (!isEnvironmentWarmCommitReceipt(committed) || committed.phase !== "ready") {
+      const phase = isEnvironmentWarmCommitReceipt(committed) ? committed.phase : "invalid";
+      const detail = isEnvironmentWarmCommitReceipt(committed) && committed.error
+        ? `: ${committed.error}`
+        : "";
+      throw new Error(`Environment mode switch did not commit (phase ${phase})${detail}`);
+    }
+    console.log(kleur.green().bold(`✓ Switched to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
+    console.log(
+      kleur.dim(
+        `  Restart verified: PID ${committed.sourceMainPid ?? "unknown"} → ${committed.targetMainPid ?? "unknown"}; activated window at ${status.selected.selectedDesktopPath}`,
+      ),
+    );
+    return;
+  }
   if (!isEnvironmentTransactionReceipt(committed) || committed.phase !== "committed") {
     const phase = isEnvironmentTransactionReceipt(committed) ? committed.phase : "invalid";
     const detail = isEnvironmentTransactionReceipt(committed) && committed.error
@@ -295,12 +376,39 @@ function isEnvironmentTransactionReceipt(
 
 function requirePreparedEnvironmentReceipt(
   value: EnvironmentCommandResult,
-): EnvironmentTransactionReceipt {
+): { kind: "v1"; transactionId: string; receipt: EnvironmentTransactionReceipt } | {
+  kind: "v2";
+  transactionId: string;
+  receipt: NonNullable<EnvironmentModeCacheV2PreparationResult["receipt"]>;
+} {
+  if (isEnvironmentModeCacheV2PreparationResult(value)) {
+    if (value.state !== "ready" || value.receipt === null) {
+      throw new Error(`Environment mode switch preparation did not complete (phase ${value.state})`);
+    }
+    return { kind: "v2", transactionId: value.receipt.generationId, receipt: value.receipt };
+  }
   if (!isEnvironmentTransactionReceipt(value) || value.phase !== "prepared") {
     const phase = isEnvironmentTransactionReceipt(value) ? value.phase : "invalid";
     throw new Error(`Environment mode switch preparation did not complete (phase ${phase})`);
   }
-  return value;
+  return { kind: "v1", transactionId: value.transactionId, receipt: value };
+}
+
+function isEnvironmentModeCacheV2PreparationResult(
+  value: EnvironmentCommandResult,
+): value is EnvironmentModeCacheV2PreparationResult {
+  return "state" in value
+    && (value.state === "disabled" || value.state === "ready")
+    && "receipt" in value;
+}
+
+function isEnvironmentWarmCommitReceipt(
+  value: EnvironmentCommandResult,
+): value is EnvironmentWarmCommitReceipt {
+  return "kind" in value
+    && value.kind === "environment-warm-commit"
+    && "transactionId" in value
+    && typeof value.transactionId === "string";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -320,6 +428,8 @@ interface ModeStatusReport {
    * that omits the key must still decode cleanly.
    */
   rendererPatches?: RendererPatchRecord;
+  /** Additive sealed-pair observation; it does not enable warm switching. */
+  cacheV2: EnvironmentModeCacheStatus;
 }
 
 async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Promise<void> {
@@ -382,6 +492,7 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
       ...(coordinator.reason ? { reason: coordinator.reason } : {}),
     },
     transition: journal ? { target: journal.target, phase: journal.phase, ownerPid: journal.ownerPid } : null,
+    cacheV2: observeEnvironmentModeCache(environmentModeCachePaths(paths.root)),
   };
 
   const rendererRecord = readRendererPatchRecord(
@@ -402,6 +513,17 @@ async function modeStatus(opts: ModeCommandOptions, deps: ModeCommandDeps): Prom
   console.log(`  parked payload: ${report.parkedPayload.present ? kleur.green(`present${report.parkedPayload.baseVersion ? ` (${report.parkedPayload.baseVersion})` : ""}`) : kleur.dim("none")}`);
   console.log(`  pristine backup: ${report.backup.present ? `${report.backup.developerIdValid ? kleur.green("Developer ID valid") : kleur.red("NOT Developer ID signed")}${report.backup.version ? ` (${report.backup.version})` : ""}` : kleur.red("missing")}`);
   console.log(`  mode controls: ${report.switcher.installed ? kleur.green("Menu Bar coordinator ready") : kleur.yellow(`unavailable${report.switcher.reason ? ` — ${report.switcher.reason}` : ""}`)}`);
+  console.log(`  sealed pair:  ${report.cacheV2.state}${report.cacheV2.generationId ? ` (${report.cacheV2.generationId})` : ""}`);
+  console.log(`  pair prepare: ${report.cacheV2.preparation.phase}${report.cacheV2.preparation.generationId ? ` (${report.cacheV2.preparation.generationId})` : ""}`);
+  if (report.cacheV2.pin) {
+    console.log(`  pair pin:     ${report.cacheV2.pin.state}${report.cacheV2.pin.releasedAt ? ` (released ${report.cacheV2.pin.releasedAt})` : ""}`);
+  }
+  if (report.cacheV2.supersession?.supersededAt) {
+    console.log(`  pair superseded: ${report.cacheV2.supersession.supersededAt}${report.cacheV2.supersession.replacementGenerationId ? ` by ${report.cacheV2.supersession.replacementGenerationId}` : ""}`);
+  }
+  if (report.cacheV2.invalidationReasons.length > 0) {
+    console.log(kleur.dim(`  pair evidence: ${report.cacheV2.invalidationReasons.join("; ")}`));
+  }
   const coverage = describeRendererPatchCoverage(report.rendererPatches ?? null, null);
   if (coverage) {
     const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;
@@ -638,9 +760,13 @@ async function switchToChatgpt(opts: ModeCommandOptions, deps: ModeCommandDeps):
 
       (deps.openApp ?? defaultOpenApp)(codex.appRoot);
 
-      const post = (deps.verifyDeep ?? verifySignature)(codex.appRoot);
+      // The destination was deep-verified moments ago inside the swap's
+      // validateDestination (a failure would have rolled back and thrown), so
+      // this display-only line needs just the cheap identity read, not a
+      // third full-bundle codesign walk.
+      const post = readSignature(codex.appRoot);
       console.log(kleur.green().bold("✓ Switched to ChatGPT mode."));
-      console.log(`  Live app:       pristine official ChatGPT (team ${OPENAI_TEAM_ID})${post.ok ? "" : kleur.red(" — post-swap signature verification FAILED")}`);
+      console.log(`  Live app:       pristine official ChatGPT (team ${OPENAI_TEAM_ID})${post.ok && post.teamIdentifier === OPENAI_TEAM_ID ? "" : kleur.red(" — post-swap signature identity check FAILED")}`);
       console.log(`  Parked payload: ${kleur.cyan(parkedApp)}${parkedVersion ? ` (${parkedVersion})` : ""}`);
       printTccReminder(paths.configFile);
       return;

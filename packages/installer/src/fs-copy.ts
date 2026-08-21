@@ -1,12 +1,15 @@
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   cpSync,
   lchmodSync,
   lstatSync,
+  mkdirSync,
   readdirSync,
   rmSync,
 } from "node:fs";
-import { join } from "node:path";
+import { platform } from "node:os";
+import { dirname, join } from "node:path";
 
 /**
  * Finder writes `.DS_Store` into any directory the user merely browses,
@@ -71,6 +74,45 @@ export function copyDirectoryPreservingModes(source: string, destination: string
   cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
   sweepMacOsJunk(destination);
   restoreDirectoryModes(source, destination);
+}
+
+export interface CloneOrCopyDirectoryDeps {
+  execFileSync?: typeof execFileSync;
+  platform?: () => NodeJS.Platform;
+}
+
+/**
+ * Copy a directory preferring APFS clonefile (`cp -Rcp`) — a near-instant
+ * copy-on-write clone on the same volume that preserves modes, timestamps,
+ * symlinks, and xattrs bit-exact, so no umask repair is needed. Any clone
+ * failure (non-darwin, cross-volume EXDEV/ENOTSUP, or cp error) clears the
+ * partial destination and falls back to `copyDirectoryPreservingModes`,
+ * keeping the byte-copy path's junk sweep and mode restoration unchanged.
+ * The destination is always cleared first; callers stage into fresh paths.
+ */
+export function cloneOrCopyDirectoryPreservingModes(
+  source: string,
+  destination: string,
+  deps: CloneOrCopyDirectoryDeps = {},
+): void {
+  const sourceRoot = lstatSync(source);
+  if (!sourceRoot.isDirectory() || sourceRoot.isSymbolicLink()) {
+    throw new Error(`Directory copy source must be a real directory: ${source}`);
+  }
+  const exec = deps.execFileSync ?? execFileSync;
+  const currentPlatform = deps.platform?.() ?? platform();
+  rmSync(destination, { recursive: true, force: true });
+  mkdirSync(dirname(destination), { recursive: true });
+  if (currentPlatform === "darwin") {
+    try {
+      exec("cp", ["-Rcp", source, destination], { stdio: "ignore" });
+      sweepMacOsJunk(destination);
+      return;
+    } catch {
+      rmSync(destination, { recursive: true, force: true });
+    }
+  }
+  copyDirectoryPreservingModes(source, destination);
 }
 
 /**

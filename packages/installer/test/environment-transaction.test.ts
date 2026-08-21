@@ -185,6 +185,251 @@ test("custom coordinators keep every adoption path inside their explicit root", 
   }
 });
 
+test("environmentModeCacheV2 is default-off and its gate never falls through to legacy preparation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-mode-cache-gate-"));
+  const { current, requested } = selections();
+  let delegated = 0;
+  let liveMutationCalls = 0;
+  const delegate = async () => {
+    delegated += 1;
+    return { state: "ready" as const, receipt: null };
+  };
+  const assertNoLiveMutation = (): void => {
+    liveMutationCalls += 1;
+    throw new Error("T3 preparation must not invoke a live mutation callback");
+  };
+  try {
+    const disabled = new InstallerEnvironmentCoordinator({ environmentRoot: root }, {
+      prepareModeCacheV2: delegate,
+    });
+    const disabledResult = await disabled.prepareModeCacheV2({
+      current,
+      requested,
+      generationId: "cache-gate-disabled",
+    });
+    assert.deepEqual(disabledResult, { state: "disabled", receipt: null });
+    assert.equal(delegated, 0, "the default feature gate cannot start any preparation work");
+    assert.equal(existsSync(join(root, "environment-cache")), false, "the default feature gate creates no cache state");
+    await assert.rejects(
+      () => disabled.commitModeCacheV2({
+        transactionId: "cache-gate-disabled-commit",
+        approvalAt: "2026-08-18T12:00:00.000Z",
+      }),
+      /warm commit is disabled by default/,
+    );
+    assert.equal(existsSync(join(root, "environment-cache")), false, "the default commit gate creates no cache state");
+
+    const enabled = new InstallerEnvironmentCoordinator({
+      environmentRoot: root,
+      environmentModeCacheV2: true,
+    }, {
+      prepareModeCacheV2: delegate,
+      quitDesktop: async () => assertNoLiveMutation(),
+      cleanupHelpers: () => assertNoLiveMutation(),
+      reopenDesktop: () => assertNoLiveMutation(),
+      pauseWatcher: () => assertNoLiveMutation(),
+      resumeWatcher: () => assertNoLiveMutation(),
+      applyPreparedEnvironment: () => assertNoLiveMutation(),
+      publishSelection: () => assertNoLiveMutation(),
+    });
+    assert.deepEqual(await enabled.prepareModeCacheV2({
+      current,
+      requested,
+      generationId: "cache-gate-enabled",
+    }), { state: "ready", receipt: null });
+    assert.equal(delegated, 1, "the enabled seam delegates once without invoking commit code");
+    await assert.rejects(
+      () => enabled.commitModeCacheV2({
+        transactionId: "cache-gate-missing-adapter",
+        approvalAt: "2026-08-18T12:00:00.000Z",
+      }),
+      /no current reachable prepared pair for warm commit/,
+    );
+    assert.equal(liveMutationCalls, 0, "T3 preparation does not touch live app, watcher, helper, or selection callbacks");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("nonterminal schema-v1 receipts are refused by the v2 recovery route", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-v1-recovery-delegation-"));
+  const { current, requested } = selections();
+  const publications: string[] = [];
+  try {
+    const coordinator = new InstallerEnvironmentCoordinator({
+      environmentRoot: root,
+      mcpConfigFile: join(root, "codex-config.toml"),
+      environmentModeCacheV2: true,
+      verificationPolls: 1,
+      verificationIntervalMs: 0,
+    }, {
+      createId: () => "v1-delegated-recovery",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: (path) => path === current.selectedDesktopPath
+        ? { pid: 5151, visibleWindow: true }
+        : null,
+      proveAppliedEnvironment: ({ direction }) => direction === "rollback"
+        ? appliedEvidence(current, "rollback")
+        : null,
+      publishSelection: (value) => { publications.push(value.appExperience); },
+      sleep: async () => {},
+    });
+    const prepared = await coordinator.prepare({ current, requested });
+    assert.equal(prepared.phase, "prepared");
+
+    await assert.rejects(
+      () => coordinator.recoverModeCacheV2(),
+      /refuses mixed-version recovery while schema-v1 transaction v1-delegated-recovery is prepared/,
+    );
+    assert.deepEqual(publications, []);
+    assert.equal(existsSync(join(root, "environment-cache")), false, "v2 recovery must not manufacture or interpret a v1 pair");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("terminal schema-v1 receipts are history rather than a schema-v2 recovery input", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-v1-terminal-history-"));
+  const { current, requested } = selections();
+  const lifecycle: string[] = [];
+  let freshV2Prepares = 0;
+  try {
+    const coordinator = new InstallerEnvironmentCoordinator({
+      environmentRoot: root,
+      mcpConfigFile: join(root, "codex-config.toml"),
+      environmentModeCacheV2: true,
+    }, {
+      createId: () => "v1-terminal-history",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: () => ({ pid: 6161, visibleWindow: true }),
+      pauseWatcher: () => { lifecycle.push("pause"); },
+      quitDesktop: () => { lifecycle.push("quit"); },
+      prepareModeCacheV2: () => {
+        freshV2Prepares += 1;
+        return { state: "ready", receipt: null };
+      },
+    });
+    const prepared = await coordinator.prepare({ current, requested });
+    writeEnvironmentTransactionReceipt(coordinator.transactionFile, {
+      ...prepared,
+      phase: "cancelled",
+      cancelledAt: "2026-08-18T12:00:03.000Z",
+    });
+
+    assert.deepEqual(await coordinator.prepareModeCacheV2({
+      current,
+      requested,
+      generationId: "first-fresh-v2-after-v1-history",
+    }), { state: "ready", receipt: null });
+    assert.equal(freshV2Prepares, 1, "terminal v1 history cannot be upgraded or used as a pair cache");
+
+    await assert.rejects(
+      () => coordinator.recoverModeCacheV2(),
+      /no current generation to recover/,
+    );
+
+    assert.equal(coordinator.status()?.phase, "cancelled");
+    assert.deepEqual(lifecycle, [], "terminal v1 history must not invoke v1 recovery or a v2 lifecycle path");
+    assert.equal(existsSync(join(root, "environment-cache")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("enabled production v2 recovery fails closed with no current generation before lifecycle callbacks", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-v2-recovery-adapter-gate-"));
+  const lifecycle: string[] = [];
+  try {
+    const coordinator = new InstallerEnvironmentCoordinator({
+      environmentRoot: root,
+      mcpConfigFile: join(root, "codex-config.toml"),
+      environmentModeCacheV2: true,
+    }, {
+      pauseWatcher: () => { lifecycle.push("pause"); },
+      quitDesktop: () => { lifecycle.push("quit"); },
+      cleanupHelpers: () => { lifecycle.push("cleanup"); },
+      reopenDesktop: () => { lifecycle.push("reopen"); },
+      publishSelection: () => { lifecycle.push("publish"); },
+    });
+
+    await assert.rejects(
+      () => coordinator.recoverModeCacheV2(),
+      /no current generation to recover/,
+    );
+
+    assert.deepEqual(lifecycle, []);
+    assert.equal(existsSync(join(root, "environment-cache")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mixed-version v2 commit rejects before lifecycle authority, watcher pause, or quit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-v1-v2-commit-boundary-"));
+  const { current, requested } = selections();
+  const lifecycle: string[] = [];
+  let warmAdapterCalls = 0;
+  let authorityCalls = 0;
+  try {
+    const coordinator = new InstallerEnvironmentCoordinator({
+      environmentRoot: root,
+      mcpConfigFile: join(root, "codex-config.toml"),
+      environmentModeCacheV2: true,
+    }, {
+      createId: () => "v1-v2-commit-boundary",
+      preparePrerequisites: () => preparedEvidence(current, requested),
+      observeDesktop: () => ({ pid: 7171, visibleWindow: true }),
+      pauseWatcher: () => { lifecycle.push("legacy-pause"); },
+      quitDesktop: () => { lifecycle.push("legacy-quit"); },
+      warmCommitModeCacheV2: {
+        preflight: () => { warmAdapterCalls += 1; throw new Error("v2 preflight must not run"); },
+        classifyStaleBeforeCutover: () => [],
+        pauseWatcher: () => { warmAdapterCalls += 1; },
+        stopExactSource: () => { warmAdapterCalls += 1; },
+        observeExactLiveTarget: () => { warmAdapterCalls += 1; return { state: "absent" }; },
+        stopExactLiveTarget: () => {
+          warmAdapterCalls += 1;
+          return { pid: null, appPath: "/Applications/ChatGPT.app", processStopped: true, helpersStopped: true };
+        },
+        recheckSourceAfterShutdown: () => { warmAdapterCalls += 1; },
+        exchangeContents: () => { warmAdapterCalls += 1; },
+        captureExchangeProof: () => { warmAdapterCalls += 1; throw new Error("v2 proof must not run"); },
+        projectTarget: () => { warmAdapterCalls += 1; throw new Error("v2 projection must not run"); },
+        reopenTarget: () => { warmAdapterCalls += 1; },
+        proveTarget: () => { warmAdapterCalls += 1; throw new Error("v2 proof must not run"); },
+        bindWatcherTarget: () => { warmAdapterCalls += 1; },
+        publishSelection: () => { warmAdapterCalls += 1; },
+        resumeWatcher: () => { warmAdapterCalls += 1; },
+      },
+    });
+    const prepared = await coordinator.prepare({ current, requested });
+    assert.equal(prepared.phase, "prepared");
+    const authority = coordinator as unknown as {
+      withWarmCommitAuthority<T>(operation: () => Promise<T>): Promise<T>;
+    };
+    const originalAuthority = authority.withWarmCommitAuthority.bind(coordinator);
+    authority.withWarmCommitAuthority = async <T>(operation: () => Promise<T>): Promise<T> => {
+      authorityCalls += 1;
+      return originalAuthority(operation);
+    };
+
+    await assert.rejects(
+      () => coordinator.commitModeCacheV2({
+        transactionId: "v1-v2-commit-boundary",
+        approvalAt: "2026-08-18T12:00:00.000Z",
+      }),
+      /refuses mixed-version commit while schema-v1 transaction v1-v2-commit-boundary is prepared/,
+    );
+
+    assert.equal(authorityCalls, 0);
+    assert.equal(warmAdapterCalls, 0);
+    assert.deepEqual(lifecycle, []);
+    assert.equal(existsSync(join(root, "environment-cache")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function selections(): { current: EnvironmentSelection; requested: EnvironmentSelection } {
   const registry = createEnvironmentProfileRegistry({
     stableDesktopPath: "/Applications/ChatGPT.app",
@@ -408,6 +653,7 @@ test("commit records the exact old PID, retries once, and proves a different vis
   const selectionFile = join(root, "environment-selection.json");
   const { current, requested } = selections();
   const calls: string[] = [];
+  let timingTick = 0;
   const observations = [
     { pid: 101, visibleWindow: true },
     { pid: 201, visibleWindow: false },
@@ -423,6 +669,10 @@ test("commit records the exact old PID, retries once, and proves a different vis
       verificationIntervalMs: 0,
     }, {
       now: () => "2026-07-17T02:00:10.000Z",
+      timingClock: {
+        nowIso: () => new Date(timingTick * 1000).toISOString(),
+        monotonicMs: () => timingTick++,
+      },
       createId: () => "environment-1",
       preparePrerequisites: ({ requested: selection }) => {
         calls.push(`prepare:${selection.selectedDesktopPath}`);
@@ -476,6 +726,23 @@ test("commit records the exact old PID, retries once, and proves a different vis
     assert.equal(committed.oldMainPid, 101);
     assert.equal(committed.newMainPid, 202);
     assert.equal(committed.requested.appliedAt, "2026-07-17T02:00:10.000Z");
+    assert.equal(committed.timing?.approvalAt, null);
+    assert.ok(committed.timing?.readyAt, "readyAt is stamped only after the first terminal receipt persist");
+    for (const phase of [
+      "cache-inspection",
+      "preparation",
+      "approval-helper-launch",
+      "watcher-pause",
+      "quit",
+      "exchange-apply",
+      "projection",
+      "reopen",
+      "readiness-proof",
+      "watcher-publication",
+      "terminal-persist",
+    ] as const) {
+      assert.notEqual(committed.timing?.phases[phase]?.durationMs, null, `${phase} records a monotonic duration`);
+    }
     assert.deepEqual(coordinator.status(), committed);
     assert.deepEqual(readEnvironmentTransactionReceipt(transactionFile), committed);
     assert.equal(existsSync(join(receiptRoot, "environment-1.json")), true);
@@ -2318,8 +2585,9 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     );
     mutateManagedSourceDuringStage = false;
     const developmentRoot = join(root, "registered-development");
-    mkdirSync(developmentRoot, { recursive: true });
-    writeFileSync(join(developmentRoot, "package.json"), "{}\n");
+    const developmentCli = join(developmentRoot, "packages", "installer", "dist", "cli.js");
+    mkdirSync(dirname(developmentCli), { recursive: true });
+    writeFileSync(developmentCli, "export {};\n");
     const developmentHash = hashTree(developmentRoot, false);
     const managedSource = join(root, "managed-runtime", "current");
     const managedPackagedRuntime = join(
@@ -2334,6 +2602,23 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     writeFileSync(join(managedPackagedRuntime, "same-b.js"), "same\n");
     symlinkSync("same-a.js", join(managedPackagedRuntime, "selected.js"));
     refreshRuntimeFingerprint(managedPackagedRuntime);
+    writeFileSync(join(root, "config.json"), `${JSON.stringify({
+      tweaker: { developmentSourceRoot: developmentRoot },
+    })}\n`);
+    executionSourceRoot = developmentRoot;
+    const callsBeforeCurrentDevelopment = calls.length;
+    const currentDevelopmentPrepared = await adapters.preparePrerequisites({
+      transactionId: "current-development-owner",
+      current,
+      requested,
+      oldMainPid: 26138,
+    });
+    assert.ok(currentDevelopmentPrepared.managedRuntime?.requested.artifactPath);
+    assert.deepEqual(
+      calls.slice(callsBeforeCurrentDevelopment),
+      ["build-development", "build-patched", "stage-managed"],
+      "a development-owned continuation remains development-owned after refresh makes its source current",
+    );
     const stableProvenance = {
       kind: "github-release",
       ref: "v1.0.0",
@@ -2345,9 +2630,6 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
       join(managedSource, ".tweakers-provenance.json"),
       `${JSON.stringify(stableProvenance, null, 2)}\n`,
     );
-    writeFileSync(join(root, "config.json"), `${JSON.stringify({
-      tweaker: { developmentSourceRoot: developmentRoot },
-    })}\n`);
     executionSourceRoot = managedSource;
     const callsBeforeStable = calls.length;
     const stablePrepared = await adapters.preparePrerequisites({
@@ -3107,6 +3389,7 @@ test("launchd commit helper submission records the exact external command and du
     writeFileSync(cliPath, "process.exit(0);\n");
     const receipt = submitEnvironmentCommitHelper({
       transactionId: "environment-123",
+      approvalAt: "2026-07-17T01:59:59.000Z",
       cliPath,
       cliArtifactDigest: fileDigest(cliPath),
       managedRuntimeArtifactPath,
@@ -3160,6 +3443,7 @@ test("launchd commit helper submission records the exact external command and du
     assert.match(wrapper, /EXPECTED_MANAGED_RUNTIME_SHA=/);
     assert.match(wrapper, /shasum -a 256/);
     assert.match(wrapper, /environment.*commit.*--transaction/);
+    assert.match(wrapper, /--approval-at.*2026-07-17T01:59:59\.000Z/);
     assert.match(wrapper, /export TWEAKERS_HOME=/);
     assert.match(wrapper, /export TWEAKER_HOME=/);
     assert.match(wrapper, /export TWEAKERS_USER_ROOT=/);

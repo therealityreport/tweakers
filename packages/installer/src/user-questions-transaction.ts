@@ -117,6 +117,11 @@ export function defaultUserQuestionsRolloutOptions(input: {
         required: true,
       },
       {
+        // Runtime-owned and boot-volatile: the tweak's broker rotates its
+        // handshake file (fresh secret) and binds a Unix socket in this
+        // directory on every app boot, including the promotion health probe.
+        // Post-seal drift here is designed behavior — do not re-tighten the
+        // canonical-after assertion for this surface (live failure 2026-08-19).
         name: "tweak_data",
         canonicalPath: join(input.userRoot, "tweak-data", USER_QUESTIONS_TWEAK_ID),
         legacyPaths: legacyIds.map((id) => join(input.userRoot, "tweak-data", id)),
@@ -312,7 +317,6 @@ export function rollbackUserQuestionsRollout(receipt: UserQuestionsRolloutReceip
     writeReceipt(rolledBack);
     return rolledBack;
   }
-  assertCanonicalAfterState(receipt, { allowCommitBefore: receipt.phase === "committing" });
   for (const surface of receipt.pathSurfaces) {
     if (surface.legacyArchivePath === null) continue;
     if (!sameFingerprint(fingerprintPath(surface.legacyArchivePath), surface.selectedLegacyBefore)) {
@@ -324,7 +328,14 @@ export function rollbackUserQuestionsRollout(receipt: UserQuestionsRolloutReceip
     }
   }
 
-  for (const surface of receipt.pathSurfaces) restorePathPreimage(surface);
+  for (const surface of receipt.pathSurfaces) {
+    // The rollout owns a canonical path only when prepare created it from a
+    // legacy source. Pre-existing payload, data, and renderer storage remain
+    // live user/runtime surfaces: app startup may legitimately update them
+    // after sealing, and the outer app-install transaction owns any payload
+    // rollback. Never replace those paths with this migration's observation.
+    if (surface.createdCanonical) retireCreatedCanonical(surface, receipt);
+  }
   restoreTrackedFile(receipt.tweakersConfig, receipt.phase === "committing");
   restoreTrackedFile(receipt.codexConfig);
   for (const surface of receipt.pathSurfaces) {
@@ -477,22 +488,42 @@ function copyPathAtomic(source: string, destination: string): void {
   }
 }
 
-function restorePathPreimage(surface: UserQuestionsPathSurfaceReceipt): void {
-  const current = fingerprintPath(surface.canonicalPath);
-  if (!sameFingerprint(current, surface.canonicalAfter)) throw new Error(`${surface.name} canonical state changed before rollback`);
-  if (surface.canonicalBefore.kind === "missing") {
+/**
+ * Remove a canonical path this migration created. `createdCanonical` implies
+ * the preimage was "missing", so restoring it means clearing the path. The
+ * runtime may have legitimately rewritten the path after sealing (broker
+ * handshake rotation during the promotion health probe — live failure
+ * 2026-08-19), and fingerprinting can even throw while the running app holds
+ * a socket inside the directory. Rollback must still clear the created path —
+ * a leftover copy plans as a conflict and holds every future rollout — so
+ * drifted contents are salvaged into the transaction archive instead of
+ * blocking rollback or being destroyed. Never throws; safe to retry.
+ */
+function retireCreatedCanonical(surface: UserQuestionsPathSurfaceReceipt, receipt: UserQuestionsRolloutReceipt): void {
+  let drifted = true;
+  try {
+    const current = fingerprintPath(surface.canonicalPath);
+    if (current.kind === "missing") return;
+    drifted = !sameFingerprint(current, surface.canonicalAfter);
+  } catch {
+    // Unsupported entries (e.g. a live broker socket) count as drift.
+  }
+  if (!drifted) {
     rmSync(surface.canonicalPath, { recursive: true, force: true });
     return;
   }
-  const retired = `${surface.canonicalPath}.${process.pid}.${randomUUID()}.rollback`;
-  renameSync(surface.canonicalPath, retired);
   try {
-    copyPathAtomic(surface.preimagePath, surface.canonicalPath);
-    rmSync(retired, { recursive: true, force: true });
-  } catch (error) {
-    rmSync(surface.canonicalPath, { recursive: true, force: true });
-    renameSync(retired, surface.canonicalPath);
-    throw error;
+    const salvageRoot = join(receipt.archiveRoot, receipt.transactionId, "salvage");
+    mkdirSync(salvageRoot, { recursive: true, mode: 0o700 });
+    let destination = join(salvageRoot, surface.name);
+    if (existsSync(destination)) destination = `${destination}-${process.pid}-${randomUUID()}`;
+    renameSync(surface.canonicalPath, destination);
+  } catch {
+    try {
+      renameSync(surface.canonicalPath, `${surface.canonicalPath}.salvaged.${process.pid}.${randomUUID()}`);
+    } catch {
+      // The path vanished or cannot move; leave it for the next rollout plan.
+    }
   }
 }
 
@@ -519,6 +550,12 @@ function assertCanonicalAfterState(
   options: { allowCommitBefore?: boolean } = {},
 ): void {
   for (const surface of receipt.pathSurfaces) {
+    // Only the installer-owned live payload must stay byte-stable between
+    // sealing and commit, and only when this migration created it. The
+    // runtime-owned data and renderer-storage surfaces are legitimately
+    // rewritten by app boots inside the acceptance window (broker handshake
+    // rotation during the promotion health probe — live failure 2026-08-19).
+    if (surface.name !== "live_payload" || !surface.createdCanonical) continue;
     if (!sameFingerprint(fingerprintPath(surface.canonicalPath), surface.canonicalAfter)) {
       throw new Error(`${surface.name} canonical state changed after sealing`);
     }

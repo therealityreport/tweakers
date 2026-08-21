@@ -59,6 +59,29 @@ test("desktop update events are persisted as private redacted JSONL", () => {
   }
 });
 
+test("phase elapsed milliseconds persist rounded and only when finite", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-desktop-update-log-"));
+  const logPath = join(fixture, "log", "desktop-update.log");
+  const base = {
+    transactionId: "desktop-1",
+    phase: "switching_to_chatgpt" as const,
+    ownerPid: 1234,
+    ownerToken: null,
+    ownerGeneration: null,
+    event: "phase_transition" as const,
+  };
+  try {
+    const timed = appendDesktopUpdateLog(logPath, { ...base, phaseElapsedMs: 1234.6 }, { now: () => NOW });
+    assert.equal(timed.phaseElapsedMs, 1235);
+    const negative = appendDesktopUpdateLog(logPath, { ...base, phaseElapsedMs: -20 }, { now: () => NOW });
+    assert.equal(negative.phaseElapsedMs, 0);
+    for (const value of [null, undefined, Number.NaN]) {
+      const record = appendDesktopUpdateLog(logPath, { ...base, phaseElapsedMs: value as never }, { now: () => NOW });
+      assert.equal("phaseElapsedMs" in record, false);
+    }
+  } finally { rmSync(fixture, { recursive: true, force: true }); }
+});
+
 test("desktop update log rotation retains a bounded tail and a complete newest event", () => {
   const fixture = mkdtempSync(join(tmpdir(), "tweakers-desktop-update-log-"));
   const logPath = join(fixture, "desktop-update.log");

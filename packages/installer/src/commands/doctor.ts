@@ -18,6 +18,12 @@ import {
   type McpLifecycleHealthReport,
 } from "../mcp-lifecycle-health.js";
 import { loadEnvironmentState } from "../environment-profile.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
+import {
+  inspectAccountRouter,
+  type AccountRouterArtifactEvidence,
+  type AccountRouterEvidence,
+} from "../account-router-status.js";
 
 interface Check {
   name: string;
@@ -41,6 +47,11 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     managedReceiptPath: join(paths.root, "mcp-lifecycle-managed.json"),
     deep: options.deep === true,
   });
+  const accountRouter = await inspectAccountRouter({
+    userRoot: paths.root,
+    sourceRoot: state?.sourceRoot ?? null,
+    installedRuntimeRoot: paths.runtime,
+  });
 
   checks.push({
     name: "user dir writable",
@@ -52,6 +63,16 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     ok: item.status === "ok" ? true : item.status === "warn" ? "warn" as const : false,
     detail: item.detail,
   })));
+  checks.push(...accountRouterDoctorChecks(accountRouter));
+
+  // This is a presentation-only read. In particular it must not create the
+  // default-off cache directory while doctor is checking an ordinary install.
+  const cacheV2 = observeEnvironmentModeCache(environmentModeCachePaths(paths.root));
+  checks.push({
+    name: "environment mode cache",
+    ok: environmentModeCacheDoctorStatus(cacheV2),
+    detail: describeEnvironmentModeCache(cacheV2),
+  });
 
   if (!state) {
     checks.push({
@@ -59,7 +80,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
       ok: false,
       detail: "no state file — run `tweaker install`",
     });
-    print(checks, options, lifecycle);
+    print(checks, options, lifecycle, cacheV2);
     return;
   }
 
@@ -95,7 +116,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
       ok: false,
       detail: (e as Error).message,
     });
-    print(checks, options, lifecycle);
+    print(checks, options, lifecycle, cacheV2);
     return;
   }
 
@@ -194,7 +215,71 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     });
   }
 
-  print(checks, options, lifecycle);
+  print(checks, options, lifecycle, cacheV2);
+}
+
+function describeEnvironmentModeCache(cache: ReturnType<typeof observeEnvironmentModeCache>): string {
+  const generation = cache.generationId ? `generation ${cache.generationId}` : "no generation";
+  const reason = cache.invalidationReasons[0];
+  return `${cache.state}; ${generation}${reason ? `; ${reason}` : ""}`;
+}
+
+function environmentModeCacheDoctorStatus(
+  cache: ReturnType<typeof observeEnvironmentModeCache>,
+): Check["ok"] {
+  // The sealed pair is default-off. A clean install that has never prepared
+  // one is healthy, not a warning. Only evidence of an attempted pair that
+  // became stale/unreadable needs operator attention.
+  if (cache.state === "ready") return true;
+  if (cache.state === "unavailable"
+    && cache.invalidationReasons.length === 1
+    && cache.invalidationReasons[0] === "no environment mode cache has been published") return true;
+  return "warn";
+}
+
+/** Operator checks distinguish recorded source, packaged candidate, installed runtime, and live mux facts. */
+export function accountRouterDoctorChecks(evidence: AccountRouterEvidence): Check[] {
+  if (evidence.configuration.state === "not_staged" || evidence.configuration.state === "manual") return [];
+  if (evidence.configuration.state === "invalid" || evidence.configuration.state === "unsafe") {
+    return [{
+      name: "account router configuration",
+      ok: false,
+      detail: `staged configuration is ${evidence.configuration.state}; manual/direct fallback is required`,
+    }];
+  }
+  const source = artifactCheck("account router source", evidence.source, null);
+  const candidate = artifactCheck("account router candidate", evidence.candidate, evidence.source.version);
+  const installed = artifactCheck("account router installed", evidence.installed, evidence.candidate.version);
+  const live: Check = evidence.live.state === "active" && evidence.live.status
+    ? {
+      name: "account router live",
+      ok: true,
+      detail: `${evidence.live.status.mode}; ${evidence.live.status.fairnessPrecision}`,
+    }
+    : {
+      name: "account router live",
+      ok: evidence.live.state === "unavailable" ? false : "warn",
+      detail: evidence.live.state.replaceAll("_", " "),
+    };
+  return [source, candidate, installed, live];
+}
+
+function artifactCheck(name: string, artifact: AccountRouterArtifactEvidence, expectedVersion: string | null): Check {
+  if (artifact.state === "present") {
+    const matchesExpected = expectedVersion === null || artifact.version === expectedVersion;
+    return {
+      name,
+      ok: matchesExpected ? true : "warn",
+      detail: matchesExpected
+        ? `present${artifact.version ? ` (${artifact.version})` : ""}`
+        : `version ${artifact.version ?? "unknown"} differs from preceding evidence ${expectedVersion}`,
+    };
+  }
+  return {
+    name,
+    ok: artifact.state === "invalid" ? false : "warn",
+    detail: artifact.state.replaceAll("_", " "),
+  };
 }
 
 function hasCodexStorageKeychainItem(): boolean {
@@ -219,6 +304,7 @@ function print(
   checks: Check[],
   options: DoctorOptions,
   lifecycle: McpLifecycleHealthReport,
+  cacheV2: ReturnType<typeof observeEnvironmentModeCache>,
 ): void {
   const failed = checks.filter((c) => c.ok === false).length;
   if (options.json) {
@@ -231,6 +317,7 @@ function print(
         detail: item.detail,
       })),
       mcpLifecycle: lifecycle,
+      cacheV2,
     }));
     if (failed > 0) process.exitCode = 1;
     return;

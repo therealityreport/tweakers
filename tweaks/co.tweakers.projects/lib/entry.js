@@ -39,7 +39,12 @@ function startRenderer(api) {
   let latestSurfaceFingerprint = null;
   let aliasRefreshRequest = 0;
   let selectedSettingsProjectId = null;
-  const apply = () => sidebar.applyNativeProjectColors(api, latestState);
+  let resizeObserver = null;
+  const apply = () => {
+    sidebar.applyNativeProjectColors(api, latestState);
+    resizeObserver?.sync();
+  };
+  resizeObserver = sidebar.installProjectSidebarResizeObserver(apply);
   const acceptResponse = (response) => {
     if (!response?.ok) return false;
     if (Array.isArray(response.nativeProjects)) latestNativeProjects = response.nativeProjects;
@@ -120,6 +125,7 @@ function startRenderer(api) {
       aliasRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
+      resizeObserver?.dispose();
       removeColorControls?.();
       removeEditProjectControls?.();
       sidebar.removeProjectColorArtifacts();

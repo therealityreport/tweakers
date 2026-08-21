@@ -1880,6 +1880,7 @@ const {
 const PROJECT_COLOR_MENU_ATTR = "data-tweaker-project-color-menu";
 const PROJECT_COLOR_STYLE_ID = "tweaker-project-colors";
 const PROJECT_COLOR_DISPOSE = Symbol("projectColorDispose");
+const MAX_PROJECT_ROW_END_INSET = 64;
 
 function isRemoveProjectMenuItem(item) {
   const label = String(item?.textContent || "").replace(/\s+/g, " ").trim();
@@ -2167,7 +2168,7 @@ function ensureProjectColorStyle() {
     document.head.appendChild(style);
   }
   style.textContent = `
-    [data-tweaker-project-color-group] { box-sizing: border-box; inline-size: 100% !important; min-inline-size: 0; max-inline-size: 100%; contain: inline-size; overflow-x: visible; --tweaker-project-row-radius: var(--radius-lg, 0.625rem); --tweaker-project-task-tint: 10%; --tweaker-project-task-foreground: var(--tweaker-project-color); --tweaker-project-header-tint: 16%; --tweaker-project-header-foreground: color-mix(in srgb, var(--tweaker-project-color) 72%, var(--color-token-text-primary)); }
+    [data-tweaker-project-color-group] { box-sizing: border-box; inline-size: calc(100% - var(--tweaker-project-row-end-inset, 0px)) !important; min-inline-size: 0; max-inline-size: calc(100% - var(--tweaker-project-row-end-inset, 0px)); contain: inline-size; overflow-x: visible; --tweaker-project-row-radius: var(--radius-lg, 0.625rem); --tweaker-project-task-tint: 10%; --tweaker-project-task-foreground: var(--tweaker-project-color); --tweaker-project-header-tint: 16%; --tweaker-project-header-foreground: color-mix(in srgb, var(--tweaker-project-color) 72%, var(--color-token-text-primary)); }
     [data-tweaker-project-color-group][data-tweaker-project-overlay="off"] { --tweaker-project-task-tint: 0%; }
     [data-tweaker-project-color-group][data-tweaker-project-overlay="subtle"] { --tweaker-project-task-tint: 6%; }
     [data-tweaker-project-color-group][data-tweaker-project-overlay="medium"] { --tweaker-project-task-tint: 10%; }
@@ -2432,6 +2433,57 @@ function visibleProjectTaskRows(group) {
     });
 }
 
+function projectNavigationForNode(node) {
+  let cursor = node;
+  while (cursor) {
+    if (cursor.tagName === "NAV" || cursor.tagName === "ASIDE" || cursor.getAttribute?.("role") === "navigation") return cursor;
+    cursor = cursor.parentElement;
+  }
+  return null;
+}
+
+function nativeProjectsHeadingInset(group, navigationRect, headerRect) {
+  const documentRef = group?.ownerDocument || (typeof document === "object" ? document : null);
+  if (!documentRef?.querySelectorAll) return 0;
+  const navigationRight = Number.isFinite(navigationRect.right)
+    ? navigationRect.right
+    : navigationRect.left + navigationRect.width;
+  const headerTop = Number.isFinite(headerRect.top) ? headerRect.top : Number.POSITIVE_INFINITY;
+  const candidates = [...documentRef.querySelectorAll("h1, h2, h3, div, span")]
+    .filter((node) => String(node.textContent || "").replace(/\s+/g, " ").trim() === "Projects")
+    .map((node) => node.getBoundingClientRect?.())
+    .filter((rect) => rect && Number.isFinite(rect.left) && rect.left >= navigationRect.left && rect.left < navigationRight)
+    .filter((rect) => (rect.height === undefined || rect.height > 0) && (!Number.isFinite(rect.top) || rect.top <= headerTop))
+    .map((rect) => ({
+      inset: rect.left - navigationRect.left,
+      distance: Number.isFinite(rect.bottom) ? Math.max(0, headerTop - rect.bottom) : 0,
+    }))
+    .filter(({ inset }) => Number.isFinite(inset) && inset > 0)
+    .sort((left, right) => left.distance - right.distance || left.inset - right.inset);
+  return candidates[0]?.inset || 0;
+}
+
+function measureNativeProjectRowEndInset(group, header) {
+  const navigation = projectNavigationForNode(group);
+  const navigationRect = navigation?.getBoundingClientRect?.();
+  const headerRect = header?.getBoundingClientRect?.();
+  if (!navigationRect || !headerRect) return 0;
+  const navigationWidth = Number.isFinite(navigationRect.width)
+    ? navigationRect.width
+    : navigationRect.right - navigationRect.left;
+  const headerInset = headerRect.left - navigationRect.left;
+  const inset = headerInset > 0 ? headerInset : nativeProjectsHeadingInset(group, navigationRect, headerRect);
+  if (!Number.isFinite(navigationWidth) || navigationWidth <= 0 || !Number.isFinite(inset) || inset <= 0) return 0;
+  return Math.min(inset, MAX_PROJECT_ROW_END_INSET, navigationWidth / 4);
+}
+
+function applyProjectGroupEndInset(group, header) {
+  const inset = measureNativeProjectRowEndInset(group, header);
+  if (inset > 0) group.style?.setProperty?.("--tweaker-project-row-end-inset", `${inset}px`);
+  else group.style?.removeProperty?.("--tweaker-project-row-end-inset");
+  return inset;
+}
+
 function measureNativeProjectRowGeometry(groups) {
   const collapsed = groups.filter((group) => visibleProjectTaskRows(group).length === 0);
   const references = collapsed.length >= 2 ? collapsed : groups;
@@ -2473,6 +2525,10 @@ function applyProjectTaskGeometry(group, header, geometry) {
 function applyUniformNativeRowSpacing() {
   const groups = [...(document.querySelectorAll?.("[data-tweaker-project-color-group]") || [])]
     .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  for (const group of groups) {
+    const header = group.querySelector?.("[data-tweaker-project-color-row]");
+    applyProjectGroupEndInset(group, header);
+  }
   const geometry = measureNativeProjectRowGeometry(groups);
   const gapValue = geometry.gap === null ? "var(--spacing-px, 1px)" : `${geometry.gap}px`;
   document.documentElement?.style?.setProperty?.("--tweaker-project-native-row-gap", gapValue);
@@ -2480,6 +2536,57 @@ function applyUniformNativeRowSpacing() {
     const header = group.querySelector?.("[data-tweaker-project-color-row]");
     applyProjectTaskGeometry(group, header, geometry);
   }
+}
+
+function installProjectSidebarResizeObserver(onResize) {
+  if (typeof ResizeObserver !== "function" || typeof onResize !== "function") {
+    return { sync() {}, dispose() {} };
+  }
+  let observed = new Set();
+  let scheduled = null;
+  let scheduledWithAnimationFrame = false;
+  let disposed = false;
+  const run = () => {
+    scheduled = null;
+    scheduledWithAnimationFrame = false;
+    if (!disposed) onResize();
+  };
+  const observer = new ResizeObserver(() => {
+    if (disposed || scheduled !== null) return;
+    if (typeof requestAnimationFrame === "function") {
+      scheduledWithAnimationFrame = true;
+      scheduled = requestAnimationFrame(run);
+    } else {
+      scheduled = setTimeout(run, 0);
+    }
+  });
+  return {
+    sync() {
+      if (disposed) return;
+      const next = new Set();
+      for (const group of document.querySelectorAll?.("[data-tweaker-project-color-group]") || []) {
+        const navigation = projectNavigationForNode(group);
+        if (navigation) next.add(navigation);
+      }
+      for (const navigation of observed) {
+        if (!next.has(navigation)) observer.unobserve?.(navigation);
+      }
+      for (const navigation of next) {
+        if (!observed.has(navigation)) observer.observe(navigation);
+      }
+      observed = next;
+    },
+    dispose() {
+      disposed = true;
+      if (scheduled !== null) {
+        if (scheduledWithAnimationFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(scheduled);
+        else clearTimeout(scheduled);
+      }
+      scheduled = null;
+      observer.disconnect();
+      observed.clear();
+    },
+  };
 }
 
 function nativeProjectMatches(api, projects) {
@@ -2672,6 +2779,7 @@ function clearNativeProjectColors() {
     node.style.removeProperty("--tweaker-project-native-row-block-size");
     node.style.removeProperty("--tweaker-project-native-row-inline-size");
     node.style.removeProperty("--tweaker-project-native-row-offset");
+    node.style.removeProperty("--tweaker-project-row-end-inset");
   }
   for (const node of document.querySelectorAll("[data-tweaker-project-color-icon], [data-tweaker-project-color-title], [data-tweaker-project-task-action], [data-tweaker-project-task-label]")) {
     node.removeAttribute("data-tweaker-project-color-icon");
@@ -2715,6 +2823,10 @@ module.exports = {
   activeProjectSessionCountFromFiber,
   measureNativeProjectRowGap,
   measureNativeProjectRowGeometry,
+  measureNativeProjectRowEndInset,
+  applyProjectGroupEndInset,
+  applyProjectTaskGeometry,
+  installProjectSidebarResizeObserver,
   nativeProjectMatches,
   projectColorForeground,
   clearNativeProjectColors,
@@ -3532,7 +3644,12 @@ function startRenderer(api) {
   let latestSurfaceFingerprint = null;
   let aliasRefreshRequest = 0;
   let selectedSettingsProjectId = null;
-  const apply = () => sidebar.applyNativeProjectColors(api, latestState);
+  let resizeObserver = null;
+  const apply = () => {
+    sidebar.applyNativeProjectColors(api, latestState);
+    resizeObserver?.sync();
+  };
+  resizeObserver = sidebar.installProjectSidebarResizeObserver(apply);
   const acceptResponse = (response) => {
     if (!response?.ok) return false;
     if (Array.isArray(response.nativeProjects)) latestNativeProjects = response.nativeProjects;
@@ -3613,6 +3730,7 @@ function startRenderer(api) {
       aliasRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
+      resizeObserver?.dispose();
       removeColorControls?.();
       removeEditProjectControls?.();
       sidebar.removeProjectColorArtifacts();

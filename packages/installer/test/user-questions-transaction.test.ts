@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -167,7 +168,7 @@ test("commit archives legacy only after acceptance and rollback restores exact p
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("rollback CAS preserves later edits and performs no partial restore", () => {
+test("rollback salvages a drifted migration-created tweak data surface instead of wedging", () => {
   const f = fixture();
   try {
     writeLegacyState(f);
@@ -176,10 +177,100 @@ test("rollback CAS preserves later edits and performs no partial restore", () =>
     const data = receipt.pathSurfaces.find((surface) => surface.name === "tweak_data")!;
     writeFileSync(join(data.canonicalPath, "later.json"), '{"user":true}\n');
 
-    assert.throws(() => rollbackUserQuestionsRollout(receipt), /canonical state changed after sealing/);
-    assert.equal(existsSync(join(data.canonicalPath, "later.json")), true);
-    assert.equal(existsSync(receipt.pathSurfaces[0]!.canonicalPath), true);
+    const rolledBack = rollbackUserQuestionsRollout(receipt);
+    assert.equal(rolledBack.phase, "rolled_back");
+    assert.equal(existsSync(data.canonicalPath), false);
+    const salvaged = join(f.archiveRoot, receipt.transactionId, "salvage", "tweak_data");
+    assert.equal(readFileSync(join(salvaged, "later.json"), "utf8"), '{"user":true}\n');
+    assert.equal(existsSync(data.selectedLegacyPath!), true);
+
+    // A follow-up rollout plans the same migration again — no conflict hold.
+    const replanned = planUserQuestionsRollout({ ...f.options, transactionId: "uq-tx-2" });
+    assert.equal(replanned.pathSurfaces.find((surface) => surface.name === "tweak_data")?.status, "copy");
+    assert.equal(replanned.holdPromotion, false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("commit survives broker rotation in a migration-created tweak data surface", () => {
+  const f = fixture();
+  try {
+    writeLegacyState(f);
+    let receipt = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
+    const data = receipt.pathSurfaces.find((surface) => surface.name === "tweak_data")!;
+    assert.equal(data.createdCanonical, true);
+    writeFileSync(join(data.canonicalPath, "user-questions-broker.v1.json"), '{"secret":"rotated"}\n', { mode: 0o600 });
+
+    receipt = commitUserQuestionsRollout(receipt);
+    assert.equal(receipt.phase, "committed");
+    assert.equal(existsSync(data.selectedLegacyPath!), false);
+    assert.equal(existsSync(data.legacyArchivePath!), true);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("commit still refuses a drifted migration-created live payload", () => {
+  const f = fixture();
+  try {
+    writeLegacyState(f);
+    let receipt = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
+    const payload = receipt.pathSurfaces.find((surface) => surface.name === "live_payload")!;
+    assert.equal(payload.createdCanonical, true);
+    writeFileSync(join(payload.canonicalPath, "manifest.json"), '{"version":"tampered"}\n');
+
+    assert.throws(() => commitUserQuestionsRollout(receipt), /live_payload canonical state changed after sealing/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("rollback completes with salvage for a drifted migration-created live payload", () => {
+  const f = fixture();
+  try {
+    writeLegacyState(f);
+    let receipt = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
+    const payload = receipt.pathSurfaces.find((surface) => surface.name === "live_payload")!;
+    writeFileSync(join(payload.canonicalPath, "manifest.json"), '{"version":"tampered"}\n');
+
+    const rolledBack = rollbackUserQuestionsRollout(receipt);
+    assert.equal(rolledBack.phase, "rolled_back");
+    assert.equal(existsSync(payload.canonicalPath), false);
+    const salvaged = join(f.archiveRoot, receipt.transactionId, "salvage", "live_payload");
+    assert.match(readFileSync(join(salvaged, "manifest.json"), "utf8"), /tampered/);
+    assert.equal(existsSync(payload.selectedLegacyPath!), true);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an unsupported entry in migration-created tweak data counts as drift and is salvaged", () => {
+  const f = fixture();
+  try {
+    const livePayload = join(f.liveTweaksRoot, "user-questions");
+    mkdirSync(livePayload, { recursive: true });
+    writeFileSync(join(livePayload, "index.js"), "module.exports = {};\n");
+    const legacyData = join(f.userRoot, "tweak-data", "co.thomashulihan.user-questions");
+    mkdirSync(legacyData, { recursive: true });
+    writeFileSync(join(legacyData, "draft.json"), '{"kept":true}\n', { mode: 0o600 });
+    writeFileSync(f.tweakersConfigPath, "{}\n", { mode: 0o600 });
+
+    let receipt = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
+    const data = receipt.pathSurfaces.find((surface) => surface.name === "tweak_data")!;
+    assert.equal(data.createdCanonical, true);
+    // The live broker binds a Unix socket in this directory; sockaddr_un's
+    // 104-byte limit makes a real socket land outside deep temp dirs, so a
+    // FIFO stands in for it — fingerprintPath rejects both the same way.
+    const fifo = spawnSync("mkfifo", [join(data.canonicalPath, ".uq-test.fifo")]);
+    assert.equal(fifo.status, 0);
+
+    const rolledBack = rollbackUserQuestionsRollout(receipt);
+    assert.equal(rolledBack.phase, "rolled_back");
+    assert.equal(existsSync(data.canonicalPath), false);
+    assert.equal(existsSync(join(f.archiveRoot, receipt.transactionId, "salvage", "tweak_data")), true);
+
+    // The helper is retry-safe: re-running rollback on the sealed receipt is a no-op.
+    assert.equal(rollbackUserQuestionsRollout({ ...receipt, phase: "sealed" }).phase, "rolled_back");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
 });
 
 test("an ambiguous legacy surface holds the whole prepare", () => {
@@ -198,7 +289,7 @@ test("an ambiguous legacy surface holds the whole prepare", () => {
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("rollback restores a pre-existing canonical payload after a sealed replacement", () => {
+test("rollback preserves a pre-existing canonical payload changed by its live owner after sealing", () => {
   const f = fixture();
   try {
     const canonical = join(f.liveTweaksRoot, "user-questions");
@@ -212,8 +303,32 @@ test("rollback restores a pre-existing canonical payload after a sealed replacem
     receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
 
     rollbackUserQuestionsRollout(receipt);
-    assert.equal(readFileSync(join(canonical, "index.js"), "utf8"), "module.exports = 'before';\n");
-    assert.equal(lstatSync(join(canonical, "index.js")).mode & 0o777, 0o600);
+    assert.equal(readFileSync(join(canonical, "index.js"), "utf8"), "module.exports = 'candidate';\n");
+    assert.equal(lstatSync(join(canonical, "index.js")).mode & 0o777, 0o644);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("broker rotation after sealing does not block commit or rollback of pre-existing canonical tweak data", () => {
+  const f = fixture();
+  try {
+    const livePayload = join(f.liveTweaksRoot, "user-questions");
+    mkdirSync(livePayload, { recursive: true });
+    writeFileSync(join(livePayload, "index.js"), "module.exports = {};\n");
+    const canonicalData = join(f.userRoot, "tweak-data", "co.tweakers.user-questions");
+    mkdirSync(canonicalData, { recursive: true });
+    const broker = join(canonicalData, "user-questions-broker.v1.json");
+    writeFileSync(broker, '{"socketPath":"before","secret":"before"}\n', { mode: 0o600 });
+    writeFileSync(f.tweakersConfigPath, "{}\n", { mode: 0o600 });
+
+    let receipt = prepareUserQuestionsRollout(planUserQuestionsRollout(f.options));
+    receipt = sealUserQuestionsRollout(receipt, { mcpConflictCount: 0 });
+    writeFileSync(broker, '{"socketPath":"after","secret":"after"}\n', { mode: 0o600 });
+
+    receipt = commitUserQuestionsRollout(receipt);
+    assert.equal(receipt.phase, "committed");
+    receipt = rollbackUserQuestionsRollout(receipt);
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(readFileSync(broker, "utf8"), '{"socketPath":"after","secret":"after"}\n');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

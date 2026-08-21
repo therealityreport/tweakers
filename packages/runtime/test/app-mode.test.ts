@@ -139,6 +139,16 @@ test("the Environment control follows the durable receipt instead of parking on 
   assert.match(section, /loadEnvironmentTransaction/);
   assert.match(section, /normalizeEnvironmentHelperSubmission/);
   assert.match(section, /environmentTransactionIsTerminal/);
+  assert.match(section, /approvalAt: new Date\(\)\.toISOString\(\)/);
+  const terminal = extractFunctionBody(injectorSource, "environmentTransactionIsTerminal");
+  assert.match(terminal, /ready/);
+  assert.match(terminal, /stale_requires_prepare/);
+  const recoverable = extractFunctionBody(injectorSource, "environmentTransactionCanRecover");
+  assert.match(recoverable, /schemaVersion === 2/);
+  const diagnostics = extractFunctionBody(mainSource, "attachEnvironmentHelperDiagnostics");
+  assert.match(diagnostics, /environment-cache/);
+  assert.match(diagnostics, /generations/);
+  assert.match(diagnostics, /submission === null && outcome === null/);
 });
 
 test("the Environment modal is accessible and traps keyboard focus", () => {

@@ -8,10 +8,12 @@ import {
   desktopUpdatePresentation,
   humanizeCodexPhase,
   desktopUpdateStatusPresentation,
+  preparedEnvironmentReceiptNeedsFreshV2Preparation,
   restoreEnvironmentFocus,
   type EnvironmentConfigEffects,
   type EnvironmentSelectionPair,
 } from "../src/preload/environment-config-controller";
+import { environmentModeCacheMenuPresentation as environmentModeCacheMenuLabel } from "../src/codex-desktop-update-menu";
 
 const source = readFileSync(
   resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
@@ -53,6 +55,47 @@ test("Desktop Update never presents stale, unavailable, or unchecked state as he
   assert.deepEqual(desktopUpdateStatusPresentation("unavailable"), { label: "Unavailable", tone: "warn" });
   assert.deepEqual(desktopUpdateStatusPresentation("error"), { label: "Error", tone: "error" });
   assert.deepEqual(desktopUpdateStatusPresentation("current"), { label: "Up to date", tone: "ok" });
+});
+
+test("sealed-pair Menu Bar presentation makes stale generations require preparation", () => {
+  assert.deepEqual(environmentModeCacheMenuLabel({
+    state: "stale",
+    generationId: "pair-7",
+    invalidationReasons: ["generation pin released: invalidated"],
+  }), {
+    label: "Sealed Pair Needs Preparation",
+    detail: "Generation pair-7 — generation pin released: invalidated; it will not switch automatically",
+    tone: "warn",
+  });
+  assert.deepEqual(environmentModeCacheMenuLabel({
+    state: "ready",
+    generationId: "pair-8",
+    invalidationReasons: [],
+  }), {
+    label: "Sealed Pair Ready",
+    detail: "Generation pair-8",
+    tone: "ok",
+  });
+});
+
+test("Config blocks only a schema-v2 receipt bound to the same stale generation", () => {
+  const stale = { state: "stale" as const, generationId: "pair-8" };
+  assert.equal(preparedEnvironmentReceiptNeedsFreshV2Preparation({
+    schemaVersion: 1,
+    phase: "prepared",
+  }, stale), false);
+  assert.equal(preparedEnvironmentReceiptNeedsFreshV2Preparation({
+    schemaVersion: 2,
+    generationId: "pair-7",
+    phase: "prepared",
+  }, stale), false);
+  assert.equal(preparedEnvironmentReceiptNeedsFreshV2Preparation({
+    schemaVersion: 2,
+    generationId: "pair-8",
+    phase: "prepared",
+  }, stale), true);
+  assert.match(source, /Fresh preparation required/);
+  assert.match(source, /it will not switch automatically/);
 });
 
 test("Desktop Update phase labels humanize both receipt separators", () => {

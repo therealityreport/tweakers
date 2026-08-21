@@ -76,7 +76,7 @@ import { terminateStaleHelperProcesses } from "../orphans.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { runHeldPromotion } from "../watcher-held.js";
 import { isSymlinkInto } from "../symlinks.js";
-import { copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
+import { cloneOrCopyDirectoryPreservingModes, copyDirectoryPreservingModes, isMacOsJunkName } from "../fs-copy.js";
 import {
   cloneAppTree,
   filesystemTransactionAdapters,
@@ -88,7 +88,9 @@ import {
   readTransactionState,
   type AppFingerprint,
   type NativeHealthProbeAdapter,
+  type ProductionHealthExpectation,
   type ProductionHealthExpectationV2,
+  type TransactionHealth,
   type TransactionResult,
 } from "../transaction.js";
 import {
@@ -478,6 +480,53 @@ export function loadVerifiedSwapHost(
   return (first, second) => nativeHost.swapDirectories(first, second);
 }
 
+/**
+ * Bind the already-prepared native swap host to exactly one pair of live and
+ * inactive `Contents` directories. This intentionally has no staging,
+ * helper-installation, copy, build, or canary capability: all of that belongs
+ * to preparation, before deliberate approval.
+ */
+export function bindVerifiedPreparedContentsExchange(
+  liveContents: string,
+  inactiveContents: string,
+  swapHost: SwapHostIdentityEvidence & { path: string },
+  deps: {
+    loadSwapHost?: typeof loadVerifiedSwapHost;
+  } = {},
+): (first: string, second: string) => void {
+  assertDirectContentsExchangePath(liveContents, "live Contents");
+  assertDirectContentsExchangePath(inactiveContents, "inactive Contents");
+  if (lstatSync(liveContents, { bigint: true }).dev !== lstatSync(inactiveContents, { bigint: true }).dev) {
+    throw new Error("Prepared Contents exchange directories must share one filesystem device");
+  }
+  const nativeExchange = (deps.loadSwapHost ?? loadVerifiedSwapHost)(swapHost);
+  return (first, second) => {
+    if (first !== liveContents || second !== inactiveContents) {
+      throw new Error("Verified Contents exchange is bound to its exact prepared live/inactive paths");
+    }
+    // Recheck only the directory shape immediately before the one native call;
+    // cache stat seals and the warm adapter own the stronger identity proof.
+    assertDirectContentsExchangePath(first, "live Contents");
+    assertDirectContentsExchangePath(second, "inactive Contents");
+    nativeExchange(first, second);
+  };
+}
+
+function assertDirectContentsExchangePath(path: string, label: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path || basename(path) !== "Contents") {
+    throw new Error(`Prepared ${label} path must be an exact absolute Contents directory: ${path}`);
+  }
+  let entry: ReturnType<typeof lstatSync>;
+  try {
+    entry = lstatSync(path, { bigint: true });
+  } catch {
+    throw new Error(`Prepared ${label} path must be a real directory: ${path}`);
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new Error(`Prepared ${label} path must be a real directory: ${path}`);
+  }
+}
+
 const HEALTH_PROBE_ENV_KEYS = [
   "PATH",
   "LANG",
@@ -505,6 +554,39 @@ export const HEALTH_PROBE_CODEX_HOME_RELATIVE_PATH = "codex-home";
 export const HEALTH_PROBE_USER_DATA_RELATIVE_PATH = "electron-user-data";
 export const HEALTH_PROBE_ROOT_PREFIX = "probe-";
 export const HEALTH_PROBE_PROCESS_TIMEOUT_MS = 170_000;
+/**
+ * How fresh a candidate build's durable health receipt must be for a
+ * rehydrated promotion to reuse it instead of launching a second probe.
+ * Deliberately far tighter than the candidate age bound itself.
+ */
+export const CANDIDATE_HEALTH_RECEIPT_REUSE_MS = 15 * 60_000;
+
+/**
+ * Accept a candidate build's durable health receipt for a rehydrated
+ * promotion only when it fully passed: the reader already enforces receipt
+ * privacy, app-fingerprint and runtime identity, and the reuse age bound;
+ * this adds the strict pass gate (host, session, and - for schema-v2
+ * receipts - promotion readiness). Anything else returns null so the caller
+ * launches a live probe.
+ */
+export function reuseCandidateHealthReceipt(
+  receiptFile: string,
+  expected: ProductionHealthExpectation,
+  options: { now?: Date } = {},
+): TransactionHealth | null {
+  const prior = readProductionHealthReceipt(receiptFile, expected, {
+    now: options.now,
+    maxAgeMs: CANDIDATE_HEALTH_RECEIPT_REUSE_MS,
+  });
+  if (prior.host !== "pass" || prior.session !== "pass") return null;
+  if (prior.promotionReady !== undefined && prior.promotionReady !== "pass") return null;
+  return {
+    ...prior,
+    detail: prior.detail
+      ? `${prior.detail}; reused the candidate build's health receipt`
+      : "reused the candidate build's health receipt",
+  };
+}
 export const HEALTH_PROBE_RECEIPT_TIMEOUT_MS = 170_000;
 // Descendants are explicitly terminated before cleanup. These retries cover
 // only short filesystem settlement after the owned process tree is gone.
@@ -1221,7 +1303,10 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         const rehydrated = candidateHealthExpectation === null;
         const expected = candidateHealthExpectation ?? readCandidatePromotionHealthExpectation(
           expectationFile,
-          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs },
+          // allowEarlierRequest: this transaction may adopt a candidate an
+          // earlier transaction built and held; the fingerprint check just
+          // below re-binds the expectation to the exact on-disk candidate.
+          { transactionCreatedAt, now: new Date(), maxAgeMs: maxCandidateAgeMs, allowEarlierRequest: true },
         );
         if (!expected) {
           return unknownPromotionHealth(
@@ -1239,6 +1324,21 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           candidatePromotionPreimages = promotionPreimageHashes(expected);
         }
         const receiptFile = join(candidateUserRoot, "health", "promotion.json");
+        if (rehydrated) {
+          // The candidate-only build already launched a real probe against
+          // these exact bytes: the durable receipt is fingerprint-bound (the
+          // expectation was just re-verified against the on-disk candidate)
+          // and one-shot per launch, so a fresh, fully passing receipt proves
+          // this promotion's candidate without a second Electron boot. Any
+          // stale, unknown, or rejected receipt falls through to a live probe
+          // exactly as before; the promotion-surface preimage and policy
+          // drift guards still run at promotion either way.
+          const prior = reuseCandidateHealthReceipt(receiptFile, expected);
+          if (prior !== null) {
+            if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot);
+            return prior;
+          }
+        }
         const healthRequest = {
           ...expected,
           requestedAt: new Date().toISOString(),
@@ -1288,7 +1388,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       rmSync(destination, { recursive: true, force: true });
       if (existsSync(runtimeRoot)) {
         mkdirSync(dirname(destination), { recursive: true });
-        copyDirectoryPreservingModes(runtimeRoot, destination);
+        cloneOrCopyDirectoryPreservingModes(runtimeRoot, destination);
       }
       signedBackupWiring.snapshotLive();
     },
@@ -2561,6 +2661,18 @@ export function readCandidatePromotionHealthExpectation(
     transactionCreatedAt: string;
     now: Date;
     maxAgeMs: number;
+    /**
+     * Accept a twin written BEFORE this transaction was created. Only for
+     * callers that adopt a held candidate from an earlier transaction (e.g.
+     * `repair` holds while the app runs, a later `install` promotes) AND
+     * separately re-verify the candidate's app fingerprint against the
+     * expectation - fingerprint equality, not the created-at ordering, is
+     * what stops a stale twin from vouching for different bytes. Without
+     * this, adoption invalidated the transaction, cleanup deleted the held
+     * candidate, and the same-payload record blocked rebuilds behind the
+     * retry backoff (live failure 2026-08-20).
+     */
+    allowEarlierRequest?: boolean;
   },
 ): ProductionHealthExpectationV2 | null {
   try {
@@ -2588,7 +2700,7 @@ export function readCandidatePromotionHealthExpectation(
       || !Number.isFinite(bounds.maxAgeMs)
       || bounds.maxAgeMs < 0
       || requestedAtMs > nowMs + HEALTH_TIMESTAMP_MAX_FUTURE_SKEW_MS
-      || requestedAtMs < transactionCreatedAtMs
+      || (bounds.allowEarlierRequest !== true && requestedAtMs < transactionCreatedAtMs)
       || requestAgeMs > bounds.maxAgeMs
       || !isValidProductionHealthExpectationV2(expected)
     ) return null;
@@ -2640,7 +2752,7 @@ function replaceDirectory(source: string, destination: string): void {
   const previous = `${destination}.tweakers-previous-${process.pid}`;
   rmSync(temporary, { recursive: true, force: true });
   rmSync(previous, { recursive: true, force: true });
-  copyDirectoryPreservingModes(source, temporary);
+  cloneOrCopyDirectoryPreservingModes(source, temporary);
   if (existsSync(destination)) renameDirectory(destination, previous);
   try {
     renameDirectory(temporary, destination);
@@ -2697,7 +2809,7 @@ export function stageAppBundleReplacement(
   const incoming = `${destination}.tweakers-contents-swap`;
   const remove = adapters.removeDirectory ?? ((path: string) => rmSync(path, { recursive: true, force: true }));
   const copy = adapters.copyDirectory
-    ?? ((from: string, to: string) => copyDirectoryPreservingModes(from, to));
+    ?? ((from: string, to: string) => cloneOrCopyDirectoryPreservingModes(from, to));
   remove(incoming);
   copy(sourceContents, incoming);
   if (!existsSync(incoming)) throw new Error("Prepared app Contents staging copy is missing");
@@ -3095,7 +3207,7 @@ export function snapshotSignedBackup(liveBackup: string, snapshot: string, marke
   // transaction's marker before copying so an interruption cannot replay it.
   rmSync(marker, { force: true });
   const existed = existsSync(liveBackup);
-  if (existed) copyDirectoryPreservingModes(liveBackup, snapshot);
+  if (existed) cloneOrCopyDirectoryPreservingModes(liveBackup, snapshot);
   const temporary = `${marker}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, existed })}\n`, { mode: 0o600 });
   renameSync(temporary, marker);

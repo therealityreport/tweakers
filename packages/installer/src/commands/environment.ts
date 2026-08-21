@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
 import {
@@ -27,6 +28,7 @@ import {
   type EnvironmentCommitHelperReceipt,
   type EnvironmentCoordinator,
   type EnvironmentCoordinatorOptions,
+  type EnvironmentModeCacheV2PreparationResult,
   type EnvironmentPreparationCapabilities,
   type PreparedEnvironmentCommitCli,
   type EnvironmentTransactionReceipt,
@@ -35,11 +37,25 @@ import {
   isTerminalEnvironmentPhase,
   readEnvironmentTransactionReceipt,
 } from "../environment-transaction.js";
+import type { EnvironmentTimingEvidence } from "../environment-timing.js";
 import { processAlive } from "../process-lock.js";
 import { userPaths, type ResolvedUserPaths } from "../paths.js";
 import { isLifecycleLockHeld, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { modeTransitionFile } from "../mode-transition.js";
 import { readAsarMarker } from "./install.js";
+import {
+  environmentModeCachePaths,
+  observeEnvironmentModeCache,
+  readCurrentEnvironmentModePair,
+  type EnvironmentModePairReceipt,
+  type EnvironmentModeCacheStatus,
+} from "../environment-mode-cache.js";
+import { environmentModeCacheV2Enabled } from "../environment-mode-production.js";
+import {
+  environmentWarmCommitJournalFile,
+  readEnvironmentWarmCommitReceipt,
+  type EnvironmentWarmCommitReceipt,
+} from "../environment-warm-commit.js";
 import {
   runEnvironmentTransactionGc,
   type EnvironmentGcResult,
@@ -79,6 +95,10 @@ export interface EnvironmentCommandOptions {
   json?: boolean;
   /** Internal compatibility clients may consume the typed result directly. */
   quiet?: boolean;
+  /** Deliberate confirmation timestamp forwarded through the detached helper. */
+  approvalAt?: string;
+  /** Sade preserves kebab-case long option names instead of camel-casing them. */
+  "approval-at"?: string;
 }
 
 export interface EnvironmentChannelStatus extends EnvironmentProfileRecord {
@@ -93,6 +113,8 @@ export interface EnvironmentStatusResult {
     alpha: EnvironmentChannelStatus;
   };
   observation?: EnvironmentObservationStatus;
+  /** Additive schema-v2 sealed-pair cache evidence; schema-v1 readers may ignore it. */
+  cacheV2: EnvironmentModeCacheStatus;
 }
 
 export interface EnvironmentObservationStatus {
@@ -101,8 +123,20 @@ export interface EnvironmentObservationStatus {
   lifecycleContended: boolean;
   commitJournalPresent: boolean;
   transitionJournalPresent: boolean;
-  transaction: { transactionId: string; phase: string } | null;
+  transaction: {
+    transactionId: string;
+    phase: string;
+    timing?: EnvironmentTransactionTimingStatus;
+  } | null;
   freshness: "current" | "contended";
+}
+
+/** Output-only timing projection; durable schema-v1 receipts remain unchanged. */
+export interface EnvironmentTransactionTimingStatus {
+  approvalAt: string | null;
+  readyAt: string | null;
+  approvalToReadyDurationMs: number | null;
+  phases: EnvironmentTimingEvidence["phases"];
 }
 
 export interface IdleEnvironmentTransaction {
@@ -112,9 +146,58 @@ export interface IdleEnvironmentTransaction {
   phase: "idle";
 }
 
+/**
+ * Read-only schema-v2 transaction projection for the sealed-pair control
+ * plane.  It is deliberately output-only: `current.json` and the
+ * generation-local warm journal remain the durable authorities.
+ *
+ * `phase`, `error`, and `timing` come from the warm journal whenever one is
+ * present. Before a warm commit starts, the current pair's durable pin state
+ * is the only available phase evidence.
+ */
+export interface EnvironmentModeCacheV2TransactionStatus {
+  schemaVersion: 2;
+  kind: "environment-mode-v2-transaction";
+  transactionId: string | null;
+  generationId: string | null;
+  phase: string;
+  error: string | null;
+  timing: EnvironmentTimingEvidence | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  terminalAt: string | null;
+  pinState: EnvironmentModePairReceipt["pin"]["state"] | null;
+  /** Target bound by the prepared pair or durable warm-commit journal. */
+  requested: Pick<LoadedEnvironmentState["current"], "appExperience" | "releaseProfile"> | null;
+}
+
+/**
+ * Additive command projection of the v2 preparer result.  Keeping `state`
+ * and `receipt` preserves mode-command compatibility while the top-level
+ * transaction identity lets Config consume it through the normal transaction
+ * path without a schema-v1 fallback.
+ */
+export interface EnvironmentModeCacheV2PreparationProjection
+  extends EnvironmentModeCacheV2PreparationResult {
+  receipt: NonNullable<EnvironmentModeCacheV2PreparationResult["receipt"]>;
+  schemaVersion: 2;
+  kind: "environment-mode-v2-transaction";
+  transactionId: string;
+  generationId: string;
+  phase: "prepared";
+  error: null;
+  timing: null;
+  createdAt: string;
+  updatedAt: string;
+  terminalAt: null;
+  pinState: EnvironmentModePairReceipt["pin"]["state"];
+  requested: Pick<LoadedEnvironmentState["current"], "appExperience" | "releaseProfile">;
+}
+
 /** Receipt plus an output-only ownerPid liveness annotation (never persisted). */
 export type AnnotatedEnvironmentTransactionReceipt = EnvironmentTransactionReceipt & {
   ownerAlive: boolean;
+  timingSummary?: EnvironmentTransactionTimingStatus;
 };
 
 export type EnvironmentCommandResult =
@@ -123,6 +206,11 @@ export type EnvironmentCommandResult =
   | EnvironmentTransactionReceipt
   | AnnotatedEnvironmentTransactionReceipt
   | EnvironmentCommitHelperReceipt
+  | EnvironmentModeCacheV2PreparationResult
+  | EnvironmentModeCacheV2PreparationProjection
+  | EnvironmentModeCacheV2TransactionStatus
+  | EnvironmentWarmCommitReceipt
+  | EnvironmentModePairReceipt
   | EnvironmentVerification
   | EnvironmentGcResult;
 
@@ -142,6 +230,20 @@ export function assertEnvironmentCliSuccess(
   action: EnvironmentAction,
   result: EnvironmentCommandResult,
 ): void {
+  if ((action === "commit" || action === "recover")
+    && "kind" in result
+    && result.kind === "environment-warm-commit"
+    && "phase" in result
+    && result.phase === "ready") {
+    return;
+  }
+  if (action === "cancel"
+    && "kind" in result
+    && result.kind === "environment-mode-pair"
+    && "pin" in result
+    && result.pin.state === "cancelled") {
+    return;
+  }
   const expected = ENVIRONMENT_SUCCESS_PHASES[action];
   if (!expected) return;
   if (!("kind" in result)
@@ -172,6 +274,10 @@ export interface EnvironmentCommandDependencies {
     receipt: EnvironmentTransactionReceipt,
     receiptRoot: string,
   ): PreparedEnvironmentCommitCli;
+  environmentModeCacheV2Enabled?(configFile: string): boolean;
+  createModeCacheGenerationId?(): string;
+  /** Read-only v2 poll seam; production defaults to current pair + warm journal. */
+  observeModeCacheV2Transaction?(environmentRoot: string): EnvironmentModeCacheV2TransactionStatus;
   print(value: string): void;
   registerAlpha?: (registry: EnvironmentProfileRegistry, appPath: string) => EnvironmentProfileRegistry;
   readRegistry(file: string): EnvironmentProfileRegistry | null;
@@ -188,6 +294,9 @@ const DEFAULT_DEPENDENCIES: EnvironmentCommandDependencies = {
   createCoordinator: createEnvironmentCoordinator,
   submitCommitHelper: submitEnvironmentCommitHelper,
   resolvePreparedCommitCli: resolvePreparedEnvironmentCommitCli,
+  environmentModeCacheV2Enabled,
+  createModeCacheGenerationId: randomUUID,
+  observeModeCacheV2Transaction: observeEnvironmentModeCacheV2Transaction,
   print: (value) => console.log(value),
   registerAlpha: registerAlphaDesktopProfile,
   readRegistry: readEnvironmentProfileRegistry,
@@ -235,6 +344,10 @@ async function runEnvironmentAction(
   paths: ResolvedUserPaths,
 ): Promise<EnvironmentCommandResult> {
   let coordinatorInstance: EnvironmentCoordinator | null = null;
+  // The only command-level rollout decision. A missing or untrusted config
+  // value is false, so ordinary commands construct the unchanged schema-v1
+  // coordinator and never create a cache generation or helper pin.
+  const modeCacheV2 = dependencies.environmentModeCacheV2Enabled?.(paths.configFile) === true;
   const configuredBundledDerivedReceipt = optionValue(
     options.bundledDerivedReceipt,
     options["bundled-derived-receipt"],
@@ -247,7 +360,11 @@ async function runEnvironmentAction(
     ? undefined
     : parseBundledDerivedReceiptPath(configuredBundledDerivedReceipt);
   const coordinator = (): EnvironmentCoordinator => {
-    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(paths, bundledDerivedReceiptFile));
+    coordinatorInstance ??= dependencies.createCoordinator(coordinatorOptions(
+      paths,
+      bundledDerivedReceiptFile,
+      modeCacheV2,
+    ));
     return coordinatorInstance;
   };
 
@@ -259,6 +376,7 @@ async function runEnvironmentAction(
       result = environmentStatus(
         loaded,
         observe ? observeEnvironment(paths, loaded.current) : undefined,
+        paths.root,
       );
       break;
     }
@@ -284,19 +402,27 @@ async function runEnvironmentAction(
         registry: registered,
         current,
         migratedFromLegacy: false,
-      });
+      }, undefined, paths.root);
       dependencies.writeRegistry(paths.environmentRegistryFile, registered);
       break;
     }
     case "transaction": {
+      if (modeCacheV2) {
+        // A v2 poll must never ask the legacy coordinator for a schema-v1
+        // receipt: a prepared pair and its warm journal are a separate,
+        // durable control plane with no compatible legacy status record.
+        result = (dependencies.observeModeCacheV2Transaction
+          ?? observeEnvironmentModeCacheV2Transaction)(paths.root);
+        break;
+      }
       const receipt = coordinator().status();
       // Output-only owner-liveness annotation; the receipt file is never
       // rewritten, so durable evidence and validators are untouched.
       result = receipt === null
         ? idleEnvironmentTransaction()
         : isTerminalEnvironmentPhase(receipt.phase)
-          ? receipt
-          : { ...receipt, ownerAlive: receipt.ownerPid === process.pid || processAlive(receipt.ownerPid) };
+          ? annotateEnvironmentTransaction(receipt)
+          : annotateEnvironmentTransaction(receipt, receipt.ownerPid === process.pid || processAlive(receipt.ownerPid));
       break;
     }
     case "prepare": {
@@ -320,11 +446,45 @@ async function runEnvironmentAction(
       // selection. Selection publication belongs exclusively to post-reopen
       // proof in the coordinator.
       dependencies.writeRegistry(paths.environmentRegistryFile, loaded.registry);
-      result = await coordinator().prepare({ current: loaded.current, requested });
+      if (modeCacheV2) {
+        const generationId = requireModeCacheGenerationId(
+          dependencies.createModeCacheGenerationId?.() ?? randomUUID(),
+        );
+        const prepared = await requireModeCacheV2Coordinator(coordinator()).prepareModeCacheV2!({
+          current: loaded.current,
+          requested,
+          generationId,
+        });
+        result = projectEnvironmentModeCacheV2Preparation(prepared);
+      } else {
+        result = await coordinator().prepare({ current: loaded.current, requested });
+      }
       break;
     }
     case "submit": {
       const transactionId = parseTransactionId(options.transaction);
+      const approvalAt = optionValue(
+        options.approvalAt,
+        options["approval-at"],
+        "approval timestamp",
+      );
+      if (modeCacheV2) {
+        if (typeof approvalAt !== "string") {
+          throw new Error("Environment mode v2 submit requires a captured approval timestamp");
+        }
+        const controlPlane = requireModeCacheV2Coordinator(coordinator()).resolvePreparedModeCacheV2CommitCli!(transactionId);
+        result = dependencies.submitCommitHelper({
+          transactionId,
+          approvalAt,
+          cliPath: controlPlane.cliPath,
+          cliArtifactDigest: controlPlane.cliArtifactDigest,
+          managedRuntimeArtifactPath: controlPlane.managedRuntimeArtifactPath,
+          managedRuntimeArtifactDigest: controlPlane.managedRuntimeArtifactDigest,
+          userRoot: paths.root,
+          receiptFile: controlPlane.receiptFile,
+        });
+        break;
+      }
       const receipt = requireTransaction(coordinator(), transactionId);
       if (receipt.phase !== "prepared") {
         throw new Error(
@@ -347,7 +507,23 @@ async function runEnvironmentAction(
       break;
     }
     case "commit": {
-      result = await coordinator().commit(parseTransactionId(options.transaction));
+      const transactionId = parseTransactionId(options.transaction);
+      const approvalAt = optionValue(
+        options.approvalAt,
+        options["approval-at"],
+        "approval timestamp",
+      );
+      if (modeCacheV2) {
+        if (typeof approvalAt !== "string") {
+          throw new Error("Environment mode v2 commit requires a captured approval timestamp");
+        }
+        result = await requireModeCacheV2Coordinator(coordinator()).commitModeCacheV2!({
+          transactionId,
+          approvalAt,
+        });
+      } else {
+        result = await coordinator().commit(transactionId, approvalAt);
+      }
       break;
     }
     case "verify": {
@@ -359,11 +535,22 @@ async function runEnvironmentAction(
       break;
     }
     case "recover": {
-      result = await coordinator().recover(parseTransactionId(options.transaction));
+      const transactionId = options.transaction === undefined ? undefined : parseTransactionId(options.transaction);
+      result = modeCacheV2
+        ? await requireModeCacheV2Coordinator(coordinator()).recoverModeCacheV2!({
+          ...(transactionId === undefined ? {} : { transactionId }),
+        })
+        : await coordinator().recover(transactionId);
       break;
     }
     case "cancel": {
-      result = await coordinator().cancel(parseTransactionId(options.transaction));
+      const transactionId = parseTransactionId(options.transaction);
+      if (modeCacheV2) {
+        await requireModeCacheV2Coordinator(coordinator()).cancelModeCacheV2!({ transactionId });
+        result = (dependencies.observeModeCacheV2Transaction ?? observeEnvironmentModeCacheV2Transaction)(paths.root);
+      } else {
+        result = await coordinator().cancel(transactionId);
+      }
       break;
     }
     case "gc": {
@@ -375,6 +562,7 @@ async function runEnvironmentAction(
       result = runEnvironmentTransactionGc({
         receiptRoot: paths.environmentReceiptRoot,
         transactionFile: paths.environmentTransactionFile,
+        cachePaths: environmentModeCachePaths(paths.root),
         mode: apply ? "apply" : "dry-run",
       });
       break;
@@ -470,6 +658,7 @@ function cachedProfileEvidence(profile: EnvironmentProfileRecord): EnvironmentPr
 function environmentStatus(
   loaded: LoadedEnvironmentState,
   observation?: EnvironmentObservationStatus,
+  environmentRoot: string = userPaths().root,
 ): EnvironmentStatusResult {
   return {
     schemaVersion: 1,
@@ -479,6 +668,9 @@ function environmentStatus(
       alpha: loaded.registry.profiles.alpha,
     },
     ...(observation ? { observation } : {}),
+    // This helper only reads the existing cache layout. It never creates
+    // roots, takes a lease, validates bytes, or changes a pin/journal.
+    cacheV2: observeEnvironmentModeCache(environmentModeCachePaths(environmentRoot)),
   };
 }
 
@@ -504,7 +696,11 @@ function observeEnvironment(
   try {
     const receipt = readEnvironmentTransactionReceipt(paths.environmentTransactionFile);
     if (receipt !== null) {
-      transaction = { transactionId: receipt.transactionId, phase: receipt.phase };
+      transaction = {
+        transactionId: receipt.transactionId,
+        phase: receipt.phase,
+        ...(receipt.timing ? { timing: environmentTransactionTimingStatus(receipt.timing) } : {}),
+      };
     }
   } catch {
     // A malformed receipt remains a mutation/recovery concern. Observation
@@ -521,6 +717,35 @@ function observeEnvironment(
   };
 }
 
+function annotateEnvironmentTransaction(
+  receipt: EnvironmentTransactionReceipt,
+  ownerAlive = true,
+): AnnotatedEnvironmentTransactionReceipt {
+  return {
+    ...receipt,
+    ownerAlive,
+    ...(receipt.timing ? { timingSummary: environmentTransactionTimingStatus(receipt.timing) } : {}),
+  };
+}
+
+export function environmentTransactionTimingStatus(
+  timing: EnvironmentTimingEvidence,
+): EnvironmentTransactionTimingStatus {
+  const approvalMs = timing.approvalAt === null ? Number.NaN : Date.parse(timing.approvalAt);
+  const readyMs = timing.readyAt === null ? Number.NaN : Date.parse(timing.readyAt);
+  const approvalToReadyDurationMs = Number.isFinite(approvalMs)
+    && Number.isFinite(readyMs)
+    && readyMs >= approvalMs
+    ? readyMs - approvalMs
+    : null;
+  return {
+    approvalAt: timing.approvalAt,
+    readyAt: timing.readyAt,
+    approvalToReadyDurationMs,
+    phases: timing.phases,
+  };
+}
+
 function idleEnvironmentTransaction(): IdleEnvironmentTransaction {
   return {
     schemaVersion: 1,
@@ -530,9 +755,115 @@ function idleEnvironmentTransaction(): IdleEnvironmentTransaction {
   };
 }
 
+/**
+ * Convert a successful v2 preparation to the ordinary transaction envelope
+ * without discarding the pair receipt that existing mode commands consume.
+ */
+export function projectEnvironmentModeCacheV2Preparation(
+  prepared: EnvironmentModeCacheV2PreparationResult,
+): EnvironmentModeCacheV2PreparationProjection {
+  if (prepared.state !== "ready" || prepared.receipt === null) {
+    throw new Error("Environment mode v2 prepare did not return a ready sealed-pair receipt");
+  }
+  const pair = prepared.receipt;
+  if (pair.pin.state !== "prepared" || pair.pin.releasedAt !== null) {
+    throw new Error("Environment mode v2 prepare returned a non-prepared sealed-pair receipt");
+  }
+  return {
+    ...prepared,
+    receipt: pair,
+    schemaVersion: 2,
+    kind: "environment-mode-v2-transaction",
+    transactionId: pair.generationId,
+    generationId: pair.generationId,
+    phase: "prepared",
+    error: null,
+    timing: null,
+    createdAt: pair.timestamps.preparedAt,
+    updatedAt: pair.timestamps.validatedAt,
+    terminalAt: null,
+    pinState: pair.pin.state,
+    requested: {
+      appExperience: pair.roles.inactive.experience,
+      releaseProfile: pair.releaseProfile,
+    },
+  };
+}
+
+/**
+ * Observe the current schema-v2 pair and its generation-local journal without
+ * constructing the legacy coordinator or reading its transaction receipt.
+ * A malformed authoritative record is surfaced as an error rather than being
+ * misreported as idle, because a caller must not prepare over unknown state.
+ */
+export function observeEnvironmentModeCacheV2Transaction(
+  environmentRoot: string,
+): EnvironmentModeCacheV2TransactionStatus {
+  const pair = readCurrentEnvironmentModePair(environmentModeCachePaths(environmentRoot));
+  if (pair === null) {
+    return {
+      schemaVersion: 2,
+      kind: "environment-mode-v2-transaction",
+      transactionId: null,
+      generationId: null,
+      phase: "idle",
+      error: null,
+      timing: null,
+      createdAt: null,
+      updatedAt: null,
+      terminalAt: null,
+      pinState: null,
+      requested: null,
+    };
+  }
+
+  const journal = readEnvironmentWarmCommitReceipt(environmentWarmCommitJournalFile(pair));
+  if (journal !== null
+    && (journal.generationId !== pair.generationId || journal.transactionId !== pair.generationId)) {
+    throw new Error(
+      `Environment mode v2 warm journal identity ${journal.transactionId}/${journal.generationId} does not match current generation ${pair.generationId}`,
+    );
+  }
+  return projectEnvironmentModeCacheV2PairTransaction(pair, journal);
+}
+
+function projectEnvironmentModeCacheV2PairTransaction(
+  pair: EnvironmentModePairReceipt,
+  journal: EnvironmentWarmCommitReceipt | null,
+): EnvironmentModeCacheV2TransactionStatus {
+  return {
+    schemaVersion: 2,
+    kind: "environment-mode-v2-transaction",
+    transactionId: pair.generationId,
+    generationId: pair.generationId,
+    // The journal is the durable mutation authority as soon as it exists;
+    // otherwise the pair's persistent pin is the only truthful phase.
+    phase: journal?.phase ?? pair.pin.state,
+    error: journal?.error ?? null,
+    timing: journal?.timing ?? null,
+    createdAt: journal?.createdAt ?? pair.timestamps.preparedAt,
+    updatedAt: journal?.updatedAt ?? modeCacheV2PairUpdatedAt(pair),
+    terminalAt: journal?.terminalAt ?? pair.timestamps.terminalAt,
+    pinState: pair.pin.state,
+    requested: {
+      appExperience: journal?.targetExperience ?? pair.roles.inactive.experience,
+      releaseProfile: pair.releaseProfile,
+    },
+  };
+}
+
+function modeCacheV2PairUpdatedAt(pair: EnvironmentModePairReceipt): string {
+  return pair.timestamps.terminalAt
+    ?? pair.timestamps.lastPreCutoverCancellationAt
+    ?? pair.timestamps.lastSuccessfulSwitchAt
+    ?? pair.timestamps.publishedAt
+    ?? pair.timestamps.validatedAt;
+}
+
 function coordinatorOptions(
   paths: ResolvedUserPaths,
   bundledDerivedReceiptFile?: string,
+  environmentModeCacheV2 = false,
 ): EnvironmentCoordinatorOptions {
   return {
     environmentRoot: paths.root,
@@ -546,8 +877,33 @@ function coordinatorOptions(
     mcpStateFile: join(paths.root, "mcp-sync-state.json"),
     tweaksRoot: paths.tweaks,
     lockFile: paths.environmentLockFile,
+    ...(environmentModeCacheV2 ? { environmentModeCacheV2: true } : {}),
     ...(bundledDerivedReceiptFile ? { bundledDerivedReceiptFile } : {}),
   };
+}
+
+function requireModeCacheV2Coordinator(coordinator: EnvironmentCoordinator): Required<Pick<
+  EnvironmentCoordinator,
+  "prepareModeCacheV2" | "commitModeCacheV2" | "cancelModeCacheV2" | "recoverModeCacheV2" | "resolvePreparedModeCacheV2CommitCli"
+>> & EnvironmentCoordinator {
+  if (!coordinator.prepareModeCacheV2
+    || !coordinator.commitModeCacheV2
+    || !coordinator.cancelModeCacheV2
+    || !coordinator.recoverModeCacheV2
+    || !coordinator.resolvePreparedModeCacheV2CommitCli) {
+    throw new Error("environmentModeCacheV2 is enabled but the Environment coordinator has no bound v2 production adapter");
+  }
+  return coordinator as Required<Pick<
+    EnvironmentCoordinator,
+    "prepareModeCacheV2" | "commitModeCacheV2" | "cancelModeCacheV2" | "recoverModeCacheV2" | "resolvePreparedModeCacheV2CommitCli"
+  >> & EnvironmentCoordinator;
+}
+
+function requireModeCacheGenerationId(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new Error("Environment mode v2 generation ID is invalid");
+  }
+  return value;
 }
 
 function parseBundledDerivedReceiptPath(value: string): string {

@@ -25,6 +25,7 @@ export type DesktopUpdateLogEvent =
   | "handoff_attempt"
   | "handoff_result"
   | "native_wait_progress"
+  | "appcast_probe"
   | "user_approval"
   | "manual_recovery";
 
@@ -40,6 +41,8 @@ export interface DesktopUpdateLogInput {
   /** Human-readable checkpoint context (redacted and bounded like error). */
   detail?: string;
   jobLabel?: string | null;
+  /** Milliseconds spent in the previous phase before this transition. */
+  phaseElapsedMs?: number | null;
 }
 
 export interface DesktopUpdateLogRecord {
@@ -54,6 +57,7 @@ export interface DesktopUpdateLogRecord {
   error?: string;
   detail?: string;
   jobLabel?: string;
+  phaseElapsedMs?: number;
 }
 
 export interface DesktopUpdateLogOptions {
@@ -98,6 +102,9 @@ export function appendDesktopUpdateLog(
     ...(input.jobLabel === null || input.jobLabel === undefined
       ? {}
       : { jobLabel: redact(input.jobLabel, roots) }),
+    ...(input.phaseElapsedMs === null || input.phaseElapsedMs === undefined || !Number.isFinite(input.phaseElapsedMs)
+      ? {}
+      : { phaseElapsedMs: Math.max(0, Math.round(input.phaseElapsedMs)) }),
   };
 
   const line = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");

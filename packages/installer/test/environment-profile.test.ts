@@ -383,6 +383,11 @@ test("installer paths own profile, selection, and environment transaction receip
     assert.equal(paths.environmentTransactionFile, "/tmp/tweaker-environment-home/transactions/environment.json");
     assert.equal(paths.environmentReceiptRoot, "/tmp/tweaker-environment-home/transactions/environment");
     assert.equal(paths.environmentLockFile, "/tmp/tweaker-environment-home/transactions/environment.lock");
+    assert.equal(paths.environmentModeCacheRoot, "/tmp/tweaker-environment-home/environment-cache");
+    assert.equal(paths.environmentModeCacheCurrentFile, "/tmp/tweaker-environment-home/environment-cache/current.json");
+    assert.equal(paths.environmentModeCacheGenerationsRoot, "/tmp/tweaker-environment-home/environment-cache/generations");
+    assert.equal(paths.environmentModeCachePreparationRoot, "/tmp/tweaker-environment-home/environment-cache/next");
+    assert.equal(paths.environmentModeCacheLockFile, "/tmp/tweaker-environment-home/environment-cache/environment-mode-cache.lock");
   } finally {
     if (previous === undefined) delete process.env.TWEAKER_HOME;
     else process.env.TWEAKER_HOME = previous;

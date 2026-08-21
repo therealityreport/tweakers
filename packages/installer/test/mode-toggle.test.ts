@@ -280,7 +280,79 @@ test("production mode compatibility prepares before one confirmation and commits
   });
 });
 
-test("production mode refuses a persisted-selection and live-marker drift before no-op", async () => {
+test("production mode records approval immediately before its environment commit", async () => {
+  await withTweakersHome(async () => {
+    const observed: Array<{ action: string; approvalAt?: string }> = [];
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      now: () => "2026-08-18T12:00:00.000Z",
+      environmentCommand: async (action, options) => {
+        observed.push({ action, approvalAt: options.approvalAt });
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "commit") return compatibilityEnvironmentResult("committed");
+        throw new Error(`unexpected environment action ${action}`);
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+    assert.deepEqual(observed.map(({ action, approvalAt }) => ({ action, approvalAt })), [
+      { action: "status", approvalAt: undefined },
+      { action: "prepare", approvalAt: undefined },
+      { action: "commit", approvalAt: "2026-08-18T12:00:00.000Z" },
+    ]);
+  });
+});
+
+test("production mode keeps the chatgpt/tweakers command names while carrying a v2 generation through confirmation and warm commit", async () => {
+  await withTweakersHome(async () => {
+    const sequence: string[] = [];
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      now: () => "2026-08-18T12:00:00.000Z",
+      environmentCommand: async (action, options) => {
+        if (action === "status") {
+          sequence.push("status");
+          return compatibilityEnvironmentResult("status");
+        }
+        if (action === "prepare") {
+          sequence.push(`prepare:${options.appExperience}:${options.releaseProfile}`);
+          return {
+            state: "ready",
+            receipt: { generationId: "mode-v2-generation" },
+          } as unknown as EnvironmentCommandResult;
+        }
+        if (action === "commit") {
+          sequence.push(`commit:${options.transaction}:${options.approvalAt}`);
+          return {
+            kind: "environment-warm-commit",
+            transactionId: "mode-v2-generation",
+            phase: "ready",
+            sourceMainPid: 101,
+            targetMainPid: 202,
+            error: null,
+          } as unknown as EnvironmentCommandResult;
+        }
+        throw new Error(`unexpected environment action ${action}`);
+      },
+      confirm: ({ target, appRoot }) => {
+        sequence.push(`confirm:${target}:${appRoot}`);
+        return true;
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+
+    assert.deepEqual(sequence, [
+      "status",
+      "prepare:chatgpt:stable",
+      "confirm:chatgpt:/Applications/ChatGPT.app",
+      "commit:mode-v2-generation:2026-08-18T12:00:00.000Z",
+    ]);
+  });
+});
+
+test("production mode reconciles a persisted-selection and live-marker drift from live truth", async () => {
   await withTweakersHome(async () => {
     const status = compatibilityEnvironmentResult("status") as Extract<
       EnvironmentCommandResult,
@@ -291,18 +363,24 @@ test("production mode refuses a persisted-selection and live-marker drift before
       appExperience: "chatgpt",
       selectionDrift: true,
     };
+    const republished: Array<{ from: string; to: string }> = [];
     const { deps } = makeDeps({
       legacyModeEngineForTests: false,
       environmentCommand: async (action) => {
         if (action === "status") return status;
         throw new Error(`unexpected environment action ${action}`);
       },
+      republishSelection: (selected, liveExperience) => {
+        republished.push({ from: selected.appExperience, to: liveExperience });
+        return { ...selected, appExperience: liveExperience, appliedAt: "2026-08-20T17:00:00.000Z" };
+      },
     });
 
-    await assert.rejects(
-      () => mode("tweakers", {}, deps),
-      /selection says tweakers.*live app proves chatgpt.*tweaker repair/i,
-    );
+    // The live bytes prove chatgpt while the stale publication says tweakers:
+    // the switch republishes from live truth and then recognizes the target
+    // as already live instead of dead-ending on "run tweaker repair".
+    await mode("chatgpt", {}, deps);
+    assert.deepEqual(republished, [{ from: "tweakers", to: "chatgpt" }]);
   });
 });
 
@@ -475,6 +553,38 @@ test("mode chatgpt: happy path parks the patched payload and restores pristine",
     assert.ok(calls.includes("open"));
     // The retired standalone status item is no longer a switching dependency.
     assert.equal(calls.includes("ensure-switcher"), false);
+  });
+});
+
+test("mode chatgpt: runs exactly two deep verifications, none after the swap", async () => {
+  await withTweakersHome(async (root) => {
+    const app = join(root, "Applications", "ChatGPT.app");
+    makeApp(app, { version: "26.1.0", asar: "patched-asar" });
+    const backup = join(root, "backup", "Codex.app");
+    makeApp(backup, { version: "26.1.0", asar: "pristine-asar" });
+    seedState(root, { appRoot: app, mode: "tweakers", codexVersion: "26.1.0" });
+
+    let deepVerifications = 0;
+    let deepVerificationsAtSwap = -1;
+    const { deps } = makeDeps({
+      verifyDeep: () => {
+        deepVerifications += 1;
+        return { ok: true, output: "" };
+      },
+      swapDirectories: (first, second) => {
+        deepVerificationsAtSwap = deepVerifications;
+        jsSwapDirectories(first, second);
+      },
+    });
+
+    await mode("chatgpt", { yes: true, app }, deps);
+
+    // Only the swap's validateDestination deep-verifies: the settled-bundle
+    // official-pristine check short-circuits on the patch marker before its
+    // deep verification, and the post-open console line reuses the swap's
+    // result via the cheap identity read instead of another full-bundle walk.
+    assert.equal(deepVerifications, 1);
+    assert.equal(deepVerifications - deepVerificationsAtSwap, 1, "the single deep verification belongs to the swap itself");
   });
 });
 

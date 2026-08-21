@@ -48,6 +48,13 @@ import {
   type EnvironmentCoordinator,
   type EnvironmentTransactionReceipt,
 } from "./environment-transaction.js";
+import {
+  environmentModeCachePaths,
+  readCurrentEnvironmentModePair,
+  type EnvironmentModePairReceipt,
+} from "./environment-mode-cache.js";
+import { environmentModeCacheV2Enabled } from "./environment-mode-production.js";
+import type { EnvironmentWarmCommitReceipt } from "./environment-warm-commit.js";
 import { userPaths } from "./paths.js";
 import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
 import { readPlist } from "./plist.js";
@@ -73,7 +80,8 @@ import {
   type NativeUpdateHandoffFailureKind,
   type NativeUpdateHandoffResult,
 } from "./alerts.js";
-import { isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
+import { type AsarMarker, isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
+import { probeDesktopAppcast, type DesktopAppcastProbeResult } from "./desktop-appcast-probe.js";
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
@@ -118,6 +126,8 @@ export interface DesktopUpdateReceipt {
   nativeUpdateHandoffAt: string | null;
   refreshSource: DesktopUpdateRefreshSource | null;
   environmentTransactionId: string | null;
+  /** Additive discriminator for receipts created after sealed-pair switching shipped. */
+  environmentTransactionKind?: "legacy" | "mode-cache-v2" | null;
   /** PID proven when the official environment was entered before native update. */
   officialMainPid?: number | null;
   safeOfficialMode: boolean;
@@ -175,6 +185,9 @@ export interface VerifyDesktopUpdateInput {
   baseline: DesktopVersionIdentity;
   observed: DesktopVersionIdentity;
   previousMainPid: number | null;
+  environmentTransactionKind: "legacy" | "mode-cache-v2" | null;
+  environmentTransactionId: string | null;
+  modeCachePair: DesktopUpdateModeCachePair | null;
 }
 
 export interface RecoveredOfficialUpdate {
@@ -183,11 +196,71 @@ export interface RecoveredOfficialUpdate {
   mainPid: number;
 }
 
+export interface DesktopUpdateModeCachePair {
+  generationId: string;
+  releaseProfile: EnvironmentSelection["releaseProfile"];
+  pinState: EnvironmentModePairReceipt["pin"]["state"];
+  live: {
+    experience: EnvironmentSelection["appExperience"];
+    appPath: string;
+    bundleId: EnvironmentSelection["selectedDesktopBundleId"];
+    version: string;
+    build: string;
+  };
+  inactive: {
+    experience: EnvironmentSelection["appExperience"];
+    appPath: string;
+    bundleId: EnvironmentSelection["selectedDesktopBundleId"];
+    version: string;
+    build: string;
+    strictSignature: boolean;
+  };
+}
+
+export interface DesktopUpdateModeCacheSwitchResult {
+  transactionId: string;
+  phase: EnvironmentWarmCommitReceipt["phase"];
+  error: string | null;
+  selection: EnvironmentSelection | null;
+  targetMainPid: number | null;
+  pair: DesktopUpdateModeCachePair | null;
+}
+
+export interface DesktopUpdateModeCacheAdapter {
+  current(): DesktopUpdateModeCachePair | null;
+  switchCurrent(input: {
+    current: EnvironmentSelection;
+    requested: EnvironmentSelection;
+    transactionId: string;
+    approvalAt: string;
+  }): Promise<DesktopUpdateModeCacheSwitchResult>;
+  prepareAndSwitch(input: {
+    current: EnvironmentSelection;
+    requested: EnvironmentSelection;
+    transactionId: string;
+    approvalAt: string;
+  }): Promise<DesktopUpdateModeCacheSwitchResult>;
+  recover(transactionId: string): Promise<DesktopUpdateModeCacheSwitchResult>;
+}
+
 export interface DesktopUpdateDependencies {
   environment: EnvironmentCoordinator;
+  /** Null preserves the complete schema-v1 update path. */
+  modeCacheV2: DesktopUpdateModeCacheAdapter | null;
   readCurrentSelection(): EnvironmentSelection | null | Promise<EnvironmentSelection | null>;
   readDesktopVersion(appPath: string): DesktopVersionIdentity | Promise<DesktopVersionIdentity>;
   readDesktopBundleIdentifier(appPath: string): string | null | Promise<string | null>;
+  /** Owner-dead recovery seam; defaults to reading the live bundle's asar patch marker. */
+  readDesktopAsarMarker?(appPath: string): AsarMarker;
+  /**
+   * Advisory pre-check of the signed Sparkle appcast before any environment
+   * swap. Only an unambiguous "current" result short-circuits the update;
+   * "unavailable" always fails open into the native updater flow.
+   */
+  probeAppcast?(input: {
+    appPath: string;
+    baseline: DesktopVersionIdentity;
+  }): DesktopAppcastProbeResult | Promise<DesktopAppcastProbeResult>;
   /** Prove the exact live desktop is pristine, OpenAI-signed, visible, and version-readable. */
   inspectLiveOfficialDesktop(
     selection: EnvironmentSelection,
@@ -231,6 +304,7 @@ export interface DesktopUpdateDependencies {
   now(): string;
   createId(): string;
   createOwnerGeneration(): string;
+  createModeCacheGenerationId(): string;
 }
 
 export interface DesktopUpdateTransactionOptions {
@@ -274,6 +348,154 @@ const RECOVERABLE_NATIVE_HANDOFF_KINDS: ReadonlySet<NativeUpdateHandoffFailureKi
   "window_not_visible",
 ]);
 
+function createProductionDesktopUpdateModeCacheAdapter(input: {
+  environment: EnvironmentCoordinator;
+  environmentRoot: string;
+  readCurrentSelection(): EnvironmentSelection | null | Promise<EnvironmentSelection | null>;
+}): DesktopUpdateModeCacheAdapter {
+  const coordinator = requireDesktopUpdateModeCacheCoordinator(input.environment);
+  const paths = environmentModeCachePaths(input.environmentRoot);
+  const current = (): DesktopUpdateModeCachePair | null => {
+    const pair = readCurrentEnvironmentModePair(paths);
+    return pair === null ? null : projectDesktopUpdateModeCachePair(pair);
+  };
+  const result = async (
+    transactionId: string,
+    warm: EnvironmentWarmCommitReceipt,
+  ): Promise<DesktopUpdateModeCacheSwitchResult> => ({
+    transactionId,
+    phase: warm.phase,
+    error: warm.error,
+    selection: await input.readCurrentSelection(),
+    targetMainPid: warm.targetMainPid,
+    pair: current(),
+  });
+  const switchCurrent = async (request: {
+    current: EnvironmentSelection;
+    requested: EnvironmentSelection;
+    transactionId: string;
+    approvalAt: string;
+  }): Promise<DesktopUpdateModeCacheSwitchResult> => {
+    const before = current();
+    assertDesktopUpdateModeCacheTransition(before, request.current, request.requested, request.transactionId);
+    const warm = await coordinator.commitModeCacheV2({
+      transactionId: request.transactionId,
+      approvalAt: request.approvalAt,
+    });
+    const switched = await result(request.transactionId, warm);
+    if (switched.phase === "ready") {
+      assertDesktopUpdateModeCacheResult(switched, request.requested);
+    }
+    return switched;
+  };
+  return {
+    current,
+    switchCurrent,
+    async prepareAndSwitch(request) {
+      const prepared = await coordinator.prepareModeCacheV2({
+        current: request.current,
+        requested: request.requested,
+        generationId: request.transactionId,
+      });
+      if (prepared.state !== "ready"
+        || prepared.receipt === null
+        || prepared.receipt.generationId !== request.transactionId) {
+        throw new Error("Desktop update could not prepare a fresh sealed environment pair");
+      }
+      return switchCurrent(request);
+    },
+    async recover(transactionId) {
+      const recovered = await coordinator.recoverModeCacheV2({ transactionId });
+      if (recovered.kind !== "environment-warm-commit") {
+        throw new Error("Desktop update v2 recovery returned a legacy environment receipt");
+      }
+      return result(transactionId, recovered);
+    },
+  };
+}
+
+function requireDesktopUpdateModeCacheCoordinator(
+  coordinator: EnvironmentCoordinator,
+): Required<Pick<EnvironmentCoordinator, "prepareModeCacheV2" | "commitModeCacheV2" | "recoverModeCacheV2">>
+  & EnvironmentCoordinator {
+  if (!coordinator.prepareModeCacheV2 || !coordinator.commitModeCacheV2 || !coordinator.recoverModeCacheV2) {
+    throw new Error("environmentModeCacheV2 is enabled but the desktop updater has no bound v2 production adapter");
+  }
+  return coordinator as Required<Pick<
+    EnvironmentCoordinator,
+    "prepareModeCacheV2" | "commitModeCacheV2" | "recoverModeCacheV2"
+  >> & EnvironmentCoordinator;
+}
+
+function projectDesktopUpdateModeCachePair(pair: EnvironmentModePairReceipt): DesktopUpdateModeCachePair {
+  return {
+    generationId: pair.generationId,
+    releaseProfile: pair.releaseProfile,
+    pinState: pair.pin.state,
+    live: {
+      experience: pair.roles.live.experience,
+      appPath: pair.roles.live.appPath,
+      bundleId: pair.roles.live.evidence.bundleId,
+      version: pair.roles.live.evidence.version,
+      build: pair.roles.live.evidence.build,
+    },
+    inactive: {
+      experience: pair.roles.inactive.experience,
+      appPath: pair.roles.inactive.appPath,
+      bundleId: pair.roles.inactive.evidence.bundleId,
+      version: pair.roles.inactive.evidence.version,
+      build: pair.roles.inactive.evidence.build,
+      strictSignature: pair.roles.inactive.evidence.signature.strict,
+    },
+  };
+}
+
+function desktopUpdateModeCachePairBinds(
+  pair: DesktopUpdateModeCachePair | null,
+  current: EnvironmentSelection,
+  requested: EnvironmentSelection,
+): pair is DesktopUpdateModeCachePair {
+  return pair !== null
+    && pair.pinState === "prepared"
+    && pair.releaseProfile === current.releaseProfile
+    && requested.releaseProfile === current.releaseProfile
+    && pair.live.appPath === current.selectedDesktopPath
+    && requested.selectedDesktopPath === current.selectedDesktopPath
+    && pair.live.bundleId === current.selectedDesktopBundleId
+    && pair.inactive.bundleId === requested.selectedDesktopBundleId
+    && pair.live.experience === current.appExperience
+    && pair.inactive.experience === requested.appExperience;
+}
+
+function assertDesktopUpdateModeCacheTransition(
+  pair: DesktopUpdateModeCachePair | null,
+  current: EnvironmentSelection,
+  requested: EnvironmentSelection,
+  transactionId: string,
+): asserts pair is DesktopUpdateModeCachePair {
+  if (!desktopUpdateModeCachePairBinds(pair, current, requested) || pair.generationId !== transactionId) {
+    throw new Error("Desktop update sealed pair does not bind the requested environment transition");
+  }
+}
+
+function assertDesktopUpdateModeCacheResult(
+  result: DesktopUpdateModeCacheSwitchResult,
+  requested: EnvironmentSelection,
+): void {
+  if (result.pair === null
+    || result.selection === null
+    || result.targetMainPid === null
+    || result.pair.generationId !== result.transactionId
+    || result.pair.pinState !== "prepared"
+    || result.pair.live.experience !== requested.appExperience
+    || result.pair.live.appPath !== requested.selectedDesktopPath
+    || result.pair.live.bundleId !== requested.selectedDesktopBundleId
+    || !sameEnvironmentSelection(result.selection, requested)
+    || result.selection.appliedAt === null) {
+    throw new Error("Desktop update sealed-pair commit did not prove the requested live environment");
+  }
+}
+
 export function createDesktopUpdateTransaction(
   options: DesktopUpdateTransactionOptions = {},
   overrides: Partial<DesktopUpdateDependencies> = {},
@@ -293,10 +515,14 @@ export function createDesktopUpdateTransaction(
   const environmentLockFile = join(root, "transactions", "environment.lock");
   const lifecycleLockFile = join(root, "transactions", "lifecycle.lock");
   const installerStateFile = join(root, "state.json");
-  const timeoutMs = Math.max(1, options.timeoutMs ?? 30 * 60 * 1_000);
+  const configFile = join(root, "config.json");
+  const timeoutMs = Math.max(1, options.timeoutMs ?? configuredNativeUpdateTimeoutMs(configFile));
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 2_000);
   const resumeLaunchWaitMs = Math.max(0, options.resumeLaunchWaitMs ?? 30_000);
   const now = overrides.now ?? (() => new Date().toISOString());
+  const modeCacheV2Enabled = overrides.modeCacheV2 !== undefined
+    ? overrides.modeCacheV2 !== null
+    : environmentModeCacheV2Enabled(configFile);
   const environment = overrides.environment ?? createEnvironmentCoordinator({
     environmentRoot: root,
     transactionFile: environmentTransactionFile,
@@ -304,25 +530,41 @@ export function createDesktopUpdateTransaction(
     selectionFile: environmentSelectionFile,
     registryFile: environmentRegistryFile,
     stateFile: installerStateFile,
-    configFile: join(root, "config.json"),
+    configFile,
     runtimeProofFile: join(root, "environment-runtime-proof.json"),
     mcpStateFile: join(root, "mcp-sync-state.json"),
     tweaksRoot: join(root, "tweaks"),
     lockFile: environmentLockFile,
     lifecycleLockFile,
+    ...(modeCacheV2Enabled ? { environmentModeCacheV2: true } : {}),
   });
+  const readCurrentSelection = overrides.readCurrentSelection ?? (() => {
+    const saved = readEnvironmentSelection(environmentSelectionFile);
+    if (saved) return saved;
+    const legacy = readState(installerStateFile);
+    return migrateLegacyEnvironmentSelection({ mode: legacy?.mode });
+  });
+  const modeCacheV2 = overrides.modeCacheV2 !== undefined
+    ? overrides.modeCacheV2
+    : modeCacheV2Enabled
+      ? createProductionDesktopUpdateModeCacheAdapter({
+        environment,
+        environmentRoot: root,
+        readCurrentSelection,
+      })
+      : null;
   const deps: DesktopUpdateDependencies = {
     environment,
-    readCurrentSelection: overrides.readCurrentSelection ?? (() => {
-      const saved = readEnvironmentSelection(environmentSelectionFile);
-      if (saved) return saved;
-      const legacy = readState(installerStateFile);
-      return migrateLegacyEnvironmentSelection({ mode: legacy?.mode });
-    }),
+    modeCacheV2,
+    readCurrentSelection,
     readDesktopVersion: overrides.readDesktopVersion ?? readDesktopVersion,
     readDesktopBundleIdentifier: overrides.readDesktopBundleIdentifier ?? ((appPath) => (
       readDesktopBundleIdentity(appPath).bundleId
     )),
+    readDesktopAsarMarker: overrides.readDesktopAsarMarker ?? ((appPath) => (
+      readAsarMarker(join(appPath, "Contents", "Resources", "app.asar"))
+    )),
+    probeAppcast: overrides.probeAppcast ?? ((input) => probeDesktopAppcast(input)),
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
     launchOfficialDesktop: overrides.launchOfficialDesktop ?? ((selection) => {
       openCodex(selection.selectedDesktopPath);
@@ -416,6 +658,7 @@ export function createDesktopUpdateTransaction(
     now,
     createId: overrides.createId ?? randomUUID,
     createOwnerGeneration: overrides.createOwnerGeneration ?? randomUUID,
+    createModeCacheGenerationId: overrides.createModeCacheGenerationId ?? randomUUID,
   };
 
   const persist = (
@@ -459,6 +702,9 @@ export function createDesktopUpdateTransaction(
         jobLabel: options.jobLabel
           ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL
           ?? null,
+        phaseElapsedMs: previous === null || previous.transactionId !== receipt.transactionId
+          ? null
+          : Date.parse(receipt.updatedAt) - Date.parse(previous.updatedAt),
       }, {
         now: deps.now,
         userRoot: root,
@@ -536,7 +782,13 @@ export function createDesktopUpdateTransaction(
       if (!ownerToken) {
         throw new Error(`Cannot establish a stable process identity for desktop update owner PID ${process.pid}`);
       }
-      return persist({
+      // Advisory appcast pre-check before any environment swap: when the
+      // signed feed unambiguously proves the installed build is current, the
+      // whole update (two environment swaps + a native wait + a runtime
+      // refresh) is a no-op and completes here in seconds. Every ambiguous or
+      // failed probe falls open into the unchanged native updater flow.
+      const probe = await deps.probeAppcast!({ appPath: source.selectedDesktopPath, baseline });
+      const created = persist({
         schemaVersion: DESKTOP_UPDATE_SCHEMA_VERSION,
         kind: "desktop-update",
         transactionId: deps.createId(),
@@ -551,6 +803,7 @@ export function createDesktopUpdateTransaction(
         nativeUpdateHandoffAt: null,
         refreshSource: null,
         environmentTransactionId: null,
+        environmentTransactionKind: null,
         officialMainPid: null,
         safeOfficialMode: false,
         resumable: false,
@@ -562,7 +815,28 @@ export function createDesktopUpdateTransaction(
         completedAt: null,
         rolledBackAt: null,
       });
+      appendDesktopUpdateLog(logFile, {
+        transactionId: created.transactionId,
+        phase: created.phase,
+        ownerPid: created.ownerPid,
+        ownerToken: created.ownerToken ?? null,
+        ownerGeneration: created.ownerGeneration ?? null,
+        event: "appcast_probe",
+        detail: probe.detail,
+        jobLabel: options.jobLabel ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL ?? null,
+      }, { now: deps.now, userRoot: root });
+      if (probe.state === "current") {
+        return update(created, {
+          phase: "completed",
+          safeOfficialMode: created.source.appExperience === "chatgpt",
+          resumable: false,
+          error: null,
+          completedAt: deps.now(),
+        }, true);
+      }
+      return created;
     });
+    if (receipt.phase === "completed") return receipt;
     return switchToOfficial(receipt);
   }
 
@@ -580,9 +854,103 @@ export function createDesktopUpdateTransaction(
         error: `Could not verify the current desktop environment: ${errorMessage(error)}`,
       }, true);
     }
+
+    if (deps.modeCacheV2 !== null) {
+      if (receipt.source.appExperience === "chatgpt") {
+        try {
+          const live = await deps.inspectLiveOfficialDesktop(receipt.official);
+          receipt = update(receipt, {
+            phase: "awaiting_native_update",
+            official: receipt.source,
+            safeOfficialMode: true,
+            resumable: true,
+            officialMainPid: live.mainPid,
+          });
+          return handoffAndAwaitNativeUpdate(receipt);
+        } catch (error) {
+          return update(receipt, {
+            phase: "failed",
+            safeOfficialMode: false,
+            resumable: false,
+            error: `Could not prove the current official desktop: ${errorMessage(error)}`,
+          }, true);
+        }
+      }
+
+      // A refresh (or any invalidation) releases the current generation's
+      // grant, and a released or mismatched pair can never bind this
+      // transition — failing on it made every post-refresh update dead on
+      // arrival (live failures 2026-08-19/20). Reuse the current pair only
+      // when it still binds; otherwise prepare a fresh sealed pair, exactly
+      // as the return leg already does.
+      const pair = deps.modeCacheV2.current();
+      const reusableGenerationId = desktopUpdateModeCachePairBinds(pair, receipt.source, receipt.official)
+        ? pair.generationId
+        : null;
+      const generationId = reusableGenerationId ?? deps.createModeCacheGenerationId();
+      receipt = update(receipt, {
+        environmentTransactionId: generationId,
+        environmentTransactionKind: "mode-cache-v2",
+      });
+      try {
+        let request = {
+          current: receipt.source,
+          requested: receipt.official,
+          transactionId: generationId,
+          approvalAt: receipt.createdAt,
+        };
+        let switched = reusableGenerationId !== null
+          ? await deps.modeCacheV2.switchCurrent(request)
+          : await deps.modeCacheV2.prepareAndSwitch(request);
+        // A pair can pass the cheap metadata binding above and still be
+        // invalidated by the bounded stat-seal preflight (for example, after
+        // refresh-local atomically replaces the live Tweakers payload). That
+        // result is explicitly pre-cutover and safe to replace. Prepare one
+        // fresh generation instead of turning the released stale grant into a
+        // blocking desktop-update failure.
+        if (reusableGenerationId !== null && switched.phase === "stale_requires_prepare") {
+          const freshGenerationId = deps.createModeCacheGenerationId();
+          receipt = update(receipt, { environmentTransactionId: freshGenerationId });
+          request = { ...request, transactionId: freshGenerationId };
+          switched = await deps.modeCacheV2.prepareAndSwitch(request);
+        }
+        if (switched.phase !== "ready"
+          || switched.selection === null
+          || switched.targetMainPid === null) {
+          return modeCacheFailure(receipt, switched, false);
+        }
+        receipt = update(receipt, {
+          phase: "awaiting_native_update",
+          official: switched.selection,
+          safeOfficialMode: true,
+          resumable: true,
+          officialMainPid: switched.targetMainPid,
+        });
+        return handoffAndAwaitNativeUpdate(receipt);
+      } catch (error) {
+        let liveOfficial: LiveOfficialDesktopObservation | null = null;
+        try {
+          liveOfficial = await deps.inspectLiveOfficialDesktop(receipt.official);
+        } catch {
+          // The caught switch error remains authoritative unless independent
+          // live proof establishes a safe official continuation.
+        }
+        return update(receipt, {
+          phase: "failed",
+          officialMainPid: liveOfficial?.mainPid ?? receipt.officialMainPid ?? null,
+          safeOfficialMode: liveOfficial !== null,
+          resumable: liveOfficial !== null,
+          error: errorMessage(error),
+        }, true);
+      }
+    }
+
     try {
       const prepared = await deps.environment.prepare({ current: receipt.source, requested: receipt.official });
-      receipt = update(receipt, { environmentTransactionId: prepared.transactionId });
+      receipt = update(receipt, {
+        environmentTransactionId: prepared.transactionId,
+        environmentTransactionKind: "legacy",
+      });
       const committed = await deps.environment.commit(prepared.transactionId);
       if (committed.phase !== "committed") return environmentFailure(receipt, committed, false);
       receipt = update(receipt, {
@@ -600,6 +968,8 @@ export function createDesktopUpdateTransaction(
       return update(receipt, {
         phase: "failed",
         environmentTransactionId: receipt.environmentTransactionId ?? failedPreparation?.transactionId ?? null,
+        environmentTransactionKind: receipt.environmentTransactionKind
+          ?? (failedPreparation === null ? null : "legacy"),
         resumable: receipt.safeOfficialMode,
         error: errorMessage(error),
       }, true);
@@ -703,6 +1073,31 @@ export function createDesktopUpdateTransaction(
     if (!initial.observed) throw new Error("Desktop update observation is missing");
     const observed = initial.observed;
 
+    if (initial.environmentTransactionKind === "mode-cache-v2"
+      && initial.environmentTransactionId !== null
+      && deps.modeCacheV2 !== null) {
+      const pair = deps.modeCacheV2.current();
+      const current = await deps.readCurrentSelection();
+      if (pairProvesLiveEnvironment(
+        pair,
+        current,
+        initial.source,
+        initial.environmentTransactionId,
+        observed,
+      )) {
+        const provenCurrent = current!;
+        const receipt = initial.phase === "verifying" && initial.error === null
+          ? initial
+          : update(initial, {
+            phase: "verifying",
+            source: provenCurrent,
+            resumable: false,
+            error: null,
+          });
+        return verifyAndComplete(receipt, provenCurrent, null, pair);
+      }
+    }
+
     // A resume may arrive after environment recovery proved the REQUESTED
     // Tweakers environment live (the return leg's commit had landed before
     // the original owner failed). The official app is not running in that
@@ -710,7 +1105,8 @@ export function createDesktopUpdateTransaction(
     // fabricate a safeOfficialMode failure that contradicts the published
     // selection. Only the runtime refresh and final verification remain; run
     // exactly those. This must precede the official-truth refresh below.
-    const recoveredCommit = initial.environmentTransactionId === null
+    const recoveredCommit = initial.environmentTransactionKind === "mode-cache-v2"
+      || initial.environmentTransactionId === null
       ? null
       : deps.environment.status();
     if (recoveredCommit !== null
@@ -764,6 +1160,72 @@ export function createDesktopUpdateTransaction(
     let receipt = reconciled.phase === "returning_to_tweakers"
       ? reconciled
       : update(reconciled, { phase: "returning_to_tweakers", resumable: false });
+
+    if (deps.modeCacheV2 !== null) {
+      const requested = {
+        ...receipt.source,
+        requestedAt: deps.now(),
+        appliedAt: null,
+      };
+      const generationId = deps.createModeCacheGenerationId();
+      const refreshSource = await deps.selectRefreshSource();
+      receipt = update(receipt, {
+        phase: "refreshing_runtime",
+        refreshSource,
+        environmentTransactionId: generationId,
+        environmentTransactionKind: "mode-cache-v2",
+      });
+      try {
+        const switched = await deps.modeCacheV2.prepareAndSwitch({
+          current: receipt.official,
+          requested,
+          transactionId: generationId,
+          approvalAt: receipt.createdAt,
+        });
+        if (switched.phase !== "ready"
+          || switched.selection === null
+          || switched.targetMainPid === null
+          || switched.pair === null) {
+          return modeCacheFailure(receipt, switched, true);
+        }
+        receipt = update(receipt, {
+          phase: "verifying",
+          source: switched.selection,
+        });
+        return verifyAndComplete(receipt, switched.selection, switched.targetMainPid, switched.pair);
+      } catch (error) {
+        const latest = status() ?? receipt;
+        const pair = deps.modeCacheV2.current();
+        const current = await deps.readCurrentSelection();
+        let safeOfficial = pairProvesLiveEnvironment(
+          pair,
+          current,
+          latest.official,
+          generationId,
+          observed,
+        );
+        let officialMainPid = latest.officialMainPid ?? null;
+        if (!safeOfficial) {
+          try {
+            const live = await deps.inspectLiveOfficialDesktop(latest.official);
+            safeOfficial = true;
+            officialMainPid = live.mainPid;
+          } catch {
+            // Keep the generation proof result. A failed preparation is only
+            // resumable when either the pair or live pristine-app proof says
+            // official ChatGPT remains safe.
+          }
+        }
+        return update(latest, {
+          phase: "failed",
+          officialMainPid,
+          safeOfficialMode: safeOfficial,
+          resumable: safeOfficial,
+          error: errorMessage(error),
+        }, true);
+      }
+    }
+
     let returnTransactionId: string | null = null;
     try {
       const requested = {
@@ -773,7 +1235,10 @@ export function createDesktopUpdateTransaction(
       };
       const prepared = await deps.environment.prepare({ current: receipt.official, requested });
       returnTransactionId = prepared.transactionId;
-      receipt = update(receipt, { environmentTransactionId: returnTransactionId });
+      receipt = update(receipt, {
+        environmentTransactionId: returnTransactionId,
+        environmentTransactionKind: "legacy",
+      });
       const committed = await deps.environment.commit(returnTransactionId);
       if (committed.phase !== "committed") return environmentFailure(receipt, committed, true);
       return await refreshRuntimeAndVerify(receipt, committed.requested, committed.newMainPid, observed);
@@ -833,6 +1298,9 @@ export function createDesktopUpdateTransaction(
       baseline: receipt.baseline,
       observed: receipt.observed!,
       previousMainPid: newMainPid,
+      environmentTransactionKind: receipt.environmentTransactionKind ?? null,
+      environmentTransactionId: receipt.environmentTransactionId,
+      modeCachePair: deps.modeCacheV2?.current() ?? null,
     });
     if (!verification.ok) {
       throw new Error(verification.error ?? "Desktop update verification failed");
@@ -850,12 +1318,16 @@ export function createDesktopUpdateTransaction(
     receipt: DesktopUpdateReceipt,
     expected: EnvironmentSelection,
     previousMainPid: number | null,
+    modeCachePair: DesktopUpdateModeCachePair | null = deps.modeCacheV2?.current() ?? null,
   ): Promise<DesktopUpdateReceipt> {
     const verification = await deps.verifyFinal({
       expected,
       baseline: receipt.baseline,
       observed: receipt.observed!,
       previousMainPid,
+      environmentTransactionKind: receipt.environmentTransactionKind ?? null,
+      environmentTransactionId: receipt.environmentTransactionId,
+      modeCachePair,
     });
     if (!verification.ok) {
       return update(receipt, {
@@ -886,6 +1358,34 @@ export function createDesktopUpdateTransaction(
       resumable: returning && rolledBack,
       error: environmentReceipt.error ?? `Environment transaction ended in ${environmentReceipt.phase}`,
       rolledBackAt: rolledBack ? deps.now() : null,
+    }, true);
+  }
+
+  function modeCacheFailure(
+    receipt: DesktopUpdateReceipt,
+    result: DesktopUpdateModeCacheSwitchResult,
+    returning: boolean,
+  ): DesktopUpdateReceipt {
+    const liveOfficial = pairProvesLiveEnvironment(
+      result.pair,
+      result.selection,
+      receipt.official,
+      result.transactionId,
+      returning && receipt.observed !== null ? receipt.observed : receipt.baseline,
+    );
+    const liveSource = pairProvesLiveEnvironment(
+      result.pair,
+      result.selection,
+      receipt.source,
+      result.transactionId,
+      returning && receipt.observed !== null ? receipt.observed : receipt.baseline,
+    );
+    return update(receipt, {
+      phase: liveSource ? "rolled_back" : "failed",
+      safeOfficialMode: liveOfficial,
+      resumable: liveOfficial,
+      error: result.error ?? `Environment mode-cache transaction ended in ${result.phase}`,
+      rolledBackAt: liveSource ? deps.now() : null,
     }, true);
   }
 
@@ -977,7 +1477,24 @@ export function createDesktopUpdateTransaction(
           error: null,
         });
       };
-      const coupledReceipt = existing.environmentTransactionId === null
+      if (existing.environmentTransactionKind === "mode-cache-v2"
+        && existing.environmentTransactionId !== null
+        && resumed.observed !== null
+        && deps.modeCacheV2 !== null) {
+        const pair = deps.modeCacheV2.current();
+        const current = await deps.readCurrentSelection();
+        if (pairProvesLiveEnvironment(
+          pair,
+          current,
+          resumed.source,
+          existing.environmentTransactionId,
+          resumed.observed,
+        )) {
+          return continueFromCommittedTweakers();
+        }
+      }
+      const coupledReceipt = existing.environmentTransactionKind === "mode-cache-v2"
+        || existing.environmentTransactionId === null
         ? null
         : deps.environment.status();
       const coupledEnvironment = coupledReceipt !== null
@@ -1218,6 +1735,134 @@ export function createDesktopUpdateTransaction(
       || existing.phase === "returning_to_tweakers"
       || existing.phase === "refreshing_runtime"
       || existing.phase === "verifying";
+    if (existing.environmentTransactionKind === "mode-cache-v2") {
+      if (deps.modeCacheV2 === null || existing.environmentTransactionId === null) {
+        return unsafeRecoveryFailure(existing, "sealed-pair recovery is not available for the recorded generation");
+      }
+      const currentPair = deps.modeCacheV2.current();
+      if (currentPair === null || currentPair.generationId !== existing.environmentTransactionId) {
+        // A fresh v2 prepare persists its intended generation ID on the
+        // desktop-update receipt before staging begins. If staging or cleanup
+        // fails before publication, current.json correctly remains on the old
+        // generation and there is no journal for the intended ID to recover.
+        // Calling recover(intendedId) against the unrelated current journal
+        // creates a transaction-mismatch error and wedges every lifecycle
+        // action. Resolve only from independent live-byte proof in this branch;
+        // never recover or mutate the unrelated current generation.
+        const selection = await deps.readCurrentSelection();
+        if (!returning && await sourceSelectionProvenByBytes(existing, selection, deps)) {
+          return update(existing, {
+            phase: "rolled_back",
+            ownerPid: process.pid,
+            source: selection!,
+            safeOfficialMode: existing.source.appExperience === "chatgpt",
+            resumable: false,
+            error: "Desktop update owner exited before the fresh sealed pair was published; the source payload was proven live by its published selection, patch marker, and version identity.",
+            rolledBackAt: deps.now(),
+          }, true);
+        }
+        try {
+          const live = await deps.inspectLiveOfficialDesktop(existing.official);
+          return update(existing, {
+            phase: "rolled_back",
+            ownerPid: process.pid,
+            officialMainPid: live.mainPid,
+            safeOfficialMode: true,
+            resumable: false,
+            error: "Desktop update owner exited before its recorded sealed pair became current; the live official desktop was proven directly.",
+            rolledBackAt: deps.now(),
+          }, true);
+        } catch {
+          return unsafeRecoveryFailure(
+            existing,
+            "the recorded sealed pair was never published and neither the source nor official desktop could be proven live",
+          );
+        }
+      }
+      try {
+        const recovered = await deps.modeCacheV2.recover(existing.environmentTransactionId);
+        if (recovered.phase !== "ready" && recovered.phase !== "stale_requires_prepare") {
+          return unsafeRecoveryFailure(
+            existing,
+            recovered.error ?? `sealed-pair recovery ended in ${recovered.phase}`,
+          );
+        }
+        const liveOfficial = pairProvesLiveEnvironment(
+          recovered.pair,
+          recovered.selection,
+          existing.official,
+          existing.environmentTransactionId,
+          existing.observed ?? existing.baseline,
+        );
+        const liveSource = pairProvesLiveEnvironment(
+          recovered.pair,
+          recovered.selection,
+          existing.source,
+          existing.environmentTransactionId,
+          returning && existing.observed !== null ? existing.observed : existing.baseline,
+        );
+        if (!liveOfficial && !liveSource) {
+          // A released sealed pair can never prove liveness through its grant.
+          // When the recovery returned terminal history and the update never
+          // reached the official leg, prove the untouched source payload
+          // directly from durable bytes: the published selection, the bundle
+          // identity, the recorded baseline version, and the asar patch
+          // marker together rule out a half-swapped desktop (live wedge
+          // 2026-08-20 behind a stale invalidated grant).
+          if (!returning && await sourceSelectionProvenByBytes(existing, recovered.selection, deps)) {
+            return update(existing, {
+              phase: "rolled_back",
+              ownerPid: process.pid,
+              safeOfficialMode: existing.source.appExperience === "chatgpt",
+              resumable: false,
+              error: "Desktop update owner exited; the sealed pair was terminal history and the source payload was proven live by its published selection, patch marker, and version identity.",
+              rolledBackAt: deps.now(),
+            }, true);
+          }
+          // The update may equally have died AFTER its cutover to the
+          // official desktop (live failure 2026-08-20: post-cutover stat-seal
+          // validation broke while Sparkle mutated the fresh bundle). Official
+          // liveness is proven by bytes alone - pristine, OpenAI-signed,
+          // marker-absent, visible - because the published selection can
+          // legitimately lag a legacy mode switch (observed stale on the same
+          // live failure). The selection is adopted only when it agrees.
+          try {
+            const live = await deps.inspectLiveOfficialDesktop(existing.official);
+            const selection = recovered.selection;
+            const publishedOfficial = selection !== null
+              && sameEnvironmentSelection(selection, existing.official)
+              && selection.appliedAt !== null;
+            return update(existing, {
+              phase: "rolled_back",
+              ownerPid: process.pid,
+              official: publishedOfficial ? selection : existing.official,
+              officialMainPid: live.mainPid,
+              safeOfficialMode: true,
+              resumable: false,
+              error: "Desktop update owner exited; the live official desktop was proven directly after the sealed pair was released.",
+              rolledBackAt: deps.now(),
+            }, true);
+          } catch {
+            // Fall through to the unsafe conclusion below.
+          }
+          return unsafeRecoveryFailure(existing, "sealed-pair recovery did not prove either bound environment live");
+        }
+        return update(existing, {
+          phase: "rolled_back",
+          ownerPid: process.pid,
+          source: liveSource ? recovered.selection! : existing.source,
+          official: liveOfficial ? recovered.selection! : existing.official,
+          safeOfficialMode: liveOfficial,
+          resumable: liveOfficial,
+          error: liveOfficial
+            ? "Desktop update owner exited; sealed-pair recovery proved official ChatGPT live."
+            : "Desktop update owner exited; sealed-pair recovery proved the source environment live.",
+          rolledBackAt: deps.now(),
+        }, true);
+      } catch (error) {
+        return unsafeRecoveryFailure(existing, `sealed-pair recovery failed: ${errorMessage(error)}`);
+      }
+    }
     const observedEnvironmentReceipt = deps.environment.status();
     // Without a recorded ID, only an in-flight environment receipt can belong
     // to the crash window between prepare() persisting and returning its ID.
@@ -1610,6 +2255,31 @@ export function pristineBackupProvesObservedDesktop(
   }
 }
 
+export function sealedModeCachePairProvesObservedDesktop(
+  pair: DesktopUpdateModeCachePair | null,
+  expected: EnvironmentSelection,
+  observed: DesktopVersionIdentity,
+  generationId: string | null,
+): boolean {
+  return generationId !== null
+    && observed.marketingVersion !== null
+    && observed.build !== null
+    && pair !== null
+    && pair.generationId === generationId
+    && pair.pinState === "prepared"
+    && pair.releaseProfile === expected.releaseProfile
+    && pair.live.experience === "tweakers"
+    && pair.live.appPath === expected.selectedDesktopPath
+    && pair.live.bundleId === expected.selectedDesktopBundleId
+    && pair.live.version === observed.marketingVersion
+    && pair.live.build === observed.build
+    && pair.inactive.experience === "chatgpt"
+    && pair.inactive.bundleId === expected.selectedDesktopBundleId
+    && pair.inactive.version === observed.marketingVersion
+    && pair.inactive.build === observed.build
+    && pair.inactive.strictSignature;
+}
+
 export async function runSynchronousLocalRefresh(
   input: RefreshTweakersInput,
   options: SynchronousLocalRefreshOptions = {},
@@ -1638,12 +2308,26 @@ async function verifyFinalDesktopReturn(
   }
 
   if (input.expected.appExperience === "tweakers") {
-    const pristineBackup = join(dirname(selectionFile), "backup", "Codex.app");
-    if (!pristineBackupProvesObservedDesktop(pristineBackup, input.observed)) {
-      return {
-        ok: false,
-        error: "The pristine official backup is not Developer ID valid at the updated desktop version/build",
-      };
+    if (input.environmentTransactionKind === "mode-cache-v2") {
+      if (!sealedModeCachePairProvesObservedDesktop(
+        input.modeCachePair,
+        input.expected,
+        input.observed,
+        input.environmentTransactionId,
+      )) {
+        return {
+          ok: false,
+          error: "The current sealed environment pair does not prove updated Tweakers and official payloads",
+        };
+      }
+    } else {
+      const pristineBackup = join(dirname(selectionFile), "backup", "Codex.app");
+      if (!pristineBackupProvesObservedDesktop(pristineBackup, input.observed)) {
+        return {
+          ok: false,
+          error: "The pristine official backup is not Developer ID valid at the updated desktop version/build",
+        };
+      }
     }
   }
 
@@ -1705,12 +2389,74 @@ async function verifyFinalDesktopReturn(
   return { ok: false, error: lastError };
 }
 
+const DEFAULT_NATIVE_UPDATE_TIMEOUT_MS = 10 * 60 * 1_000;
+
+/**
+ * Native-wait ceiling for the Sparkle handoff. Ten minutes covers a real
+ * download+install with margin; a phased-rollout build the updater refuses to
+ * surface should cost minutes, not the historical half hour, and the timeout
+ * already lands resumable in safe official mode. `tweaker.desktopUpdateTimeoutMinutes`
+ * (clamped 2-30) overrides it.
+ */
+function configuredNativeUpdateTimeoutMs(configFile: string): number {
+  const section = readConfigFile(configFile).tweaker;
+  const minutes = section !== null && typeof section === "object" && !Array.isArray(section)
+    ? (section as Record<string, unknown>).desktopUpdateTimeoutMinutes
+    : undefined;
+  if (typeof minutes === "number" && Number.isFinite(minutes)) {
+    return Math.min(30, Math.max(2, Math.round(minutes))) * 60_000;
+  }
+  return DEFAULT_NATIVE_UPDATE_TIMEOUT_MS;
+}
+
+async function sourceSelectionProvenByBytes(
+  existing: DesktopUpdateReceipt,
+  selection: EnvironmentSelection | null,
+  deps: DesktopUpdateDependencies,
+): Promise<boolean> {
+  if (selection === null || !sameEnvironmentSelection(selection, existing.source) || selection.appliedAt === null) {
+    return false;
+  }
+  const bundleId = await deps.readDesktopBundleIdentifier(existing.source.selectedDesktopPath);
+  if (bundleId !== existing.source.selectedDesktopBundleId) return false;
+  const version = await deps.readDesktopVersion(existing.source.selectedDesktopPath);
+  if (existing.baseline.marketingVersion !== null && version.marketingVersion !== existing.baseline.marketingVersion) {
+    return false;
+  }
+  if (existing.baseline.build !== null && version.build !== existing.baseline.build) return false;
+  const readMarker = deps.readDesktopAsarMarker
+    ?? ((appPath: string) => readAsarMarker(join(appPath, "Contents", "Resources", "app.asar")));
+  const marker = readMarker(existing.source.selectedDesktopPath);
+  return existing.source.appExperience === "tweakers" ? marker === "present" : marker === "absent";
+}
+
 function sameEnvironmentSelection(first: EnvironmentSelection, second: EnvironmentSelection): boolean {
   return first.appExperience === second.appExperience
     && first.releaseProfile === second.releaseProfile
     && first.backendLane === second.backendLane
     && first.selectedDesktopPath === second.selectedDesktopPath
     && first.selectedDesktopBundleId === second.selectedDesktopBundleId;
+}
+
+function pairProvesLiveEnvironment(
+  pair: DesktopUpdateModeCachePair | null,
+  current: EnvironmentSelection | null,
+  expected: EnvironmentSelection,
+  generationId: string,
+  version: DesktopVersionIdentity,
+): pair is DesktopUpdateModeCachePair {
+  return pair !== null
+    && current !== null
+    && pair.generationId === generationId
+    && pair.pinState === "prepared"
+    && pair.releaseProfile === expected.releaseProfile
+    && pair.live.experience === expected.appExperience
+    && pair.live.appPath === expected.selectedDesktopPath
+    && pair.live.bundleId === expected.selectedDesktopBundleId
+    && (version.marketingVersion === null || pair.live.version === version.marketingVersion)
+    && (version.build === null || pair.live.build === version.build)
+    && sameEnvironmentSelection(current, expected)
+    && current.appliedAt !== null;
 }
 
 function readDesktopBundleIdentity(appPath: string): {
@@ -1853,6 +2599,10 @@ function isDesktopUpdateReceipt(value: unknown): value is DesktopUpdateReceipt {
     && (receipt.nativeUpdateHandoffAt === null || isIsoDate(receipt.nativeUpdateHandoffAt))
     && (receipt.refreshSource === null || receipt.refreshSource === "development" || receipt.refreshSource === "stable")
     && (receipt.environmentTransactionId === null || typeof receipt.environmentTransactionId === "string")
+    && (receipt.environmentTransactionKind === undefined
+      || receipt.environmentTransactionKind === null
+      || receipt.environmentTransactionKind === "legacy"
+      || receipt.environmentTransactionKind === "mode-cache-v2")
     && (receipt.officialMainPid === undefined || receipt.officialMainPid === null
       || (typeof receipt.officialMainPid === "number" && Number.isInteger(receipt.officialMainPid) && receipt.officialMainPid > 0))
     && typeof receipt.safeOfficialMode === "boolean"

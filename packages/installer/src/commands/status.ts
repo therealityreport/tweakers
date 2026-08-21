@@ -13,10 +13,21 @@ import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../m
 import { readConfigFile } from "../config.js";
 import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
+import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
+import {
+  formatAccountRouterEvidence,
+  inspectAccountRouter,
+  type AccountRouterEvidence,
+} from "../account-router-status.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
   const state = readState(paths.stateFile);
+  const accountRouter = await inspectAccountRouter({
+    userRoot: paths.root,
+    sourceRoot: state?.sourceRoot ?? null,
+    installedRuntimeRoot: paths.runtime,
+  });
 
   console.log(kleur.bold("tweaker status"));
   console.log(`  user dir:     ${paths.root}`);
@@ -36,7 +47,33 @@ export async function status(): Promise<void> {
   if (desktopUpdate.receiptError) console.log(`  error:        ${kleur.red(desktopUpdate.receiptError)}`);
   console.log();
 
+  // Status never prepares a sealed pair or writes cache metadata. It only
+  // renders the last atomically published receipt, when one exists.
+  const cacheV2 = observeEnvironmentModeCache(environmentModeCachePaths(paths.root));
+  console.log(kleur.bold("environment mode cache"));
+  console.log(`  state:        ${cacheV2.state}`);
+  console.log(`  generation:   ${cacheV2.generationId ?? "(none)"}`);
+  if (cacheV2.roles) {
+    console.log(`  roles:        live ${cacheV2.roles.live.experience}; inactive ${cacheV2.roles.inactive.experience}`);
+  }
+  console.log(`  preparation:  ${cacheV2.preparation.phase}${cacheV2.preparation.generationId ? ` (${cacheV2.preparation.generationId})` : ""}`);
+  if (cacheV2.pin) {
+    console.log(`  pin:          ${cacheV2.pin.state}${cacheV2.pin.releasedAt ? ` (released ${cacheV2.pin.releasedAt})` : ` (pinned ${cacheV2.pin.pinnedAt})`}`);
+  }
+  if (cacheV2.supersession?.supersededAt) {
+    console.log(`  superseded:   ${cacheV2.supersession.supersededAt}${cacheV2.supersession.replacementGenerationId ? ` by ${cacheV2.supersession.replacementGenerationId}` : ""}`);
+  }
+  if (cacheV2.timings) {
+    console.log(`  prepared:     ${cacheV2.timings.preparedAt}; validated ${cacheV2.timings.validatedAt}`);
+    if (cacheV2.timings.lastSuccessfulSwitchAt) console.log(`  last switch:  ${cacheV2.timings.lastSuccessfulSwitchAt}`);
+  }
+  if (cacheV2.invalidationReasons.length > 0) {
+    console.log(`  evidence:     ${cacheV2.invalidationReasons.join("; ")}`);
+  }
+  console.log();
+
   if (!state) {
+    printAccountRouterStatus(accountRouter);
     console.log(kleur.yellow("Not installed. Run `tweaker install`."));
     return;
   }
@@ -132,6 +169,21 @@ export async function status(): Promise<void> {
   if (coverage) {
     const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;
     console.log(`  renderer tweaks: ${paint(coverage.label)}`);
+  }
+
+  printAccountRouterStatus(accountRouter);
+}
+
+function printAccountRouterStatus(evidence: AccountRouterEvidence): void {
+  console.log();
+  console.log(kleur.bold("account router evidence"));
+  for (const line of formatAccountRouterEvidence(evidence)) console.log(line);
+  if (evidence.live.state !== "active" || !evidence.live.status) return;
+  for (const account of evidence.live.status.accounts) {
+    console.log(`  ${account.label}:    ${account.eligibility}; spend ${account.normalizedSpend}; assigned ${account.assignedThreadCount}`);
+  }
+  if (evidence.live.status.degradedReason) {
+    console.log(`  degraded:     ${evidence.live.status.degradedReason.replaceAll("_", " ")}`);
   }
 }
 

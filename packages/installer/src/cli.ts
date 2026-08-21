@@ -132,12 +132,14 @@ async function runRefreshLocal(opts: {
   app?: string;
   developmentRoot?: string;
   "development-root"?: string;
+  force?: boolean;
 }): Promise<void> {
   const { refreshLocal } = await import("./commands/refresh-local.js");
   return refreshLocal({
     source: opts.source,
     app: opts.app,
     developmentRoot: opts.developmentRoot ?? opts["development-root"],
+    force: opts.force === true,
   });
 }
 
@@ -356,6 +358,7 @@ prog
   .option("--release-profile", "Release profile: stable or alpha")
   .option("--bundled-derived-receipt", "Validated bundled-derived Codex receipt (prepare only)")
   .option("--transaction", "Durable environment transaction ID")
+  .option("--approval-at", "Deliberate approval timestamp forwarded to the detached mode helper")
   .option("--app-path", "Exact absolute path to a user-selected OpenAI Beta .app (register-alpha only)")
   .option("--app", "Alias for --app-path")
   .option("--observe", "Read persisted and observed environment state without taking the lifecycle lock")
@@ -437,6 +440,7 @@ prog
   .option("--source", "Refresh source: smart, development, or stable", "smart")
   .option("--development-root", "Exact absolute Tweakers Git worktree root; requires --source development")
   .option("--app", "Path to ChatGPT.app / install dir")
+  .option("--force", "Run the full refresh even when nothing changed since the last accepted refresh")
   .action(wrap(runRefreshLocal));
 
 prog.command("refresh-status").describe("Print local ChatGPT refresh status as JSON").action(wrap(runRefreshStatus));

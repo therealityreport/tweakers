@@ -12,9 +12,9 @@
       "manifest": {
         "id": "co.tweakers.account-switcher",
         "name": "Easy Account Switcher",
-        "version": "0.1.10",
+        "version": "0.2.0",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Switch existing local Codex sessions with optional remote plugin receipt protection, without duplicating credentials.",
+        "description": "Switch existing local Codex sessions, protect remote-plugin receipts, and stage an optional two-account balanced router without duplicating credentials.",
         "author": "hulibrands",
         "tags": [
           "accounts",
@@ -136,7 +136,7 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.5.5",
+        "version": "0.5.8",
         "githubRepo": "therealityreport/tweakers",
         "description": "Project-colored sidebar rows, project settings, connection references, and read-only repository inventory.",
         "author": "hulibrands",

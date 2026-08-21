@@ -245,6 +245,32 @@ test("extracted-app patch discovers a selector in a renderer dependency", () => 
   }
 });
 
+test("extracted-app patch ignores bundled relative module identifiers that are not imports", () => {
+  const appDir = mkdtempSync(join(tmpdir(), "tweakers-model-selector-bundled-identifiers-"));
+  try {
+    const assetsDir = join(appDir, "webview", "assets");
+    mkdirSync(assetsDir, { recursive: true });
+    writeFileSync(
+      join(appDir, "webview", "index.html"),
+      '<!doctype html><script type="module" src="./assets/index.js"></script>',
+    );
+    writeFileSync(
+      join(assetsDir, "index.js"),
+      [
+        'const bundled={"../../../node_modules/.pnpm/example/dist/internal.js":()=>null};',
+        'import "./app.js";',
+      ].join(""),
+    );
+    writeFileSync(join(assetsDir, "app.js"), selectorFixture());
+
+    const result = patchCodexModelSelectionInExtractedApp(appDir);
+    assert.equal(result.status, "patched");
+    assert.equal(result.relativePath, join("webview", "assets", "app.js"));
+  } finally {
+    rmSync(appDir, { recursive: true, force: true });
+  }
+});
+
 test("extracted-app patch follows an mjs renderer bootstrap", () => {
   const appDir = mkdtempSync(join(tmpdir(), "tweakers-model-selector-mjs-"));
   try {

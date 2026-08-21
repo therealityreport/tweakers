@@ -9,8 +9,12 @@ import {
   cancelRefreshLocal,
   getLocalRefreshStatus,
   handoffRefreshLocalToLaunchd,
+  hashRefreshSourceTree,
   hashTree,
   npmCommand,
+  readAcceptedRefreshReceipt,
+  refreshBindingMatches,
+  writeAcceptedRefreshReceipt,
   preferredDesktopRefreshSource,
   refreshCliPath,
   registerDevelopmentCheckout,
@@ -337,7 +341,7 @@ test("both promote branches restore coordinator metadata after the runtime insta
     /promote: async \(\) => \{/.source,
     /[\s\S]*?installManagedRuntime\(preparedStableSource, paths\.root\);/.source,
     /[\s\S]*?writeDevelopmentProvenanceHash\(managed, hashTree\(sourceRoot, false\)\);/.source,
-    /\s*\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
+    /[\s\S]*?\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
   ].join("")));
 });
 
@@ -458,6 +462,68 @@ test("refresh cancel refuses mid-promotion without force and is a no-op when idl
     } finally {
       rmSync(idleRoot, { recursive: true, force: true });
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("hashRefreshSourceTree covers tweak sources the provenance hash deliberately excludes", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-hash-"));
+  try {
+    mkdirSync(join(root, "packages", "installer", "assets", "runtime"), { recursive: true });
+    mkdirSync(join(root, "tweaks", "co.example.tweak"), { recursive: true });
+    writeFileSync(join(root, "packages", "installer", "assets", "runtime", "main.js"), "built");
+    writeFileSync(join(root, "tweaks", "co.example.tweak", "index.js"), "before");
+    writeFileSync(join(root, "src.ts"), "source");
+
+    const before = hashRefreshSourceTree(root);
+    const provenanceBefore = hashTree(root, false);
+    writeFileSync(join(root, "tweaks", "co.example.tweak", "index.js"), "after");
+    assert.notEqual(hashRefreshSourceTree(root), before, "a tweak-only edit must change the refresh hash");
+    assert.equal(hashTree(root, false), provenanceBefore, "the provenance hash ignores tweak sources");
+
+    // Build outputs must not self-invalidate the refresh hash.
+    const afterTweakEdit = hashRefreshSourceTree(root);
+    writeFileSync(join(root, "packages", "installer", "assets", "runtime", "main.js"), "rebuilt");
+    assert.equal(hashRefreshSourceTree(root), afterTweakEdit);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted-refresh receipts round-trip, validate strictly, and match only exact bindings", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-accepted-"));
+  try {
+    const binding = {
+      sourceRoot: join(root, "checkout"),
+      sourceRefreshHash: "a".repeat(64),
+      appRoot: "/Applications/ChatGPT.app",
+      appAsarHeaderHash: "b".repeat(64),
+      runtimeFingerprintSha256: "c".repeat(64),
+      managedProvenanceSha256: "d".repeat(64),
+      toolchainKey: `${process.version}:${"e".repeat(64)}`,
+    };
+    assert.equal(readAcceptedRefreshReceipt(root), null);
+    writeAcceptedRefreshReceipt(root, binding);
+    const receipt = readAcceptedRefreshReceipt(root);
+    assert.ok(receipt);
+    assert.equal(receipt.kind, "refresh-accepted");
+    assert.equal(refreshBindingMatches(receipt, binding), true);
+    for (const key of Object.keys(binding) as Array<keyof typeof binding>) {
+      assert.equal(
+        refreshBindingMatches(receipt, { ...binding, [key]: "drifted" }),
+        false,
+        `a drifted ${key} must invalidate the gate`,
+      );
+    }
+
+    // A receipt missing any bound field is rejected outright.
+    writeFileSync(join(root, "refresh-accepted.json"), JSON.stringify({
+      schemaVersion: 1,
+      kind: "refresh-accepted",
+      sourceRoot: binding.sourceRoot,
+    }), { mode: 0o600 });
+    assert.equal(readAcceptedRefreshReceipt(root), null);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
