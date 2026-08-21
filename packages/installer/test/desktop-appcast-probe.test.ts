@@ -57,6 +57,9 @@ test("a newer signed release reports update-available; equal and older report cu
     assert.equal(newer.state, "update-available");
     assert.equal(newer.latestBuild, "6744");
     assert.equal(newer.feedUrl, "https://feeds.example.com/appcast.xml");
+    // The winning item's signed enclosure feeds the direct updater.
+    assert.equal(newer.enclosureUrl, "https://persistent.oaistatic.com/codex-app-prod/app.zip");
+    assert.equal(newer.enclosureLength, 1);
 
     for (const build of ["6720", "6662"]) {
       const result = await probeDesktopAppcast({

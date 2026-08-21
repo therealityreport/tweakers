@@ -28,6 +28,9 @@ export interface DesktopAppcastProbeResult {
   state: "current" | "update-available" | "unavailable";
   latestMarketingVersion: string | null;
   latestBuild: string | null;
+  /** Signed release archive of the winning item; feeds the direct updater. */
+  enclosureUrl: string | null;
+  enclosureLength: number | null;
   feedUrl: string | null;
   detail: string;
 }
@@ -57,9 +60,17 @@ export interface DesktopAppcastProbeInput {
 export async function probeDesktopAppcast(input: DesktopAppcastProbeInput): Promise<DesktopAppcastProbeResult> {
   const feedUrl = readFeedUrl(input.appPath) ?? CODEX_PUBLIC_PRODUCTION_APPCAST;
   if (input.baseline.marketingVersion === null || input.baseline.build === null) {
-    return { state: "unavailable", latestMarketingVersion: null, latestBuild: null, feedUrl, detail: "installed baseline is unreadable" };
+    return {
+      state: "unavailable",
+      latestMarketingVersion: null,
+      latestBuild: null,
+      enclosureUrl: null,
+      enclosureLength: null,
+      feedUrl,
+      detail: "installed baseline is unreadable",
+    };
   }
-  let latest: { marketingVersion: string; build: string };
+  let latest: { marketingVersion: string; build: string; enclosureUrl: string; enclosureLength: number | null };
   try {
     const xml = await fetchBoundedAppcast(feedUrl, input);
     latest = parseAppcast(xml);
@@ -68,6 +79,8 @@ export async function probeDesktopAppcast(input: DesktopAppcastProbeInput): Prom
       state: "unavailable",
       latestMarketingVersion: null,
       latestBuild: null,
+      enclosureUrl: null,
+      enclosureLength: null,
       feedUrl,
       detail: `appcast ${redactedAppcastFailure(error)}`,
     };
@@ -80,6 +93,8 @@ export async function probeDesktopAppcast(input: DesktopAppcastProbeInput): Prom
     state: comparison > 0 ? "update-available" : "current",
     latestMarketingVersion: latest.marketingVersion,
     latestBuild: latest.build,
+    enclosureUrl: latest.enclosureUrl,
+    enclosureLength: latest.enclosureLength,
     feedUrl,
     detail: comparison > 0
       ? `appcast latest ${latest.marketingVersion} (${latest.build}) is newer than installed ${input.baseline.marketingVersion} (${input.baseline.build})`
@@ -154,7 +169,12 @@ async function defaultAppcastFetch(
   };
 }
 
-function parseAppcast(xml: string): { marketingVersion: string; build: string } {
+function parseAppcast(xml: string): {
+  marketingVersion: string;
+  build: string;
+  enclosureUrl: string;
+  enclosureLength: number | null;
+} {
   if (!/<rss\b/i.test(xml) || !/<channel\b/i.test(xml) || !/<\/channel\s*>/i.test(xml)) {
     throw new Error("invalid appcast");
   }
@@ -170,10 +190,17 @@ function parseAppcast(xml: string): { marketingVersion: string; build: string } 
     // Metadata is authenticated by the trusted HTTPS feed. Requiring a valid
     // Ed25519-shaped Sparkle enclosure signature additionally ensures we never
     // act on an item the native OpenAI updater could not verify at install.
+    const enclosureUrl = archiveUrl === null ? null : safeHttpsUrl(archiveUrl);
     if (!marketingVersion || !build || marketingVersion.length > 80 || build.length > 80
-      || !archiveUrl || safeHttpsUrl(archiveUrl) === null
+      || enclosureUrl === null
       || !isSparkleEd25519Signature(archiveSignature)) return [];
-    return [{ marketingVersion, build }];
+    const announcedLength = Number(readXmlAttribute(enclosure, "length"));
+    return [{
+      marketingVersion,
+      build,
+      enclosureUrl,
+      enclosureLength: Number.isFinite(announcedLength) && announcedLength > 0 ? announcedLength : null,
+    }];
   });
   if (releases.length === 0) throw new Error("appcast has no release");
   releases.sort((left, right) => compareAppcastRelease(right, left));

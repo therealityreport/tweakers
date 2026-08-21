@@ -82,6 +82,7 @@ import {
 } from "./alerts.js";
 import { type AsarMarker, isDeveloperIdSignedBackup, readAsarMarker } from "./commands/install.js";
 import { probeDesktopAppcast, type DesktopAppcastProbeResult } from "./desktop-appcast-probe.js";
+import { performDirectOfficialUpdate } from "./official-update-download.js";
 import { readConfigFile } from "./config.js";
 import { createMcpModeBridge } from "./mcp-mode-bridge.js";
 import { proveRegularChatGptMcpRuntime } from "./mcp-runtime-proof.js";
@@ -261,6 +262,19 @@ export interface DesktopUpdateDependencies {
     appPath: string;
     baseline: DesktopVersionIdentity;
   }): DesktopAppcastProbeResult | Promise<DesktopAppcastProbeResult>;
+  /**
+   * Verified direct install from the signed appcast: download, verify with
+   * the full official trust chain, swap atomically, reopen. Used when the
+   * native Sparkle handoff is unavailable (Automation denied) or its passive
+   * wait times out. Null disables the fallback
+   * (`tweaker.desktopUpdateDirectFallback = false`).
+   */
+  directOfficialUpdate?: ((input: {
+    selection: EnvironmentSelection;
+    latest: { marketingVersion: string; build: string };
+    enclosureUrl: string;
+    enclosureLength: number | null;
+  }) => Promise<DesktopVersionIdentity>) | null;
   /** Prove the exact live desktop is pristine, OpenAI-signed, visible, and version-readable. */
   inspectLiveOfficialDesktop(
     selection: EnvironmentSelection,
@@ -565,6 +579,14 @@ export function createDesktopUpdateTransaction(
       readAsarMarker(join(appPath, "Contents", "Resources", "app.asar"))
     )),
     probeAppcast: overrides.probeAppcast ?? ((input) => probeDesktopAppcast(input)),
+    directOfficialUpdate: overrides.directOfficialUpdate !== undefined
+      ? overrides.directOfficialUpdate
+      : directFallbackEnabled(configFile)
+        ? (input) => performDirectOfficialUpdate({
+          ...input,
+          workRoot: join(root, "transactions", "desktop-update-direct"),
+        })
+        : null,
     inspectLiveOfficialDesktop: overrides.inspectLiveOfficialDesktop ?? inspectLiveOfficialDesktop,
     launchOfficialDesktop: overrides.launchOfficialDesktop ?? ((selection) => {
       openCodex(selection.selectedDesktopPath);
@@ -1003,7 +1025,14 @@ export function createDesktopUpdateTransaction(
           nativeUpdateHandoffAt: deps.now(),
           updatedAt: deps.now(),
         }, false, "handoff_result");
-      return awaitNativeUpdate(handoff);
+      // A TCC-denied Automation click means the native updater was never
+      // asked; the passive wait would burn its whole window for nothing
+      // (observed live 2026-08-21). Try the verified direct install first
+      // and fall into the normal wait only when it cannot conclude.
+      const directFirst = result !== undefined && result !== null
+        && !result.ok
+        && result.kind === "automation_permission_denied";
+      return awaitNativeUpdate(handoff, { directFirst });
     } catch (error) {
       return update(initial, {
         phase: "failed",
@@ -1014,14 +1043,71 @@ export function createDesktopUpdateTransaction(
     }
   }
 
-  async function awaitNativeUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
-    const observed = await deps.waitForVersionChange({
-      transactionId: initial.transactionId,
-      appPath: initial.official.selectedDesktopPath,
-      baseline: initial.baseline,
-      timeoutMs,
-      pollIntervalMs,
-    });
+  /**
+   * Verified direct install from the signed appcast; fails open (null) into
+   * the existing native-wait behavior on any refusal or error.
+   */
+  async function attemptDirectOfficialUpdate(receipt: DesktopUpdateReceipt): Promise<DesktopVersionIdentity | null> {
+    if (!deps.directOfficialUpdate) return null;
+    const logDirect = (detail: string, error?: unknown): void => {
+      appendDesktopUpdateLog(logFile, {
+        transactionId: receipt.transactionId,
+        phase: receipt.phase,
+        ownerPid: receipt.ownerPid,
+        ownerToken: receipt.ownerToken ?? null,
+        ownerGeneration: receipt.ownerGeneration ?? null,
+        event: "direct_update",
+        detail,
+        ...(error === undefined ? {} : { error }),
+        jobLabel: options.jobLabel ?? process.env.TWEAKERS_DESKTOP_UPDATE_JOB_LABEL ?? null,
+      }, { now: deps.now, userRoot: root });
+    };
+    try {
+      const probe = await deps.probeAppcast!({
+        appPath: receipt.official.selectedDesktopPath,
+        baseline: receipt.baseline,
+      });
+      if (probe.state !== "update-available"
+        || probe.enclosureUrl === null
+        || probe.latestMarketingVersion === null
+        || probe.latestBuild === null) {
+        return null;
+      }
+      logDirect(`attempting verified direct install of ${probe.latestMarketingVersion} (${probe.latestBuild}) from the signed appcast`);
+      const installed = await deps.directOfficialUpdate({
+        selection: receipt.official,
+        latest: { marketingVersion: probe.latestMarketingVersion, build: probe.latestBuild },
+        enclosureUrl: probe.enclosureUrl,
+        enclosureLength: probe.enclosureLength,
+      });
+      logDirect(`verified direct install completed at ${installed.marketingVersion} (${installed.build})`);
+      return installed;
+    } catch (error) {
+      logDirect("verified direct install failed; continuing with the native updater flow", error);
+      return null;
+    }
+  }
+
+  async function awaitNativeUpdate(
+    initial: DesktopUpdateReceipt,
+    waitOptions: { directFirst?: boolean } = {},
+  ): Promise<DesktopUpdateReceipt> {
+    let observed = waitOptions.directFirst === true
+      ? await attemptDirectOfficialUpdate(initial)
+      : null;
+    if (observed === null) {
+      observed = await deps.waitForVersionChange({
+        transactionId: initial.transactionId,
+        appPath: initial.official.selectedDesktopPath,
+        baseline: initial.baseline,
+        timeoutMs,
+        pollIntervalMs,
+      });
+    }
+    // The native wait exhausted its window with nothing installed; the
+    // verified direct install is the unattended way out before concluding a
+    // resumable timeout.
+    if (observed === null) observed = await attemptDirectOfficialUpdate(initial);
     await deps.beforeNativeWaitTransition?.();
     const transitioned = await withDesktopUpdateLock(lockFile, async () => {
       const latest = status();
@@ -2390,6 +2476,14 @@ async function verifyFinalDesktopReturn(
 }
 
 const DEFAULT_NATIVE_UPDATE_TIMEOUT_MS = 10 * 60 * 1_000;
+
+function directFallbackEnabled(configFile: string): boolean {
+  const section = readConfigFile(configFile).tweaker;
+  return !(section !== null
+    && typeof section === "object"
+    && !Array.isArray(section)
+    && (section as Record<string, unknown>).desktopUpdateDirectFallback === false);
+}
 
 /**
  * Native-wait ceiling for the Sparkle handoff. Ten minutes covers a real

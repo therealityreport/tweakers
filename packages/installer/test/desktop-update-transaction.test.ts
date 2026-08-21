@@ -305,9 +305,12 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
       state: "unavailable",
       latestMarketingVersion: null,
       latestBuild: null,
+      enclosureUrl: null,
+      enclosureLength: null,
       feedUrl: null,
       detail: "stubbed probe",
     }),
+    directOfficialUpdate: null,
     inspectLiveOfficialDesktop: () => ({
       version: { marketingVersion: "1.0.0", build: "100" },
       mainPid: 101,
@@ -758,6 +761,8 @@ test("an unambiguous current appcast completes the update before any environment
         state: "current",
         latestMarketingVersion: "1.0.0",
         latestBuild: "100",
+        enclosureUrl: null,
+        enclosureLength: null,
         feedUrl: "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
         detail: "appcast latest 1.0.0 (100) is not newer than installed 1.0.0 (100)",
       }),
@@ -781,6 +786,8 @@ test("an unambiguous current appcast completes the update before any environment
         state: "update-available",
         latestMarketingVersion: "1.1.0",
         latestBuild: "110",
+        enclosureUrl: null,
+        enclosureLength: null,
         feedUrl: null,
         detail: "appcast latest 1.1.0 (110) is newer than installed 1.0.0 (100)",
       }),
@@ -792,6 +799,84 @@ test("an unambiguous current appcast completes the update before any environment
     assert.equal(receipt.phase, "completed");
     assert.equal(calls.includes("refresh-environment-truth"), true);
     assert.equal(calls.includes("native-update-handoff"), true);
+  });
+});
+
+test("the native wait falls back to a verified direct install instead of a resumable timeout", async () => {
+  const availableProbe = () => ({
+    state: "update-available" as const,
+    latestMarketingVersion: "1.1.0",
+    latestBuild: "110",
+    enclosureUrl: "https://persistent.oaistatic.com/codex-app-prod/app.zip",
+    enclosureLength: 1024,
+    feedUrl: null,
+    detail: "appcast latest 1.1.0 (110) is newer than installed 1.0.0 (100)",
+  });
+
+  await withFixture(async (fixture) => {
+    const directCalls: string[] = [];
+    const { deps } = dependencies({
+      probeAppcast: availableProbe,
+      waitForVersionChange: async () => null,
+      directOfficialUpdate: async ({ latest, enclosureUrl }) => {
+        directCalls.push(`${latest.marketingVersion}:${enclosureUrl}`);
+        return { marketingVersion: "1.1.0", build: "110" };
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(directCalls, ["1.1.0:https://persistent.oaistatic.com/codex-app-prod/app.zip"]);
+    const log = readFileSync(join(fixture.root, "log", "desktop-update.log"), "utf8");
+    assert.match(log, /"event":"direct_update"/);
+    assert.match(log, /verified direct install completed/);
+  });
+
+  await withFixture(async (fixture) => {
+    // A TCC-denied Automation handoff never asked the native updater; the
+    // direct install runs first instead of burning the whole passive wait.
+    const directCalls: string[] = [];
+    const { deps } = dependencies({
+      probeAppcast: availableProbe,
+      initiateNativeUpdate: async () => ({
+        ok: false as const,
+        kind: "automation_permission_denied" as const,
+        message: "macOS denied Automation access",
+        permissionGuidance: null,
+      }),
+      waitForVersionChange: async () => {
+        throw new Error("the passive wait must not run when the direct install concludes first");
+      },
+      directOfficialUpdate: async ({ latest }) => {
+        directCalls.push(latest.build);
+        return { marketingVersion: "1.1.0", build: "110" };
+      },
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(directCalls, ["110"]);
+  });
+
+  await withFixture(async (fixture) => {
+    // With the fallback disabled the timeout stays a safe resumable failure.
+    const { deps } = dependencies({
+      probeAppcast: availableProbe,
+      waitForVersionChange: async () => null,
+      directOfficialUpdate: null,
+    });
+    const transaction = createDesktopUpdateTransaction(fixture, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.equal(receipt.resumable, true);
+    assert.match(receipt.error ?? "", /did not complete before the timeout/);
   });
 });
 
