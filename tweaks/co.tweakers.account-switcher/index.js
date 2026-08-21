@@ -11,6 +11,13 @@ const PLUGIN_PROFILE_SCHEMA_VERSION = 1;
 const PLUGIN_RECEIPT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 const PLUGIN_PROBE_TIMEOUT_MS = 8_000;
 const PLUGIN_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+const ACCOUNT_ROUTER_SCHEMA_VERSION = 1;
+const ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT = "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10";
+const ACCOUNT_ROUTER_CONFIG_NAME = "account-router-config.json";
+const ACCOUNT_ROUTER_STATE_NAME = "router-state.json";
+const ACCOUNT_ROUTER_CONTROL_SECRET_NAME = "control-secret.v1";
+const ACCOUNT_ROUTER_RECEIPTS_NAME = "migration-receipts.v1.json";
+const MAX_ROUTER_STATE_BYTES = 512 * 1024;
 // These are stable remote package identifiers returned by Codex's experimental
 // app-server `plugin/installed` reconciliation endpoint. Keep this list free of
 // private/created-by-me plugins: a local account switcher must never assume it
@@ -80,6 +87,10 @@ module.exports = {
   stop() {
     if (typeof window === "undefined") {
       const service = globalThis[SERVICE_KEY];
+      // Disabling this tweak is a staged rollback: retain diagnostic state and
+      // isolated homes, but make the next authorized startup take the direct
+      // manual path. It never interrupts an already-open stdio session.
+      try { service?.disableRouter?.(); } catch {}
       service?.dispose?.();
       if (globalThis[SERVICE_KEY] === service) globalThis[SERVICE_KEY] = null;
       // Remove the IPC handler and reset the guard so a later start() re-registers
@@ -97,6 +108,9 @@ module.exports = {
     cleanupLegacyAnalytics, accountMenuTargetFromCandidates, startRenderer, disposeRenderer,
     defaultPluginProfile, normalizePluginProfile, profileHash, evaluatePluginReceipt,
     makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
+    accountRouterPaths, opaqueAccountId, validateRouterConfig, routerPublicStatus,
+    stageBalancedRouterConfig, stageManualRouterConfig, resetRouterBalanceEpoch,
+    readRouterConfig, readRouterState,
   },
 };
 
@@ -124,6 +138,13 @@ function startMain(api) {
 function createAccountService(api, options = {}) {
   const deps = options.deps || nodeDeps();
   const paths = options.paths || authPaths(deps);
+  // The runtime reads its launch config from this existing tweak data
+  // namespace. Main-process APIs expose its real absolute path; tests and
+  // older hosts use the same deterministic user-root fallback.
+  if (typeof paths.routerDataDir !== "string") {
+    paths.routerDataDir = options.routerDataDir || api?.fs?.dataDir
+      || deps.path.join(deps.homedir(), "tweak-data", "co.tweakers.account-switcher");
+  }
   const intents = new Map();
   const refs = new Map();
   let disposed = false;
@@ -147,6 +168,9 @@ function createAccountService(api, options = {}) {
       if (message?.action === "prepare-save") return service.prepareSave(message.name);
       if (message?.action === "switch") return service.switch(message.intent);
       if (message?.action === "save") return service.save(message.intent);
+      if (message?.action === "router-status") return service.routerStatus();
+      if (message?.action === "router-configure") return service.configureRouter(message);
+      if (message?.action === "router-reset-balance-epoch") return service.resetRouterBalanceEpoch();
       return Promise.resolve(safeFailure("invalid-request"));
     },
     async list() { return listAccounts(deps, paths, refs, await pluginProtectionSnapshot(api, deps, paths)); },
@@ -163,6 +187,10 @@ function createAccountService(api, options = {}) {
     prepareSave(name) { return Promise.resolve(prepareIntent(deps, paths, refs, intents, "save", name)); },
     switch(intent) { return enqueueIntent({ action: "switch", intent }); },
     save(intent) { return enqueueIntent({ action: "save", intent }); },
+    routerStatus() { return routerStatus(api, deps, paths); },
+    configureRouter(message) { return enqueue(() => configureRouter(api, deps, paths, refs, message)); },
+    resetRouterBalanceEpoch() { return enqueue(() => resetRouterBalanceEpoch(deps, accountRouterPaths(deps, paths))); },
+    disableRouter() { return stageManualRouterConfig(deps, paths); },
     dispose() { disposed = true; stopSnapshotSync(); intents.clear(); refs.clear(); },
     async observeStartup() {
       const result = await pluginProtectionSnapshot(api, deps, paths);
@@ -1026,6 +1054,303 @@ function authPaths(deps) {
   };
 }
 
+// Account Router state is intentionally separate from the compatible manual
+// snapshots.  The router receives opaque ids and private copies only; the
+// renderer gets the small redacted projection built below.
+function accountRouterPaths(deps, paths) {
+  const routerDir = deps.path.resolve(paths.routerDataDir || deps.path.join(deps.homedir(), "tweak-data", "co.tweakers.account-switcher"));
+  return {
+    routerDir,
+    accountsDir: deps.path.join(routerDir, "accounts"),
+    configFile: deps.path.join(routerDir, ACCOUNT_ROUTER_CONFIG_NAME),
+    stateFile: deps.path.join(routerDir, ACCOUNT_ROUTER_STATE_NAME),
+    controlSecretFile: deps.path.join(routerDir, ACCOUNT_ROUTER_CONTROL_SECRET_NAME),
+    receiptsFile: deps.path.join(routerDir, ACCOUNT_ROUTER_RECEIPTS_NAME),
+  };
+}
+
+function ensureOwnerPrivateDirectory(deps, directory) {
+  const fs = deps.fs;
+  if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+  const stat = fs.lstatSync(directory);
+  const uid = typeof deps.getuid === "function" ? deps.getuid() : stat.uid;
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o077) !== 0) throw coded("untrusted-router-directory");
+  fs.chmodSync(directory, 0o700);
+}
+
+function ensureRouterRoot(deps, paths) {
+  assertTrustedDirectory(deps.fs, paths.codexDir);
+  const routerPaths = accountRouterPaths(deps, paths);
+  ensureOwnerPrivateDirectory(deps, deps.path.dirname(routerPaths.routerDir));
+  ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
+  ensureOwnerPrivateDirectory(deps, routerPaths.accountsDir);
+  return routerPaths;
+}
+
+function routerSecret(deps, routerPaths) {
+  const fs = deps.fs;
+  ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
+  if (!fs.existsSync(routerPaths.controlSecretFile)) {
+    const { randomBytes } = require("node:crypto");
+    const generated = randomBytes(32);
+    try { createExclusiveAtomic(deps, routerPaths.routerDir, routerPaths.controlSecretFile, generated); }
+    finally { clearSecretBuffer(generated); }
+  }
+  return withOptionalSecureBytes(fs, routerPaths.controlSecretFile, 64, (bytes) => {
+    if (!bytes || bytes.length !== 32) throw coded("invalid-router-control-secret");
+    return Buffer.from(bytes);
+  });
+}
+
+function opaqueAccountId(secret, rawAccountId) {
+  if (!Buffer.isBuffer(secret) || secret.length !== 32 || typeof rawAccountId !== "string" || !rawAccountId.length || rawAccountId.length > 1024) throw coded("invalid-account-identity");
+  const { createHmac } = require("node:crypto");
+  return `ar_${createHmac("sha256", secret).update(`account-router:v1:${rawAccountId}`, "utf8").digest("base64url")}`;
+}
+
+function isOpaqueAccountId(value) { return typeof value === "string" && /^ar_[A-Za-z0-9_-]{43}$/.test(value); }
+function isFingerprint(value) { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value); }
+function isoNow(deps) { return new Date(deps.now()).toISOString(); }
+function pendingCapabilityFingerprint(opaqueId) {
+  const { createHash } = require("node:crypto");
+  return `sha256:${createHash("sha256").update(`account-router:v1:pending-capability:${opaqueId}`).digest("hex")}`;
+}
+
+function validateRouterConfig(value) {
+  if (!isRecord(value) || Object.keys(value).length !== 6
+    || value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    || !["manual", "balanced"].includes(value.mode)
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !isOpaqueAccountId(value.primaryOpaqueAccountId)
+    || !Array.isArray(value.accounts) || value.accounts.length !== 2
+    || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) throw coded("invalid-router-config");
+  const seen = new Set();
+  for (const account of value.accounts) {
+    if (!isRecord(account) || Object.keys(account).length !== 4
+      || !isOpaqueAccountId(account.opaqueAccountId) || typeof account.included !== "boolean"
+      || !Number.isInteger(account.weight) || account.weight < 1 || account.weight > 100
+      || !isFingerprint(account.capabilityFingerprint) || seen.has(account.opaqueAccountId)) throw coded("invalid-router-config");
+    seen.add(account.opaqueAccountId);
+  }
+  if (!seen.has(value.primaryOpaqueAccountId)) throw coded("invalid-router-config");
+  if (value.mode === "balanced" && value.accounts.filter((account) => account.included).length !== 2) throw coded("invalid-router-config");
+  return value;
+}
+
+function readPrivateJson(deps, file, maxBytes, errorCode) {
+  return withOptionalSecureBytes(deps.fs, file, maxBytes, (bytes) => {
+    if (!bytes) return null;
+    try { return JSON.parse(bytes.toString("utf8")); } catch { throw coded(errorCode); }
+  });
+}
+
+function readRouterConfig(deps, routerPaths) {
+  const value = readPrivateJson(deps, routerPaths.configFile, 32 * 1024, "invalid-router-config");
+  return value === null ? null : validateRouterConfig(value);
+}
+
+function validateRouterState(value) {
+  if (!isRecord(value) || value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !Number.isInteger(value.epoch) || value.epoch < 1
+    || !isRecord(value.ledger) || !isRecord(value.accountEligibility)
+    || !Array.isArray(value.reservations) || !Array.isArray(value.correlations)
+    || !isRecord(value.threadOwners) || !isRecord(value.pendingThreadOwners)
+    || !(value.stagedDisable === null || isRecord(value.stagedDisable))) throw coded("invalid-router-state");
+  return value;
+}
+
+function readRouterState(deps, routerPaths) {
+  const value = readPrivateJson(deps, routerPaths.stateFile, MAX_ROUTER_STATE_BYTES, "invalid-router-state");
+  return value === null ? null : validateRouterState(value);
+}
+
+function writePrivateJson(deps, directory, file, value) {
+  const bytes = Buffer.from(JSON.stringify(value), "utf8");
+  try { atomicWrite(deps, directory, file, bytes); } finally { clearSecretBuffer(bytes); }
+}
+
+function safeRouterReceipt(deps, routerPaths, entry) {
+  const existing = readPrivateJson(deps, routerPaths.receiptsFile, MAX_ROUTER_STATE_BYTES, "invalid-router-receipts") || [];
+  if (!Array.isArray(existing) || existing.some((item) => !isRecord(item))) throw coded("invalid-router-receipts");
+  existing.push(entry);
+  writePrivateJson(deps, routerPaths.routerDir, routerPaths.receiptsFile, existing.slice(-32));
+}
+
+function exactRouterChild(deps, routerPaths, opaqueId) {
+  if (!isOpaqueAccountId(opaqueId)) throw coded("invalid-account-identity");
+  return deps.path.join(routerPaths.accountsDir, opaqueId);
+}
+
+function cleanupStagingHome(deps, routerPaths, staging) {
+  const fs = deps.fs;
+  const relative = deps.path.relative(routerPaths.accountsDir, staging);
+  if (!relative || relative.startsWith("..") || deps.path.isAbsolute(relative) || !/^\.staging-[A-Za-z0-9-]+$/.test(relative)) throw coded("invalid-router-staging");
+  const codexHome = deps.path.join(staging, "codex-home");
+  const sqliteHome = deps.path.join(staging, "sqlite-home");
+  for (const file of [deps.path.join(codexHome, "auth.json"), deps.path.join(codexHome, "config.toml")]) {
+    try { fs.unlinkSync(file); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  for (const directory of [sqliteHome, codexHome, staging]) {
+    try { fs.rmdirSync(directory); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+}
+
+function stageRouterHome(deps, paths, routerPaths, filename, opaqueId, secret) {
+  const source = sourceFilePath(deps.path, paths.accountsDir, filename);
+  let sourceSnapshot;
+  let promoted = false;
+  let staging;
+  try {
+    sourceSnapshot = readSecureAuth(deps.fs, source);
+    if (opaqueAccountId(secret, authAccountId(sourceSnapshot.value)) !== opaqueId) throw coded("router-account-identity-changed");
+    const target = exactRouterChild(deps, routerPaths, opaqueId);
+    if (deps.fs.existsSync(target)) {
+      const authFile = deps.path.join(target, "codex-home", "auth.json");
+      ensureOwnerPrivateDirectory(deps, target);
+      ensureOwnerPrivateDirectory(deps, deps.path.join(target, "codex-home"));
+      withSecureAuth(deps.fs, authFile, (existing) => {
+        if (existing.hash !== sourceSnapshot.hash) throw coded("router-home-conflict");
+      });
+      return { reused: true, hash: sourceSnapshot.hash };
+    }
+    staging = deps.path.join(routerPaths.accountsDir, `.staging-${deps.randomUUID()}`);
+    ensureOwnerPrivateDirectory(deps, staging);
+    const codexHome = deps.path.join(staging, "codex-home");
+    const sqliteHome = deps.path.join(staging, "sqlite-home");
+    ensureOwnerPrivateDirectory(deps, codexHome);
+    ensureOwnerPrivateDirectory(deps, sqliteHome);
+    atomicWrite(deps, codexHome, deps.path.join(codexHome, "auth.json"), sourceSnapshot.bytes);
+    // v1 never copies live config/environment/MCP credentials. This empty file
+    // makes the deny-by-default capability policy explicit for the runtime.
+    atomicWrite(deps, codexHome, deps.path.join(codexHome, "config.toml"), Buffer.alloc(0));
+    withSecureAuth(deps.fs, source, (revalidated) => {
+      if (revalidated.identity !== sourceSnapshot.identity || revalidated.hash !== sourceSnapshot.hash
+        || opaqueAccountId(secret, authAccountId(revalidated.value)) !== opaqueId) throw coded("router-source-changed");
+    });
+    deps.fs.renameSync(staging, target);
+    promoted = true;
+    return { reused: false, hash: sourceSnapshot.hash };
+  } finally {
+    clearSecretBuffer(sourceSnapshot?.bytes);
+    if (staging && !promoted) cleanupStagingHome(deps, routerPaths, staging);
+  }
+}
+
+function stageBalancedRouterConfig(deps, paths, refs, message) {
+  const routerPaths = ensureRouterRoot(deps, paths);
+  const refsInput = Array.isArray(message?.refs) ? message.refs : [];
+  if (refsInput.length !== 2 || new Set(refsInput).size !== 2) throw coded("router-requires-exactly-two-accounts");
+  const filenames = refsInput.map((ref) => refs.get(ref));
+  if (filenames.some((filename) => typeof filename !== "string")) throw coded("unknown-reference");
+  const weights = Array.isArray(message?.weights) ? message.weights : [1, 1];
+  if (weights.length !== 2 || weights.some((weight) => !Number.isInteger(weight) || weight < 1 || weight > 100)) throw coded("invalid-router-weight");
+  const secret = routerSecret(deps, routerPaths);
+  try {
+    const accounts = filenames.map((filename, index) => withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, filename), (snapshot) => {
+      const rawId = authAccountId(snapshot.value);
+      if (!rawId) throw coded("invalid-account-identity");
+      return { filename, opaqueAccountId: opaqueAccountId(secret, rawId), included: true, weight: weights[index], capabilityFingerprint: pendingCapabilityFingerprint(opaqueAccountId(secret, rawId)) };
+    }));
+    if (new Set(accounts.map((account) => account.opaqueAccountId)).size !== 2) throw coded("router-requires-distinct-accounts");
+    const primaryRef = typeof message?.primaryRef === "string" ? message.primaryRef : refsInput[0];
+    const primaryIndex = refsInput.indexOf(primaryRef);
+    if (primaryIndex < 0) throw coded("invalid-router-primary");
+    for (const account of accounts) {
+      const result = stageRouterHome(deps, paths, routerPaths, account.filename, account.opaqueAccountId, secret);
+      safeRouterReceipt(deps, routerPaths, { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, opaqueAccountId: account.opaqueAccountId, snapshotHash: `sha256:${result.hash}`, protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, result: result.reused ? "reused" : "staged", stagedAt: isoNow(deps) });
+      delete account.filename;
+    }
+    const config = validateRouterConfig({ schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "balanced", protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, primaryOpaqueAccountId: accounts[primaryIndex].opaqueAccountId, accounts, updatedAt: isoNow(deps) });
+    writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
+    return config;
+  } finally {
+    clearSecretBuffer(secret);
+  }
+}
+
+function stageManualRouterConfig(deps, paths) {
+  const routerPaths = ensureRouterRoot(deps, paths);
+  const existing = readRouterConfig(deps, routerPaths);
+  if (!existing) return null;
+  const config = { ...existing, mode: "manual", updatedAt: isoNow(deps) };
+  writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
+  return config;
+}
+
+function routerDegradedReason(state) {
+  const code = state?.stagedDisable?.reasonCode;
+  return ({ protocol_drift: "unsupported_protocol", isolation_failure: "capability_mismatch", policy_stop: "policy_stop", post_start_failure: "post_start_failure" })[code] || null;
+}
+
+function routerPublicStatus(deps, config, state) {
+  if (!config) return { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "manual", protocolState: "supported", fairnessPrecision: "exact_completed_spend", accounts: [], restartRequired: false, degradedReason: null };
+  const invalid = config.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT;
+  const degradedReason = invalid ? "invalid_config" : routerDegradedReason(state);
+  const mode = degradedReason ? "direct_fallback" : config.mode;
+  const accounts = (config?.accounts || []).map((account, index) => {
+    const ledger = state?.ledger?.[account.opaqueAccountId];
+    const completed = Number.isInteger(ledger?.completedInputTokens) ? ledger.completedInputTokens : 0;
+    const output = Number.isInteger(ledger?.completedOutputTokens) ? ledger.completedOutputTokens : 0;
+    const reserved = Number.isInteger(ledger?.reservedRequestCost) ? ledger.reservedRequestCost : 0;
+    return {
+      opaqueAccountId: account.opaqueAccountId,
+      label: index === 0 ? "Account A" : "Account B",
+      eligibility: state?.accountEligibility?.[account.opaqueAccountId] || "validating",
+      normalizedSpend: (completed + output + reserved) / account.weight,
+      assignedThreadCount: Number.isInteger(ledger?.assignedThreadCount) ? ledger.assignedThreadCount : 0,
+    };
+  });
+  const inFlight = Boolean(state?.reservations?.length || state?.correlations?.length || accounts.some((account) => ["validating", "reserved", "active"].includes(account.eligibility)));
+  return redact({ schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode, protocolState: invalid ? "unknown" : "supported", fairnessPrecision: inFlight ? "projected" : "exact_completed_spend", accounts, restartRequired: mode === "balanced" || mode === "direct_fallback", degradedReason });
+}
+
+async function routerStatus(_api, deps, paths) {
+  const routerPaths = accountRouterPaths(deps, paths);
+  try {
+    const config = readRouterConfig(deps, routerPaths);
+    const state = readRouterState(deps, routerPaths);
+    return { ok: true, router: routerPublicStatus(deps, config, state) };
+  } catch {
+    // A malformed/stale persisted control record never blocks manual behavior.
+    // The runtime will select direct mode; the renderer receives only its code.
+    return { ok: true, router: { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "direct_fallback", protocolState: "unknown", fairnessPrecision: "estimated", accounts: [], restartRequired: true, degradedReason: "invalid_config" } };
+  }
+}
+
+async function configureRouter(_api, deps, paths, refs, message) {
+  try {
+    const config = message?.mode === "balanced"
+      ? stageBalancedRouterConfig(deps, paths, refs, message)
+      : message?.mode === "manual" ? stageManualRouterConfig(deps, paths) : (() => { throw coded("invalid-router-mode"); })();
+    return { ok: true, router: routerPublicStatus(deps, config, null) };
+  } catch (error) { return safeFailure(errorCode(error)); }
+}
+
+function routerIsIdle(state) {
+  return state.reservations.length === 0 && state.correlations.length === 0
+    && !Object.values(state.accountEligibility).some((value) => ["validating", "reserved", "active"].includes(value));
+}
+
+function resetRouterBalanceEpoch(deps, routerPaths) {
+  try {
+    ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
+    const state = readRouterState(deps, routerPaths);
+    if (!state) throw coded("router-state-unavailable");
+    if (!routerIsIdle(state)) throw coded("router-not-idle");
+    for (const ledger of Object.values(state.ledger)) {
+      if (!isRecord(ledger)) throw coded("invalid-router-state");
+      ledger.completedInputTokens = 0;
+      ledger.completedOutputTokens = 0;
+      ledger.reservedRequestCost = 0;
+      ledger.assignedThreadCount = 0;
+    }
+    state.epoch += 1;
+    writePrivateJson(deps, routerPaths.routerDir, routerPaths.stateFile, state);
+    return { ok: true, epoch: state.epoch };
+  } catch (error) { return safeFailure(errorCode(error)); }
+}
+
 function cleanupLegacyAnalytics(deps) {
   const fs = deps?.fs;
   const path = deps?.path;
@@ -1139,6 +1464,7 @@ function renderAccountsPage(state, root) {
     status.textContent = response.accounts.some((account) => account.active) ? "Ready. The current account is marked below." : "No saved account matches the current session.";
     state.statusElement = status;
     const protection = pluginProtectionCard(state, response.pluginProtection);
+    const router = routerControlCard(state, response.accounts);
     const save = document.createElement("button");
     save.type = "button";
     save.className = "self-start rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
@@ -1148,10 +1474,98 @@ function renderAccountsPage(state, root) {
       const saved = await saveCurrentFromMenu(state);
       if (!disposed) status.textContent = saved ? "Current account saved. Reopen this page to refresh the list." : "Save cancelled or unavailable; no success was recorded.";
     });
-    root.append(protection);
+    root.append(router, protection);
     root.append(status, save, card);
   }).catch(() => { if (!disposed) root.textContent = "Accounts are unavailable."; });
   return () => { disposed = true; root.replaceChildren(); };
+}
+
+function routerControlCard(state, accounts) {
+  const card = document.createElement("div");
+  card.className = "border-token-border mb-3 flex flex-col divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border";
+  const summary = document.createElement("div");
+  summary.className = "flex flex-col gap-1 p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Account routing";
+  const description = document.createElement("div");
+  description.className = "text-sm text-token-text-secondary";
+  description.textContent = "Manual switching remains the default. Balanced routing stages two saved accounts for the next separately authorized restart; it does not restart ChatGPT from this page.";
+  summary.append(title, description);
+  const body = document.createElement("div");
+  body.className = "flex flex-col gap-3 p-3";
+  const status = document.createElement("div");
+  status.className = "text-sm text-token-text-secondary";
+  status.textContent = "Checking staged router status…";
+  const selected = new Set(accounts.slice(0, 2).map((account) => account.ref));
+  const weights = new Map(accounts.map((account) => [account.ref, 1]));
+  const choices = document.createElement("div");
+  choices.className = "flex flex-col gap-2";
+  for (const account of accounts) {
+    const row = document.createElement("label");
+    row.className = "flex items-center justify-between gap-3 text-sm text-token-text-primary";
+    const inclusion = document.createElement("input");
+    inclusion.type = "checkbox";
+    inclusion.checked = selected.has(account.ref);
+    const label = document.createElement("span");
+    label.className = "min-w-0 flex-1 truncate";
+    label.textContent = account.label;
+    const weight = document.createElement("input");
+    weight.type = "number"; weight.min = "1"; weight.max = "100"; weight.value = "1";
+    weight.className = "border-token-border bg-token-foreground/5 w-16 rounded-md border px-2 py-1 text-sm text-token-text-primary";
+    inclusion.addEventListener("change", () => {
+      if (inclusion.checked && selected.size >= 2) { inclusion.checked = false; return; }
+      if (inclusion.checked) selected.add(account.ref); else selected.delete(account.ref);
+    });
+    weight.addEventListener("change", () => weights.set(account.ref, Number(weight.value)));
+    row.append(inclusion, label, weight);
+    choices.append(row);
+  }
+  const controls = document.createElement("div");
+  controls.className = "flex flex-wrap items-center gap-2";
+  const balanced = document.createElement("button");
+  balanced.type = "button";
+  balanced.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
+  balanced.textContent = "Stage Balanced Mode";
+  balanced.addEventListener("click", async () => {
+    const refs = [...selected];
+    if (refs.length !== 2) { status.textContent = "Choose exactly two saved accounts before staging balanced mode."; return; }
+    status.textContent = "Staging isolated account homes…";
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "balanced", refs, primaryRef: refs[0], weights: refs.map((ref) => weights.get(ref)) });
+      status.textContent = result?.ok ? "Balanced mode is staged for the next authorized restart." : "Balanced mode could not be staged safely.";
+    } catch { status.textContent = "Balanced mode could not be staged safely."; }
+  });
+  const manual = document.createElement("button");
+  manual.type = "button";
+  manual.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
+  manual.textContent = "Use Manual Mode";
+  manual.addEventListener("click", async () => {
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
+      status.textContent = result?.ok ? "Manual mode is staged. Existing saved sessions remain unchanged." : "Manual mode could not be staged safely.";
+    } catch { status.textContent = "Manual mode could not be staged safely."; }
+  });
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "rounded-full px-2 py-0.5 text-sm bg-token-charts-red/10 text-token-charts-red hover:bg-token-charts-red/20";
+  reset.textContent = "Reset balance";
+  reset.addEventListener("click", async () => {
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "router-reset-balance-epoch" });
+      status.textContent = result?.ok ? "Balance epoch reset while idle." : "Balance reset requires an idle router.";
+    } catch { status.textContent = "Balance reset was unavailable."; }
+  });
+  controls.append(balanced, manual, reset);
+  body.append(status, choices, controls);
+  card.append(summary, body);
+  void state.api.ipc.invoke(IPC, { action: "router-status" }).then((result) => {
+    if (!result?.ok) { status.textContent = "Router status is unavailable; manual switching remains available."; return; }
+    const router = result.router;
+    const degraded = router.degradedReason ? ` Degraded: ${router.degradedReason.replace(/_/g, " ")}.` : "";
+    status.textContent = `${router.mode === "balanced" ? "Balanced mode is staged." : "Manual mode is active."}${degraded}`;
+  }).catch(() => { status.textContent = "Router status is unavailable; manual switching remains available."; });
+  return card;
 }
 
 function pluginProtectionCard(state, protection) {

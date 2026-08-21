@@ -14,10 +14,20 @@ import { readConfigFile } from "../config.js";
 import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
 import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
+import {
+  formatAccountRouterEvidence,
+  inspectAccountRouter,
+  type AccountRouterEvidence,
+} from "../account-router-status.js";
 
 export async function status(): Promise<void> {
   const paths = ensureUserPaths();
   const state = readState(paths.stateFile);
+  const accountRouter = await inspectAccountRouter({
+    userRoot: paths.root,
+    sourceRoot: state?.sourceRoot ?? null,
+    installedRuntimeRoot: paths.runtime,
+  });
 
   console.log(kleur.bold("tweaker status"));
   console.log(`  user dir:     ${paths.root}`);
@@ -63,6 +73,7 @@ export async function status(): Promise<void> {
   console.log();
 
   if (!state) {
+    printAccountRouterStatus(accountRouter);
     console.log(kleur.yellow("Not installed. Run `tweaker install`."));
     return;
   }
@@ -158,6 +169,21 @@ export async function status(): Promise<void> {
   if (coverage) {
     const paint = coverage.tone === "green" ? kleur.green : kleur.yellow;
     console.log(`  renderer tweaks: ${paint(coverage.label)}`);
+  }
+
+  printAccountRouterStatus(accountRouter);
+}
+
+function printAccountRouterStatus(evidence: AccountRouterEvidence): void {
+  console.log();
+  console.log(kleur.bold("account router evidence"));
+  for (const line of formatAccountRouterEvidence(evidence)) console.log(line);
+  if (evidence.live.state !== "active" || !evidence.live.status) return;
+  for (const account of evidence.live.status.accounts) {
+    console.log(`  ${account.label}:    ${account.eligibility}; spend ${account.normalizedSpend}; assigned ${account.assignedThreadCount}`);
+  }
+  if (evidence.live.status.degradedReason) {
+    console.log(`  degraded:     ${evidence.live.status.degradedReason.replaceAll("_", " ")}`);
   }
 }
 

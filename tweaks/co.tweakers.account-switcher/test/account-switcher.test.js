@@ -390,10 +390,186 @@ test("account metadata declares the settings surface and has a synchronized patc
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.1.10");
+  assert.equal(manifest.version, "0.2.0");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
+});
+
+function addSavedAccount(setup, name, token, accountId) {
+  fs.writeFileSync(path.join(setup.paths.accountsDir, `${name}.json`), auth(token, accountId), { mode: 0o600 });
+}
+
+function validRouterState(config, overrides = {}) {
+  const ledger = Object.fromEntries(config.accounts.map((account) => [account.opaqueAccountId, {
+    completedInputTokens: 100,
+    completedOutputTokens: 20,
+    reservedRequestCost: 0,
+    weight: account.weight,
+    assignedThreadCount: 1,
+  }]));
+  return {
+    schemaVersion: 1,
+    protocolFingerprint: "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10",
+    epoch: 1,
+    threadOwners: {},
+    pendingThreadOwners: {},
+    ledger,
+    reservations: [],
+    accountEligibility: Object.fromEntries(config.accounts.map((account) => [account.opaqueAccountId, "eligible"])),
+    correlations: [],
+    stagedDisable: null,
+    ...overrides,
+  };
+}
+
+test("balanced mode stages exactly two isolated snapshot homes and an opaque atomic config", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  const result = await setup.service.handle({
+    action: "router-configure", mode: "balanced",
+    refs: listed.accounts.map((account) => account.ref),
+    primaryRef: listed.accounts[0].ref,
+    weights: [1, 3],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.router.mode, "balanced");
+  assert.equal(result.router.accounts.length, 2);
+  assert.equal(JSON.stringify(result).includes("account-work"), false);
+  assert.equal(JSON.stringify(result).includes("access_token"), false);
+  assert.equal(JSON.stringify(result).includes(setup.paths.codexDir), false);
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore, "manual source snapshot remains canonical and unchanged");
+
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
+  assert.equal(config.mode, "balanced");
+  assert.equal(config.accounts.length, 2);
+  assert.equal(config.accounts.every((account) => /^ar_[A-Za-z0-9_-]{43}$/.test(account.opaqueAccountId)), true);
+  assert.equal(JSON.stringify(config).includes("account-work"), false);
+  assert.equal(JSON.stringify(config).includes("access_token"), false);
+  assert.equal(fs.statSync(routerPaths.routerDir).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(routerPaths.configFile).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(routerPaths.controlSecretFile).mode & 0o777, 0o600);
+  for (const account of config.accounts) {
+    const home = path.join(routerPaths.accountsDir, account.opaqueAccountId, "codex-home");
+    assert.equal(fs.statSync(home).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(home, "auth.json")).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(path.join(home, "config.toml"), "utf8"), "", "v1 does not copy existing config or environment");
+  }
+});
+
+test("balanced configuration rejects a third account, invalid weights, and duplicate identity before mutating config", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  addSavedAccount(setup, "third", "third", "account-third");
+  const listed = await setup.service.handle({ action: "list" });
+  const before = fs.readFileSync(setup.paths.authFile);
+  const third = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1, 1] });
+  assert.equal(third.ok, false);
+  const badWeight = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.slice(0, 2).map((account) => account.ref), weights: [0, 1] });
+  assert.equal(badWeight.ok, false);
+  assert.deepEqual(fs.readFileSync(setup.paths.authFile), before);
+  assert.equal(fs.existsSync(path.join(setup.root, "tweak-data", "co.tweakers.account-switcher", "account-router-config.json")), false);
+});
+
+test("failed isolated-home promotion removes only its staging home and never alters a manual snapshot", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  const originalRename = setup.deps.fs.renameSync;
+  setup.deps.fs.renameSync = (from, to) => {
+    if (String(to).includes(`${path.sep}accounts${path.sep}ar_`)) throw Object.assign(new Error("injected"), { code: "EIO" });
+    return originalRename(from, to);
+  };
+  t.after(() => { setup.deps.fs.renameSync = originalRename; });
+  const failed = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] });
+  assert.equal(failed.ok, false);
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
+  const routerAccounts = path.join(setup.root, "tweak-data", "co.tweakers.account-switcher", "accounts");
+  assert.equal(fs.readdirSync(routerAccounts).some((name) => name.startsWith(".staging-")), false);
+});
+
+test("manual mode and lifecycle disable preserve staged homes while disabling balanced startup on the next restart", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] })).ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const homesBefore = fs.readdirSync(routerPaths.accountsDir).sort();
+  const manual = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(manual.ok, true);
+  assert.equal(manual.router.mode, "manual");
+  assert.deepEqual(fs.readdirSync(routerPaths.accountsDir).sort(), homesBefore);
+  assert.equal(JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8")).mode, "manual");
+  fs.writeFileSync(routerPaths.configFile, JSON.stringify({ ..._test.readRouterConfig(setup.deps, routerPaths), mode: "balanced" }), { mode: 0o600 });
+  setup.service.disableRouter();
+  assert.equal(JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8")).mode, "manual");
+});
+
+test("balance epoch reset is durably allowed only while the router is idle", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [2, 3] });
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config)), { mode: 0o600 });
+  const reset = await setup.service.handle({ action: "router-reset-balance-epoch" });
+  assert.deepEqual(reset, { ok: true, epoch: 2 });
+  const after = _test.readRouterState(setup.deps, routerPaths);
+  assert.equal(after.epoch, 2);
+  assert.equal(Object.values(after.ledger).every((ledger) => ledger.completedInputTokens === 0 && ledger.assignedThreadCount === 0), true);
+
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { reservations: [{ pending: true }] })), { mode: 0o600 });
+  const blocked = await setup.service.handle({ action: "router-reset-balance-epoch" });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error.code, "router-not-idle");
+});
+
+test("router status is a redacted ownership and degraded-state projection", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] });
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { stagedDisable: { reasonCode: "post_start_failure", stagedAt: new Date().toISOString() } })), { mode: 0o600 });
+  const status = await setup.service.handle({ action: "router-status" });
+  assert.equal(status.ok, true);
+  assert.equal(status.router.mode, "direct_fallback");
+  assert.equal(status.router.degradedReason, "post_start_failure");
+  assert.deepEqual(status.router.accounts.map((account) => account.label), ["Account A", "Account B"]);
+  assert.equal(JSON.stringify(status).includes("account-work"), false);
+  assert.equal(JSON.stringify(status).includes("access_token"), false);
+  assert.equal(JSON.stringify(status).includes(setup.paths.codexDir), false);
+});
+
+test("router status defaults to manual and fails closed to a redacted direct fallback for corrupt state", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const defaultStatus = await setup.service.handle({ action: "router-status" });
+  assert.equal(defaultStatus.ok, true);
+  assert.equal(defaultStatus.router.mode, "manual");
+  assert.equal(defaultStatus.router.restartRequired, false);
+
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  fs.mkdirSync(routerPaths.routerDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(routerPaths.configFile, "{", { mode: 0o600 });
+  const corrupt = await setup.service.handle({ action: "router-status" });
+  assert.equal(corrupt.ok, true);
+  assert.equal(corrupt.router.mode, "direct_fallback");
+  assert.equal(corrupt.router.degradedReason, "invalid_config");
+  assert.equal(JSON.stringify(corrupt).includes(setup.paths.codexDir), false);
 });
 
 test("experimental inventory maps package IDs and excludes created-by-me plugins", () => {

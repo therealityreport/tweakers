@@ -1,6 +1,11 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import {
+  defaultAccountRouterConfigPath,
+  readRouterLaunchSelection,
+} from "./account-router/config";
+import { preflightRouterHomes } from "./account-router/app-server-mux";
 
 const INSTALL_MARKER = Symbol.for("co.tweakers.codex-app-server-parent");
 
@@ -95,6 +100,20 @@ export interface CodexAppServerParentInstallOptions {
   resourcesPath?: string;
   platform?: NodeJS.Platform;
   pathExists?: (path: string) => boolean;
+  accountRouter?: AccountRouterParentOptions;
+}
+
+/**
+ * The only parent-visible router input is a redacted, versioned config.  It
+ * is read before process creation so invalid/stale state leaves the exact
+ * direct app-server parent path reachable without opening a mux session.
+ */
+export interface AccountRouterParentOptions {
+  userRoot?: string;
+  configPath?: string | null;
+  runtimeEntrypointPath?: string;
+  pathExists?: (path: string) => boolean;
+  readFile?: (path: string, encoding: BufferEncoding) => string;
 }
 
 export interface CodexAppServerParentInstallResult {
@@ -136,6 +155,15 @@ export function isCodexAppServerSpawn(
 
 export function buildCodexAppServerParentArgs(command: string, args: readonly string[]): string[] {
   return ["-e", CODEX_APP_SERVER_PARENT_SOURCE, "--", command, ...args];
+}
+
+export function buildAccountRouterMuxArgs(
+  entrypoint: string,
+  configPath: string,
+  command: string,
+  args: readonly string[],
+): string[] {
+  return [entrypoint, "--config", configPath, "--state-root", dirname(configPath), "--", command, ...args];
 }
 
 export function installCodexAppServerParent(
@@ -186,9 +214,17 @@ export function installCodexAppServerParent(
       if (installed.cleanupStarted) {
         throw new Error("Tweakers Codex parent: app-server cleanup has started");
       }
+      const router = accountRouterLaunch({
+        router: options.accountRouter,
+        bundledNodePath,
+        defaultPathExists: pathExists,
+      });
+      const childArgs = router
+        ? buildAccountRouterMuxArgs(router.entrypoint, router.configPath, command, argsOrOptions)
+        : buildCodexAppServerParentArgs(command, argsOrOptions);
       const child = Reflect.apply(originalSpawn, this, [
         bundledNodePath,
-        buildCodexAppServerParentArgs(command, argsOrOptions),
+        childArgs,
         sanitizeParentSpawnOptions(maybeOptions),
       ]) as ChildProcess;
       installed.children.add(child);
@@ -203,6 +239,21 @@ export function installCodexAppServerParent(
   childProcess.spawn = wrappedSpawn;
   childProcess[INSTALL_MARKER] = installed;
   return result(true, bundledNodePath, "installed", childProcess, installed);
+}
+
+function accountRouterLaunch(options: {
+  router: AccountRouterParentOptions | undefined;
+  bundledNodePath: string;
+  defaultPathExists: (path: string) => boolean;
+}): { entrypoint: string; configPath: string } | null {
+  const userRoot = options.router?.userRoot ?? process.env.TWEAKERS_USER_ROOT ?? process.env.TWEAKER_USER_ROOT;
+  const configPath = options.router?.configPath ?? defaultAccountRouterConfigPath(userRoot);
+  const pathExists = options.router?.pathExists ?? options.defaultPathExists;
+  const selection = readRouterLaunchSelection(configPath, options.router?.readFile, pathExists);
+  if (selection.mode !== "mux" || !configPath) return null;
+  const entrypoint = options.router?.runtimeEntrypointPath ?? join(__dirname, "account-router", "app-server-mux.js");
+  if (!pathExists(entrypoint) || !preflightRouterHomes(selection.config!, dirname(configPath))) return null;
+  return { entrypoint, configPath };
 }
 
 function sanitizeParentSpawnOptions(options?: SpawnOptions): SpawnOptions {

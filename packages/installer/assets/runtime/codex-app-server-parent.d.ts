@@ -31,6 +31,19 @@ export interface CodexAppServerParentInstallOptions {
     resourcesPath?: string;
     platform?: NodeJS.Platform;
     pathExists?: (path: string) => boolean;
+    accountRouter?: AccountRouterParentOptions;
+}
+/**
+ * The only parent-visible router input is a redacted, versioned config.  It
+ * is read before process creation so invalid/stale state leaves the exact
+ * direct app-server parent path reachable without opening a mux session.
+ */
+export interface AccountRouterParentOptions {
+    userRoot?: string;
+    configPath?: string | null;
+    runtimeEntrypointPath?: string;
+    pathExists?: (path: string) => boolean;
+    readFile?: (path: string, encoding: BufferEncoding) => string;
 }
 export interface CodexAppServerParentInstallResult {
     installed: boolean;
@@ -44,5 +57,6 @@ export interface CodexAppServerParentInstallResult {
 }
 export declare function isCodexAppServerSpawn(command: unknown, args: unknown, options?: SpawnOptions): command is string;
 export declare function buildCodexAppServerParentArgs(command: string, args: readonly string[]): string[];
+export declare function buildAccountRouterMuxArgs(entrypoint: string, configPath: string, command: string, args: readonly string[]): string[];
 export declare function installCodexAppServerParent(options?: CodexAppServerParentInstallOptions): CodexAppServerParentInstallResult;
 export {};

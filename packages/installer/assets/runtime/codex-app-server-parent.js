@@ -3,9 +3,12 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CODEX_APP_SERVER_PARENT_SOURCE = void 0;
 exports.isCodexAppServerSpawn = isCodexAppServerSpawn;
 exports.buildCodexAppServerParentArgs = buildCodexAppServerParentArgs;
+exports.buildAccountRouterMuxArgs = buildAccountRouterMuxArgs;
 exports.installCodexAppServerParent = installCodexAppServerParent;
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
+const config_1 = require("./account-router/config");
+const app_server_mux_1 = require("./account-router/app-server-mux");
 const INSTALL_MARKER = Symbol.for("co.tweakers.codex-app-server-parent");
 /**
  * The native browser peer authorizer validates three generations of process
@@ -96,6 +99,9 @@ function isCodexAppServerSpawn(command, args, options) {
 function buildCodexAppServerParentArgs(command, args) {
     return ["-e", exports.CODEX_APP_SERVER_PARENT_SOURCE, "--", command, ...args];
 }
+function buildAccountRouterMuxArgs(entrypoint, configPath, command, args) {
+    return [entrypoint, "--config", configPath, "--state-root", (0, node_path_1.dirname)(configPath), "--", command, ...args];
+}
 function installCodexAppServerParent(options = {}) {
     const childProcess = options.childProcess ??
         require("node:child_process");
@@ -132,9 +138,17 @@ function installCodexAppServerParent(options = {}) {
             if (installed.cleanupStarted) {
                 throw new Error("Tweakers Codex parent: app-server cleanup has started");
             }
+            const router = accountRouterLaunch({
+                router: options.accountRouter,
+                bundledNodePath,
+                defaultPathExists: pathExists,
+            });
+            const childArgs = router
+                ? buildAccountRouterMuxArgs(router.entrypoint, router.configPath, command, argsOrOptions)
+                : buildCodexAppServerParentArgs(command, argsOrOptions);
             const child = Reflect.apply(originalSpawn, this, [
                 bundledNodePath,
-                buildCodexAppServerParentArgs(command, argsOrOptions),
+                childArgs,
                 sanitizeParentSpawnOptions(maybeOptions),
             ]);
             installed.children.add(child);
@@ -148,6 +162,18 @@ function installCodexAppServerParent(options = {}) {
     childProcess.spawn = wrappedSpawn;
     childProcess[INSTALL_MARKER] = installed;
     return result(true, bundledNodePath, "installed", childProcess, installed);
+}
+function accountRouterLaunch(options) {
+    const userRoot = options.router?.userRoot ?? process.env.TWEAKERS_USER_ROOT ?? process.env.TWEAKER_USER_ROOT;
+    const configPath = options.router?.configPath ?? (0, config_1.defaultAccountRouterConfigPath)(userRoot);
+    const pathExists = options.router?.pathExists ?? options.defaultPathExists;
+    const selection = (0, config_1.readRouterLaunchSelection)(configPath, options.router?.readFile, pathExists);
+    if (selection.mode !== "mux" || !configPath)
+        return null;
+    const entrypoint = options.router?.runtimeEntrypointPath ?? (0, node_path_1.join)(__dirname, "account-router", "app-server-mux.js");
+    if (!pathExists(entrypoint) || !(0, app_server_mux_1.preflightRouterHomes)(selection.config, (0, node_path_1.dirname)(configPath)))
+        return null;
+    return { entrypoint, configPath };
 }
 function sanitizeParentSpawnOptions(options) {
     const env = { ...(options?.env ?? process.env) };
