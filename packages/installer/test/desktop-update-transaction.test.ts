@@ -548,6 +548,94 @@ test("cancel and recover resolves an orphaned v2 switch from sealed-pair proof w
   });
 });
 
+test("cancel recovers when a fresh v2 preparation failed before its generation was published", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.818.22352", build: "6872" };
+    const source = selection("tweakers");
+    const stalePair = {
+      ...modeCachePair("previous-stale-generation", "tweakers", baseline),
+      pinState: "stale_requires_prepare" as const,
+    };
+    const recoveryCalls: string[] = [];
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => stalePair,
+      switchCurrent: async () => { throw new Error("unexpected v2 switch"); },
+      prepareAndSwitch: async () => { throw new Error("unexpected v2 preparation"); },
+      recover: async (transactionId) => {
+        recoveryCalls.push(transactionId);
+        throw new Error("an unrelated current journal must never be recovered");
+      },
+    };
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source,
+      baseline,
+      safeOfficialMode: false,
+      resumable: false,
+      error: "ENOTEMPTY: directory not empty, rmdir 'environment-cache/next/fresh-outbound'",
+      environmentTransactionId: "fresh-outbound",
+      environmentTransactionKind: "mode-cache-v2",
+    }));
+    const { deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => source,
+      readDesktopVersion: () => baseline,
+      readDesktopBundleIdentifier: () => source.selectedDesktopBundleId,
+      readDesktopAsarMarker: () => "present",
+      inspectLiveOfficialDesktop: () => { throw new Error("official desktop is not live"); },
+    });
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).cancel();
+
+    assert.equal(receipt.phase, "rolled_back");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.equal(receipt.resumable, false);
+    assert.match(receipt.error ?? "", /before the fresh sealed pair was published.*source payload was proven live/i);
+    assert.deepEqual(recoveryCalls, [], "the previous current generation is unrelated history");
+  });
+});
+
+test("an unpublished v2 generation mismatch stays blocked when live bytes prove neither environment", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.818.22352", build: "6872" };
+    const source = selection("tweakers");
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => ({
+        ...modeCachePair("previous-stale-generation", "tweakers", baseline),
+        pinState: "stale_requires_prepare" as const,
+      }),
+      switchCurrent: async () => { throw new Error("unexpected v2 switch"); },
+      prepareAndSwitch: async () => { throw new Error("unexpected v2 preparation"); },
+      recover: async () => { throw new Error("unrelated recovery must not run"); },
+    };
+    writeDesktopUpdateReceipt(fixture.stateFile, persistedReceipt({
+      phase: "failed",
+      source,
+      baseline,
+      safeOfficialMode: false,
+      resumable: false,
+      error: "candidate cleanup failed",
+      environmentTransactionId: "fresh-outbound",
+      environmentTransactionKind: "mode-cache-v2",
+    }));
+    const { deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => source,
+      readDesktopVersion: () => baseline,
+      readDesktopBundleIdentifier: () => source.selectedDesktopBundleId,
+      readDesktopAsarMarker: () => "absent",
+      inspectLiveOfficialDesktop: () => { throw new Error("official desktop is not live"); },
+    });
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).cancel();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, false);
+    assert.equal(receipt.resumable, false);
+    assert.match(receipt.error ?? "", /neither the source nor official desktop could be proven live/i);
+  });
+});
+
 test("a stale or missing sealed pair prepares fresh on the outbound leg instead of failing", async () => {
   await withFixture(async (fixture) => {
     const baseline = { marketingVersion: "26.814.41407", build: "6720" };
@@ -598,6 +686,66 @@ test("a stale or missing sealed pair prepares fresh on the outbound leg instead 
     assert.equal(receipt.phase, "completed");
     assert.deepEqual(modeCalls, [
       "prepare-and-switch:fresh-outbound:chatgpt",
+      "prepare-and-switch:fresh-return:tweakers",
+    ]);
+  });
+});
+
+test("a reusable sealed pair that becomes stale during bounded preflight prepares fresh once", async () => {
+  await withFixture(async (fixture) => {
+    const baseline = { marketingVersion: "26.814.41407", build: "6720" };
+    const observed = { marketingVersion: "26.814.41957", build: "6744" };
+    let currentSelection = selection("tweakers");
+    let currentPair = modeCachePair("metadata-current", "tweakers", baseline);
+    const modeCalls: string[] = [];
+    const modeCacheV2: DesktopUpdateModeCacheAdapter = {
+      current: () => currentPair,
+      switchCurrent: async ({ transactionId }) => {
+        modeCalls.push(`switch:${transactionId}`);
+        currentPair = { ...currentPair, pinState: "stale_requires_prepare" };
+        return {
+          transactionId,
+          phase: "stale_requires_prepare",
+          error: "live tree seal changed after refresh",
+          selection: null,
+          targetMainPid: null,
+          pair: currentPair,
+        };
+      },
+      prepareAndSwitch: async ({ requested, transactionId }) => {
+        modeCalls.push(`prepare-and-switch:${transactionId}:${requested.appExperience}`);
+        currentSelection = { ...requested, appliedAt: NOW };
+        currentPair = modeCachePair(
+          transactionId,
+          requested.appExperience,
+          requested.appExperience === "chatgpt" ? baseline : observed,
+        );
+        return readyModeCacheResult(transactionId, requested, currentPair);
+      },
+      recover: async (transactionId) => {
+        throw new Error(`unexpected mode-cache recovery for ${transactionId}`);
+      },
+    };
+    const generationIds = ["fresh-after-preflight", "fresh-return"];
+    const { deps } = dependencies({
+      modeCacheV2,
+      readCurrentSelection: () => currentSelection,
+      readDesktopVersion: () => baseline,
+      waitForVersionChange: async () => observed,
+      createModeCacheGenerationId: () => generationIds.shift() ?? "exhausted",
+      refreshTweakers: async () => {
+        throw new Error("legacy runtime refresh must not run for a prepared v2 pair");
+      },
+      verifyFinal: async () => ({ ok: true, error: null }),
+    });
+
+    const receipt = await createDesktopUpdateTransaction(fixture, deps).start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.equal(receipt.environmentTransactionId, "fresh-return");
+    assert.deepEqual(modeCalls, [
+      "switch:metadata-current",
+      "prepare-and-switch:fresh-after-preflight:chatgpt",
       "prepare-and-switch:fresh-return:tweakers",
     ]);
   });

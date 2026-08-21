@@ -474,7 +474,7 @@ export function createEnvironmentModeProductionBindings(
       return {
         state: "ready",
         source: { appPath: pair.roles.live.appPath, pid: source.pid, visibleWindow: source.visibleWindow },
-        target: targetIdentity(pair, target),
+        target: environmentModeWarmCommitTargetIdentity(pair, target),
         exchangeBefore: exchangeBefore(pair),
       };
     } catch (error) {
@@ -1478,10 +1478,10 @@ function assertFullRoleIdentity(
   }
 }
 
-function targetIdentity(
+export function environmentModeWarmCommitTargetIdentity(
   pair: EnvironmentModePairReceipt,
   role: EnvironmentModePairReceipt["roles"]["inactive"],
-) {
+): EnvironmentWarmCommitPreflightReady["target"] {
   return {
     appPath: role.appPath,
     appExperience: role.experience,
@@ -1490,10 +1490,14 @@ function targetIdentity(
     build: role.evidence.build,
     asarHeaderDigest: role.evidence.asarHeaderDigest,
     signatureDigest: role.evidence.signature.signatureDigest,
-    backendDigest: role.experience === "tweakers" ? pair.tweakers.backend.digest : "",
-    runtimeDigest: role.experience === "tweakers" ? pair.tweakers.runtime.digest : "",
-    managedRuntimeDigest: role.experience === "tweakers" ? pair.tweakers.managedRuntime.digest : "",
-    nativeHostDigest: role.experience === "tweakers" ? pair.tweakers.nativeHost.digest : "",
+    // These digests bind the complete prepared pair, not only the target
+    // experience. A pristine ChatGPT target still belongs to the generation
+    // that carries the cached Tweakers artifacts needed for the inverse
+    // transition, so preflight must preserve those exact identities too.
+    backendDigest: pair.tweakers.backend.digest,
+    runtimeDigest: pair.tweakers.runtime.digest,
+    managedRuntimeDigest: pair.tweakers.managedRuntime.digest,
+    nativeHostDigest: pair.tweakers.nativeHost.digest,
   };
 }
 

@@ -22,6 +22,7 @@ import {
 } from "../src/commands/environment";
 import {
   createEnvironmentModeProductionBindings,
+  environmentModeWarmCommitTargetIdentity,
   environmentModeCacheV2Enabled,
   resolveEnvironmentModeV2PreparedCommitCli,
   type EnvironmentModeProductionDeps,
@@ -315,6 +316,27 @@ test("tweakers-live prepare and stale classification never consult the live-path
 
     const reasons = bindings.warmCommit.classifyStaleBeforeCutover(result.receipt, "bounded-check-failed");
     assert.equal(reasons.some((reason) => /not signed by OpenAI Team/.test(reason)), false);
+  });
+});
+
+test("tweakers-live warm preflight binds the complete pair for a pristine ChatGPT target", async () => {
+  await withFixture(async (fixture) => {
+    const mirrored = mirrorFixture(fixture);
+    const bindings = createBindings(mirrored);
+    const result = await bindings.prepare({
+      current: mirrored.current,
+      requested: mirrored.requested,
+      generationId: "chatgpt-target-preflight",
+    });
+    assert.equal(result.state, "ready");
+    assert.ok(result.receipt);
+
+    const target = environmentModeWarmCommitTargetIdentity(result.receipt, result.receipt.roles.inactive);
+    assert.equal(target.appExperience, "chatgpt");
+    assert.equal(target.backendDigest, result.receipt.tweakers.backend.digest);
+    assert.equal(target.runtimeDigest, result.receipt.tweakers.runtime.digest);
+    assert.equal(target.managedRuntimeDigest, result.receipt.tweakers.managedRuntime.digest);
+    assert.equal(target.nativeHostDigest, result.receipt.tweakers.nativeHost.digest);
   });
 });
 

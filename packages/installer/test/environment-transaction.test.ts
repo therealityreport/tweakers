@@ -2585,8 +2585,9 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     );
     mutateManagedSourceDuringStage = false;
     const developmentRoot = join(root, "registered-development");
-    mkdirSync(developmentRoot, { recursive: true });
-    writeFileSync(join(developmentRoot, "package.json"), "{}\n");
+    const developmentCli = join(developmentRoot, "packages", "installer", "dist", "cli.js");
+    mkdirSync(dirname(developmentCli), { recursive: true });
+    writeFileSync(developmentCli, "export {};\n");
     const developmentHash = hashTree(developmentRoot, false);
     const managedSource = join(root, "managed-runtime", "current");
     const managedPackagedRuntime = join(
@@ -2601,6 +2602,23 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     writeFileSync(join(managedPackagedRuntime, "same-b.js"), "same\n");
     symlinkSync("same-a.js", join(managedPackagedRuntime, "selected.js"));
     refreshRuntimeFingerprint(managedPackagedRuntime);
+    writeFileSync(join(root, "config.json"), `${JSON.stringify({
+      tweaker: { developmentSourceRoot: developmentRoot },
+    })}\n`);
+    executionSourceRoot = developmentRoot;
+    const callsBeforeCurrentDevelopment = calls.length;
+    const currentDevelopmentPrepared = await adapters.preparePrerequisites({
+      transactionId: "current-development-owner",
+      current,
+      requested,
+      oldMainPid: 26138,
+    });
+    assert.ok(currentDevelopmentPrepared.managedRuntime?.requested.artifactPath);
+    assert.deepEqual(
+      calls.slice(callsBeforeCurrentDevelopment),
+      ["build-development", "build-patched", "stage-managed"],
+      "a development-owned continuation remains development-owned after refresh makes its source current",
+    );
     const stableProvenance = {
       kind: "github-release",
       ref: "v1.0.0",
@@ -2612,9 +2630,6 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
       join(managedSource, ".tweakers-provenance.json"),
       `${JSON.stringify(stableProvenance, null, 2)}\n`,
     );
-    writeFileSync(join(root, "config.json"), `${JSON.stringify({
-      tweaker: { developmentSourceRoot: developmentRoot },
-    })}\n`);
     executionSourceRoot = managedSource;
     const callsBeforeStable = calls.length;
     const stablePrepared = await adapters.preparePrerequisites({

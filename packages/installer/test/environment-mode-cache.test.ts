@@ -870,6 +870,9 @@ test("one next generation is enforced and a published cache is steady only witho
   try {
     publishEnvironmentModePair(fixture.paths, fixture.receipt, { now: () => NOW });
     assert.equal(assertEnvironmentModeCacheSteadyState(fixture.paths).generationId, fixture.receipt.generationId);
+    mkdirSync(fixture.paths.preparationRoot, { recursive: true });
+    writeFileSync(join(fixture.paths.preparationRoot, ".DS_Store"), "finder-metadata");
+    assert.equal(assertEnvironmentModeCacheSteadyState(fixture.paths).generationId, fixture.receipt.generationId);
     mkdirSync(join(fixture.paths.preparationRoot, "generation-next-a"), { recursive: true });
     assert.equal(assertAtMostOneEnvironmentModeCachePreparation(fixture.paths), "generation-next-a");
     assert.throws(() => assertEnvironmentModeCacheSteadyState(fixture.paths), /not steady/);
@@ -880,6 +883,51 @@ test("one next generation is enforced and a published cache is steady only witho
     assert.equal(environmentModeCacheState({ current: fixture.receipt, unavailable: true }), "unavailable");
   } finally {
     cleanup(fixture.root);
+  }
+});
+
+test("T3 reclaims one orphaned unpublished next generation before staging a fresh pair", async () => {
+  const source = makePairFixture("source");
+  const root = mkdtempSync(join(tmpdir(), "tweaker-mode-cache-orphaned-next-"));
+  const paths = environmentModeCachePaths(root);
+  const orphaned = join(paths.preparationRoot, "orphaned");
+  try {
+    mkdirSync(orphaned, { recursive: true });
+    writeFileSync(join(paths.preparationRoot, ".DS_Store"), "finder-root-metadata");
+    writeFileSync(join(orphaned, ".DS_Store"), "finder-generation-metadata");
+    writeFileSync(join(orphaned, "partial"), "unpublished-candidate-bytes");
+
+    const published = await prepareAndPublishEnvironmentModePair(paths, "fresh", {
+      stage: ({ preparation }) => {
+        writeAppTree(preparation.inactiveAppPath, "fresh-inactive");
+        writeTree(preparation.runtimeRoot, "fresh-runtime");
+        writeTree(preparation.managedRuntimeRoot, "fresh-managed-runtime");
+      },
+      validatePrepared: () => {},
+      createValidatedReceipt: ({ generation }) => receiptForMaterializedGeneration(source.receipt, generation),
+    }, { now: () => NOW });
+
+    assert.equal(published.generationId, "fresh");
+    assert.equal(existsSync(orphaned), false);
+    assert.equal(readCurrentEnvironmentModePair(paths)?.generationId, "fresh");
+    assert.equal(assertAtMostOneEnvironmentModeCachePreparation(paths), null);
+  } finally {
+    cleanup(source.root);
+    cleanup(root);
+  }
+});
+
+test("preparation metadata is ignored only when .DS_Store is a real regular file", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-mode-cache-next-metadata-"));
+  const paths = environmentModeCachePaths(root);
+  try {
+    mkdirSync(join(paths.preparationRoot, ".DS_Store"), { recursive: true });
+    assert.throws(
+      () => assertAtMostOneEnvironmentModeCachePreparation(paths),
+      /preparation metadata must be a regular file/,
+    );
+  } finally {
+    cleanup(root);
   }
 });
 
@@ -949,6 +997,10 @@ test("T3 removes a failed unpublished next reservation and never publishes parti
         writeAppTree(preparation.inactiveAppPath, "partial");
         writeTree(preparation.runtimeRoot, "partial");
         writeTree(preparation.managedRuntimeRoot, "partial");
+        // macOS Finder may add this while a large candidate is staged. It is
+        // metadata, not a second reservation, and cleanup must remove it with
+        // the exact unpublished generation after a pre-publication failure.
+        writeFileSync(join(preparation.generationRoot, ".DS_Store"), "finder-metadata");
       },
       validatePrepared: () => { throw new Error("forced pre-publish validation failure"); },
       createValidatedReceipt: () => source.receipt,

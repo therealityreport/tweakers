@@ -1860,12 +1860,16 @@ async function prepareManagedRuntimeSourcePlan(
   }
 
   const refreshStatus = getLocalRefreshStatus(environmentRoot);
-  if (refreshStatus.source === "development") {
-    const sourceRoot = refreshStatus.developmentSourceRoot;
+  const executionSourceRoot = deps.executionSourceRoot();
+  const registeredDevelopmentRoot = refreshStatus.developmentSourceRoot;
+  const executingRegisteredDevelopment = registeredDevelopmentRoot !== null
+    && sameCanonicalPath(registeredDevelopmentRoot, executionSourceRoot);
+  if (refreshStatus.source === "development"
+    || (refreshStatus.source === "current" && executingRegisteredDevelopment)) {
+    const sourceRoot = registeredDevelopmentRoot;
     if (!sourceRoot || !pathEntryExists(sourceRoot)) {
       throw new Error("The selected development refresh source is unavailable");
     }
-    const executionSourceRoot = deps.executionSourceRoot();
     if (!sameCanonicalPath(sourceRoot, executionSourceRoot)) {
       throw new Error(
         "Refusing to build a development candidate from a checkout that does not own the executing installer: "
@@ -1911,7 +1915,6 @@ async function prepareManagedRuntimeSourcePlan(
   if (!pathEntryExists(managedRuntimeTarget)) {
     throw new Error(`No managed runtime source is available at ${managedRuntimeTarget}`);
   }
-  const executionSourceRoot = deps.executionSourceRoot();
   if (!sameCanonicalPath(managedRuntimeTarget, executionSourceRoot)) {
     throw new Error(
       "Refusing to prepare the current managed runtime from an installer owned by another source: "

@@ -585,7 +585,14 @@ export function assertAtMostOneEnvironmentModeCachePreparation(
   assertEnvironmentModeCacheRootIsReal(paths);
   if (!existsSync(paths.preparationRoot)) return null;
   assertRealDirectory(paths.preparationRoot, "environment mode cache preparation root");
-  const entries = readdirSync(paths.preparationRoot, { withFileTypes: true });
+  const entries = readdirSync(paths.preparationRoot, { withFileTypes: true }).filter((entry) => {
+    if (entry.name !== ".DS_Store") return true;
+    const metadataPath = join(paths.preparationRoot, entry.name);
+    if (!entry.isFile() || entry.isSymbolicLink() || lstatSync(metadataPath).isSymbolicLink()) {
+      throw new Error("Environment mode cache preparation metadata must be a regular file");
+    }
+    return false;
+  });
   if (entries.length === 0) return null;
   if (entries.length !== 1) {
     throw new Error("Environment mode cache permits at most one next generation");
@@ -1543,8 +1550,14 @@ export async function prepareAndPublishEnvironmentModePair(
   });
   try {
     reconcileCurrentEnvironmentModePairReceiptShadowUnlocked(paths);
-    if (assertAtMostOneEnvironmentModeCachePreparation(paths) !== null) {
-      throw new Error("Environment mode cache already has a reserved next generation");
+    const orphanedGenerationId = assertAtMostOneEnvironmentModeCachePreparation(paths);
+    if (orphanedGenerationId !== null) {
+      // The cache mutex is process-owned. Acquiring it proves no live prepare
+      // owner still controls the one unpublished reservation, so a prior
+      // next/<generation> is abandoned pre-publication state rather than
+      // recovery evidence. Reclaim only that validated exact child before
+      // reserving the caller's new generation.
+      removeUnpublishedEnvironmentModeCachePreparation(paths, orphanedGenerationId);
     }
     const preparation = environmentModeCachePreparationPaths(paths, generationId);
     const generation = environmentModeCacheGenerationPaths(paths, generationId);
@@ -1579,14 +1592,34 @@ export async function prepareAndPublishEnvironmentModePair(
       return publishEnvironmentModePairUnlocked(paths, receipt, options);
     } catch (error) {
       if (!existsSync(generation.generationRoot) && existsSync(preparation.generationRoot)) {
-        rmSync(preparation.generationRoot, { recursive: true, force: false });
-        fsyncDirectory(preparation.preparationRoot);
+        removeUnpublishedEnvironmentModeCachePreparation(paths, generationId);
       }
       throw error;
     }
   } finally {
     lock.release();
   }
+}
+
+function removeUnpublishedEnvironmentModeCachePreparation(
+  paths: EnvironmentModeCachePaths,
+  generationId: string,
+): void {
+  const preparation = environmentModeCachePreparationPaths(paths, generationId);
+  if (!existsSync(preparation.generationRoot)) return;
+  assertNoSymlinkInExistingPath(preparation.generationRoot, "environment mode cache unpublished preparation");
+  assertRealDirectory(preparation.generationRoot, "environment mode cache unpublished preparation");
+  // Finder and other macOS metadata services may create `.DS_Store` while a
+  // large prepared app tree is being removed. A single recursive rmdir then
+  // races that write and reports ENOTEMPTY, leaving the reservation behind.
+  // Node retries only transient filesystem errors when maxRetries is set.
+  rmSync(preparation.generationRoot, {
+    recursive: true,
+    force: true,
+    maxRetries: 8,
+    retryDelay: 50,
+  });
+  fsyncDirectory(preparation.preparationRoot);
 }
 
 function publishEnvironmentModePairUnlocked(

@@ -893,15 +893,27 @@ export function createDesktopUpdateTransaction(
         environmentTransactionKind: "mode-cache-v2",
       });
       try {
-        const request = {
+        let request = {
           current: receipt.source,
           requested: receipt.official,
           transactionId: generationId,
           approvalAt: receipt.createdAt,
         };
-        const switched = reusableGenerationId !== null
+        let switched = reusableGenerationId !== null
           ? await deps.modeCacheV2.switchCurrent(request)
           : await deps.modeCacheV2.prepareAndSwitch(request);
+        // A pair can pass the cheap metadata binding above and still be
+        // invalidated by the bounded stat-seal preflight (for example, after
+        // refresh-local atomically replaces the live Tweakers payload). That
+        // result is explicitly pre-cutover and safe to replace. Prepare one
+        // fresh generation instead of turning the released stale grant into a
+        // blocking desktop-update failure.
+        if (reusableGenerationId !== null && switched.phase === "stale_requires_prepare") {
+          const freshGenerationId = deps.createModeCacheGenerationId();
+          receipt = update(receipt, { environmentTransactionId: freshGenerationId });
+          request = { ...request, transactionId: freshGenerationId };
+          switched = await deps.modeCacheV2.prepareAndSwitch(request);
+        }
         if (switched.phase !== "ready"
           || switched.selection === null
           || switched.targetMainPid === null) {
@@ -1726,6 +1738,46 @@ export function createDesktopUpdateTransaction(
     if (existing.environmentTransactionKind === "mode-cache-v2") {
       if (deps.modeCacheV2 === null || existing.environmentTransactionId === null) {
         return unsafeRecoveryFailure(existing, "sealed-pair recovery is not available for the recorded generation");
+      }
+      const currentPair = deps.modeCacheV2.current();
+      if (currentPair === null || currentPair.generationId !== existing.environmentTransactionId) {
+        // A fresh v2 prepare persists its intended generation ID on the
+        // desktop-update receipt before staging begins. If staging or cleanup
+        // fails before publication, current.json correctly remains on the old
+        // generation and there is no journal for the intended ID to recover.
+        // Calling recover(intendedId) against the unrelated current journal
+        // creates a transaction-mismatch error and wedges every lifecycle
+        // action. Resolve only from independent live-byte proof in this branch;
+        // never recover or mutate the unrelated current generation.
+        const selection = await deps.readCurrentSelection();
+        if (!returning && await sourceSelectionProvenByBytes(existing, selection, deps)) {
+          return update(existing, {
+            phase: "rolled_back",
+            ownerPid: process.pid,
+            source: selection!,
+            safeOfficialMode: existing.source.appExperience === "chatgpt",
+            resumable: false,
+            error: "Desktop update owner exited before the fresh sealed pair was published; the source payload was proven live by its published selection, patch marker, and version identity.",
+            rolledBackAt: deps.now(),
+          }, true);
+        }
+        try {
+          const live = await deps.inspectLiveOfficialDesktop(existing.official);
+          return update(existing, {
+            phase: "rolled_back",
+            ownerPid: process.pid,
+            officialMainPid: live.mainPid,
+            safeOfficialMode: true,
+            resumable: false,
+            error: "Desktop update owner exited before its recorded sealed pair became current; the live official desktop was proven directly.",
+            rolledBackAt: deps.now(),
+          }, true);
+        } catch {
+          return unsafeRecoveryFailure(
+            existing,
+            "the recorded sealed pair was never published and neither the source nor official desktop could be proven live",
+          );
+        }
       }
       try {
         const recovered = await deps.modeCacheV2.recover(existing.environmentTransactionId);
