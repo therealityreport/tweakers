@@ -105,7 +105,10 @@ export function getLocalRefreshStatus(userRoot: string): LocalRefreshStatus {
   const developmentSourceRoot = typeof section.developmentSourceRoot === "string" && existsSync(section.developmentSourceRoot)
     ? section.developmentSourceRoot
     : null;
-  const refreshState = readJson<Partial<LocalRefreshStatus>>(join(userRoot, "refresh-state.json"));
+  const refreshState = withoutClearedModeRefusal(
+    userRoot,
+    readJson<Partial<LocalRefreshStatus>>(join(userRoot, "refresh-state.json")),
+  );
   if (developmentSourceRoot) {
     const currentHash = hashTree(developmentSourceRoot, false);
     const provenance = readJson<{ sourceRuntimeHash?: string }>(join(managedSourceRoot(userRoot), ".tweakers-provenance.json"));
@@ -374,6 +377,28 @@ function readPackageRecord(path: string): Record<string, unknown> | null {
   }
 }
 
+const CHATGPT_MODE_REFUSAL_MARKER = "Refusing to refresh the local app while ChatGPT mode is active";
+
+/**
+ * A ChatGPT-mode refusal is a by-design precondition, not a malfunction, yet
+ * it persists in refresh-state.json as phase "failed" and kept the UI wearing
+ * a failure badge long after the machine returned to Tweakers mode (observed
+ * live 2026-08-21). Drop the saved failure once its condition has cleared;
+ * every other failure kind is preserved untouched.
+ */
+function withoutClearedModeRefusal(
+  userRoot: string,
+  saved: Partial<LocalRefreshStatus> | null,
+): Partial<LocalRefreshStatus> | null {
+  if (saved?.phase !== "failed" || !saved.error?.includes(CHATGPT_MODE_REFUSAL_MARKER)) return saved;
+  try {
+    assertRefreshAllowedByMode(join(userRoot, "state.json"));
+  } catch {
+    return saved;
+  }
+  return null;
+}
+
 function assertRefreshAllowedByMode(stateFile: string, app?: string): void {
   const state = readState(stateFile);
   let markerPresent = false;
@@ -384,7 +409,7 @@ function assertRefreshAllowedByMode(stateFile: string, app?: string): void {
   }
   if (resolveMode(state, markerPresent) !== "chatgpt") return;
   throw new Error(
-    "Refusing to refresh the local app while ChatGPT mode is active.\n" +
+    `${CHATGPT_MODE_REFUSAL_MARKER}.\n` +
       "The official app stays pristine in ChatGPT mode; a refresh would rebuild and promote a patched bundle.\n" +
       "Run `tweaker mode tweakers` first.",
   );

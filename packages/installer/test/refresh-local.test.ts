@@ -528,3 +528,41 @@ test("accepted-refresh receipts round-trip, validate strictly, and match only ex
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a ChatGPT-mode refusal failure self-heals once Tweakers mode is restored", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-refusal-"));
+  try {
+    mkdirSync(join(root, "repo", "packages", "installer", "dist"), { recursive: true });
+    writeFileSync(join(root, "repo", "package.json"), "{}\n");
+    registerDevelopmentCheckout(join(root, "config.json"), join(root, "repo"));
+    const refusal = {
+      available: true,
+      source: "development",
+      phase: "failed",
+      developmentSourceRoot: join(root, "repo"),
+      detail: "Local refresh failed before it could start",
+      error: "Refusing to refresh the local app while ChatGPT mode is active.\nRun `tweaker mode tweakers` first.",
+      checkedAt: "2026-08-21T02:42:52.712Z",
+    };
+    writeFileSync(join(root, "refresh-state.json"), JSON.stringify(refusal), { mode: 0o600 });
+
+    // Still in ChatGPT mode: the refusal is current and must keep showing.
+    writeFileSync(join(root, "state.json"), JSON.stringify({ mode: "chatgpt" }), { mode: 0o600 });
+    assert.equal(getLocalRefreshStatus(root).phase, "failed");
+
+    // Back in Tweakers mode: the by-design refusal is stale, not a failure.
+    writeFileSync(join(root, "state.json"), JSON.stringify({ mode: "tweakers" }), { mode: 0o600 });
+    const healed = getLocalRefreshStatus(root);
+    assert.notEqual(healed.phase, "failed");
+    assert.equal(healed.error, null);
+
+    // Any other failure kind is preserved untouched.
+    writeFileSync(join(root, "refresh-state.json"), JSON.stringify({
+      ...refusal,
+      error: "Promotion health check failed; rolled back.",
+    }), { mode: 0o600 });
+    assert.equal(getLocalRefreshStatus(root).phase, "failed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
