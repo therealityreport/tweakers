@@ -72,95 +72,160 @@ function passingDeps(events: string[], overrides: Partial<DirectOfficialUpdateDe
     quitApp: () => { events.push("quit"); },
     isAppRunning: () => false,
     openApp: () => { events.push("open"); },
-    replaceApp: (staged, destination, adapters) => {
-      events.push("replace");
-      assert.equal(existsSync(join(staged, "Contents", "Info.plist")), true);
-      assert.equal(adapters?.validateDestination?.(staged), true, "the destination validator must accept a verified bundle");
-      rmSync(destination, { recursive: true, force: true });
-      spawnSync("ditto", [staged, destination]);
-    },
     sleep: async () => {},
     ...overrides,
   };
 }
 
-test("a verified appcast enclosure installs directly: download, verify, quit, swap, reopen", async () => {
+function fixture(): { root: string; live: string; zip: Buffer; cleanup(): void } {
   const root = mkdtempSync(join(tmpdir(), "direct-update-"));
-  try {
-    const source = join(root, "source");
-    mkdirSync(source, { recursive: true });
-    writeApp(join(source, "ChatGPT.app"));
-    const zip = zipApp(source);
-    const live = join(root, "Applications", "ChatGPT.app");
-    writeApp(live, { version: "26.818.22352", build: "6872" });
-    const events: string[] = [];
+  const source = join(root, "source");
+  mkdirSync(source, { recursive: true });
+  writeApp(join(source, "ChatGPT.app"));
+  const zip = zipApp(source);
+  const live = join(root, "Applications", "ChatGPT.app");
+  writeApp(live, { version: "26.818.22352", build: "6872" });
+  return { root, live, zip, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
 
-    const installed = await performDirectOfficialUpdate({
-      selection: makeSelection(live),
-      latest: LATEST,
-      enclosureUrl: "https://persistent.oaistatic.com/codex-app-prod/app.zip",
-      enclosureLength: zip.byteLength,
-      workRoot: join(root, "work"),
-    }, { ...passingDeps(events), fetch: fetchServing(zip) });
+function input(f: ReturnType<typeof fixture>) {
+  return {
+    selection: makeSelection(f.live),
+    latest: LATEST,
+    enclosureUrl: "https://persistent.oaistatic.com/codex-app-prod/app.zip",
+    enclosureLength: f.zip.byteLength,
+    workRoot: join(f.root, "work"),
+  };
+}
+
+test("a verified appcast enclosure installs directly: download, verify, quit, swap, reopen", async () => {
+  const f = fixture();
+  try {
+    const events: string[] = [];
+    const installed = await performDirectOfficialUpdate(input(f), {
+      ...passingDeps(events),
+      fetch: fetchServing(f.zip),
+    });
 
     assert.deepEqual(installed, { marketingVersion: LATEST.marketingVersion, build: LATEST.build });
-    assert.deepEqual(events, ["quit", "replace", "open"]);
-    assert.equal(readFileSync(join(live, "Contents", "Info.plist"), "utf8").includes("6933"), true);
-    // The staging work root never survives the attempt.
-    assert.equal(existsSync(join(root, "work")) ? readdirSync(join(root, "work")).length : 0, 0);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+    assert.deepEqual(events, ["quit", "open"], "reopen always follows the quit");
+    assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8").includes("6933"), true);
+    // No staging debris: work root and both rename siblings are gone.
+    assert.equal(existsSync(join(f.root, "work")), false);
+    assert.deepEqual(
+      readdirSync(join(f.root, "Applications")).filter((name) => name !== "ChatGPT.app"),
+      [],
+    );
+  } finally { f.cleanup(); }
+});
+
+test("Sparkle's install-on-quit result wins: an already-current disk version skips the swap", async () => {
+  const f = fixture();
+  try {
+    const events: string[] = [];
+    const deps = passingDeps(events, {
+      quitApp: () => {
+        events.push("quit");
+        // Sparkle finishes its staged install the moment the app exits.
+        rmSync(f.live, { recursive: true, force: true });
+        writeApp(f.live);
+      },
+    });
+    const installed = await performDirectOfficialUpdate(input(f), { ...deps, fetch: fetchServing(f.zip) });
+    assert.deepEqual(installed, { marketingVersion: LATEST.marketingVersion, build: LATEST.build });
+    assert.deepEqual(events, ["quit", "open"]);
+  } finally { f.cleanup(); }
+});
+
+test("every failure past the quit still reopens the app, and an abort stops before the quit", async () => {
+  const f = fixture();
+  try {
+    // Failure after quit (app refuses to settle): the desktop is reopened.
+    const stuck: string[] = [];
+    let polls = 0;
+    await assert.rejects(
+      performDirectOfficialUpdate(input(f), {
+        ...passingDeps(stuck, { isAppRunning: () => { polls += 1; return true; } }),
+        fetch: fetchServing(f.zip),
+      }),
+      /did not quit/,
+    );
+    assert.equal(stuck.includes("open"), true, "the app must be reopened after a post-quit failure");
+    assert.equal(polls > 0, true);
+
+    // Abort (e.g. a cancel landed on the receipt): nothing is quit or swapped.
+    const aborted: string[] = [];
+    await assert.rejects(
+      performDirectOfficialUpdate(input(f), {
+        ...passingDeps(aborted),
+        fetch: fetchServing(f.zip),
+        shouldAbort: () => true,
+      }),
+      /aborted before touching the live app/,
+    );
+    assert.deepEqual(aborted, []);
+    assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8").includes("6872"), true);
+  } finally { f.cleanup(); }
 });
 
 test("the direct install refuses untrusted, mismatched, or oversized archives before touching the live app", async () => {
-  const root = mkdtempSync(join(tmpdir(), "direct-update-"));
+  const f = fixture();
   try {
-    const source = join(root, "source");
-    mkdirSync(source, { recursive: true });
-    writeApp(join(source, "ChatGPT.app"));
-    const zip = zipApp(source);
-    const live = join(root, "Applications", "ChatGPT.app");
-    writeApp(live, { version: "26.818.22352", build: "6872" });
-    const input = {
-      selection: makeSelection(live),
-      latest: LATEST,
-      enclosureUrl: "https://persistent.oaistatic.com/codex-app-prod/app.zip",
-      enclosureLength: zip.byteLength,
-      workRoot: join(root, "work"),
-    };
-    const liveBytesBefore = readFileSync(join(live, "Contents", "Info.plist"), "utf8");
+    const liveBefore = readFileSync(join(f.live, "Contents", "Info.plist"), "utf8");
     const events: string[] = [];
 
     await assert.rejects(
-      performDirectOfficialUpdate(input, {
+      performDirectOfficialUpdate(input(f), {
         ...passingDeps(events),
-        fetch: fetchServing(zip),
+        fetch: fetchServing(f.zip),
         signatureInfo: () => ({ ok: true, adHoc: false, teamIdentifier: "NOTOPENAI", authority: [], output: "" }),
       }),
       /not signed by OpenAI Team/,
     );
     await assert.rejects(
       performDirectOfficialUpdate(
-        { ...input, latest: { marketingVersion: "27.0.0", build: "9999" } },
-        { ...passingDeps(events), fetch: fetchServing(zip) },
+        { ...input(f), latest: { marketingVersion: "27.0.0", build: "9999" } },
+        { ...passingDeps(events), fetch: fetchServing(f.zip) },
       ),
       /does not match the signed appcast item/,
     );
     await assert.rejects(
-      performDirectOfficialUpdate(input, {
+      performDirectOfficialUpdate(input(f), {
         ...passingDeps(events),
-        fetch: fetchServing(zip, String(64 * 1024 * 1024 * 1024)),
+        fetch: fetchServing(f.zip, String(64 * 1024 * 1024 * 1024)),
       }),
       /exceeds the size bound/,
     );
     await assert.rejects(
       performDirectOfficialUpdate(
-        { ...input, enclosureUrl: "http://insecure.example.com/app.zip" },
-        { ...passingDeps(events), fetch: fetchServing(zip) },
+        { ...input(f), enclosureUrl: "http://insecure.example.com/app.zip" },
+        { ...passingDeps(events), fetch: fetchServing(f.zip) },
       ),
       /transport must be HTTPS/,
     );
+    // A redirect may not downgrade the transport either.
+    await assert.rejects(
+      performDirectOfficialUpdate(input(f), {
+        ...passingDeps(events),
+        fetch: (async () => ({
+          ok: true,
+          status: 302,
+          headers: { get: (name: string) => (name.toLowerCase() === "location" ? "http://insecure.example.com/app.zip" : null) },
+          body: null,
+        })) as unknown as typeof fetch,
+      }),
+      /transport must be HTTPS/,
+    );
+    // A truncated body that contradicts the enclosure length is refused.
+    await assert.rejects(
+      performDirectOfficialUpdate(
+        { ...input(f), enclosureLength: f.zip.byteLength + 1000 },
+        { ...passingDeps(events), fetch: fetchServing(f.zip) },
+      ),
+      /length does not match/,
+    );
 
     assert.deepEqual(events, [], "no quit, swap, or reopen may run for a refused archive");
-    assert.equal(readFileSync(join(live, "Contents", "Info.plist"), "utf8"), liveBytesBefore);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+    assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8"), liveBefore);
+  } finally { f.cleanup(); }
 });

@@ -311,6 +311,7 @@ function dependencies(overrides: Partial<DesktopUpdateDependencies> = {}) {
       detail: "stubbed probe",
     }),
     directOfficialUpdate: null,
+    readDesktopAsarMarker: () => "absent",
     inspectLiveOfficialDesktop: () => ({
       version: { marketingVersion: "1.0.0", build: "100" },
       mainPid: 101,
@@ -1454,11 +1455,16 @@ test("a failed prepare does not correlate an unrelated historical environment re
       attempt: 0,
       error: "older unrelated failure",
     };
+    const touched: string[] = [];
     const coordinator: EnvironmentCoordinator = {
       ...fakeCoordinator([]),
       prepare: async () => { throw new Error("prepare failed before persisting its own receipt"); },
       status: () => historical,
-    };
+      rollback: async (transactionId: string) => {
+        touched.push(transactionId);
+        throw new Error("the unrelated historical receipt must never be recovered");
+      },
+    } as EnvironmentCoordinator;
     const { deps } = dependencies({ environment: coordinator });
     const transaction = createDesktopUpdateTransaction(fixture, deps);
 
@@ -1466,11 +1472,15 @@ test("a failed prepare does not correlate an unrelated historical environment re
 
     assert.equal(failed.phase, "failed");
     assert.equal(failed.environmentTransactionId, null);
-    await assert.rejects(() => transaction.cancel(), /cannot be safely cancelled from failed/i);
-    assert.throws(
-      () => assertLifecycleReceiptsIdle(fixture.root, { contextOwned: false }),
-      /without confirmed safe official mode.*explicit recovery/i,
-    );
+    // A pre-binding failure (environmentTransactionId null) has no
+    // transaction to recover through a coordinator; cancel resolves it from
+    // independent live-byte proof without ever touching the unrelated
+    // historical receipt - and the lifecycle gate opens again.
+    const cancelled = await transaction.cancel();
+    assert.equal(cancelled.phase, "rolled_back");
+    assert.equal(cancelled.safeOfficialMode, true);
+    assert.deepEqual(touched, []);
+    assert.doesNotThrow(() => assertLifecycleReceiptsIdle(fixture.root, { contextOwned: false }));
   });
 });
 
