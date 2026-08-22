@@ -153,17 +153,31 @@ test("every failure past the quit still reopens the app, and an abort stops befo
     assert.equal(stuck.includes("open"), true, "the app must be reopened after a post-quit failure");
     assert.equal(polls > 0, true);
 
-    // Abort (e.g. a cancel landed on the receipt): nothing is quit or swapped.
+    // Abort (e.g. a cancel landed on the receipt): nothing is quit or
+    // swapped. shouldAbort rides the INPUT - the exact shape the production
+    // adapter forwards - never a test-only deps seam.
     const aborted: string[] = [];
     await assert.rejects(
-      performDirectOfficialUpdate(input(f), {
-        ...passingDeps(aborted),
-        fetch: fetchServing(f.zip),
-        shouldAbort: () => true,
-      }),
+      performDirectOfficialUpdate(
+        { ...input(f), shouldAbort: () => true },
+        { ...passingDeps(aborted), fetch: fetchServing(f.zip) },
+      ),
       /aborted before touching the live app/,
     );
     assert.deepEqual(aborted, []);
+
+    // A cancel landing DURING the slow staging/verify window still stops the
+    // quit itself: first consult passes, the pre-quit consult aborts.
+    const lateAbort: string[] = [];
+    let consults = 0;
+    await assert.rejects(
+      performDirectOfficialUpdate(
+        { ...input(f), shouldAbort: () => { consults += 1; return consults > 1; } },
+        { ...passingDeps(lateAbort), fetch: fetchServing(f.zip) },
+      ),
+      /aborted before touching the live app/,
+    );
+    assert.deepEqual(lateAbort, [], "the quit must never run after a staging-window cancel");
     assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8").includes("6872"), true);
   } finally { f.cleanup(); }
 });

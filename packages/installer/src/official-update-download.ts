@@ -53,6 +53,13 @@ export interface DirectOfficialUpdateInput {
   enclosureUrl: string;
   enclosureLength: number | null;
   workRoot: string;
+  /**
+   * Abort channel consulted before staging, before the quit, and before the
+   * swap. Lives on the INPUT (not the deps) so the transaction's adapter
+   * forwards it structurally - a deps-side twin was silently unwired in
+   * production and both checks were no-ops (re-audit 2026-08-21).
+   */
+  shouldAbort?: () => boolean;
 }
 
 export interface DirectOfficialUpdateDeps {
@@ -65,8 +72,6 @@ export interface DirectOfficialUpdateDeps {
   isAppRunning?: (appPath: string) => boolean;
   openApp?: (appPath: string) => void;
   sleep?: (ms: number) => Promise<void>;
-  /** Consulted between download/verify and the quit, and again before the swap. */
-  shouldAbort?: () => boolean;
 }
 
 export async function performDirectOfficialUpdate(
@@ -103,7 +108,7 @@ export async function performDirectOfficialUpdate(
     const verified = locateSingleApp(extracted);
     assertVerifiedOfficialBundle(verified, input, deps);
 
-    if (deps.shouldAbort?.() === true) {
+    if (input.shouldAbort?.() === true) {
       throw new Error("Direct update aborted before touching the live app");
     }
 
@@ -120,6 +125,12 @@ export async function performDirectOfficialUpdate(
     const open = deps.openApp ?? ((path: string) => openCodex(path, { detached: true }));
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
+    // The staging clone and its re-verification above take tens of seconds
+    // on a multi-GB bundle; a cancel landing in that window must stop the
+    // quit itself, not merely the later swap.
+    if (input.shouldAbort?.() === true) {
+      throw new Error("Direct update aborted before touching the live app");
+    }
     quit(appPath);
     try {
       for (let attempt = 0; running(appPath); attempt += 1) {
@@ -137,7 +148,7 @@ export async function performDirectOfficialUpdate(
         return settled;
       }
 
-      if (deps.shouldAbort?.() === true) {
+      if (input.shouldAbort?.() === true) {
         throw new Error("Direct update aborted before the swap");
       }
 
