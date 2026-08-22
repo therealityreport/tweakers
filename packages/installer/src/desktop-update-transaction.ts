@@ -1513,7 +1513,19 @@ export function createDesktopUpdateTransaction(
           phase: "verifying",
           source: switched.selection,
         });
-        const completed = await verifyAndComplete(receipt, switched.selection, switched.targetMainPid, switched.pair);
+        // previousMainPid is the PID from BEFORE the cutover: verification
+        // proves the desktop actually restarted into the requested
+        // environment. The warm commit already launched the target, so
+        // passing its own targetMainPid demanded a SECOND restart that never
+        // comes and timed out every v2 return (live failure 2026-08-22, the
+        // first run to reach this leg). Compare against the official app the
+        // swap replaced instead.
+        const completed = await verifyAndComplete(
+          receipt,
+          switched.selection,
+          receipt.officialMainPid ?? null,
+          switched.pair,
+        );
         refreshPristineBackupFromPair(completed, switched.pair);
         return completed;
       } catch (error) {

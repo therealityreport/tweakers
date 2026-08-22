@@ -469,6 +469,7 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
     };
     let verificationKind: string | null = null;
     let verificationPair: DesktopUpdateModeCachePair | null = null;
+    let verificationPreviousMainPid: number | null | undefined;
     const { calls, deps } = dependencies({
       modeCacheV2,
       readCurrentSelection: () => currentSelection,
@@ -480,6 +481,7 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
       verifyFinal: async (input) => {
         verificationKind = input.environmentTransactionKind;
         verificationPair = input.modeCachePair;
+        verificationPreviousMainPid = input.previousMainPid;
         return { ok: true, error: null };
       },
     });
@@ -494,6 +496,11 @@ test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a f
     assert.equal(receipt.refreshSource, "development");
     assert.equal(verificationKind, "mode-cache-v2");
     assert.equal(verificationPair?.generationId, "mode-generation-2");
+    // Verification proves the desktop RESTARTED into Tweakers, so it must be
+    // handed the pre-cutover official PID (201), never the target PID the
+    // warm commit just launched (301) - that demanded a second restart that
+    // never comes and timed out every v2 return (live failure 2026-08-22).
+    assert.equal(verificationPreviousMainPid, 201);
     assert.deepEqual(modeCalls, [
       "switch:mode-generation-1:chatgpt",
       "prepare-and-switch:mode-generation-2:tweakers",
