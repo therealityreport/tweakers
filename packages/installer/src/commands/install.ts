@@ -2502,7 +2502,6 @@ export function copyCandidatePreimage(source: string, destination: string): void
 interface PromotionMcpReceiptSummary {
   status: "updated" | "unchanged" | "conflict" | "error";
   conflictCount: number;
-  userQuestionsStateConsistent: boolean;
 }
 
 export function reconcilePromotionMcpConfig(input: {
@@ -2518,12 +2517,8 @@ export function reconcilePromotionMcpConfig(input: {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Candidate MCP reconciler is not a regular runtime file");
   const runtime = createRequire(import.meta.url)(runtimeModulePath) as {
     reconcileMcpConfig(options: Record<string, unknown>): Record<string, unknown>;
-    userQuestionsMcpReceiptMatchesEnabledState(receipt: Record<string, unknown>, enabled: boolean): boolean;
   };
   if (typeof runtime.reconcileMcpConfig !== "function") throw new Error("Candidate runtime does not expose MCP reconciliation");
-  if (typeof runtime.userQuestionsMcpReceiptMatchesEnabledState !== "function") {
-    throw new Error("Candidate runtime does not expose User Questions MCP state validation");
-  }
   const config = readJsonRecord(input.tweakersConfigPath);
   const ownedTweaks = readdirSync(input.tweaksRoot, { withFileTypes: true })
     // Dot-directories are lifecycle bookkeeping, not tweaks — notably
@@ -2547,11 +2542,7 @@ export function reconcilePromotionMcpConfig(input: {
       };
     })
     .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-  if (!ownedTweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID)) {
-    throw new Error("Canonical User Questions MCP source is missing from the promotion tree");
-  }
   const tweaks = ownedTweaks.filter((tweak) => tweakEnabledInConfig(config, String(tweak.manifest.id)));
-  const userQuestionsEnabled = tweaks.some((tweak) => tweak.manifest.id === USER_QUESTIONS_TWEAK_ID);
   mkdirSync(dirname(input.codexConfigPath), { recursive: true, mode: 0o700 });
   const receipt = runtime.reconcileMcpConfig({
     configPath: input.codexConfigPath,
@@ -2574,13 +2565,12 @@ export function reconcilePromotionMcpConfig(input: {
   return {
     status: status as PromotionMcpReceiptSummary["status"],
     conflictCount: conflicts.length,
-    userQuestionsStateConsistent: runtime.userQuestionsMcpReceiptMatchesEnabledState(receipt, userQuestionsEnabled),
   };
 }
 
 function assertPromotionMcpReceipt(receipt: PromotionMcpReceiptSummary, scope: string): void {
-  if (receipt.status === "conflict" || receipt.status === "error" || receipt.conflictCount !== 0 || !receipt.userQuestionsStateConsistent) {
-    throw new Error(`${scope} MCP reconciliation did not prove the expected User Questions enabled state`);
+  if (receipt.status === "conflict" || receipt.status === "error" || receipt.conflictCount !== 0) {
+    throw new Error(`${scope} MCP reconciliation did not complete cleanly`);
   }
 }
 

@@ -1080,7 +1080,8 @@ export interface UserQuestionsHealthObservation {
   brokerSelfTest: HealthValue;
   schemaSelfTest: HealthValue;
   rendererStorageSelfTest: HealthValue;
-  mcpConflictCount: number;
+  enhancementHandshake: HealthValue;
+  genericFallback: HealthValue;
 }
 
 export interface RuntimePromotionProbes {
@@ -1277,10 +1278,8 @@ async function buildV2Receipt(
     brokerSelfTest: observedUserQuestions?.brokerSelfTest ?? "unknown",
     schemaSelfTest: observedUserQuestions?.schemaSelfTest ?? "unknown",
     rendererStorageSelfTest: observedUserQuestions?.rendererStorageSelfTest ?? "unknown",
-    mcpConflictCount: observedUserQuestions?.mcpConflictCount ?? null,
-    zeroMcpConflicts: observedUserQuestions
-      ? observedUserQuestions.mcpConflictCount === 0 ? "pass" : "fail"
-      : "unknown",
+    enhancementHandshake: observedUserQuestions?.enhancementHandshake ?? "unknown",
+    genericFallback: observedUserQuestions?.genericFallback ?? "unknown",
   };
   const allSurfacesPass = Object.values(surfaces).every((surface) => surface.status === "pass");
   const allPermissionsPass = Object.values(permissions).every((permission) => permission === "pass");
@@ -1290,7 +1289,8 @@ async function buildV2Receipt(
     userQuestions.brokerSelfTest,
     userQuestions.schemaSelfTest,
     userQuestions.rendererStorageSelfTest,
-    userQuestions.zeroMcpConflicts,
+    userQuestions.enhancementHandshake,
+    userQuestions.genericFallback,
   ].every((value) => value === "pass");
   const rendererProofPass = passingRendererProofSummary(observedRendererProof);
   return {
@@ -1431,12 +1431,12 @@ function validPromotionHash(value: unknown): value is string {
 
 function validUserQuestionsObservation(value: unknown): value is UserQuestionsHealthObservation {
   if (!plainRecord(value) || !exactKeys(value, [
-    "id", "version", "payloadHash", "mainLifecycle", "brokerSelfTest", "schemaSelfTest", "rendererStorageSelfTest", "mcpConflictCount",
+    "id", "version", "payloadHash", "mainLifecycle", "brokerSelfTest", "schemaSelfTest", "rendererStorageSelfTest", "enhancementHandshake", "genericFallback",
   ])) return false;
   return typeof value.id === "string" && typeof value.version === "string" && validPromotionHash(value.payloadHash) &&
     validHealthValue(value.mainLifecycle) && validHealthValue(value.brokerSelfTest) && validHealthValue(value.schemaSelfTest) &&
     validHealthValue(value.rendererStorageSelfTest) &&
-    Number.isInteger(value.mcpConflictCount) && (value.mcpConflictCount as number) >= 0;
+    validHealthValue(value.enhancementHandshake) && validHealthValue(value.genericFallback);
 }
 
 function validHealthValue(value: unknown): value is HealthValue {

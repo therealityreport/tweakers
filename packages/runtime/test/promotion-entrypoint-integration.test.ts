@@ -60,11 +60,14 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   const userQuestions = sourceBlock("function promotionUserQuestionsHealth", "const desktopUpdateStartupReconciler");
   assert.match(userQuestions, /USER_QUESTIONS_TWEAK_ID/);
   assert.match(userQuestions, /fingerprintUserQuestionsPath\(root\)/);
-  assert.match(userQuestions, /typeof lifecycle\.start === "function" && typeof lifecycle\.stop === "function"/);
-  assert.match(userQuestions, /broker\.decodeFrame\(broker\.encodeFrame\(request\)\)/);
-  assert.match(userQuestions, /schema\.validateAskInput/);
+  // The probe must run the EXACT shared predicates the canonical-source
+  // repository test pins (user-questions-promotion-selftest.ts) — never
+  // inline copies that can drift from the shipped broker/schema contract
+  // (candidate refusal 2026-08-25).
+  assert.match(userQuestions, /userQuestionsMainLifecycleSelfTest\(/);
+  assert.match(userQuestions, /userQuestionsBrokerSelfTest\(/);
+  assert.match(userQuestions, /userQuestionsSchemaSelfTest\(/);
   assert.match(userQuestions, /rendererStorageSelfTest: HealthValue/);
-  assert.match(userQuestions, /userQuestionsMcpConflictCount\(\)/);
   assert.doesNotMatch(userQuestions, /new Map<string, string>/);
 
   const renderer = sourceBlock("async function runPromotionRendererProof", "const desktopUpdateStartupReconciler");
@@ -189,11 +192,11 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   assert.match(promotionHealthSource, /readFile: PromotionRendererReadFile = readFileSync/);
   assert.match(promotionHealthSource, /new Response\(null, \{ status: 404 \}\)/);
 
-  const mcp = sourceBlock("function userQuestionsMcpConflictCount", "function promotionUserQuestionsHealth");
-  assert.match(mcp, /receipt\.phase !== "complete"/);
-  assert.match(mcp, /receipt\.afterFingerprint/);
-  assert.match(mcp, /userQuestionsMcpReceiptMatchesEnabledState/);
-  assert.match(mcp, /isTweakEnabled\(USER_QUESTIONS_TWEAK_ID\)/);
+  // The enhancement owns no MCP entrypoint any more: the probe proves that
+  // directly on the manifest and derives genericFallback from the same guard,
+  // replacing the retired userQuestionsMcpConflictCount receipt comparison.
+  assert.match(userQuestions, /must not own an MCP entrypoint/);
+  assert.match(userQuestions, /genericFallback: Object\.hasOwn\(manifest, "mcp"\) \? "fail" : "pass"/);
 
   const responder = sourceBlock("void answerPromotionHealthRequest", ").then((answered)");
   assert.match(responder, /readCodexAuth\(MCP_RUNTIME_PATHS\.codexHome\)/);

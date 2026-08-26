@@ -189,6 +189,18 @@ export async function recoverEnvironmentModePairWarm(
     if (journal.phase === "ready" && journal.terminalAt !== null && pair.pin.state === "stale_requires_prepare") {
       return journal;
     }
+    // A terminal failed journal whose own failure handling already exchanged
+    // the Contents back, re-proved and reopened the source, resumed the
+    // watcher, and invalidated the grant is equally history. Without this,
+    // recovering it threw "grant is already stale" and the desktop updater's
+    // owner-dead reconcile classified an actually-healthy machine as an
+    // unsafe failure (post-revert invalidation, 2026-08-25).
+    if (journal.phase === "failed" && journal.terminalAt !== null
+      && pair.pin.state === "stale_requires_prepare"
+      && journal.stamps.some((entry) => entry.phase === "exchange-reverted")
+      && journal.stamps.some((entry) => entry.phase === "source-watcher-resumed")) {
+      return journal;
+    }
     // Cache invalidation and official adoption were durably recorded, but the
     // process died before the terminal stale fsync. No adapter or exchange is
     // needed (or permitted) to finish that journal publication.

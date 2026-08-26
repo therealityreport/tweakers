@@ -29,11 +29,8 @@ import {
   promotionPolicyFingerprintFailureReason,
 } from "./promotion-policy";
 import {
-  canonicalConfigFingerprint,
   createMcpReconciler,
-  readMcpSyncState,
   resolveMcpRuntimePaths,
-  userQuestionsMcpReceiptMatchesEnabledState,
   type McpSyncTrigger,
 } from "./mcp-reconciliation";
 import { getAndPublishWatcherHealth, getWatcherHealth, readRuntimeFingerprintEvidence } from "./watcher-health";
@@ -194,6 +191,14 @@ import {
   verifiedCodexDesktopProfileIdentity,
   type CapturedCodexDesktopProfileFeed,
 } from "./codex-desktop-update-profile";
+import {
+  userQuestionsBrokerSelfTest,
+  userQuestionsMainLifecycleSelfTest,
+  userQuestionsSchemaSelfTest,
+  type UserQuestionsBrokerModule,
+  type UserQuestionsLifecycleModule,
+  type UserQuestionsSchemaModule,
+} from "./user-questions-promotion-selftest";
 
 // Tweakers is the public name. Keep the Tweakers variables as compatibility
 // aliases so existing patched apps and user data continue to boot.
@@ -1719,36 +1724,6 @@ function promotionSelfTest(run: () => boolean): PromotionProbeValue {
   }
 }
 
-function userQuestionsMcpConflictCount(): number {
-  const stat = lstatSync(MCP_SYNC_STATE_FILE);
-  if (
-    !stat.isFile()
-    || stat.isSymbolicLink()
-    || (stat.mode & 0o777) !== 0o600
-    || stat.size > 256 * 1024
-    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-  ) throw new Error("MCP reconciliation receipt is not owner-only");
-  const receipt = readMcpSyncState(MCP_SYNC_STATE_FILE);
-  if (!receipt || receipt.schemaVersion !== 2 || receipt.phase !== "complete") {
-    throw new Error("MCP reconciliation receipt is incomplete");
-  }
-  const configBytes = existsSync(CODEX_CONFIG_FILE) ? readFileSync(CODEX_CONFIG_FILE) : Buffer.alloc(0);
-  // The app stamps volatile marketplace `last_updated` lines into config.toml
-  // after the boot-time reconcile, so a raw-byte binding races every probe.
-  // Prefer the receipt's canonical binding; raw compare remains the fallback
-  // for receipts written before the canonical field existed.
-  const bound = receipt.afterFingerprintCanonical !== undefined
-    ? receipt.afterFingerprintCanonical === canonicalConfigFingerprint(configBytes)
-    : receipt.afterFingerprint === createHash("sha256").update(configBytes).digest("hex");
-  if (!bound) {
-    throw new Error("MCP reconciliation receipt does not bind the observed Codex config");
-  }
-  if (!userQuestionsMcpReceiptMatchesEnabledState(receipt, isTweakEnabled(USER_QUESTIONS_TWEAK_ID))) {
-    throw new Error("MCP receipt does not prove the expected User Questions enabled state and policy");
-  }
-  return receipt.conflicts.length;
-}
-
 function promotionUserQuestionsHealth(rendererStorageSelfTest: HealthValue): UserQuestionsHealthObservation {
   assertPromotionProbeIsolation();
   const root = join(TWEAKS_DIR, USER_QUESTIONS_FOLDER);
@@ -1768,52 +1743,20 @@ function promotionUserQuestionsHealth(rendererStorageSelfTest: HealthValue): Use
     throw new Error("User Questions broker permissions are missing");
   }
   const mainEntrypoint = typeof manifest.main === "string" ? manifest.main : "index.js";
-  const mcp = manifest.mcp && typeof manifest.mcp === "object" && !Array.isArray(manifest.mcp)
-    ? manifest.mcp as Record<string, unknown>
-    : null;
-  const mcpArgs = mcp && Array.isArray(mcp.args) ? mcp.args : [];
-  const mcpEntrypoint = mcpArgs.find((value): value is string => typeof value === "string" && value.endsWith(".js"));
-  if (mcp?.command !== "node" || !mcpEntrypoint) throw new Error("User Questions MCP entrypoint is invalid");
-  requirePromotionModule(root, mcpEntrypoint);
+  if (Object.hasOwn(manifest, "mcp")) throw new Error("User Questions enhancement must not own an MCP entrypoint");
 
-  const mainLifecycle = promotionSelfTest(() => {
-    const lifecycle = requirePromotionModule(root, mainEntrypoint) as { start?: unknown; stop?: unknown };
-    return typeof lifecycle.start === "function" && typeof lifecycle.stop === "function";
-  });
-  const brokerSelfTest = promotionSelfTest(() => {
-    const broker = requirePromotionModule(root, "broker-protocol.js") as {
-      requestFrame(id: string, method: string, payload: object): unknown;
-      encodeFrame(frame: unknown): Buffer;
-      decodeFrame(frame: Buffer): Record<string, unknown>;
-    };
-    const request = broker.requestFrame("promotion-health", "ping", { probe: true });
-    const decoded = broker.decodeFrame(broker.encodeFrame(request));
-    let rejectedMalformed = false;
-    try { broker.decodeFrame(Buffer.from("{}\n")); } catch { rejectedMalformed = true; }
-    return decoded.version === 1 && decoded.kind === "request" && decoded.id === "promotion-health"
-      && decoded.method === "ping" && rejectedMalformed;
-  });
-  const schemaSelfTest = promotionSelfTest(() => {
-    const schema = requirePromotionModule(root, "core.js") as {
-      validateAskInput(value: unknown): { ok: boolean };
-    };
-    const valid = schema.validateAskInput({
-      round_id: "promotion-health",
-      questions: [{
-        id: "choice",
-        header: "Promotion health",
-        question: "Does the native decision schema accept this round?",
-        selection_mode: "single",
-        options: [
-          { id: "yes", label: "Yes (Recommended)", description: "Accept the canonical schema.", recommended: true },
-          { id: "no", label: "No", description: "Reject the canonical schema." },
-        ],
-        allow_other: true,
-      }],
-    });
-    const invalid = schema.validateAskInput({ round_id: "promotion-health", questions: [] });
-    return valid.ok === true && invalid.ok === false;
-  });
+  // These predicates are shared verbatim with the repository test that pins
+  // the canonical tweak sources, so an enhancement-protocol migration can
+  // never half-land again (candidate refusal 2026-08-25).
+  const mainLifecycle = promotionSelfTest(() => userQuestionsMainLifecycleSelfTest(
+    requirePromotionModule(root, mainEntrypoint) as UserQuestionsLifecycleModule,
+  ));
+  const brokerSelfTest = promotionSelfTest(() => userQuestionsBrokerSelfTest(
+    requirePromotionModule(root, "main-broker.js") as UserQuestionsBrokerModule,
+  ));
+  const schemaSelfTest = promotionSelfTest(() => userQuestionsSchemaSelfTest(
+    requirePromotionModule(root, "core.js") as UserQuestionsSchemaModule,
+  ));
   return {
     id: USER_QUESTIONS_TWEAK_ID,
     version: manifest.version,
@@ -1822,7 +1765,8 @@ function promotionUserQuestionsHealth(rendererStorageSelfTest: HealthValue): Use
     brokerSelfTest,
     schemaSelfTest,
     rendererStorageSelfTest,
-    mcpConflictCount: userQuestionsMcpConflictCount(),
+    enhancementHandshake: brokerSelfTest,
+    genericFallback: Object.hasOwn(manifest, "mcp") ? "fail" : "pass",
   };
 }
 
@@ -4114,11 +4058,9 @@ async function loadAllMainTweaks(): Promise<void> {
     : nextReloadMcpTrigger;
   initialMcpReconciliationPending = false;
   nextReloadMcpTrigger = "tweak-reload";
-  let userQuestionsMcpReady = false;
   if (mcpReconciler) {
     try {
-      const receipt = await mcpReconciler.reconcileNow(mcpTrigger);
-      userQuestionsMcpReady = userQuestionsMcpReceiptMatchesEnabledState(receipt, true);
+      await mcpReconciler.reconcileNow(mcpTrigger);
     } catch (error) {
       log("error", "MCP reconciliation failed before main tweak startup:", error);
     }
@@ -4129,13 +4071,6 @@ async function loadAllMainTweaks(): Promise<void> {
     if (!isTweakEnabled(t.manifest.id)) {
       recordTweakLifecycle(t.manifest.id, "main", isTweakQuarantined(t.manifest.id) ? "quarantined" : "disabled");
       log("info", `skipping disabled main tweak: ${t.manifest.id}`);
-      continue;
-    }
-    if (t.manifest.id === "co.tweakers.user-questions" && !userQuestionsMcpReady) {
-      const error = "canonical User Questions MCP reconciliation did not complete";
-      recordTweakLifecycle(t.manifest.id, "main", "failed", error);
-      recordTweakHealth(t.manifest.id, "failed", error);
-      log("error", `skipping User Questions main migration: ${error}`);
       continue;
     }
     recordTweakLifecycle(t.manifest.id, "main", "starting");

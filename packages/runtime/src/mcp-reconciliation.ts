@@ -28,10 +28,9 @@ import type {
 import {
   MCP_MANAGED_END,
   MCP_MANAGED_START,
-  USER_QUESTIONS_MCP_SERVER_NAME,
   hasStrayManagedMcpEndMarker,
   mcpServerNameFromTweakId,
-  observeUserQuestionsApprovalPolicy,
+  observeTopLevelPolicyAssignments,
   planManagedMcpReconciliation,
   sanitizePreservedApprovalPolicy,
   sanitizePreservedMcpOptions,
@@ -79,26 +78,6 @@ export interface McpSyncReceipt {
    */
   managedConfigurationChangedAt?: string | null;
   error?: string;
-}
-
-export function userQuestionsMcpReceiptMatchesEnabledState(
-  receipt: Pick<McpSyncReceipt, "status" | "desiredNames" | "appliedNames" | "conflicts" | "approvalPolicy">,
-  enabled: boolean,
-): boolean {
-  if (
-    receipt.status === "conflict"
-    || receipt.status === "error"
-    || receipt.conflicts.length !== 0
-    || receipt.approvalPolicy.status !== "unchanged"
-    || receipt.approvalPolicy.beforeRaw !== receipt.approvalPolicy.afterRaw
-    || receipt.approvalPolicy.sandboxModeBeforeRaw !== receipt.approvalPolicy.sandboxModeAfterRaw
-    || receipt.approvalPolicy.restartRequired
-  ) return false;
-  const desiredCount = receipt.desiredNames.filter((name) => name === USER_QUESTIONS_MCP_SERVER_NAME).length;
-  const appliedCount = receipt.appliedNames.filter((name) => name === USER_QUESTIONS_MCP_SERVER_NAME).length;
-  if (!enabled) return desiredCount === 0 && appliedCount === 0;
-  return desiredCount === 1
-    && appliedCount === 1;
 }
 
 export interface ReconcileMcpConfigOptions {
@@ -1107,14 +1086,10 @@ export function planMcpConfigReconciliation(
   options: PlanMcpConfigReconciliationOptions = {},
 ): McpReconciliationPlan {
   const mcpPlan = planManagedMcpReconciliation(tweaks, currentToml, options);
-  const ownedTweaks = options.ownedTweaks ?? tweaks;
   const preservedApprovalPolicy = sanitizePreservedApprovalPolicy(options.preservedApprovalPolicy);
-  const approvalPolicy = ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions")
-    ? observeUserQuestionsApprovalPolicy(currentToml, preservedApprovalPolicy)
-    : mcpPlan.approvalPolicy;
   const plan: McpReconciliationPlan = {
     ...mcpPlan,
-    approvalPolicy,
+    approvalPolicy: observeTopLevelPolicyAssignments(currentToml, preservedApprovalPolicy),
     preservedApprovalPolicy,
   };
   if (!mcpPlan.changed || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {

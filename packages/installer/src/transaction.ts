@@ -129,8 +129,8 @@ export interface UserQuestionsPromotionObservation {
   brokerSelfTest: HealthValue;
   schemaSelfTest: HealthValue;
   rendererStorageSelfTest: HealthValue;
-  mcpConflictCount: number | null;
-  zeroMcpConflicts: HealthValue;
+  enhancementHandshake: HealthValue;
+  genericFallback: HealthValue;
 }
 
 export interface RendererPromotionProofObservation {
@@ -1446,7 +1446,8 @@ function validV2HealthReceipt(
     userQuestions.brokerSelfTest,
     userQuestions.schemaSelfTest,
     userQuestions.rendererStorageSelfTest,
-    userQuestions.zeroMcpConflicts,
+    userQuestions.enhancementHandshake,
+    userQuestions.genericFallback,
   ].every((status) => status === "pass");
   const expectedReady: HealthValue = surfaceStatuses.every((status) => status === "pass")
     && value.hostReady === "pass"
@@ -1531,8 +1532,8 @@ function validUserQuestionsReceipt(
     "brokerSelfTest",
     "schemaSelfTest",
     "rendererStorageSelfTest",
-    "mcpConflictCount",
-    "zeroMcpConflicts",
+    "enhancementHandshake",
+    "genericFallback",
   ])) return false;
   if (!sameUserQuestionsExpectation(value.expected, expected)) return false;
   const observed = value.observed === null
@@ -1548,14 +1549,10 @@ function validUserQuestionsReceipt(
     || validHealthValue(value.brokerSelfTest) !== value.brokerSelfTest
     || validHealthValue(value.schemaSelfTest) !== value.schemaSelfTest
     || validHealthValue(value.rendererStorageSelfTest) !== value.rendererStorageSelfTest
+    || validHealthValue(value.enhancementHandshake) !== value.enhancementHandshake
+    || validHealthValue(value.genericFallback) !== value.genericFallback
   ) return false;
-  if (value.mcpConflictCount !== null && (
-    !Number.isInteger(value.mcpConflictCount) || (value.mcpConflictCount as number) < 0
-  )) return false;
-  const zeroMcpConflicts: HealthValue = value.mcpConflictCount === null
-    ? "unknown"
-    : value.mcpConflictCount === 0 ? "pass" : "fail";
-  return value.zeroMcpConflicts === zeroMcpConflicts;
+  return true;
 }
 
 function validPromotionExpectation(expected: ProductionHealthExpectationV2): boolean {

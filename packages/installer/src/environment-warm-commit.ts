@@ -340,6 +340,10 @@ export async function commitPreparedEnvironmentModePairWarm(
   const journalFile = environmentWarmCommitJournalFile(pair);
   let receipt = createWarmCommitReceipt(input, pair, now());
   let exchanged = false;
+  // The receipt rotation is a separate boundary from the physical exchange: a
+  // proof failure can leave bytes swapped while the receipt still holds the
+  // pre-exchange roles, and the inverse leg must know which happened.
+  let rotationRecorded = false;
   // The outer live path stays fixed, while this immutable role identifies the
   // incoming target bytes that occupy it after the forward Contents exchange.
   let inverseTargetRole: EnvironmentModePairReceipt["roles"]["inactive"] | null = null;
@@ -434,6 +438,7 @@ export async function commitPreparedEnvironmentModePairWarm(
 
     const exchangeProof = await deps.captureExchangeProof({ pair, before: preflight.exchangeBefore });
     const rotated = lease.completeContentsExchange(exchangeProof, now());
+    rotationRecorded = true;
     activePair = rotated;
     receipt = stamp(receipt, "exchanged", now());
     receipt = persistWarmCommitReceipt(journalFile, receipt);
@@ -520,6 +525,54 @@ export async function commitPreparedEnvironmentModePairWarm(
         );
         receipt = stamp({ ...receipt, exchangeCount: receipt.exchangeCount + 1 }, "exchange-reverted", now());
         receipt = persistWarmCommitReceipt(journalFile, receipt);
+        if (!rotationRecorded) {
+          // The bytes are restored exactly and the receipt never rotated, so
+          // this is a pre-cutover outcome — but the failure itself proves the
+          // pair's evidence no longer binds reality. Release the grant so the
+          // next mode action prepares a fresh generation instead of replaying
+          // this one into the same failure.
+          try {
+            lease.invalidateBeforeCutover(now());
+            failures.push("sealed pair invalidated; the next mode action prepares a fresh generation");
+          } catch (invalidationError) {
+            failures.push(`post-revert invalidation failed: ${errorMessage(invalidationError)}`);
+          }
+          // Restore the user's app and the watcher like the pre-exchange
+          // failure path — but only after RE-PROVING the sealed source role at
+          // the live path. The proof failure that landed here may itself mean
+          // the inactive slot no longer held the original source, in which
+          // case the exchange-back installed unproven bytes that must never be
+          // launched or attested to the watcher. Leaving the watcher paused on
+          // that refusal is deliberate: supervised recovery owns it. (Both
+          // halves are live failure 2026-08-25: the paused orphan blocked
+          // every later transaction, and the blind reopen was flagged in
+          // review before it shipped.)
+          try {
+            const restoredSource = environmentWarmCommitLiveTargetIdentity(pair, pair.roles.live, pair.roles.live.appPath);
+            const restored = assertEnvironmentWarmCommitLiveTargetObservation(
+              restoredSource,
+              await deps.observeExactLiveTarget({
+                pair,
+                expected: restoredSource,
+                recordedMainPid: receipt.targetMainPid,
+              }),
+            );
+            if (restored !== null) {
+              throw new Error("Warm commit post-revert source verification found an unexpected running process");
+            }
+            await deps.reopenTarget(pair.roles.live.appPath);
+            await deps.resumeWatcher({
+              transactionId: input.transactionId,
+              targetAppRoot: pair.roles.live.appPath,
+              targetExpectedFingerprint: pair.roles.live.evidence.appDigest,
+            });
+            watcherPaused = false;
+            receipt = stamp(receipt, "source-watcher-resumed", now());
+            receipt = persistWarmCommitReceipt(journalFile, receipt);
+          } catch (sourceRestoreError) {
+            failures.push(`post-revert source restore failed: ${errorMessage(sourceRestoreError)}`);
+          }
+        }
       } catch (exchangeBackError) {
         failures.push(`immediate exchange-back failed: ${errorMessage(exchangeBackError)}`);
       }

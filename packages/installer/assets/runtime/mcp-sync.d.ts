@@ -1,7 +1,6 @@
 import type { TweakMcpServer } from "@therealityreport/tweakers-sdk";
 export declare const MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 export declare const MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
-export declare const USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
 export declare const RESERVED_MANAGED_MCP_ENV_KEYS: readonly ["TWEAKER_TWEAK_DATA_DIR", "TWEAKER_TWEAK_ID"];
 export interface McpSyncTweak {
     dir: string;
@@ -73,12 +72,13 @@ export declare function syncManagedMcpServers({ configPath, tweaks, }: {
 export declare function buildManagedMcpBlock(tweaks: McpSyncTweak[], existingToml?: string): BuiltManagedMcpBlock;
 export declare function planManagedMcpReconciliation(tweaks: McpSyncTweak[], currentToml?: string, options?: ManagedMcpReconciliationOptions): McpReconciliationPlan;
 /**
- * Observe policy fields for reconciliation receipts without changing them.
- * Policy mutation belongs exclusively to the User Questions Preview/Apply/
- * Restore transaction; ordinary MCP startup and enable/disable reconciliation
- * may only register or remove the server block.
+ * Observe top-level policy fields for reconciliation receipts without
+ * changing them. Managed MCP reconciliation may only register or remove
+ * server blocks; it never rewrites approval_policy or sandbox_mode.
+ * Duplicate top-level assignments make the live policy ambiguous, so the
+ * plan fails closed as a conflict instead of guessing which line wins.
  */
-export declare function observeUserQuestionsApprovalPolicy(currentToml: string, preserved?: Readonly<PreservedApprovalPolicy> | null): ApprovalPolicyReconciliation;
+export declare function observeTopLevelPolicyAssignments(currentToml: string, preserved?: Readonly<PreservedApprovalPolicy> | null): ApprovalPolicyReconciliation;
 export declare function sanitizePreservedApprovalPolicy(value: unknown): PreservedApprovalPolicy | null;
 export declare function sanitizePreservedMcpOptions(value: unknown, allowedServerNames: Iterable<string>): PreservedMcpOptionsByServerName;
 export declare function mergeManagedMcpBlock(currentToml: string, managedBlock: string): string;

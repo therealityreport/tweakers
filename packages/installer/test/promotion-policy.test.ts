@@ -365,7 +365,8 @@ test("schema-v2 request and receipt align installer expectation with runtime sem
         brokerSelfTest: "pass",
         schemaSelfTest: "pass",
         rendererStorageSelfTest: "pass",
-        mcpConflictCount: 0,
+        enhancementHandshake: "pass",
+        genericFallback: "pass",
       }),
     }, { now: new Date("2026-07-21T23:00:01.000Z") });
     assert.equal(accepted, true);

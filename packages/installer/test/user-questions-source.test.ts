@@ -11,15 +11,14 @@ function sourceFixture(): string {
     id: "co.tweakers.user-questions",
     version: "0.5.0",
     scope: "both",
-    mcp: { command: "node", args: ["mcp-server.js"] },
   }));
-  for (const file of ["index.js", "mcp-server.js", "broker-protocol.js", "core.js"]) {
+  for (const file of ["index.js", "main-broker.js", "core.js"]) {
     writeFileSync(join(root, file), `module.exports = ${JSON.stringify(file)};\n`);
   }
   return root;
 }
 
-test("source proof binds canonical ID, version, payload, lifecycle, broker, and schema", () => {
+test("source proof binds the enhancement-only canonical ID, version, payload, lifecycle, broker, and schema", () => {
   const root = sourceFixture();
   try {
     const proof = inspectUserQuestionsSource(root);
@@ -28,6 +27,7 @@ test("source proof binds canonical ID, version, payload, lifecycle, broker, and 
     assert.match(proof.payloadHash, /^[a-f0-9]{64}$/);
     assert.equal(userQuestionsSourceMatches(proof, proof), true);
     assert.equal(userQuestionsSourceMatches(proof, { ...proof, version: "0.5.1" }), false);
+    assert.equal("mcpEntrypoint" in proof, false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -51,5 +51,18 @@ test("source proof rejects symlinked payload entries", () => {
     mkdirSync(join(root, "outside"));
     symlinkSync(join(root, "outside"), join(root, "linked"));
     assert.throws(() => inspectUserQuestionsSource(root), /symbolic links are not allowed/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("source proof rejects an embedded MCP declaration", () => {
+  const root = sourceFixture();
+  try {
+    writeFileSync(join(root, "manifest.json"), JSON.stringify({
+      id: "co.tweakers.user-questions",
+      version: "0.5.0",
+      scope: "both",
+      mcp: { command: "node", args: ["mcp-server.js"] },
+    }));
+    assert.throws(() => inspectUserQuestionsSource(root), /must not declare an embedded MCP entrypoint/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

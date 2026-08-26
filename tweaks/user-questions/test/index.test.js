@@ -3,9 +3,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const { tmpdir } = require("node:os");
+const { join } = require("node:path");
 const vm = require("node:vm");
 const { createRoundState, reduceRoundState } = require("../round-state");
+const { createMainBroker } = require("../main-broker");
 const { SemanticEvent, createSemanticDom, findByText, flushDom } = require("./semantic-dom");
+const { exchangeEnhancement } = require("./enhancement-client");
 
 const SOURCE = fs.readFileSync(require.resolve("../index"), "utf8");
 const NONCE = "renderer-nonce-1234";
@@ -495,7 +499,296 @@ test("main startup never imports or invokes repairGlobalStateFile and cleans bro
   assert.equal(brokerStarts, 1);
   assert.equal(brokerStops, 1);
   assert.equal(repairReads, 0);
-  assert.equal(removed.length, 8);
+  assert.equal(removed.length, 12);
+});
+
+test("enhancement renderer acknowledges a bound delivery and returns a deliberate generic-form response", async () => {
+  const harness = rendererHarness({ noCarrier: true, deferEnhancementAck: true });
+  await harness.start();
+  const delivery = {
+    version: 1,
+    type: "deliver",
+    id: "enhanced-request-1",
+    session_id: "enhanced-session-1",
+    route_fingerprint: "a".repeat(64),
+    input_fingerprint: "b".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose an option.",
+      requestedSchema: {
+        type: "object",
+        required: ["choice", "tags", "__proto__"],
+        properties: {
+          details: {
+            type: "string",
+            title: "Details",
+          },
+          choice: {
+            type: "string",
+            title: "Choice",
+            oneOf: [
+              { const: "a", title: "A" },
+              { const: "b", title: "B" },
+            ],
+          },
+          optionalChoice: {
+            type: "string",
+            title: "Optional choice",
+            oneOf: [
+              { const: "optional-a", title: "Optional A" },
+              { const: "optional-b", title: "Optional B" },
+            ],
+          },
+          tags: {
+            type: "array",
+            title: "Tags",
+            minItems: 1,
+            items: {
+              anyOf: [
+                { const: "tag-a", title: "Tag A" },
+                { const: "tag-b", title: "Tag B" },
+              ],
+            },
+          },
+          ["__proto__"]: {
+            type: "string",
+            title: "Prototype field",
+          },
+        },
+      },
+    },
+  };
+  harness.deliverEnhancement(delivery);
+  await flushDom();
+  const card = harness.enhancementCard();
+  assert.ok(card, "the exact renderer mounted the delivered form");
+  assert.equal(harness.enhancementAcks.length, 1);
+  assert.equal(card.getAttribute("aria-busy"), "true");
+  assert.equal(
+    card.querySelectorAll("button, input, textarea").every((control) => control.disabled),
+    true,
+    "the enhancement cannot lose input while acknowledgement is pending",
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementAcks[0])), {
+    version: 1,
+    type: "acknowledged",
+    session_id: delivery.session_id,
+    route_fingerprint: delivery.route_fingerprint,
+    input_fingerprint: delivery.input_fingerprint,
+  });
+  assert.equal(harness.enhancementResponses.length, 0, "mounting alone cannot invent an answer");
+  harness.resolveEnhancementAck();
+  await flushDom();
+  assert.equal(card.getAttribute("aria-busy"), "false");
+  const textInput = card.querySelectorAll("input").find((input) => input.type === "text");
+  assert.equal(textInput.getAttribute("aria-label"), "Details");
+  textInput.value = "More context";
+  const prototypeInput = card.querySelectorAll("input").find((input) => input.getAttribute("aria-label") === "Prototype field");
+  prototypeInput.value = "preserved";
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  const firstChoice = card.querySelectorAll("input").find((input) => input.value === "a");
+  const optionalChoice = card.querySelectorAll("input").find((input) => input.value === "optional-a");
+  const firstTag = card.querySelectorAll("input").find((input) => input.value === "tag-a");
+  assert.equal(harness.enhancementResponses.length, 0, "an unanswered single choice cannot drop its response key");
+  assert.equal(firstChoice.getAttribute("aria-invalid"), "true");
+  assert.equal(optionalChoice.getAttribute("aria-invalid"), null, "an unanswered optional choice remains valid");
+  assert.equal(firstTag.getAttribute("aria-invalid"), "true", "a required minItems constraint blocks an empty array");
+  assert.equal(harness.document.activeElement, firstChoice);
+  firstChoice.click();
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  assert.equal(harness.enhancementResponses.length, 0, "the required multi-select remains enforced independently");
+  assert.equal(firstTag.getAttribute("aria-invalid"), "true");
+  firstTag.click();
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementResponses)), [{
+    version: 1,
+    type: "response",
+    session_id: delivery.session_id,
+    route_fingerprint: delivery.route_fingerprint,
+    input_fingerprint: delivery.input_fingerprint,
+    response: {
+      action: "accept",
+      content: Object.fromEntries([
+        ["details", "More context"],
+        ["choice", "a"],
+        ["tags", ["tag-a"]],
+        ["__proto__", "preserved"],
+      ]),
+    },
+  }]);
+  assert.equal(harness.enhancementCard(), null, "completed response cleans the rendered card");
+  await harness.stop();
+  assert.equal(harness.enhancementRegistrations, 1);
+  assert.equal(harness.enhancementUnregistrations, 1);
+});
+
+test("enhancement renderer rejects an unsatisfiable required multi-select before acknowledgement", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  harness.deliverEnhancement({
+    version: 1,
+    type: "deliver",
+    id: "enhanced-request-unsatisfiable",
+    session_id: "enhanced-session-unsatisfiable",
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose three options.",
+      requestedSchema: {
+        type: "object",
+        required: ["tags"],
+        properties: {
+          tags: {
+            type: "array",
+            title: "Tags",
+            minItems: 3,
+            items: {
+              anyOf: [
+                { const: "tag-a", title: "Tag A" },
+                { const: "tag-b", title: "Tag B" },
+              ],
+            },
+          },
+        },
+      },
+    },
+  });
+  await flushDom();
+  assert.equal(harness.enhancementAcks.length, 0);
+  assert.equal(harness.enhancementCard(), null);
+  assert.match(harness.logs.join("\n"), /"code":"request_failed"/);
+  await harness.stop();
+});
+
+test("enhancement renderer rejects ambiguous, incompatible, and inherited choice schemas", async () => {
+  const inheritedProperties = Object.assign(
+    Object.create({ inherited: { type: "string", title: "Inherited" } }),
+    { valid: { type: "string", title: "Valid" } },
+  );
+  const schemas = [
+    {
+      type: "object",
+      properties: {
+        duplicate: {
+          type: "string",
+          title: "Duplicate",
+          oneOf: [
+            { const: "same", title: "First" },
+            { const: "same", title: "Second" },
+          ],
+        },
+      },
+    },
+    {
+      type: "object",
+      properties: {
+        incompatible: {
+          type: "number",
+          title: "Incompatible",
+          oneOf: [{ const: "one", title: "One" }],
+        },
+      },
+    },
+    {
+      type: "object",
+      properties: {
+        incompatibleItems: {
+          type: "array",
+          title: "Incompatible items",
+          items: { type: "number", anyOf: [{ const: "one", title: "One" }] },
+        },
+      },
+    },
+    { type: "object", required: ["inherited"], properties: inheritedProperties },
+  ];
+
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  for (const [index, requestedSchema] of schemas.entries()) {
+    harness.deliverEnhancement({
+      version: 1,
+      type: "deliver",
+      id: `enhanced-request-invalid-${index}`,
+      session_id: `enhanced-session-invalid-${index}`,
+      route_fingerprint: "e".repeat(64),
+      input_fingerprint: "f".repeat(64),
+      elicitation: { mode: "form", message: "Invalid schema.", requestedSchema },
+    });
+    await flushDom();
+    assert.equal(harness.enhancementAcks.length, 0);
+    assert.equal(harness.enhancementCard(), null);
+  }
+  await harness.stop();
+});
+
+test("enhancement socket delivers to its registered renderer and returns only that renderer's submitted response", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = fs.mkdtempSync(join(tmpdir(), "uq-renderer-bridge-"));
+  let harness;
+  const broker = createMainBroker({
+    dataDir: join(root, "data"),
+    tweakId: "co.tweakers.user-questions",
+    permissions: ["ipc", "network"],
+    socketPath: join(root, "broker.sock"),
+    enhancementSocketPath: join(root, "enhancement.sock"),
+    sendToRenderer(webContentsId, channel, payload) {
+      if (webContentsId !== 73 || channel !== "enhancement.deliver" || !harness) return false;
+      harness.deliverEnhancement(payload);
+      return true;
+    },
+  });
+  t.after(async () => broker.stop());
+  const endpoint = await broker.start();
+  harness = rendererHarness({ noCarrier: true, enhancementBridge: { broker, webContentsId: 73 } });
+  t.after(async () => harness.stop());
+  await harness.start();
+
+  const claim = await exchangeEnhancement(endpoint.enhancementSocketPath, {
+    version: 1,
+    type: "claim",
+    id: "renderer-bridge-claim",
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+  });
+  const pending = exchangeEnhancement(endpoint.enhancementSocketPath, {
+    version: 1,
+    type: "deliver",
+    id: "renderer-bridge-delivery",
+    session_id: claim.session_id,
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose an option.",
+      requestedSchema: {
+        type: "object",
+        properties: { choice: { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }] } },
+      },
+    },
+  });
+  await flushDom();
+  const card = harness.enhancementCard();
+  assert.ok(card, "the registered renderer received the exact socket session");
+  card.querySelectorAll("input").find((input) => input.value === "a").click();
+  findByText(card, "button", "Submit").click();
+  const delivered = await pending;
+  assert.deepEqual(delivered, {
+    version: 1,
+    type: "delivered",
+    session_id: claim.session_id,
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    response: { action: "accept", content: { choice: "a" } },
+  });
+  assert.equal(broker.snapshot().enhancementSessions, 0, "returned response releases the socket session");
+  await harness.stop();
+  assert.equal(broker.snapshot().enhancementRenderers, 0, "renderer cleanup unregisters the exact IPC peer");
+  await broker.stop();
+  assert.equal(fs.existsSync(endpoint.enhancementSocketPath), false, "only the owned socket is removed during cleanup");
 });
 
 function rendererHarness(options = {}) {
@@ -517,7 +810,7 @@ function rendererHarness(options = {}) {
   genericButton.type = "submit";
   genericButton.textContent = "Continue standard form";
   carrier.append(genericButton);
-  dom.document.body.append(carrier);
+  if (!options.noCarrier) dom.document.body.append(carrier);
 
   const input = questionInput(options.longCopy);
   if (Number.isInteger(options.multipleMaxSelections)) {
@@ -549,9 +842,15 @@ function rendererHarness(options = {}) {
   let page;
   let unobserved = 0;
   let unregistered = 0;
+  let enhancementRegistrations = 0;
+  let enhancementUnregistrations = 0;
   let releaseCalls = 0;
+  const enhancementAcks = [];
+  const enhancementResponses = [];
+  const ipcListeners = new Map();
   let resolveDeferredClaim = null;
   let resolveDeferredDelivery = null;
+  let resolveDeferredEnhancementAck = null;
   let mountAckFailures = options.failMountAck
     ? Number.POSITIVE_INFINITY
     : options.failMountAckOnce
@@ -616,7 +915,7 @@ function rendererHarness(options = {}) {
       },
     },
     react: {
-      getFiber(node) { return node === carrier ? fiber : null; },
+      getFiber(node) { return !options.noCarrier && node === carrier ? fiber : null; },
       host: {
         observe() { return () => { unobserved += 1; }; },
         attachMcpFormCarrier(nonce) {
@@ -638,7 +937,40 @@ function rendererHarness(options = {}) {
       },
     },
     ipc: {
+      on(channel, listener) {
+        ipcListeners.set(channel, listener);
+        return () => ipcListeners.delete(channel);
+      },
       async invoke(channel, ...args) {
+        if (channel === "enhancement.register") {
+          enhancementRegistrations += 1;
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.registerEnhancementRenderer(options.enhancementBridge.webContentsId)
+            : { registered: true };
+        }
+        if (channel === "enhancement.unregister") {
+          enhancementUnregistrations += 1;
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.unregisterEnhancementRenderer(options.enhancementBridge.webContentsId)
+            : true;
+        }
+        if (channel === "enhancement.ack") {
+          enhancementAcks.push(args[0]);
+          if (options.deferEnhancementAck) {
+            return new Promise((resolve) => {
+              resolveDeferredEnhancementAck = () => resolve({ acknowledged: true });
+            });
+          }
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.acknowledgeEnhancement(options.enhancementBridge.webContentsId, args[0])
+            : { acknowledged: true };
+        }
+        if (channel === "enhancement.respond") {
+          enhancementResponses.push(args[0]);
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.respondEnhancement(options.enhancementBridge.webContentsId, args[0])
+            : { delivered: true };
+        }
         if (channel === "claim") {
           if (options.claimError) throw options.claimError;
           if (options.deferClaim) {
@@ -720,8 +1052,18 @@ function rendererHarness(options = {}) {
     get unobserved() { return unobserved; },
     get unregistered() { return unregistered; },
     get releaseCalls() { return releaseCalls; },
+    get enhancementAcks() { return enhancementAcks; },
+    get enhancementResponses() { return enhancementResponses; },
+    get enhancementRegistrations() { return enhancementRegistrations; },
+    get enhancementUnregistrations() { return enhancementUnregistrations; },
     get currentState() { return currentState; },
     card: () => dom.document.querySelector("[data-tweaker-user-questions-card]"),
+    enhancementCard: () => dom.document.querySelector("[data-tweaker-user-questions-enhancement-card]"),
+    deliverEnhancement(delivery) {
+      const listener = ipcListeners.get("enhancement.deliver");
+      assert.ok(listener, "enhancement renderer listener was not registered");
+      listener(delivery);
+    },
     resolveClaim() {
       assert.ok(resolveDeferredClaim, "deferred claim was not pending");
       const resolve = resolveDeferredClaim;
@@ -732,6 +1074,12 @@ function rendererHarness(options = {}) {
       assert.ok(resolveDeferredDelivery, "deferred delivery was not pending");
       const resolve = resolveDeferredDelivery;
       resolveDeferredDelivery = null;
+      resolve();
+    },
+    resolveEnhancementAck() {
+      assert.ok(resolveDeferredEnhancementAck, "deferred enhancement acknowledgement was not pending");
+      const resolve = resolveDeferredEnhancementAck;
+      resolveDeferredEnhancementAck = null;
       resolve();
     },
     async start() { await tweak.start(api); await flushDom(); },

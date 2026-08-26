@@ -4,7 +4,6 @@ import type { TweakMcpServer } from "@therealityreport/tweakers-sdk";
 
 export const MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 export const MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
-export const USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
 export const RESERVED_MANAGED_MCP_ENV_KEYS = [
   "TWEAKER_TWEAK_DATA_DIR",
   "TWEAKER_TWEAK_ID",
@@ -356,7 +355,7 @@ export function planManagedMcpReconciliation(
     migrations,
     conflicts,
     preservedOptions,
-    approvalPolicy: unchangedApprovalPolicy(findTopLevelApprovalPolicies(currentToml)[0]?.raw ?? null, null),
+    approvalPolicy: observeTopLevelPolicyAssignments(currentToml),
     preservedApprovalPolicy: null,
     changed,
     restartRequired: changed,
@@ -374,12 +373,13 @@ const TOP_LEVEL_APPROVAL_POLICY_ASSIGNMENT = /^\s*(?:approval_policy|"approval_p
 const TOP_LEVEL_SANDBOX_MODE_ASSIGNMENT = /^\s*(?:sandbox_mode|"sandbox_mode"|'sandbox_mode')\s*=/;
 
 /**
- * Observe policy fields for reconciliation receipts without changing them.
- * Policy mutation belongs exclusively to the User Questions Preview/Apply/
- * Restore transaction; ordinary MCP startup and enable/disable reconciliation
- * may only register or remove the server block.
+ * Observe top-level policy fields for reconciliation receipts without
+ * changing them. Managed MCP reconciliation may only register or remove
+ * server blocks; it never rewrites approval_policy or sandbox_mode.
+ * Duplicate top-level assignments make the live policy ambiguous, so the
+ * plan fails closed as a conflict instead of guessing which line wins.
  */
-export function observeUserQuestionsApprovalPolicy(
+export function observeTopLevelPolicyAssignments(
   currentToml: string,
   preserved: Readonly<PreservedApprovalPolicy> | null = null,
 ): ApprovalPolicyReconciliation {

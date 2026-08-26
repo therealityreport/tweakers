@@ -33,6 +33,8 @@ import { fingerprintPath } from "../src/user-questions-source";
 function writeUserQuestions(root: string, version: string, marker: string): string {
   const tweak = join(root, "user-questions");
   mkdirSync(tweak, { recursive: true });
+  // The enhancement contract owns no embedded MCP entrypoint: the broker and
+  // schema modules are the only proof surfaces beside the main lifecycle.
   writeFileSync(join(tweak, "manifest.json"), `${JSON.stringify({
     id: "co.tweakers.user-questions",
     name: "User Questions",
@@ -40,11 +42,9 @@ function writeUserQuestions(root: string, version: string, marker: string): stri
     githubRepo: "therealityreport/tweakers",
     scope: "both",
     permissions: ["settings", "filesystem", "ipc", "network"],
-    mcp: { command: "node", args: ["mcp-server.js"] },
   }, null, 2)}\n`);
   writeFileSync(join(tweak, "index.js"), `module.exports = { start() {}, stop() {}, marker: ${JSON.stringify(marker)} };\n`);
-  writeFileSync(join(tweak, "mcp-server.js"), "module.exports = { createMcpRuntime() {} };\n");
-  writeFileSync(join(tweak, "broker-protocol.js"), "module.exports = { marker: 'broker' };\n");
+  writeFileSync(join(tweak, "main-broker.js"), "module.exports = { marker: 'broker' };\n");
   writeFileSync(join(tweak, "core.js"), "module.exports = { marker: 'schema' };\n");
   return tweak;
 }

@@ -1045,8 +1045,8 @@ test("schema-v2 production health accepts only the exact eight surfaces and cano
         brokerSelfTest: "pass",
         schemaSelfTest: "pass",
         rendererStorageSelfTest: "pass",
-        mcpConflictCount: 0,
-        zeroMcpConflicts: "pass",
+        enhancementHandshake: "pass",
+        genericFallback: "pass",
       },
       promotionReady: "pass",
     };
@@ -1068,8 +1068,8 @@ test("schema-v2 production health accepts only the exact eight surfaces and cano
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "unknown");
 
     const conflicting = structuredClone(valid);
-    conflicting.userQuestions.mcpConflictCount = 1;
-    conflicting.userQuestions.zeroMcpConflicts = "fail";
+    conflicting.userQuestions.enhancementHandshake = "fail";
+    conflicting.userQuestions.genericFallback = "fail";
     conflicting.promotionReady = "fail";
     writeFileSync(receipt, JSON.stringify(conflicting), { mode: 0o600 });
     assert.equal(readProductionHealthReceipt(receipt, expected, { now: options(f).now }).promotionReady, "fail");

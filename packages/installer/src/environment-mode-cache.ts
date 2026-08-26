@@ -2566,13 +2566,25 @@ function persistEnvironmentModePairWarmCommitTerminalTargetTransition(
   }
 }
 
-function assertEnvironmentModePairContentsExchangeProof(
+/** The captured pre-exchange evidence shared by preflight and the post-exchange proof. */
+export type EnvironmentModePairExchangeBeforeEvidence = Pick<
+  EnvironmentModePairContentsExchangeProof,
+  "liveContentsBefore" | "inactiveContentsBefore" | "liveOuterBefore" | "inactiveOuterBefore"
+>;
+
+/**
+ * Validate captured pre-exchange evidence against the pair's prepared seals
+ * BEFORE the sole native Contents exchange. These are exactly the "before"
+ * legs the post-exchange proof re-asserts, so any drift the proof would
+ * reject after the swap is instead detected while the source app is still
+ * intact and the failure can resolve as stale_requires_prepare (invalidate,
+ * then prepare a fresh generation). Detecting the same drift only after the
+ * swap left no safe automatic path (live failure 2026-08-25).
+ */
+export function assertEnvironmentModePairExchangeReadyEvidence(
   receipt: EnvironmentModePairReceipt,
-  proof: EnvironmentModePairContentsExchangeProof,
+  before: EnvironmentModePairExchangeBeforeEvidence,
 ): void {
-  if (!isEnvironmentModePairContentsExchangeProof(proof)) {
-    throw new Error("Environment mode cache Contents exchange proof has an invalid schema");
-  }
   const liveAppPath = receipt.roles.live.appPath;
   const inactiveAppPath = receipt.paths.inactiveAppPath;
   const liveContents = join(liveAppPath, "Contents");
@@ -2583,8 +2595,24 @@ function assertEnvironmentModePairContentsExchangeProof(
     || liveContentsSeal.type !== "directory" || inactiveContentsSeal.type !== "directory") {
     throw new Error("Environment mode cache pair lacks sealed Contents directories");
   }
-  assertContentsIdentity(proof.liveContentsBefore, liveContents, liveContentsSeal);
-  assertContentsIdentity(proof.inactiveContentsBefore, inactiveContents, inactiveContentsSeal);
+  assertContentsIdentity(before.liveContentsBefore, liveContents, liveContentsSeal);
+  assertContentsIdentity(before.inactiveContentsBefore, inactiveContents, inactiveContentsSeal);
+  assertOuterAppSealBinding(before.liveOuterBefore, liveAppPath, receipt.seals.liveApp.entries[0]!);
+  assertOuterAppSealBinding(before.inactiveOuterBefore, inactiveAppPath, receipt.seals.inactiveApp.entries[0]!);
+}
+
+function assertEnvironmentModePairContentsExchangeProof(
+  receipt: EnvironmentModePairReceipt,
+  proof: EnvironmentModePairContentsExchangeProof,
+): void {
+  if (!isEnvironmentModePairContentsExchangeProof(proof)) {
+    throw new Error("Environment mode cache Contents exchange proof has an invalid schema");
+  }
+  assertEnvironmentModePairExchangeReadyEvidence(receipt, proof);
+  const liveAppPath = receipt.roles.live.appPath;
+  const inactiveAppPath = receipt.paths.inactiveAppPath;
+  const liveContents = join(liveAppPath, "Contents");
+  const inactiveContents = join(inactiveAppPath, "Contents");
   assertContentsIdentityMatches(proof.liveContentsAfter, liveContents, proof.inactiveContentsBefore);
   assertContentsIdentityMatches(proof.inactiveContentsAfter, inactiveContents, proof.liveContentsBefore);
   assertContentsIdentityMatches(readEnvironmentModeCacheContentsIdentity(liveContents), liveContents, proof.liveContentsAfter);
@@ -2731,17 +2759,47 @@ function assertContentsIdentityMatches(
   }
 }
 
+/**
+ * Bind observed outer-app evidence to the sealed root's IDENTITY tuple only.
+ * The live .app root directory is not cache-resident: macOS legitimately
+ * advances its ctime on any inode-metadata write (Gatekeeper provenance and
+ * quarantine xattrs, LaunchServices touches) without changing a single sealed
+ * byte, exactly as the live TREE validator already documents. Pinning the full
+ * root stat tuple here turned that benign churn into a post-exchange abort
+ * whose inverse leg then wedged the pair (live failure 2026-08-25: root
+ * ctimeNs drifted 4h after the last seal rotation). Directory size/mtime/ctime
+ * follow the composed-seal doctrine and stay unpinned; dev/ino/mode/type do
+ * not — a replaced root is a different directory and must still refuse. The
+ * uid/gid/ACL/xattr/quarantine continuity proof and every Contents-descendant
+ * seal remain strict.
+ */
+function assertOuterAppSealBinding(
+  before: EnvironmentModeCacheOuterAppEvidence,
+  expectedPath: string,
+  expectedBeforeRoot: EnvironmentModeCacheStatSealRecord,
+): void {
+  if (before.path !== expectedPath
+    || before.stat.relativePath !== ""
+    || before.stat.type !== "directory"
+    || expectedBeforeRoot.relativePath !== ""
+    || expectedBeforeRoot.type !== "directory"
+    || before.stat.dev !== expectedBeforeRoot.dev
+    || before.stat.ino !== expectedBeforeRoot.ino
+    || before.stat.mode !== expectedBeforeRoot.mode
+    || before.stat.symlinkTarget !== expectedBeforeRoot.symlinkTarget) {
+    throw new Error(`Environment mode cache outer app evidence does not match its prepared seal at ${expectedPath}`);
+  }
+}
+
 function assertOuterAppContinuity(
   before: EnvironmentModeCacheOuterAppEvidence,
   after: EnvironmentModeCacheOuterAppEvidence,
   expectedPath: string,
   expectedBeforeRoot: EnvironmentModeCacheStatSealRecord,
 ): void {
-  if (before.path !== expectedPath || after.path !== expectedPath
-    || !sameJson(before.stat, expectedBeforeRoot)
-    || before.stat.relativePath !== ""
+  assertOuterAppSealBinding(before, expectedPath, expectedBeforeRoot);
+  if (after.path !== expectedPath
     || after.stat.relativePath !== ""
-    || before.stat.type !== "directory"
     || after.stat.type !== "directory") {
     throw new Error(`Environment mode cache outer app evidence does not match its prepared seal at ${expectedPath}`);
   }

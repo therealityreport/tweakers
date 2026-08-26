@@ -12,10 +12,15 @@ import {
 import { join } from "node:path";
 import test from "node:test";
 import {
+  environmentModeCacheGenerationPaths,
   environmentModeCachePaths,
   readCurrentEnvironmentModePair,
   sealEnvironmentModeCacheTree,
 } from "../src/environment-mode-cache";
+import {
+  writeWatcherPromotionReceipt,
+  type WatcherPromotionReceipt,
+} from "../src/watcher-promotion";
 import {
   environment,
   type EnvironmentCommandDependencies,
@@ -560,3 +565,145 @@ function directoryDigest(root: string): string {
 function fileDigest(file: string): string {
   return createHash("sha256").update(readFileSync(file)).digest("hex");
 }
+
+function abandonedPausedPromotion(transactionId: string, appRoot: string): WatcherPromotionReceipt {
+  return {
+    schemaVersion: 1,
+    kind: "watcher-promotion",
+    transactionId,
+    phase: "paused",
+    sourceAppRoot: appRoot,
+    requestedAppRoot: appRoot,
+    activeTargetAppRoot: null,
+    sourceExpectedFingerprint: "9".repeat(64),
+    targetExpectedFingerprint: null,
+    snapshot: {
+      schemaVersion: 1,
+      kind: "watcher-promotion-snapshot",
+      watcherKind: "launchd",
+      configured: true,
+      loaded: true,
+      enabled: true,
+      definitionPath: null,
+      definitionDigest: null,
+      capturedAt: NOW,
+    },
+    createdAt: NOW,
+    updatedAt: NOW,
+    pausedAt: NOW,
+    resumedAt: null,
+    error: null,
+  };
+}
+
+function terminalWarmJournal(generationId: string, sourceAppPath: string, terminal: boolean): EnvironmentWarmCommitReceipt {
+  return {
+    schemaVersion: 1,
+    kind: "environment-warm-commit",
+    transactionId: generationId,
+    generationId,
+    pairReceiptDigest: "a".repeat(64),
+    sourceAppPath,
+    targetExperience: "chatgpt",
+    sourceMainPid: null,
+    targetMainPid: null,
+    phase: terminal ? "failed" : "exchange-intent",
+    error: terminal ? "post-swap proof failed" : null,
+    exchangeCount: terminal ? 2 : 1,
+    stamps: [],
+    timing: { schemaVersion: 1, approvalAt: NOW, readyAt: null, phases: {} },
+    createdAt: NOW,
+    updatedAt: NOW,
+    terminalAt: terminal ? NOW : null,
+  };
+}
+
+test("an abandoned paused watcher promotion from a terminal transaction is reclaimed before the new pause", async () => {
+  await withFixture(async (fixture) => {
+    const appRoot = fixture.current.selectedDesktopPath;
+    const watcherFile = join(fixture.root, "transactions", "environment-watcher.json");
+    const begun: string[] = [];
+    const finished: Array<{ transactionId: string; targetAppRoot: string; targetExpectedFingerprint: string }> = [];
+    const bindings = createBindings(fixture, {
+      beginWatcher: ((_file, input) => {
+        begun.push(input.transactionId);
+        return abandonedPausedPromotion(input.transactionId, appRoot);
+      }) as EnvironmentModeProductionDeps["beginWatcher"],
+      finishWatcher: ((_file, input) => {
+        finished.push(input);
+        return abandonedPausedPromotion(input.transactionId, appRoot);
+      }) as EnvironmentModeProductionDeps["finishWatcher"],
+    });
+    const cachePaths = environmentModeCachePaths(fixture.root);
+    const deadGeneration = "dead-generation";
+    const generationRoot = environmentModeCacheGenerationPaths(cachePaths, deadGeneration).generationRoot;
+    mkdirSync(generationRoot, { recursive: true });
+
+    // Terminal journal: the pause is provably orphaned and must be reclaimed
+    // by resuming against the CURRENT pause request's live evidence.
+    writeWatcherPromotionReceipt(watcherFile, abandonedPausedPromotion(deadGeneration, appRoot));
+    writeEnvironmentWarmCommitReceipt(
+      join(generationRoot, "warm-commit.json"),
+      terminalWarmJournal(deadGeneration, appRoot, true),
+    );
+    await bindings.warmCommit.pauseWatcher({
+      transactionId: "fresh-generation",
+      sourceAppRoot: appRoot,
+      targetAppRoot: appRoot,
+      sourceExpectedFingerprint: "f".repeat(64),
+    });
+    assert.deepEqual(finished, [{
+      transactionId: deadGeneration,
+      targetAppRoot: appRoot,
+      targetExpectedFingerprint: "f".repeat(64),
+    }]);
+    assert.deepEqual(begun, ["fresh-generation"]);
+
+    // Non-terminal journal: the owner may still be alive, so the strict
+    // begin-time refusal is preserved and no reclaim happens.
+    writeWatcherPromotionReceipt(watcherFile, abandonedPausedPromotion(deadGeneration, appRoot));
+    writeEnvironmentWarmCommitReceipt(
+      join(generationRoot, "warm-commit.json"),
+      terminalWarmJournal(deadGeneration, appRoot, false),
+    );
+    await bindings.warmCommit.pauseWatcher({
+      transactionId: "fresh-generation",
+      sourceAppRoot: appRoot,
+      targetAppRoot: appRoot,
+      sourceExpectedFingerprint: "f".repeat(64),
+    });
+    assert.equal(finished.length, 1);
+    assert.deepEqual(begun, ["fresh-generation", "fresh-generation"]);
+
+    // A pause without a v2 generation directory belongs to the legacy v1
+    // coordinator; its owner's liveness cannot be proven here, so the strict
+    // cross-transaction refusal is preserved.
+    writeWatcherPromotionReceipt(watcherFile, abandonedPausedPromotion("legacy-v1-transaction", appRoot));
+    await bindings.warmCommit.pauseWatcher({
+      transactionId: "fresh-generation",
+      sourceAppRoot: appRoot,
+      targetAppRoot: appRoot,
+      sourceExpectedFingerprint: "f".repeat(64),
+    });
+    assert.equal(finished.length, 1);
+
+    // A cross-transaction "pausing" receipt is not resumable by
+    // finishWatcherPromotion; the reclaim skips it instead of throwing.
+    writeWatcherPromotionReceipt(watcherFile, {
+      ...abandonedPausedPromotion(deadGeneration, appRoot),
+      phase: "pausing",
+      pausedAt: null,
+    });
+    writeEnvironmentWarmCommitReceipt(
+      join(generationRoot, "warm-commit.json"),
+      terminalWarmJournal(deadGeneration, appRoot, true),
+    );
+    await bindings.warmCommit.pauseWatcher({
+      transactionId: "fresh-generation",
+      sourceAppRoot: appRoot,
+      targetAppRoot: appRoot,
+      sourceExpectedFingerprint: "f".repeat(64),
+    });
+    assert.equal(finished.length, 1);
+  });
+});

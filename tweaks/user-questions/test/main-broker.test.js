@@ -21,12 +21,35 @@ const {
   connectBroker,
   createProtocolPeer,
 } = require("../broker-protocol");
-const { ROUTE_HMAC_KEY_FILE, createMainBroker } = require("../main-broker");
+const {
+  ENHANCEMENT_PROTOCOL_VERSION,
+  ROUTE_HMAC_KEY_FILE,
+  createEnhancementClaimResponse,
+  createMainBroker,
+} = require("../main-broker");
+const { exchangeEnhancement } = require("./enhancement-client");
 
 const ROUTE = Object.freeze({
   webContentsId: 73,
   hostId: "host-41",
   conversationId: "conversation-29",
+});
+
+test("enhancement client rejects when the peer closes without a response frame", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = mkdtempSync(join(tmpdir(), "uq-enhancement-client-"));
+  const socketPath = join(root, "enhancement.sock");
+  const server = net.createServer((socket) => socket.once("data", () => socket.end()));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  await assert.rejects(
+    exchangeEnhancement(socketPath, { type: "claim" }),
+    /closed before a complete response frame/,
+  );
 });
 
 test("authenticated broker binds one-use claims to the exact renderer and cleans every endpoint", async (t) => {
@@ -168,6 +191,114 @@ test("wrong tokens, registration replay, and claim timeouts fail closed", async 
   );
 });
 
+test("enhancement claim, mounted-renderer acknowledgement, and deliberate response share one exact session", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = mkdtempSync(join(tmpdir(), "uq-enhancement-v1-"));
+  const deliveries = [];
+  let broker;
+  broker = createMainBroker({
+    dataDir: join(root, "data"),
+    tweakId: "co.tweakers.user-questions",
+    permissions: ["ipc", "network"],
+    socketPath: join(root, "broker.sock"),
+    enhancementSocketPath: join(root, "enhancement.sock"),
+    sendToRenderer: (webContentsId, channel, payload) => {
+      deliveries.push({ webContentsId, channel, payload });
+      setImmediate(() => {
+        broker.acknowledgeEnhancement(webContentsId, acknowledgementFor(payload));
+        broker.respondEnhancement(webContentsId, responseFor(payload, {
+          action: "accept",
+          content: { choice: "a" },
+        }));
+      });
+      return true;
+    },
+  });
+  t.after(async () => broker.stop());
+  const endpoint = await broker.start();
+  assert.equal(statSync(endpoint.enhancementSocketPath).mode & 0o777, 0o600);
+  assert.deepEqual(broker.registerEnhancementRenderer(ROUTE.webContentsId), { registered: true });
+
+  const claim = {
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type: "claim",
+    id: "fresh-task-claim",
+    route_fingerprint: "a".repeat(64),
+    input_fingerprint: "b".repeat(64),
+  };
+  const response = await exchangeEnhancement(endpoint.enhancementSocketPath, claim);
+  assert.deepEqual({
+    version: response.version,
+    type: response.type,
+    route_fingerprint: response.route_fingerprint,
+    input_fingerprint: response.input_fingerprint,
+  }, {
+    version: claim.version,
+    type: "claimed",
+    route_fingerprint: claim.route_fingerprint,
+    input_fingerprint: claim.input_fingerprint,
+  });
+  assert.match(response.session_id, /^[a-f0-9-]{36}$/);
+  const delivery = await exchangeEnhancement(endpoint.enhancementSocketPath, {
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type: "deliver",
+    id: "fresh-task-delivery",
+    session_id: response.session_id,
+    route_fingerprint: claim.route_fingerprint,
+    input_fingerprint: claim.input_fingerprint,
+    elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string", title: "Choice" } } } },
+  });
+  assert.deepEqual(delivery, {
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type: "delivered",
+    session_id: response.session_id,
+    route_fingerprint: claim.route_fingerprint,
+    input_fingerprint: claim.input_fingerprint,
+    response: { action: "accept", content: { choice: "a" } },
+  });
+  assert.equal(deliveries.length, 1);
+  assert.deepEqual(deliveries[0], {
+    webContentsId: ROUTE.webContentsId,
+    channel: "enhancement.deliver",
+    payload: {
+      version: ENHANCEMENT_PROTOCOL_VERSION,
+      type: "deliver",
+      id: "fresh-task-delivery",
+      session_id: response.session_id,
+      route_fingerprint: claim.route_fingerprint,
+      input_fingerprint: claim.input_fingerprint,
+      elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string", title: "Choice" } } } },
+    },
+  });
+  assert.equal(broker.snapshot().enhancementSessions, 0, "response releases its exact session");
+  assert.throws(
+    () => createEnhancementClaimResponse({ ...claim, input_fingerprint: "not-a-fingerprint" }),
+    (error) => error instanceof BrokerProtocolError && error.code === "payload_invalid",
+  );
+  await broker.stop();
+  assert.equal(statMissing(endpoint.enhancementSocketPath), true);
+});
+
+test("enhancement unavailability leaves the ordinary broker alive and never removes an occupied socket", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = mkdtempSync(join(tmpdir(), "uq-enhancement-fallback-"));
+  const occupied = join(root, "occupied.sock");
+  writeFileSync(occupied, "do not remove", { mode: 0o600 });
+  const broker = createMainBroker({
+    dataDir: join(root, "data"),
+    tweakId: "co.tweakers.user-questions",
+    permissions: ["ipc", "network"],
+    socketPath: join(root, "broker.sock"),
+    enhancementSocketPath: occupied,
+    sendToRenderer: () => true,
+  });
+  t.after(async () => broker.stop());
+  const endpoint = await broker.start();
+  assert.equal(endpoint.enhancementSocketPath, null);
+  assert.equal(statSync(occupied).isFile(), true, "a non-owned path is preserved");
+  assert.equal(broker.snapshot().started, true, "ordinary generic-form broker remains usable");
+});
+
 test("route identity persists across broker instances but remains isolated by data directory", async (t) => {
   if (process.platform === "win32") return t.skip("Unix-domain broker contract");
   const root = mkdtempSync(join(tmpdir(), "uq-main-broker-route-key-"));
@@ -272,6 +403,24 @@ test("route identity key rejects corruption, unsafe permissions, and symlinks wi
     process.getuid = originalGetuid;
   }
 });
+
+function acknowledgementFor(payload) {
+  return {
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type: "acknowledged",
+    session_id: payload.session_id,
+    route_fingerprint: payload.route_fingerprint,
+    input_fingerprint: payload.input_fingerprint,
+  };
+}
+
+function responseFor(payload, response) {
+  return {
+    ...acknowledgementFor(payload),
+    type: "response",
+    response,
+  };
+}
 
 function openSocket(socketPath) {
   return new Promise((resolve, reject) => {

@@ -37,7 +37,6 @@ export interface McpSyncReceipt {
     managedConfigurationChangedAt?: string | null;
     error?: string;
 }
-export declare function userQuestionsMcpReceiptMatchesEnabledState(receipt: Pick<McpSyncReceipt, "status" | "desiredNames" | "appliedNames" | "conflicts" | "approvalPolicy">, enabled: boolean): boolean;
 export interface ReconcileMcpConfigOptions {
     configPath: string;
     statePath: string;
