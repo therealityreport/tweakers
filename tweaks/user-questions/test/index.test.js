@@ -517,7 +517,7 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
       message: "Choose an option.",
       requestedSchema: {
         type: "object",
-        required: ["choice", "tags"],
+        required: ["choice", "tags", "__proto__"],
         properties: {
           details: {
             type: "string",
@@ -550,6 +550,10 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
               ],
             },
           },
+          ["__proto__"]: {
+            type: "string",
+            title: "Prototype field",
+          },
         },
       },
     },
@@ -579,6 +583,8 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
   const textInput = card.querySelectorAll("input").find((input) => input.type === "text");
   assert.equal(textInput.getAttribute("aria-label"), "Details");
   textInput.value = "More context";
+  const prototypeInput = card.querySelectorAll("input").find((input) => input.getAttribute("aria-label") === "Prototype field");
+  prototypeInput.value = "preserved";
   findByText(card, "button", "Submit").click();
   await flushDom();
   const firstChoice = card.querySelectorAll("input").find((input) => input.value === "a");
@@ -603,7 +609,15 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
     session_id: delivery.session_id,
     route_fingerprint: delivery.route_fingerprint,
     input_fingerprint: delivery.input_fingerprint,
-    response: { action: "accept", content: { details: "More context", choice: "a", tags: ["tag-a"] } },
+    response: {
+      action: "accept",
+      content: Object.fromEntries([
+        ["details", "More context"],
+        ["choice", "a"],
+        ["tags", ["tag-a"]],
+        ["__proto__", "preserved"],
+      ]),
+    },
   }]);
   assert.equal(harness.enhancementCard(), null, "completed response cleans the rendered card");
   await harness.stop();
@@ -647,6 +661,67 @@ test("enhancement renderer rejects an unsatisfiable required multi-select before
   assert.equal(harness.enhancementAcks.length, 0);
   assert.equal(harness.enhancementCard(), null);
   assert.match(harness.logs.join("\n"), /"code":"request_failed"/);
+  await harness.stop();
+});
+
+test("enhancement renderer rejects ambiguous, incompatible, and inherited choice schemas", async () => {
+  const inheritedProperties = Object.assign(
+    Object.create({ inherited: { type: "string", title: "Inherited" } }),
+    { valid: { type: "string", title: "Valid" } },
+  );
+  const schemas = [
+    {
+      type: "object",
+      properties: {
+        duplicate: {
+          type: "string",
+          title: "Duplicate",
+          oneOf: [
+            { const: "same", title: "First" },
+            { const: "same", title: "Second" },
+          ],
+        },
+      },
+    },
+    {
+      type: "object",
+      properties: {
+        incompatible: {
+          type: "number",
+          title: "Incompatible",
+          oneOf: [{ const: "one", title: "One" }],
+        },
+      },
+    },
+    {
+      type: "object",
+      properties: {
+        incompatibleItems: {
+          type: "array",
+          title: "Incompatible items",
+          items: { type: "number", anyOf: [{ const: "one", title: "One" }] },
+        },
+      },
+    },
+    { type: "object", required: ["inherited"], properties: inheritedProperties },
+  ];
+
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  for (const [index, requestedSchema] of schemas.entries()) {
+    harness.deliverEnhancement({
+      version: 1,
+      type: "deliver",
+      id: `enhanced-request-invalid-${index}`,
+      session_id: `enhanced-session-invalid-${index}`,
+      route_fingerprint: "e".repeat(64),
+      input_fingerprint: "f".repeat(64),
+      elicitation: { mode: "form", message: "Invalid schema.", requestedSchema },
+    });
+    await flushDom();
+    assert.equal(harness.enhancementAcks.length, 0);
+    assert.equal(harness.enhancementCard(), null);
+  }
   await harness.stop();
 });
 

@@ -265,7 +265,7 @@ function normalizeEnhancementDelivery(value) {
   const requiredNames = schema.required === undefined ? [] : schema.required;
   if (
     !Array.isArray(requiredNames)
-    || requiredNames.some((name) => typeof name !== "string" || !(name in properties))
+    || requiredNames.some((name) => typeof name !== "string" || !Object.prototype.hasOwnProperty.call(properties, name))
     || new Set(requiredNames).size !== requiredNames.length
   ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
   const required = new Set(requiredNames);
@@ -285,16 +285,28 @@ function enhancementField(name, value, required) {
     throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
   }
   const multiple = property.type === "array";
+  const items = record(property.items);
+  if (
+    (!multiple && property.type !== undefined && property.type !== "string")
+    || (multiple && items?.type !== undefined && items.type !== "string")
+  ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
   const choices = multiple
-    ? (Array.isArray(record(property.items)?.anyOf) ? record(property.items).anyOf : null)
+    ? (Array.isArray(items?.anyOf) ? items.anyOf : null)
     : (Array.isArray(property.oneOf) ? property.oneOf : null);
   if (choices) {
     if (!choices.length || choices.length > 32) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+    const seenValues = new Set();
     const normalizedChoices = choices.map((choice) => {
       const option = record(choice);
-      if (!option || typeof option.const !== "string" || typeof option.title !== "string") {
+      if (
+        !option
+        || typeof option.const !== "string"
+        || typeof option.title !== "string"
+        || seenValues.has(option.const)
+      ) {
         throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
       }
+      seenValues.add(option.const);
       return Object.freeze({ value: option.const, label: option.title });
     });
     const minItems = multiple && property.minItems !== undefined ? property.minItems : 0;
@@ -398,7 +410,7 @@ function mountEnhancementField(session, card, field) {
 }
 
 async function submitEnhancementSession(session) {
-  const content = {};
+  const content = Object.create(null);
   let firstInvalidInput = null;
   for (const [name, control] of session.controls) {
     if (!control.field.choices) {

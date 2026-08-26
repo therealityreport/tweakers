@@ -246,7 +246,7 @@ test("enhancement claim, mounted-renderer acknowledgement, and deliberate respon
     session_id: response.session_id,
     route_fingerprint: claim.route_fingerprint,
     input_fingerprint: claim.input_fingerprint,
-    elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string" } } } },
+    elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string", title: "Choice" } } } },
   });
   assert.deepEqual(delivery, {
     version: ENHANCEMENT_PROTOCOL_VERSION,
@@ -267,7 +267,7 @@ test("enhancement claim, mounted-renderer acknowledgement, and deliberate respon
       session_id: response.session_id,
       route_fingerprint: claim.route_fingerprint,
       input_fingerprint: claim.input_fingerprint,
-      elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string" } } } },
+      elicitation: { mode: "form", message: "Select one", requestedSchema: { type: "object", properties: { choice: { type: "string", title: "Choice" } } } },
     },
   });
   assert.equal(broker.snapshot().enhancementSessions, 0, "response releases its exact session");
