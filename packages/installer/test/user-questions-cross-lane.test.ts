@@ -6,7 +6,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { validateTweakManifest } from "../../sdk/src/index";
-import mcpSync from "../../runtime/src/mcp-sync";
 import promotionHealth from "../../runtime/src/promotion-health";
 import rendererStorage from "../../runtime/src/renderer-storage";
 import { readDevSnapshotReceipt } from "../src/commands/dev-sync";
@@ -21,14 +20,16 @@ const require = createRequire(import.meta.url);
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const tweakRoot = join(repositoryRoot, "tweaks", USER_QUESTIONS_FOLDER);
 const fixtureRoot = join(tweakRoot, "test", "fixtures");
+const runtimeMcpSyncSource = readFileSync(join(repositoryRoot, "packages", "runtime", "src", "mcp-sync.ts"), "utf8");
+const runtimeMcpReconciliationSource = readFileSync(join(repositoryRoot, "packages", "runtime", "src", "mcp-reconciliation.ts"), "utf8");
+const runtimeMainSource = readFileSync(join(repositoryRoot, "packages", "runtime", "src", "main.ts"), "utf8");
+const installerSource = readFileSync(join(repositoryRoot, "packages", "installer", "src", "commands", "install.ts"), "utf8");
 const manifest = readJson(join(tweakRoot, "manifest.json"));
 const tweakPackage = readJson(join(tweakRoot, "package.json"));
 const lifecycle = require(join(tweakRoot, "index.js"));
 const broker = require(join(tweakRoot, "broker-protocol.js"));
 const core = require(join(tweakRoot, "core.js"));
-const mcp = require(join(tweakRoot, "mcp-server.js"));
 const policy = require(join(tweakRoot, "policy-state.js"));
-const { mcpServerNameFromTweakId } = mcpSync;
 const { answerPromotionHealthRequest, PROMOTION_SURFACE_NAMES } = promotionHealth;
 const { prepareRendererStorageMigration } = rendererStorage;
 
@@ -40,11 +41,11 @@ interface StorageLike {
   removeItem(key: string): void;
 }
 
-test("canonical manifest, package, lifecycle, broker, and source proof stay at one 0.6.1 identity", () => {
+test("canonical manifest, package, lifecycle, broker, and source proof stay at one enhancement-only identity", () => {
   const validation = validateTweakManifest(manifest);
   assert.equal(validation.ok, true, JSON.stringify(validation.errors));
   assert.equal(manifest.id, USER_QUESTIONS_TWEAK_ID);
-  assert.equal(manifest.version, "0.6.1");
+  assert.equal(manifest.version, "1.0.0");
   assert.equal(tweakPackage.version, manifest.version);
   assert.equal(manifest.scope, "both");
   assert.deepEqual(broker.REQUIRED_BROKER_PERMISSIONS, ["ipc", "network"]);
@@ -53,53 +54,35 @@ test("canonical manifest, package, lifecycle, broker, and source proof stay at o
   }
   assert.equal(typeof lifecycle.start, "function");
   assert.equal(typeof lifecycle.stop, "function");
-  assert.equal(mcpServerNameFromTweakId(manifest.id), "co-tweakers-user-questions");
+  assert.equal(Object.hasOwn(manifest, "mcp"), false);
 
   const proof = inspectUserQuestionsSource(tweakRoot);
   assert.equal(proof.id, manifest.id);
   assert.equal(proof.version, manifest.version);
   assert.match(proof.payloadHash, /^[a-f0-9]{64}$/);
   assert.match(proof.mainEntrypointHash, /^[a-f0-9]{64}$/);
-  assert.match(proof.mcpEntrypointHash, /^[a-f0-9]{64}$/);
-  assert.match(proof.brokerEntrypointHash, /^[a-f0-9]{64}$/);
+  assert.match(proof.enhancementBrokerEntrypointHash, /^[a-f0-9]{64}$/);
   assert.match(proof.schemaEntrypointHash, /^[a-f0-9]{64}$/);
 });
 
-test("rich schema, generic fallback, submitted delivery, and redaction use the frozen fixtures", () => {
+test("cutover removes every Tweakers-owned User Questions MCP registration and startup requirement", () => {
+  assert.doesNotMatch(runtimeMcpSyncSource, /co-tweakers-user-questions/);
+  assert.doesNotMatch(runtimeMcpReconciliationSource, /userQuestionsMcpReceiptMatchesEnabledState|observeUserQuestionsApprovalPolicy/);
+  assert.doesNotMatch(runtimeMainSource, /userQuestionsMcpReady|canonical User Questions MCP reconciliation/);
+  assert.doesNotMatch(installerSource, /userQuestionsStateConsistent|Canonical User Questions MCP source is missing/);
+  assert.equal(Object.hasOwn(manifest, "mcp"), false);
+});
+
+test("enhancement support preserves rich schema, generic terminal fixtures, and redaction without an embedded server", () => {
   const richFixture = readJson(join(fixtureRoot, "rich-ask.json"));
   const validation = core.validateAskInput(richFixture.input);
   assert.equal(validation.ok, true, validation.errors?.join("; "));
   assert.deepEqual(validation.value, richFixture.normalized);
 
-  const tool = mcp.toolDefinition();
-  const optionProperties = tool.inputSchema.properties.questions.items.properties.options.items.properties;
-  for (const field of ["details", "pros", "cons", "gives_up", "recommended"]) {
-    assert.ok(optionProperties[field], `tool schema is missing ${field}`);
-  }
-  assert.match(tool.description, /current-task preferences, not permanent rules/i);
-  assert.match(tool.description, /explain conflicts/i);
-  assert.match(tool.description, /not written to diagnostic logs/i);
-
-  const carrier = "__tweakers_carrier_nonce_0123456789abcdef";
-  const elicitation = mcp.buildRoundElicitation(validation.value, false, carrier);
-  const scanner = elicitation.requestedSchema.properties[carrier];
-  assert.equal(elicitation.requestedSchema.properties.scanner_setup, undefined);
-  assert.match(scanner.description, /Details:/);
-  assert.match(scanner.description, /Pros:/);
-  assert.match(scanner.description, /Cons:/);
-  assert.match(scanner.description, /What you give up:/);
-  assert.match(scanner.description, /Skip this question/);
-  assert.match(scanner.description, /Choose Other/);
-  assert.ok(scanner.oneOf.some((option: { const: string; title: string }) => option.const === "__skip__"));
-  assert.ok(scanner.oneOf.some((option: { const: string; title: string }) => option.const === "built_in" && /Recommended/.test(option.title)));
-
   const submittedFixture = readJson(join(fixtureRoot, "submitted-result.json"));
-  const serialized = mcp.serializeToolResult(validation.value, submittedFixture.result);
-  assert.equal(serialized.isError, false);
-  assert.deepEqual(serialized.structuredContent, submittedFixture.normalized);
-  assert.deepEqual(JSON.parse(serialized.content[0].text), submittedFixture.normalized);
-  assert.equal(serialized.structuredContent.decision_guidance.semantics, "preference-not-policy");
-  assert.match(serialized.structuredContent.decision_guidance.on_conflict, /Ask before materially changing/);
+  const submitted = core.serializeResult(validation.value, submittedFixture.result);
+  assert.equal(submitted.ok, true);
+  assert.deepEqual(submitted.value.structuredContent, submittedFixture.normalized);
 
   const displayFailed = readJson(join(fixtureRoot, "display-failed-result.json"));
   const hostEmpty = readJson(join(fixtureRoot, "host-empty-response-result.json"));
@@ -253,7 +236,8 @@ test("schema-v2 promotion health binds the canonical source proof and all rollou
         brokerSelfTest: "pass",
         schemaSelfTest: "pass",
         rendererStorageSelfTest: "pass",
-        mcpConflictCount: 0,
+        enhancementHandshake: "pass",
+        genericFallback: "pass",
       }),
     }, { now: new Date("2026-07-20T12:00:01.000Z") });
     assert.equal(accepted, true);
@@ -265,7 +249,8 @@ test("schema-v2 promotion health binds the canonical source proof and all rollou
     assert.equal(receipt.userQuestions.expected.version, manifest.version);
     assert.equal(receipt.userQuestions.expected.payloadHash, proof.payloadHash);
     assert.equal(receipt.userQuestions.identity, "pass");
-    assert.equal(receipt.userQuestions.zeroMcpConflicts, "pass");
+    assert.equal(receipt.userQuestions.enhancementHandshake, "pass");
+    assert.equal(receipt.userQuestions.genericFallback, "pass");
     assert.deepEqual(Object.keys(receipt.surfaces).sort(), [...PROMOTION_SURFACE_NAMES].sort());
   } finally {
     rmSync(root, { recursive: true, force: true });

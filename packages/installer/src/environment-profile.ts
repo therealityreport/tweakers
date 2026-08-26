@@ -1406,6 +1406,42 @@ export function publishEnvironmentSnapshot(
   commitEnvironmentDocumentsAtomically(registryFile, registry, selectionFile, selection, {});
 }
 
+/**
+ * Republish the selection documents from the PROVEN live experience. Live
+ * bytes outrank a stale publication: a swap-at-quit flow or a failed exchange
+ * can change the live app without republishing, after which every
+ * selection-trusting flow (mode switching, prepare, repair intent,
+ * update-recovery adoption) works from fiction until reconciled. Preserves
+ * the selected desktop path/bundle and release profile; only the experience
+ * axes are rewritten to match reality.
+ */
+export function republishEnvironmentSelectionFromLiveExperience(input: {
+  registryFile: string;
+  selectionFile: string;
+  environmentRoot: string;
+  selected: EnvironmentSelection;
+  liveExperience: AppExperience;
+  now?: string;
+}): EnvironmentSelection {
+  const now = input.now ?? new Date().toISOString();
+  const profile = resolveEnvironmentProfile(
+    defaultEnvironmentProfileRegistry(input.environmentRoot),
+    input.selected.releaseProfile,
+  );
+  const selection = createEnvironmentSelection({
+    profile: {
+      ...profile,
+      selectedDesktopPath: input.selected.selectedDesktopPath,
+      selectedDesktopBundleId: input.selected.selectedDesktopBundleId,
+    },
+    appExperience: input.liveExperience,
+    requestedAt: now,
+    appliedAt: now,
+  });
+  publishEnvironmentSelection(input.registryFile, input.selectionFile, selection);
+  return selection;
+}
+
 /** Publish one verified selection to both schema-2 documents as one rollback-safe pair. */
 export function publishEnvironmentSelection(
   registryFile: string,

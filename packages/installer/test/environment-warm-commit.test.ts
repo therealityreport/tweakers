@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import {
+  assertEnvironmentModePairExchangeReadyEvidence,
   assertEnvironmentModePairMaterialized,
   assertEnvironmentModePairWarmCommitMaterialized,
   acquireCurrentEnvironmentModePairWarmCommitLease,
@@ -40,11 +41,13 @@ import {
   captureEnvironmentModeCacheOuterAppEvidence,
   commitPreparedEnvironmentModePairWarm,
   digestEnvironmentModeCacheOuterAppAclListing,
+  environmentWarmCommitLiveTargetIdentity,
   type EnvironmentWarmCommitDeps,
   type EnvironmentWarmCommitPreflightReady,
   type EnvironmentWarmCommitProjection,
   type EnvironmentWarmCommitTargetProof,
 } from "../src/environment-warm-commit";
+import { sealedRoleAtLiveTarget } from "../src/environment-mode-production";
 
 const HASH = "a".repeat(64);
 const APPROVAL_AT = "2026-08-18T12:00:00.000Z";
@@ -866,4 +869,142 @@ test("a pristine ChatGPT target fails closed if its dormant Tweakers loader or M
     assert.equal(events.includes("publish-selection"), false);
     assert.equal(events.includes("resume-watcher"), false);
   }, "tweakers");
+});
+
+test("exchange-ready evidence tolerates outer root stat churn but refuses identity drift before the swap", async () => {
+  await withFixture((fixture) => {
+    const before = exchangeBefore(fixture.receipt);
+    assert.doesNotThrow(() => assertEnvironmentModePairExchangeReadyEvidence(fixture.receipt, before));
+
+    // macOS legitimately advances the live .app root's size/mtime/ctime
+    // (Gatekeeper provenance xattrs, LaunchServices touches) without changing
+    // one sealed byte. Pinning those root fields turned that churn into a
+    // post-exchange abort (live failure 2026-08-25: root ctimeNs drifted).
+    const churned = {
+      ...before,
+      liveOuterBefore: {
+        ...before.liveOuterBefore,
+        stat: {
+          ...before.liveOuterBefore.stat,
+          size: (BigInt(before.liveOuterBefore.stat.size) + 32n).toString(),
+          mtimeNs: (BigInt(before.liveOuterBefore.stat.mtimeNs) + 1_000_000n).toString(),
+          ctimeNs: (BigInt(before.liveOuterBefore.stat.ctimeNs) + 1_000_000n).toString(),
+        },
+      },
+    };
+    assert.doesNotThrow(() => assertEnvironmentModePairExchangeReadyEvidence(fixture.receipt, churned));
+
+    // A replaced root directory is a different inode and must still refuse.
+    const replacedRoot = {
+      ...before,
+      liveOuterBefore: {
+        ...before.liveOuterBefore,
+        stat: {
+          ...before.liveOuterBefore.stat,
+          ino: (BigInt(before.liveOuterBefore.stat.ino) + 1n).toString(),
+        },
+      },
+    };
+    assert.throws(
+      () => assertEnvironmentModePairExchangeReadyEvidence(fixture.receipt, replacedRoot),
+      /outer app evidence does not match its prepared seal/,
+    );
+
+    // A moved Contents directory must refuse before the swap, not after it.
+    const movedContents = {
+      ...before,
+      liveContentsBefore: {
+        ...before.liveContentsBefore,
+        ino: (BigInt(before.liveContentsBefore.ino) + 1n).toString(),
+      },
+    };
+    assert.throws(
+      () => assertEnvironmentModePairExchangeReadyEvidence(fixture.receipt, movedContents),
+      /Contents identity does not match its prepared seal/,
+    );
+
+    // The production preflight must run these legs BEFORE the sole native
+    // exchange; drift there resolves as stale_requires_prepare instead of a
+    // post-swap proof failure.
+    const source = readFileSync(
+      fileURLToPath(new URL("../src/environment-mode-production.ts", import.meta.url)),
+      "utf8",
+    );
+    assert.match(source, /assertEnvironmentModePairExchangeReadyEvidence\(pair, before\)/);
+  });
+});
+
+test("a post-swap proof failure before receipt rotation exchanges back and invalidates the pair", async () => {
+  await withFixture(async (fixture) => {
+    const events: string[] = [];
+    const liveBefore = contentsIdentity(fixture.receipt.roles.live.appPath);
+    const inactiveBefore = contentsIdentity(fixture.receipt.paths.inactiveAppPath);
+    const receipt = await commit(fixture, warmDeps(fixture, events, {
+      captureExchangeProof: ({ pair, before }) => {
+        events.push("capture-proof");
+        const proof = exchangeProof(pair, before);
+        // A mid-swap drift surfaces as a proof that no longer binds; the
+        // receipt rotation refuses, so the catch path sees the PRE-rotation
+        // roles while the live path already holds the incoming payload.
+        return {
+          ...proof,
+          liveContentsAfter: {
+            ...proof.liveContentsAfter,
+            ino: (BigInt(proof.liveContentsAfter.ino) + 1n).toString(),
+          },
+        };
+      },
+    }));
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.exchangeCount, 2);
+    assert.equal(receipt.stamps.some((stamp) => stamp.phase === "exchange-reverted"), true);
+    assert.match(receipt.error ?? "", /inode role exchange was not proven/);
+    // The bytes are restored and the receipt never rotated, so the grant is
+    // released: the next mode action prepares a fresh generation instead of
+    // replaying this pair into the same failure.
+    assert.match(receipt.error ?? "", /sealed pair invalidated/);
+    assert.deepEqual(contentsIdentity(fixture.receipt.roles.live.appPath), liveBefore);
+    assert.deepEqual(contentsIdentity(fixture.receipt.paths.inactiveAppPath), inactiveBefore);
+    const current = readCurrentEnvironmentModePair(fixture.paths);
+    assert.equal(current?.pin.state, "stale_requires_prepare");
+    assert.equal(current?.pin.releaseReason, "invalidated");
+    // The reverted source app reopens and the watcher resumes; an orphaned
+    // paused promotion receipt must not outlive the failed transaction.
+    assert.equal(receipt.stamps.some((stamp) => stamp.phase === "source-watcher-resumed"), true);
+    const reopenIndex = events.lastIndexOf("reopen");
+    const resumeIndex = events.lastIndexOf("resume-watcher");
+    const revertExchangeIndex = events.lastIndexOf("exchange");
+    assert.equal(revertExchangeIndex < reopenIndex, true);
+    assert.equal(reopenIndex < resumeIndex, true);
+  });
+});
+
+test("the live-target observation binds the sealed role its expectation derives from", async () => {
+  await withFixture((fixture) => {
+    const pair = fixture.receipt;
+    const livePath = pair.roles.live.appPath;
+
+    // After a forward exchange whose rotation failed, the live path holds the
+    // sealed INACTIVE role's payload. The inverse observation must bind that
+    // role at the live path — asserting roles.live there refused every
+    // immediate exchange-back (live failure 2026-08-25).
+    const fromInactive = environmentWarmCommitLiveTargetIdentity(pair, pair.roles.inactive, livePath);
+    const boundInactive = sealedRoleAtLiveTarget(pair, fromInactive);
+    assert.equal(boundInactive.role, "live");
+    assert.equal(boundInactive.appPath, livePath);
+    assert.equal(boundInactive.experience, pair.roles.inactive.experience);
+    assert.equal(boundInactive.evidence.asarDigest, pair.roles.inactive.evidence.asarDigest);
+    assert.equal(boundInactive.evidence.asarPath, join(livePath, "Contents", "Resources", "app.asar"));
+
+    const fromLive = environmentWarmCommitLiveTargetIdentity(pair, pair.roles.live, livePath);
+    const boundLive = sealedRoleAtLiveTarget(pair, fromLive);
+    assert.equal(boundLive.experience, pair.roles.live.experience);
+    assert.equal(boundLive.evidence.asarDigest, pair.roles.live.evidence.asarDigest);
+
+    assert.throws(
+      () => sealedRoleAtLiveTarget(pair, { ...fromLive, asarHeaderDigest: "0".repeat(64) }),
+      /does not bind either sealed role/,
+    );
+  });
 });

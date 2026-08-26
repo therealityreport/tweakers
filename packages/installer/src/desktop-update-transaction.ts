@@ -33,6 +33,7 @@ import {
   publishEnvironmentSelection,
   readEnvironmentSelection,
   readEnvironmentProfileRegistry,
+  republishEnvironmentSelectionFromLiveExperience,
   resolveEnvironmentProfile,
   validateOfficialEnvironmentProfile,
   writeEnvironmentProfileRegistry,
@@ -227,6 +228,13 @@ export interface DesktopUpdateModeCacheSwitchResult {
   selection: EnvironmentSelection | null;
   targetMainPid: number | null;
   pair: DesktopUpdateModeCachePair | null;
+  /**
+   * True when a failed warm commit's own handling exchanged the Contents
+   * back, re-proved and reopened the source, and resumed the watcher. That
+   * handling also invalidates the grant, so failure classification must not
+   * require a still-prepared pin to recognize the clean rollback.
+   */
+  sourceRestored?: boolean;
 }
 
 export interface DesktopUpdateModeCacheAdapter {
@@ -299,8 +307,11 @@ export interface DesktopUpdateDependencies {
   /** Test/adapter seam after the native wait settles but before its atomic receipt transition. */
   beforeNativeWaitTransition?(): void | Promise<void>;
   /**
-   * Recompute profile/artifact evidence without changing the identity of the
-   * environment that the desktop-update transaction already captured.
+   * Recompute profile/artifact evidence for the environment the transaction
+   * captured. The desktop path/profile identity never changes, but the
+   * returned selection may carry a RECONCILED appExperience when the live
+   * marker contradicts the published selection — callers must plan from the
+   * returned value, not the captured one (live failure 2026-08-25).
    */
   refreshEnvironmentTruth(
     current: EnvironmentSelection,
@@ -387,6 +398,9 @@ function createProductionDesktopUpdateModeCacheAdapter(input: {
     selection: await input.readCurrentSelection(),
     targetMainPid: warm.targetMainPid,
     pair: current(),
+    sourceRestored: warm.phase === "failed"
+      && warm.stamps.some((entry) => entry.phase === "exchange-reverted")
+      && warm.stamps.some((entry) => entry.phase === "source-watcher-resumed"),
   });
   const switchCurrent = async (request: {
     current: EnvironmentSelection;
@@ -653,7 +667,7 @@ export function createDesktopUpdateTransaction(
     refreshEnvironmentTruth: overrides.refreshEnvironmentTruth ?? ((current) => {
       const capabilities = environmentPreparationCapabilities();
       const managedAlpha = inspectManagedAlphaBackend(root);
-      const loaded = loadEnvironmentState({
+      const load = () => loadEnvironmentState({
         legacyStateFile: installerStateFile,
         registryFile: environmentRegistryFile,
         selectionFile: environmentSelectionFile,
@@ -680,6 +694,35 @@ export function createDesktopUpdateTransaction(
           return evidence;
         },
       });
+      let loaded = load();
+      // The updater branches its whole transition strategy on the source
+      // experience, so it must never plan from a stale publication. A failed
+      // exchange can leave the live app in the OTHER mode; reconcile the
+      // durable selection from the proven live marker before planning
+      // (live failure 2026-08-25). Best-effort: an unreadable marker or a
+      // refused republish falls back to the published selection unchanged.
+      try {
+        const marker = readAsarMarker(join(
+          loaded.current.selectedDesktopPath,
+          "Contents",
+          "Resources",
+          "app.asar",
+        ));
+        const liveExperience = marker === "present" ? "tweakers" as const : marker === "absent" ? "chatgpt" as const : null;
+        if (liveExperience !== null && liveExperience !== loaded.current.appExperience) {
+          republishEnvironmentSelectionFromLiveExperience({
+            registryFile: environmentRegistryFile,
+            selectionFile: environmentSelectionFile,
+            environmentRoot: root,
+            selected: loaded.current,
+            liveExperience,
+          });
+          loaded = load();
+        }
+      } catch {
+        // Reconciliation must never make the update less available than the
+        // pre-reconciliation behavior it protects.
+      }
       writeEnvironmentProfileRegistry(environmentRegistryFile, loaded.registry);
       return loaded.current;
     }),
@@ -911,8 +954,19 @@ export function createDesktopUpdateTransaction(
       // A local refresh can atomically replace both the patched payload and
       // pristine backup. Recompute their fingerprints immediately before
       // preparation so the coordinator never validates fresh artifacts
-      // against a stale registry snapshot.
-      await deps.refreshEnvironmentTruth(receipt.source);
+      // against a stale registry snapshot. The refresh also reconciles a
+      // selection whose experience contradicts the live marker; the plan must
+      // adopt that reconciled source, because the captured fiction can no
+      // longer prepare against the republished registry (live failure
+      // 2026-08-25).
+      const refreshedSource = await deps.refreshEnvironmentTruth(receipt.source);
+      if (refreshedSource
+        && refreshedSource.selectedDesktopPath === receipt.source.selectedDesktopPath
+        && refreshedSource.selectedDesktopBundleId === receipt.source.selectedDesktopBundleId
+        && refreshedSource.releaseProfile === receipt.source.releaseProfile
+        && refreshedSource.appExperience !== receipt.source.appExperience) {
+        receipt = update(receipt, { source: refreshedSource });
+      }
     } catch (error) {
       return update(receipt, {
         phase: "failed",
@@ -1689,12 +1743,17 @@ export function createDesktopUpdateTransaction(
       result.transactionId,
       returning && receipt.observed !== null ? receipt.observed : receipt.baseline,
     );
+    // A failed commit whose own handling proved the clean rollback (bytes
+    // exchanged back, source re-proved/reopened, watcher resumed) also
+    // invalidates its grant, so the source proof must accept the released
+    // pin in exactly that case (post-revert invalidation, 2026-08-25).
     const liveSource = pairProvesLiveEnvironment(
       result.pair,
       result.selection,
       receipt.source,
       result.transactionId,
       returning && receipt.observed !== null ? receipt.observed : receipt.baseline,
+      result.sourceRestored === true,
     );
     return update(receipt, {
       phase: liveSource ? "rolled_back" : "failed",
@@ -2805,11 +2864,13 @@ function pairProvesLiveEnvironment(
   expected: EnvironmentSelection,
   generationId: string,
   version: DesktopVersionIdentity,
+  acceptInvalidatedPin = false,
 ): pair is DesktopUpdateModeCachePair {
   return pair !== null
     && current !== null
     && pair.generationId === generationId
-    && pair.pinState === "prepared"
+    && (pair.pinState === "prepared"
+      || (acceptInvalidatedPin && pair.pinState === "stale_requires_prepare"))
     && pair.releaseProfile === expected.releaseProfile
     && pair.live.experience === expected.appExperience
     && pair.live.appPath === expected.selectedDesktopPath

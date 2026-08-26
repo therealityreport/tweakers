@@ -979,10 +979,8 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
         brokerSelfTest: observedUserQuestions?.brokerSelfTest ?? "unknown",
         schemaSelfTest: observedUserQuestions?.schemaSelfTest ?? "unknown",
         rendererStorageSelfTest: observedUserQuestions?.rendererStorageSelfTest ?? "unknown",
-        mcpConflictCount: observedUserQuestions?.mcpConflictCount ?? null,
-        zeroMcpConflicts: observedUserQuestions
-            ? observedUserQuestions.mcpConflictCount === 0 ? "pass" : "fail"
-            : "unknown",
+        enhancementHandshake: observedUserQuestions?.enhancementHandshake ?? "unknown",
+        genericFallback: observedUserQuestions?.genericFallback ?? "unknown",
     };
     const allSurfacesPass = Object.values(surfaces).every((surface) => surface.status === "pass");
     const allPermissionsPass = Object.values(permissions).every((permission) => permission === "pass");
@@ -992,7 +990,8 @@ async function buildV2Receipt(request, probes, permissions, authenticatedSession
         userQuestions.brokerSelfTest,
         userQuestions.schemaSelfTest,
         userQuestions.rendererStorageSelfTest,
-        userQuestions.zeroMcpConflicts,
+        userQuestions.enhancementHandshake,
+        userQuestions.genericFallback,
     ].every((value) => value === "pass");
     const rendererProofPass = passingRendererProofSummary(observedRendererProof);
     return {
@@ -1129,13 +1128,13 @@ function validPromotionHash(value) {
 }
 function validUserQuestionsObservation(value) {
     if (!plainRecord(value) || !exactKeys(value, [
-        "id", "version", "payloadHash", "mainLifecycle", "brokerSelfTest", "schemaSelfTest", "rendererStorageSelfTest", "mcpConflictCount",
+        "id", "version", "payloadHash", "mainLifecycle", "brokerSelfTest", "schemaSelfTest", "rendererStorageSelfTest", "enhancementHandshake", "genericFallback",
     ]))
         return false;
     return typeof value.id === "string" && typeof value.version === "string" && validPromotionHash(value.payloadHash) &&
         validHealthValue(value.mainLifecycle) && validHealthValue(value.brokerSelfTest) && validHealthValue(value.schemaSelfTest) &&
         validHealthValue(value.rendererStorageSelfTest) &&
-        Number.isInteger(value.mcpConflictCount) && value.mcpConflictCount >= 0;
+        validHealthValue(value.enhancementHandshake) && validHealthValue(value.genericFallback);
 }
 function validHealthValue(value) {
     return value === "pass" || value === "fail" || value === "unknown";

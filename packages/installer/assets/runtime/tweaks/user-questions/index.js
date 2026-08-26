@@ -5,6 +5,8 @@ const CARRIER_NONCE_PREFIX = "__tweakers_carrier_nonce_";
 const CARD_ATTRIBUTE = "data-tweaker-user-questions-card";
 const NOTICE_ATTRIBUTE = "data-tweaker-user-questions-notice";
 const STYLE_ATTRIBUTE = "data-tweaker-user-questions-style";
+const ENHANCEMENT_CARD_ATTRIBUTE = "data-tweaker-user-questions-enhancement-card";
+const ENHANCEMENT_PROTOCOL_VERSION = 1;
 const MAX_FIBER_DEPTH = 128;
 const NONCE_PATTERN = /^[A-Za-z0-9._~-]{8,128}$/;
 const OTHER_VALUE = "__other__";
@@ -58,6 +60,7 @@ async function startMain(api, state) {
     dataDir: api.fs.dataDir,
     tweakId: api.manifest.id,
     permissions: api.manifest.permissions,
+    enhancementSocketPath: globalThis.process?.env?.USER_QUESTIONS_ENHANCEMENT_SOCKET,
     sendToRenderer: (webContentsId, channel, ...args) => (
       api.ipc.sendToRenderer(webContentsId, channel, ...args)
     ),
@@ -82,6 +85,18 @@ async function startMain(api, state) {
   ));
   registerMainHandler(state, api, "release", (context, token, hostId, conversationId) => (
     broker.release(token, route(context, hostId, conversationId))
+  ));
+  registerMainHandler(state, api, "enhancement.register", (context) => (
+    broker.registerEnhancementRenderer(context.sender.webContentsId)
+  ));
+  registerMainHandler(state, api, "enhancement.unregister", (context) => (
+    broker.unregisterEnhancementRenderer(context.sender.webContentsId)
+  ));
+  registerMainHandler(state, api, "enhancement.ack", (context, acknowledgement) => (
+    broker.acknowledgeEnhancement(context.sender.webContentsId, acknowledgement)
+  ));
+  registerMainHandler(state, api, "enhancement.respond", (context, response) => (
+    broker.respondEnhancement(context.sender.webContentsId, response)
   ));
 
   const policy = createPolicyCommandInterface();
@@ -142,6 +157,7 @@ async function startRenderer(api, state) {
     throw new Error("User Questions requires the semantic host adapter and renderer IPC");
   }
   state.api = api;
+  state.enhancementSessions = new Map();
   state.style = installStyle();
   state.cleanups.push(() => state.style?.remove?.());
   state.settings = registerSettingsPage(api);
@@ -150,6 +166,21 @@ async function startRenderer(api, state) {
   const scan = () => void scanForCarriers(api, state);
   const unobserve = api.react.host.observe?.(["assistant-turns"], scan);
   if (typeof unobserve === "function") state.cleanups.push(unobserve);
+  if (typeof api.ipc.on === "function") {
+    const unsubscribe = api.ipc.on("enhancement.deliver", (delivery) => {
+      void receiveEnhancementDelivery(api, state, delivery);
+    });
+    if (typeof unsubscribe === "function") state.cleanups.push(unsubscribe);
+    try {
+      await api.ipc.invoke("enhancement.register");
+      state.enhancementRegistered = true;
+      state.cleanups.push(async () => {
+        try { await api.ipc.invoke("enhancement.unregister"); } catch {}
+      });
+    } catch (error) {
+      api.log.warn("User Questions enhanced renderer is unavailable; standard forms remain available", redactedErrorMetadata(error));
+    }
+  }
   scan();
 }
 
@@ -168,6 +199,222 @@ async function scanForCarriers(api, state) {
   } finally {
     state.scanning = false;
   }
+}
+
+/**
+ * This is intentionally separate from the legacy nonce carrier.  The
+ * independently installed MCP sends a standard elicitation over its optional
+ * socket; this renderer receives only a session-bound delivery after the main
+ * broker has selected this exact renderer.  Nothing here registers an MCP or
+ * manufactures a generic-form result.
+ */
+async function receiveEnhancementDelivery(api, state, delivery) {
+  let session;
+  try {
+    const normalized = normalizeEnhancementDelivery(delivery);
+    if (state.stopped || state.enhancementSessions.has(normalized.session_id)) {
+      throw Object.assign(new Error("enhancement_session_unavailable"), { code: "renderer_unavailable" });
+    }
+    session = createEnhancementSession(api, state, normalized);
+    state.enhancementSessions.set(session.id, session);
+    mountEnhancementSession(session);
+    await survivePaint();
+    if (state.stopped || !session.card?.isConnected) {
+      throw Object.assign(new Error("enhancement_mount_failed"), { code: "owned_mount" });
+    }
+    session.heading?.focus?.({ preventScroll: true });
+    await api.ipc.invoke("enhancement.ack", enhancementEnvelope(session, "acknowledged"));
+    session.acknowledged = true;
+  } catch (error) {
+    if (session) {
+      session.card?.remove?.();
+      state.enhancementSessions.delete(session.id);
+    }
+    api.log.warn("User Questions enhanced delivery was not mounted; standard form remains available", redactedErrorMetadata(error));
+  }
+}
+
+function normalizeEnhancementDelivery(value) {
+  if (!record(value)) throw Object.assign(new Error("enhancement_invalid"), { code: "request_failed" });
+  const expected = ["elicitation", "id", "input_fingerprint", "route_fingerprint", "session_id", "type", "version"];
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== expected.length
+    || keys.some((key, index) => key !== expected[index])
+    || value.version !== ENHANCEMENT_PROTOCOL_VERSION
+    || value.type !== "deliver"
+    || !/^[A-Za-z0-9._~-]{1,128}$/.test(value.id || "")
+    || !/^[A-Za-z0-9_-]{1,128}$/.test(value.session_id || "")
+    || !/^[a-f0-9]{64}$/.test(value.route_fingerprint || "")
+    || !/^[a-f0-9]{64}$/.test(value.input_fingerprint || "")
+  ) throw Object.assign(new Error("enhancement_invalid"), { code: "request_failed" });
+  const elicitation = record(value.elicitation);
+  const schema = record(elicitation?.requestedSchema);
+  const properties = record(schema?.properties);
+  if (
+    elicitation?.mode !== "form"
+    || typeof elicitation.message !== "string"
+    || elicitation.message.length > 8_192
+    || schema?.type !== "object"
+    || !properties
+    || Object.keys(properties).length < 1
+    || Object.keys(properties).length > 8
+  ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+  const fields = Object.entries(properties).map(([name, property]) => enhancementField(name, property));
+  return Object.freeze({
+    id: value.id,
+    session_id: value.session_id,
+    route_fingerprint: value.route_fingerprint,
+    input_fingerprint: value.input_fingerprint,
+    elicitation: Object.freeze({ message: elicitation.message, fields }),
+  });
+}
+
+function enhancementField(name, value) {
+  const property = record(value);
+  if (!/^[A-Za-z0-9._~-]{1,128}$/.test(name) || !property || typeof property.title !== "string") {
+    throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+  }
+  const choices = Array.isArray(property.oneOf)
+    ? property.oneOf
+    : Array.isArray(record(property.items)?.anyOf)
+      ? record(property.items).anyOf
+      : null;
+  if (choices) {
+    if (!choices.length || choices.length > 32) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+    const normalizedChoices = choices.map((choice) => {
+      const option = record(choice);
+      if (!option || typeof option.const !== "string" || typeof option.title !== "string") {
+        throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+      }
+      return Object.freeze({ value: option.const, label: option.title });
+    });
+    return Object.freeze({
+      name,
+      title: property.title,
+      description: typeof property.description === "string" ? property.description : "",
+      multiple: property.type === "array",
+      choices: Object.freeze(normalizedChoices),
+    });
+  }
+  if (property.type !== "string") throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+  return Object.freeze({
+    name,
+    title: property.title,
+    description: typeof property.description === "string" ? property.description : "",
+    multiple: false,
+    choices: null,
+  });
+}
+
+function createEnhancementSession(api, state, delivery) {
+  return {
+    id: delivery.session_id,
+    api,
+    state,
+    delivery,
+    card: null,
+    heading: null,
+    controls: new Map(),
+    acknowledged: false,
+    responding: false,
+  };
+}
+
+function mountEnhancementSession(session) {
+  const card = document.createElement("form");
+  card.noValidate = true;
+  card.setAttribute(ENHANCEMENT_CARD_ATTRIBUTE, "");
+  card.setAttribute("aria-label", "User Questions");
+  card.className = "border-token-border bg-token-bg-primary flex min-w-0 flex-col gap-4 rounded-lg border p-panel text-token-text-primary";
+  card.addEventListener("submit", preventDefault);
+  const heading = element("h2", "text-base font-medium text-token-text-primary", "User Questions");
+  heading.tabIndex = -1;
+  heading.setAttribute("data-uq-enhancement-heading", "");
+  const message = element("p", "text-sm text-token-text-secondary", session.delivery.elicitation.message);
+  card.append(heading, message);
+  for (const field of session.delivery.elicitation.fields) mountEnhancementField(session, card, field);
+  const actions = element("div", "flex flex-wrap justify-end gap-2");
+  actions.append(
+    actionButton("Cancel", "secondary", () => void finishEnhancementSession(session, { action: "cancel" })),
+    actionButton("Submit", "primary", () => void submitEnhancementSession(session)),
+  );
+  card.append(actions);
+  (document.body || document.documentElement)?.appendChild?.(card);
+  if (!card.isConnected) throw Object.assign(new Error("enhancement_mount_failed"), { code: "owned_mount" });
+  session.card = card;
+  session.heading = heading;
+}
+
+function mountEnhancementField(session, card, field) {
+  const fieldset = document.createElement("fieldset");
+  fieldset.className = "flex min-w-0 flex-col gap-2";
+  fieldset.append(element("legend", "text-sm font-medium text-token-text-primary", field.title));
+  if (field.description) fieldset.append(element("p", "text-sm text-token-text-secondary", field.description));
+  if (!field.choices) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "border-token-border bg-token-bg-primary h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
+    fieldset.append(input);
+    session.controls.set(field.name, { field, inputs: [input] });
+    card.append(fieldset);
+    return;
+  }
+  const inputs = [];
+  for (const choice of field.choices) {
+    const label = element("label", "flex items-start gap-2 text-sm text-token-text-primary");
+    const input = document.createElement("input");
+    input.type = field.multiple ? "checkbox" : "radio";
+    input.name = `${session.id}:${field.name}`;
+    input.value = choice.value;
+    label.append(input, element("span", "min-w-0", choice.label));
+    fieldset.append(label);
+    inputs.push(input);
+  }
+  session.controls.set(field.name, { field, inputs });
+  card.append(fieldset);
+}
+
+async function submitEnhancementSession(session) {
+  const content = {};
+  for (const [name, control] of session.controls) {
+    if (!control.field.choices) {
+      content[name] = control.inputs[0]?.value || "";
+      continue;
+    }
+    const selected = control.inputs.filter((input) => input.checked).map((input) => input.value);
+    content[name] = control.field.multiple ? selected : selected[0];
+  }
+  await finishEnhancementSession(session, { action: "accept", content });
+}
+
+async function finishEnhancementSession(session, response) {
+  if (session.responding || !session.acknowledged || session.state.stopped) return;
+  session.responding = true;
+  setBusy(session, true);
+  try {
+    await session.api.ipc.invoke("enhancement.respond", enhancementEnvelope(session, "response", response));
+    session.card?.remove?.();
+    session.state.enhancementSessions.delete(session.id);
+  } catch (error) {
+    session.responding = false;
+    setBusy(session, false);
+    const notice = element("p", "text-sm text-token-text-secondary", "Delivery could not be completed. You can try again.");
+    notice.setAttribute("role", "alert");
+    session.card?.append(notice);
+    session.api.log.warn("User Questions enhanced response was not delivered", redactedErrorMetadata(error));
+  }
+}
+
+function enhancementEnvelope(session, type, response) {
+  return Object.freeze({
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type,
+    session_id: session.id,
+    route_fingerprint: session.delivery.route_fingerprint,
+    input_fingerprint: session.delivery.input_fingerprint,
+    ...(response === undefined ? {} : { response }),
+  });
 }
 
 function discoverCarrierNonces(api, form) {
@@ -1078,6 +1325,11 @@ function restoreHostForm(form, snapshot) {
 async function cleanupState(state) {
   if (state.stopped) return;
   state.stopped = true;
+  for (const session of state.enhancementSessions?.values?.() || []) {
+    session.responding = true;
+    session.card?.remove?.();
+  }
+  state.enhancementSessions?.clear?.();
   for (const session of state.sessions.values()) {
     if (!session || session.status === "claiming") continue;
     restoreHostForm(session.controller.form, session.formSnapshot);

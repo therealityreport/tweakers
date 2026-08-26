@@ -1149,7 +1149,7 @@ test("patched runtime rejects stale or insecure requests without probing", async
   }
 });
 
-test("schema-v2 receipt proves every promoted surface and canonical User Questions health", async () => {
+test("schema-v2 receipt proves every promoted surface and enhancement-only User Questions health", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-health-v2-"));
   try {
     const health = join(root, "health");
@@ -1194,7 +1194,8 @@ test("schema-v2 receipt proves every promoted surface and canonical User Questio
         brokerSelfTest: "pass",
         schemaSelfTest: "pass",
         rendererStorageSelfTest: "pass",
-        mcpConflictCount: 0,
+        enhancementHandshake: "pass",
+        genericFallback: "pass",
       }),
     }, { now: new Date("2026-07-10T12:00:01.000Z") }), true);
 
@@ -1230,7 +1231,8 @@ test("schema-v2 receipt proves every promoted surface and canonical User Questio
     assert.equal(receipt.userQuestions.brokerSelfTest, "pass");
     assert.equal(receipt.userQuestions.schemaSelfTest, "pass");
     assert.equal(receipt.userQuestions.rendererStorageSelfTest, "pass");
-    assert.equal(receipt.userQuestions.zeroMcpConflicts, "pass");
+    assert.equal(receipt.userQuestions.enhancementHandshake, "pass");
+    assert.equal(receipt.userQuestions.genericFallback, "pass");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1283,13 +1285,14 @@ test("schema-v2 request fails closed on missing surfaces and absent injected pro
       promotionReady: string;
       hostReady: string;
       surfaces: Record<string, { status: string }>;
-      userQuestions: { identity: string; zeroMcpConflicts: string };
+      userQuestions: { identity: string; enhancementHandshake: string; genericFallback: string };
     };
     assert.equal(receipt.promotionReady, "fail");
     assert.equal(receipt.hostReady, "unknown");
     assert.equal(receipt.surfaces.codexConfig?.status, "unknown");
     assert.equal(receipt.userQuestions.identity, "unknown");
-    assert.equal(receipt.userQuestions.zeroMcpConflicts, "unknown");
+    assert.equal(receipt.userQuestions.enhancementHandshake, "unknown");
+    assert.equal(receipt.userQuestions.genericFallback, "unknown");
   } finally {
     rmSync(noProbes.root, { recursive: true, force: true });
   }

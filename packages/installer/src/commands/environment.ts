@@ -11,6 +11,7 @@ import {
   recoverEnvironmentDocumentCommit,
   registerAlphaDesktopProfile,
   loadEnvironmentState,
+  republishEnvironmentSelectionFromLiveExperience,
   writeEnvironmentProfileRegistry,
   type AppExperience,
   type EnvironmentProfileRecord,
@@ -276,6 +277,8 @@ export interface EnvironmentCommandDependencies {
   ): PreparedEnvironmentCommitCli;
   environmentModeCacheV2Enabled?(configFile: string): boolean;
   createModeCacheGenerationId?(): string;
+  /** Selection-drift reconciliation seam; production republishes from the live marker. */
+  republishSelectionFromLiveExperience?: typeof republishEnvironmentSelectionFromLiveExperience;
   /** Read-only v2 poll seam; production defaults to current pair + warm journal. */
   observeModeCacheV2Transaction?(environmentRoot: string): EnvironmentModeCacheV2TransactionStatus;
   print(value: string): void;
@@ -436,7 +439,33 @@ async function runEnvironmentAction(
         options["release-profile"],
         "release profile",
       ));
-      const loaded = recomputeEnvironmentTruth(paths, dependencies);
+      let loaded = recomputeEnvironmentTruth(paths, dependencies);
+      // Live bytes outrank a stale publication. A failed exchange or
+      // swap-at-quit flow can leave the published selection describing the
+      // WRONG experience; preparing from that fiction either builds an
+      // unusable pair or refuses with a same-experience error even though the
+      // live app is visibly in the other mode (live failure 2026-08-25).
+      // Reconcile the durable selection from the proven live marker first.
+      // Best-effort by design: when the marker is unreadable or republishing
+      // refuses, preparation continues from the published selection and the
+      // preparer's own validation names the mismatch.
+      try {
+        const observedExperience = observeEnvironment(paths, loaded.current).appExperience;
+        if (observedExperience !== null && observedExperience !== loaded.current.appExperience) {
+          (dependencies.republishSelectionFromLiveExperience
+            ?? republishEnvironmentSelectionFromLiveExperience)({
+            registryFile: paths.environmentRegistryFile,
+            selectionFile: paths.environmentSelectionFile,
+            environmentRoot: paths.root,
+            selected: loaded.current,
+            liveExperience: observedExperience,
+          });
+          loaded = recomputeEnvironmentTruth(paths, dependencies);
+        }
+      } catch {
+        // Reconciliation must never make preparation less available than the
+        // pre-reconciliation behavior it protects.
+      }
 
       const requested = dependencies.createRequestedSelection(loaded.registry, {
         appExperience,

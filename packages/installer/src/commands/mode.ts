@@ -57,10 +57,7 @@ import {
 } from "../transaction.js";
 import { isUpdateModeFresh, readUpdateMode } from "../update-mode.js";
 import {
-  createEnvironmentSelection,
-  defaultEnvironmentProfileRegistry,
-  publishEnvironmentSelection,
-  resolveEnvironmentProfile,
+  republishEnvironmentSelectionFromLiveExperience,
   type EnvironmentSelection,
 } from "../environment-profile.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
@@ -225,24 +222,13 @@ function republishSelectionFromLiveExperience(
   liveExperience: "chatgpt" | "tweakers",
 ): EnvironmentSelection {
   const paths = ensureUserPaths();
-  const now = new Date().toISOString();
-  const profile = resolveEnvironmentProfile(defaultEnvironmentProfileRegistry(), selected.releaseProfile);
-  const selection = createEnvironmentSelection({
-    profile: {
-      ...profile,
-      selectedDesktopPath: selected.selectedDesktopPath,
-      selectedDesktopBundleId: selected.selectedDesktopBundleId,
-    },
-    appExperience: liveExperience,
-    requestedAt: now,
-    appliedAt: now,
+  return republishEnvironmentSelectionFromLiveExperience({
+    registryFile: join(paths.root, "environment-registry.json"),
+    selectionFile: join(paths.root, "environment-selection.json"),
+    environmentRoot: paths.root,
+    selected,
+    liveExperience,
   });
-  publishEnvironmentSelection(
-    join(paths.root, "environment-registry.json"),
-    join(paths.root, "environment-selection.json"),
-    selection,
-  );
-  return selection;
 }
 
 async function switchEnvironmentExperience(

@@ -1,7 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MCP_CANDIDATE_CODEX_HOME_ENV = exports.MCP_CANDIDATE_RECONCILIATION_ENV = void 0;
-exports.userQuestionsMcpReceiptMatchesEnabledState = userQuestionsMcpReceiptMatchesEnabledState;
 exports.resolveMcpRuntimePaths = resolveMcpRuntimePaths;
 exports.reconcileMcpConfig = reconcileMcpConfig;
 exports.createMcpReconciler = createMcpReconciler;
@@ -14,22 +13,6 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const node_util_1 = require("node:util");
 const mcp_sync_1 = require("./mcp-sync");
-function userQuestionsMcpReceiptMatchesEnabledState(receipt, enabled) {
-    if (receipt.status === "conflict"
-        || receipt.status === "error"
-        || receipt.conflicts.length !== 0
-        || receipt.approvalPolicy.status !== "unchanged"
-        || receipt.approvalPolicy.beforeRaw !== receipt.approvalPolicy.afterRaw
-        || receipt.approvalPolicy.sandboxModeBeforeRaw !== receipt.approvalPolicy.sandboxModeAfterRaw
-        || receipt.approvalPolicy.restartRequired)
-        return false;
-    const desiredCount = receipt.desiredNames.filter((name) => name === mcp_sync_1.USER_QUESTIONS_MCP_SERVER_NAME).length;
-    const appliedCount = receipt.appliedNames.filter((name) => name === mcp_sync_1.USER_QUESTIONS_MCP_SERVER_NAME).length;
-    if (!enabled)
-        return desiredCount === 0 && appliedCount === 0;
-    return desiredCount === 1
-        && appliedCount === 1;
-}
 exports.MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
 exports.MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
 /**
@@ -833,14 +816,10 @@ function canonicalConfigFingerprint(value) {
 }
 function planMcpConfigReconciliation(tweaks, currentToml, options = {}) {
     const mcpPlan = (0, mcp_sync_1.planManagedMcpReconciliation)(tweaks, currentToml, options);
-    const ownedTweaks = options.ownedTweaks ?? tweaks;
     const preservedApprovalPolicy = (0, mcp_sync_1.sanitizePreservedApprovalPolicy)(options.preservedApprovalPolicy);
-    const approvalPolicy = ownedTweaks.some((tweak) => tweak.manifest.id === "co.tweakers.user-questions")
-        ? (0, mcp_sync_1.observeUserQuestionsApprovalPolicy)(currentToml, preservedApprovalPolicy)
-        : mcpPlan.approvalPolicy;
     const plan = {
         ...mcpPlan,
-        approvalPolicy,
+        approvalPolicy: (0, mcp_sync_1.observeTopLevelPolicyAssignments)(currentToml, preservedApprovalPolicy),
         preservedApprovalPolicy,
     };
     if (!mcpPlan.changed || !managedBlocksDifferOnlyByLiveRoot(currentToml, mcpPlan.nextToml, tweaks)) {

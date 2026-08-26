@@ -302,9 +302,9 @@
       "manifest": {
         "id": "co.tweakers.user-questions",
         "name": "User Questions",
-        "version": "0.6.1",
+        "version": "1.0.0",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Task-scoped preference rounds with rich tradeoffs, explicit Skip and Other choices, resumable drafts, and safe generic fallback.",
+        "description": "Optional enhancement for the separately installed User Questions service. The standard MCP form remains available when enhancement is absent or incompatible.",
         "author": "hulibrands",
         "tags": [
           "questions",
@@ -318,13 +318,7 @@
           "filesystem",
           "ipc",
           "network"
-        ],
-        "mcp": {
-          "command": "node",
-          "args": [
-            "mcp-server.js"
-          ]
-        }
+        ]
       },
       "approvedAt": "2026-07-12T00:00:00.000Z",
       "approvedBy": "tweakers"

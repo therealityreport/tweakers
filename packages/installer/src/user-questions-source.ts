@@ -23,9 +23,7 @@ export interface UserQuestionsSourceProof {
   payloadHash: string;
   mainEntrypoint: string;
   mainEntrypointHash: string;
-  mcpEntrypoint: string;
-  mcpEntrypointHash: string;
-  brokerEntrypointHash: string;
+  enhancementBrokerEntrypointHash: string;
   schemaEntrypointHash: string;
 }
 
@@ -86,12 +84,9 @@ export function inspectUserQuestionsSource(tweakRoot: string): UserQuestionsSour
     throw new Error("User Questions must declare a main lifecycle");
   }
   const mainEntrypoint = typeof manifest.main === "string" ? manifest.main : "index.js";
-  const mcp = manifest.mcp && typeof manifest.mcp === "object" && !Array.isArray(manifest.mcp)
-    ? manifest.mcp as Record<string, unknown>
-    : null;
-  const args = mcp && Array.isArray(mcp.args) ? mcp.args : [];
-  const mcpEntrypoint = args.find((value): value is string => typeof value === "string" && value.endsWith(".js"));
-  if (mcp?.command !== "node" || !mcpEntrypoint) throw new Error("User Questions MCP entrypoint is invalid");
+  if (Object.hasOwn(manifest, "mcp")) {
+    throw new Error("User Questions enhancement must not declare an embedded MCP entrypoint");
+  }
 
   const entryHash = (name: string): string => {
     if (basename(name) !== name) throw new Error("User Questions entrypoints must be direct children");
@@ -105,9 +100,7 @@ export function inspectUserQuestionsSource(tweakRoot: string): UserQuestionsSour
     payloadHash: fingerprintPath(tweakRoot).hash,
     mainEntrypoint,
     mainEntrypointHash: entryHash(mainEntrypoint),
-    mcpEntrypoint,
-    mcpEntrypointHash: entryHash(mcpEntrypoint),
-    brokerEntrypointHash: entryHash("broker-protocol.js"),
+    enhancementBrokerEntrypointHash: entryHash("main-broker.js"),
     schemaEntrypointHash: entryHash("core.js"),
   };
 }
@@ -120,7 +113,6 @@ export function userQuestionsSourceMatches(
     && actual.version === expected.version
     && actual.payloadHash === expected.payloadHash
     && actual.mainEntrypointHash !== "missing"
-    && actual.mcpEntrypointHash !== "missing"
-    && actual.brokerEntrypointHash !== "missing"
+    && actual.enhancementBrokerEntrypointHash !== "missing"
     && actual.schemaEntrypointHash !== "missing";
 }

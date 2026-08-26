@@ -35,11 +35,13 @@ import { bindVerifiedPreparedContentsExchange, readAsarMarker } from "./commands
 import { readConfigFile, updateConfigFile } from "./config.js";
 import { signatureInfo, verifySignature } from "./codesign.js";
 import {
+  assertEnvironmentModePairExchangeReadyEvidence,
   assertEnvironmentModePairMaterialized,
   assertEnvironmentModePairWarmCommitMaterialized,
   assertEnvironmentModeCacheTreeStatSealOnly,
   assertEnvironmentModeCacheTreeStatSealAfterRename,
   compareEnvironmentModeCacheInvalidation,
+  environmentModeCacheGenerationPaths,
   environmentModeCachePaths,
   finalizeEnvironmentModePairReceipt,
   isEnvironmentModeCacheTreeStatSeal,
@@ -64,6 +66,7 @@ import {
   captureEnvironmentModeCacheContentsIdentity,
   captureEnvironmentModeCacheOuterAppEvidence,
   environmentWarmCommitLiveTargetIdentity,
+  readEnvironmentWarmCommitReceipt,
   type EnvironmentWarmCommitDeps,
   type EnvironmentWarmCommitReceipt,
   type EnvironmentWarmCommitExactTargetStopProof,
@@ -88,7 +91,11 @@ import { getOpenReport, listProcesses, type ProcessInfo } from "./commands/debug
 import { locateCodexAtExactPath } from "./platform.js";
 import { readPlist } from "./plist.js";
 import { readState, writeState } from "./state.js";
-import { beginWatcherPromotion, finishWatcherPromotion } from "./watcher-promotion.js";
+import {
+  beginWatcherPromotion,
+  finishWatcherPromotion,
+  readWatcherPromotionReceipt,
+} from "./watcher-promotion.js";
 import {
   fingerprintDirectoryTree,
   type EnvironmentModeCacheV2PreparationResult,
@@ -471,11 +478,18 @@ export function createEnvironmentModeProductionBindings(
         return { state: "stale_requires_prepare", reason: "exact source process with visible window is absent" };
       }
       const target = pair.roles.inactive;
+      // Validate the captured evidence against the prepared seals HERE, while
+      // the source app is still intact. Drift between seal rotation and this
+      // commit (an official update, an outer-app metadata rewrite) must resolve
+      // as stale_requires_prepare, never as a post-exchange proof failure
+      // (live failure 2026-08-25).
+      const before = exchangeBefore(pair);
+      assertEnvironmentModePairExchangeReadyEvidence(pair, before);
       return {
         state: "ready",
         source: { appPath: pair.roles.live.appPath, pid: source.pid, visibleWindow: source.visibleWindow },
         target: environmentModeWarmCommitTargetIdentity(pair, target),
-        exchangeBefore: exchangeBefore(pair),
+        exchangeBefore: before,
       };
     } catch (error) {
       return { state: "stale_requires_prepare", reason: errorMessage(error) };
@@ -559,9 +573,14 @@ export function createEnvironmentModeProductionBindings(
   }): EnvironmentWarmCommitLiveTargetObservation => {
     // Post-launch recovery must not reuse the pre-launch whole-tree/projection
     // seal. Bind the exact live app cryptographically here; runtime/MCP proof
-    // remains the separate target-readiness gate.
+    // remains the separate target-readiness gate. The role asserted at the
+    // live path is the one `expected` derives from, NOT unconditionally
+    // roles.live: when the immediate inverse leg runs after a forward exchange
+    // whose receipt rotation never completed, the live path holds the sealed
+    // INACTIVE role's payload, and asserting roles.live there refused every
+    // exchange-back (live failure 2026-08-25).
     const control = readControl(input.pair);
-    assertBoundedRoleIdentity(input.pair.roles.live, readHeader, fileFingerprint);
+    assertBoundedRoleIdentity(sealedRoleAtLiveTarget(input.pair, input.expected), readHeader, fileFingerprint);
     assertBoundedCachedArtifactIdentity(input.pair, control, fileFingerprint);
     const observation = observeDesktop(input.expected.appPath);
     if (observation === null) {
@@ -573,8 +592,6 @@ export function createEnvironmentModeProductionBindings(
     if (input.recordedMainPid !== null && observation.pid === input.recordedMainPid) {
       throw new Error("Warm target observation reused the recorded source PID");
     }
-    const live = input.pair.roles.live;
-    assertBoundedRoleIdentity(live, readHeader, fileFingerprint);
     const expected = input.expected;
     const actual: EnvironmentWarmCommitLiveTargetProcess = {
       ...expected,
@@ -717,16 +734,95 @@ export function createEnvironmentModeProductionBindings(
     assertBoundedRoleIdentity(input.pair.roles.live, readHeader, fileFingerprint);
   };
 
+  /**
+   * A warm commit that dies after its watcher pause leaves the promotion
+   * receipt "paused" under a transaction that will never resume it, and the
+   * begin-time cross-transaction refusal then blocks every later switch
+   * (live failure 2026-08-25: the failed generation de3c0aaf… held the
+   * watcher paused for a day and refused the healthy generation ff1bd9f1…).
+   * Reclaim only a pause whose owning transaction is provably finished: its
+   * warm journal reached a terminal timestamp, or no journal exists and the
+   * transaction no longer holds the current prepared grant. The reclaim
+   * resumes the watcher against the CURRENT pause request's live evidence,
+   * which moves the stale receipt to a terminal phase so the new pause can
+   * begin; an active or ambiguous owner keeps the strict refusal.
+   */
+  const reclaimAbandonedWatcherPause = (input: {
+    transactionId: string;
+    sourceAppRoot: string;
+    sourceExpectedFingerprint: string;
+  }): void => {
+    let existing: ReturnType<typeof readWatcherPromotionReceipt>;
+    try {
+      existing = readWatcherPromotionReceipt(options.watcherPromotionFile);
+    } catch {
+      return;
+    }
+    // Only the phases finishWatcherPromotion can resume are reclaimable;
+    // "failed" is terminal (begin retries it itself) and "pausing" keeps the
+    // strict cross-transaction refusal rather than throwing a new error.
+    if (existing === null
+      || existing.transactionId === input.transactionId
+      || (existing.phase !== "paused" && existing.phase !== "resuming")) {
+      return;
+    }
+    // The promotion file is shared with the legacy v1 coordinator, whose
+    // transaction ids never map to a v2 generation. Terminality can only be
+    // proven from v2 evidence, so a pause without a generation directory
+    // keeps the strict refusal instead of resuming a v1 owner's pause.
+    let generationRoot: string;
+    try {
+      generationRoot = environmentModeCacheGenerationPaths(paths, existing.transactionId).generationRoot;
+    } catch {
+      return;
+    }
+    if (!existsSync(generationRoot)) return;
+    let journal: EnvironmentWarmCommitReceipt | null;
+    try {
+      journal = readEnvironmentWarmCommitReceipt(join(generationRoot, "warm-commit.json"));
+    } catch {
+      return;
+    }
+    if (journal !== null && journal.terminalAt === null) return;
+    if (journal === null) {
+      let current: EnvironmentModePairReceipt | null = null;
+      try {
+        current = readCurrentEnvironmentModePair(paths);
+      } catch {
+        return;
+      }
+      const ownsCurrentGrant = current !== null
+        && current.generationId === existing.transactionId
+        && current.pin.state === "prepared"
+        && current.pin.releasedAt === null;
+      if (ownsCurrentGrant) return;
+    }
+    try {
+      finishWatcher(options.watcherPromotionFile, {
+        transactionId: existing.transactionId,
+        targetAppRoot: input.sourceAppRoot,
+        targetExpectedFingerprint: input.sourceExpectedFingerprint,
+      });
+    } catch {
+      // A refused or failed resume leaves the receipt for beginWatcher's own
+      // strict refusal (or its terminal-failed retry) rather than replacing
+      // that canonical error with a reclaim-specific one.
+    }
+  };
+
   const warmCommit: EnvironmentWarmCommitDeps = {
     now,
     preflight,
     classifyStaleBeforeCutover,
-    pauseWatcher: (input) => { beginWatcher(options.watcherPromotionFile, {
-      transactionId: input.transactionId,
-      sourceAppRoot: input.sourceAppRoot,
-      requestedAppRoot: input.targetAppRoot,
-      sourceExpectedFingerprint: input.sourceExpectedFingerprint,
-    }); },
+    pauseWatcher: (input) => {
+      reclaimAbandonedWatcherPause(input);
+      beginWatcher(options.watcherPromotionFile, {
+        transactionId: input.transactionId,
+        sourceAppRoot: input.sourceAppRoot,
+        requestedAppRoot: input.targetAppRoot,
+        sourceExpectedFingerprint: input.sourceExpectedFingerprint,
+      });
+    },
     stopExactSource: (input) => stopExact(input.appPath, input.pid),
     observeExactLiveTarget,
     stopExactLiveTarget,
@@ -805,12 +901,15 @@ export function createEnvironmentModeProductionBindings(
   });
   const warmRecovery: EnvironmentWarmRecoveryDeps = {
     now,
-    pauseWatcher: (input) => { beginWatcher(options.watcherPromotionFile, {
-      transactionId: input.transactionId,
-      sourceAppRoot: input.sourceAppRoot,
-      requestedAppRoot: input.targetAppRoot,
-      sourceExpectedFingerprint: input.sourceExpectedFingerprint,
-    }); },
+    pauseWatcher: (input) => {
+      reclaimAbandonedWatcherPause(input);
+      beginWatcher(options.watcherPromotionFile, {
+        transactionId: input.transactionId,
+        sourceAppRoot: input.sourceAppRoot,
+        requestedAppRoot: input.targetAppRoot,
+        sourceExpectedFingerprint: input.sourceExpectedFingerprint,
+      });
+    },
     observeExactLiveTarget,
     stopExactLiveTarget,
     checkForVerifiedNewerOfficial: ({ pair, journal }) => recoveryCheckOfficial({
@@ -1341,11 +1440,29 @@ function artifactEvidence(rootPath: string, digest: string, fileCount: number, p
 }
 
 function assertModePairInput(input: PrepareEnvironmentModeCacheV2Input): void {
-  if (input.current.releaseProfile !== input.requested.releaseProfile
-    || input.current.selectedDesktopPath !== input.requested.selectedDesktopPath
-    || input.current.selectedDesktopBundleId !== input.requested.selectedDesktopBundleId
-    || input.current.appExperience === input.requested.appExperience) {
-    throw new Error("Environment mode v2 requires one exact release/app path and opposite mode experiences");
+  // Name the exact mismatched axis: the generic message hid which selection
+  // field disagreed and turned a reconcilable drift into an opaque refusal.
+  if (input.current.releaseProfile !== input.requested.releaseProfile) {
+    throw new Error(
+      "Environment mode v2 requires one exact release profile: "
+        + `current is ${input.current.releaseProfile} but requested is ${input.requested.releaseProfile}`,
+    );
+  }
+  if (input.current.selectedDesktopPath !== input.requested.selectedDesktopPath
+    || input.current.selectedDesktopBundleId !== input.requested.selectedDesktopBundleId) {
+    throw new Error(
+      "Environment mode v2 requires one exact desktop app: "
+        + `current is ${input.current.selectedDesktopPath} (${input.current.selectedDesktopBundleId}) `
+        + `but requested is ${input.requested.selectedDesktopPath} (${input.requested.selectedDesktopBundleId})`,
+    );
+  }
+  if (input.current.appExperience === input.requested.appExperience) {
+    throw new Error(
+      "Environment mode v2 requires opposite mode experiences: "
+        + `both the current selection and the request are ${input.requested.appExperience}. `
+        + "If the app is visibly in the other mode, the published selection is stale; "
+        + "re-run the mode action so the selection reconciles from the live app first.",
+    );
   }
 }
 
@@ -1365,6 +1482,40 @@ function validateOfficialForPair(
   validateOfficial: (selection: EnvironmentSelection) => void,
 ): void {
   if (source.appExperience === "chatgpt") validateOfficial(source);
+}
+
+/**
+ * Resolve which sealed role `expected` was derived from and rebase its
+ * evidence to the live outer path it now occupies. After a forward Contents
+ * exchange the live path may hold either sealed role's payload depending on
+ * whether the receipt rotation completed, so the observation must bind the
+ * role the caller actually expects there rather than assuming roles.live.
+ */
+export function sealedRoleAtLiveTarget(
+  pair: EnvironmentModePairReceipt,
+  expected: EnvironmentWarmCommitLiveTargetIdentity,
+): EnvironmentModePairReceipt["roles"]["live"] {
+  const match = [pair.roles.live, pair.roles.inactive].find((role) => (
+    role.experience === expected.appExperience
+    && role.evidence.bundleId === expected.bundleId
+    && role.evidence.version === expected.version
+    && role.evidence.build === expected.build
+    && role.evidence.appDigest === expected.desktopArtifactDigest
+    && role.evidence.asarHeaderDigest === expected.asarHeaderDigest
+    && role.evidence.signature.signatureDigest === expected.signatureDigest
+  ));
+  if (match === undefined) {
+    throw new Error("Warm live target expectation does not bind either sealed role");
+  }
+  return {
+    ...match,
+    role: "live",
+    appPath: expected.appPath,
+    evidence: {
+      ...match.evidence,
+      asarPath: join(expected.appPath, "Contents", "Resources", "app.asar"),
+    },
+  };
 }
 
 function assertBoundedRoleIdentity(

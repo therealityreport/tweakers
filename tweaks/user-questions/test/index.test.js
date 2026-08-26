@@ -3,8 +3,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const net = require("node:net");
+const { tmpdir } = require("node:os");
+const { join } = require("node:path");
 const vm = require("node:vm");
 const { createRoundState, reduceRoundState } = require("../round-state");
+const { createMainBroker } = require("../main-broker");
 const { SemanticEvent, createSemanticDom, findByText, flushDom } = require("./semantic-dom");
 
 const SOURCE = fs.readFileSync(require.resolve("../index"), "utf8");
@@ -495,7 +499,131 @@ test("main startup never imports or invokes repairGlobalStateFile and cleans bro
   assert.equal(brokerStarts, 1);
   assert.equal(brokerStops, 1);
   assert.equal(repairReads, 0);
-  assert.equal(removed.length, 8);
+  assert.equal(removed.length, 12);
+});
+
+test("enhancement renderer acknowledges a bound delivery and returns a deliberate generic-form response", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  const delivery = {
+    version: 1,
+    type: "deliver",
+    id: "enhanced-request-1",
+    session_id: "enhanced-session-1",
+    route_fingerprint: "a".repeat(64),
+    input_fingerprint: "b".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose an option.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          choice: {
+            type: "string",
+            title: "Choice",
+            oneOf: [
+              { const: "a", title: "A" },
+              { const: "b", title: "B" },
+            ],
+          },
+        },
+      },
+    },
+  };
+  harness.deliverEnhancement(delivery);
+  await flushDom();
+  const card = harness.enhancementCard();
+  assert.ok(card, "the exact renderer mounted the delivered form");
+  assert.equal(harness.enhancementAcks.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementAcks[0])), {
+    version: 1,
+    type: "acknowledged",
+    session_id: delivery.session_id,
+    route_fingerprint: delivery.route_fingerprint,
+    input_fingerprint: delivery.input_fingerprint,
+  });
+  assert.equal(harness.enhancementResponses.length, 0, "mounting alone cannot invent an answer");
+  card.querySelectorAll("input").find((input) => input.value === "a").click();
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementResponses)), [{
+    version: 1,
+    type: "response",
+    session_id: delivery.session_id,
+    route_fingerprint: delivery.route_fingerprint,
+    input_fingerprint: delivery.input_fingerprint,
+    response: { action: "accept", content: { choice: "a" } },
+  }]);
+  assert.equal(harness.enhancementCard(), null, "completed response cleans the rendered card");
+  await harness.stop();
+  assert.equal(harness.enhancementRegistrations, 1);
+  assert.equal(harness.enhancementUnregistrations, 1);
+});
+
+test("enhancement socket delivers to its registered renderer and returns only that renderer's submitted response", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = fs.mkdtempSync(join(tmpdir(), "uq-renderer-bridge-"));
+  let harness;
+  const broker = createMainBroker({
+    dataDir: join(root, "data"),
+    tweakId: "co.tweakers.user-questions",
+    permissions: ["ipc", "network"],
+    socketPath: join(root, "broker.sock"),
+    enhancementSocketPath: join(root, "enhancement.sock"),
+    sendToRenderer(webContentsId, channel, payload) {
+      if (webContentsId !== 73 || channel !== "enhancement.deliver" || !harness) return false;
+      harness.deliverEnhancement(payload);
+      return true;
+    },
+  });
+  t.after(async () => broker.stop());
+  const endpoint = await broker.start();
+  harness = rendererHarness({ noCarrier: true, enhancementBridge: { broker, webContentsId: 73 } });
+  t.after(async () => harness.stop());
+  await harness.start();
+
+  const claim = await exchangeEnhancement(endpoint.enhancementSocketPath, {
+    version: 1,
+    type: "claim",
+    id: "renderer-bridge-claim",
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+  });
+  const pending = exchangeEnhancement(endpoint.enhancementSocketPath, {
+    version: 1,
+    type: "deliver",
+    id: "renderer-bridge-delivery",
+    session_id: claim.session_id,
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose an option.",
+      requestedSchema: {
+        type: "object",
+        properties: { choice: { type: "string", title: "Choice", oneOf: [{ const: "a", title: "A" }] } },
+      },
+    },
+  });
+  await flushDom();
+  const card = harness.enhancementCard();
+  assert.ok(card, "the registered renderer received the exact socket session");
+  card.querySelectorAll("input").find((input) => input.value === "a").click();
+  findByText(card, "button", "Submit").click();
+  const delivered = await pending;
+  assert.deepEqual(delivered, {
+    version: 1,
+    type: "delivered",
+    session_id: claim.session_id,
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    response: { action: "accept", content: { choice: "a" } },
+  });
+  assert.equal(broker.snapshot().enhancementSessions, 0, "returned response releases the socket session");
+  await harness.stop();
+  assert.equal(broker.snapshot().enhancementRenderers, 0, "renderer cleanup unregisters the exact IPC peer");
+  await broker.stop();
+  assert.equal(fs.existsSync(endpoint.enhancementSocketPath), false, "only the owned socket is removed during cleanup");
 });
 
 function rendererHarness(options = {}) {
@@ -517,7 +645,7 @@ function rendererHarness(options = {}) {
   genericButton.type = "submit";
   genericButton.textContent = "Continue standard form";
   carrier.append(genericButton);
-  dom.document.body.append(carrier);
+  if (!options.noCarrier) dom.document.body.append(carrier);
 
   const input = questionInput(options.longCopy);
   if (Number.isInteger(options.multipleMaxSelections)) {
@@ -549,7 +677,12 @@ function rendererHarness(options = {}) {
   let page;
   let unobserved = 0;
   let unregistered = 0;
+  let enhancementRegistrations = 0;
+  let enhancementUnregistrations = 0;
   let releaseCalls = 0;
+  const enhancementAcks = [];
+  const enhancementResponses = [];
+  const ipcListeners = new Map();
   let resolveDeferredClaim = null;
   let resolveDeferredDelivery = null;
   let mountAckFailures = options.failMountAck
@@ -616,7 +749,7 @@ function rendererHarness(options = {}) {
       },
     },
     react: {
-      getFiber(node) { return node === carrier ? fiber : null; },
+      getFiber(node) { return !options.noCarrier && node === carrier ? fiber : null; },
       host: {
         observe() { return () => { unobserved += 1; }; },
         attachMcpFormCarrier(nonce) {
@@ -638,7 +771,35 @@ function rendererHarness(options = {}) {
       },
     },
     ipc: {
+      on(channel, listener) {
+        ipcListeners.set(channel, listener);
+        return () => ipcListeners.delete(channel);
+      },
       async invoke(channel, ...args) {
+        if (channel === "enhancement.register") {
+          enhancementRegistrations += 1;
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.registerEnhancementRenderer(options.enhancementBridge.webContentsId)
+            : { registered: true };
+        }
+        if (channel === "enhancement.unregister") {
+          enhancementUnregistrations += 1;
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.unregisterEnhancementRenderer(options.enhancementBridge.webContentsId)
+            : true;
+        }
+        if (channel === "enhancement.ack") {
+          enhancementAcks.push(args[0]);
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.acknowledgeEnhancement(options.enhancementBridge.webContentsId, args[0])
+            : { acknowledged: true };
+        }
+        if (channel === "enhancement.respond") {
+          enhancementResponses.push(args[0]);
+          return options.enhancementBridge
+            ? options.enhancementBridge.broker.respondEnhancement(options.enhancementBridge.webContentsId, args[0])
+            : { delivered: true };
+        }
         if (channel === "claim") {
           if (options.claimError) throw options.claimError;
           if (options.deferClaim) {
@@ -720,8 +881,18 @@ function rendererHarness(options = {}) {
     get unobserved() { return unobserved; },
     get unregistered() { return unregistered; },
     get releaseCalls() { return releaseCalls; },
+    get enhancementAcks() { return enhancementAcks; },
+    get enhancementResponses() { return enhancementResponses; },
+    get enhancementRegistrations() { return enhancementRegistrations; },
+    get enhancementUnregistrations() { return enhancementUnregistrations; },
     get currentState() { return currentState; },
     card: () => dom.document.querySelector("[data-tweaker-user-questions-card]"),
+    enhancementCard: () => dom.document.querySelector("[data-tweaker-user-questions-enhancement-card]"),
+    deliverEnhancement(delivery) {
+      const listener = ipcListeners.get("enhancement.deliver");
+      assert.ok(listener, "enhancement renderer listener was not registered");
+      listener(delivery);
+    },
     resolveClaim() {
       assert.ok(resolveDeferredClaim, "deferred claim was not pending");
       const resolve = resolveDeferredClaim;
@@ -737,6 +908,29 @@ function rendererHarness(options = {}) {
     async start() { await tweak.start(api); await flushDom(); },
     async stop() { await tweak.stop(); await flushDom(); },
   };
+}
+
+function exchangeEnhancement(socketPath, frame) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: socketPath });
+    let buffer = "";
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      callback(value);
+    };
+    socket.once("error", (error) => finish(reject, error));
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try { finish(resolve, JSON.parse(buffer.slice(0, newline))); }
+      catch (error) { finish(reject, error); }
+    });
+    socket.once("connect", () => socket.write(`${JSON.stringify(frame)}\n`));
+  });
 }
 
 function questionInput(longCopy = "") {

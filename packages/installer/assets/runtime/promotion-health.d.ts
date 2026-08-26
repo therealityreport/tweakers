@@ -362,7 +362,8 @@ export interface UserQuestionsHealthObservation {
     brokerSelfTest: HealthValue;
     schemaSelfTest: HealthValue;
     rendererStorageSelfTest: HealthValue;
-    mcpConflictCount: number;
+    enhancementHandshake: HealthValue;
+    genericFallback: HealthValue;
 }
 export interface RuntimePromotionProbes {
     authenticatedSession(): HealthValue | Promise<HealthValue>;

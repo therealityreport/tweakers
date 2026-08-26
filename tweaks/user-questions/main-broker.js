@@ -17,7 +17,7 @@ const {
   rmSync,
   writeFileSync,
 } = require("node:fs");
-const { createHash, createHmac, randomBytes } = require("node:crypto");
+const { createHash, createHmac, randomBytes, randomUUID } = require("node:crypto");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -44,6 +44,12 @@ const ROUTE_PART_MAX_LENGTH = 512;
 const ROUTE_HMAC_KEY_FILE = "user-questions-route-hmac.v1.key";
 const ROUTE_HMAC_KEY_BYTES = 32;
 const ROUTE_HMAC_KEY_HEX_LENGTH = ROUTE_HMAC_KEY_BYTES * 2;
+const ENHANCEMENT_PROTOCOL_VERSION = 1;
+const ENHANCEMENT_MAX_FRAME_BYTES = 16 * 1024;
+const ENHANCEMENT_SOCKET_ENV = "USER_QUESTIONS_ENHANCEMENT_SOCKET";
+const ENHANCEMENT_CLAIM_TTL_MS = 30_000;
+const ENHANCEMENT_DELIVERY_TIMEOUT_MS = 5 * 60_000;
+const MAX_ENHANCEMENT_SESSIONS = 32;
 
 function createMainBroker(options = {}) {
   assertBrokerPermissions(options.permissions);
@@ -59,14 +65,35 @@ function createMainBroker(options = {}) {
     DEFAULT_REGISTRATION_TIMEOUT_MS,
   );
   const nonceRetentionMs = boundedTimeout(options.nonceRetentionMs, DEFAULT_NONCE_RETENTION_MS, 60 * 60_000);
+  const enhancementClaimTtlMs = boundedTimeout(
+    options.enhancementClaimTtlMs,
+    ENHANCEMENT_CLAIM_TTL_MS,
+    5 * 60_000,
+  );
+  const enhancementDeliveryTimeoutMs = boundedTimeout(
+    options.enhancementDeliveryTimeoutMs,
+    ENHANCEMENT_DELIVERY_TIMEOUT_MS,
+    10 * 60_000,
+  );
   const secret = randomBytes(32).toString("hex");
   const metadataPath = path.join(dataDir, BROKER_METADATA_FILE);
   const socketPath = selectSocketPath(dataDir, options.socketPath);
+  let enhancementSocketPath = null;
+  let enhancementPathError = null;
+  try {
+    enhancementSocketPath = resolveEnhancementSocketPath(options.enhancementSocketPath);
+  } catch (error) {
+    enhancementPathError = error;
+  }
   const sessions = new Set();
   const pendingByNonce = new Map();
   const consumedNonces = new Map();
   const claims = new Map();
+  const enhancementRenderers = new Set();
+  const enhancementSessions = new Map();
   let server = null;
+  let enhancementServer = null;
+  let ownedEnhancementSocket = null;
   let routeHmacKey = null;
   let started = false;
   let stopping = false;
@@ -81,11 +108,34 @@ function createMainBroker(options = {}) {
     await listen(server, socketPath);
     try {
       chmodSync(socketPath, 0o600);
+      if (enhancementSocketPath) {
+        try {
+          assertEnhancementSocketAvailable(enhancementSocketPath);
+          enhancementServer = net.createServer(onEnhancementConnection);
+          enhancementServer.maxConnections = MAX_CONNECTIONS;
+          await listen(enhancementServer, enhancementSocketPath);
+          chmodSync(enhancementSocketPath, 0o600);
+          ownedEnhancementSocket = socketIdentity(enhancementSocketPath);
+        } catch (error) {
+          const unavailableServer = enhancementServer;
+          enhancementServer = null;
+          if (unavailableServer) await closeServer(unavailableServer);
+          removeOwnedEnhancementSocket();
+          enhancementSocketPath = null;
+          diagnose("enhancement_unavailable", errorCode(error));
+        }
+      } else if (enhancementPathError) {
+        diagnose("enhancement_unavailable", errorCode(enhancementPathError));
+      }
       writeMetadata(metadataPath, { version: BROKER_PROTOCOL_VERSION, tweakId, socketPath, secret });
     } catch (error) {
+      const activeEnhancementServer = enhancementServer;
+      enhancementServer = null;
+      if (activeEnhancementServer) await closeServer(activeEnhancementServer);
       await closeServer(server);
       server = null;
       rmSync(socketPath, { force: true });
+      removeOwnedEnhancementSocket();
       throw error;
     }
     started = true;
@@ -120,6 +170,69 @@ function createMainBroker(options = {}) {
       session.peer.close();
     }, authTimeoutMs);
     session.authTimer.unref?.();
+  }
+
+  function onEnhancementConnection(socket) {
+    let buffered = Buffer.alloc(0);
+    let handled = false;
+    let pendingSessionId = null;
+    let timeout = setTimeout(() => socket.destroy(), DEFAULT_AUTH_TIMEOUT_MS);
+    timeout.unref?.();
+
+    const stopTimer = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = null;
+    };
+    const fail = () => {
+      stopTimer();
+      socket.destroy();
+    };
+    socket.on("error", stopTimer);
+    socket.on("close", () => {
+      stopTimer();
+      if (pendingSessionId) abandonEnhancementDelivery(pendingSessionId, socket);
+    });
+    socket.on("data", (chunk) => {
+      if (handled) return;
+      buffered = Buffer.concat([buffered, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      if (buffered.byteLength > ENHANCEMENT_MAX_FRAME_BYTES) return fail();
+      const newline = buffered.indexOf(0x0a);
+      if (newline === -1) return;
+      handled = true;
+      let request;
+      try {
+        request = JSON.parse(buffered.subarray(0, newline).toString("utf8"));
+      } catch {
+        return fail();
+      }
+      if (request?.type === "claim") {
+        try {
+          socket.end(`${JSON.stringify(claimEnhancement(request))}\n`);
+        } catch {
+          fail();
+        }
+        return;
+      }
+      if (request?.type !== "deliver") return fail();
+      stopTimer();
+      timeout = setTimeout(() => fail(), enhancementDeliveryTimeoutMs);
+      timeout.unref?.();
+      let pending;
+      try {
+        pending = deliverEnhancement(request, socket);
+        pendingSessionId = request.session_id;
+      } catch {
+        return fail();
+      }
+      Promise.resolve(pending).then(
+        (response) => {
+          pendingSessionId = null;
+          stopTimer();
+          socket.end(`${JSON.stringify(response)}\n`);
+        },
+        () => fail(),
+      );
+    });
   }
 
   async function handleSessionRequest(session, method, payload) {
@@ -218,6 +331,157 @@ function createMainBroker(options = {}) {
     return delivered;
   }
 
+  /**
+   * The standalone MCP remains the only server owner.  This registration only
+   * records a live renderer that can receive an optional enhancement request.
+   * Ambiguity is intentionally a generic-form fallback, never a best guess.
+   */
+  function registerEnhancementRenderer(webContentsId) {
+    assertRendererId(webContentsId);
+    enhancementRenderers.add(webContentsId);
+    return Object.freeze({ registered: true });
+  }
+
+  function unregisterEnhancementRenderer(webContentsId) {
+    assertRendererId(webContentsId);
+    enhancementRenderers.delete(webContentsId);
+    for (const [sessionId, session] of enhancementSessions) {
+      if (session.webContentsId === webContentsId) abandonEnhancementSession(sessionId, "renderer_unavailable");
+    }
+    return true;
+  }
+
+  function claimEnhancement(value) {
+    const claim = exactEnhancementClaim(value);
+    if (!started || stopping || enhancementSessions.size >= MAX_ENHANCEMENT_SESSIONS) {
+      throw new BrokerProtocolError("enhancement_unavailable");
+    }
+    const rendererIds = [...enhancementRenderers];
+    if (rendererIds.length !== 1) throw new BrokerProtocolError("renderer_unavailable");
+    const sessionId = randomUUID();
+    const session = {
+      id: sessionId,
+      claimId: claim.id,
+      routeFingerprint: claim.route_fingerprint,
+      inputFingerprint: claim.input_fingerprint,
+      webContentsId: rendererIds[0],
+      state: "claimed",
+      timer: null,
+      pending: null,
+    };
+    session.timer = setTimeout(() => abandonEnhancementSession(sessionId, "claim_timeout"), enhancementClaimTtlMs);
+    session.timer.unref?.();
+    enhancementSessions.set(sessionId, session);
+    diagnose("enhancement_claimed");
+    return Object.freeze({
+      version: ENHANCEMENT_PROTOCOL_VERSION,
+      type: "claimed",
+      route_fingerprint: claim.route_fingerprint,
+      input_fingerprint: claim.input_fingerprint,
+      session_id: sessionId,
+    });
+  }
+
+  function deliverEnhancement(value, socket) {
+    const delivery = exactEnhancementDelivery(value);
+    const session = enhancementSessions.get(delivery.session_id);
+    if (!session || session.state !== "claimed") throw new BrokerProtocolError("session_inactive");
+    if (
+      !secureEqualString(session.routeFingerprint, delivery.route_fingerprint)
+      || !secureEqualString(session.inputFingerprint, delivery.input_fingerprint)
+    ) {
+      abandonEnhancementSession(session.id, "fingerprint_mismatch");
+      throw new BrokerProtocolError("fingerprint_mismatch");
+    }
+    if (!enhancementRenderers.has(session.webContentsId)) {
+      abandonEnhancementSession(session.id, "renderer_unavailable");
+      throw new BrokerProtocolError("renderer_unavailable");
+    }
+    clearTimer(session.timer);
+    session.timer = null;
+    session.state = "delivering";
+    return new Promise((resolve, reject) => {
+      session.pending = { resolve, reject, socket };
+      const delivered = sendToRenderer(session.webContentsId, "enhancement.deliver", Object.freeze({
+        version: ENHANCEMENT_PROTOCOL_VERSION,
+        type: "deliver",
+        id: delivery.id,
+        session_id: session.id,
+        route_fingerprint: session.routeFingerprint,
+        input_fingerprint: session.inputFingerprint,
+        elicitation: delivery.elicitation,
+      })) === true;
+      if (!delivered) {
+        abandonEnhancementSession(session.id, "renderer_unavailable");
+        return;
+      }
+      diagnose("enhancement_deliver_requested");
+    });
+  }
+
+  function acknowledgeEnhancement(webContentsId, value) {
+    assertRendererId(webContentsId);
+    const acknowledgement = exactEnhancementAcknowledgement(value);
+    const session = requireEnhancementSession(acknowledgement, webContentsId, "delivering");
+    session.state = "delivered";
+    diagnose("enhancement_renderer_delivered");
+    return Object.freeze({ acknowledged: true });
+  }
+
+  function respondEnhancement(webContentsId, value) {
+    assertRendererId(webContentsId);
+    const response = exactEnhancementResponse(value);
+    const session = requireEnhancementSession(response, webContentsId, "delivered");
+    const pending = session.pending;
+    if (!pending) throw new BrokerProtocolError("session_inactive");
+    session.pending = null;
+    enhancementSessions.delete(session.id);
+    clearTimer(session.timer);
+    pending.resolve(Object.freeze({
+      version: ENHANCEMENT_PROTOCOL_VERSION,
+      type: "delivered",
+      session_id: session.id,
+      route_fingerprint: session.routeFingerprint,
+      input_fingerprint: session.inputFingerprint,
+      response: response.response,
+    }));
+    diagnose("enhancement_response_delivered");
+    return Object.freeze({ delivered: true });
+  }
+
+  function requireEnhancementSession(value, webContentsId, stateName) {
+    const session = enhancementSessions.get(value.session_id);
+    if (!session || session.state !== stateName || session.webContentsId !== webContentsId) {
+      throw new BrokerProtocolError("session_inactive");
+    }
+    if (
+      !secureEqualString(session.routeFingerprint, value.route_fingerprint)
+      || !secureEqualString(session.inputFingerprint, value.input_fingerprint)
+    ) {
+      abandonEnhancementSession(session.id, "fingerprint_mismatch");
+      throw new BrokerProtocolError("fingerprint_mismatch");
+    }
+    return session;
+  }
+
+  function abandonEnhancementDelivery(sessionId, socket) {
+    const session = enhancementSessions.get(sessionId);
+    if (!session || session.pending?.socket !== socket) return;
+    abandonEnhancementSession(sessionId, "client_disconnected");
+  }
+
+  function abandonEnhancementSession(sessionId, code) {
+    const session = enhancementSessions.get(sessionId);
+    if (!session) return;
+    enhancementSessions.delete(sessionId);
+    clearTimer(session.timer);
+    session.timer = null;
+    const pending = session.pending;
+    session.pending = null;
+    if (pending) pending.reject(new BrokerProtocolError(code));
+    diagnose("enhancement_session_released", code);
+  }
+
   function observeRoute(claimToken, routeContext) {
     try {
       requireClaim(claimToken, routeContext);
@@ -261,15 +525,34 @@ function createMainBroker(options = {}) {
     pendingByNonce.clear();
     claims.clear();
     consumedNonces.clear();
+    enhancementRenderers.clear();
+    for (const sessionId of [...enhancementSessions.keys()]) {
+      abandonEnhancementSession(sessionId, "broker_stopped");
+    }
     const activeServer = server;
     server = null;
     if (activeServer) await closeServer(activeServer);
+    const activeEnhancementServer = enhancementServer;
+    enhancementServer = null;
+    if (activeEnhancementServer) await closeServer(activeEnhancementServer);
     removeOwnedMetadata(metadataPath, socketPath, secret);
     rmSync(socketPath, { force: true });
+    removeOwnedEnhancementSocket();
     routeHmacKey?.fill(0);
     routeHmacKey = null;
     started = false;
     diagnose("broker_stopped");
+  }
+
+  function removeOwnedEnhancementSocket() {
+    if (!enhancementSocketPath || !ownedEnhancementSocket) return;
+    try {
+      const observed = socketIdentity(enhancementSocketPath);
+      if (observed && observed.dev === ownedEnhancementSocket.dev && observed.ino === ownedEnhancementSocket.ino) {
+        rmSync(enhancementSocketPath, { force: true });
+      }
+    } catch {}
+    ownedEnhancementSocket = null;
   }
 
   function cleanupSession(session) {
@@ -293,7 +576,7 @@ function createMainBroker(options = {}) {
   }
 
   function endpoint() {
-    return Object.freeze({ metadataPath, socketPath, version: BROKER_PROTOCOL_VERSION });
+    return Object.freeze({ metadataPath, socketPath, enhancementSocketPath, version: BROKER_PROTOCOL_VERSION });
   }
 
   function diagnose(event, code) {
@@ -309,6 +592,10 @@ function createMainBroker(options = {}) {
     deliver,
     observeRoute,
     release,
+    registerEnhancementRenderer,
+    unregisterEnhancementRenderer,
+    acknowledgeEnhancement,
+    respondEnhancement,
     endpoint,
     snapshot: () => Object.freeze({
       started,
@@ -316,6 +603,8 @@ function createMainBroker(options = {}) {
       pendingRegistrations: pendingByNonce.size,
       activeClaims: claims.size,
       consumedNonces: consumedNonces.size,
+      enhancementRenderers: enhancementRenderers.size,
+      enhancementSessions: enhancementSessions.size,
       contentRedacted: true,
     }),
   });
@@ -514,6 +803,160 @@ function selectSocketPath(dataDir, requestedPath) {
   return path.join(os.tmpdir(), `tweakers-uq-${digest}.sock`);
 }
 
+/**
+ * The standalone User Questions plugin discovers this optional endpoint through
+ * USER_QUESTIONS_ENHANCEMENT_SOCKET. It is deliberately supplied by the
+ * embedding environment: Tweakers never writes MCP configuration or launches
+ * the service that owns the generic form.
+ */
+function resolveEnhancementSocketPath(requestedPath) {
+  if (requestedPath === undefined || requestedPath === null || requestedPath === "") return null;
+  const explicit = requireAbsolutePath(requestedPath, "socket_path_invalid");
+  if (Buffer.byteLength(explicit) > MAX_UNIX_SOCKET_PATH_BYTES) {
+    throw new BrokerProtocolError("socket_path_oversize");
+  }
+  return explicit;
+}
+
+/** Frozen v1 response shape for a separately validated enhancement claim. */
+function createEnhancementClaimResponse(value) {
+  const claim = exactEnhancementClaim(value);
+  return Object.freeze({
+    version: ENHANCEMENT_PROTOCOL_VERSION,
+    type: "claimed",
+    route_fingerprint: claim.route_fingerprint,
+    input_fingerprint: claim.input_fingerprint,
+    session_id: randomUUID(),
+  });
+}
+
+function exactEnhancementClaim(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  const keys = Object.keys(value).sort();
+  const expected = ["id", "input_fingerprint", "route_fingerprint", "type", "version"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  if (value.version !== ENHANCEMENT_PROTOCOL_VERSION || value.type !== "claim") {
+    throw new BrokerProtocolError("version_unsupported");
+  }
+  if (typeof value.id !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(value.id)) {
+    throw new BrokerProtocolError("id_invalid");
+  }
+  if (
+    typeof value.route_fingerprint !== "string"
+    || typeof value.input_fingerprint !== "string"
+    || !/^[a-f0-9]{64}$/.test(value.route_fingerprint)
+    || !/^[a-f0-9]{64}$/.test(value.input_fingerprint)
+  ) throw new BrokerProtocolError("payload_invalid");
+  return value;
+}
+
+function exactEnhancementDelivery(value) {
+  const delivery = exactEnhancementEnvelope(value, [
+    "elicitation",
+    "id",
+    "input_fingerprint",
+    "route_fingerprint",
+    "session_id",
+    "type",
+    "version",
+  ], "deliver");
+  if (!validRequestId(delivery.id) || !validSessionId(delivery.session_id) || !isRecord(delivery.elicitation)) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  return delivery;
+}
+
+function exactEnhancementAcknowledgement(value) {
+  const acknowledgement = exactEnhancementEnvelope(value, [
+    "input_fingerprint",
+    "route_fingerprint",
+    "session_id",
+    "type",
+    "version",
+  ], "acknowledged");
+  if (!validSessionId(acknowledgement.session_id)) throw new BrokerProtocolError("payload_invalid");
+  return acknowledgement;
+}
+
+function exactEnhancementResponse(value) {
+  const response = exactEnhancementEnvelope(value, [
+    "input_fingerprint",
+    "response",
+    "route_fingerprint",
+    "session_id",
+    "type",
+    "version",
+  ], "response");
+  if (!validSessionId(response.session_id) || !isGenericFormResponse(response.response)) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  return response;
+}
+
+function exactEnhancementEnvelope(value, expected, type) {
+  if (!isRecord(value)) throw new BrokerProtocolError("payload_invalid");
+  const keys = Object.keys(value).sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  if (value.version !== ENHANCEMENT_PROTOCOL_VERSION || value.type !== type) {
+    throw new BrokerProtocolError("version_unsupported");
+  }
+  if (!validFingerprint(value.route_fingerprint) || !validFingerprint(value.input_fingerprint)) {
+    throw new BrokerProtocolError("payload_invalid");
+  }
+  return value;
+}
+
+function isGenericFormResponse(value) {
+  if (!isRecord(value) || !["accept", "cancel", "decline"].includes(value.action)) return false;
+  const keys = Object.keys(value).sort();
+  if (value.action === "accept") {
+    return keys.length === 2 && keys[0] === "action" && keys[1] === "content" && isRecord(value.content);
+  }
+  return keys.length === 1 && keys[0] === "action";
+}
+
+function validRequestId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9._~-]{1,128}$/.test(value);
+}
+
+function validSessionId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+function validFingerprint(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertRendererId(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new BrokerProtocolError("renderer_invalid");
+}
+
+function assertEnhancementSocketAvailable(socketPath) {
+  try {
+    lstatSync(socketPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw new BrokerProtocolError("socket_path_invalid");
+  }
+  throw new BrokerProtocolError("enhancement_socket_occupied");
+}
+
+function socketIdentity(socketPath) {
+  const stat = lstatSync(socketPath);
+  if (!stat.isSocket()) throw new BrokerProtocolError("socket_path_invalid");
+  return Object.freeze({ dev: stat.dev, ino: stat.ino });
+}
+
 function listen(server, socketPath) {
   return new Promise((resolve, reject) => {
     const onError = (error) => {
@@ -564,7 +1007,10 @@ function errorCode(error) {
 }
 
 module.exports = {
+  ENHANCEMENT_PROTOCOL_VERSION,
+  ENHANCEMENT_SOCKET_ENV,
   ROUTE_HMAC_KEY_FILE,
+  createEnhancementClaimResponse,
   createMainBroker,
   hashRoute,
 };

@@ -25,11 +25,10 @@ import {
   type McpReconciler,
   readMcpSyncState,
   reconcileMcpConfig,
-  userQuestionsMcpReceiptMatchesEnabledState,
 } from "../src/mcp-reconciliation";
 import {
   MCP_MANAGED_END,
-  USER_QUESTIONS_MCP_SERVER_NAME,
+  observeTopLevelPolicyAssignments,
   sanitizePreservedApprovalPolicy,
 } from "../src/mcp-sync";
 
@@ -37,60 +36,37 @@ const MALFORMED_TOML_FIXTURE = Buffer.from([
   ...Buffer.from('[mcp_servers.manual]\ncommand = "manual"\n\n[unrelated]\nvalue = "unterminated\n'),
 ]);
 
-test("promotion MCP receipt matches canonical registration without requiring a policy mutation", () => {
-  const enabled = {
-    status: "updated" as const,
-    desiredNames: [USER_QUESTIONS_MCP_SERVER_NAME],
-    appliedNames: [USER_QUESTIONS_MCP_SERVER_NAME],
-    conflicts: [],
-    approvalPolicy: {
-      status: "unchanged" as const,
-      beforeRaw: 'approval_policy = "never"',
-      afterRaw: 'approval_policy = "never"',
-      preservedOriginalRaw: null,
-      preservedOriginalPresent: false,
-      sandboxModeBeforeRaw: 'sandbox_mode = "workspace-write"',
-      sandboxModeAfterRaw: 'sandbox_mode = "workspace-write"',
-      restartRequired: false,
-    },
-  };
-  const disabled = {
-    ...enabled,
-    status: "unchanged" as const,
-    desiredNames: [],
-    appliedNames: [],
-    approvalPolicy: {
-      ...enabled.approvalPolicy,
-      status: "unchanged" as const,
-      afterRaw: 'approval_policy = "never"',
-      restartRequired: false,
-    },
-  };
+test("observeTopLevelPolicyAssignments observes policy bytes exactly and fails closed on duplicates", () => {
+  const observed = observeTopLevelPolicyAssignments(
+    'approval_policy = "never" # exact original\nsandbox_mode = "workspace-write"\n',
+    { present: true, rawAssignment: 'approval_policy = "never" # exact original' },
+  );
+  assert.equal(observed.status, "unchanged");
+  assert.equal(observed.beforeRaw, 'approval_policy = "never" # exact original');
+  assert.equal(observed.afterRaw, observed.beforeRaw);
+  assert.equal(observed.sandboxModeBeforeRaw, 'sandbox_mode = "workspace-write"');
+  assert.equal(observed.sandboxModeAfterRaw, observed.sandboxModeBeforeRaw);
+  assert.equal(observed.preservedOriginalRaw, 'approval_policy = "never" # exact original');
+  assert.equal(observed.preservedOriginalPresent, true);
+  assert.equal(observed.restartRequired, false);
 
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(enabled, true), true);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(enabled, false), false);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(disabled, false), true);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState(disabled, true), false);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
-    ...enabled,
-    approvalPolicy: { ...enabled.approvalPolicy, status: "managed" as const },
-  }, true), false);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
-    ...enabled,
-    approvalPolicy: { ...enabled.approvalPolicy, afterRaw: 'approval_policy = "on-request"' },
-  }, true), false);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
-    ...enabled,
-    approvalPolicy: { ...enabled.approvalPolicy, sandboxModeAfterRaw: 'sandbox_mode = "danger-full-access"' },
-  }, true), false);
-  assert.equal(userQuestionsMcpReceiptMatchesEnabledState({
-    ...disabled,
-    conflicts: [{
-      observedName: USER_QUESTIONS_MCP_SERVER_NAME,
-      canonicalName: USER_QUESTIONS_MCP_SERVER_NAME,
-      reason: "canonical-collision" as const,
-    }],
-  }, false), false);
+  const absent = observeTopLevelPolicyAssignments("[features]\nhooks = true\n");
+  assert.equal(absent.status, "unchanged");
+  assert.equal(absent.beforeRaw, null);
+  assert.equal(absent.sandboxModeBeforeRaw, null);
+  assert.equal(absent.preservedOriginalPresent, false);
+
+  const duplicateApproval = observeTopLevelPolicyAssignments(
+    'approval_policy = "never"\n"approval_policy" = "on-request"\n',
+  );
+  assert.equal(duplicateApproval.status, "conflict");
+  assert.equal(duplicateApproval.error, "Duplicate top-level approval_policy assignments");
+
+  const duplicateSandbox = observeTopLevelPolicyAssignments(
+    'sandbox_mode = "read-only"\n"sandbox_mode" = "danger-full-access"\n',
+  );
+  assert.equal(duplicateSandbox.status, "conflict");
+  assert.equal(duplicateSandbox.error, "Duplicate top-level sandbox_mode assignments");
 });
 
 test("sanitizePreservedApprovalPolicy accepts one assignment and rejects injected statements", () => {

@@ -1,11 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.RESERVED_MANAGED_MCP_ENV_KEYS = exports.USER_QUESTIONS_MCP_SERVER_NAME = exports.MCP_MANAGED_END = exports.MCP_MANAGED_START = void 0;
+exports.RESERVED_MANAGED_MCP_ENV_KEYS = exports.MCP_MANAGED_END = exports.MCP_MANAGED_START = void 0;
 exports.withMcpConfigMutationLock = withMcpConfigMutationLock;
 exports.syncManagedMcpServers = syncManagedMcpServers;
 exports.buildManagedMcpBlock = buildManagedMcpBlock;
 exports.planManagedMcpReconciliation = planManagedMcpReconciliation;
-exports.observeUserQuestionsApprovalPolicy = observeUserQuestionsApprovalPolicy;
+exports.observeTopLevelPolicyAssignments = observeTopLevelPolicyAssignments;
 exports.sanitizePreservedApprovalPolicy = sanitizePreservedApprovalPolicy;
 exports.sanitizePreservedMcpOptions = sanitizePreservedMcpOptions;
 exports.mergeManagedMcpBlock = mergeManagedMcpBlock;
@@ -17,7 +17,6 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 exports.MCP_MANAGED_START = "# BEGIN TWEAKER MANAGED MCP SERVERS";
 exports.MCP_MANAGED_END = "# END TWEAKER MANAGED MCP SERVERS";
-exports.USER_QUESTIONS_MCP_SERVER_NAME = "co-tweakers-user-questions";
 exports.RESERVED_MANAGED_MCP_ENV_KEYS = [
     "TWEAKER_TWEAK_DATA_DIR",
     "TWEAKER_TWEAK_ID",
@@ -254,7 +253,7 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
         migrations,
         conflicts,
         preservedOptions,
-        approvalPolicy: unchangedApprovalPolicy(findTopLevelApprovalPolicies(currentToml)[0]?.raw ?? null, null),
+        approvalPolicy: observeTopLevelPolicyAssignments(currentToml),
         preservedApprovalPolicy: null,
         changed,
         restartRequired: changed,
@@ -263,12 +262,13 @@ function planManagedMcpReconciliation(tweaks, currentToml = "", options = {}) {
 const TOP_LEVEL_APPROVAL_POLICY_ASSIGNMENT = /^\s*(?:approval_policy|"approval_policy"|'approval_policy')\s*=/;
 const TOP_LEVEL_SANDBOX_MODE_ASSIGNMENT = /^\s*(?:sandbox_mode|"sandbox_mode"|'sandbox_mode')\s*=/;
 /**
- * Observe policy fields for reconciliation receipts without changing them.
- * Policy mutation belongs exclusively to the User Questions Preview/Apply/
- * Restore transaction; ordinary MCP startup and enable/disable reconciliation
- * may only register or remove the server block.
+ * Observe top-level policy fields for reconciliation receipts without
+ * changing them. Managed MCP reconciliation may only register or remove
+ * server blocks; it never rewrites approval_policy or sandbox_mode.
+ * Duplicate top-level assignments make the live policy ambiguous, so the
+ * plan fails closed as a conflict instead of guessing which line wins.
  */
-function observeUserQuestionsApprovalPolicy(currentToml, preserved = null) {
+function observeTopLevelPolicyAssignments(currentToml, preserved = null) {
     const approvalAssignments = findTopLevelApprovalPolicies(currentToml);
     const sandboxAssignments = findTopLevelSandboxModes(currentToml);
     const beforeRaw = approvalAssignments[0]?.raw ?? null;

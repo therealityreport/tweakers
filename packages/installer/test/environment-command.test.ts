@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import {
   assertEnvironmentCliSuccess,
@@ -416,6 +416,66 @@ test("prepare normalizes Sade option keys, publishes only recomputed registry ev
   assert.deepEqual(prepared, [{ appExperience: "tweakers", releaseProfile: "alpha" }]);
   assert.equal("transactionId" in result ? result.transactionId : null, "prepared-1");
   assert.equal(fixture.printed.length, 1);
+});
+
+test("prepare reconciles a drifted published selection from the live marker before validation", async () => {
+  // The live app carries the Tweakers loader marker while the published
+  // selection still claims chatgpt — the crossed state a failed exchange
+  // leaves behind (live failure 2026-08-25). Prepare must republish from the
+  // proven live experience instead of validating the fiction.
+  const asar = (await import("@electron/asar")).default;
+  const appRoot = `${ROOT}/Live ChatGPT.app`;
+  const stage = `${ROOT}/asar-stage`;
+  mkdirSync(`${appRoot}/Contents/Resources`, { recursive: true });
+  mkdirSync(stage, { recursive: true });
+  writeFileSync(`${stage}/package.json`, JSON.stringify({ main: "tweaker-loader.cjs", __tweaker: {} }));
+  writeFileSync(`${stage}/tweaker-loader.cjs`, "module.exports = {};\n");
+  await asar.createPackage(stage, `${appRoot}/Contents/Resources/app.asar`);
+  try {
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: appRoot,
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: ROOT,
+      stableEvidence: trustedEvidence("stable"),
+      alphaEvidence: trustedEvidence("alpha"),
+    });
+    const current = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: NOW,
+      appliedAt: NOW,
+    });
+    const registry = createEnvironmentProfileRegistry({
+      stableDesktopPath: appRoot,
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: ROOT,
+      selected: current,
+      lastKnownWorkingSelection: current,
+      stableEvidence: trustedEvidence("stable"),
+      alphaEvidence: trustedEvidence("alpha"),
+    });
+    const republished: Array<{ liveExperience: string; selectionFile: string }> = [];
+    const fixture = dependencies({
+      loadState: () => ({ registry, current, migratedFromLegacy: false }),
+      republishSelectionFromLiveExperience: (input) => {
+        republished.push({ liveExperience: input.liveExperience, selectionFile: input.selectionFile });
+        return input.selected;
+      },
+    });
+
+    await environment("prepare", {
+      appExperience: "tweakers",
+      releaseProfile: "stable",
+      json: true,
+    }, fixture.deps);
+
+    assert.deepEqual(republished, [{
+      liveExperience: "tweakers",
+      selectionFile: `${ROOT}/environment-selection.json`,
+    }]);
+  } finally {
+    rmSync(ROOT, { recursive: true, force: true });
+  }
 });
 
 test("prepare forwards only an explicit internal bundled-derived receipt to the production coordinator", async () => {
