@@ -223,8 +223,10 @@ async function receiveEnhancementDelivery(api, state, delivery) {
       throw Object.assign(new Error("enhancement_mount_failed"), { code: "owned_mount" });
     }
     session.heading?.focus?.({ preventScroll: true });
+    setBusy(session, true);
     await api.ipc.invoke("enhancement.ack", enhancementEnvelope(session, "acknowledged"));
     session.acknowledged = true;
+    setBusy(session, false);
   } catch (error) {
     if (session) {
       session.card?.remove?.();

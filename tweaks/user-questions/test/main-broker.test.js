@@ -35,6 +35,23 @@ const ROUTE = Object.freeze({
   conversationId: "conversation-29",
 });
 
+test("enhancement client rejects when the peer closes without a response frame", async (t) => {
+  if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
+  const root = mkdtempSync(join(tmpdir(), "uq-enhancement-client-"));
+  const socketPath = join(root, "enhancement.sock");
+  const server = net.createServer((socket) => socket.once("data", () => socket.end()));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  await assert.rejects(
+    exchangeEnhancement(socketPath, { type: "claim" }),
+    /closed before a complete response frame/,
+  );
+});
+
 test("authenticated broker binds one-use claims to the exact renderer and cleans every endpoint", async (t) => {
   if (process.platform === "win32") return t.skip("Unix-domain broker contract");
   const root = mkdtempSync(join(tmpdir(), "uq-main-broker-"));

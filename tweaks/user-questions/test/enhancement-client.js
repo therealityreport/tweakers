@@ -14,6 +14,12 @@ function exchangeEnhancement(socketPath, frame) {
       callback(value);
     };
     socket.once("error", (error) => finish(reject, error));
+    const rejectIncompleteResponse = () => finish(
+      reject,
+      new Error("enhancement socket closed before a complete response frame"),
+    );
+    socket.once("end", rejectIncompleteResponse);
+    socket.once("close", rejectIncompleteResponse);
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       const newline = buffer.indexOf("\n");

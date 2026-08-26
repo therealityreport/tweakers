@@ -503,7 +503,7 @@ test("main startup never imports or invokes repairGlobalStateFile and cleans bro
 });
 
 test("enhancement renderer acknowledges a bound delivery and returns a deliberate generic-form response", async () => {
-  const harness = rendererHarness({ noCarrier: true });
+  const harness = rendererHarness({ noCarrier: true, deferEnhancementAck: true });
   await harness.start();
   const delivery = {
     version: 1,
@@ -539,6 +539,12 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
   const card = harness.enhancementCard();
   assert.ok(card, "the exact renderer mounted the delivered form");
   assert.equal(harness.enhancementAcks.length, 1);
+  assert.equal(card.getAttribute("aria-busy"), "true");
+  assert.equal(
+    card.querySelectorAll("button, input, textarea").every((control) => control.disabled),
+    true,
+    "the enhancement cannot lose input while acknowledgement is pending",
+  );
   assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementAcks[0])), {
     version: 1,
     type: "acknowledged",
@@ -547,6 +553,9 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
     input_fingerprint: delivery.input_fingerprint,
   });
   assert.equal(harness.enhancementResponses.length, 0, "mounting alone cannot invent an answer");
+  harness.resolveEnhancementAck();
+  await flushDom();
+  assert.equal(card.getAttribute("aria-busy"), "false");
   const textInput = card.querySelectorAll("input").find((input) => input.type === "text");
   assert.equal(textInput.getAttribute("aria-label"), "Details");
   textInput.value = "More context";
@@ -698,6 +707,7 @@ function rendererHarness(options = {}) {
   const ipcListeners = new Map();
   let resolveDeferredClaim = null;
   let resolveDeferredDelivery = null;
+  let resolveDeferredEnhancementAck = null;
   let mountAckFailures = options.failMountAck
     ? Number.POSITIVE_INFINITY
     : options.failMountAckOnce
@@ -803,6 +813,11 @@ function rendererHarness(options = {}) {
         }
         if (channel === "enhancement.ack") {
           enhancementAcks.push(args[0]);
+          if (options.deferEnhancementAck) {
+            return new Promise((resolve) => {
+              resolveDeferredEnhancementAck = () => resolve({ acknowledged: true });
+            });
+          }
           return options.enhancementBridge
             ? options.enhancementBridge.broker.acknowledgeEnhancement(options.enhancementBridge.webContentsId, args[0])
             : { acknowledged: true };
@@ -916,6 +931,12 @@ function rendererHarness(options = {}) {
       assert.ok(resolveDeferredDelivery, "deferred delivery was not pending");
       const resolve = resolveDeferredDelivery;
       resolveDeferredDelivery = null;
+      resolve();
+    },
+    resolveEnhancementAck() {
+      assert.ok(resolveDeferredEnhancementAck, "deferred enhancement acknowledgement was not pending");
+      const resolve = resolveDeferredEnhancementAck;
+      resolveDeferredEnhancementAck = null;
       resolve();
     },
     async start() { await tweak.start(api); await flushDom(); },
