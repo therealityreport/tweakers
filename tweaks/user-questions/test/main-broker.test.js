@@ -27,6 +27,7 @@ const {
   createEnhancementClaimResponse,
   createMainBroker,
 } = require("../main-broker");
+const { exchangeEnhancement } = require("./enhancement-client");
 
 const ROUTE = Object.freeze({
   webContentsId: 73,
@@ -409,22 +410,6 @@ function openSocket(socketPath) {
     const socket = net.createConnection({ path: socketPath });
     socket.once("connect", () => resolve(socket));
     socket.once("error", reject);
-  });
-}
-
-function exchangeEnhancement(socketPath, claim) {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ path: socketPath });
-    let buffered = "";
-    socket.once("error", reject);
-    socket.on("data", (chunk) => {
-      buffered += chunk.toString("utf8");
-      const newline = buffered.indexOf("\n");
-      if (newline < 0) return;
-      socket.end();
-      try { resolve(JSON.parse(buffered.slice(0, newline))); } catch (error) { reject(error); }
-    });
-    socket.once("connect", () => socket.write(`${JSON.stringify(claim)}\n`));
   });
 }
 

@@ -872,7 +872,7 @@ test("a pristine ChatGPT target fails closed if its dormant Tweakers loader or M
 });
 
 test("exchange-ready evidence tolerates outer root stat churn but refuses identity drift before the swap", async () => {
-  await withFixture((fixture) => {
+  await withFixture(async (fixture) => {
     const before = exchangeBefore(fixture.receipt);
     assert.doesNotThrow(() => assertEnvironmentModePairExchangeReadyEvidence(fixture.receipt, before));
 
@@ -923,14 +923,20 @@ test("exchange-ready evidence tolerates outer root stat churn but refuses identi
       /Contents identity does not match its prepared seal/,
     );
 
-    // The production preflight must run these legs BEFORE the sole native
-    // exchange; drift there resolves as stale_requires_prepare instead of a
-    // post-swap proof failure.
-    const source = readFileSync(
-      fileURLToPath(new URL("../src/environment-mode-production.ts", import.meta.url)),
-      "utf8",
-    );
-    assert.match(source, /assertEnvironmentModePairExchangeReadyEvidence\(pair, before\)/);
+    // The direct assertions above prove the production evidence classifier;
+    // this behavioral leg proves a stale preflight returns before the sole
+    // native exchange, without depending on source formatting or local names.
+    const events: string[] = [];
+    const receipt = await commit(fixture, warmDeps(fixture, events, {
+      preflight: () => {
+        events.push("preflight-stale");
+        return { state: "stale_requires_prepare", reason: "outer app evidence does not match its prepared seal" };
+      },
+    }));
+    assert.equal(receipt.phase, "stale_requires_prepare");
+    assert.equal(receipt.exchangeCount, 0);
+    assert.deepEqual(events, ["preflight-stale", "full-validate-stale"]);
+    assert.equal(readCurrentEnvironmentModePair(fixture.paths)?.pin.state, "stale_requires_prepare");
   });
 });
 

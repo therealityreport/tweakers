@@ -3,13 +3,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const net = require("node:net");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const vm = require("node:vm");
 const { createRoundState, reduceRoundState } = require("../round-state");
 const { createMainBroker } = require("../main-broker");
 const { SemanticEvent, createSemanticDom, findByText, flushDom } = require("./semantic-dom");
+const { exchangeEnhancement } = require("./enhancement-client");
 
 const SOURCE = fs.readFileSync(require.resolve("../index"), "utf8");
 const NONCE = "renderer-nonce-1234";
@@ -518,6 +518,10 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
       requestedSchema: {
         type: "object",
         properties: {
+          details: {
+            type: "string",
+            title: "Details",
+          },
           choice: {
             type: "string",
             title: "Choice",
@@ -543,7 +547,16 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
     input_fingerprint: delivery.input_fingerprint,
   });
   assert.equal(harness.enhancementResponses.length, 0, "mounting alone cannot invent an answer");
-  card.querySelectorAll("input").find((input) => input.value === "a").click();
+  const textInput = card.querySelectorAll("input").find((input) => input.type === "text");
+  assert.equal(textInput.getAttribute("aria-label"), "Details");
+  textInput.value = "More context";
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  const firstChoice = card.querySelectorAll("input").find((input) => input.value === "a");
+  assert.equal(harness.enhancementResponses.length, 0, "an unanswered single choice cannot drop its response key");
+  assert.equal(firstChoice.getAttribute("aria-invalid"), "true");
+  assert.equal(harness.document.activeElement, firstChoice);
+  firstChoice.click();
   findByText(card, "button", "Submit").click();
   await flushDom();
   assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementResponses)), [{
@@ -552,7 +565,7 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
     session_id: delivery.session_id,
     route_fingerprint: delivery.route_fingerprint,
     input_fingerprint: delivery.input_fingerprint,
-    response: { action: "accept", content: { choice: "a" } },
+    response: { action: "accept", content: { details: "More context", choice: "a" } },
   }]);
   assert.equal(harness.enhancementCard(), null, "completed response cleans the rendered card");
   await harness.stop();
@@ -908,29 +921,6 @@ function rendererHarness(options = {}) {
     async start() { await tweak.start(api); await flushDom(); },
     async stop() { await tweak.stop(); await flushDom(); },
   };
-}
-
-function exchangeEnhancement(socketPath, frame) {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ path: socketPath });
-    let buffer = "";
-    let settled = false;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      callback(value);
-    };
-    socket.once("error", (error) => finish(reject, error));
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      try { finish(resolve, JSON.parse(buffer.slice(0, newline))); }
-      catch (error) { finish(reject, error); }
-    });
-    socket.once("connect", () => socket.write(`${JSON.stringify(frame)}\n`));
-  });
 }
 
 function questionInput(longCopy = "") {

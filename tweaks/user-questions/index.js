@@ -354,6 +354,7 @@ function mountEnhancementField(session, card, field) {
   if (!field.choices) {
     const input = document.createElement("input");
     input.type = "text";
+    input.setAttribute("aria-label", field.title);
     input.className = "border-token-border bg-token-bg-primary h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
     fieldset.append(input);
     session.controls.set(field.name, { field, inputs: [input] });
@@ -377,13 +378,24 @@ function mountEnhancementField(session, card, field) {
 
 async function submitEnhancementSession(session) {
   const content = {};
+  let firstInvalidInput = null;
   for (const [name, control] of session.controls) {
     if (!control.field.choices) {
       content[name] = control.inputs[0]?.value || "";
       continue;
     }
     const selected = control.inputs.filter((input) => input.checked).map((input) => input.value);
+    for (const input of control.inputs) input.removeAttribute("aria-invalid");
+    if (!control.field.multiple && selected.length === 0) {
+      for (const input of control.inputs) input.setAttribute("aria-invalid", "true");
+      firstInvalidInput ||= control.inputs[0] || null;
+      continue;
+    }
     content[name] = control.field.multiple ? selected : selected[0];
+  }
+  if (firstInvalidInput) {
+    firstInvalidInput.focus?.();
+    return;
   }
   await finishEnhancementSession(session, { action: "accept", content });
 }
