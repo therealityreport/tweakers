@@ -302,6 +302,7 @@ function enhancementField(name, value, required) {
     if (
       !Number.isInteger(minItems)
       || minItems < 0
+      || minItems > choices.length
       || !Number.isInteger(maxItems)
       || maxItems < minItems
     ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });

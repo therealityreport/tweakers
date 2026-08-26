@@ -611,6 +611,45 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
   assert.equal(harness.enhancementUnregistrations, 1);
 });
 
+test("enhancement renderer rejects an unsatisfiable required multi-select before acknowledgement", async () => {
+  const harness = rendererHarness({ noCarrier: true });
+  await harness.start();
+  harness.deliverEnhancement({
+    version: 1,
+    type: "deliver",
+    id: "enhanced-request-unsatisfiable",
+    session_id: "enhanced-session-unsatisfiable",
+    route_fingerprint: "c".repeat(64),
+    input_fingerprint: "d".repeat(64),
+    elicitation: {
+      mode: "form",
+      message: "Choose three options.",
+      requestedSchema: {
+        type: "object",
+        required: ["tags"],
+        properties: {
+          tags: {
+            type: "array",
+            title: "Tags",
+            minItems: 3,
+            items: {
+              anyOf: [
+                { const: "tag-a", title: "Tag A" },
+                { const: "tag-b", title: "Tag B" },
+              ],
+            },
+          },
+        },
+      },
+    },
+  });
+  await flushDom();
+  assert.equal(harness.enhancementAcks.length, 0);
+  assert.equal(harness.enhancementCard(), null);
+  assert.match(harness.logs.join("\n"), /"code":"request_failed"/);
+  await harness.stop();
+});
+
 test("enhancement socket delivers to its registered renderer and returns only that renderer's submitted response", async (t) => {
   if (process.platform === "win32") return t.skip("Unix-domain enhancement contract");
   const root = fs.mkdtempSync(join(tmpdir(), "uq-renderer-bridge-"));
