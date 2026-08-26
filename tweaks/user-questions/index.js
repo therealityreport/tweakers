@@ -262,7 +262,14 @@ function normalizeEnhancementDelivery(value) {
     || Object.keys(properties).length < 1
     || Object.keys(properties).length > 8
   ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
-  const fields = Object.entries(properties).map(([name, property]) => enhancementField(name, property));
+  const requiredNames = schema.required === undefined ? [] : schema.required;
+  if (
+    !Array.isArray(requiredNames)
+    || requiredNames.some((name) => typeof name !== "string" || !(name in properties))
+    || new Set(requiredNames).size !== requiredNames.length
+  ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+  const required = new Set(requiredNames);
+  const fields = Object.entries(properties).map(([name, property]) => enhancementField(name, property, required.has(name)));
   return Object.freeze({
     id: value.id,
     session_id: value.session_id,
@@ -272,16 +279,15 @@ function normalizeEnhancementDelivery(value) {
   });
 }
 
-function enhancementField(name, value) {
+function enhancementField(name, value, required) {
   const property = record(value);
   if (!/^[A-Za-z0-9._~-]{1,128}$/.test(name) || !property || typeof property.title !== "string") {
     throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
   }
-  const choices = Array.isArray(property.oneOf)
-    ? property.oneOf
-    : Array.isArray(record(property.items)?.anyOf)
-      ? record(property.items).anyOf
-      : null;
+  const multiple = property.type === "array";
+  const choices = multiple
+    ? (Array.isArray(record(property.items)?.anyOf) ? record(property.items).anyOf : null)
+    : (Array.isArray(property.oneOf) ? property.oneOf : null);
   if (choices) {
     if (!choices.length || choices.length > 32) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
     const normalizedChoices = choices.map((choice) => {
@@ -291,11 +297,22 @@ function enhancementField(name, value) {
       }
       return Object.freeze({ value: option.const, label: option.title });
     });
+    const minItems = multiple && property.minItems !== undefined ? property.minItems : 0;
+    const maxItems = multiple && property.maxItems !== undefined ? property.maxItems : choices.length;
+    if (
+      !Number.isInteger(minItems)
+      || minItems < 0
+      || !Number.isInteger(maxItems)
+      || maxItems < minItems
+    ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
     return Object.freeze({
       name,
       title: property.title,
       description: typeof property.description === "string" ? property.description : "",
-      multiple: property.type === "array",
+      required,
+      multiple,
+      minItems,
+      maxItems,
       choices: Object.freeze(normalizedChoices),
     });
   }
@@ -304,6 +321,7 @@ function enhancementField(name, value) {
     name,
     title: property.title,
     description: typeof property.description === "string" ? property.description : "",
+    required,
     multiple: false,
     choices: null,
   });
@@ -388,11 +406,16 @@ async function submitEnhancementSession(session) {
     }
     const selected = control.inputs.filter((input) => input.checked).map((input) => input.value);
     for (const input of control.inputs) input.removeAttribute("aria-invalid");
-    if (!control.field.multiple && selected.length === 0) {
+    const selectionInvalid = control.field.multiple
+      ? (selected.length > 0 || control.field.required)
+        && (selected.length < control.field.minItems || selected.length > control.field.maxItems)
+      : control.field.required && selected.length === 0;
+    if (selectionInvalid) {
       for (const input of control.inputs) input.setAttribute("aria-invalid", "true");
       firstInvalidInput ||= control.inputs[0] || null;
       continue;
     }
+    if (selected.length === 0 && !control.field.required) continue;
     content[name] = control.field.multiple ? selected : selected[0];
   }
   if (firstInvalidInput) {

@@ -517,6 +517,7 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
       message: "Choose an option.",
       requestedSchema: {
         type: "object",
+        required: ["choice", "tags"],
         properties: {
           details: {
             type: "string",
@@ -529,6 +530,25 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
               { const: "a", title: "A" },
               { const: "b", title: "B" },
             ],
+          },
+          optionalChoice: {
+            type: "string",
+            title: "Optional choice",
+            oneOf: [
+              { const: "optional-a", title: "Optional A" },
+              { const: "optional-b", title: "Optional B" },
+            ],
+          },
+          tags: {
+            type: "array",
+            title: "Tags",
+            minItems: 1,
+            items: {
+              anyOf: [
+                { const: "tag-a", title: "Tag A" },
+                { const: "tag-b", title: "Tag B" },
+              ],
+            },
           },
         },
       },
@@ -562,10 +582,19 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
   findByText(card, "button", "Submit").click();
   await flushDom();
   const firstChoice = card.querySelectorAll("input").find((input) => input.value === "a");
+  const optionalChoice = card.querySelectorAll("input").find((input) => input.value === "optional-a");
+  const firstTag = card.querySelectorAll("input").find((input) => input.value === "tag-a");
   assert.equal(harness.enhancementResponses.length, 0, "an unanswered single choice cannot drop its response key");
   assert.equal(firstChoice.getAttribute("aria-invalid"), "true");
+  assert.equal(optionalChoice.getAttribute("aria-invalid"), null, "an unanswered optional choice remains valid");
+  assert.equal(firstTag.getAttribute("aria-invalid"), "true", "a required minItems constraint blocks an empty array");
   assert.equal(harness.document.activeElement, firstChoice);
   firstChoice.click();
+  findByText(card, "button", "Submit").click();
+  await flushDom();
+  assert.equal(harness.enhancementResponses.length, 0, "the required multi-select remains enforced independently");
+  assert.equal(firstTag.getAttribute("aria-invalid"), "true");
+  firstTag.click();
   findByText(card, "button", "Submit").click();
   await flushDom();
   assert.deepEqual(JSON.parse(JSON.stringify(harness.enhancementResponses)), [{
@@ -574,7 +603,7 @@ test("enhancement renderer acknowledges a bound delivery and returns a deliberat
     session_id: delivery.session_id,
     route_fingerprint: delivery.route_fingerprint,
     input_fingerprint: delivery.input_fingerprint,
-    response: { action: "accept", content: { details: "More context", choice: "a" } },
+    response: { action: "accept", content: { details: "More context", choice: "a", tags: ["tag-a"] } },
   }]);
   assert.equal(harness.enhancementCard(), null, "completed response cleans the rendered card");
   await harness.stop();
