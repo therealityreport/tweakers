@@ -42,3 +42,18 @@ credential copying is performed while staging routing.
 Balanced mode is source-stage functionality only until the runtime candidate,
 independent evidence, explicit live-account bindings, and separately authorized
 restart have all been completed.
+
+## 0.2.1 routing repair
+
+- Router-owned directories created with the normal owner-readable `0755` mode
+  are verified through open descriptors and tightened to `0700`; unsafe,
+  symlinked, replaced, or foreign-owned paths are rejected without changing the
+  shared parent directory.
+- Selecting Manual while no router configuration exists is a successful no-op,
+  and an already-manual configuration is not rewritten.
+- Snapshot synchronization can repair a stale current-account marker only when
+  one secure saved snapshot uniquely matches the live account. A failed marker
+  write restores the previous marker.
+- Router controls expose only a finite set of safe error codes and fixed user
+  messages; lower-level paths and error details stay out of the settings UI and
+  logs.

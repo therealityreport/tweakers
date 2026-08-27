@@ -18,6 +18,24 @@ const ACCOUNT_ROUTER_STATE_NAME = "router-state.json";
 const ACCOUNT_ROUTER_CONTROL_SECRET_NAME = "control-secret.v1";
 const ACCOUNT_ROUTER_RECEIPTS_NAME = "migration-receipts.v1.json";
 const MAX_ROUTER_STATE_BYTES = 512 * 1024;
+const ROUTER_PUBLIC_ERROR_CODES = new Set([
+  "invalid-router-mode",
+  "untrusted-router-directory",
+  "router-requires-exactly-two-accounts",
+  "invalid-router-weight",
+  "router-requires-distinct-accounts",
+  "router-not-idle",
+  "router-operation-failed",
+]);
+const ROUTER_CONTROL_FAILURE_MESSAGES = Object.freeze({
+  "invalid-router-mode": "The requested router mode is unavailable.",
+  "untrusted-router-directory": "Router storage could not be verified safely.",
+  "router-requires-exactly-two-accounts": "Choose exactly two saved accounts before staging balanced mode.",
+  "invalid-router-weight": "Each selected account needs a routing weight from 1 to 100.",
+  "router-requires-distinct-accounts": "Choose two different saved accounts before staging balanced mode.",
+  "router-not-idle": "Balance reset requires an idle router.",
+  "router-operation-failed": "The router action could not be completed safely.",
+});
 // These are stable remote package identifiers returned by Codex's experimental
 // app-server `plugin/installed` reconciliation endpoint. Keep this list free of
 // private/created-by-me plugins: a local account switcher must never assume it
@@ -110,7 +128,7 @@ module.exports = {
     makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
     accountRouterPaths, opaqueAccountId, validateRouterConfig, routerPublicStatus,
     stageBalancedRouterConfig, stageManualRouterConfig, resetRouterBalanceEpoch,
-    readRouterConfig, readRouterState,
+    readRouterConfig, readRouterState, routerControlFailure,
   },
 };
 
@@ -204,22 +222,26 @@ function createAccountService(api, options = {}) {
   // OAuth reuse detection and the server REVOKES the whole token family
   // (observed 2026-07-13). Keep the active account's snapshot in lockstep
   // with auth.json so switching back always presents current tokens.
-  const stopSnapshotSync = startActiveSnapshotSync(deps, paths, api, () => disposed);
+  const stopSnapshotSync = startActiveSnapshotSync(deps, paths, api, () => disposed, enqueue);
   return service;
 }
 
-function startActiveSnapshotSync(deps, paths, api, isDisposed) {
+function startActiveSnapshotSync(deps, paths, api, isDisposed, enqueue) {
   const fs = deps.fs;
   if (typeof fs.watch !== "function") return () => {};
   let timer = null;
   let watcher = null;
+  const warn = () => api.log?.warn?.("Account Router marker reconciliation failed", "router-operation-failed");
   const sync = () => {
     timer = null;
     if (isDisposed()) return;
-    try {
-      syncActiveSnapshot(deps, paths);
-    } catch (error) {
-      api.log?.warn?.("active account snapshot sync failed", String(error?.code || error));
+    const task = () => {
+      if (!isDisposed()) syncActiveSnapshot(deps, paths);
+    };
+    if (typeof enqueue === "function") {
+      Promise.resolve(enqueue(task)).catch(warn);
+    } else {
+      try { task(); } catch { warn(); }
     }
   };
   try {
@@ -231,7 +253,7 @@ function startActiveSnapshotSync(deps, paths, api, isDisposed) {
       timer = setTimeout(sync, 1_000);
     });
   } catch (error) {
-    api.log?.warn?.("active account snapshot sync unavailable", String(error?.code || error));
+    api.log?.warn?.("Account Router marker reconciliation unavailable", "router-operation-failed");
     return () => {};
   }
   // Also reconcile once at startup: the app may have rotated tokens while
@@ -246,31 +268,193 @@ function startActiveSnapshotSync(deps, paths, api, isDisposed) {
 function syncActiveSnapshot(deps, paths) {
   const fs = deps.fs;
   const marker = readCurrentMarker(fs, paths.currentMarker);
-  if (marker.status !== "ok" || !marker.value) return;
-  const target = sourceFilePath(deps.path, paths.accountsDir, marker.value);
-  let readingSnapshot = true;
-  try {
-    return withSecureAuth(fs, target, (snapshot) => {
-      readingSnapshot = false;
-      return withSecureAuth(fs, paths.authFile, (current) => {
-        if (!current.bytes.length || current.hash === snapshot.hash) return;
-        // Only propagate tokens for the SAME account; a manual re-login to a
-        // different account must not overwrite another account's snapshot.
-        const currentAccount = authAccountId(current.value);
-        const snapshotAccount = authAccountId(snapshot.value);
-        if (!currentAccount || currentAccount !== snapshotAccount) return;
-        atomicWrite(deps, paths.accountsDir, target, current.bytes);
-      });
-    });
-  } catch (error) {
-    if (readingSnapshot) return; // Snapshot missing/invalid: nothing safe to sync into.
-    throw error;
+  const live = readLiveAuthMetadata(deps, paths);
+  if (!live) return;
+
+  if (marker.status === "ok" && marker.value) {
+    try {
+      const marked = readSnapshotMetadata(deps, paths, marker.value);
+      if (marked.accountId === live.accountId) {
+        syncMarkedSnapshot(deps, paths, marker.value, live, marked);
+        return;
+      }
+    } catch {
+      // The deterministic inventory below must reject an unsafe candidate
+      // before it can be considered for a marker repair.
+    }
   }
+  reconcileCurrentMarker(deps, paths, marker, live);
 }
 
 function authAccountId(value) {
   const id = value?.tokens?.account_id;
   return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function authSnapshotMetadata(snapshot, filename = null) {
+  const accountId = authAccountId(snapshot.value);
+  return accountId ? { filename, accountId, identity: snapshot.identity, hash: snapshot.hash } : null;
+}
+
+function readLiveAuthMetadata(deps, paths) {
+  return withSecureAuth(deps.fs, paths.authFile, (snapshot) => authSnapshotMetadata(snapshot));
+}
+
+function readSnapshotMetadata(deps, paths, filename) {
+  const target = sourceFilePath(deps.path, paths.accountsDir, filename);
+  return withSecureAuth(deps.fs, target, (snapshot) => {
+    const metadata = authSnapshotMetadata(snapshot, filename);
+    if (!metadata) throw coded("router-operation-failed");
+    return metadata;
+  });
+}
+
+function sameAuthMetadata(left, right) {
+  return Boolean(left && right
+    && left.accountId === right.accountId
+    && left.identity === right.identity
+    && left.hash === right.hash);
+}
+
+function sameMarker(left, right) {
+  return left?.status === right?.status && left?.value === right?.value;
+}
+
+function trustedRepairMarker(marker) {
+  return (marker?.status === "missing" && marker.value === null)
+    || (marker?.status === "ok" && typeof marker.value === "string");
+}
+
+function sameMarkerSnapshot(left, right) {
+  if (!sameMarker(left, right)) return false;
+  if (left?.status === "missing") return left.bytes === null && right?.bytes === null;
+  return Buffer.isBuffer(left?.bytes) && Buffer.isBuffer(right?.bytes) && left.bytes.equals(right.bytes);
+}
+
+function snapshotInventory(deps, paths) {
+  const fs = deps.fs;
+  if (!routerPathStatOrNull(fs, paths.accountsDir)) return [];
+  assertTrustedDirectory(fs, paths.codexDir);
+  assertTrustedDirectory(fs, paths.accountsDir);
+  const entries = fs.readdirSync(paths.accountsDir, { withFileTypes: true })
+    .filter((entry) => entry.name.endsWith(".json"))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  return entries.map((entry) => {
+    if (!entry.isFile()) throw coded("router-operation-failed");
+    return readSnapshotMetadata(deps, paths, entry.name);
+  });
+}
+
+function sameSnapshotInventory(left, right) {
+  return left.length === right.length && left.every((entry, index) => {
+    const other = right[index];
+    return entry.filename === other?.filename
+      && entry.accountId === other.accountId
+      && entry.identity === other.identity
+      && entry.hash === other.hash;
+  });
+}
+
+function syncMarkedSnapshot(deps, paths, filename, expectedLive, expectedSnapshot) {
+  if (expectedLive.hash === expectedSnapshot.hash) return;
+  const target = sourceFilePath(deps.path, paths.accountsDir, filename);
+  withSecureAuth(deps.fs, paths.authFile, (liveSnapshot) => {
+    const live = authSnapshotMetadata(liveSnapshot);
+    if (!sameAuthMetadata(live, expectedLive)) return;
+    return withSecureAuth(deps.fs, target, (selectedSnapshot) => {
+      const selected = authSnapshotMetadata(selectedSnapshot, filename);
+      if (!sameAuthMetadata(selected, expectedSnapshot) || selected.accountId !== live.accountId) return;
+      if (live.hash !== selected.hash) atomicWrite(deps, paths.accountsDir, target, liveSnapshot.bytes);
+    });
+  });
+}
+
+function inventoryMatchesReconciledLive(before, after, selectedFilename, live) {
+  if (before.length !== after.length) return false;
+  for (const expected of before) {
+    const observed = after.find((item) => item.filename === expected.filename);
+    if (!observed || observed.accountId !== expected.accountId) return false;
+    if (expected.filename === selectedFilename) {
+      if (observed.hash !== live.hash) return false;
+    } else if (!sameAuthMetadata(expected, observed)) {
+      return false;
+    }
+  }
+  return after.filter((item) => item.accountId === live.accountId).length === 1;
+}
+
+function writeReconciledMarker(deps, paths, filename, expectedMarker) {
+  if (!trustedRepairMarker(expectedMarker)) return false;
+  let previous;
+  let rechecked;
+  let bytes;
+  let writeAttempted = false;
+  try {
+    previous = readCurrentMarkerSnapshot(deps.fs, paths.currentMarker);
+    if (!trustedRepairMarker(previous) || !sameMarker(previous, expectedMarker)) return false;
+    rechecked = readCurrentMarkerSnapshot(deps.fs, paths.currentMarker);
+    if (!sameMarkerSnapshot(previous, rechecked)) return false;
+    clearSecretBuffer(rechecked.bytes); rechecked = undefined;
+    bytes = Buffer.from(`${filename}\n`, "utf8");
+    writeAttempted = true;
+    atomicWrite(deps, paths.codexDir, paths.currentMarker, bytes);
+    const written = readCurrentMarker(deps.fs, paths.currentMarker);
+    if (written.status !== "ok" || written.value !== filename) throw coded("router-operation-failed");
+    return true;
+  } catch {
+    if (writeAttempted) {
+      try {
+        restoreReconciledMarker(deps, paths, previous);
+      } catch {
+        throw coded("router-operation-failed");
+      }
+    }
+    throw coded("router-operation-failed");
+  } finally {
+    clearSecretBuffer(bytes);
+    clearSecretBuffer(rechecked?.bytes);
+    clearSecretBuffer(previous?.bytes);
+  }
+}
+
+function restoreReconciledMarker(deps, paths, previous) {
+  if (!trustedRepairMarker(previous)) throw coded("router-operation-failed");
+  restoreOptional(deps, paths.codexDir, paths.currentMarker, previous.status === "ok" ? previous.bytes : null);
+  const restored = readCurrentMarkerSnapshot(deps.fs, paths.currentMarker);
+  try {
+    if (!sameMarkerSnapshot(previous, restored)) throw coded("router-operation-failed");
+  } finally {
+    clearSecretBuffer(restored.bytes);
+  }
+}
+
+function reconcileCurrentMarker(deps, paths, expectedMarker, expectedLive) {
+  if (!trustedRepairMarker(expectedMarker)) return;
+  const initial = snapshotInventory(deps, paths);
+  const matches = initial.filter((snapshot) => snapshot.accountId === expectedLive.accountId);
+  if (matches.length !== 1) return;
+  const selected = matches[0];
+  const rechecked = snapshotInventory(deps, paths);
+  if (!sameSnapshotInventory(initial, rechecked) || !sameMarker(readCurrentMarker(deps.fs, paths.currentMarker), expectedMarker)) return;
+
+  const target = sourceFilePath(deps.path, paths.accountsDir, selected.filename);
+  const updated = withSecureAuth(deps.fs, paths.authFile, (liveSnapshot) => {
+    const live = authSnapshotMetadata(liveSnapshot);
+    if (!sameAuthMetadata(live, expectedLive)) return false;
+    return withSecureAuth(deps.fs, target, (selectedSnapshot) => {
+      const currentSelected = authSnapshotMetadata(selectedSnapshot, selected.filename);
+      if (!sameAuthMetadata(currentSelected, selected) || currentSelected.accountId !== live.accountId) return false;
+      if (live.hash !== currentSelected.hash) atomicWrite(deps, paths.accountsDir, target, liveSnapshot.bytes);
+      return true;
+    });
+  });
+  if (!updated) return;
+
+  const finalLive = readLiveAuthMetadata(deps, paths);
+  const finalInventory = snapshotInventory(deps, paths);
+  if (!sameAuthMetadata(finalLive, expectedLive)
+    || !inventoryMatchesReconciledLive(initial, finalInventory, selected.filename, finalLive)) return;
+  writeReconciledMarker(deps, paths, selected.filename, expectedMarker);
 }
 
 function listAccounts(deps, paths, refs, protection = null) {
@@ -907,8 +1091,13 @@ function readOptionalSecureBytes(fs, file, maxBytes) {
   let bytes;
   let transferred = false;
   try {
-    if (!fs.existsSync(file)) return null;
-    const stat = fs.lstatSync(file);
+    let stat;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw coded("invalid-existing-state");
+    }
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0 || stat.size > maxBytes) throw coded("invalid-existing-state");
     bytes = fs.readFileSync(file);
     transferred = true;
@@ -992,28 +1181,45 @@ function assertTrustedDirectory(fs, dir) {
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0) throw coded("untrusted-auth-directory");
 }
 
-function readCurrentMarker(fs, file) {
+function readCurrentMarkerSnapshot(fs, file) {
   let fd;
+  let bytes;
+  let transferred = false;
   try {
     // Open with O_NOFOLLOW and fstat the fd (TOCTOU-safe), matching the rigor of
     // readSecureAuth rather than lstat-then-read.
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0 || stat.size <= 0 || stat.size > 256) return { value: null, status: "invalid" };
-    const buffer = Buffer.alloc(stat.size);
+    if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0 || stat.size <= 0 || stat.size > 256) return { value: null, status: "invalid", bytes: null };
+    bytes = Buffer.alloc(stat.size);
     let offset = 0;
-    while (offset < buffer.length) {
-      const count = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
       if (!count) break;
       offset += count;
     }
-    const value = buffer.toString("utf8").trim();
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\.json$/.test(value)) return { value: null, status: "invalid" };
-    return { value, status: "ok" };
+    if (offset !== bytes.length) return { value: null, status: "invalid", bytes: null };
+    const value = bytes.toString("utf8").trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\.json$/.test(value)) return { value: null, status: "invalid", bytes: null };
+    transferred = true;
+    return { value, status: "ok", bytes };
   } catch (error) {
-    return { value: null, status: error?.code === "ENOENT" ? "missing" : "invalid" };
+    return { value: null, status: error?.code === "ENOENT" ? "missing" : "invalid", bytes: null };
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+    try {
+      if (fd !== undefined) fs.closeSync(fd);
+    } finally {
+      if (!transferred) clearSecretBuffer(bytes);
+    }
+  }
+}
+
+function readCurrentMarker(fs, file) {
+  const marker = readCurrentMarkerSnapshot(fs, file);
+  try {
+    return { value: marker.value, status: marker.status };
+  } finally {
+    clearSecretBuffer(marker.bytes);
   }
 }
 
@@ -1069,27 +1275,98 @@ function accountRouterPaths(deps, paths) {
   };
 }
 
-function ensureOwnerPrivateDirectory(deps, directory) {
+function routerPathStatOrNull(fs, target) {
+  try { return fs.lstatSync(target); }
+  catch (error) {
+    if (error?.code === "ENOENT") return null;
+    if (["ENOTDIR", "ELOOP"].includes(error?.code)) throw coded("untrusted-router-directory");
+    throw coded("router-operation-failed");
+  }
+}
+
+function routerUid(deps) {
+  const uid = typeof deps?.getuid === "function" ? deps.getuid() : null;
+  if (!Number.isInteger(uid)) throw coded("untrusted-router-directory");
+  return uid;
+}
+
+function sameDirectoryIdentity(left, right) {
+  return left?.dev === right?.dev && left?.ino === right?.ino && left?.uid === right?.uid;
+}
+
+function trustedRouterDirectoryStat(stat, uid) {
+  return Boolean(stat && typeof stat.isDirectory === "function" && stat.isDirectory()
+    && stat.uid === uid && (stat.mode & 0o022) === 0);
+}
+
+function inspectRouterDirectory(deps, directory, harden) {
   const fs = deps.fs;
-  if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
-  const stat = fs.lstatSync(directory);
-  const uid = typeof deps.getuid === "function" ? deps.getuid() : stat.uid;
-  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o077) !== 0) throw coded("untrusted-router-directory");
-  fs.chmodSync(directory, 0o700);
+  const constants = fs?.constants;
+  if (!Number.isInteger(constants?.O_RDONLY) || !Number.isInteger(constants?.O_DIRECTORY)
+    || !Number.isInteger(constants?.O_NOFOLLOW) || typeof fs?.openSync !== "function"
+    || typeof fs?.fstatSync !== "function" || typeof fs?.closeSync !== "function"
+    || (harden && typeof fs?.fchmodSync !== "function")) throw coded("untrusted-router-directory");
+  const uid = routerUid(deps);
+  let fd;
+  try {
+    fd = fs.openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const before = fs.fstatSync(fd);
+    if (!trustedRouterDirectoryStat(before, uid)) throw coded("untrusted-router-directory");
+    if (!harden) return before;
+
+    // A shared parent is only inspected. Router-owned descendants are hardened
+    // through this opened descriptor, never with a path-level chmod.
+    fs.fchmodSync(fd, 0o700);
+    const after = fs.fstatSync(fd);
+    const current = fs.lstatSync(directory);
+    if (!trustedRouterDirectoryStat(after, uid) || (after.mode & 0o777) !== 0o700
+      || !trustedRouterDirectoryStat(current, uid) || current.isSymbolicLink()
+      || !sameDirectoryIdentity(after, current)) throw coded("untrusted-router-directory");
+    return after;
+  } catch (error) {
+    if (error?.code === "untrusted-router-directory") throw error;
+    if (["ENOENT", "ENOTDIR", "ELOOP"].includes(error?.code)) throw coded("untrusted-router-directory");
+    throw coded("router-operation-failed");
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* fail closed before caller mutation */ }
+    }
+  }
+}
+
+function hardenRouterChild(deps, parent, child, create) {
+  const fs = deps.fs;
+  const parentPath = deps.path.resolve(parent);
+  const childPath = deps.path.resolve(child);
+  if (deps.path.dirname(childPath) !== parentPath) throw coded("untrusted-router-directory");
+  const parentBefore = inspectRouterDirectory(deps, parentPath, false);
+  const existing = routerPathStatOrNull(fs, childPath);
+  if (!existing) {
+    if (!create) throw coded("untrusted-router-directory");
+    try { fs.mkdirSync(childPath, { mode: 0o700 }); }
+    catch (error) {
+      if (error?.code !== "EEXIST") throw coded("router-operation-failed");
+    }
+  }
+  const childStat = inspectRouterDirectory(deps, childPath, true);
+  const parentAfter = inspectRouterDirectory(deps, parentPath, false);
+  if (!sameDirectoryIdentity(parentBefore, parentAfter)) throw coded("untrusted-router-directory");
+  return childStat;
 }
 
 function ensureRouterRoot(deps, paths) {
   assertTrustedDirectory(deps.fs, paths.codexDir);
   const routerPaths = accountRouterPaths(deps, paths);
-  ensureOwnerPrivateDirectory(deps, deps.path.dirname(routerPaths.routerDir));
-  ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
-  ensureOwnerPrivateDirectory(deps, routerPaths.accountsDir);
+  // `tweak-data` is a runtime-owned shared parent. It may be 0755, but it
+  // must be trusted and is never chmodded by this tweak.
+  hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, true);
+  hardenRouterChild(deps, routerPaths.routerDir, routerPaths.accountsDir, true);
   return routerPaths;
 }
 
 function routerSecret(deps, routerPaths) {
   const fs = deps.fs;
-  ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
+  hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
   if (!fs.existsSync(routerPaths.controlSecretFile)) {
     const { randomBytes } = require("node:crypto");
     const generated = randomBytes(32);
@@ -1205,21 +1482,22 @@ function stageRouterHome(deps, paths, routerPaths, filename, opaqueId, secret) {
     sourceSnapshot = readSecureAuth(deps.fs, source);
     if (opaqueAccountId(secret, authAccountId(sourceSnapshot.value)) !== opaqueId) throw coded("router-account-identity-changed");
     const target = exactRouterChild(deps, routerPaths, opaqueId);
-    if (deps.fs.existsSync(target)) {
+    if (routerPathStatOrNull(deps.fs, target)) {
       const authFile = deps.path.join(target, "codex-home", "auth.json");
-      ensureOwnerPrivateDirectory(deps, target);
-      ensureOwnerPrivateDirectory(deps, deps.path.join(target, "codex-home"));
+      hardenRouterChild(deps, routerPaths.accountsDir, target, false);
+      hardenRouterChild(deps, target, deps.path.join(target, "codex-home"), false);
+      hardenRouterChild(deps, target, deps.path.join(target, "sqlite-home"), false);
       withSecureAuth(deps.fs, authFile, (existing) => {
         if (existing.hash !== sourceSnapshot.hash) throw coded("router-home-conflict");
       });
       return { reused: true, hash: sourceSnapshot.hash };
     }
     staging = deps.path.join(routerPaths.accountsDir, `.staging-${deps.randomUUID()}`);
-    ensureOwnerPrivateDirectory(deps, staging);
+    hardenRouterChild(deps, routerPaths.accountsDir, staging, true);
     const codexHome = deps.path.join(staging, "codex-home");
     const sqliteHome = deps.path.join(staging, "sqlite-home");
-    ensureOwnerPrivateDirectory(deps, codexHome);
-    ensureOwnerPrivateDirectory(deps, sqliteHome);
+    hardenRouterChild(deps, staging, codexHome, true);
+    hardenRouterChild(deps, staging, sqliteHome, true);
     atomicWrite(deps, codexHome, deps.path.join(codexHome, "auth.json"), sourceSnapshot.bytes);
     // v1 never copies live config/environment/MCP credentials. This empty file
     // makes the deny-by-default capability policy explicit for the runtime.
@@ -1228,8 +1506,12 @@ function stageRouterHome(deps, paths, routerPaths, filename, opaqueId, secret) {
       if (revalidated.identity !== sourceSnapshot.identity || revalidated.hash !== sourceSnapshot.hash
         || opaqueAccountId(secret, authAccountId(revalidated.value)) !== opaqueId) throw coded("router-source-changed");
     });
+    if (routerPathStatOrNull(deps.fs, target)) throw coded("router-home-conflict");
     deps.fs.renameSync(staging, target);
     promoted = true;
+    hardenRouterChild(deps, routerPaths.accountsDir, target, false);
+    hardenRouterChild(deps, target, deps.path.join(target, "codex-home"), false);
+    hardenRouterChild(deps, target, deps.path.join(target, "sqlite-home"), false);
     return { reused: false, hash: sourceSnapshot.hash };
   } finally {
     clearSecretBuffer(sourceSnapshot?.bytes);
@@ -1270,9 +1552,14 @@ function stageBalancedRouterConfig(deps, paths, refs, message) {
 }
 
 function stageManualRouterConfig(deps, paths) {
-  const routerPaths = ensureRouterRoot(deps, paths);
+  const routerPaths = accountRouterPaths(deps, paths);
+  // Manual mode is a no-op when the router has never been configured. Do not
+  // create, chmod, or otherwise touch the runtime-owned namespace in that case.
+  if (!routerPathStatOrNull(deps.fs, routerPaths.configFile)) return null;
+  hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
   const existing = readRouterConfig(deps, routerPaths);
   if (!existing) return null;
+  if (existing.mode === "manual") return existing;
   const config = { ...existing, mode: "manual", updatedAt: isoNow(deps) };
   writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
   return config;
@@ -1324,7 +1611,7 @@ async function configureRouter(_api, deps, paths, refs, message) {
       ? stageBalancedRouterConfig(deps, paths, refs, message)
       : message?.mode === "manual" ? stageManualRouterConfig(deps, paths) : (() => { throw coded("invalid-router-mode"); })();
     return { ok: true, router: routerPublicStatus(deps, config, null) };
-  } catch (error) { return safeFailure(errorCode(error)); }
+  } catch (error) { return safeRouterFailure(error); }
 }
 
 function routerIsIdle(state) {
@@ -1334,7 +1621,7 @@ function routerIsIdle(state) {
 
 function resetRouterBalanceEpoch(deps, routerPaths) {
   try {
-    ensureOwnerPrivateDirectory(deps, routerPaths.routerDir);
+    hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
     const state = readRouterState(deps, routerPaths);
     if (!state) throw coded("router-state-unavailable");
     if (!routerIsIdle(state)) throw coded("router-not-idle");
@@ -1348,7 +1635,7 @@ function resetRouterBalanceEpoch(deps, routerPaths) {
     state.epoch += 1;
     writePrivateJson(deps, routerPaths.routerDir, routerPaths.stateFile, state);
     return { ok: true, epoch: state.epoch };
-  } catch (error) { return safeFailure(errorCode(error)); }
+  } catch (error) { return safeRouterFailure(error); }
 }
 
 function cleanupLegacyAnalytics(deps) {
@@ -1529,12 +1816,13 @@ function routerControlCard(state, accounts) {
   balanced.textContent = "Stage Balanced Mode";
   balanced.addEventListener("click", async () => {
     const refs = [...selected];
-    if (refs.length !== 2) { status.textContent = "Choose exactly two saved accounts before staging balanced mode."; return; }
+    if (refs.length !== 2) { reportRouterControlFailure(state, status, "router-requires-exactly-two-accounts"); return; }
     status.textContent = "Staging isolated account homes…";
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "balanced", refs, primaryRef: refs[0], weights: refs.map((ref) => weights.get(ref)) });
-      status.textContent = result?.ok ? "Balanced mode is staged for the next authorized restart." : "Balanced mode could not be staged safely.";
-    } catch { status.textContent = "Balanced mode could not be staged safely."; }
+      if (result?.ok) status.textContent = "Balanced mode is staged for the next authorized restart.";
+      else reportRouterControlFailure(state, status, result?.error?.code);
+    } catch { reportRouterControlFailure(state, status); }
   });
   const manual = document.createElement("button");
   manual.type = "button";
@@ -1543,8 +1831,9 @@ function routerControlCard(state, accounts) {
   manual.addEventListener("click", async () => {
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
-      status.textContent = result?.ok ? "Manual mode is staged. Existing saved sessions remain unchanged." : "Manual mode could not be staged safely.";
-    } catch { status.textContent = "Manual mode could not be staged safely."; }
+      if (result?.ok) status.textContent = "Manual mode is staged. Existing saved sessions remain unchanged.";
+      else reportRouterControlFailure(state, status, result?.error?.code);
+    } catch { reportRouterControlFailure(state, status); }
   });
   const reset = document.createElement("button");
   reset.type = "button";
@@ -1553,8 +1842,9 @@ function routerControlCard(state, accounts) {
   reset.addEventListener("click", async () => {
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-reset-balance-epoch" });
-      status.textContent = result?.ok ? "Balance epoch reset while idle." : "Balance reset requires an idle router.";
-    } catch { status.textContent = "Balance reset was unavailable."; }
+      if (result?.ok) status.textContent = "Balance epoch reset while idle.";
+      else reportRouterControlFailure(state, status, result?.error?.code);
+    } catch { reportRouterControlFailure(state, status); }
   });
   controls.append(balanced, manual, reset);
   body.append(status, choices, controls);
@@ -1807,6 +2097,21 @@ function displayLabelFromAuth(value, fallback) {
   return validLabel(fallbackLabel) ? fallbackLabel : "Saved account";
 }
 function safeFailure(code) { return { ok: false, error: { code, message: "The account request could not be completed safely." } }; }
+function routerPublicErrorCode(code) {
+  return typeof code === "string" && ROUTER_PUBLIC_ERROR_CODES.has(code) ? code : "router-operation-failed";
+}
+function routerControlFailure(code) {
+  const safeCode = routerPublicErrorCode(code);
+  return { code: safeCode, message: ROUTER_CONTROL_FAILURE_MESSAGES[safeCode] };
+}
+function reportRouterControlFailure(state, status, code) {
+  const failure = routerControlFailure(code);
+  try { state.api.log?.warn?.("Account Router control failure", failure.code); } catch {}
+  status.textContent = failure.message;
+}
+function safeRouterFailure(error) {
+  return safeFailure(routerPublicErrorCode(error?.code));
+}
 function coded(code) { const error = new Error(code); error.code = code; return error; }
 function errorCode(error) { return typeof error?.code === "string" && /^[a-z0-9-]+$/.test(error.code) ? error.code : "operation-failed"; }
 function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
