@@ -90,14 +90,16 @@ function createProjectService(api, dependencies = {}) {
   }
 
   function save(next) {
-    store.write(next);
+    const { normalizeState } = require("./state");
+    const normalized = normalizeState(next);
+    store.write(normalized);
     // The first persist of an in-memory seeded store also settles the
     // one-time legacy color import that startup applied but deferred writing.
     if (startedEmpty && legacyColors.found && imported.changed
-      && next.nodes.some((node) => node.type === "project")) {
+      && normalized.nodes.some((node) => node.type === "project")) {
       try { legacyMigration.complete(); } catch {}
     }
-    replaceObject(state, next);
+    replaceObject(state, normalized);
     inventory.clear();
     githubBranchesCache.clear();
     storageStatus = "ok";

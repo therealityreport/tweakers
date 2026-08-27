@@ -53,7 +53,7 @@ function schedulerFor(
   });
 }
 
-test("mutation storms are bounded to four missing probes per second", () => {
+test("missing Settings runs a bounded ten-probe burst and becomes dormant", () => {
   const clock = new FakeClock();
   let probes = 0;
   const scheduler = schedulerFor(clock, () => {
@@ -62,18 +62,20 @@ test("mutation storms are bounded to four missing probes per second", () => {
   });
 
   scheduler.request({ immediate: true });
-  for (let elapsed = 0; elapsed < 1_000; elapsed += 10) {
+  for (let elapsed = 0; elapsed < 10_000; elapsed += 10) {
     scheduler.request();
     clock.advance(10);
   }
 
-  assert.equal(probes, 5, "one immediate probe plus four probes during the first second");
+  assert.equal(probes, 10);
+  assert.equal(scheduler.metrics().dormant, true);
+  assert.equal(clock.pendingTimerCount(), 0);
   assert.ok(scheduler.metrics().coalescedRequestCount > 0);
   scheduler.stop();
   assert.equal(scheduler.metrics().activeTimerCount, 0);
 });
 
-test("ten misses back off subsequent probes to once per second", () => {
+test("ten thousand irrelevant mutations do not probe after dormancy", () => {
   const clock = new FakeClock();
   let probes = 0;
   const scheduler = schedulerFor(clock, () => {
@@ -82,19 +84,23 @@ test("ten misses back off subsequent probes to once per second", () => {
   });
 
   scheduler.request({ immediate: true });
-  clock.advance(2_250);
+  clock.advance(10_000);
   assert.equal(probes, 10);
-  clock.advance(999);
+  for (let index = 0; index < 10_000; index += 1) {
+    scheduler.recordFilteredMutation();
+    scheduler.request();
+  }
+  clock.advance(10_000);
   assert.equal(probes, 10);
-  clock.advance(1);
-  assert.equal(probes, 11);
-  assert.equal(scheduler.metrics().currentBackoffMs, 1_000);
+  assert.equal(scheduler.metrics().filteredMutationCount, 10_000);
+  assert.equal(scheduler.metrics().dormant, true);
+  assert.equal(clock.pendingTimerCount(), 0);
   assert.equal(scheduler.metrics().backoffEventCount, 1);
   scheduler.stop();
   assert.equal(scheduler.metrics().activeTimerCount, 0);
 });
 
-test("navigation resets backoff and probes immediately", () => {
+test("navigation wakes a dormant scheduler exactly once", () => {
   const clock = new FakeClock();
   let probes = 0;
   const scheduler = schedulerFor(clock, () => {
@@ -103,11 +109,13 @@ test("navigation resets backoff and probes immediately", () => {
   });
 
   scheduler.request({ immediate: true });
-  clock.advance(3_250);
-  assert.equal(scheduler.metrics().currentBackoffMs, 1_000);
+  clock.advance(10_000);
+  assert.equal(scheduler.metrics().dormant, true);
   const beforeNavigation = probes;
-  scheduler.request({ immediate: true, resetBackoff: true });
+  scheduler.request({ immediate: true, resetBackoff: true, wake: true });
   assert.equal(probes, beforeNavigation + 1);
+  assert.equal(scheduler.metrics().wakeCount, 1);
+  assert.equal(scheduler.metrics().dormant, false);
   assert.equal(scheduler.metrics().currentBackoffMs, 250);
   scheduler.stop();
 });
@@ -188,10 +196,11 @@ test("a detached sidebar root triggers one immediate reinjection without history
   const observerEnd = injectorSource.indexOf("function publishSettingsInjectorDiagnostics", observerStart);
   assert.ok(observerStart >= 0 && observerEnd > observerStart, "observer source range exists");
   const observer = injectorSource.slice(observerStart, observerEnd);
-  assert.match(observer, /const target = document\.documentElement/);
-  assert.match(observer, /if \(sidebarRoot && !sidebarRoot\.isConnected\)/);
+  assert.match(observer, /const target = sidebarRoot \?\? document\.documentElement/);
+  assert.match(observer, /if \(sidebarRoot\.isConnected\) return/);
   assert.match(observer, /state\.sidebarRoot = null/);
-  assert.match(observer, /request\(\{ immediate: true, resetBackoff: true \}\)/);
+  assert.match(observer, /mutationRecordsContainRemovedRoot\(records, sidebarRoot\)/);
+  assert.match(observer, /request\(\{ immediate: true, resetBackoff: true, wake: true \}\)/);
 
   const clock = new FakeClock();
   let injections = 0;
@@ -203,7 +212,7 @@ test("a detached sidebar root triggers one immediate reinjection without history
   const onDocumentMutation = (): void => {
     if (!sidebarRoot.isConnected) {
       sidebarRoot = { isConnected: true };
-      scheduler.request({ immediate: true, resetBackoff: true });
+      scheduler.request({ immediate: true, resetBackoff: true, wake: true });
     }
   };
 
@@ -212,8 +221,50 @@ test("a detached sidebar root triggers one immediate reinjection without history
   onDocumentMutation();
   onDocumentMutation();
   assert.equal(injections, 2, "the replacement causes one reinjection without navigation");
+  assert.equal(scheduler.metrics().wakeCount, 1);
   assert.equal(clock.pendingTimerCount(), 0, "the found replacement leaves no duplicate timer");
   scheduler.stop();
+});
+
+test("injector filters ordinary document mutations and wakes for Settings markers", () => {
+  const injectorSource = readFileSync(
+    resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
+    "utf8",
+  );
+  const observerStart = injectorSource.indexOf("function scopeSettingsObserver");
+  const observerEnd = injectorSource.indexOf("function publishSettingsInjectorDiagnostics", observerStart);
+  const observer = injectorSource.slice(observerStart, observerEnd);
+  assert.match(observer, /mutationRecordsContainSettingsMarkers\(records\)/);
+  assert.match(observer, /recordFilteredMutation\(records\.length\)/);
+  assert.match(observer, /node instanceof Element && node\.matches\("\[data-settings-panel-slug\]"\)/);
+  assert.match(observer, /node instanceof DocumentFragment/);
+  assert.match(observer, /node\.querySelector\("\[data-settings-panel-slug\]"\)/);
+});
+
+test("replacement sentinel ignores unrelated mutations after sidebar detachment", () => {
+  const injectorSource = readFileSync(
+    resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
+    "utf8",
+  );
+  const observerStart = injectorSource.indexOf("function scopeSettingsObserver");
+  const observerEnd = injectorSource.indexOf("function publishSettingsInjectorDiagnostics", observerStart);
+  const observer = injectorSource.slice(observerStart, observerEnd);
+  assert.match(observer, /new MutationObserver\(\(records\) => \{/);
+  assert.match(observer, /if \(sidebarRoot\.isConnected\) return;/);
+  assert.match(observer, /if \(!mutationRecordsContainRemovedRoot\(records, sidebarRoot\)\) return;/);
+  assert.match(observer, /function mutationRecordsContainRemovedRoot\(records: MutationRecord\[], root: Node\)/);
+  assert.match(observer, /node === root \|\| \(node instanceof Node && node\.contains\(root\)\)/);
+});
+
+test("explicit Settings page opening wakes the scheduler", () => {
+  const injectorSource = readFileSync(
+    resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
+    "utf8",
+  );
+  const start = injectorSource.indexOf("export function openRegisteredPage");
+  const end = injectorSource.indexOf("export function setListedTweaks", start);
+  const body = injectorSource.slice(start, end);
+  assert.match(body, /request\(\{ immediate: true, resetBackoff: true, wake: true \}\)/);
 });
 
 test("stop cancels timers and prevents future probes", () => {
@@ -230,4 +281,17 @@ test("stop cancels timers and prevents future probes", () => {
   scheduler.request({ immediate: true });
   assert.equal(probes, 1);
   assert.equal(scheduler.metrics().activeTimerCount, 0);
+
+  const injectorSource = readFileSync(
+    resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
+    "utf8",
+  );
+  const start = injectorSource.indexOf("export function stopSettingsInjector");
+  const end = injectorSource.indexOf("function onNav", start);
+  const stopBody = injectorSource.slice(start, end);
+  assert.match(stopBody, /settlePendingRegisteredPageOpen/);
+  assert.match(stopBody, /state\.probeScheduler\?\.stop\(\)/);
+  assert.match(stopBody, /state\.observer\?\.disconnect\(\)/);
+  assert.match(stopBody, /state\.replacementObserver\?\.disconnect\(\)/);
+  assert.match(stopBody, /clearTimeout\(state\.settingsSurfaceHideTimer\)/);
 });

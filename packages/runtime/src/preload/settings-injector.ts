@@ -443,6 +443,7 @@ interface InjectorState {
   panelHost: HTMLElement | null;
   observer: MutationObserver | null;
   observerTarget: Node | null;
+  replacementObserver: MutationObserver | null;
   probeScheduler: SettingsProbeScheduler | null;
   installedRuntimeFingerprint: string | null;
   sourceRuntimeFingerprint: string | null;
@@ -486,6 +487,7 @@ const state: InjectorState = {
   panelHost: null,
   observer: null,
   observerTarget: null,
+  replacementObserver: null,
   probeScheduler: null,
   installedRuntimeFingerprint: null,
   sourceRuntimeFingerprint: null,
@@ -593,11 +595,16 @@ export function startSettingsInjector(): void {
 
 export function stopSettingsInjector(): void {
   const metrics = state.probeScheduler?.metrics() ?? null;
+  if (pendingRegisteredPageOpen) {
+    settlePendingRegisteredPageOpen({ ok: false, reason: "mount-timeout" });
+  }
   state.probeScheduler?.stop();
   state.probeScheduler = null;
   state.observer?.disconnect();
   state.observer = null;
   state.observerTarget = null;
+  state.replacementObserver?.disconnect();
+  state.replacementObserver = null;
   if (state.settingsSurfaceHideTimer) {
     clearTimeout(state.settingsSurfaceHideTimer);
     state.settingsSurfaceHideTimer = null;
@@ -624,7 +631,7 @@ function onNav(): void {
   state.fingerprint = null;
   state.sidebarRoot = null;
   scopeSettingsObserver("missing");
-  state.probeScheduler?.request({ immediate: true, resetBackoff: true });
+  state.probeScheduler?.request({ immediate: true, resetBackoff: true, wake: true });
 }
 
 function onDocumentClick(e: MouseEvent): void {
@@ -636,7 +643,7 @@ function onDocumentClick(e: MouseEvent): void {
     setSettingsSurfaceVisible(false, "back-to-app");
     state.sidebarRoot = null;
     scopeSettingsObserver("missing");
-    state.probeScheduler?.request({ immediate: true, resetBackoff: true });
+    state.probeScheduler?.request({ immediate: true, resetBackoff: true, wake: true });
   }, 0);
 }
 
@@ -646,25 +653,61 @@ function runSettingsProbe(): SettingsProbeOutcome {
   return outcome;
 }
 
-function scopeSettingsObserver(_outcome: SettingsProbeOutcome): void {
-  // Keep this observer anchored above the routed sidebar. React can replace
-  // the entire root without a history event, which a root-scoped observer
-  // cannot observe after that root has been detached.
-  const target = document.documentElement;
+function scopeSettingsObserver(outcome: SettingsProbeOutcome): void {
+  const sidebarRoot = outcome === "found" && state.sidebarRoot?.isConnected
+    ? state.sidebarRoot
+    : null;
+  const target = sidebarRoot ?? document.documentElement;
   if (state.observer && state.observerTarget === target) return;
   state.observer?.disconnect();
-  state.observer = new MutationObserver(() => {
-    const sidebarRoot = state.sidebarRoot;
-    if (sidebarRoot && !sidebarRoot.isConnected) {
-      state.sidebarRoot = null;
-      state.fingerprint = null;
-      state.probeScheduler?.request({ immediate: true, resetBackoff: true });
+  state.observer = new MutationObserver((records) => {
+    if (sidebarRoot) {
+      state.probeScheduler?.request();
       return;
     }
-    state.probeScheduler?.request();
+    if (mutationRecordsContainSettingsMarkers(records)) {
+      state.probeScheduler?.request({ immediate: true, resetBackoff: true, wake: true });
+      return;
+    }
+    state.probeScheduler?.recordFilteredMutation(records.length);
+    publishSettingsInjectorDiagnostics();
   });
   state.observer.observe(target, { childList: true, subtree: true });
   state.observerTarget = target;
+
+  state.replacementObserver?.disconnect();
+  state.replacementObserver = null;
+  if (sidebarRoot) {
+    // This document-level sentinel does no probing or subtree inspection. It
+    // only notices when React detaches the scoped Settings root.
+    state.replacementObserver = new MutationObserver((records) => {
+      if (sidebarRoot.isConnected) return;
+      if (!mutationRecordsContainRemovedRoot(records, sidebarRoot)) return;
+      state.sidebarRoot = null;
+      state.fingerprint = null;
+      state.probeScheduler?.request({ immediate: true, resetBackoff: true, wake: true });
+    });
+    state.replacementObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+}
+
+function mutationRecordsContainSettingsMarkers(records: MutationRecord[]): boolean {
+  for (const record of records) {
+    for (const node of Array.from(record.addedNodes)) {
+      if (node instanceof Element && node.matches("[data-settings-panel-slug]")) return true;
+      if ((node instanceof Element || node instanceof DocumentFragment)
+        && node.querySelector("[data-settings-panel-slug]")) return true;
+    }
+  }
+  return false;
+}
+
+function mutationRecordsContainRemovedRoot(records: MutationRecord[], root: Node): boolean {
+  return records.some((record) =>
+    Array.from(record.removedNodes).some((node) =>
+      node === root || (node instanceof Node && node.contains(root)),
+    ),
+  );
 }
 
 function publishSettingsInjectorDiagnostics(): void {
@@ -678,6 +721,9 @@ function publishSettingsInjectorDiagnostics(): void {
     consecutiveMisses: 0,
     currentBackoffMs: 0,
     lastOutcome: null,
+    dormant: false,
+    wakeCount: 0,
+    filteredMutationCount: 0,
   };
   try {
     (
@@ -825,6 +871,7 @@ export function openRegisteredPage(
       }
     }, 5_000);
     pendingRegisteredPageOpen = { tweakId, pageId, resolve, timer };
+    state.probeScheduler?.request({ immediate: true, resetBackoff: true, wake: true });
     void ipcRenderer.invoke("tweaker:open-settings").then((opened: unknown) => {
       if (opened === true) return;
       if (pendingRegisteredPageOpen?.pageId === pageId) {

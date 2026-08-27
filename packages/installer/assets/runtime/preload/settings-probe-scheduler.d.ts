@@ -9,6 +9,9 @@ export interface SettingsProbeMetrics {
     consecutiveMisses: number;
     currentBackoffMs: number;
     lastOutcome: SettingsProbeOutcome | null;
+    dormant: boolean;
+    wakeCount: number;
+    filteredMutationCount: number;
 }
 interface SettingsProbeSchedulerOptions {
     probe: () => SettingsProbeOutcome;
@@ -22,9 +25,9 @@ interface SettingsProbeSchedulerOptions {
 /**
  * Coalesces renderer mutation storms into bounded Settings probes.
  *
- * Missing Settings is probed at most four times per second, then once per
- * second after ten misses. A navigation request bypasses the current timer and
- * resets the miss backoff.
+ * Missing Settings is probed at most four times per second for a bounded
+ * ten-probe burst. It then becomes dormant until a meaningful renderer event
+ * explicitly wakes it.
  */
 export declare class SettingsProbeScheduler {
     private readonly probe;
@@ -44,7 +47,9 @@ export declare class SettingsProbeScheduler {
     request(options?: {
         immediate?: boolean;
         resetBackoff?: boolean;
+        wake?: boolean;
     }): void;
+    recordFilteredMutation(count?: number): void;
     stop(): void;
     metrics(): SettingsProbeMetrics;
     private runProbe;

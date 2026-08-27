@@ -136,12 +136,14 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.5.8",
+        "version": "0.6.0",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Project-colored sidebar rows, project settings, connection references, and read-only repository inventory.",
+        "description": "Project-colored sidebar rows, folder-local task sorting and pinning, project settings, connection references, and read-only repository inventory.",
         "author": "hulibrands",
         "tags": [
           "projects",
+          "tasks",
+          "organization",
           "connections",
           "github"
         ],

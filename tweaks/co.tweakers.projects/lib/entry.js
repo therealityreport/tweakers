@@ -38,6 +38,7 @@ function startRenderer(api) {
   let latestNativeProjects = [];
   let latestSurfaceFingerprint = null;
   let aliasRefreshRequest = 0;
+  let revisionRefreshRequest = 0;
   let selectedSettingsProjectId = null;
   let resizeObserver = null;
   const apply = () => {
@@ -55,6 +56,9 @@ function startRenderer(api) {
   };
   const saveAppearance = async (projectId, choice) => {
     if (!latestState || !projectId) return;
+    const taskOrderingChange = Object.prototype.hasOwnProperty.call(choice || {}, "taskSort")
+      || Object.prototype.hasOwnProperty.call(choice || {}, "pinnedTaskIds");
+    const changeLabel = taskOrderingChange ? "project task order" : "project color";
     try {
       const nodes = latestState.nodes.map((node) => node.id === projectId ? { ...node, ...choice } : node);
       const response = await api.ipc.invoke(IPC, {
@@ -63,8 +67,15 @@ function startRenderer(api) {
         baseRevision: latestRevision,
       });
       if (!response?.ok) {
-        api.log?.warn?.("project appearance save failed", response?.error?.code || "unknown");
-        window.alert("Could not save the project color.");
+        const code = response?.error?.code || "unknown";
+        api.log?.warn?.(`${changeLabel} save failed`, code);
+        if (code === "stale-revision") {
+          const current = await api.ipc.invoke(IPC, { action: "get" });
+          if (acceptResponse(current)) apply();
+          window.alert(`Could not save the ${changeLabel} because this project changed. Try again.`);
+          return;
+        }
+        window.alert(`Could not save the ${changeLabel}.`);
         return;
       }
       latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
@@ -72,13 +83,17 @@ function startRenderer(api) {
       apply();
       window.dispatchEvent(new CustomEvent("tweaker:projects-color-change", { detail: { projectId } }));
     } catch (error) {
-      api.log?.warn?.("project appearance save failed", String(error));
-      window.alert("Could not save the project color.");
+      api.log?.warn?.(`${changeLabel} save failed`, String(error));
+      window.alert(`Could not save the ${changeLabel}.`);
     }
   };
   const removeRevision = api.ipc.on?.("revision", (payload) => {
     if (typeof payload?.revision === "string" && /^[a-f0-9]{32}$/.test(payload.revision)) {
       window.dispatchEvent(new CustomEvent("tweaker:projects-revision", { detail: { revision: payload.revision } }));
+      const request = ++revisionRefreshRequest;
+      api.ipc.invoke(IPC, { action: "get" }).then((response) => {
+        if (request === revisionRefreshRequest && acceptResponse(response)) apply();
+      }).catch(() => {});
     }
   });
   const handle = api.settings.registerPage({
@@ -109,6 +124,7 @@ function startRenderer(api) {
     }).catch(() => {});
   });
   const removeColorControls = sidebar.installProjectColorControls(api, () => latestState, saveAppearance);
+  const removeTaskControls = sidebar.installProjectTaskControls(api, () => latestState, saveAppearance);
   const removeEditProjectControls = settingsPresenter.installEditProjectDialogControls(
     api,
     () => latestState,
@@ -123,10 +139,12 @@ function startRenderer(api) {
   return {
     unregister() {
       aliasRefreshRequest += 1;
+      revisionRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
       resizeObserver?.dispose();
       removeColorControls?.();
+      removeTaskControls?.();
       removeEditProjectControls?.();
       sidebar.removeProjectColorArtifacts();
       handle.unregister?.();
