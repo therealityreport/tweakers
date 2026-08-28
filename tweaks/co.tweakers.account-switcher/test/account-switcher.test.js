@@ -391,7 +391,8 @@ test("marker reconciliation refuses zero, duplicate, missing-id, insecure, and r
     const markerBefore = fs.readFileSync(setup.paths.currentMarker);
     const targetBefore = fs.readFileSync(target);
     if (kind === "missing-id" || kind === "insecure") {
-      assert.throws(() => _test.syncActiveSnapshot(setup.deps, setup.paths), kind);
+      const expectedError = kind === "missing-id" ? /router-operation-failed/ : /invalid-auth-source/;
+      assert.throws(() => _test.syncActiveSnapshot(setup.deps, setup.paths), expectedError, kind);
     } else {
       _test.syncActiveSnapshot(setup.deps, setup.paths);
     }

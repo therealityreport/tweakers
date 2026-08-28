@@ -5,9 +5,8 @@
  * action scaffolding lives in separate modules and is not reachable from the
  * shipped bundle or signed launcher.
  */
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { realpathSync, writeSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   MANAGER_PROTOCOL_VERSION,
@@ -15,9 +14,10 @@ import {
   type ManagerExecutableIdentityV1,
 } from "./manager-contract.js";
 import { createTweakersManagerReadOnlyStatusSnapshot } from "./manager-status.js";
+import { resolveManagerExecutableIdentity } from "./manager-launcher-identity.js";
 
-const MANAGER_LAUNCHER_NAME = "Tweakers Manager Launcher";
 const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export interface TweakersManagerStatusResponseV1 {
   protocolVersion: typeof MANAGER_PROTOCOL_VERSION;
@@ -84,28 +84,7 @@ export function runTweakersManagerStatusCli(
   }
 }
 
-/** Resolve only the fixed launcher beside the sealed bundle; never create it. */
-export function resolveManagerExecutableIdentity(entrypoint = process.argv[1]): ManagerExecutableIdentityV1 {
-  try {
-    if (!entrypoint) throw new Error("manager bundle entrypoint is unavailable");
-    if (!isAbsolute(entrypoint) || resolve(entrypoint) !== entrypoint) {
-      throw new Error("manager bundle entrypoint must be an exact absolute path");
-    }
-    const bundle = realpathSync(entrypoint);
-    const launcher = join(dirname(bundle), MANAGER_LAUNCHER_NAME);
-    const stat = lstatSync(launcher);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || realpathSync(launcher) !== launcher) {
-      throw new Error("fixed sibling launcher is not a canonical regular single-link file");
-    }
-    return {
-      state: "resolved",
-      path: launcher,
-      sha256: createHash("sha256").update(readFileSync(launcher)).digest("hex"),
-    };
-  } catch (error) {
-    return { state: "unresolved", reason: errorMessage(error) };
-  }
-}
+export { resolveManagerExecutableIdentity } from "./manager-launcher-identity.js";
 
 function maybeRequestId(argv: readonly string[]): string | null {
   const index = argv.indexOf("--request-id");
@@ -116,7 +95,7 @@ function maybeRequestId(argv: readonly string[]): string | null {
 function safeNow(now: () => string): string {
   try {
     const value = now();
-    return Number.isFinite(Date.parse(value)) ? value : new Date().toISOString();
+    return RFC3339.test(value) && Number.isFinite(Date.parse(value)) ? value : new Date().toISOString();
   } catch {
     return new Date().toISOString();
   }

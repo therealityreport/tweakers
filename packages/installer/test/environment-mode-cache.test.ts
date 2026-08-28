@@ -792,12 +792,13 @@ test("T6 fails closed when an unreachable generation has a nonempty commit-helpe
       receiptRoot: join(first.root, "transactions", "environment"),
       transactionFile: join(first.root, "transactions", "environment.json"),
       cachePaths: first.paths,
-      mode: "dry-run",
+      mode: "apply",
     });
     const old = result.generationEntries.find((entry) => entry.generationId === "generation-a");
     assert.equal(old?.action, "keep");
     assert.match(old?.reason ?? "", /claim directory is not an empty real directory/);
     assert.equal(existsSync(first.receipt.paths.inactiveAppPath), true);
+    assert.equal(result.reclaimedBytes, 0);
   } finally {
     cleanup(first.root);
   }
@@ -814,12 +815,13 @@ test("T6 fails closed when generation Finder metadata is not a regular file", ()
       receiptRoot: join(first.root, "transactions", "environment"),
       transactionFile: join(first.root, "transactions", "environment.json"),
       cachePaths: first.paths,
-      mode: "dry-run",
+      mode: "apply",
     });
     const old = result.generationEntries.find((entry) => entry.generationId === "generation-a");
     assert.equal(old?.action, "keep");
     assert.match(old?.reason ?? "", /Finder metadata is not a real regular file/);
     assert.equal(existsSync(first.receipt.paths.inactiveAppPath), true);
+    assert.equal(result.reclaimedBytes, 0);
   } finally {
     cleanup(first.root);
   }

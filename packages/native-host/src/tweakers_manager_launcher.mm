@@ -307,7 +307,7 @@ bool ParseSeal(const std::string &contents, Seal *seal) {
   for (size_t index = 0; index < keys.size(); ++index) {
     if (lines[index + 1].rfind(keys[index], 0) != 0) return Fail("target seal record order is invalid");
     values[index] = lines[index + 1].substr(keys[index].size());
-    if (values[index].empty() || values[index].find_first_of("\r\n\0") != std::string::npos) return Fail("target seal record is empty or contains control data");
+    if (values[index].empty() || values[index].find_first_of("\r\n\0", 0, 3) != std::string::npos) return Fail("target seal record is empty or contains control data");
   }
   if (values[0] != kManagerId || values[1] != "1" || !IsHexLower64(values[2]) || !IsHexLower64(values[3]) || !IsHexLower64(values[5]) || !IsHexLower64(values[6])) {
     return Fail("target seal has an invalid fixed value");

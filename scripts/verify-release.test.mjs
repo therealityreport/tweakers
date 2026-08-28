@@ -47,11 +47,12 @@ test("tagged archive verification binds every committed manager artifact byte", 
   const prefix = `tweakers-${tag}`;
   const archiveRoot = join(root, prefix);
   const tarball = `tweakers-${tag}.tar.gz`;
+  const managerBundle = "packages/installer/assets/manager-launcher/manager.mjs";
   const managerFiles = [
     "packages/native-host/manager-signing-policy.json",
     "packages/native-host/assets/Tweakers Manager Launcher",
     "packages/installer/assets/manager-launcher/Tweakers Manager Launcher",
-    "packages/installer/assets/manager-launcher/manager.mjs",
+    managerBundle,
     "packages/installer/assets/manager-launcher/signing-policy.json",
   ];
   try {
@@ -69,8 +70,18 @@ test("tagged archive verification binds every committed manager artifact byte", 
     writeFileSync(join(root, "SHA256SUMS"), `${digest}  ${tarball}\n`);
     assert.equal(verifyReleaseArchiveAssets(root, tag).sha256, digest);
 
-    writeFileSync(join(root, managerFiles[3]), "changed after archive\n");
+    writeFileSync(join(root, managerBundle), "changed after archive\n");
     assert.throws(() => verifyReleaseArchiveAssets(root, tag), /stale manager artifact bytes/);
+
+    writeFileSync(join(root, "SHA256SUMS"), `${"0".repeat(64)}  ${tarball}\n`);
+    assert.throws(() => verifyReleaseArchiveAssets(root, tag), /digest does not match/);
+
+    rmSync(join(archiveRoot, "package.json"));
+    const untagged = spawnSync("tar", ["-czf", join(root, tarball), "-C", root, prefix], { encoding: "utf8" });
+    assert.equal(untagged.status, 0, untagged.stderr);
+    const untaggedDigest = createHash("sha256").update(readFileSync(join(root, tarball))).digest("hex");
+    writeFileSync(join(root, "SHA256SUMS"), `${untaggedDigest}  ${tarball}\n`);
+    assert.throws(() => verifyReleaseArchiveAssets(root, tag), /not a tagged Tweakers archive/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

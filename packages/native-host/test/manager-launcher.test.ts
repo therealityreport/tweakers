@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -74,39 +75,52 @@ function mkdir0700(path: string): void {
   chmodSync(path, 0o700);
 }
 
-function stageGeneration(managerSource: string, options: { adHocSignLauncher?: boolean } = {}) {
+function stageGeneration(
+  managerSource: string,
+  options: {
+    adHocSignLauncher?: boolean;
+    launcherSource?: string;
+    onSandboxCreated?: (sandbox: string) => void;
+  } = {},
+) {
   const sandbox = mkdtempSync(join(process.cwd(), ".tweakers-manager-launcher-test-"));
-  chmodSync(sandbox, 0o700);
-  const userRoot = join(sandbox, "user-root");
-  const managers = join(userRoot, "managers");
-  const managerRoot = join(managers, managerId);
-  const generations = join(managerRoot, "generations");
-  const pending = join(generations, "pending");
-  for (const directory of [userRoot, managers, managerRoot, generations, pending]) mkdir0700(directory);
+  try {
+    options.onSandboxCreated?.(sandbox);
+    chmodSync(sandbox, 0o700);
+    const userRoot = join(sandbox, "user-root");
+    const managers = join(userRoot, "managers");
+    const managerRoot = join(managers, managerId);
+    const generations = join(managerRoot, "generations");
+    const pending = join(generations, "pending");
+    for (const directory of [userRoot, managers, managerRoot, generations, pending]) mkdir0700(directory);
 
-  const launcher = join(pending, launcherName);
-  const manager = join(pending, "manager.mjs");
-  copyFileSync(launcherSource, launcher);
-  chmodSync(launcher, 0o500);
-  writeFileSync(manager, managerSource, { mode: 0o400 });
-  chmodSync(manager, 0o400);
-  if (options.adHocSignLauncher) {
-    const signed = spawnSync("codesign", ["--force", "--sign", "-", launcher], { encoding: "utf8" });
-    if (signed.status !== 0) throw new Error(`could not ad-hoc sign test launcher: ${signed.stderr}`);
+    const launcher = join(pending, launcherName);
+    const manager = join(pending, "manager.mjs");
+    copyFileSync(options.launcherSource ?? launcherSource, launcher);
     chmodSync(launcher, 0o500);
-  }
+    writeFileSync(manager, managerSource, { mode: 0o400 });
+    chmodSync(manager, 0o400);
+    if (options.adHocSignLauncher) {
+      const signed = spawnSync("codesign", ["--force", "--sign", "-", launcher], { encoding: "utf8" });
+      if (signed.status !== 0) throw new Error(`could not ad-hoc sign test launcher: ${signed.stderr}`);
+      chmodSync(launcher, 0o500);
+    }
 
-  const nodePath = realpathSync(process.execPath);
-  const launcherSha256 = sha256(launcher);
-  const managerSha256 = sha256(manager);
-  const nodeSha256 = sha256(nodePath);
-  const id = generationId({ launcherSha256, nodePath, nodeSha256, managerSha256 });
-  const generation = join(generations, id);
-  renameSync(pending, generation);
-  const targetSeal = join(generation, "target.seal");
-  writeFileSync(targetSeal, seal({ generationId: id, launcherSha256, nodePath, nodeSha256, managerSha256 }), { mode: 0o400 });
-  chmodSync(targetSeal, 0o400);
-  return { sandbox, managers, managerRoot, generations, generation, launcher: join(generation, launcherName), manager: join(generation, "manager.mjs"), targetSeal, nodePath, id };
+    const nodePath = realpathSync(process.execPath);
+    const launcherSha256 = sha256(launcher);
+    const managerSha256 = sha256(manager);
+    const nodeSha256 = sha256(nodePath);
+    const id = generationId({ launcherSha256, nodePath, nodeSha256, managerSha256 });
+    const generation = join(generations, id);
+    renameSync(pending, generation);
+    const targetSeal = join(generation, "target.seal");
+    writeFileSync(targetSeal, seal({ generationId: id, launcherSha256, nodePath, nodeSha256, managerSha256 }), { mode: 0o400 });
+    chmodSync(targetSeal, 0o400);
+    return { sandbox, managers, managerRoot, generations, generation, launcher: join(generation, launcherName), manager: join(generation, "manager.mjs"), targetSeal, nodePath, id };
+  } catch (error) {
+    rmSync(sandbox, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function invoke(
@@ -136,6 +150,38 @@ console.log(JSON.stringify({
   pgid: execFileSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim(),
 }));
 `;
+
+test("manager launcher staging removes its sandbox when setup fails", () => {
+  let sandbox = "";
+  const missingLauncher = join(tmpdir(), `tweakers-missing-manager-launcher-${process.pid}-${Date.now()}`);
+  assert.throws(
+    () => stageGeneration(reportingManager, {
+      launcherSource: missingLauncher,
+      onSandboxCreated: (path) => { sandbox = path; },
+    }),
+    /ENOENT/,
+  );
+  assert.notEqual(sandbox, "");
+  assert.equal(existsSync(sandbox), false);
+});
+
+test("native host build rejects a malformed manager signing policy before compilation", () => {
+  const sandbox = mkdtempSync(join(tmpdir(), "tweakers-native-host-policy-test-"));
+  try {
+    const scripts = join(sandbox, "scripts");
+    mkdirSync(scripts, { recursive: true });
+    writeFileSync(join(scripts, "build.mjs"), readFileSync(buildScript, "utf8"));
+    const policy = JSON.parse(readFileSync(join(process.cwd(), "packages/native-host/manager-signing-policy.json"), "utf8")) as Record<string, unknown>;
+    policy.certificateLeafSha1 = "not-a-sha1";
+    writeFileSync(join(sandbox, "manager-signing-policy.json"), JSON.stringify(policy));
+
+    const result = spawnSync(process.execPath, [join(scripts, "build.mjs")], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /manager-signing-policy\.json is malformed or internally inconsistent/);
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
 
 test("manager launcher enforces the fixed seal layout and runs only sealed fixed-protocol status", { skip: process.platform !== "darwin" }, () => {
   assert.equal(existsSync(launcherSource), true, "manager launcher must be built before tests");
@@ -254,12 +300,14 @@ test("ordinary build is credential-free while release promotion requires the exa
   assert.match(source, /enum class InvocationKind/);
   assert.match(source, /childArguments\.push_back\(argv\[index\]\)/);
   assert.match(source, /only the fixed v1 status manager argv shape is supported/);
+  assert.ok(source.includes('find_first_of("\\r\\n\\0", 0, 3)'));
   assert.doesNotMatch(source, /posix_spawnp|system\s*\(|spawnp/);
 
   const strings = spawnSync("strings", [launcherSource], { encoding: "utf8" });
   assert.equal(strings.status, 0, strings.stderr);
   assert.doesNotMatch(strings.stdout, /environment\.cancel|desktop-update\.resume|prepare input/);
 
+  assert.equal(existsSync(adHocLauncherSource), true, "ordinary native-host build must produce an ad-hoc manager launcher before tests");
   const adHoc = spawnSync("codesign", ["-d", "--verbose=4", adHocLauncherSource], { encoding: "utf8" });
   assert.equal(adHoc.status, 0, `${adHoc.stdout}\n${adHoc.stderr}`);
   assert.doesNotMatch(`${adHoc.stdout}\n${adHoc.stderr}`, /^Authority=/m);

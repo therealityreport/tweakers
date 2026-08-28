@@ -1,7 +1,6 @@
 // src/manager-status-cli.ts
-import { createHash as createHash3 } from "node:crypto";
-import { lstatSync, readFileSync as readFileSync2, realpathSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join as join3, resolve } from "node:path";
+import { realpathSync as realpathSync2, writeSync } from "node:fs";
+import { isAbsolute as isAbsolute2 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/manager-contract.ts
@@ -21,7 +20,7 @@ function canonicalManagerJson(value) {
       return JSON.stringify(value);
     case "object":
       if (Array.isArray(value)) return `[${value.map(canonicalManagerJson).join(",")}]`;
-      return `{${Object.keys(value).sort((left, right) => left.localeCompare(right)).map((key) => `${JSON.stringify(key)}:${canonicalManagerJson(value[key])}`).join(",")}}`;
+      return `{${Object.keys(value).sort((left, right) => left < right ? -1 : left > right ? 1 : 0).map((key) => `${JSON.stringify(key)}:${canonicalManagerJson(value[key])}`).join(",")}}`;
     default:
       throw new Error("Manager state-token inputs must be JSON values");
   }
@@ -199,6 +198,17 @@ function createTweakersManagerReadOnlyStatusSnapshot(input, dependencies = {}) {
   const readDirectory = dependencies.readDirectory ?? defaultReadDirectory;
   const now = dependencies.now ?? (() => (/* @__PURE__ */ new Date()).toISOString());
   const generatedAt = assertRfc3339(now(), "manager status clock");
+  const observations = observeManagerStatus(paths, readText, readDirectory, generatedAt);
+  const operations = {
+    state: "missing",
+    revision: "status-only",
+    activeOperationId: null,
+    preparedCount: 0,
+    problem: null
+  };
+  return createManagerStatusSnapshotProjection(input.executable, observations, operations, [], []);
+}
+function observeManagerStatus(paths, readText, readDirectory, generatedAt) {
   const config = readDocument(paths.configFile, readText);
   const installerState = readDocument(paths.stateFile, readText);
   const updateMode = readDocument(paths.updateModeFile, readText);
@@ -220,39 +230,44 @@ function createTweakersManagerReadOnlyStatusSnapshot(input, dependencies = {}) {
     observeModeCacheReceipt(modeCacheReceipt),
     ...observeCodexDerivedReceipts(paths.codexDerivedReceiptRoot, readText, readDirectory)
   ];
-  const coordinator = observeCoordinator(receipts, lifecycleLock);
-  const operations = {
-    state: "missing",
-    revision: "status-only",
-    activeOperationId: null,
-    preparedCount: 0,
-    problem: null
+  return {
+    generatedAt,
+    configurationRevision: config.revision,
+    installation,
+    mode,
+    environment,
+    updater,
+    runtime,
+    receipts,
+    coordinator: observeCoordinator(receipts, lifecycleLock)
   };
+}
+function createManagerStatusSnapshotProjection(executable, observations, operations, allowedActions, actions) {
   const stateTokenInputs = {
     schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
     manager: {
       id: TWEAKERS_MANAGER_ID,
       protocolVersion: MANAGER_PROTOCOL_VERSION,
-      executable: input.executable
+      executable
     },
-    configurationRevision: config.revision,
+    configurationRevision: observations.configurationRevision,
     installation: {
-      state: installation.state,
-      version: installation.version,
-      appRoot: installation.appRoot,
-      runtimeUpdatedAt: installation.runtimeUpdatedAt,
-      revision: installation.revision
+      state: observations.installation.state,
+      version: observations.installation.version,
+      appRoot: observations.installation.appRoot,
+      runtimeUpdatedAt: observations.installation.runtimeUpdatedAt,
+      revision: observations.installation.revision
     },
-    mode,
-    environment,
-    updater,
-    runtime,
+    mode: observations.mode,
+    environment: observations.environment,
+    updater: observations.updater,
+    runtime: observations.runtime,
     coordinator: {
-      state: coordinator.state,
-      activeOperationId: coordinator.activeOperationId
+      state: observations.coordinator.state,
+      activeOperationId: observations.coordinator.activeOperationId
     },
     operations,
-    receiptChronology: receipts.map((receipt) => ({
+    receiptChronology: observations.receipts.map((receipt) => ({
       source: receipt.entry.source,
       receiptId: receipt.entry.receiptId,
       phase: receipt.entry.phase,
@@ -263,25 +278,28 @@ function createTweakersManagerReadOnlyStatusSnapshot(input, dependencies = {}) {
       revision: receipt.entry.revision,
       active: receipt.entry.active
     })),
-    allowedActions: []
+    // The token binds the executable capability set itself. A status response
+    // that cannot execute a family must not advertise that family in a token
+    // which could later be replayed against a different manager generation.
+    allowedActions
   };
   return deepFreeze({
     protocolVersion: MANAGER_PROTOCOL_VERSION,
     managerId: TWEAKERS_MANAGER_ID,
-    generatedAt,
+    generatedAt: observations.generatedAt,
     stateToken: createManagerStateToken(stateTokenInputs),
     status: {
       schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
-      installation,
-      mode,
-      environment,
-      updater,
-      runtime,
-      coordinator,
+      installation: observations.installation,
+      mode: observations.mode,
+      environment: observations.environment,
+      updater: observations.updater,
+      runtime: observations.runtime,
+      coordinator: observations.coordinator,
       operations,
-      receipts: receipts.map((receipt) => receipt.entry)
+      receipts: observations.receipts.map((receipt) => receipt.entry)
     },
-    actions: [],
+    actions,
     stateTokenInputs
   });
 }
@@ -671,9 +689,42 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
-// src/manager-status-cli.ts
+// src/manager-launcher-identity.ts
+import { createHash as createHash3 } from "node:crypto";
+import { lstatSync, readFileSync as readFileSync2, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join as join3, resolve } from "node:path";
 var MANAGER_LAUNCHER_NAME = "Tweakers Manager Launcher";
+function resolveManagerExecutableIdentity(entrypoint = process.argv[1]) {
+  try {
+    if (!entrypoint) throw new Error("manager bundle entrypoint is unavailable");
+    const bundle = realpathSync(requireExactAbsolutePath(entrypoint, "manager bundle entrypoint"));
+    const launcher = join3(dirname(bundle), MANAGER_LAUNCHER_NAME);
+    const stat = lstatSync(launcher);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("fixed sibling launcher is not a regular single-link file");
+    }
+    const canonicalLauncher = realpathSync(launcher);
+    if (canonicalLauncher !== launcher) throw new Error("fixed sibling launcher resolves through a link");
+    return {
+      state: "resolved",
+      path: canonicalLauncher,
+      sha256: createHash3("sha256").update(readFileSync2(canonicalLauncher)).digest("hex")
+    };
+  } catch (error) {
+    return { state: "unresolved", reason: errorMessage2(error) };
+  }
+}
+function requireExactAbsolutePath(path, label) {
+  if (!isAbsolute(path) || resolve(path) !== path) throw new Error(`${label} must be an exact absolute path`);
+  return path;
+}
+function errorMessage2(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// src/manager-status-cli.ts
 var LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 function parseTweakersManagerStatusArguments(argv) {
   if (argv.length !== 4 || argv[0] !== "status" || argv[1] !== "--request-id" || argv[3] !== "--json") {
     throw new Error("Expected: status --request-id <lowercase-uuid> --json");
@@ -711,33 +762,12 @@ function runTweakersManagerStatusCli(argv, dependencies = {}) {
       generatedAt: safeNow(now),
       error: {
         code: argv[0] && argv[0] !== "status" ? "unsupported_action" : "invalid_request",
-        message: errorMessage2(error),
+        message: errorMessage3(error),
         retryable: false
       }
     })}
 `);
     return 64;
-  }
-}
-function resolveManagerExecutableIdentity(entrypoint = process.argv[1]) {
-  try {
-    if (!entrypoint) throw new Error("manager bundle entrypoint is unavailable");
-    if (!isAbsolute(entrypoint) || resolve(entrypoint) !== entrypoint) {
-      throw new Error("manager bundle entrypoint must be an exact absolute path");
-    }
-    const bundle = realpathSync(entrypoint);
-    const launcher = join3(dirname(bundle), MANAGER_LAUNCHER_NAME);
-    const stat = lstatSync(launcher);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || realpathSync(launcher) !== launcher) {
-      throw new Error("fixed sibling launcher is not a canonical regular single-link file");
-    }
-    return {
-      state: "resolved",
-      path: launcher,
-      sha256: createHash3("sha256").update(readFileSync2(launcher)).digest("hex")
-    };
-  } catch (error) {
-    return { state: "unresolved", reason: errorMessage2(error) };
   }
 }
 function maybeRequestId(argv) {
@@ -748,19 +778,19 @@ function maybeRequestId(argv) {
 function safeNow(now) {
   try {
     const value = now();
-    return Number.isFinite(Date.parse(value)) ? value : (/* @__PURE__ */ new Date()).toISOString();
+    return RFC3339.test(value) && Number.isFinite(Date.parse(value)) ? value : (/* @__PURE__ */ new Date()).toISOString();
   } catch {
     return (/* @__PURE__ */ new Date()).toISOString();
   }
 }
-function errorMessage2(error) {
+function errorMessage3(error) {
   return error instanceof Error ? error.message : String(error);
 }
 function isDirectExecution() {
   const entrypoint = process.argv[1];
-  if (!entrypoint || !isAbsolute(entrypoint)) return false;
+  if (!entrypoint || !isAbsolute2(entrypoint)) return false;
   try {
-    return realpathSync(entrypoint) === fileURLToPath(import.meta.url);
+    return realpathSync2(entrypoint) === fileURLToPath(import.meta.url);
   } catch {
     return false;
   }

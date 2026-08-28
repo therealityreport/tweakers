@@ -1908,8 +1908,10 @@ module.exports = {
 
 const { isRecord, titleCase } = require("./common");
 const {
+  MAX_PINNED_TASK_IDS,
   PROJECT_COLOR_OPTIONS,
   PROJECT_OVERLAY_OPTIONS,
+  TASK_SORT_OPTIONS: STATE_TASK_SORT_OPTIONS,
   autoColor,
   projectForNativeIdentity,
   projectNativeNames,
@@ -1925,12 +1927,15 @@ const PROJECT_MENU_DISPOSE = Symbol("projectMenuDispose");
 const PROJECT_NATIVE_MENU_ATTR = "data-tweaker-project-native-menu";
 const NATIVE_TASK_PLACEMENTS = new Map();
 const MAX_PROJECT_ROW_END_INSET = 64;
+const TASK_SORT_LABELS = {
+  "created-desc": "Created newest",
+  "created-asc": "Created oldest",
+  "updated-desc": "Updated newest",
+  "updated-asc": "Updated oldest",
+};
 const TASK_SORT_OPTIONS = [
   { id: "default", label: "Default", value: undefined },
-  { id: "created-desc", label: "Created newest", value: "created-desc" },
-  { id: "created-asc", label: "Created oldest", value: "created-asc" },
-  { id: "updated-desc", label: "Updated newest", value: "updated-desc" },
-  { id: "updated-asc", label: "Updated oldest", value: "updated-asc" },
+  ...STATE_TASK_SORT_OPTIONS.map((value) => ({ id: value, label: TASK_SORT_LABELS[value] || value, value })),
 ];
 
 function normalizeTaskSort(value) {
@@ -2755,15 +2760,17 @@ function isNativeTaskPinMenuItem(item) {
   return /^(?:un)?pin$/i.test(label);
 }
 
-function findNativeTaskMenu(doc, context = {}) {
+function findNativeTaskMenu(doc) {
   const menus = [...(doc?.querySelectorAll?.('[role="menu"]') || [])]
-    .filter((menu) => menu.getAttribute?.("data-state") === "open" && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_TASK_MENU_ATTR))
+    .filter((menu) => menu.getAttribute?.("data-state") === "open"
+      && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_TASK_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR))
     .filter((menu) => [...(menu.querySelectorAll?.('[role="menuitem"]') || [])].some(isNativeTaskPinMenuItem))
     .map((menu) => ({ menu, rect: menu.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0);
-  const x = Number.isFinite(context.x) ? context.x : 0;
-  const y = Number.isFinite(context.y) ? context.y : 0;
-  return menus.sort((a, b) => (Math.abs(a.rect.left - x) + Math.abs(a.rect.top - y)) - (Math.abs(b.rect.left - x) + Math.abs(b.rect.top - y)))[0]?.menu || null;
+  return menus.length === 1 ? menus[0].menu : null;
 }
 
 function addMenuButton(doc, label, template, onClick) {
@@ -2848,22 +2855,6 @@ function openProjectTaskSortSubmenu(doc, anchor, context, onSelect) {
   return submenu;
 }
 
-function injectProjectTaskSortMenu(doc, nativeMenu, context, onSelect) {
-  if (!doc?.createElement || !nativeMenu || nativeMenu.querySelector?.(`[${PROJECT_TASK_MENU_ATTR}="sort"]`)) return null;
-  const items = [...(nativeMenu.querySelectorAll?.('[role="menuitem"]') || [])];
-  const removeItem = items.find(isRemoveProjectMenuItem) || null;
-  const template = items[0];
-  const trigger = addMenuButton(doc, "Sort", template, () => openProjectTaskSortSubmenu(doc, trigger, context, onSelect));
-  trigger.setAttribute(PROJECT_TASK_MENU_ATTR, "sort");
-  trigger.addEventListener("pointerenter", () => openProjectTaskSortSubmenu(doc, trigger, context, onSelect));
-  trigger.addEventListener("focus", () => openProjectTaskSortSubmenu(doc, trigger, context, onSelect));
-  trigger.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowRight") openProjectTaskSortSubmenu(doc, trigger, context, onSelect);
-  });
-  nativeMenu.insertBefore(trigger, removeItem);
-  return trigger;
-}
-
 function installProjectTaskControls(api, getState, saveProject) {
   if (typeof document === "undefined") return () => {};
   let pending = null;
@@ -2879,11 +2870,15 @@ function installProjectTaskControls(api, getState, saveProject) {
   const savePins = async (context, pinned) => {
     const ids = Array.isArray(context.project.pinnedTaskIds) ? context.project.pinnedTaskIds.map(String) : [];
     const next = pinned ? [...ids.filter((id) => id !== context.taskId), context.taskId] : ids.filter((id) => id !== context.taskId);
+    if (next.length > MAX_PINNED_TASK_IDS) {
+      window.alert(`This project already has ${MAX_PINNED_TASK_IDS} pinned tasks. Unpin one task first.`);
+      return;
+    }
     await saveProject?.(context.project.id, { pinnedTaskIds: next });
   };
   const inject = (context, id) => {
     if (!pending || pending !== context || requestId !== id) return;
-    const nativeMenu = findNativeTaskMenu(document, context);
+    const nativeMenu = findNativeTaskMenu(document);
     if (!nativeMenu) return;
     injectProjectTaskPinMenu(document, nativeMenu, context, async (pinned) => {
       await savePins(context, pinned);
@@ -3553,7 +3548,6 @@ module.exports = {
   resolveProjectTaskContext,
   findNativeTaskMenu,
   injectProjectTaskPinMenu,
-  injectProjectTaskSortMenu,
   openProjectTaskSortSubmenu,
   installProjectTaskControls,
   collectProjectIdentities,

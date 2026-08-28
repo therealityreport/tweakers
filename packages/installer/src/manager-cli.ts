@@ -4,9 +4,8 @@
  * shell text, generic command, or caller-supplied executable can cross this
  * boundary.
  */
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { readFileSync, realpathSync, writeSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   MANAGER_PROTOCOL_VERSION,
@@ -25,9 +24,8 @@ import {
 } from "./manager-action-adapter.js";
 import { createTweakersManagerStatusSnapshot } from "./manager-status.js";
 import { ManagerStrictJsonError, parseManagerStrictJsonObject } from "./manager-strict-json.js";
+import { resolveManagerExecutableIdentity } from "./manager-launcher-identity.js";
 
-const MANAGER_LAUNCHER_NAME = "Tweakers Manager Launcher";
-const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/;
 const STATE_TOKEN = /^sha256:[a-f0-9]{64}$/;
 const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -120,17 +118,20 @@ export interface RunTweakersManagerCliDependencies {
   write?: (line: string) => void;
 }
 
-type ManagerCliErrorCode =
-  | "invalid_request"
-  | "unsupported_protocol"
-  | "unsupported_action"
-  | "stale_state"
-  | "operation_expired"
-  | "operation_consumed"
-  | "operation_conflict"
-  | "cancelled"
-  | "timeout"
-  | "internal_error";
+const MANAGER_CLI_ERROR_CODES = [
+  "invalid_request",
+  "unsupported_protocol",
+  "unsupported_action",
+  "stale_state",
+  "operation_expired",
+  "operation_consumed",
+  "operation_conflict",
+  "cancelled",
+  "timeout",
+  "internal_error",
+] as const;
+
+type ManagerCliErrorCode = typeof MANAGER_CLI_ERROR_CODES[number];
 
 interface ManagerCliError extends Error {
   code: ManagerCliErrorCode;
@@ -320,32 +321,7 @@ function parsePrepareParameters(input: Uint8Array, actionId: TweakersManagerActi
   return {};
 }
 
-/**
- * This does not repair or create anything. The launcher verifies stronger
- * ownership/mode/seal conditions before Node starts; the bundle reports an
- * unresolved identity instead of accepting an arbitrary launcher path when
- * directly invoked outside that boundary.
- */
-export function resolveManagerExecutableIdentity(entrypoint = process.argv[1]): ManagerExecutableIdentityV1 {
-  try {
-    if (!entrypoint) throw new Error("manager bundle entrypoint is unavailable");
-    const bundle = realpathSync(requireExactAbsolutePath(entrypoint, "manager bundle entrypoint"));
-    const launcher = join(dirname(bundle), MANAGER_LAUNCHER_NAME);
-    const stat = lstatSync(launcher);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
-      throw new Error("fixed sibling launcher is not a regular single-link file");
-    }
-    const canonicalLauncher = realpathSync(launcher);
-    if (canonicalLauncher !== launcher) throw new Error("fixed sibling launcher resolves through a link");
-    return {
-      state: "resolved",
-      path: canonicalLauncher,
-      sha256: createHash("sha256").update(readFileSync(canonicalLauncher)).digest("hex"),
-    };
-  } catch (error) {
-    return { state: "unresolved", reason: errorMessage(error) };
-  }
-}
+export { resolveManagerExecutableIdentity } from "./manager-launcher-identity.js";
 
 function parseUuid(value: string | undefined, label: string): string {
   if (!value || !LOWERCASE_UUID.test(value)) throw managerCliError("invalid_request", `${label} must be a lowercase RFC4122 UUID`);
@@ -376,7 +352,7 @@ function toManagerCliError(error: unknown): ManagerCliError {
 function isManagerCliError(error: unknown): error is ManagerCliError {
   return error instanceof Error
     && (error as Partial<ManagerCliError>).code !== undefined
-    && ["invalid_request", "unsupported_protocol", "unsupported_action", "stale_state", "operation_expired", "operation_consumed", "operation_conflict", "cancelled", "timeout", "internal_error"].includes((error as ManagerCliError).code);
+    && MANAGER_CLI_ERROR_CODES.includes((error as ManagerCliError).code);
 }
 
 function writeJson(write: (line: string) => void, value: unknown): void {
@@ -390,11 +366,6 @@ function safeNow(now: () => string): string {
   } catch {
     return new Date().toISOString();
   }
-}
-
-function requireExactAbsolutePath(path: string, label: string): string {
-  if (!isAbsolute(path) || resolve(path) !== path) throw new Error(`${label} must be an exact absolute path`);
-  return path;
 }
 
 function errorMessage(error: unknown): string {

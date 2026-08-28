@@ -157,6 +157,29 @@ test("rejected candidates use the same bounded miss backoff", () => {
   scheduler.stop();
 });
 
+test("suppressed probes stay active until the injector backoff expires", () => {
+  const clock = new FakeClock();
+  let probes = 0;
+  const scheduler = schedulerFor(clock, () => {
+    probes += 1;
+    return probes === 1 ? "suppressed" : "found";
+  });
+
+  scheduler.request({ immediate: true });
+  assert.equal(probes, 1);
+  assert.equal(scheduler.metrics().dormant, false);
+  assert.equal(scheduler.metrics().consecutiveMisses, 0);
+  assert.equal(scheduler.metrics().currentBackoffMs, 30_000);
+  assert.equal(clock.pendingTimerCount(), 1);
+  clock.advance(29_999);
+  assert.equal(probes, 1);
+  clock.advance(1);
+  assert.equal(probes, 2, "the scheduled wake resumes injection after suppression expires");
+  assert.equal(scheduler.metrics().lastOutcome, "found");
+  assert.equal(clock.pendingTimerCount(), 0);
+  scheduler.stop();
+});
+
 test("a thrown probe clears scheduler state and retries with bounded missing backoff", () => {
   const clock = new FakeClock();
   let probes = 0;

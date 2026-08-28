@@ -101,7 +101,7 @@ test("manager-safe cancellation accepts preparing but refuses post-cutover and i
 
     writeFileSync(file, `${JSON.stringify({ ...receipt, phase: "prepared", prepared: {
       ...receipt.prepared,
-      candidate: { ...receipt.prepared!, candidate: undefined },
+      candidate: { ...receipt.prepared!.candidate, desktopPath: undefined },
     } })}\n`);
     assert.throws(
       () => cancelPreparedEnvironmentTransaction({

@@ -11,7 +11,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { getuid } from "node:process";
+import process from "node:process";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   MANAGER_PROTOCOL_VERSION,
@@ -30,7 +30,6 @@ import {
   parseManagerStrictJsonObject,
 } from "./manager-strict-json.js";
 
-const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -271,7 +270,7 @@ function assertSafeRecord(path: string): void {
 }
 
 function assertCurrentUser(uid: number, label: string): void {
-  if (typeof getuid === "function" && uid !== getuid()) {
+  if (typeof process.getuid === "function" && uid !== process.getuid()) {
     throw new ManagerOperationStoreError(`${label} has an unexpected owner`);
   }
 }
@@ -287,7 +286,7 @@ function fsyncDirectory(root: string): void {
 }
 
 function assertOperationId(value: string): void {
-  if (!isManagerOperationId(value)) throw new ManagerOperationStoreError("operationId must be a lowercase RFC4122 UUID");
+  if (!isManagerOperationId(value)) throw new ManagerOperationStoreError("operationId must be a lowercase UUID");
 }
 
 function parseModuleIdentity(value: unknown): ManagerResolvedExecutableIdentityV1 {

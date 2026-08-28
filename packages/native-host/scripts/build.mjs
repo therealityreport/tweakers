@@ -12,7 +12,7 @@ const outDir = resolve(root, "dist");
 const out = resolve(outDir, "tweaker_native_host.node");
 const managerLauncherOutput = resolve(outDir, "Tweakers Manager Launcher");
 const managerLauncherAsset = resolve(root, "assets", "Tweakers Manager Launcher");
-const managerSigningPolicy = JSON.parse(readFileSync(resolve(root, "manager-signing-policy.json"), "utf8"));
+const managerSigningPolicy = readManagerSigningPolicy(resolve(root, "manager-signing-policy.json"));
 const releaseManagerLauncher = process.argv.includes("--release-manager-launcher");
 const helperSource = resolve(root, "src", "tweaker_swap_helper.mm");
 const helperOutput = resolve(outDir, "Tweakers Swap Helper.app");
@@ -176,14 +176,49 @@ function verifyManagerLauncherBinary(path, { requirePublisherSignature }) {
     throw new Error(`Tweakers Manager Launcher must contain only ${managerSigningPolicy.architecture}; found ${architectures}`);
   }
   const output = run("codesign", ["-d", "-r-", "--verbose=4", path], { includeStderr: true });
-  if (!output.includes(`Identifier=${managerSigningPolicy.identifier}`)) {
+  if (signingOutputValue(output, "Identifier=") !== managerSigningPolicy.identifier) {
     throw new Error("Tweakers Manager Launcher identifier did not verify");
   }
   if (requirePublisherSignature
-      && (!output.includes(`Authority=${managerSigningPolicy.certificateCommonName}`)
-        || !output.includes(`designated => ${managerSigningPolicy.designatedRequirement}`))) {
+      && (signingOutputValue(output, "Authority=") !== managerSigningPolicy.certificateCommonName
+        || signingOutputValue(output, "designated => ") !== managerSigningPolicy.designatedRequirement)) {
     throw new Error("Tweakers Manager Launcher exact publisher designated requirement did not verify");
   }
+}
+
+function readManagerSigningPolicy(path) {
+  let policy;
+  try {
+    policy = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error("manager-signing-policy.json is malformed or internally inconsistent");
+  }
+  if (!isRecord(policy)
+    || policy.schemaVersion !== 1
+    || policy.managerId !== "com.thomashulihan.tweakers"
+    || policy.protocolVersion !== 1
+    || policy.executableName !== "Tweakers Manager Launcher"
+    || policy.identifier !== "com.therealityreport.tweakers.manager-launcher"
+    || policy.architecture !== "arm64"
+    || policy.certificateCommonName !== "Tweakers Local Signing"
+    || typeof policy.certificateLeafSha1 !== "string"
+    || !/^[a-f0-9]{40}$/.test(policy.certificateLeafSha1)
+    || typeof policy.designatedRequirement !== "string"
+    || policy.designatedRequirement !== `identifier "${policy.identifier}" and certificate leaf = H"${policy.certificateLeafSha1}"`) {
+    throw new Error("manager-signing-policy.json is malformed or internally inconsistent");
+  }
+  return policy;
+}
+
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+
+function signingOutputValue(output, prefix) {
+  const line = output.split(/\r?\n/)
+    .map((candidate) => candidate.trim())
+    .find((candidate) => candidate.startsWith(prefix));
+  return line?.slice(prefix.length);
 }
 
 function run(command, args, opts = {}) {

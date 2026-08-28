@@ -101,6 +101,18 @@ interface ParsedReceipt {
   activeOperationId: string | null;
 }
 
+interface ManagerStatusObservations {
+  generatedAt: string;
+  configurationRevision: string;
+  installation: ManagerDashboardInstallationV1;
+  mode: ManagerDashboardModeV1;
+  environment: ManagerDashboardEnvironmentV1;
+  updater: ManagerDashboardUpdaterV1;
+  runtime: ManagerDashboardRuntimeV1;
+  receipts: readonly ParsedReceipt[];
+  coordinator: ManagerDashboardCoordinatorV1;
+}
+
 export function managerStatusPaths(root: string): ManagerStatusPaths {
   return {
     root,
@@ -135,101 +147,23 @@ export function createTweakersManagerStatusSnapshot(
   const readDirectory = dependencies.readDirectory ?? defaultReadDirectory;
   const now = dependencies.now ?? (() => new Date().toISOString());
   const generatedAt = assertRfc3339(now(), "manager status clock");
-
-  const config = readDocument(paths.configFile, readText);
-  const installerState = readDocument(paths.stateFile, readText);
-  const updateMode = readDocument(paths.updateModeFile, readText);
-  const environmentRegistry = readDocument(paths.environmentRegistryFile, readText);
-  const environmentSelection = readDocument(paths.environmentSelectionFile, readText);
-  const environmentReceipt = readDocument(paths.environmentTransactionFile, readText);
-  const desktopReceipt = readDocument(paths.desktopUpdateReceiptFile, readText);
-  const modeCacheReceipt = readDocument(paths.environmentModeCacheCurrentFile, readText);
-  const runtimeProvenance = readDocument(paths.managedRuntimeProvenanceFile, readText);
-  const lifecycleLock = readText(paths.lifecycleLockFile);
-
-  const installation = observeInstallation(installerState);
-  const mode = observeMode(installerState, updateMode, generatedAt);
-  const environment = observeEnvironment(environmentRegistry, environmentSelection, modeCacheReceipt);
-  const updater = observeUpdater(desktopReceipt);
-  const runtime = observeRuntime(runtimeProvenance);
-
-  const receipts = [
-    observeEnvironmentReceipt(environmentReceipt),
-    observeDesktopUpdateReceipt(desktopReceipt),
-    observeModeCacheReceipt(modeCacheReceipt),
-    ...observeCodexDerivedReceipts(paths.codexDerivedReceiptRoot, readText, readDirectory),
-  ];
+  const observations = observeManagerStatus(paths, readText, readDirectory, generatedAt);
   const operations = observeManagerOperations(
     paths.managerOperationRoot,
     readText,
     readDirectory,
-    receipts,
-    updater,
+    observations.receipts,
+    observations.updater,
     input.excludeOperationId,
   );
-  const coordinator = observeCoordinator(receipts, lifecycleLock);
   const enabledActionIds = compiledEnabledActionIds(input.enabledActionIds);
-  const actions = actionAvailability(receipts, updater, operations, enabledActionIds);
-  const stateTokenInputs: ManagerStateTokenInputsV1 = {
-    schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
-    manager: {
-      id: TWEAKERS_MANAGER_ID,
-      protocolVersion: MANAGER_PROTOCOL_VERSION,
-      executable: input.executable,
-    },
-    configurationRevision: config.revision,
-    installation: {
-      state: installation.state,
-      version: installation.version,
-      appRoot: installation.appRoot,
-      runtimeUpdatedAt: installation.runtimeUpdatedAt,
-      revision: installation.revision,
-    },
-    mode,
-    environment,
-    updater,
-    runtime,
-    coordinator: {
-      state: coordinator.state,
-      activeOperationId: coordinator.activeOperationId,
-    },
+  return createManagerStatusSnapshotProjection(
+    input.executable,
+    observations,
     operations,
-    receiptChronology: receipts.map((receipt) => ({
-      source: receipt.entry.source,
-      receiptId: receipt.entry.receiptId,
-      phase: receipt.entry.phase,
-      updatedAt: receipt.entry.updatedAt,
-      terminalAt: receipt.entry.terminalAt,
-      error: receipt.entry.error,
-      state: receipt.entry.state,
-      revision: receipt.entry.revision,
-      active: receipt.entry.active,
-    })),
-    // The token binds the executable capability set itself. A status response
-    // that cannot execute a family must not advertise that family in a token
-    // which could later be replayed against a different manager generation.
-    allowedActions: enabledActionIds,
-  };
-  const snapshot: TweakersManagerStatusSnapshotV1 = {
-    protocolVersion: MANAGER_PROTOCOL_VERSION,
-    managerId: TWEAKERS_MANAGER_ID,
-    generatedAt,
-    stateToken: createManagerStateToken(stateTokenInputs),
-    status: {
-      schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
-      installation,
-      mode,
-      environment,
-      updater,
-      runtime,
-      coordinator,
-      operations,
-      receipts: receipts.map((receipt) => receipt.entry),
-    },
-    actions,
-    stateTokenInputs,
-  };
-  return deepFreeze(snapshot);
+    enabledActionIds,
+    actionAvailability(observations.receipts, observations.updater, operations, enabledActionIds),
+  );
 }
 
 /**
@@ -246,7 +180,23 @@ export function createTweakersManagerReadOnlyStatusSnapshot(
   const readDirectory = dependencies.readDirectory ?? defaultReadDirectory;
   const now = dependencies.now ?? (() => new Date().toISOString());
   const generatedAt = assertRfc3339(now(), "manager status clock");
+  const observations = observeManagerStatus(paths, readText, readDirectory, generatedAt);
+  const operations: ManagerDashboardOperationsV1 = {
+    state: "missing",
+    revision: "status-only",
+    activeOperationId: null,
+    preparedCount: 0,
+    problem: null,
+  };
+  return createManagerStatusSnapshotProjection(input.executable, observations, operations, [], []);
+}
 
+function observeManagerStatus(
+  paths: ManagerStatusPaths,
+  readText: (path: string) => ManagerStatusTextRead,
+  readDirectory: (path: string) => ManagerStatusDirectoryRead,
+  generatedAt: string,
+): ManagerStatusObservations {
   const config = readDocument(paths.configFile, readText);
   const installerState = readDocument(paths.stateFile, readText);
   const updateMode = readDocument(paths.updateModeFile, readText);
@@ -257,7 +207,6 @@ export function createTweakersManagerReadOnlyStatusSnapshot(
   const modeCacheReceipt = readDocument(paths.environmentModeCacheCurrentFile, readText);
   const runtimeProvenance = readDocument(paths.managedRuntimeProvenanceFile, readText);
   const lifecycleLock = readText(paths.lifecycleLockFile);
-
   const installation = observeInstallation(installerState);
   const mode = observeMode(installerState, updateMode, generatedAt);
   const environment = observeEnvironment(environmentRegistry, environmentSelection, modeCacheReceipt);
@@ -269,39 +218,51 @@ export function createTweakersManagerReadOnlyStatusSnapshot(
     observeModeCacheReceipt(modeCacheReceipt),
     ...observeCodexDerivedReceipts(paths.codexDerivedReceiptRoot, readText, readDirectory),
   ];
-  const coordinator = observeCoordinator(receipts, lifecycleLock);
-  const operations: ManagerDashboardOperationsV1 = {
-    state: "missing",
-    revision: "status-only",
-    activeOperationId: null,
-    preparedCount: 0,
-    problem: null,
+  return {
+    generatedAt,
+    configurationRevision: config.revision,
+    installation,
+    mode,
+    environment,
+    updater,
+    runtime,
+    receipts,
+    coordinator: observeCoordinator(receipts, lifecycleLock),
   };
+}
+
+function createManagerStatusSnapshotProjection(
+  executable: ManagerExecutableIdentityV1,
+  observations: ManagerStatusObservations,
+  operations: ManagerDashboardOperationsV1,
+  allowedActions: readonly TweakersManagerActionIdV1[],
+  actions: readonly ManagerActionAvailabilityV1[],
+): TweakersManagerStatusSnapshotV1 {
   const stateTokenInputs: ManagerStateTokenInputsV1 = {
     schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
     manager: {
       id: TWEAKERS_MANAGER_ID,
       protocolVersion: MANAGER_PROTOCOL_VERSION,
-      executable: input.executable,
+      executable,
     },
-    configurationRevision: config.revision,
+    configurationRevision: observations.configurationRevision,
     installation: {
-      state: installation.state,
-      version: installation.version,
-      appRoot: installation.appRoot,
-      runtimeUpdatedAt: installation.runtimeUpdatedAt,
-      revision: installation.revision,
+      state: observations.installation.state,
+      version: observations.installation.version,
+      appRoot: observations.installation.appRoot,
+      runtimeUpdatedAt: observations.installation.runtimeUpdatedAt,
+      revision: observations.installation.revision,
     },
-    mode,
-    environment,
-    updater,
-    runtime,
+    mode: observations.mode,
+    environment: observations.environment,
+    updater: observations.updater,
+    runtime: observations.runtime,
     coordinator: {
-      state: coordinator.state,
-      activeOperationId: coordinator.activeOperationId,
+      state: observations.coordinator.state,
+      activeOperationId: observations.coordinator.activeOperationId,
     },
     operations,
-    receiptChronology: receipts.map((receipt) => ({
+    receiptChronology: observations.receipts.map((receipt) => ({
       source: receipt.entry.source,
       receiptId: receipt.entry.receiptId,
       phase: receipt.entry.phase,
@@ -312,25 +273,28 @@ export function createTweakersManagerReadOnlyStatusSnapshot(
       revision: receipt.entry.revision,
       active: receipt.entry.active,
     })),
-    allowedActions: [],
+    // The token binds the executable capability set itself. A status response
+    // that cannot execute a family must not advertise that family in a token
+    // which could later be replayed against a different manager generation.
+    allowedActions,
   };
   return deepFreeze({
     protocolVersion: MANAGER_PROTOCOL_VERSION,
     managerId: TWEAKERS_MANAGER_ID,
-    generatedAt,
+    generatedAt: observations.generatedAt,
     stateToken: createManagerStateToken(stateTokenInputs),
     status: {
       schemaVersion: MANAGER_STATUS_SCHEMA_VERSION,
-      installation,
-      mode,
-      environment,
-      updater,
-      runtime,
-      coordinator,
+      installation: observations.installation,
+      mode: observations.mode,
+      environment: observations.environment,
+      updater: observations.updater,
+      runtime: observations.runtime,
+      coordinator: observations.coordinator,
       operations,
-      receipts: receipts.map((receipt) => receipt.entry),
+      receipts: observations.receipts.map((receipt) => receipt.entry),
     },
-    actions: [],
+    actions,
     stateTokenInputs,
   });
 }

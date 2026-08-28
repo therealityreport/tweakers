@@ -392,8 +392,16 @@ export function createSealedTweakersManagerActionAdapter(
 ): TweakersManagerActionAdapter {
   const userRoot = dependencies.userRoot ?? (() => userPaths().root);
   const now = dependencies.now ?? (() => new Date().toISOString());
+  // The omitted executor keys remain present on a widened TypeScript object or
+  // a JavaScript caller. Copy and remove them at the runtime boundary so the
+  // sealed adapter's capability set cannot be widened by object spreading.
+  const sealedDependencies: ManagerActionAdapterDependencies = { ...dependencies };
+  delete sealedDependencies.executeEnvironmentCancel;
+  delete sealedDependencies.executeEnvironmentRecover;
+  delete sealedDependencies.executeDesktopResume;
+  delete sealedDependencies.executeDesktopCancel;
   return new TweakersManagerActionAdapter({
-    ...dependencies,
+    ...sealedDependencies,
     userRoot,
     now,
     async executeEnvironmentCancel(transactionId: string) {

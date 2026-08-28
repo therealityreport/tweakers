@@ -529,6 +529,101 @@ test("native project menu targeting fails closed for zero or multiple visible po
   assert.equal(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), null);
 });
 
+test("native task menu targeting ignores owned project portals and fails closed when ambiguous", () => {
+  const document = new FakeDocument();
+  const makeMenu = (attribute) => {
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("data-state", "open");
+    menu.rect = { left: 100, top: 100, right: 260, bottom: 180, width: 160, height: 80 };
+    if (attribute) menu.setAttribute(attribute, "overlay");
+    const pin = document.createElement("div");
+    pin.setAttribute("role", "menuitem");
+    pin.textContent = "Pin";
+    menu.appendChild(pin);
+    document.body.appendChild(menu);
+    return menu;
+  };
+  const ownedProject = makeMenu("data-tweaker-project-menu");
+  const hiddenNativeProject = makeMenu("data-tweaker-project-native-menu");
+  const taskMenu = makeMenu();
+
+  assert.equal(_test.findNativeTaskMenu(document), taskMenu, "owned project surfaces cannot receive task controls");
+  const duplicateTaskMenu = makeMenu();
+  assert.equal(_test.findNativeTaskMenu(document), null, "multiple matching task portals fail closed");
+  ownedProject.remove();
+  hiddenNativeProject.remove();
+  taskMenu.remove();
+  duplicateTaskMenu.remove();
+});
+
+test("task pinning reports the bounded project limit before saving", async (t) => {
+  const document = new FakeDocument();
+  const previous = {
+    document: global.document,
+    window: global.window,
+    Element: global.Element,
+    MutationObserver: global.MutationObserver,
+  };
+  const alerts = [];
+  global.document = document;
+  global.window = {
+    alert(message) { alerts.push(message); },
+    setTimeout() { return 1; },
+    clearTimeout() {},
+  };
+  global.Element = FakeElement;
+  global.MutationObserver = class {
+    observe() {}
+    disconnect() {}
+  };
+  t.after(() => {
+    global.document = previous.document;
+    global.window = previous.window;
+    global.Element = previous.Element;
+    global.MutationObserver = previous.MutationObserver;
+  });
+
+  const group = document.createElement("div");
+  group.setAttribute("data-tweaker-project-color-group", "true");
+  group.setAttribute("data-tweaker-project-id", "project-a");
+  const task = document.createElement("div");
+  task.setAttribute("role", "listitem");
+  task.setAttribute("data-app-action-sidebar-thread-id", "task-new");
+  task.closest = (selector) => {
+    if (selector === '[role="listitem"]') return task;
+    if (selector === "[data-tweaker-project-color-group]") return group;
+    return null;
+  };
+  group.appendChild(task);
+  document.body.appendChild(group);
+  const nativeMenu = document.createElement("div");
+  nativeMenu.setAttribute("role", "menu");
+  nativeMenu.setAttribute("data-state", "open");
+  const nativePin = document.createElement("div");
+  nativePin.setAttribute("role", "menuitem");
+  nativePin.textContent = "Pin";
+  nativeMenu.appendChild(nativePin);
+  document.body.appendChild(nativeMenu);
+  const saved = [];
+  const dispose = _test.installProjectTaskControls({}, () => ({
+    nodes: [{
+      id: "project-a",
+      type: "project",
+      pinnedTaskIds: Array.from({ length: 100 }, (_, index) => `task-${index}`),
+    }],
+  }), async (...args) => { saved.push(args); });
+
+  document.dispatchEvent({ type: "contextmenu", target: task, clientX: 100, clientY: 100 });
+  const localPin = nativeMenu.querySelector('[data-tweaker-project-task-menu="pin"]');
+  assert.ok(localPin, "the safe, unambiguous native task menu receives the pin control");
+  localPin.click();
+  await Promise.resolve();
+  assert.deepEqual(saved, []);
+  assert.deepEqual(alerts, ["This project already has 100 pinned tasks. Unpin one task first."]);
+  dispose();
+});
+
 test("project tint rerenders immediately and teardown stays inside the semantic project row", (t) => {
   const document = new FakeDocument();
   const previousDocument = global.document;

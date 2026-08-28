@@ -396,8 +396,11 @@ export function removeTweakersManagerDescriptor(options: RemoveTweakersManagerDe
   }
   // The publisher owns this directory. Validate it before unlinking so an
   // attacker cannot redirect uninstall through a symlinked host path.
-  assertExactOwnedDirectory(paths.descriptorRoot, owner, MANAGER_DIRECTORY_MODE, "Menu Bar manager descriptor directory");
-  assertSafeAncestors(paths.descriptorRoot, owner, "Menu Bar manager descriptor directory");
+  // This host-owned directory may predate Tweakers and use a safe, non-0700
+  // mode such as 0755. Removal needs the same no-symlink, owner, and
+  // non-writable-by-others protections, but must not block uninstall solely
+  // because Tweakers did not create the directory.
+  ensureExistingSafeDirectory(paths.descriptorRoot, owner, "Menu Bar manager descriptor directory", false);
   try {
     // lstat deliberately sees a dangling hostile symlink too. `existsSync`
     // would report that case as absent and leave discovery metadata behind.

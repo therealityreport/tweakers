@@ -294,7 +294,7 @@ export function canonicalManagerJson(value: unknown): string {
     case "object":
       if (Array.isArray(value)) return `[${value.map(canonicalManagerJson).join(",")}]`;
       return `{${Object.keys(value as Record<string, unknown>)
-        .sort((left, right) => left.localeCompare(right))
+        .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
         .map((key) => `${JSON.stringify(key)}:${canonicalManagerJson((value as Record<string, unknown>)[key])}`)
         .join(",")}}`;
     default:

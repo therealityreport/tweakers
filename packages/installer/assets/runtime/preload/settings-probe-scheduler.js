@@ -3,6 +3,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.SettingsProbeScheduler = void 0;
 const ORDINARY_MISS_BACKOFF_MS = 250;
 const FOUND_UPDATE_BACKOFF_MS = 100;
+// Keep this aligned with settings-injector.ts's nav-group reinjection backoff.
+// A suppressed probe has already found a Settings surface; it must retry once
+// after that backoff rather than being counted as a missing surface.
+const SUPPRESSED_RETRY_BACKOFF_MS = 30_000;
 const SUSTAINED_MISS_THRESHOLD = 10;
 /**
  * Coalesces renderer mutation storms into bounded Settings probes.
@@ -131,6 +135,11 @@ class SettingsProbeScheduler {
                 this.metricsState.currentBackoffMs = FOUND_UPDATE_BACKOFF_MS;
                 this.metricsState.dormant = false;
             }
+            else if (outcome === "suppressed") {
+                this.metricsState.consecutiveMisses = 0;
+                this.metricsState.currentBackoffMs = SUPPRESSED_RETRY_BACKOFF_MS;
+                this.metricsState.dormant = false;
+            }
             else {
                 this.metricsState.consecutiveMisses += 1;
                 if (this.metricsState.consecutiveMisses >= SUSTAINED_MISS_THRESHOLD) {
@@ -153,6 +162,8 @@ class SettingsProbeScheduler {
     nextDelayMs() {
         if (this.metricsState.lastOutcome === "found")
             return FOUND_UPDATE_BACKOFF_MS;
+        if (this.metricsState.lastOutcome === "suppressed")
+            return SUPPRESSED_RETRY_BACKOFF_MS;
         return this.nextMissBackoffMs();
     }
     nextMissBackoffMs() {
