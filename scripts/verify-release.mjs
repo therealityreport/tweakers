@@ -85,16 +85,19 @@ export function verifyManagerReleaseArtifacts(root) {
     throw new Error(`canonical manager launcher must contain only ${policy.architecture}; found ${architectures}`);
   }
   const signing = run("codesign", ["-d", "-r-", "--verbose=4", canonicalLauncher], { includeStderr: true });
-  const identifier = signingOutputValue(signing, "Identifier=");
-  if (identifier !== policy.identifier) {
+  const policyIdentifier = requireNonEmptyString(policy.identifier, "manager signing policy identifier");
+  const policyAuthority = requireNonEmptyString(policy.certificateCommonName, "manager signing policy certificateCommonName");
+  const policyDesignatedRequirement = requireNonEmptyString(policy.designatedRequirement, "manager signing policy designatedRequirement");
+  const identifier = requireNonEmptyString(signingOutputValue(signing, "Identifier="), "canonical manager launcher identifier");
+  if (identifier !== policyIdentifier) {
     throw new Error("canonical manager launcher identifier does not match signing policy");
   }
-  const authority = signingOutputValue(signing, "Authority=");
-  if (authority !== policy.certificateCommonName) {
+  const authority = requireNonEmptyString(signingOutputValue(signing, "Authority="), "canonical manager launcher leaf authority");
+  if (authority !== policyAuthority) {
     throw new Error("canonical manager launcher leaf authority does not match signing policy");
   }
-  const designatedRequirement = signingOutputValue(signing, "designated => ");
-  if (designatedRequirement !== policy.designatedRequirement) {
+  const designatedRequirement = requireNonEmptyString(signingOutputValue(signing, "designated => "), "canonical manager launcher designated requirement");
+  if (designatedRequirement !== policyDesignatedRequirement) {
     throw new Error("canonical manager launcher designated requirement does not match signing policy");
   }
 
@@ -126,6 +129,13 @@ function signingOutputValue(output, prefix) {
     .map((candidate) => candidate.trim())
     .find((candidate) => candidate.startsWith(prefix));
   return line?.slice(prefix.length);
+}
+
+function requireNonEmptyString(value, label) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} is missing or invalid`);
+  }
+  return value;
 }
 
 function run(command, args, { includeStderr = false } = {}) {
