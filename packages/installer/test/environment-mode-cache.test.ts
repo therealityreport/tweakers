@@ -740,6 +740,11 @@ test("T6 retains a released current pointer until replacement, then reclaims onl
       `${helperLabel}.stderr.log`,
       `${helperLabel}.outcome.json`,
     ]) writeFileSync(join(oldGenerationRoot, name), name);
+    writeFileSync(
+      join(oldGenerationRoot, ".DS_Store"),
+      "Finder metadata must not strand an otherwise unreachable generation",
+    );
+    mkdirSync(join(oldGenerationRoot, "commit-helper.json.lock.claims"), { mode: 0o700 });
     const planned = runEnvironmentTransactionGc({
       receiptRoot: join(first.root, "transactions", "environment"),
       transactionFile: join(first.root, "transactions", "environment.json"),
@@ -766,8 +771,55 @@ test("T6 retains a released current pointer until replacement, then reclaims onl
     assert.equal(existsSync(join(oldGenerationRoot, "projection")), false);
     assert.equal(existsSync(join(oldGenerationRoot, "control-v2.json")), false);
     assert.equal(existsSync(join(oldGenerationRoot, "commit-helper.json")), false);
+    assert.equal(existsSync(join(oldGenerationRoot, "commit-helper.json.lock.claims")), false);
     assert.equal(existsSync(first.receipt.paths.receiptFile), true);
     assert.deepEqual(readdirSync(first.receipt.paths.generationRoot).sort(), ["receipt.json"]);
+  } finally {
+    cleanup(first.root);
+  }
+});
+
+test("T6 fails closed when an unreachable generation has a nonempty commit-helper claim directory", () => {
+  const first = makePairFixture("generation-a");
+  try {
+    publishEnvironmentModePair(first.paths, first.receipt, { now: () => NOW });
+    const second = makePairInRoot(first.root, first.paths, "generation-b");
+    publishEnvironmentModePair(first.paths, second.receipt, { now: () => LATER });
+    const claimsRoot = join(first.receipt.paths.generationRoot, "commit-helper.json.lock.claims");
+    mkdirSync(claimsRoot, { mode: 0o700 });
+    writeFileSync(join(claimsRoot, "ticket-0000000000000001-1234-test"), "1234\n");
+    const result = runEnvironmentTransactionGc({
+      receiptRoot: join(first.root, "transactions", "environment"),
+      transactionFile: join(first.root, "transactions", "environment.json"),
+      cachePaths: first.paths,
+      mode: "dry-run",
+    });
+    const old = result.generationEntries.find((entry) => entry.generationId === "generation-a");
+    assert.equal(old?.action, "keep");
+    assert.match(old?.reason ?? "", /claim directory is not an empty real directory/);
+    assert.equal(existsSync(first.receipt.paths.inactiveAppPath), true);
+  } finally {
+    cleanup(first.root);
+  }
+});
+
+test("T6 fails closed when generation Finder metadata is not a regular file", () => {
+  const first = makePairFixture("generation-a");
+  try {
+    publishEnvironmentModePair(first.paths, first.receipt, { now: () => NOW });
+    const second = makePairInRoot(first.root, first.paths, "generation-b");
+    publishEnvironmentModePair(first.paths, second.receipt, { now: () => LATER });
+    mkdirSync(join(first.receipt.paths.generationRoot, ".DS_Store"));
+    const result = runEnvironmentTransactionGc({
+      receiptRoot: join(first.root, "transactions", "environment"),
+      transactionFile: join(first.root, "transactions", "environment.json"),
+      cachePaths: first.paths,
+      mode: "dry-run",
+    });
+    const old = result.generationEntries.find((entry) => entry.generationId === "generation-a");
+    assert.equal(old?.action, "keep");
+    assert.match(old?.reason ?? "", /Finder metadata is not a real regular file/);
+    assert.equal(existsSync(first.receipt.paths.inactiveAppPath), true);
   } finally {
     cleanup(first.root);
   }

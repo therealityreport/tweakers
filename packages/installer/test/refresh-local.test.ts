@@ -486,6 +486,29 @@ test("hashRefreshSourceTree covers tweak sources the provenance hash deliberatel
     const afterTweakEdit = hashRefreshSourceTree(root);
     writeFileSync(join(root, "packages", "installer", "assets", "runtime", "main.js"), "rebuilt");
     assert.equal(hashRefreshSourceTree(root), afterTweakEdit);
+
+    const managerAssets = join(root, "packages", "installer", "assets", "manager-launcher");
+    mkdirSync(managerAssets, { recursive: true });
+    writeFileSync(join(managerAssets, "Tweakers Manager Launcher"), "signed launcher");
+    writeFileSync(join(managerAssets, "manager.mjs"), "export {};");
+    assert.equal(
+      hashRefreshSourceTree(root),
+      afterTweakEdit,
+      "generated manager assets must not self-invalidate the refresh hash",
+    );
+    assert.equal(
+      hashTree(root, false),
+      provenanceBefore,
+      "generated manager assets must not self-invalidate development provenance",
+    );
+
+    const sourceLikeSibling = join(root, "packages", "installer", "assets", "manager-launcher-source.ts");
+    writeFileSync(sourceLikeSibling, "export const version = 1;");
+    assert.notEqual(
+      hashRefreshSourceTree(root),
+      afterTweakEdit,
+      "source-like siblings of generated asset roots must remain hash-visible",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

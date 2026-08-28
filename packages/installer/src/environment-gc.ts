@@ -512,6 +512,7 @@ function assertGenerationPayloadContained(
   if (lstatSync(generationRoot).isSymbolicLink()) throw new Error("generation root is a symlink");
   const canonicalGeneration = realpathSync(generationRoot);
   const allowed = new Set([
+    ".DS_Store",
     "receipt.json",
     "warm-commit.json",
     "inactive",
@@ -522,12 +523,25 @@ function assertGenerationPayloadContained(
     "projection",
     "control-v2.json",
     "commit-helper.json",
+    "commit-helper.json.lock.claims",
     `co.tweakers.environment.${generationRoot.split("/").at(-1)}.sh`,
     `co.tweakers.environment.${generationRoot.split("/").at(-1)}.stdout.log`,
     `co.tweakers.environment.${generationRoot.split("/").at(-1)}.stderr.log`,
     `co.tweakers.environment.${generationRoot.split("/").at(-1)}.outcome.json`,
   ]);
   for (const entry of readdirSync(generationRoot, { withFileTypes: true })) {
+    if (entry.name === ".DS_Store") {
+      const metadataPath = join(generationRoot, entry.name);
+      if (!entry.isFile() || entry.isSymbolicLink() || lstatSync(metadataPath).isSymbolicLink()) {
+        throw new Error("generation Finder metadata is not a real regular file");
+      }
+    }
+    if (entry.name === "commit-helper.json.lock.claims") {
+      const claimsRoot = join(generationRoot, entry.name);
+      if (!entry.isDirectory() || entry.isSymbolicLink() || readdirSync(claimsRoot).length !== 0) {
+        throw new Error("generation commit-helper claim directory is not an empty real directory");
+      }
+    }
     const previousHelperReceipt = entry.name.startsWith("commit-helper.json.") && entry.name.endsWith(".previous");
     const previousHelperOutcome = entry.name.startsWith(`co.tweakers.environment.${generationRoot.split("/").at(-1)}.outcome.json.`)
       && entry.name.endsWith(".previous");
@@ -549,6 +563,7 @@ function environmentModeGenerationPayloadPaths(
 ): string[] {
   const label = `co.tweakers.environment.${generation.generationId}`;
   const fixed = [
+    join(generation.generationRoot, ".DS_Store"),
     generation.inactiveRoot,
     generation.runtimeRoot,
     generation.managedRuntimeRoot,
@@ -557,6 +572,7 @@ function environmentModeGenerationPayloadPaths(
     join(generation.generationRoot, "projection"),
     join(generation.generationRoot, "control-v2.json"),
     join(generation.generationRoot, "commit-helper.json"),
+    join(generation.generationRoot, "commit-helper.json.lock.claims"),
     join(generation.generationRoot, `${label}.sh`),
     join(generation.generationRoot, `${label}.stdout.log`),
     join(generation.generationRoot, `${label}.stderr.log`),

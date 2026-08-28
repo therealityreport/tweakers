@@ -422,13 +422,22 @@ export function refreshCliPath(userRoot: string, status = getLocalRefreshStatus(
   return managedCliPath(userRoot);
 }
 
+function isPathAtOrBelow(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+function isGeneratedInstallerAsset(path: string): boolean {
+  return isPathAtOrBelow(path, "packages/installer/assets/runtime")
+    || isPathAtOrBelow(path, "packages/installer/assets/manager-launcher");
+}
+
 /**
  * Hash every refresh-relevant source input. Unlike `hashTree(root, false)` —
  * which exists to compare against the managed runtime's provenance and so
  * excludes `tweaks/` — this hash includes the tweak sources: a tweak-only
  * edit must invalidate the accepted-refresh receipt. Build outputs
- * (`packages/installer/assets/runtime`) stay excluded so the hash does not
- * invalidate itself.
+ * (`packages/installer/assets/runtime` and the bundled Manager launcher pair)
+ * stay excluded so the hash does not invalidate itself.
  */
 export function hashRefreshSourceTree(root: string): string {
   const hash = createHash("sha256");
@@ -438,7 +447,7 @@ export function hashRefreshSourceTree(root: string): string {
       if ([".git", "node_modules", "dist", ".DS_Store"].includes(entry.name)) continue;
       const path = join(dir, entry.name);
       const rel = relative(root, path).replaceAll("\\", "/");
-      if (rel.startsWith("packages/installer/assets/runtime")) continue;
+      if (isGeneratedInstallerAsset(rel)) continue;
       if (entry.isDirectory()) visit(path);
       else if (entry.isFile()) { hash.update(rel); hash.update(readFileSync(path)); }
     }
@@ -544,7 +553,11 @@ export function hashTree(root: string, tweaksOnly: boolean): string {
       if ([".git", "node_modules", "dist", ".DS_Store"].includes(entry.name)) continue;
       const path = join(dir, entry.name);
       const rel = relative(root, path).replaceAll("\\", "/");
-      if (!tweaksOnly && (rel === "tweaks" || rel.startsWith("tweaks/") || rel.startsWith("packages/installer/assets/runtime"))) continue;
+      if (!tweaksOnly && (
+        rel === "tweaks"
+        || rel.startsWith("tweaks/")
+        || isGeneratedInstallerAsset(rel)
+      )) continue;
       if (entry.isDirectory()) visit(path);
       else if (entry.isFile()) { hash.update(rel); hash.update(readFileSync(path)); }
     }
