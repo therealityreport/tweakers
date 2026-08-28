@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,8 +7,13 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const src = resolve(root, "src", "tweaker_native_host.mm");
+const managerLauncherSource = resolve(root, "src", "tweakers_manager_launcher.mm");
 const outDir = resolve(root, "dist");
 const out = resolve(outDir, "tweaker_native_host.node");
+const managerLauncherOutput = resolve(outDir, "Tweakers Manager Launcher");
+const managerLauncherAsset = resolve(root, "assets", "Tweakers Manager Launcher");
+const managerSigningPolicy = JSON.parse(readFileSync(resolve(root, "manager-signing-policy.json"), "utf8"));
+const releaseManagerLauncher = process.argv.includes("--release-manager-launcher");
 const helperSource = resolve(root, "src", "tweaker_swap_helper.mm");
 const helperOutput = resolve(outDir, "Tweakers Swap Helper.app");
 
@@ -54,6 +59,46 @@ run("xcrun", [
 
 run("codesign", ["--force", "--sign", "-", out], { stdio: "inherit" });
 console.log(`[native-host] built ${out}`);
+
+run("xcrun", [
+  "clang++",
+  "-std=c++20",
+  "-fobjc-arc",
+  "-ObjC++",
+  "-mmacosx-version-min=13.0",
+  "-isysroot",
+  sdkPath,
+  "-framework",
+  "Foundation",
+  "-framework",
+  "Security",
+  `-DTWEAKERS_MANAGER_CERTIFICATE_LEAF_SHA1=\"${managerSigningPolicy.certificateLeafSha1}\"`,
+  managerLauncherSource,
+  "-o",
+  managerLauncherOutput,
+], { stdio: "inherit" });
+const managerLauncherIdentity = releaseManagerLauncher ? findExactManagerLauncherIdentity() : "-";
+run("codesign", [
+  "--force",
+  "--sign",
+  managerLauncherIdentity,
+  "--identifier",
+  managerSigningPolicy.identifier,
+  ...(releaseManagerLauncher ? ["--options", "runtime"] : []),
+  managerLauncherOutput,
+], { stdio: "inherit" });
+run("codesign", ["--verify", "--strict", managerLauncherOutput], { stdio: "inherit" });
+verifyManagerLauncherBinary(managerLauncherOutput, { requirePublisherSignature: releaseManagerLauncher });
+console.log(`[native-host] built ${releaseManagerLauncher ? "publisher-signed" : "ad-hoc"} ${managerLauncherOutput}`);
+if (releaseManagerLauncher) {
+  mkdirSync(dirname(managerLauncherAsset), { recursive: true });
+  const stagedAsset = `${managerLauncherAsset}.candidate-${process.pid}`;
+  rmSync(stagedAsset, { force: true });
+  cpSync(managerLauncherOutput, stagedAsset);
+  verifyManagerLauncherBinary(stagedAsset, { requirePublisherSignature: true });
+  renameSync(stagedAsset, managerLauncherAsset);
+  console.log(`[native-host] promoted verified publisher launcher to ${managerLauncherAsset}`);
+}
 
 const temporaryRoot = mkdtempSync(join(tmpdir(), "tweakers-swap-helper-build-"));
 try {
@@ -113,6 +158,34 @@ function findNodeIncludeDir() {
   throw new Error(`Could not find node_api.h. Tried: ${candidates.join(", ")}`);
 }
 
+function findExactManagerLauncherIdentity() {
+  const output = run("security", ["find-identity", "-v", "-p", "codesigning"]);
+  const matches = [...output.matchAll(/^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"Tweakers Local Signing"\s*$/gm)]
+    .map((match) => match[1].toUpperCase());
+  const unique = [...new Set(matches)];
+  const expected = managerSigningPolicy.certificateLeafSha1.toUpperCase();
+  if (unique.length !== 1 || unique[0] !== expected) {
+    throw new Error(`Manager release signing requires exactly the pinned ${expected} identity; same-name or replacement certificates are rejected`);
+  }
+  return unique[0];
+}
+
+function verifyManagerLauncherBinary(path, { requirePublisherSignature }) {
+  const architectures = run("lipo", ["-archs", path]).trim();
+  if (architectures !== managerSigningPolicy.architecture) {
+    throw new Error(`Tweakers Manager Launcher must contain only ${managerSigningPolicy.architecture}; found ${architectures}`);
+  }
+  const output = run("codesign", ["-d", "-r-", "--verbose=4", path], { includeStderr: true });
+  if (!output.includes(`Identifier=${managerSigningPolicy.identifier}`)) {
+    throw new Error("Tweakers Manager Launcher identifier did not verify");
+  }
+  if (requirePublisherSignature
+      && (!output.includes(`Authority=${managerSigningPolicy.certificateCommonName}`)
+        || !output.includes(`designated => ${managerSigningPolicy.designatedRequirement}`))) {
+    throw new Error("Tweakers Manager Launcher exact publisher designated requirement did not verify");
+  }
+}
+
 function run(command, args, opts = {}) {
   const result = spawnSync(command, args, {
     encoding: "utf8",
@@ -123,5 +196,5 @@ function run(command, args, opts = {}) {
     const stdout = result.stdout ? `\n${result.stdout}` : "";
     throw new Error(`${command} ${args.join(" ")} failed${stdout}${stderr}`);
   }
-  return result.stdout ?? "";
+  return `${result.stdout ?? ""}${opts.includeStderr ? result.stderr ?? "" : ""}`;
 }

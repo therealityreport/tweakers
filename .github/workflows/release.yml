@@ -25,8 +25,15 @@ jobs:
       - run: npm run check:public-history
       - run: npm test
       - run: npm run build
+      - name: Verify committed manager artifacts without signing
+        run: node scripts/verify-release.mjs --manager-artifacts
       - name: Verify generated files are committed
-        run: git diff --exit-code -- store/index.json packages/installer/assets/runtime
+        run: |
+          git diff --exit-code -- \
+            store/index.json \
+            packages/installer/assets/runtime \
+            packages/native-host/assets/'Tweakers Manager Launcher' \
+            packages/installer/assets/manager-launcher
       - name: Build release tarball + checksums
         run: |
           TARBALL="tweakers-${GITHUB_REF_NAME}.tar.gz"
@@ -35,7 +42,7 @@ jobs:
           # OPTIONAL (documented, not required): if a signing key is configured, emit a detached
           # signature, e.g. `minisign -Sm SHA256SUMS` or `cosign sign-blob`. CI does not require a
           # signer to be present; the SHA256SUMS asset is the mandatory integrity anchor.
-      - name: Verify release assets exist
+      - name: Verify tagged archive and checksum assets without signing
         run: node scripts/verify-release.mjs --assets
       - name: Publish stable GitHub release
         env:

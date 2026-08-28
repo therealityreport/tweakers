@@ -26,7 +26,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run copy-assets",
+    "build": "tsc -p tsconfig.json && npm run build-manager && npm run copy-assets",
+    "build-manager": "node ./scripts/build-manager.mjs",
     "copy-assets": "node ./scripts/copy-assets.mjs",
     "dev": "tsx src/cli.ts"
   },
@@ -43,6 +44,7 @@
     "@types/plist": "^3.0.5",
     "@types/prompts": "^2.4.9",
     "@types/tar": "^6.1.13",
+    "esbuild": "^0.28.1",
     "tsx": "^4.23.5",
     "typescript": "^5.6.0"
   },

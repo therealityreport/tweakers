@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "managerId": "com.thomashulihan.tweakers",
+  "protocolVersion": 1,
+  "executableName": "Tweakers Manager Launcher",
+  "identifier": "com.therealityreport.tweakers.manager-launcher",
+  "architecture": "arm64",
+  "certificateCommonName": "Tweakers Local Signing",
+  "certificateLeafSha1": "631275551276127985a524acf1f469bf5164d50d",
+  "designatedRequirement": "identifier \"com.therealityreport.tweakers.manager-launcher\" and certificate leaf = H\"631275551276127985a524acf1f469bf5164d50d\""
+}

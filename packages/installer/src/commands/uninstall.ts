@@ -16,6 +16,7 @@ import { clearModeTransition, modeTransitionFile, parkedPayloadRoot } from "../m
 import { removeSwitcher } from "../switcher-setup.js";
 import type { CodexInstall } from "../platform.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
+import { removeTweakersManagerDescriptor } from "../manager-descriptor.js";
 
 interface Opts {
   app?: string;
@@ -42,6 +43,14 @@ async function uninstallUnlocked(opts: Opts, paths: ReturnType<typeof ensureUser
         `Quit Codex completely, then rerun this command. ` +
         `Uninstall needs the app closed so the app on disk and the running process cannot diverge.`,
     );
+  }
+
+  // Disable Menu Bar discovery before deleting any Tweakers-owned state. This
+  // intentionally touches only the publisher descriptor; host trust remains
+  // a user-controlled Menu Bar concern and is never read or removed here.
+  const managerDescriptor = removeTweakersManagerDescriptor({ userRoot: paths.root });
+  if (managerDescriptor.removed) {
+    console.log(kleur.green("Removed Tweakers manager descriptor; Menu Bar trust was preserved."));
   }
 
   const fullAppBackup = codex.platform === "darwin" ? join(paths.backup, "Codex.app") : null;

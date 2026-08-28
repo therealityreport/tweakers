@@ -24,7 +24,12 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build
+      # This invokes the ordinary credential-free native-host build. It never
+      # calls the separate --release-manager-launcher private-signer path.
+      - name: Build without a private manager signer
+        run: npm run build
+      - name: Verify canonical signed launcher and status-only manager bundle
+        run: node scripts/verify-release.mjs --manager-artifacts
       - name: Verify deterministic generated files are committed
         run: |
           # The native host is compiled and ad-hoc signed with the runner's
@@ -36,3 +41,8 @@ jobs:
             packages/installer/assets/runtime \
             ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json'
+          git diff --exit-code -- \
+            packages/native-host/assets/'Tweakers Manager Launcher' \
+            packages/installer/assets/manager-launcher
+      - name: Verify canonical tweak catalog remains synchronized
+        run: npm run sync:tweaks -- --check

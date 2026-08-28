@@ -23,6 +23,15 @@ const copies = [
   ["packages/native-host/dist/Tweakers Swap Helper.app", "swap-helper/Tweakers Swap Helper.app"],
 ];
 
+// The fixed launcher and its single-file manager must arrive together. A
+// partial build must preserve the last complete pair instead of mixing fresh
+// launcher bytes with an old bundle (or vice versa).
+const managerCopies = [
+  ["packages/native-host/assets/Tweakers Manager Launcher", "manager-launcher/Tweakers Manager Launcher"],
+  ["packages/native-host/manager-signing-policy.json", "manager-launcher/signing-policy.json"],
+  ["packages/installer/dist/manager.mjs", "manager-launcher/manager.mjs"],
+];
+
 export function copyInstallerAssets(root = defaultRoot, { publicationDependencies } = {}) {
   const out = resolve(root, "packages", "installer", "assets");
   const loaderSource = resolve(root, "packages", "loader", "loader.cjs");
@@ -30,6 +39,10 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
   const loaderAvailable = existsSync(loaderSource);
   const runtimeAvailable = existsSync(runtimeSource);
   const mcpLifecycleAvailable = existsSync(resolve(root, "packages", "mcp-lifecycle"));
+  const managerAssetsAvailable = managerCopies.every(([relativeSource]) => existsSync(resolve(root, ...relativeSource.split("/"))));
+  if (!managerAssetsAvailable) {
+    throw new Error("Manager asset publication requires the canonical signed launcher and freshly built status bundle");
+  }
   let tweakCount = 0;
   let fingerprint = null;
   let pendingCatalog = null;
@@ -43,8 +56,8 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
 
     // Copy every declared pair from its source. Runtime keeps its dedicated
     // branch below (tweak sync + fingerprint), so it is skipped here rather
-    // than copied twice. A missing source leaves the committed asset alone
-    // (warned after publication), mirroring the runtime availability rule.
+    // than copied twice. Manager assets are handled as an inseparable pair
+    // below; ordinary assets retain the historical missing-source behavior.
     for (const [relativeSource, destinationName] of copies) {
       if (destinationName === "runtime") continue;
       const source = resolve(root, ...relativeSource.split("/"));
@@ -58,6 +71,21 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
         preserveTimestamps: true,
       });
       if (lstatSync(staged).isDirectory()) sweepFinderJunk(staged);
+    }
+
+    if (managerAssetsAvailable) {
+      const managerAssetRoot = join(stagedAssets, "manager-launcher");
+      rmSync(managerAssetRoot, { recursive: true, force: true });
+      for (const [relativeSource, destinationName] of managerCopies) {
+        const source = resolve(root, ...relativeSource.split("/"));
+        const staged = join(stagedAssets, destinationName);
+        mkdirSync(dirname(staged), { recursive: true });
+        cpSync(source, staged, {
+          recursive: true,
+          verbatimSymlinks: true,
+          preserveTimestamps: true,
+        });
+      }
     }
 
     const stagedRuntime = join(stagedAssets, "runtime");
@@ -96,6 +124,7 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
   else console.log("[copy-assets] packages/loader/loader.cjs -> assets/loader.cjs");
   if (!mcpLifecycleAvailable) console.warn("[copy-assets] skip (missing): packages/mcp-lifecycle");
   else console.log("[copy-assets] packages/mcp-lifecycle -> assets/mcp-lifecycle");
+  console.log("[copy-assets] signed manager launcher + standalone manager bundle -> assets/manager-launcher");
   if (!runtimeAvailable) {
     console.warn("[copy-assets] skip (missing): packages/runtime/dist");
     return { runtimeCopied: false, tweakCount: 0, fingerprint: null, cleanupErrors: publication.cleanupErrors };

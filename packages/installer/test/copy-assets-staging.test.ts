@@ -46,10 +46,21 @@ function fixture(): string {
   mkdirSync(join(root, "packages", "loader"), { recursive: true });
   mkdirSync(join(root, "packages", "runtime", "dist"), { recursive: true });
   mkdirSync(join(root, "packages", "installer", "assets"), { recursive: true });
+  mkdirSync(join(root, "packages", "installer", "dist"), { recursive: true });
+  mkdirSync(join(root, "packages", "native-host", "assets"), { recursive: true });
   mkdirSync(join(root, "tweaks", "alpha"), { recursive: true });
   mkdirSync(join(root, "store"), { recursive: true });
   writeFileSync(join(root, "packages", "loader", "loader.cjs"), "loader\n");
   writeFileSync(join(root, "packages", "runtime", "dist", "main.js"), "runtime\n");
+  writeFileSync(
+    join(root, "packages", "native-host", "assets", "Tweakers Manager Launcher"),
+    "signed fixture launcher\n",
+  );
+  writeFileSync(
+    join(root, "packages", "native-host", "manager-signing-policy.json"),
+    '{"schemaVersion":1}\n',
+  );
+  writeFileSync(join(root, "packages", "installer", "dist", "manager.mjs"), "export const statusOnly = true;\n");
   writeFileSync(join(root, "tweaks", "alpha", "manifest.json"), JSON.stringify({
     id: "com.example.alpha",
     name: "alpha",

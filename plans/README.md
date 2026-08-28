@@ -21,6 +21,7 @@ Pre-existing files in this directory (`recon.md`, `architecture.md`, `dock-icon-
 | 005 | AppShots store dead end → bump trunk runtime version to 1.1.0 (pin stays) | P2 | S–M | — | TODO |
 | 006 | Unify SemVer comparators (alpha users miss stable updates) | P2 | M | 002 (same file) | TODO |
 | 007 | Renderer observer jank during streaming (host-surfaces + projects tweak) | P3 | M | — | TODO |
+| 008 | Universal Menu Bar manager contract + project-aware Portless integration | P1 | XL | Coordinate with 003/006 if active | IN PROGRESS — status-only milestone complete; actions deferred; Program B out of scope |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -33,6 +34,7 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - All plans execute in place on the current working tree under the shared execution protocol above (baseline manifests in `plans/artifacts/`, no branches/commits). Because everything lands in one tree, the dependency order doubles as the integration order.
 - Every plan that touches `packages/runtime/src` or `tweaks/` must regenerate committed assets (`npm run build` / `npm run sync:tweaks`; the projects tweak additionally regenerates `index.js` via `tweaks/co.tweakers.projects/scripts/build-renderer-entry.cjs`) — CI verifies generated files are in sync.
 - House rule for all executors (`AGENTS.md`): never restart, repair, or promote the live Codex/ChatGPT app as part of plan execution. The tweak workflow's closing `tweaker dev-sync` snapshot is operator-gated in plans 004 and 007.
+- 008 is a newer multi-repository architecture plan written against Tweakers `c947e79`; its own baseline, ownership, cross-repository gates, and explicit live-promotion boundaries supersede this packet's older `46a2fcc` run context for that plan only.
 
 ## Vetted findings table (deep audit, all 9 categories)
 
