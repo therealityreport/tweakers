@@ -1,22 +1,20 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { join } from "node:path";
 import { readDesktopUpdateReceipt } from "./desktop-update-transaction.js";
 import { readEnvironmentTransactionReceipt } from "./environment-transaction.js";
 import {
-  acquireProcessLock,
   isLockHeldByLiveOwner,
 } from "./process-lock.js";
+import {
+  currentLifecycleOperation,
+  lifecycleLockFile,
+  withLifecycleLock,
+} from "./lifecycle-lock-core.js";
 
-interface LifecycleContext {
-  lockFile: string;
-  operation: string;
-}
-
-const lifecycleContext = new AsyncLocalStorage<LifecycleContext>();
-
-export function lifecycleLockFile(userRoot: string): string {
-  return join(userRoot, "transactions", "lifecycle.lock");
-}
+export {
+  currentLifecycleOperation,
+  lifecycleLockFile,
+  withLifecycleLock,
+} from "./lifecycle-lock-core.js";
 
 export function isLifecycleLockHeld(userRoot: string): boolean {
   return isLockHeldByLiveOwner(lifecycleLockFile(userRoot));
@@ -36,10 +34,6 @@ export interface LifecycleReceiptAllowance {
    * supervised recovery.
    */
   environmentRecovery?: boolean;
-}
-
-export function currentLifecycleOperation(): string | null {
-  return lifecycleContext.getStore()?.operation ?? null;
 }
 
 /**
@@ -142,57 +136,5 @@ export function assertLifecycleReceiptsIdle(
         `Desktop update ${desktop.transactionId} is ${detail}; ${instruction}`,
       );
     }
-  }
-}
-
-/**
- * Serialize every live-app lifecycle owner through one cross-process lock.
- * Nested work in the same async operation borrows the lease, while an
- * unrelated call from the same PID still contends (process-lock enforces it).
- */
-/**
- * Short-lived readers (status polls from the Menu Bar) share this lock with
- * long operations, so a fail-fast acquisition turns routine overlap into
- * user-visible failures. Contended acquisitions wait out the holder for a
- * bounded window before surfacing the contention error.
- */
-const LIFECYCLE_LOCK_WAIT_ATTEMPTS = 30;
-const LIFECYCLE_LOCK_WAIT_INTERVAL_MS = 1_000;
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export async function withLifecycleLock<T>(
-  lockFile: string,
-  operation: string,
-  run: () => Promise<T>,
-): Promise<T> {
-  const active = lifecycleContext.getStore();
-  if (active?.lockFile === lockFile) return run();
-
-  let lock: ReturnType<typeof acquireProcessLock>;
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      lock = acquireProcessLock(lockFile, {
-        onContended: (owner) => new Error(
-          owner === null
-            ? `Another Tweakers lifecycle operation is active; refusing ${operation}`
-            : `Another Tweakers lifecycle operation is active (PID ${owner}); refusing ${operation}`,
-        ),
-      });
-      break;
-    } catch (error) {
-      if (attempt >= LIFECYCLE_LOCK_WAIT_ATTEMPTS
-        || !/Another Tweakers lifecycle operation is active/.test(errorMessage(error))) {
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, LIFECYCLE_LOCK_WAIT_INTERVAL_MS));
-    }
-  }
-  try {
-    return await lifecycleContext.run({ lockFile, operation }, run);
-  } finally {
-    lock.release();
   }
 }

@@ -3,6 +3,24 @@
 Projects adds colors, organization, connection references, and a read-only
 repository inventory to the native Projects sidebar.
 
+## Project menu
+
+When Codex opens a project menu, Projects replaces that one visible portal with
+an owned Codex-styled menu in the same position. It snapshots the actual native
+commands in their original order, including their disabled state and icons, and
+replays the selected native command itself. This keeps Edit, Reveal, Remove,
+and future Codex commands under Codex's own semantics while also adding the
+Project color and task Sort controls. If the project identity or native portal
+is ambiguous, Projects leaves the native menu untouched.
+
+## Task ordering
+
+Each project folder can independently keep Codex's default task order or sort
+its tasks by created or last-updated date in either direction. Tasks can also
+be pinned inside one project; these local pins stay above that project's
+selected date order and do not change Codex's global pinned list. Sorting and
+local pins use stable task identifiers rather than visible task titles.
+
 ## First run and recovery
 
 The first settings-page load creates a project entry only from a native project
@@ -17,7 +35,8 @@ unreadable, the tweak uses that recovery copy and reports the recovery status.
 
 ## Data and privacy
 
-Saved state contains project names, ordering, colors, safe connection
+Saved state contains project names, ordering, colors, folder-local task sort
+choices and pinned task identifiers, safe connection
 references, optional GitHub `owner/repository` names, and primary local project
 paths. It does not store provider tokens, browser cookies, passwords, or GitHub
 credentials. Paths are used locally only to find repositories and fixed,

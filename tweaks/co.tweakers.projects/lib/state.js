@@ -21,6 +21,13 @@ const PROFILE_CONNECTION_TYPES = CONNECTION_TYPES;
 const MAX_NODES = 200;
 const MAX_DEPTH = 8;
 const MAX_NATIVE_PROJECTS = 100;
+const MAX_PINNED_TASK_IDS = 100;
+const TASK_SORT_OPTIONS = Object.freeze([
+  "created-desc",
+  "created-asc",
+  "updated-desc",
+  "updated-asc",
+]);
 const PROJECT_COLOR_OPTIONS = Object.freeze([
   { id: "neutral", label: "Neutral", value: "#404040" },
   { id: "stone", label: "Stone", value: "#44403c" },
@@ -114,6 +121,10 @@ function normalizeNode(node, ids) {
   if (node.type === "project") {
     out.colorMode = colorMode;
     out.overlayIntensity = normalizeOverlayIntensity(node.overlayIntensity);
+    const taskSort = normalizeTaskSort(node.taskSort);
+    const pinnedTaskIds = normalizePinnedTaskIds(node.pinnedTaskIds);
+    if (taskSort) out.taskSort = taskSort;
+    if (pinnedTaskIds.length) out.pinnedTaskIds = pinnedTaskIds;
     if (node.projectPath !== undefined && node.projectPath !== null && node.projectPath !== "") {
       out.projectPath = normalizeWorkspacePath(node.projectPath);
     }
@@ -307,6 +318,27 @@ function normalizeOverlayIntensity(value) {
   const normalized = value === undefined || value === null || value === "" ? "medium" : String(value).toLowerCase();
   if (!PROJECT_OVERLAY_OPTIONS.includes(normalized)) throw coded("invalid-overlay-intensity");
   return normalized;
+}
+
+function normalizeTaskSort(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !TASK_SORT_OPTIONS.includes(value)) throw coded("invalid-task-sort");
+  return value;
+}
+
+function normalizePinnedTaskIds(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw coded("invalid-pinned-task-ids");
+  if (value.length > MAX_PINNED_TASK_IDS) throw coded("too-many-pinned-task-ids");
+  const ids = [];
+  const seen = new Set();
+  for (const candidate of value) {
+    const id = safeId(candidate);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 function autoColor(identity) {
@@ -571,6 +603,8 @@ function looksLikeSecret(value) {
 module.exports = {
   CONNECTION_TYPES,
   PROFILE_CONNECTION_TYPES,
+  MAX_PINNED_TASK_IDS,
+  TASK_SORT_OPTIONS,
   PROJECT_COLOR_OPTIONS,
   PROJECT_OVERLAY_OPTIONS,
   LEGACY_COLOR_KEYS,
@@ -586,6 +620,8 @@ module.exports = {
   normalizeColor,
   normalizeColorMode,
   normalizeOverlayIntensity,
+  normalizeTaskSort,
+  normalizePinnedTaskIds,
   autoColor,
   mergeLegacyProjectColors,
   safeReference,

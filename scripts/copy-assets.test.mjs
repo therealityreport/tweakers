@@ -11,12 +11,23 @@ function fixture() {
   mkdirSync(join(root, "packages", "loader"), { recursive: true });
   mkdirSync(join(root, "packages", "runtime", "dist"), { recursive: true });
   mkdirSync(join(root, "packages", "installer", "assets", "runtime", "tweaks", "stale"), { recursive: true });
+  mkdirSync(join(root, "packages", "installer", "dist"), { recursive: true });
+  mkdirSync(join(root, "packages", "native-host", "assets"), { recursive: true });
   mkdirSync(join(root, "tweaks", "alpha"), { recursive: true });
   mkdirSync(join(root, "store"), { recursive: true });
   writeFileSync(join(root, "packages", "loader", "loader.cjs"), "loader\n");
   writeFileSync(join(root, "packages", "installer", "assets", "loader.cjs"), "old loader\n");
   chmodSync(join(root, "packages", "installer", "assets", "loader.cjs"), 0o710);
   writeFileSync(join(root, "packages", "runtime", "dist", "main.js"), "runtime\n");
+  writeFileSync(
+    join(root, "packages", "native-host", "assets", "Tweakers Manager Launcher"),
+    "signed fixture launcher\n",
+  );
+  writeFileSync(
+    join(root, "packages", "native-host", "manager-signing-policy.json"),
+    '{"schemaVersion":1}\n',
+  );
+  writeFileSync(join(root, "packages", "installer", "dist", "manager.mjs"), "export const statusOnly = true;\n");
   chmodSync(join(root, "packages", "runtime", "dist", "main.js"), 0o750);
   writeFileSync(join(root, "packages", "installer", "assets", "runtime", "stale.js"), "stale\n");
   writeFileSync(join(root, "packages", "installer", "assets", "runtime", "main.js"), "old\n");

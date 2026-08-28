@@ -27,8 +27,13 @@ function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tweakers-account-"));
   const codexDir = path.join(root, ".codex");
   const accountsDir = path.join(codexDir, "auth_accounts");
+  const tweakDataParent = path.join(root, "tweak-data");
   const resourcesPath = path.join(root, "runtime-resources");
   fs.mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+  // This is the runtime-owned shared parent. Account Router may validate it,
+  // but must never change its 0755 mode while hardening its own descendants.
+  fs.mkdirSync(tweakDataParent, { recursive: true, mode: 0o755 });
+  fs.chmodSync(tweakDataParent, 0o755);
   fs.mkdirSync(resourcesPath, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(resourcesPath, "codex"), "test executable", { mode: 0o700 });
   if (!options.withoutAccountsDirectory) fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
@@ -38,6 +43,7 @@ function fixture(options = {}) {
     authFile: path.join(codexDir, "auth.json"),
     currentMarker: path.join(codexDir, "current_account"),
     lkgFile: path.join(codexDir, "auth.account-switcher-lkg.json"),
+    routerDataDir: path.join(tweakDataParent, "co.tweakers.account-switcher"),
   };
   fs.writeFileSync(paths.authFile, auth("current"), { mode: 0o600 });
   if (!options.withoutAccountsDirectory) {
@@ -110,6 +116,7 @@ test("list is redacted, side-effect-free, and reports a dangling marker", async 
   assert.equal(JSON.stringify(result).includes("access_token"), false);
   assert.deepEqual(fs.readFileSync(setup.paths.authFile), before);
   assert.equal(fs.existsSync(setup.paths.lkgFile), false);
+  assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "missing.json\n", "listing must not reconcile a marker");
 });
 
 test("first use lists an absent snapshot directory as empty and saves safely", async (t) => {
@@ -324,6 +331,8 @@ test("active snapshot sync propagates rotated tokens only for the same account",
   const setup = fixture();
   disposeFixture(t, setup);
   const target = path.join(setup.paths.accountsDir, "work.json");
+  const untouched = path.join(setup.paths.accountsDir, "untouched.json");
+  fs.writeFileSync(untouched, auth("untouched", "acct-2"), { mode: 0o600 });
 
   fs.writeFileSync(target, auth("stale", "acct-1"), { mode: 0o600 });
   fs.writeFileSync(setup.paths.authFile, auth("rotated", "acct-1"), { mode: 0o600 });
@@ -334,6 +343,9 @@ test("active snapshot sync propagates rotated tokens only for the same account",
   fs.writeFileSync(setup.paths.authFile, auth("other-login", "acct-2"), { mode: 0o600 });
   _test.syncActiveSnapshot(setup.deps, setup.paths);
   assert.equal(JSON.parse(fs.readFileSync(target)).tokens.access_token, "rotated");
+  assert.equal(JSON.parse(fs.readFileSync(untouched)).tokens.access_token, "other-login");
+  assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "untouched.json\n");
+  const untouchedAfterReconcile = fs.readFileSync(untouched);
 
   fs.writeFileSync(setup.paths.authFile, JSON.stringify({
     auth_mode: "chatgpt",
@@ -346,7 +358,76 @@ test("active snapshot sync propagates rotated tokens only for the same account",
   fs.writeFileSync(setup.paths.currentMarker, "missing.json\n", { mode: 0o600 });
   fs.writeFileSync(setup.paths.authFile, auth("rotated-2", "acct-1"), { mode: 0o600 });
   _test.syncActiveSnapshot(setup.deps, setup.paths);
-  assert.equal(JSON.parse(fs.readFileSync(target)).tokens.access_token, "rotated");
+  assert.equal(JSON.parse(fs.readFileSync(target)).tokens.access_token, "rotated-2");
+  assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "work.json\n");
+  assert.deepEqual(fs.readFileSync(untouched), untouchedAfterReconcile, "reconciliation changes only the unique matching snapshot");
+});
+
+test("marker reconciliation refuses zero, duplicate, missing-id, insecure, and raced candidates without changing the marker", (t) => {
+  for (const kind of ["zero", "duplicate", "missing-id", "insecure", "race"]) {
+    const setup = fixture();
+    disposeFixture(t, setup);
+    const target = path.join(setup.paths.accountsDir, "work.json");
+    fs.writeFileSync(setup.paths.currentMarker, "missing.json\n", { mode: 0o600 });
+    fs.writeFileSync(setup.paths.authFile, auth(kind === "zero" ? "live-no-match" : "stale", kind === "zero" ? "acct-none" : "acct-1"), { mode: 0o600 });
+    fs.writeFileSync(target, auth("stale", "acct-1"), { mode: 0o600 });
+    if (kind === "duplicate") addSavedAccount(setup, "second", "other", "acct-1");
+    if (kind === "missing-id") {
+      const missing = JSON.parse(auth("stale", "acct-1"));
+      delete missing.tokens.account_id;
+      fs.writeFileSync(target, JSON.stringify(missing), { mode: 0o600 });
+    }
+    if (kind === "insecure") fs.chmodSync(target, 0o644);
+    if (kind === "race") {
+      const wrapped = Object.create(fs);
+      let scans = 0;
+      wrapped.readdirSync = (directory, options) => {
+        const entries = fs.readdirSync(directory, options);
+        if (directory === setup.paths.accountsDir && ++scans === 2) addSavedAccount(setup, "second", "other", "acct-1");
+        return entries;
+      };
+      setup.deps.fs = wrapped;
+    }
+    const markerBefore = fs.readFileSync(setup.paths.currentMarker);
+    const targetBefore = fs.readFileSync(target);
+    if (kind === "missing-id" || kind === "insecure") {
+      const expectedError = kind === "missing-id" ? /router-operation-failed/ : /invalid-auth-source/;
+      assert.throws(() => _test.syncActiveSnapshot(setup.deps, setup.paths), expectedError, kind);
+    } else {
+      _test.syncActiveSnapshot(setup.deps, setup.paths);
+    }
+    assert.deepEqual(fs.readFileSync(setup.paths.currentMarker), markerBefore, kind);
+    assert.deepEqual(fs.readFileSync(target), targetBefore, kind);
+  }
+});
+
+test("marker reconciliation restores the previous marker when post-write verification fails", (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const target = path.join(setup.paths.accountsDir, "work.json");
+  const invalidMarker = path.join(setup.paths.codexDir, "invalid-marker-fixture");
+  fs.writeFileSync(setup.paths.currentMarker, "missing.json\n", { mode: 0o600 });
+  fs.writeFileSync(setup.paths.authFile, auth("rotated", "acct-1"), { mode: 0o600 });
+  fs.writeFileSync(target, auth("stale", "acct-1"), { mode: 0o600 });
+  fs.writeFileSync(invalidMarker, "not a marker\n", { mode: 0o600 });
+
+  const wrapped = Object.create(fs);
+  let sabotageNextMarkerRead = false;
+  wrapped.renameSync = (source, destination) => {
+    fs.renameSync(source, destination);
+    if (destination === setup.paths.currentMarker) sabotageNextMarkerRead = true;
+  };
+  wrapped.openSync = (file, ...args) => {
+    if (file === setup.paths.currentMarker && sabotageNextMarkerRead) {
+      sabotageNextMarkerRead = false;
+      return fs.openSync(invalidMarker, ...args);
+    }
+    return fs.openSync(file, ...args);
+  };
+  setup.deps.fs = wrapped;
+
+  assert.throws(() => _test.syncActiveSnapshot(setup.deps, setup.paths), /router-operation-failed/);
+  assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "missing.json\n");
 });
 
 test("secure snapshot buffers are cleared after thrown reads and writes", async (t) => {
@@ -390,7 +471,7 @@ test("account metadata declares the settings surface and has a synchronized patc
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.2.0");
+  assert.equal(manifest.version, "0.2.1");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
@@ -477,6 +558,137 @@ test("balanced configuration rejects a third account, invalid weights, and dupli
   assert.equal(fs.existsSync(path.join(setup.root, "tweak-data", "co.tweakers.account-switcher", "account-router-config.json")), false);
 });
 
+test("router hardens only owner-owned 0755 children and leaves its shared parent unchanged", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  fs.mkdirSync(routerPaths.routerDir, { mode: 0o755 });
+  fs.mkdirSync(routerPaths.accountsDir, { mode: 0o755 });
+  fs.chmodSync(routerPaths.routerDir, 0o755);
+  fs.chmodSync(routerPaths.accountsDir, 0o755);
+  const sharedParent = path.dirname(routerPaths.routerDir);
+  const parentMode = fs.statSync(sharedParent).mode & 0o777;
+  const listed = await setup.service.handle({ action: "list" });
+  const result = await setup.service.handle({
+    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(fs.statSync(sharedParent).mode & 0o777, parentMode, "the shared runtime parent is never chmodded");
+  assert.equal(fs.statSync(routerPaths.routerDir).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(routerPaths.accountsDir).mode & 0o777, 0o700);
+});
+
+test("router directory hardening rejects writable, symlinked, and non-directory children before config mutation", async (t) => {
+  for (const kind of ["0775", "0777", "symlink", "file"]) {
+    const setup = fixture();
+    disposeFixture(t, setup);
+    addSavedAccount(setup, "second", "second", "account-second");
+    const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+    const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+    if (kind === "0775" || kind === "0777") {
+      fs.mkdirSync(routerPaths.routerDir, { mode: 0o700 });
+      fs.chmodSync(routerPaths.routerDir, kind === "0775" ? 0o775 : 0o777);
+    } else if (kind === "symlink") {
+      const outside = path.join(setup.root, "outside-router");
+      fs.mkdirSync(outside, { mode: 0o700 });
+      fs.symlinkSync(outside, routerPaths.routerDir);
+    } else {
+      fs.writeFileSync(routerPaths.routerDir, "not a directory", { mode: 0o600 });
+    }
+    const listed = await setup.service.handle({ action: "list" });
+    const result = await setup.service.handle({
+      action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+    });
+    assert.equal(result.ok, false, kind);
+    assert.equal(result.error.code, "untrusted-router-directory", kind);
+    assert.equal(fs.existsSync(routerPaths.configFile), false, kind);
+    assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore, kind);
+  }
+});
+
+test("router directory hardening rejects wrong-owner and post-open replacement observations before config mutation", async (t) => {
+  for (const kind of ["wrong-owner", "post-open-replacement"]) {
+    const setup = fixture();
+    disposeFixture(t, setup);
+    addSavedAccount(setup, "second", "second", "account-second");
+    const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+    const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+    const wrapped = Object.create(fs);
+    let routerFd = null;
+    let hardened = false;
+    wrapped.openSync = (target, ...args) => {
+      const fd = fs.openSync(target, ...args);
+      if (target === routerPaths.routerDir) routerFd = fd;
+      return fd;
+    };
+    wrapped.fchmodSync = (fd, mode) => {
+      fs.fchmodSync(fd, mode);
+      if (fd === routerFd) hardened = true;
+    };
+    wrapped.fstatSync = (fd) => {
+      const stat = fs.fstatSync(fd);
+      if (kind === "wrong-owner" && fd === routerFd) return Object.assign(Object.create(stat), { uid: stat.uid + 1 });
+      return stat;
+    };
+    wrapped.lstatSync = (target) => {
+      const stat = fs.lstatSync(target);
+      if (kind === "post-open-replacement" && target === routerPaths.routerDir && hardened) {
+        return Object.assign(Object.create(stat), { ino: stat.ino + 1 });
+      }
+      return stat;
+    };
+    setup.deps.fs = wrapped;
+    const listed = await setup.service.handle({ action: "list" });
+    const result = await setup.service.handle({
+      action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+    });
+    assert.equal(result.ok, false, kind);
+    assert.equal(result.error.code, "untrusted-router-directory", kind);
+    assert.equal(fs.existsSync(routerPaths.configFile), false, kind);
+    assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore, kind);
+  }
+});
+
+test("manual router mode leaves an absent configuration and router children untouched", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const sharedParent = path.dirname(routerPaths.routerDir);
+  const parentMode = fs.statSync(sharedParent).mode & 0o777;
+  const manual = await setup.service.handle({ action: "router-configure", mode: "manual" });
+
+  assert.equal(manual.ok, true);
+  assert.equal(manual.router.mode, "manual");
+  assert.equal(fs.existsSync(routerPaths.routerDir), false);
+  assert.equal(fs.existsSync(routerPaths.configFile), false);
+  assert.equal(fs.statSync(sharedParent).mode & 0o777, parentMode);
+});
+
+test("router IPC maps injected details to a finite safe error code", async (t) => {
+  const logs = [];
+  const setup = fixture({ log: { info(...args) { logs.push(args); }, warn(...args) { logs.push(args); } } });
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const wrapped = Object.create(fs);
+  wrapped.fchmodSync = () => {
+    throw Object.assign(new Error("/private/router-secret-canary"), { code: "arbitrary-lowercase-secret-canary" });
+  };
+  setup.deps.fs = wrapped;
+  const result = await setup.service.handle({
+    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "router-operation-failed");
+  const publicText = JSON.stringify(result);
+  assert.equal(publicText.includes("arbitrary-lowercase-secret-canary"), false);
+  assert.equal(publicText.includes("/private/router-secret-canary"), false);
+  assert.equal(JSON.stringify(logs).includes("router-secret-canary"), false);
+});
+
 test("failed isolated-home promotion removes only its staging home and never alters a manual snapshot", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
@@ -504,11 +716,23 @@ test("manual mode and lifecycle disable preserve staged homes while disabling ba
   assert.equal((await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] })).ok, true);
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const homesBefore = fs.readdirSync(routerPaths.accountsDir).sort();
+  const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  const authBefore = fs.readFileSync(setup.paths.authFile);
+  const markerBefore = fs.readFileSync(setup.paths.currentMarker);
   const manual = await setup.service.handle({ action: "router-configure", mode: "manual" });
   assert.equal(manual.ok, true);
   assert.equal(manual.router.mode, "manual");
   assert.deepEqual(fs.readdirSync(routerPaths.accountsDir).sort(), homesBefore);
   assert.equal(JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8")).mode, "manual");
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
+  assert.deepEqual(fs.readFileSync(setup.paths.authFile), authBefore);
+  assert.deepEqual(fs.readFileSync(setup.paths.currentMarker), markerBefore);
+  const manualBytes = fs.readFileSync(routerPaths.configFile);
+  const manualMtimeMs = fs.statSync(routerPaths.configFile).mtimeMs;
+  const repeated = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(repeated.ok, true);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), manualBytes, "manual mode remains byte-for-byte idempotent");
+  assert.equal(fs.statSync(routerPaths.configFile).mtimeMs, manualMtimeMs, "manual mode does not rewrite config");
   fs.writeFileSync(routerPaths.configFile, JSON.stringify({ ..._test.readRouterConfig(setup.deps, routerPaths), mode: "balanced" }), { mode: 0o600 });
   setup.service.disableRouter();
   assert.equal(JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8")).mode, "manual");

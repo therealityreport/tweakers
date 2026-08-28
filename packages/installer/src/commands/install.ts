@@ -70,6 +70,7 @@ import {
   type RendererPatchOutcome,
 } from "../renderer-patch-outcome.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
+import { publishTweakersManagerDescriptor } from "../manager-descriptor.js";
 import { getOpenReport, listProcesses, reportsMainProcessRunning, type OpenReport, type ProcessInfo } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
@@ -1734,6 +1735,20 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     // A promoted live app is by definition in Tweakers mode, and any parked
     // ChatGPT-mode payload predates this promotion (now stale) — discard it.
     finalizePromotedModeState(paths.stateFile, paths.root);
+    // T3 publishes only a read-only status manager. It is deliberately after
+    // state finalization, so the first host query observes the committed live
+    // install, and before no host trust or restart work. A missing signing
+    // identity/immutable asset fails closed: no descriptor is left behind.
+    if (codex.platform === "darwin") {
+      try {
+        const manager = publishTweakersManagerDescriptor({ userRoot: paths.root });
+        if (!opts.quiet) console.log(kleur.dim(`Published read-only Tweakers manager descriptor (${manager.generationId}).`));
+      } catch (error) {
+        throw new Error(
+          `Tweakers app promotion completed, but read-only manager descriptor publication failed closed: ${errorMessage(error)}`,
+        );
+      }
+    }
     // Mode controls live in the existing Menu Bar app. Refresh its durable CLI
     // coordinator metadata and retire the old second status item nonfatally.
     if (codex.platform === "darwin") {

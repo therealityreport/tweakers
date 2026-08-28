@@ -10,6 +10,9 @@ export interface SettingsProbeMetrics {
   consecutiveMisses: number;
   currentBackoffMs: number;
   lastOutcome: SettingsProbeOutcome | null;
+  dormant: boolean;
+  wakeCount: number;
+  filteredMutationCount: number;
 }
 
 interface SettingsProbeSchedulerOptions {
@@ -23,16 +26,19 @@ interface SettingsProbeSchedulerOptions {
 }
 
 const ORDINARY_MISS_BACKOFF_MS = 250;
-const SUSTAINED_MISS_BACKOFF_MS = 1_000;
 const FOUND_UPDATE_BACKOFF_MS = 100;
+// Keep this aligned with settings-injector.ts's nav-group reinjection backoff.
+// A suppressed probe has already found a Settings surface; it must retry once
+// after that backoff rather than being counted as a missing surface.
+const SUPPRESSED_RETRY_BACKOFF_MS = 30_000;
 const SUSTAINED_MISS_THRESHOLD = 10;
 
 /**
  * Coalesces renderer mutation storms into bounded Settings probes.
  *
- * Missing Settings is probed at most four times per second, then once per
- * second after ten misses. A navigation request bypasses the current timer and
- * resets the miss backoff.
+ * Missing Settings is probed at most four times per second for a bounded
+ * ten-probe burst. It then becomes dormant until a meaningful renderer event
+ * explicitly wakes it.
  */
 export class SettingsProbeScheduler {
   private readonly probe: () => SettingsProbeOutcome;
@@ -57,6 +63,9 @@ export class SettingsProbeScheduler {
     consecutiveMisses: 0,
     currentBackoffMs: 0,
     lastOutcome: null,
+    dormant: false,
+    wakeCount: 0,
+    filteredMutationCount: 0,
   };
 
   constructor(options: SettingsProbeSchedulerOptions) {
@@ -68,9 +77,16 @@ export class SettingsProbeScheduler {
     this.onProbeError = options.onProbeError;
   }
 
-  request(options: { immediate?: boolean; resetBackoff?: boolean } = {}): void {
+  request(options: { immediate?: boolean; resetBackoff?: boolean; wake?: boolean } = {}): void {
     if (this.stopped) return;
     this.metricsState.requestCount += 1;
+    if (options.wake) {
+      this.metricsState.wakeCount += 1;
+      this.metricsState.dormant = false;
+    } else if (this.metricsState.dormant) {
+      this.metricsState.coalescedRequestCount += 1;
+      return;
+    }
     if (options.resetBackoff) {
       this.metricsState.consecutiveMisses = 0;
       this.metricsState.currentBackoffMs = 0;
@@ -99,6 +115,11 @@ export class SettingsProbeScheduler {
       this.timerDueAt = 0;
       this.runProbe();
     }, Math.max(0, dueAt - this.now()));
+  }
+
+  recordFilteredMutation(count = 1): void {
+    if (this.stopped || count <= 0) return;
+    this.metricsState.filteredMutationCount += count;
   }
 
   stop(): void {
@@ -138,13 +159,19 @@ export class SettingsProbeScheduler {
       if (outcome === "found") {
         this.metricsState.consecutiveMisses = 0;
         this.metricsState.currentBackoffMs = FOUND_UPDATE_BACKOFF_MS;
+        this.metricsState.dormant = false;
+      } else if (outcome === "suppressed") {
+        this.metricsState.consecutiveMisses = 0;
+        this.metricsState.currentBackoffMs = SUPPRESSED_RETRY_BACKOFF_MS;
+        this.metricsState.dormant = false;
       } else {
-        const previousBackoffMs = this.metricsState.currentBackoffMs;
         this.metricsState.consecutiveMisses += 1;
-        this.metricsState.currentBackoffMs = this.nextMissBackoffMs();
-        if (previousBackoffMs !== SUSTAINED_MISS_BACKOFF_MS
-          && this.metricsState.currentBackoffMs === SUSTAINED_MISS_BACKOFF_MS) {
+        if (this.metricsState.consecutiveMisses >= SUSTAINED_MISS_THRESHOLD) {
+          this.metricsState.currentBackoffMs = 0;
+          this.metricsState.dormant = true;
           this.metricsState.backoffEventCount += 1;
+        } else {
+          this.metricsState.currentBackoffMs = ORDINARY_MISS_BACKOFF_MS;
         }
       }
       this.running = false;
@@ -152,18 +179,17 @@ export class SettingsProbeScheduler {
     if (probeFailed) this.onProbeError?.(probeError);
     this.onProbe?.(outcome, this.metrics());
 
-    if (outcome !== "found" || this.pending) this.request();
+    if ((!this.metricsState.dormant && outcome !== "found") || this.pending) this.request();
   }
 
   private nextDelayMs(): number {
     if (this.metricsState.lastOutcome === "found") return FOUND_UPDATE_BACKOFF_MS;
+    if (this.metricsState.lastOutcome === "suppressed") return SUPPRESSED_RETRY_BACKOFF_MS;
     return this.nextMissBackoffMs();
   }
 
   private nextMissBackoffMs(): number {
-    return this.metricsState.consecutiveMisses >= SUSTAINED_MISS_THRESHOLD
-      ? SUSTAINED_MISS_BACKOFF_MS
-      : ORDINARY_MISS_BACKOFF_MS;
+    return ORDINARY_MISS_BACKOFF_MS;
   }
 
   private cancelTimer(): void {

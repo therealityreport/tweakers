@@ -113,6 +113,13 @@ const PROFILE_CONNECTION_TYPES = CONNECTION_TYPES;
 const MAX_NODES = 200;
 const MAX_DEPTH = 8;
 const MAX_NATIVE_PROJECTS = 100;
+const MAX_PINNED_TASK_IDS = 100;
+const TASK_SORT_OPTIONS = Object.freeze([
+  "created-desc",
+  "created-asc",
+  "updated-desc",
+  "updated-asc",
+]);
 const PROJECT_COLOR_OPTIONS = Object.freeze([
   { id: "neutral", label: "Neutral", value: "#404040" },
   { id: "stone", label: "Stone", value: "#44403c" },
@@ -206,6 +213,10 @@ function normalizeNode(node, ids) {
   if (node.type === "project") {
     out.colorMode = colorMode;
     out.overlayIntensity = normalizeOverlayIntensity(node.overlayIntensity);
+    const taskSort = normalizeTaskSort(node.taskSort);
+    const pinnedTaskIds = normalizePinnedTaskIds(node.pinnedTaskIds);
+    if (taskSort) out.taskSort = taskSort;
+    if (pinnedTaskIds.length) out.pinnedTaskIds = pinnedTaskIds;
     if (node.projectPath !== undefined && node.projectPath !== null && node.projectPath !== "") {
       out.projectPath = normalizeWorkspacePath(node.projectPath);
     }
@@ -399,6 +410,27 @@ function normalizeOverlayIntensity(value) {
   const normalized = value === undefined || value === null || value === "" ? "medium" : String(value).toLowerCase();
   if (!PROJECT_OVERLAY_OPTIONS.includes(normalized)) throw coded("invalid-overlay-intensity");
   return normalized;
+}
+
+function normalizeTaskSort(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !TASK_SORT_OPTIONS.includes(value)) throw coded("invalid-task-sort");
+  return value;
+}
+
+function normalizePinnedTaskIds(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw coded("invalid-pinned-task-ids");
+  if (value.length > MAX_PINNED_TASK_IDS) throw coded("too-many-pinned-task-ids");
+  const ids = [];
+  const seen = new Set();
+  for (const candidate of value) {
+    const id = safeId(candidate);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 function autoColor(identity) {
@@ -663,6 +695,8 @@ function looksLikeSecret(value) {
 module.exports = {
   CONNECTION_TYPES,
   PROFILE_CONNECTION_TYPES,
+  MAX_PINNED_TASK_IDS,
+  TASK_SORT_OPTIONS,
   PROJECT_COLOR_OPTIONS,
   PROJECT_OVERLAY_OPTIONS,
   LEGACY_COLOR_KEYS,
@@ -678,6 +712,8 @@ module.exports = {
   normalizeColor,
   normalizeColorMode,
   normalizeOverlayIntensity,
+  normalizeTaskSort,
+  normalizePinnedTaskIds,
   autoColor,
   mergeLegacyProjectColors,
   safeReference,
@@ -1656,14 +1692,16 @@ function createProjectService(api, dependencies = {}) {
   }
 
   function save(next) {
-    store.write(next);
+    const { normalizeState } = require("./state");
+    const normalized = normalizeState(next);
+    store.write(normalized);
     // The first persist of an in-memory seeded store also settles the
     // one-time legacy color import that startup applied but deferred writing.
     if (startedEmpty && legacyColors.found && imported.changed
-      && next.nodes.some((node) => node.type === "project")) {
+      && normalized.nodes.some((node) => node.type === "project")) {
       try { legacyMigration.complete(); } catch {}
     }
-    replaceObject(state, next);
+    replaceObject(state, normalized);
     inventory.clear();
     githubBranchesCache.clear();
     storageStatus = "ok";
@@ -1870,8 +1908,10 @@ module.exports = {
 
 const { isRecord, titleCase } = require("./common");
 const {
+  MAX_PINNED_TASK_IDS,
   PROJECT_COLOR_OPTIONS,
   PROJECT_OVERLAY_OPTIONS,
+  TASK_SORT_OPTIONS: STATE_TASK_SORT_OPTIONS,
   autoColor,
   projectForNativeIdentity,
   projectNativeNames,
@@ -1880,51 +1920,322 @@ const {
 const PROJECT_COLOR_MENU_ATTR = "data-tweaker-project-color-menu";
 const PROJECT_COLOR_STYLE_ID = "tweaker-project-colors";
 const PROJECT_COLOR_DISPOSE = Symbol("projectColorDispose");
+const PROJECT_TASK_MENU_ATTR = "data-tweaker-project-task-menu";
+const PROJECT_TASK_DISPOSE = Symbol("projectTaskDispose");
+const PROJECT_MENU_ATTR = "data-tweaker-project-menu";
+const PROJECT_MENU_DISPOSE = Symbol("projectMenuDispose");
+const PROJECT_NATIVE_MENU_ATTR = "data-tweaker-project-native-menu";
+const NATIVE_TASK_PLACEMENTS = new Map();
 const MAX_PROJECT_ROW_END_INSET = 64;
+const TASK_SORT_LABELS = {
+  "created-desc": "Created newest",
+  "created-asc": "Created oldest",
+  "updated-desc": "Updated newest",
+  "updated-asc": "Updated oldest",
+};
+const TASK_SORT_OPTIONS = [
+  { id: "default", label: "Default", value: undefined },
+  ...STATE_TASK_SORT_OPTIONS.map((value) => ({ id: value, label: TASK_SORT_LABELS[value] || value, value })),
+];
+
+function normalizeTaskSort(value) {
+  return TASK_SORT_OPTIONS.some((option) => option.value === value && option.value) ? value : undefined;
+}
 
 function isRemoveProjectMenuItem(item) {
   const label = String(item?.textContent || "").replace(/\s+/g, " ").trim();
   return /^(?:remove|delete)(?: (?:local )?project)?$/i.test(label) || /^remove from\b/i.test(label);
 }
 
-function injectProjectColorMenu(doc, nativeMenu, context, onSelect) {
-  if (!doc?.createElement || !nativeMenu || nativeMenu.querySelector?.(`[${PROJECT_COLOR_MENU_ATTR}="trigger"]`)) return null;
-  const nativeItems = [...new Set([
-    ...(nativeMenu.querySelectorAll?.('[role="menuitem"]') || []),
-    ...(nativeMenu.querySelectorAll?.("button") || []),
-    ...(nativeMenu.querySelectorAll?.("[data-radix-collection-item]") || []),
-  ])];
-  const removeItem = nativeItems.find(isRemoveProjectMenuItem) || null;
-  const template = nativeItems[0];
-  const trigger = doc.createElement("div");
-  trigger.setAttribute("role", "menuitem");
-  trigger.setAttribute("tabindex", "-1");
-  trigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
-  trigger.className = template?.className || "text-token-foreground rounded-lg px-2 py-2 text-sm flex items-center cursor-interaction";
-  const content = doc.createElement("span");
-  content.className = "flex min-w-0 w-full flex-1 items-center justify-between gap-2";
-  const label = doc.createElement("span");
-  label.textContent = "Project color";
-  label.className = "min-w-0 flex-1 truncate";
-  const chevron = doc.createElement("span");
-  chevron.textContent = "›";
-  chevron.className = "text-token-text-secondary";
-  chevron.setAttribute("aria-hidden", "true");
-  content.append(label, chevron);
-  trigger.appendChild(content);
-  const open = (event) => {
+function nativeMenuItemRole(item) {
+  return String(item?.getAttribute?.("role") || "").toLowerCase();
+}
+
+function isNativeMenuCommand(item) {
+  const role = nativeMenuItemRole(item);
+  const tag = String(item?.tagName || "").toUpperCase();
+  return role === "menuitem" || role === "menuitemcheckbox" || role === "menuitemradio"
+    || tag === "BUTTON" || item?.hasAttribute?.("data-radix-collection-item");
+}
+
+function nativeMenuCommandLabel(item) {
+  const text = String(item?.textContent || "").replace(/\s+/g, " ").trim();
+  if (text) return text;
+  for (const attribute of ["aria-label", "title", "data-label"]) {
+    const value = String(item?.getAttribute?.(attribute) || "").replace(/\s+/g, " ").trim();
+    if (value) return value;
+  }
+  return "Untitled command";
+}
+
+function nativeMenuCommandIcon(item) {
+  return item?.querySelector?.('svg, img, [data-slot="icon"]') || null;
+}
+
+function nativeMenuCommandRole(item) {
+  const role = nativeMenuItemRole(item);
+  return role === "menuitemcheckbox" || role === "menuitemradio" ? role : "menuitem";
+}
+
+function nativeMenuCommandChecked(item) {
+  const value = item?.getAttribute?.("aria-checked");
+  return value === "true" || value === "false" || value === "mixed" ? value : null;
+}
+
+function isNativeMenuCommandDisabled(item) {
+  return item?.disabled === true || item?.hasAttribute?.("disabled")
+    || item?.getAttribute?.("aria-disabled") === "true" || item?.getAttribute?.("data-disabled") === "true";
+}
+
+// Snapshot real host commands once. The replay closure deliberately retains the
+// exact DOM command that Codex opened, rather than trying to infer behavior
+// from labels (especially for destructive or future commands).
+function snapshotNativeProjectMenuCommands(nativeMenu) {
+  const candidateSet = new Set([
+    ...(nativeMenu?.querySelectorAll?.('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]') || []),
+    ...(nativeMenu?.querySelectorAll?.("button") || []),
+    ...(nativeMenu?.querySelectorAll?.("[data-radix-collection-item]") || []),
+  ]);
+  const descendants = [];
+  const visit = (node) => {
+    for (const child of node?.children || []) {
+      descendants.push(child);
+      visit(child);
+    }
+  };
+  visit(nativeMenu);
+  const candidates = descendants.filter((item) => candidateSet.has(item) && isNativeMenuCommand(item));
+  return candidates
+    .filter((item) => !candidates.some((other) => other !== item
+      && /^(?:menuitem|menuitemcheckbox|menuitemradio)$/.test(nativeMenuItemRole(other)) && other.contains?.(item)))
+    .map((item, order) => ({
+      label: nativeMenuCommandLabel(item),
+      disabled: isNativeMenuCommandDisabled(item),
+      icon: nativeMenuCommandIcon(item),
+      role: nativeMenuCommandRole(item),
+      ariaChecked: nativeMenuCommandChecked(item),
+      order,
+      source: item,
+      replay() {
+        if (this.disabled || this.source?.isConnected === false || typeof this.source?.click !== "function") return false;
+        this.source.click();
+        return true;
+      },
+    }));
+}
+
+function ownedProjectMenuSubmenuContains(doc, target) {
+  return [
+    ...(doc?.querySelectorAll?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`) || []),
+    ...(doc?.querySelectorAll?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`) || []),
+  ].some((submenu) => submenu.contains?.(target));
+}
+
+function disposeOwnedProjectMenuSubmenus(overlay) {
+  const submenus = [
+    ...(overlay?.querySelectorAll?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`) || []),
+    ...(overlay?.querySelectorAll?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`) || []),
+  ];
+  for (const submenu of submenus) {
+    if (typeof submenu[PROJECT_COLOR_DISPOSE] === "function") submenu[PROJECT_COLOR_DISPOSE]();
+    else if (typeof submenu[PROJECT_TASK_DISPOSE] === "function") submenu[PROJECT_TASK_DISPOSE]();
+    else submenu.remove?.();
+  }
+}
+
+function projectMenuSubmenuHost(doc, anchor) {
+  let cursor = anchor;
+  while (cursor) {
+    if (cursor.getAttribute?.(PROJECT_MENU_ATTR) === "overlay") return cursor;
+    cursor = cursor.parentElement;
+  }
+  return doc?.body || null;
+}
+
+function ownedProjectMenuItem(doc, label, template, onSelect, options = {}) {
+  const item = doc.createElement("button");
+  item.type = "button";
+  item.setAttribute("role", options.role || "menuitem");
+  item.setAttribute("tabindex", "-1");
+  if (options.ariaChecked !== null && options.ariaChecked !== undefined) item.setAttribute("aria-checked", options.ariaChecked);
+  item.className = template?.className || "text-token-text-primary hover:bg-token-foreground/10 flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm cursor-interaction";
+  if (options.disabled) {
+    item.disabled = true;
+    item.setAttribute("disabled", "");
+    item.setAttribute("aria-disabled", "true");
+  }
+  const icon = options.icon?.cloneNode?.(true) || null;
+  if (icon) {
+    icon.setAttribute?.("aria-hidden", "true");
+    icon.classList?.add?.("size-4", "shrink-0");
+    item.appendChild(icon);
+  }
+  const text = doc.createElement("span");
+  text.textContent = label;
+  text.className = "min-w-0 flex-1 truncate";
+  item.appendChild(text);
+  if (options.submenu) {
+    const chevron = doc.createElement("span");
+    chevron.textContent = "›";
+    chevron.className = "text-token-text-secondary";
+    chevron.setAttribute("aria-hidden", "true");
+    item.appendChild(chevron);
+  }
+  item.addEventListener("click", (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
-    openProjectColorSubmenu(doc, trigger, context, onSelect);
-  };
-  trigger.addEventListener("click", open);
-  trigger.addEventListener("pointerenter", open);
-  trigger.addEventListener("focus", open);
-  trigger.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " " || event.key === "ArrowRight") open(event);
+    if (!options.disabled) onSelect?.(event);
   });
-  nativeMenu.insertBefore(trigger, removeItem);
-  return trigger;
+  return item;
+}
+
+function nativeProjectMenuIsLive(nativeMenu) {
+  if (!nativeMenu || nativeMenu.isConnected === false) return false;
+  const state = nativeMenu.getAttribute?.("data-state");
+  return state === null || state === "open";
+}
+
+function projectMenuOverlayPlacement(rect, view) {
+  const viewportHeight = Number(view?.innerHeight) || 800;
+  const margin = 8;
+  const maxHeight = Math.max(1, Math.min(
+    Math.max(96, Math.floor(viewportHeight * 0.7)),
+    viewportHeight - (margin * 2),
+  ));
+  // The native portal may fit at its original top edge while the two owned
+  // controls do not. Flip the owned surface upward and cap it to the visible
+  // viewport so its own scroll container remains reachable.
+  const top = Math.max(margin, Math.min(Number(rect?.top) || margin, viewportHeight - maxHeight - margin));
+  return { top, maxHeight };
+}
+
+function firstDocumentMatch(doc, selector) {
+  return doc?.querySelector?.(selector) || doc?.querySelectorAll?.(selector)?.[0] || null;
+}
+
+function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
+  if (!doc?.createElement || !nativeProjectMenuIsLive(nativeMenu) || nativeMenu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR)) return null;
+  const commands = snapshotNativeProjectMenuCommands(nativeMenu);
+  if (!commands.length) return null;
+  const previous = firstDocumentMatch(doc, `[${PROJECT_MENU_ATTR}="overlay"]`);
+  if (typeof previous?.[PROJECT_MENU_DISPOSE] === "function") previous[PROJECT_MENU_DISPOSE]();
+  else previous?.remove?.();
+
+  const rect = nativeMenu.getBoundingClientRect?.();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+  const overlay = doc.createElement("div");
+  overlay.setAttribute("role", "menu");
+  overlay.setAttribute("tabindex", "-1");
+  overlay.setAttribute(PROJECT_MENU_ATTR, "overlay");
+  overlay.className = "fixed z-[10000] flex min-w-[220px] max-h-[70vh] flex-col overflow-y-auto rounded-xl border border-token-border p-1 shadow-lg";
+  overlay.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
+  const placement = projectMenuOverlayPlacement(rect, doc.defaultView);
+  overlay.style?.setProperty?.("left", `${Math.max(8, Number(rect.left) || 8)}px`);
+  overlay.style?.setProperty?.("top", `${placement.top}px`);
+  overlay.style?.setProperty?.("min-width", `${Math.max(160, Number(rect.width) || 220)}px`);
+  overlay.style?.setProperty?.("max-height", `${placement.maxHeight}px`);
+  overlay.style?.setProperty?.("overflow-y", "auto");
+  overlay.style?.setProperty?.("overscroll-behavior", "contain");
+  overlay.style?.setProperty?.("scrollbar-gutter", "stable");
+
+  const interactive = [];
+  const add = (item) => { interactive.push(item); overlay.appendChild(item); return item; };
+  const template = commands[0]?.source;
+  for (const command of commands) {
+    const item = ownedProjectMenuItem(doc, command.label, template, () => {
+      close();
+      command.replay();
+    }, command);
+    item.setAttribute("data-tweaker-project-native-command", String(command.order));
+    add(item);
+  }
+  const divider = doc.createElement("div");
+  divider.setAttribute("role", "separator");
+  divider.className = "my-1 h-px bg-token-border";
+  overlay.appendChild(divider);
+  const openColor = () => openProjectColorSubmenu(doc, colorTrigger, context, async (choice) => {
+    await handlers.saveAppearance?.(context.project.id, choice);
+    close();
+  });
+  const openSort = () => openProjectTaskSortSubmenu(doc, sortTrigger, context, async (taskSort) => {
+    await handlers.saveAppearance?.(context.project.id, { taskSort });
+    close();
+  });
+  const colorTrigger = ownedProjectMenuItem(doc, "Project color", template, openColor, { submenu: true });
+  colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
+  add(colorTrigger);
+  const sortTrigger = ownedProjectMenuItem(doc, "Sort", template, openSort, { submenu: true });
+  sortTrigger.setAttribute(PROJECT_TASK_MENU_ATTR, "sort");
+  add(sortTrigger);
+
+  // Keep keyboard navigation on the same submenu seam as the trigger click.
+  // Calling dispatchEvent with a plain object is rejected by a real DOM node.
+
+  let activeIndex = -1;
+  const focusAt = (position) => {
+    const enabled = interactive.map((item, index) => ({ item, index })).filter(({ item }) => !item.disabled && item.getAttribute?.("aria-disabled") !== "true");
+    if (!enabled.length) return;
+    const match = enabled[((position % enabled.length) + enabled.length) % enabled.length];
+    activeIndex = match.index;
+    for (const { item, index } of interactive.map((item, index) => ({ item, index }))) item.setAttribute("tabindex", index === activeIndex ? "0" : "-1");
+    match.item.focus?.();
+  };
+  const focusRelative = (delta) => {
+    const enabledIndexes = interactive.map((item, index) => ({ item, index })).filter(({ item }) => !item.disabled && item.getAttribute?.("aria-disabled") !== "true").map(({ index }) => index);
+    const current = Math.max(0, enabledIndexes.indexOf(activeIndex));
+    focusAt(current + delta);
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") {
+      if (ownedProjectMenuSubmenuContains(doc, event.target)) return;
+      event.preventDefault?.();
+      close();
+      return;
+    }
+    if (event.key === "ArrowDown") { event.preventDefault?.(); focusRelative(1); return; }
+    if (event.key === "ArrowUp") { event.preventDefault?.(); focusRelative(-1); return; }
+    if (event.key === "Home") { event.preventDefault?.(); focusAt(0); return; }
+    if (event.key === "End") { event.preventDefault?.(); focusAt(-1); return; }
+    if (event.key === "ArrowRight" && (interactive[activeIndex] === colorTrigger || interactive[activeIndex] === sortTrigger)) {
+      event.preventDefault?.();
+      if (interactive[activeIndex] === colorTrigger) openColor();
+      else openSort();
+    }
+  };
+  const onOutside = (event) => {
+    if (overlay.contains?.(event.target) || ownedProjectMenuSubmenuContains(doc, event.target)) return;
+    close();
+  };
+  let closed = false;
+  let nativeObserver = null;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    doc.removeEventListener?.("pointerdown", onOutside, true);
+    doc.removeEventListener?.("keydown", onKeydown, true);
+    nativeObserver?.disconnect?.();
+    disposeOwnedProjectMenuSubmenus(overlay);
+    nativeMenu.removeAttribute?.(PROJECT_NATIVE_MENU_ATTR);
+    overlay[PROJECT_MENU_DISPOSE] = null;
+    overlay.remove?.();
+  };
+  nativeMenu.setAttribute(PROJECT_NATIVE_MENU_ATTR, "hidden");
+  overlay[PROJECT_MENU_DISPOSE] = close;
+  // Keep the owned surface inside the native portal. Codex's dismissable-menu
+  // boundary therefore still treats a click in our dropdown as inside the
+  // opened portal, while the source command elements remain available to
+  // replay their real click semantics.
+  nativeMenu.appendChild(overlay);
+  doc.addEventListener?.("pointerdown", onOutside, true);
+  doc.addEventListener?.("keydown", onKeydown, true);
+  if (typeof MutationObserver === "function") {
+    nativeObserver = new MutationObserver(() => {
+      if (!nativeProjectMenuIsLive(nativeMenu)) close();
+    });
+    nativeObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-state"] });
+  }
+  focusAt(0);
+  return overlay;
 }
 
 function openProjectColorSubmenu(doc, anchor, context, onSelect) {
@@ -2018,7 +2329,7 @@ function openProjectColorSubmenu(doc, anchor, context, onSelect) {
   };
   const onKeydown = (event) => { if (event.key === "Escape") close(); };
   submenu[PROJECT_COLOR_DISPOSE] = close;
-  doc.body.appendChild(submenu);
+  projectMenuSubmenuHost(doc, anchor)?.appendChild(submenu);
   checkedItem?.scrollIntoView?.({ block: "nearest" });
   doc.addEventListener?.("pointerdown", onOutside, true);
   doc.addEventListener?.("keydown", onKeydown, true);
@@ -2067,11 +2378,12 @@ function installProjectColorControls(api, getState, saveAppearance) {
     if (!pending || requestId !== id || pending !== context) return;
     const nativeMenu = findNativeProjectMenu(document, context);
     if (!nativeMenu) return;
-    const trigger = injectProjectColorMenu(document, nativeMenu, context, async (choice) => {
-      await saveAppearance?.(context.project.id, choice);
-      nativeMenu.remove?.();
-    });
-    if (trigger) api.log?.info?.("Project color menu injected", { projectId: context.project.id, source: context.source });
+    const overlay = interceptNativeProjectMenu(document, nativeMenu, context, { saveAppearance });
+    if (overlay) {
+      api.log?.info?.("Project menu intercepted", { projectId: context.project.id, source: context.source });
+      pending = null;
+      stopMenuObserver();
+    }
   };
   const stopMenuObserver = () => {
     menuObserver?.disconnect?.();
@@ -2126,7 +2438,7 @@ function resolveProjectContext(api, state, target) {
     const container = element.closest?.('[role="listitem"]') || element;
     if (!(element === target || element.contains(target) || target.contains?.(element) || (targetContainer && targetContainer === container))) continue;
     const identity = element.getAttribute?.("data-app-action-sidebar-project-id") || element.getAttribute?.("data-workspace-path") || element.getAttribute?.("data-project-path");
-    const project = projectForNativeIdentity(projects, projectLabelForRow(element), identity);
+    const project = unambiguousProjectForNativeIdentity(projects, projectLabelForRow(element), identity);
     if (project) return { project, element, container, source: "semantic" };
   }
   if (!(targetContainer instanceof HTMLElement)) return null;
@@ -2135,9 +2447,21 @@ function resolveProjectContext(api, state, target) {
   if (!donorRowShape) return null;
   const label = projectLabelForRow(projectAction instanceof HTMLElement ? projectAction : targetContainer);
   const identity = projectAction?.getAttribute?.("data-app-action-sidebar-project-id") || targetContainer.getAttribute?.("data-workspace-path") || targetContainer.getAttribute?.("data-project-path");
-  const project = projectForNativeIdentity(projects, label, identity);
+  const project = unambiguousProjectForNativeIdentity(projects, label, identity);
   if (!project) return null;
   return { project, element: projectAction instanceof HTMLElement ? projectAction : targetContainer, container: targetContainer, source: "live-row" };
+}
+
+function unambiguousProjectForNativeIdentity(projects, label, identity) {
+  const list = Array.isArray(projects) ? projects : [];
+  const exact = identity ? list.filter((project) => project.id === identity || project.projectPath === identity
+    || (Array.isArray(project.nativeProjectIds) && project.nativeProjectIds.includes(identity))
+    || (Array.isArray(project.nativeProjectPaths) && project.nativeProjectPaths.includes(identity))) : [];
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null;
+  const names = list.filter((project) => projectNativeNames(project)
+    .some((name) => label === name || label.startsWith(`${name} `) || label.startsWith(`${name} ·`)));
+  return names.length === 1 ? names[0] : null;
 }
 
 function nativeProjectSurfaceFingerprint(api) {
@@ -2150,14 +2474,15 @@ function nativeProjectSurfaceFingerprint(api) {
 
 function findNativeProjectMenu(doc, context = {}) {
   const menus = [...(doc?.querySelectorAll?.('[role="menu"]') || [])]
-    .filter((menu) => menu.getAttribute?.("data-state") === "open" && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR))
+    .filter((menu) => menu.getAttribute?.("data-state") === "open" && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR))
     .filter((menu) => [...(menu.querySelectorAll?.('[role="menuitem"]') || [])]
       .some(isRemoveProjectMenuItem))
     .map((menu) => ({ menu, rect: menu.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0);
-  const x = Number.isFinite(context.x) ? context.x : 0;
-  const y = Number.isFinite(context.y) ? context.y : 0;
-  return menus.sort((a, b) => (Math.abs(a.rect.left - x) + Math.abs(a.rect.top - y)) - (Math.abs(b.rect.left - x) + Math.abs(b.rect.top - y)))[0]?.menu || null;
+  // A browser event may arrive while a previous portal is animating out. With
+  // more than one matching command surface, there is no safe way to bind it to
+  // this project row. Preserve Codex's native menus rather than guessing.
+  return menus.length === 1 ? menus[0].menu : null;
 }
 
 function ensureProjectColorStyle() {
@@ -2205,9 +2530,387 @@ function ensureProjectColorStyle() {
     [data-tweaker-project-custom-color] { -webkit-appearance: none; appearance: none; overflow: hidden; padding: 0 !important; }
     [data-tweaker-project-custom-color]::-webkit-color-swatch-wrapper { padding: 0; }
     [data-tweaker-project-custom-color]::-webkit-color-swatch { border: 0; border-radius: 9999px; }
+    [${PROJECT_NATIVE_MENU_ATTR}] { visibility: hidden !important; pointer-events: none !important; }
+    [${PROJECT_NATIVE_MENU_ATTR}] [${PROJECT_MENU_ATTR}="overlay"] { visibility: visible !important; pointer-events: auto !important; }
+    [${PROJECT_MENU_ATTR}="overlay"] { color-scheme: light dark; }
     [${PROJECT_COLOR_MENU_ATTR}="submenu"] { color-scheme: light dark; }
   `;
   return style;
+}
+
+function taskIdForRow(row) {
+  const candidate = row?.getAttribute?.("data-app-action-sidebar-thread-id")
+    || row?.querySelector?.("[data-app-action-sidebar-thread-id]")?.getAttribute?.("data-app-action-sidebar-thread-id");
+  const value = typeof candidate === "string" ? candidate.trim() : "";
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(value) ? value : null;
+}
+
+function taskTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const milliseconds = Math.abs(value) < 100_000_000_000 ? value * 1_000 : value;
+    return Math.abs(milliseconds) <= 8_640_000_000_000_000 ? milliseconds : null;
+  }
+  if (typeof value !== "string" || value.length > 80) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && value.trim() !== "") return taskTimestamp(numeric);
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function taskTimestampKeys(kind) {
+  return kind === "created"
+    ? ["createdAt", "created_at", "createdTime", "creationTime", "createdTimestamp"]
+    : ["updatedAt", "updated_at", "updatedTime", "lastUpdatedAt", "lastModifiedAt", "updatedTimestamp"];
+}
+
+function taskTimestampFromRecord(value, taskId, kind, limits = {}) {
+  const maxDepth = limits.maxDepth || 5;
+  const maxNodes = limits.maxNodes || 240;
+  const timestampKeys = taskTimestampKeys(kind);
+  const seen = new Set();
+  let visited = 0;
+  let result = null;
+  const visit = (item, depth) => {
+    if (result !== null || !isRecord(item) || depth > maxDepth || visited >= maxNodes || seen.has(item)) return;
+    seen.add(item);
+    visited += 1;
+    const identity = item.threadId || item.thread_id || item.conversationId || item.conversation_id || item.taskId || item.task_id || item.id;
+    if (identity === taskId) {
+      for (const key of timestampKeys) {
+        const parsed = taskTimestamp(item[key]);
+        if (parsed !== null) { result = parsed; return; }
+      }
+    }
+    for (const child of Object.values(item)) {
+      if (isRecord(child)) visit(child, depth + 1);
+      else if (Array.isArray(child) && depth < maxDepth) {
+        for (const entry of child) visit(entry, depth + 1);
+      }
+      if (result !== null) return;
+    }
+  };
+  visit(value, 0);
+  return result;
+}
+
+function taskTimestampFromFiber(api, row, taskId, kind) {
+  const attributeNames = kind === "created"
+    ? ["data-created-at", "data-created-time"]
+    : ["data-updated-at", "data-updated-time"];
+  for (const attribute of attributeNames) {
+    const parsed = taskTimestamp(row?.getAttribute?.(attribute));
+    if (parsed !== null) return parsed;
+  }
+  let fiber = api?.react?.getFiber?.(row) || null;
+  for (let depth = 0; fiber && depth < 18; depth += 1, fiber = fiber.return) {
+    const props = taskTimestampFromRecord(fiber.memoizedProps, taskId, kind);
+    if (props !== null) return props;
+    const state = taskTimestampFromRecord(fiber.memoizedState, taskId, kind);
+    if (state !== null) return state;
+  }
+  return null;
+}
+
+function taskRecordsForRows(api, rows) {
+  return rows.map((row, nativeIndex) => {
+    const id = taskIdForRow(row);
+    return {
+      row,
+      id,
+      nativeIndex,
+      createdAt: id ? taskTimestampFromFiber(api, row, id, "created") : null,
+      updatedAt: id ? taskTimestampFromFiber(api, row, id, "updated") : null,
+    };
+  });
+}
+
+function orderProjectTaskRecords(records, taskSort, pinnedTaskIds) {
+  const sort = normalizeTaskSort(taskSort);
+  if (!sort) return [...records].sort((left, right) => left.nativeIndex - right.nativeIndex);
+  const pinned = new Set(Array.isArray(pinnedTaskIds) ? pinnedTaskIds.map(String) : []);
+  const sortKey = sort.startsWith("created") ? "createdAt" : "updatedAt";
+  const direction = sort.endsWith("-asc") ? 1 : -1;
+  const sortPartition = (partition) => {
+    const dated = partition.filter((record) => Number.isFinite(record[sortKey]));
+    const undated = partition.filter((record) => !Number.isFinite(record[sortKey]));
+    dated.sort((left, right) => {
+      if (left[sortKey] !== right[sortKey]) return direction * (left[sortKey] - right[sortKey]);
+      return left.nativeIndex - right.nativeIndex;
+    });
+    // Never manufacture a timestamp from task text. Rows without a usable
+    // date remain in their native relative order after the dated partition.
+    undated.sort((left, right) => left.nativeIndex - right.nativeIndex);
+    return [...dated, ...undated];
+  };
+  const localPins = records.filter((record) => !!record.id && pinned.has(String(record.id)));
+  const unpinned = records.filter((record) => !record.id || !pinned.has(String(record.id)));
+  return [...sortPartition(localPins), ...sortPartition(unpinned)];
+}
+
+function pruneDetachedTaskPlacements() {
+  let removed = 0;
+  for (const parent of [...NATIVE_TASK_PLACEMENTS.keys()]) {
+    if (parent?.isConnected !== false) continue;
+    NATIVE_TASK_PLACEMENTS.delete(parent);
+    removed += 1;
+  }
+  return removed;
+}
+
+function rememberNativeTaskOrder(parent, records) {
+  pruneDetachedTaskPlacements();
+  if (!parent || NATIVE_TASK_PLACEMENTS.has(parent)) return;
+  const siblings = [...(parent.children || [])];
+  NATIVE_TASK_PLACEMENTS.set(parent, records.map((record) => {
+    const index = siblings.indexOf(record.row);
+    return { row: record.row, nextSibling: index >= 0 ? (siblings[index + 1] || null) : null };
+  }));
+}
+
+function restoreProjectTaskOrder(container = null) {
+  pruneDetachedTaskPlacements();
+  for (const [parent, placements] of [...NATIVE_TASK_PLACEMENTS]) {
+    if (container && parent !== container && !container.contains?.(parent)) continue;
+    for (let index = placements.length - 1; index >= 0; index -= 1) {
+      const { row, nextSibling } = placements[index];
+      if (row?.parentElement !== parent) continue;
+      if (nextSibling && nextSibling.parentElement !== parent) continue;
+      row.remove?.();
+      parent.insertBefore?.(row, nextSibling);
+    }
+    NATIVE_TASK_PLACEMENTS.delete(parent);
+  }
+}
+
+function contiguousTaskRuns(records) {
+  const runs = [];
+  for (const record of records) {
+    const parent = record.row?.parentElement;
+    const current = runs[runs.length - 1];
+    const previous = current?.[current.length - 1];
+    const siblings = [...(parent?.children || [])];
+    if (!current || previous?.row?.parentElement !== parent
+      || siblings.indexOf(previous.row) + 1 !== siblings.indexOf(record.row)) {
+      runs.push([record]);
+    } else {
+      current.push(record);
+    }
+  }
+  return runs;
+}
+
+function reorderProjectTaskRows(api, container, project) {
+  const sort = normalizeTaskSort(project?.taskSort);
+  if (!sort) {
+    restoreProjectTaskOrder(container);
+    return 0;
+  }
+  if (!container?.querySelectorAll) return 0;
+  const rows = [...container.querySelectorAll('[role="listitem"]')]
+    .filter((row) => row !== container && !row.closest?.('[data-tweaker-project-color-row]'))
+    .filter((row) => taskIdForRow(row));
+  const records = taskRecordsForRows(api, rows);
+  const byParent = new Map();
+  for (const record of records) {
+    const parent = record.row?.parentElement;
+    if (!parent) continue;
+    const list = byParent.get(parent) || [];
+    list.push(record);
+    byParent.set(parent, list);
+  }
+  let changed = 0;
+  for (const group of byParent.values()) {
+    for (const run of contiguousTaskRuns(group)) {
+      const ordered = orderProjectTaskRecords(run, sort, project?.pinnedTaskIds);
+      if (ordered.every((record, index) => record === run[index])) continue;
+      const parent = run[0]?.row?.parentElement;
+      const siblings = [...(parent?.children || [])];
+      const finalNativeIndex = siblings.indexOf(run[run.length - 1].row);
+      const anchor = finalNativeIndex >= 0 ? (siblings[finalNativeIndex + 1] || null) : null;
+      rememberNativeTaskOrder(parent, group);
+      for (const record of ordered) {
+        record.row.remove?.();
+        parent?.insertBefore?.(record.row, anchor);
+      }
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
+function taskRowsForContainer(container) {
+  return [...(container?.querySelectorAll?.('[role="listitem"]') || [])]
+    .filter((row) => row !== container && taskIdForRow(row));
+}
+
+function resolveProjectTaskContext(api, state, target) {
+  if (!state?.nodes || !(target instanceof Element)) return null;
+  const row = closestThreadRow(target);
+  const taskId = taskIdForRow(row);
+  if (!taskId) return null;
+  const group = row?.closest?.("[data-tweaker-project-color-group]");
+  const projectId = group?.getAttribute?.("data-tweaker-project-id");
+  const project = state.nodes.find((node) => node.type === "project" && node.id === projectId);
+  if (!project) return null;
+  return { project, row, taskId, group };
+}
+
+function isNativeTaskPinMenuItem(item) {
+  const label = String(item?.textContent || "").replace(/\s+/g, " ").trim();
+  return /^(?:un)?pin$/i.test(label);
+}
+
+function findNativeTaskMenu(doc) {
+  const menus = [...(doc?.querySelectorAll?.('[role="menu"]') || [])]
+    .filter((menu) => menu.getAttribute?.("data-state") === "open"
+      && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_TASK_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR))
+    .filter((menu) => [...(menu.querySelectorAll?.('[role="menuitem"]') || [])].some(isNativeTaskPinMenuItem))
+    .map((menu) => ({ menu, rect: menu.getBoundingClientRect?.() }))
+    .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0);
+  return menus.length === 1 ? menus[0].menu : null;
+}
+
+function addMenuButton(doc, label, template, onClick) {
+  const item = doc.createElement("div");
+  item.setAttribute("role", "menuitem");
+  item.setAttribute("tabindex", "-1");
+  item.className = template?.className || "text-token-foreground rounded-lg px-2 py-2 text-sm flex items-center cursor-interaction";
+  item.textContent = label;
+  item.addEventListener("click", (event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    onClick?.();
+  });
+  return item;
+}
+
+function injectProjectTaskPinMenu(doc, nativeMenu, context, onSelect) {
+  if (!doc?.createElement || !nativeMenu || nativeMenu.querySelector?.(`[${PROJECT_TASK_MENU_ATTR}="pin"]`)) return null;
+  const items = [...(nativeMenu.querySelectorAll?.('[role="menuitem"]') || [])];
+  const nativePin = items.find(isNativeTaskPinMenuItem);
+  if (!nativePin) return null;
+  const isPinned = new Set(Array.isArray(context?.project?.pinnedTaskIds) ? context.project.pinnedTaskIds.map(String) : []).has(String(context.taskId));
+  const local = addMenuButton(doc, isPinned ? "Unpin from project" : "Pin in project", nativePin, () => onSelect?.(!isPinned));
+  local.setAttribute(PROJECT_TASK_MENU_ATTR, "pin");
+  nativeMenu.insertBefore(local, nativePin);
+  return local;
+}
+
+function openProjectTaskSortSubmenu(doc, anchor, context, onSelect) {
+  const previous = doc.body.querySelector?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`);
+  if (typeof previous?.[PROJECT_TASK_DISPOSE] === "function") previous[PROJECT_TASK_DISPOSE]();
+  else previous?.remove?.();
+  const submenu = doc.createElement("div");
+  submenu.setAttribute("role", "menu");
+  submenu.setAttribute(PROJECT_TASK_MENU_ATTR, "sort-submenu");
+  submenu.className = "fixed z-[10000] flex min-w-[220px] flex-col rounded-xl border border-token-border p-1 shadow-lg";
+  submenu.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
+  const rect = anchor?.getBoundingClientRect?.();
+  const viewportWidth = Number(doc.defaultView?.innerWidth) || 1200;
+  const right = Number(rect?.right) || 8;
+  submenu.style?.setProperty?.("left", `${right + 220 <= viewportWidth - 8 ? right : Math.max(8, (Number(rect?.left) || right) - 220)}px`);
+  submenu.style?.setProperty?.("top", `${Math.max(8, Number(rect?.top) || 8)}px`);
+  const current = normalizeTaskSort(context?.project?.taskSort);
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    doc.removeEventListener?.("pointerdown", onOutside, true);
+    doc.removeEventListener?.("keydown", onKeydown, true);
+    submenu[PROJECT_TASK_DISPOSE] = null;
+    submenu.remove?.();
+  };
+  const onOutside = (event) => {
+    if (submenu.contains?.(event.target) || anchor?.contains?.(event.target)) return;
+    close();
+  };
+  const onKeydown = (event) => { if (event.key === "Escape") close(); };
+  for (const option of TASK_SORT_OPTIONS) {
+    const item = doc.createElement("button");
+    item.type = "button";
+    item.setAttribute("role", "menuitemradio");
+    item.setAttribute("aria-checked", String(option.value === current));
+    item.className = "flex min-h-8 items-center justify-between rounded-md px-2 text-left text-sm text-token-text-primary hover:bg-token-foreground/10";
+    item.textContent = option.label;
+    if (option.value === current) {
+      const check = doc.createElement("span");
+      check.textContent = "✓";
+      item.appendChild(check);
+    }
+    item.addEventListener("click", (event) => {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      onSelect?.(option.value);
+      close();
+    });
+    submenu.appendChild(item);
+  }
+  submenu[PROJECT_TASK_DISPOSE] = close;
+  projectMenuSubmenuHost(doc, anchor)?.appendChild(submenu);
+  doc.addEventListener?.("pointerdown", onOutside, true);
+  doc.addEventListener?.("keydown", onKeydown, true);
+  return submenu;
+}
+
+function installProjectTaskControls(api, getState, saveProject) {
+  if (typeof document === "undefined") return () => {};
+  let pending = null;
+  let requestId = 0;
+  let menuObserver = null;
+  let menuTimer = null;
+  const stopMenuObserver = () => {
+    menuObserver?.disconnect?.();
+    menuObserver = null;
+    if (menuTimer !== null) window.clearTimeout(menuTimer);
+    menuTimer = null;
+  };
+  const savePins = async (context, pinned) => {
+    const ids = Array.isArray(context.project.pinnedTaskIds) ? context.project.pinnedTaskIds.map(String) : [];
+    const next = pinned ? [...ids.filter((id) => id !== context.taskId), context.taskId] : ids.filter((id) => id !== context.taskId);
+    if (next.length > MAX_PINNED_TASK_IDS) {
+      window.alert(`This project already has ${MAX_PINNED_TASK_IDS} pinned tasks. Unpin one task first.`);
+      return;
+    }
+    await saveProject?.(context.project.id, { pinnedTaskIds: next });
+  };
+  const inject = (context, id) => {
+    if (!pending || pending !== context || requestId !== id) return;
+    const nativeMenu = findNativeTaskMenu(document);
+    if (!nativeMenu) return;
+    injectProjectTaskPinMenu(document, nativeMenu, context, async (pinned) => {
+      await savePins(context, pinned);
+      nativeMenu.remove?.();
+    });
+  };
+  const seed = (event) => {
+    const context = resolveProjectTaskContext(api, getState?.(), event.target);
+    if (!context) return;
+    stopMenuObserver();
+    const rect = context.row?.getBoundingClientRect?.();
+    pending = { ...context, x: Number.isFinite(event.clientX) ? event.clientX : (rect?.right || 0), y: Number.isFinite(event.clientY) ? event.clientY : (rect?.top || 0) };
+    const id = ++requestId;
+    inject(pending, id);
+    menuObserver = new MutationObserver(() => inject(pending, id));
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+    menuTimer = window.setTimeout(() => {
+      if (requestId === id) pending = null;
+      stopMenuObserver();
+    }, 1_500);
+  };
+  document.addEventListener("contextmenu", seed, true);
+  document.addEventListener("pointerdown", seed, true);
+  document.addEventListener("click", seed, true);
+  return () => {
+    document.removeEventListener("contextmenu", seed, true);
+    document.removeEventListener("pointerdown", seed, true);
+    document.removeEventListener("click", seed, true);
+    stopMenuObserver();
+    requestId += 1;
+    pending = null;
+  };
 }
 
 function applyNativeProjectColors(api, state) {
@@ -2227,6 +2930,7 @@ function applyNativeProjectColors(api, state) {
     const header = projectHeaderForMatch(row, container, project);
     markProjectColorNode(container, "data-tweaker-project-color-group", project);
     markProjectColorNode(header, "data-tweaker-project-color-row", project);
+    reorderProjectTaskRows(api, container, project);
     for (const icon of header.querySelectorAll?.("svg") || []) icon.setAttribute?.("data-tweaker-project-color-icon", "true");
     const projectNames = new Set(projectNativeNames(project));
     const title = [...(header.querySelectorAll?.("span") || [])]
@@ -2797,25 +3501,55 @@ function clearNativeProjectColors() {
 
 function removeProjectColorArtifacts() {
   if (typeof document === "undefined") return;
+  restoreProjectTaskOrder();
   clearNativeProjectColors();
   document.querySelectorAll(`[${PROJECT_COLOR_MENU_ATTR}]`).forEach((node) => {
     if (typeof node[PROJECT_COLOR_DISPOSE] === "function") node[PROJECT_COLOR_DISPOSE]();
     else node.remove();
   });
+  document.querySelectorAll(`[${PROJECT_TASK_MENU_ATTR}]`).forEach((node) => {
+    if (typeof node[PROJECT_TASK_DISPOSE] === "function") node[PROJECT_TASK_DISPOSE]();
+    else node.remove();
+  });
+  document.querySelectorAll(`[${PROJECT_MENU_ATTR}]`).forEach((node) => {
+    if (typeof node[PROJECT_MENU_DISPOSE] === "function") node[PROJECT_MENU_DISPOSE]();
+    else node.remove();
+  });
+  document.querySelectorAll(`[${PROJECT_NATIVE_MENU_ATTR}]`).forEach((node) => node.removeAttribute?.(PROJECT_NATIVE_MENU_ATTR));
   document.getElementById(PROJECT_COLOR_STYLE_ID)?.remove();
 }
 
 module.exports = {
   PROJECT_COLOR_MENU_ATTR,
-  injectProjectColorMenu,
+  PROJECT_MENU_ATTR,
+  PROJECT_NATIVE_MENU_ATTR,
+  snapshotNativeProjectMenuCommands,
+  interceptNativeProjectMenu,
   openProjectColorSubmenu,
   openNativeProjectEditDialog,
   installProjectColorControls,
   resolveProjectContext,
+  unambiguousProjectForNativeIdentity,
   nativeProjectSurfaceFingerprint,
   findNativeProjectMenu,
   ensureProjectColorStyle,
   applyNativeProjectColors,
+  normalizeTaskSort,
+  taskIdForRow,
+  taskTimestamp,
+  taskTimestampFromRecord,
+  taskTimestampFromFiber,
+  taskRecordsForRows,
+  orderProjectTaskRecords,
+  reorderProjectTaskRows,
+  pruneDetachedTaskPlacements,
+  restoreProjectTaskOrder,
+  taskRowsForContainer,
+  resolveProjectTaskContext,
+  findNativeTaskMenu,
+  injectProjectTaskPinMenu,
+  openProjectTaskSortSubmenu,
+  installProjectTaskControls,
   collectProjectIdentities,
   projectIdFromPinnedFiber,
   pinnedProjectRows,
@@ -3643,6 +4377,7 @@ function startRenderer(api) {
   let latestNativeProjects = [];
   let latestSurfaceFingerprint = null;
   let aliasRefreshRequest = 0;
+  let revisionRefreshRequest = 0;
   let selectedSettingsProjectId = null;
   let resizeObserver = null;
   const apply = () => {
@@ -3660,6 +4395,9 @@ function startRenderer(api) {
   };
   const saveAppearance = async (projectId, choice) => {
     if (!latestState || !projectId) return;
+    const taskOrderingChange = Object.prototype.hasOwnProperty.call(choice || {}, "taskSort")
+      || Object.prototype.hasOwnProperty.call(choice || {}, "pinnedTaskIds");
+    const changeLabel = taskOrderingChange ? "project task order" : "project color";
     try {
       const nodes = latestState.nodes.map((node) => node.id === projectId ? { ...node, ...choice } : node);
       const response = await api.ipc.invoke(IPC, {
@@ -3668,8 +4406,15 @@ function startRenderer(api) {
         baseRevision: latestRevision,
       });
       if (!response?.ok) {
-        api.log?.warn?.("project appearance save failed", response?.error?.code || "unknown");
-        window.alert("Could not save the project color.");
+        const code = response?.error?.code || "unknown";
+        api.log?.warn?.(`${changeLabel} save failed`, code);
+        if (code === "stale-revision") {
+          const current = await api.ipc.invoke(IPC, { action: "get" });
+          if (acceptResponse(current)) apply();
+          window.alert(`Could not save the ${changeLabel} because this project changed. Try again.`);
+          return;
+        }
+        window.alert(`Could not save the ${changeLabel}.`);
         return;
       }
       latestState = state.bindNativeProjectIdentities(response.state, latestNativeProjects);
@@ -3677,13 +4422,17 @@ function startRenderer(api) {
       apply();
       window.dispatchEvent(new CustomEvent("tweaker:projects-color-change", { detail: { projectId } }));
     } catch (error) {
-      api.log?.warn?.("project appearance save failed", String(error));
-      window.alert("Could not save the project color.");
+      api.log?.warn?.(`${changeLabel} save failed`, String(error));
+      window.alert(`Could not save the ${changeLabel}.`);
     }
   };
   const removeRevision = api.ipc.on?.("revision", (payload) => {
     if (typeof payload?.revision === "string" && /^[a-f0-9]{32}$/.test(payload.revision)) {
       window.dispatchEvent(new CustomEvent("tweaker:projects-revision", { detail: { revision: payload.revision } }));
+      const request = ++revisionRefreshRequest;
+      api.ipc.invoke(IPC, { action: "get" }).then((response) => {
+        if (request === revisionRefreshRequest && acceptResponse(response)) apply();
+      }).catch(() => {});
     }
   });
   const handle = api.settings.registerPage({
@@ -3714,6 +4463,7 @@ function startRenderer(api) {
     }).catch(() => {});
   });
   const removeColorControls = sidebar.installProjectColorControls(api, () => latestState, saveAppearance);
+  const removeTaskControls = sidebar.installProjectTaskControls(api, () => latestState, saveAppearance);
   const removeEditProjectControls = settingsPresenter.installEditProjectDialogControls(
     api,
     () => latestState,
@@ -3728,10 +4478,12 @@ function startRenderer(api) {
   return {
     unregister() {
       aliasRefreshRequest += 1;
+      revisionRefreshRequest += 1;
       removeRevision?.();
       removeHostObserver?.();
       resizeObserver?.dispose();
       removeColorControls?.();
+      removeTaskControls?.();
       removeEditProjectControls?.();
       sidebar.removeProjectColorArtifacts();
       handle.unregister?.();
