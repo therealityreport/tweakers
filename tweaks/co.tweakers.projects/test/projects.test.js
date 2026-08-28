@@ -79,49 +79,260 @@ test("legacy UI Improvements color preferences import by normalized project name
   assert.equal(result.state.nodes[0].overlayIntensity, "strong");
 });
 
-test("current native project menu receives one working Project color item before Remove local project", () => {
+test("project menu interception snapshots native commands in order and replays their own handlers", () => {
   const document = new FakeDocument();
   document.defaultView = { innerHeight: 800, innerWidth: 400 };
   const menu = document.createElement("div");
   menu.setAttribute("role", "menu");
+  menu.setAttribute("data-state", "open");
+  menu.rect = { left: 260, top: 700, right: 400, bottom: 760, width: 140, height: 60 };
+  const calls = [];
+  const edit = document.createElement("div");
+  edit.setAttribute("role", "menuitem");
+  edit.textContent = "Edit project";
+  const icon = document.createElement("svg");
+  edit.appendChild(icon);
+  edit.click = () => calls.push("edit");
+  const reveal = document.createElement("button");
+  reveal.textContent = "Reveal in Finder";
+  reveal.click = () => calls.push("reveal");
   const remove = document.createElement("div");
   remove.setAttribute("role", "menuitem");
   remove.textContent = "Remove local project";
-  menu.appendChild(remove);
-  const selections = [];
+  remove.setAttribute("aria-disabled", "true");
+  remove.click = () => calls.push("remove");
+  menu.append(edit, reveal, remove);
+  document.body.appendChild(menu);
   const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
 
-  _test.injectProjectColorMenu(document, menu, context, (choice) => selections.push(choice));
-  _test.injectProjectColorMenu(document, menu, context, (choice) => selections.push(choice));
+  const snapshot = _test.snapshotNativeProjectMenuCommands(menu);
+  assert.deepEqual(snapshot.map(({ label, disabled, order }) => ({ label, disabled, order })), [
+    { label: "Edit project", disabled: false, order: 0 },
+    { label: "Reveal in Finder", disabled: false, order: 1 },
+    { label: "Remove local project", disabled: true, order: 2 },
+  ]);
+  assert.equal(snapshot[0].icon, icon);
 
-  assert.equal(menu.querySelectorAll('[data-tweaker-project-color-menu="trigger"]').length, 1);
-  const trigger = menu.querySelector('[data-tweaker-project-color-menu="trigger"]');
-  assert.equal(trigger.children.length, 1);
-  const triggerContent = trigger.children[0];
-  assert.match(triggerContent.className, /\bflex\b/);
-  assert.match(triggerContent.className, /\bitems-center\b/);
-  assert.match(triggerContent.className, /\bjustify-between\b/);
-  assert.equal(triggerContent.children[0].textContent, "Project color");
-  assert.equal(triggerContent.children[1].textContent, "›");
-  assert.equal(triggerContent.children[1].getAttribute("aria-hidden"), "true");
-  trigger.rect = { left: 260, top: 700, right: 300, bottom: 730, width: 40, height: 30 };
-  assert.equal(menu.children.indexOf(trigger) < menu.children.indexOf(remove), true);
-  trigger.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {}, stopPropagation() {} });
-  assert.equal(document.listenerCount(), 2);
-  trigger.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  assert.equal(document.body.querySelectorAll('[data-tweaker-project-color-menu="submenu"]').length, 1);
-  const submenu = document.body.querySelector('[data-tweaker-project-color-menu="submenu"]');
-  assert.equal(submenu.style.values.get("overflow-y"), "auto");
-  assert.equal(submenu.style.values.get("overscroll-behavior"), "contain");
-  assert.equal(submenu.style.values.get("scrollbar-gutter"), "stable");
-  assert.equal(submenu.style.values.get("max-height"), "560px");
-  assert.equal(submenu.style.values.get("top"), "232px");
-  assert.equal(submenu.style.values.get("left"), "40px");
-  assert.equal(document.listenerCount(), 2, "reopening disposes the prior submenu listeners");
-  const blue = document.body.querySelector('[data-color-id="blue"]');
-  assert.ok(blue);
+  const overlay = _test.interceptNativeProjectMenu(document, menu, context);
+  assert.equal(menu.getAttribute("data-tweaker-project-native-menu"), "hidden");
+  assert.equal(overlay.style.values.get("left"), "260px");
+  assert.equal(overlay.style.values.get("top"), "232px", "the owned menu flips upward so its added controls remain visible");
+  assert.equal(overlay.style.values.get("max-height"), "560px");
+  assert.equal(overlay.style.values.get("min-width"), "160px");
+  assert.equal(overlay.style.values.get("overflow-y"), "auto");
+  assert.equal(overlay.style.values.get("overscroll-behavior"), "contain");
+  assert.equal(overlay.style.values.get("scrollbar-gutter"), "stable");
+  const commands = overlay.querySelectorAll("[data-tweaker-project-native-command]");
+  assert.deepEqual(commands.map((node) => node.getAttribute("data-tweaker-project-native-command")), ["0", "1", "2"]);
+  assert.equal(commands[0].children[0].tagName, "SVG", "the native command icon is cloned into the owned menu");
+  assert.equal(commands[2].getAttribute("aria-disabled"), "true");
+  commands[2].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.deepEqual(calls, [], "disabled native commands remain disabled");
+  assert.ok(overlay.querySelector('[data-tweaker-project-color-menu="trigger"]'));
+  assert.ok(overlay.querySelector('[data-tweaker-project-task-menu="sort"]'));
+  commands[0].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.deepEqual(calls, ["edit"], "the original native command receives the replayed click");
+  assert.equal(menu.getAttribute("data-tweaker-project-native-menu"), null);
+  assert.equal(overlay.parentElement, null);
+});
+
+test("project menu portal and identity ambiguity fail closed", () => {
+  const document = new FakeDocument();
+  const makeMenu = () => {
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("data-state", "open");
+    menu.rect = { left: 100, top: 100, right: 260, bottom: 180, width: 160, height: 80 };
+    const remove = document.createElement("div");
+    remove.setAttribute("role", "menuitem");
+    remove.textContent = "Remove local project";
+    menu.appendChild(remove);
+    document.body.appendChild(menu);
+    return menu;
+  };
+  assert.equal(_test.findNativeProjectMenu(document, { x: 100, y: 100 }), null, "no portal fails closed");
+  makeMenu(); makeMenu();
+  assert.equal(_test.findNativeProjectMenu(document, { x: 100, y: 100 }), null, "equidistant portals fail closed");
+  assert.equal(_test.unambiguousProjectForNativeIdentity([
+    { id: "one", name: "Same" },
+    { id: "two", name: "Same" },
+  ], "Same", null), null, "duplicate project names do not pick the first match");
+  assert.equal(_test.unambiguousProjectForNativeIdentity([
+    { id: "one", name: "Same" },
+    { id: "two", name: "Same" },
+  ], "Same", "two")?.id, "two", "an exact native identity remains safe");
+});
+
+test("owned menu retains native checked roles and focuses the first enabled command", () => {
+  const document = new FakeDocument();
+  const menu = document.createElement("div");
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("data-state", "open");
+  const disabled = document.createElement("div");
+  disabled.setAttribute("role", "menuitem");
+  disabled.setAttribute("disabled", "");
+  disabled.textContent = "Unavailable";
+  const checkbox = document.createElement("div");
+  checkbox.setAttribute("role", "menuitemcheckbox");
+  checkbox.setAttribute("aria-checked", "true");
+  checkbox.textContent = "Show in sidebar";
+  const radio = document.createElement("div");
+  radio.setAttribute("role", "menuitemradio");
+  radio.setAttribute("aria-checked", "false");
+  radio.textContent = "Compact";
+  menu.append(disabled, checkbox, radio);
+  document.body.appendChild(menu);
+  const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
+
+  const overlay = _test.interceptNativeProjectMenu(document, menu, context);
+  const commands = overlay.querySelectorAll("[data-tweaker-project-native-command]");
+  assert.equal(commands[1].getAttribute("role"), "menuitemcheckbox");
+  assert.equal(commands[1].getAttribute("aria-checked"), "true");
+  assert.equal(commands[2].getAttribute("role"), "menuitemradio");
+  assert.equal(commands[2].getAttribute("aria-checked"), "false");
+  assert.equal(document.activeElement, commands[1], "a leading disabled command cannot make focus skip the first enabled item");
+  document.dispatchEvent({ type: "keydown", key: "Escape", target: overlay, preventDefault() {} });
+  assert.equal(document.listenerCount(), 0);
+});
+
+test("owned project menu keeps Project color and Sort controls on its saved project", async () => {
+  const document = new FakeDocument();
+  const menu = document.createElement("div");
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("data-state", "open");
+  const remove = document.createElement("button"); remove.textContent = "Remove local project"; remove.click = () => {};
+  menu.appendChild(remove);
+  document.body.appendChild(menu);
+  const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
+  const saves = [];
+  const saveAppearance = async (projectId, choice) => { saves.push({ projectId, choice }); };
+
+  let overlay = _test.interceptNativeProjectMenu(document, menu, context, { saveAppearance });
+  overlay.querySelector('[data-tweaker-project-color-menu="trigger"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  const blue = overlay.querySelector('[data-color-id="blue"]');
+  assert.ok(blue, "the color picker stays inside the owned portal");
   blue.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  assert.deepEqual(selections, [{ colorMode: "manual", color: "#1d4ed8" }]);
+  await Promise.resolve();
+  assert.deepEqual(saves, [{ projectId: "p", choice: { colorMode: "manual", color: "#1d4ed8" } }]);
+  assert.equal(overlay.parentElement, null);
+
+  overlay = _test.interceptNativeProjectMenu(document, menu, context, { saveAppearance });
+  overlay.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  const sort = overlay.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
+  assert.ok(sort, "the Sort picker stays inside the owned portal");
+  sort.children[1].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  await Promise.resolve();
+  assert.deepEqual(saves[1], { projectId: "p", choice: { taskSort: "created-desc" } });
+  assert.equal(overlay.parentElement, null);
+  assert.equal(document.listenerCount(), 0);
+});
+
+test("owned project menu supports keyboard, outside pointer, stale portal, and teardown cleanup", (t) => {
+  const previousMutationObserver = global.MutationObserver;
+  let observe;
+  global.MutationObserver = class FakeMutationObserver {
+    constructor(callback) { observe = callback; }
+    observe() {}
+    disconnect() {}
+  };
+  t.after(() => { global.MutationObserver = previousMutationObserver; });
+  const document = new FakeDocument();
+  const previousDocument = global.document;
+  global.document = document;
+  t.after(() => { global.document = previousDocument; });
+  const menu = document.createElement("div");
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("data-state", "open");
+  const edit = document.createElement("button"); edit.textContent = "Edit project"; edit.click = () => {};
+  const remove = document.createElement("button"); remove.textContent = "Remove local project"; remove.click = () => {};
+  menu.append(edit, remove);
+  document.body.appendChild(menu);
+  const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
+  const overlay = _test.interceptNativeProjectMenu(document, menu, context);
+  const colorTrigger = overlay.querySelector('[data-tweaker-project-color-menu="trigger"]');
+  const nativeDispatchEvent = colorTrigger.dispatchEvent.bind(colorTrigger);
+  colorTrigger.dispatchEvent = (event) => {
+    if (!(event instanceof Event)) throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'");
+    return nativeDispatchEvent(event);
+  };
+  assert.throws(
+    () => colorTrigger.dispatchEvent({ type: "click" }),
+    TypeError,
+    "the regression harness rejects the plain object that real DOM dispatchEvent rejects",
+  );
+  document.dispatchEvent({ type: "keydown", key: "ArrowDown", target: overlay, preventDefault() {} });
+  assert.equal(document.activeElement?.getAttribute("data-tweaker-project-native-command"), "1");
+  document.dispatchEvent({ type: "keydown", key: "ArrowDown", target: overlay, preventDefault() {} });
+  document.dispatchEvent({ type: "keydown", key: "ArrowRight", target: colorTrigger, preventDefault() {} });
+  assert.ok(overlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), "ArrowRight opens the submenu without invalid dispatchEvent input");
+  document.dispatchEvent({ type: "keydown", key: "Escape", target: overlay, preventDefault() {} });
+  assert.equal(overlay.parentElement, null, "Escape closes the owned menu");
+
+  const pointerOverlay = _test.interceptNativeProjectMenu(document, menu, context);
+  document.dispatchEvent({ type: "pointerdown", target: document.body });
+  assert.equal(pointerOverlay.parentElement, null, "outside pointer closes the owned menu");
+
+  const staleOverlay = _test.interceptNativeProjectMenu(document, menu, context);
+  menu.setAttribute("data-state", "closed");
+  observe();
+  assert.equal(staleOverlay.parentElement, null, "a stale native portal closes the owned menu");
+  assert.equal(menu.getAttribute("data-tweaker-project-native-menu"), null);
+
+  menu.setAttribute("data-state", "open");
+  const cleanupOverlay = _test.interceptNativeProjectMenu(document, menu, context);
+  _test.removeProjectColorArtifacts();
+  assert.equal(cleanupOverlay.parentElement, null);
+  assert.equal(menu.getAttribute("data-tweaker-project-native-menu"), null);
+  assert.equal(document.listenerCount(), 0, "teardown removes owned-menu listeners");
+});
+
+test("parent, stale, and replacement disposal close nested project menu submenus", (t) => {
+  const previousMutationObserver = global.MutationObserver;
+  const observers = [];
+  global.MutationObserver = class FakeMutationObserver {
+    constructor(callback) { observers.push(callback); }
+    observe() {}
+    disconnect() {}
+  };
+  t.after(() => { global.MutationObserver = previousMutationObserver; });
+  const document = new FakeDocument();
+  const makeNativeMenu = () => {
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("data-state", "open");
+    const remove = document.createElement("button"); remove.textContent = "Remove local project"; remove.click = () => {};
+    menu.appendChild(remove);
+    document.body.appendChild(menu);
+    return menu;
+  };
+  const context = { project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" } };
+
+  const colorMenu = makeNativeMenu();
+  const colorOverlay = _test.interceptNativeProjectMenu(document, colorMenu, context);
+  colorOverlay.querySelector('[data-tweaker-project-color-menu="trigger"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.equal(document.listenerCount(), 4, "parent plus Color submenu listeners are registered");
+  document.dispatchEvent({ type: "keydown", key: "Escape", target: colorOverlay, preventDefault() {} });
+  assert.equal(colorOverlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
+  assert.equal(document.listenerCount(), 0, "parent close disposes Color submenu listeners");
+
+  const sortMenu = makeNativeMenu();
+  const sortOverlay = _test.interceptNativeProjectMenu(document, sortMenu, context);
+  sortOverlay.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.equal(document.listenerCount(), 4, "parent plus Sort submenu listeners are registered");
+  sortMenu.setAttribute("data-state", "closed");
+  observers.at(-1)();
+  assert.equal(sortOverlay.querySelector('[data-tweaker-project-task-menu="sort-submenu"]'), null);
+  assert.equal(document.listenerCount(), 0, "stale portal close disposes Sort submenu listeners");
+
+  const replacedMenu = makeNativeMenu();
+  const replacedOverlay = _test.interceptNativeProjectMenu(document, replacedMenu, context);
+  replacedOverlay.querySelector('[data-tweaker-project-color-menu="trigger"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.equal(document.listenerCount(), 4);
+  const nextMenu = makeNativeMenu();
+  const nextOverlay = _test.interceptNativeProjectMenu(document, nextMenu, context);
+  assert.equal(replacedOverlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
+  assert.equal(document.listenerCount(), 2, "replacement disposes the previous overlay and child listeners before installing itself");
+  document.dispatchEvent({ type: "keydown", key: "Escape", target: nextOverlay, preventDefault() {} });
   assert.equal(document.listenerCount(), 0);
 });
 
@@ -292,7 +503,7 @@ test("workspace-root label aliases fail closed when more than one native project
   assert.equal(nativeProjects[1].rootPathAliases, undefined);
 });
 
-test("native menu targeting chooses the nearest visible open project menu", () => {
+test("native project menu targeting fails closed for zero or multiple visible portals", () => {
   const document = new FakeDocument();
   const makeMenu = ({ state, left, top, width = 220, height = 320 }) => {
     const menu = document.createElement("div");
@@ -311,10 +522,11 @@ test("native menu targeting chooses the nearest visible open project menu", () =
   const hidden = makeMenu({ state: "open", left: 300, top: 200, width: 0, height: 0 });
   const projectMenu = makeMenu({ state: "open", left: 310, top: 205 });
 
+  assert.equal(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), null);
+  unrelated.remove();
   assert.equal(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), projectMenu);
-  assert.notEqual(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), stale);
-  assert.notEqual(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), unrelated);
-  assert.notEqual(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), hidden);
+  projectMenu.remove();
+  assert.equal(_test.findNativeProjectMenu(document, { x: 300, y: 200 }), null);
 });
 
 test("project tint rerenders immediately and teardown stays inside the semantic project row", (t) => {
@@ -1765,6 +1977,7 @@ class FakeDocument {
     this.listeners.get(type).add(listener);
   }
   removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+  dispatchEvent(event) { for (const listener of this.listeners.get(event.type) || []) listener(event); }
   listenerCount() { return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0); }
 }
 
@@ -1816,6 +2029,18 @@ class FakeElement {
   }
   addEventListener(type, listener) { this.listeners.set(type, listener); }
   dispatchEvent(event) { this.listeners.get(event.type)?.(event); }
+  click() { this.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} }); }
+  focus() { this.ownerDocument.activeElement = this; }
+  cloneNode(deep = false) {
+    const clone = new FakeElement(this.tagName, this.ownerDocument);
+    clone.className = this.className;
+    clone.textContent = this.textContent;
+    for (const [name, value] of this.attributes) clone.setAttribute(name, value);
+    for (const [name, value] of this.style.values) clone.style.setProperty(name, value);
+    for (const name of this.classes) clone.classList.add(name);
+    if (deep) for (const child of this.children) clone.appendChild(child.cloneNode(true));
+    return clone;
+  }
   getBoundingClientRect() { return this.rect || { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
   contains(node) {
     if (node === this) return true;

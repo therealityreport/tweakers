@@ -3,6 +3,16 @@
 Projects adds colors, organization, connection references, and a read-only
 repository inventory to the native Projects sidebar.
 
+## Project menu
+
+When Codex opens a project menu, Projects replaces that one visible portal with
+an owned Codex-styled menu in the same position. It snapshots the actual native
+commands in their original order, including their disabled state and icons, and
+replays the selected native command itself. This keeps Edit, Reveal, Remove,
+and future Codex commands under Codex's own semantics while also adding the
+Project color and task Sort controls. If the project identity or native portal
+is ambiguous, Projects leaves the native menu untouched.
+
 ## Task ordering
 
 Each project folder can independently keep Codex's default task order or sort
