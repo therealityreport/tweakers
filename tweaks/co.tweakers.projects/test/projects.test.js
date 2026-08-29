@@ -163,6 +163,59 @@ test("project menu portal and identity ambiguity fail closed", () => {
   ], "Same", "two")?.id, "two", "an exact native identity remains safe");
 });
 
+test("current Codex project menu keeps native commands and gains a native-shaped Project settings submenu", async () => {
+  const document = new FakeDocument();
+  document.defaultView = { innerHeight: 800, innerWidth: 1200 };
+  const menu = document.createElement("div");
+  menu.setAttribute("data-state", "open");
+  menu.setAttribute("data-radix-menu-content", "");
+  menu.className = "native-menu-surface";
+  menu.rect = { left: 120, top: 100, right: 360, bottom: 440, width: 240, height: 340 };
+  const calls = [];
+  const makeCommand = (label) => {
+    const item = document.createElement("button");
+    item.setAttribute("data-radix-collection-item", "");
+    item.className = "native-menu-item";
+    item.textContent = label;
+    item.click = () => calls.push(label);
+    return item;
+  };
+  const pin = makeCommand("Pin");
+  const section = makeCommand("Section");
+  const sectionIcon = document.createElement("svg");
+  section.appendChild(sectionIcon);
+  const reveal = makeCommand("Reveal in Finder");
+  const remove = makeCommand("Remove project");
+  menu.append(pin, section, reveal, remove);
+  document.body.appendChild(menu);
+
+  assert.equal(_test.findNativeProjectMenu(document), menu, "role-less Radix menu content is recognized");
+  const nativeNodes = [...menu.children];
+  const saves = [];
+  const trigger = _test.injectNativeProjectSettingsMenu(document, menu, {
+    project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" },
+  }, { saveAppearance: async (projectId, choice) => saves.push({ projectId, choice }) });
+
+  assert.equal(trigger.children[1].textContent, "Project settings");
+  assert.equal(trigger.children.at(-1).textContent, "›");
+  assert.equal(trigger.className, section.className, "the native Section item supplies the menu-item styling");
+  assert.equal(menu.children.indexOf(trigger), menu.children.indexOf(section) + 1);
+  assert.deepEqual(nativeNodes.every((node) => menu.contains(node)), true, "all native commands remain mounted");
+  assert.deepEqual(calls, [], "native commands are never replayed during injection");
+
+  trigger.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  const settings = menu.querySelector('[data-tweaker-project-menu="settings-submenu"]');
+  assert.equal(settings.className, menu.className, "the submenu inherits the native menu surface styling");
+  assert.ok(settings.querySelector('[data-tweaker-project-color-menu="trigger"]'));
+  assert.ok(settings.querySelector('[data-tweaker-project-task-menu="sort"]'));
+  settings.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  const sort = settings.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
+  sort.children[1].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  await Promise.resolve();
+  assert.deepEqual(saves, [{ projectId: "p", choice: { taskSort: "created-desc" } }]);
+  assert.deepEqual(nativeNodes.every((node) => menu.contains(node)), true, "saving settings leaves native commands untouched");
+});
+
 test("owned menu retains native checked roles and focuses the first enabled command", () => {
   const document = new FakeDocument();
   const menu = document.createElement("div");

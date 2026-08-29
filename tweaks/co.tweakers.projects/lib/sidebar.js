@@ -140,7 +140,7 @@ function disposeOwnedProjectMenuSubmenus(overlay) {
 function projectMenuSubmenuHost(doc, anchor) {
   let cursor = anchor;
   while (cursor) {
-    if (cursor.getAttribute?.(PROJECT_MENU_ATTR) === "overlay") return cursor;
+    if (["overlay", "settings-submenu"].includes(cursor.getAttribute?.(PROJECT_MENU_ATTR))) return cursor;
     cursor = cursor.parentElement;
   }
   return doc?.body || null;
@@ -332,6 +332,111 @@ function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
   return overlay;
 }
 
+// Keep Codex's project menu authoritative. The tweak adds one native-shaped
+// submenu trigger and never hides, clones, or replays host commands.
+function injectNativeProjectSettingsMenu(doc, nativeMenu, context, handlers = {}) {
+  if (!doc?.createElement || !nativeProjectMenuIsLive(nativeMenu)
+    || nativeMenu.querySelector?.(`[${PROJECT_MENU_ATTR}="trigger"]`)) return null;
+  const commands = snapshotNativeProjectMenuCommands(nativeMenu);
+  const section = commands.find((command) => /^Section$/i.test(command.label))?.source || null;
+  const remove = commands.find((command) => isRemoveProjectMenuItem(command.source))?.source || null;
+  const template = section || commands.find((command) => !command.disabled)?.source;
+  if (!template || !remove) return null;
+
+  const trigger = ownedProjectMenuItem(doc, "Project settings", template, () => {
+    openProjectSettingsSubmenu(doc, nativeMenu, trigger, context, handlers);
+  }, { icon: nativeMenuCommandIcon(section), submenu: true });
+  trigger.setAttribute(PROJECT_MENU_ATTR, "trigger");
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("data-state", "closed");
+  const siblings = [...(nativeMenu.children || [])];
+  const sectionIndex = section ? siblings.indexOf(section) : -1;
+  nativeMenu.insertBefore(trigger, sectionIndex >= 0 ? (siblings[sectionIndex + 1] || null) : remove);
+
+  let disposed = false;
+  let observer = null;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    observer?.disconnect?.();
+    const submenu = firstDocumentMatch(doc, `[${PROJECT_MENU_ATTR}="settings-submenu"]`);
+    if (typeof submenu?.[PROJECT_MENU_DISPOSE] === "function") submenu[PROJECT_MENU_DISPOSE]();
+    else submenu?.remove?.();
+    trigger[PROJECT_MENU_DISPOSE] = null;
+    trigger.remove?.();
+  };
+  trigger[PROJECT_MENU_DISPOSE] = dispose;
+  if (typeof MutationObserver === "function") {
+    observer = new MutationObserver(() => {
+      if (!nativeProjectMenuIsLive(nativeMenu)) dispose();
+    });
+    observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-state"] });
+  }
+  return trigger;
+}
+
+function openProjectSettingsSubmenu(doc, nativeMenu, anchor, context, handlers = {}) {
+  const previous = firstDocumentMatch(doc, `[${PROJECT_MENU_ATTR}="settings-submenu"]`);
+  if (typeof previous?.[PROJECT_MENU_DISPOSE] === "function") previous[PROJECT_MENU_DISPOSE]();
+  else previous?.remove?.();
+  const submenu = doc.createElement("div");
+  submenu.setAttribute("role", "menu");
+  submenu.setAttribute(PROJECT_MENU_ATTR, "settings-submenu");
+  submenu.setAttribute("data-state", "open");
+  submenu.className = nativeMenu.className || "fixed z-[10000] flex min-w-[220px] flex-col rounded-xl border border-token-border p-1 shadow-lg";
+  submenu.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
+  const rect = anchor?.getBoundingClientRect?.();
+  const viewportWidth = Number(doc.defaultView?.innerWidth) || 1200;
+  const right = Number(rect?.right) || 8;
+  submenu.style?.setProperty?.("position", "fixed");
+  submenu.style?.setProperty?.("left", `${right + 220 <= viewportWidth - 8 ? right : Math.max(8, (Number(rect?.left) || right) - 220)}px`);
+  submenu.style?.setProperty?.("top", `${Math.max(8, Number(rect?.top) || 8)}px`);
+
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    doc.removeEventListener?.("pointerdown", onOutside, true);
+    doc.removeEventListener?.("keydown", onKeydown, true);
+    disposeOwnedProjectMenuSubmenus(submenu);
+    anchor?.setAttribute?.("data-state", "closed");
+    submenu[PROJECT_MENU_DISPOSE] = null;
+    submenu.remove?.();
+  };
+  const openColor = () => openProjectColorSubmenu(doc, colorTrigger, context, async (choice) => {
+    await handlers.saveAppearance?.(context.project.id, choice);
+    dispose();
+  });
+  const openSort = () => openProjectTaskSortSubmenu(doc, sortTrigger, context, async (taskSort) => {
+    await handlers.saveAppearance?.(context.project.id, { taskSort });
+    dispose();
+  });
+  const colorTrigger = ownedProjectMenuItem(doc, "Project color", anchor, openColor, { submenu: true });
+  colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
+  colorTrigger.setAttribute("aria-haspopup", "menu");
+  const sortTrigger = ownedProjectMenuItem(doc, "Task sorting", anchor, openSort, { submenu: true });
+  sortTrigger.setAttribute(PROJECT_TASK_MENU_ATTR, "sort");
+  sortTrigger.setAttribute("aria-haspopup", "menu");
+  submenu.append(colorTrigger, sortTrigger);
+  const onOutside = (event) => {
+    if (submenu.contains?.(event.target) || anchor?.contains?.(event.target)
+      || ownedProjectMenuSubmenuContains(doc, event.target)) return;
+    dispose();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape" && !ownedProjectMenuSubmenuContains(doc, event.target)) dispose();
+    if (event.key === "ArrowRight" && event.target === colorTrigger) openColor();
+    if (event.key === "ArrowRight" && event.target === sortTrigger) openSort();
+  };
+  submenu[PROJECT_MENU_DISPOSE] = dispose;
+  nativeMenu.appendChild(submenu);
+  anchor?.setAttribute?.("data-state", "open");
+  doc.addEventListener?.("pointerdown", onOutside, true);
+  doc.addEventListener?.("keydown", onKeydown, true);
+  colorTrigger.focus?.();
+  return submenu;
+}
+
 function openProjectColorSubmenu(doc, anchor, context, onSelect) {
   const previous = doc.body.querySelector?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`);
   if (typeof previous?.[PROJECT_COLOR_DISPOSE] === "function") previous[PROJECT_COLOR_DISPOSE]();
@@ -472,9 +577,9 @@ function installProjectColorControls(api, getState, saveAppearance) {
     if (!pending || requestId !== id || pending !== context) return;
     const nativeMenu = findNativeProjectMenu(document, context);
     if (!nativeMenu) return;
-    const overlay = interceptNativeProjectMenu(document, nativeMenu, context, { saveAppearance });
-    if (overlay) {
-      api.log?.info?.("Project menu intercepted", { projectId: context.project.id, source: context.source });
+    const trigger = injectNativeProjectSettingsMenu(document, nativeMenu, context, { saveAppearance });
+    if (trigger) {
+      api.log?.info?.("Project settings menu injected", { projectId: context.project.id, source: context.source });
       pending = null;
       stopMenuObserver();
     }
@@ -567,10 +672,15 @@ function nativeProjectSurfaceFingerprint(api) {
 }
 
 function findNativeProjectMenu(doc, context = {}) {
-  const menus = [...(doc?.querySelectorAll?.('[role="menu"]') || [])]
-    .filter((menu) => menu.getAttribute?.("data-state") === "open" && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR))
-    .filter((menu) => [...(menu.querySelectorAll?.('[role="menuitem"]') || [])]
-      .some(isRemoveProjectMenuItem))
+  const surfaces = new Set([
+    ...(doc?.querySelectorAll?.('[role="menu"]') || []),
+    ...(doc?.querySelectorAll?.('[data-radix-menu-content]') || []),
+    ...(doc?.querySelectorAll?.('[data-state="open"]') || []),
+  ]);
+  const menus = [...surfaces]
+    .filter((menu) => nativeProjectMenuIsLive(menu) && !menu.hasAttribute?.(PROJECT_COLOR_MENU_ATTR)
+      && !menu.hasAttribute?.(PROJECT_MENU_ATTR) && !menu.hasAttribute?.(PROJECT_NATIVE_MENU_ATTR))
+    .filter((menu) => snapshotNativeProjectMenuCommands(menu).some((command) => isRemoveProjectMenuItem(command.source)))
     .map((menu) => ({ menu, rect: menu.getBoundingClientRect?.() }))
     .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0);
   // A browser event may arrive while a previous portal is animating out. With
@@ -1619,6 +1729,8 @@ module.exports = {
   PROJECT_NATIVE_MENU_ATTR,
   snapshotNativeProjectMenuCommands,
   interceptNativeProjectMenu,
+  injectNativeProjectSettingsMenu,
+  openProjectSettingsSubmenu,
   openProjectColorSubmenu,
   openNativeProjectEditDialog,
   installProjectColorControls,
