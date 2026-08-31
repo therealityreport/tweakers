@@ -24,9 +24,9 @@ from typing import Any, Callable, Iterable
 
 SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
-PRODUCER_VERSION = "0.5.0"
+PRODUCER_VERSION = "0.6.0"
 CLEANUP_POLICY_VERSION = "strict-detached-v5"
-MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v5"
+MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v6"
 # Soft-blocker policy (strict-detached-v5): inside a *detached* tree, an
 # unrecognized node/node_repl process -- or a node/npm/npx/python launcher
 # whose arguments mention "mcp" -- is presumed to be an MCP helper that the
@@ -448,6 +448,39 @@ class ProcessInfo:
 class MCPDescriptor:
     identifier: str
     family: str
+
+
+@dataclass(frozen=True)
+class LogicalMCPInstance:
+    """One exact MCP root, separated from its raw descendant process set.
+
+    This is intentionally process metadata only: callers receive no command
+    arguments and cannot use this projection to widen the reaper's authority.
+    """
+
+    pid: int
+    family: str
+    descriptor_id: str
+    ownership: str
+    raw_process_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MCPTopology:
+    """The shared matcher registry's observation-only topology projection."""
+
+    logical_instances: tuple[LogicalMCPInstance, ...]
+    raw_process_ids: tuple[int, ...]
+    loaded_task_stacks: int
+    logical_family_counts: dict[str, int]
+    ownership_counts: dict[str, int]
+    ui_owned_logical_helpers: int
+    raw_rss_kib: int
+    raw_cpu_seconds: float
+    zombie_under_mcp_root: bool
+    ambiguous_ownership: bool
+    app_server_count: int
+    owner_identity: ProcessIdentity | None
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1215,10 @@ def _mcp_descriptor(process: ProcessInfo) -> MCPDescriptor | None:
             return MCPDescriptor("app.computer-use.mcp", "computer_use")
         if command_tail == ["event-stream", "mcp"]:
             return MCPDescriptor("app.computer-use.event-stream", "computer_use")
+        if command_tail == ["messages", "mcp"]:
+            return MCPDescriptor("app.computer-use.messages", "computer_use")
+        if command_tail == ["computer-history", "mcp"]:
+            return MCPDescriptor("app.computer-use.computer-history", "computer_use")
         return None
     npm_launcher = _trusted_launcher(process, tokens, {"npm", "npx"})
     if npm_launcher:
@@ -1231,7 +1268,6 @@ def _mcp_descriptor(process: ProcessInfo) -> MCPDescriptor | None:
         node_scripts = {
             "iconify-mcp.mjs": "iconify",
             "react-doctor-mcp.mjs": "react_doctor",
-            "context7-app-compat-mcp.mjs": "context7",
             "chrome-devtools-mcp": "chrome_devtools",
             "playwright-mcp": "playwright",
             "decodo-mcp": "decodo",
@@ -1528,6 +1564,88 @@ def classify_codex_trees(
             children,
         ))
     return classifications
+
+
+def classify_mcp_topology(
+    snapshot: dict[int, ProcessInfo],
+    uid: int | None = None,
+) -> MCPTopology:
+    """Return the sole shared-registry view of MCP helper topology.
+
+    A *logical instance* is one exact recognized MCP root.  Its descendant
+    processes are counted separately and deduplicated across roots, so a
+    helper fan-out cannot be confused with the number of logical helpers.  The
+    reaper's existing tree classifier remains the ownership oracle; this
+    function only projects its result for observation consumers.
+    """
+    selected_uid = os.getuid() if uid is None else uid
+    owned = {pid: process for pid, process in snapshot.items() if process.uid == selected_uid}
+    children = children_index(owned)
+    trees = classify_codex_trees(owned, uid=selected_uid)
+    ownership_by_pid: dict[int, str] = {}
+    for tree in trees:
+        for pid in tree.process_ids:
+            prior = ownership_by_pid.get(pid)
+            # A PID must never be claimed by conflicting lifecycle trees.  If
+            # that invariant is broken, observation fails closed to ambiguous.
+            ownership_by_pid[pid] = tree.ownership if prior in (None, tree.ownership) else "ambiguous"
+
+    live_app_servers = {
+        process.pid: process
+        for process in owned.values()
+        if process.ppid != 1 and is_codex_app_server(process)
+    }
+    owner_candidates = [
+        process.identity for process in live_app_servers.values() if process.identity is not None
+    ]
+    owner_identity = owner_candidates[0] if len(owner_candidates) == 1 else None
+    loaded_task_stacks = sum(
+        1
+        for process in owned.values()
+        if process.ppid in live_app_servers
+        and (_swap_vnode_current_path(process.executable) or process.executable) in ALLOWED_NODE_REPL_PATHS
+        and _mcp_descriptor(process) is not None
+    )
+
+    instances: list[LogicalMCPInstance] = []
+    raw_process_ids: set[int] = set()
+    for process in sorted(owned.values(), key=lambda item: item.pid):
+        descriptor = _mcp_descriptor(process)
+        # node_repl is a task-stack diagnostic, not an MCP logical helper.
+        if descriptor is None or descriptor.family == "node_repl":
+            continue
+        descendants = tuple(sorted(set(subtree_ids(process.pid, children))))
+        ownership = ownership_by_pid.get(process.pid, "ambiguous")
+        instances.append(LogicalMCPInstance(
+            pid=process.pid,
+            family=descriptor.family,
+            descriptor_id=descriptor.identifier,
+            ownership=ownership,
+            raw_process_ids=descendants,
+        ))
+        raw_process_ids.update(descendants)
+
+    family_counts: Counter[str] = Counter(instance.family for instance in instances)
+    ownership_counts: Counter[str] = Counter(instance.ownership for instance in instances)
+    raw_sorted = tuple(sorted(raw_process_ids))
+    return MCPTopology(
+        logical_instances=tuple(instances),
+        raw_process_ids=raw_sorted,
+        loaded_task_stacks=loaded_task_stacks,
+        logical_family_counts=dict(sorted(family_counts.items())),
+        ownership_counts=dict(sorted(ownership_counts.items())),
+        ui_owned_logical_helpers=sum(
+            1 for instance in instances if instance.ownership == "ui_owned"
+        ),
+        raw_rss_kib=sum(owned[pid].rss_kib for pid in raw_sorted if pid in owned),
+        raw_cpu_seconds=sum(owned[pid].cpu_seconds for pid in raw_sorted if pid in owned),
+        zombie_under_mcp_root=any(
+            owned[pid].state.upper().startswith("Z") for pid in raw_sorted if pid in owned
+        ),
+        ambiguous_ownership=any(instance.ownership == "ambiguous" for instance in instances),
+        app_server_count=len(live_app_servers),
+        owner_identity=owner_identity,
+    )
 
 
 def advance_lifecycle_state(

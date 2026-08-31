@@ -32,7 +32,13 @@ const managerCopies = [
   ["packages/installer/dist/manager.mjs", "manager-launcher/manager.mjs"],
 ];
 
-export function copyInstallerAssets(root = defaultRoot, { publicationDependencies } = {}) {
+export function copyInstallerAssets(root = defaultRoot, { publicationDependencies, only } = {}) {
+  if (only !== undefined) {
+    if (only !== "mcp-lifecycle") {
+      throw new Error(`Unsupported scoped installer asset copy: ${String(only)}`);
+    }
+    return copyMcpLifecycleAssets(root, publicationDependencies);
+  }
   const out = resolve(root, "packages", "installer", "assets");
   const loaderSource = resolve(root, "packages", "loader", "loader.cjs");
   const runtimeSource = resolve(root, "packages", "runtime", "dist");
@@ -135,6 +141,37 @@ export function copyInstallerAssets(root = defaultRoot, { publicationDependencie
   return { runtimeCopied: true, tweakCount, fingerprint, cleanupErrors: publication.cleanupErrors };
 }
 
+/**
+ * Publish only the lifecycle package subtree.  This deliberately uses the
+ * generated-tree transaction at `assets/mcp-lifecycle`, not at `assets`, so a
+ * scoped package refresh cannot observe, copy, remove, or replace runtime,
+ * manager, catalog, loader, or tweak bytes.
+ */
+function copyMcpLifecycleAssets(root, publicationDependencies = {}) {
+  const source = resolve(root, "packages", "mcp-lifecycle");
+  const destination = resolve(root, "packages", "installer", "assets", "mcp-lifecycle");
+  if (!existsSync(source) || !lstatSync(source).isDirectory()) {
+    throw new Error("MCP lifecycle scoped asset copy requires packages/mcp-lifecycle");
+  }
+  const publication = publishGeneratedDirectorySync(destination, (staged) => {
+    cpSync(source, staged, {
+      recursive: true,
+      verbatimSymlinks: true,
+      preserveTimestamps: true,
+    });
+    sweepFinderJunk(staged);
+    removeGeneratedConflictCopies(staged);
+  }, publicationDependencies);
+  console.log("[copy-assets] packages/mcp-lifecycle -> assets/mcp-lifecycle (scoped transaction)");
+  return {
+    runtimeCopied: false,
+    tweakCount: 0,
+    fingerprint: null,
+    scoped: "mcp-lifecycle",
+    cleanupErrors: publication.cleanupErrors,
+  };
+}
+
 // Physically remove Finder junk so shipped assets are clean.
 function sweepFinderJunk(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -180,4 +217,12 @@ export function writeRuntimeFingerprint(runtimeRoot) {
 }
 
 const invoked = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invoked) copyInstallerAssets();
+if (invoked) {
+  const args = process.argv.slice(2);
+  if (args.length === 0) copyInstallerAssets();
+  else if (args.length === 2 && args[0] === "--only" && args[1] === "mcp-lifecycle") {
+    copyInstallerAssets(defaultRoot, { only: "mcp-lifecycle" });
+  } else {
+    throw new Error("Usage: node packages/installer/scripts/copy-assets.mjs [--only mcp-lifecycle]");
+  }
+}

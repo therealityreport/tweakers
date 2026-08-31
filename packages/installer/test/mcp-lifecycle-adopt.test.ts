@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -27,8 +28,11 @@ import {
 import type { McpLifecycleHealthReport } from "../src/mcp-lifecycle-health";
 import {
   MCP_LIFECYCLE_LABELS,
+  expectedMcpLifecycleLabelStates,
   installMcpLifecyclePackage,
+  readMcpLifecycleManifest,
   verifyMcpLifecyclePackage,
+  type McpLifecycleLabelState,
 } from "../src/mcp-lifecycle-install";
 import { lifecycleLockFile } from "../src/lifecycle-lock";
 import { acquireProcessLock } from "../src/process-lock";
@@ -86,10 +90,45 @@ test("explicit adopt upgrades exactly the recognized v2 managed receipt", () => 
     assert.equal(result.status, "installed");
     assert.equal(fixture.reloads(), 1);
     const receipt = fixture.receipt();
-    assert.equal(receipt.packageVersion, "0.5.0");
+    assert.equal(receipt.packageVersion, "0.6.0");
+    assert.equal(receipt.schemaVersion, 2);
     assert.equal(receipt.policyVersion, "strict-detached-v5");
-    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v5");
+    assert.equal(receipt.matcherRegistryVersion, "mcp-family-descriptors-v6");
     assert.deepEqual(receipt.labels, MCP_LIFECYCLE_LABELS);
+  });
+});
+
+test("receipt records distinct frozen plist hashes before candidate promotion", () => {
+  withFixture((fixture) => {
+    const beforeStates = fixture.labelStates();
+    const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
+    assert.equal(result.status, "installed");
+    const transitions = fixture.receipt().labelTransitions as Array<{
+      label: string;
+      before: McpLifecycleLabelState;
+      intended: McpLifecycleLabelState;
+      observed: McpLifecycleLabelState;
+    }>;
+    assert.equal(transitions.length, MCP_LIFECYCLE_LABELS.length);
+    for (const transition of transitions) {
+      const frozen = beforeStates.find((state) => state.label === transition.label);
+      assert.ok(frozen);
+      assert.deepEqual(transition.before, frozen);
+      assert.notEqual(transition.before.plistSha256, transition.intended.plistSha256);
+      assert.deepEqual(transition.observed, transition.intended);
+      assert.deepEqual(
+        {
+          disabled: transition.intended.disabled,
+          loadedInstances: transition.intended.loadedInstances,
+          plistPath: transition.intended.plistPath,
+        },
+        {
+          disabled: transition.before.disabled,
+          loadedInstances: transition.before.loadedInstances,
+          plistPath: transition.before.plistPath,
+        },
+      );
+    }
   });
 });
 
@@ -106,8 +145,8 @@ test("explicit adopt upgrades exactly the recognized 0.3.0 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.5.0");
-    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v5");
+    assert.equal(fixture.receipt().packageVersion, "0.6.0");
+    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v6");
   });
 });
 
@@ -124,7 +163,7 @@ test("explicit adopt upgrades exactly the recognized 0.3.1 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().packageVersion, "0.6.0");
     assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
   });
 });
@@ -142,7 +181,7 @@ test("explicit adopt upgrades exactly the recognized 0.4.0 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().packageVersion, "0.6.0");
     assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
   });
 });
@@ -160,9 +199,9 @@ test("explicit adopt upgrades exactly the recognized 0.4.1 managed receipt", () 
     const result = adoptMcpLifecycle(fixture.input(), fixture.dependencies());
 
     assert.equal(result.status, "installed");
-    assert.equal(fixture.receipt().packageVersion, "0.5.0");
+    assert.equal(fixture.receipt().packageVersion, "0.6.0");
     assert.equal(fixture.receipt().policyVersion, "strict-detached-v5");
-    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v5");
+    assert.equal(fixture.receipt().matcherRegistryVersion, "mcp-family-descriptors-v6");
   });
 });
 
@@ -212,6 +251,7 @@ test("explicit adopt preview prerequisites reject absent, unsafe, and unrecogniz
 test("explicit adopt rolls back assets and services when receipt publication fails", () => {
   withFixture((fixture) => {
     const before = fixture.snapshot();
+    const beforeStates = fixture.labelStates();
     let writes = 0;
     assert.throws(() => adoptMcpLifecycle(fixture.input(), fixture.dependencies({
       writeReceipt: () => {
@@ -222,6 +262,11 @@ test("explicit adopt rolls back assets and services when receipt publication fai
     assert.equal(writes, 1);
     assert.deepEqual(fixture.snapshot().assets, before.assets);
     assert.equal(fixture.receiptBytesOrNull(), before.receipt);
+    assert.deepEqual(fixture.labelStates(), beforeStates);
+    assert.deepEqual(fixture.reloadedLabels(), [
+      ["com.thomashulihan.codex-mcp-idle-reaper"],
+      ["com.thomashulihan.codex-mcp-idle-reaper"],
+    ]);
     assert.equal(fixture.reloads(), 2, "activate then restore the prior labels");
   });
 });
@@ -292,36 +337,78 @@ test("receipt identity and label/status proof are rechecked at the final commit 
           inspections += 1;
           return kind === "status" && inspections >= 3 ? stale : fixture.eligibleReport();
         },
-        labelInstances: (label: string) => {
+        labelStates: () => {
           labelReads += 1;
           if (kind === "receipt" && labelReads === 5) fixture.replaceReceiptWithIdenticalBytes();
-          if (kind === "label" && labelReads === 5) return 0;
-          return 1;
+          const states = fixture.labelStates();
+          if (kind === "label" && labelReads === 5) {
+            return states.map((state) => state.label === MCP_LIFECYCLE_LABELS[1]
+              ? { ...state, disabled: true, loadedInstances: 1 as const }
+              : state);
+          }
+          return states;
         },
         reload: (_home: string, labels: readonly string[], beforeEach?: (label: string) => void) => {
           for (const label of labels) beforeEach?.(label);
         },
       });
-      assert.throws(() => adoptMcpLifecycle(fixture.input(), deps), /receipt changed|Expected exactly one|status became stale|reload deferred/i, kind);
+      assert.throws(() => adoptMcpLifecycle(fixture.input(), deps), /receipt changed|disabled\/loaded state|label state changed|status became stale|reload deferred/i, kind);
       assert.deepEqual(fixture.assetSnapshot(), before.assets, kind);
       assert.equal(fixture.receiptBytesOrNull(), before.receipt, kind);
     });
   }
 });
 
+test("the first destructive boundary rechecks an enabled Guard heartbeat before any installed mutation", () => {
+  withFixture((fixture) => {
+    const before = fixture.snapshot();
+    let beforeBackupHooks = 0;
+    let receiptWrites = 0;
+    let guardHeartbeatInvalid = false;
+    const guardHeartbeatDeferred: McpLifecycleHealthReport = {
+      ...fixture.eligibleReport("ok"),
+      preview: {
+        ...fixture.eligibleReport("ok").preview,
+        reloadEligible: false,
+        reloadDeferredReason: "Guard heartbeat problem: Guard heartbeat became stale",
+      },
+    };
+    const deps = fixture.dependencies({
+      inspect: () => guardHeartbeatInvalid ? guardHeartbeatDeferred : fixture.eligibleReport("ok"),
+      beforeInstallStep: (step: string) => {
+        if (step === "before-backup") {
+          beforeBackupHooks += 1;
+          guardHeartbeatInvalid = true;
+        }
+      },
+      writeReceipt: () => {
+        receiptWrites += 1;
+      },
+    });
+
+    assert.throws(
+      () => adoptMcpLifecycle(fixture.input(), deps),
+      /MCP lifecycle reload deferred: Guard heartbeat problem: Guard heartbeat became stale/,
+    );
+    assert.equal(beforeBackupHooks, 1, "the first installed backup hook invalidates the heartbeat");
+    assert.deepEqual(fixture.assetSnapshot(), before.assets, "no installed asset may change");
+    assert.equal(fixture.receiptBytesOrNull(), before.receipt, "the prior receipt must remain unchanged");
+    assert.equal(receiptWrites, 0, "no receipt may be written");
+    assert.equal(fixture.reloads(), 0, "no reload may occur");
+  });
+});
+
 test("final receipt commit re-proves source and installed destinations", () => {
   for (const kind of ["source", "destination"] as const) {
     withFixture((fixture) => {
       const before = fixture.snapshot();
-      let inspections = 0;
       const deps = fixture.dependencies({
-        inspect: () => {
-          inspections += 1;
-          if (inspections === 2) {
-            if (kind === "source") fixture.mutateCanonicalSource();
-            else fixture.mutateInstalledDestination();
-          }
-          return fixture.eligibleReport();
+        reload: (_home, labels, beforeEach) => {
+          for (const label of labels) beforeEach?.(label);
+          // This is after asset promotion, immediately before the final
+          // receipt proof.  It must be detected without a second install.
+          if (kind === "source") fixture.mutateCanonicalSource();
+          else fixture.mutateInstalledDestination();
         },
       });
       assert.throws(() => adoptMcpLifecycle(fixture.input(), deps), /proof failed|digest mismatch|asset/i, kind);
@@ -385,6 +472,27 @@ test("the explicit adopt command honors shared lifecycle-lock contention before 
   });
 });
 
+test("the explicit repair command honors shared lifecycle-lock contention before it can mutate", async () => {
+  await withFixtureAsync(async (fixture) => {
+    const previousHome = process.env.TWEAKER_HOME;
+    process.env.TWEAKER_HOME = fixture.root;
+    const lock = acquireProcessLock(lifecycleLockFile(fixture.root));
+    const before = fixture.snapshot();
+    try {
+      await assert.rejects(
+        mcpLifecycle("repair", { apply: true, source: fixture.input().sourceRoot }),
+        /Another Tweakers lifecycle operation is active/i,
+      );
+      assert.deepEqual(fixture.snapshot(), before);
+      assert.equal(fixture.reloads(), 0);
+    } finally {
+      lock.release();
+      if (previousHome === undefined) delete process.env.TWEAKER_HOME;
+      else process.env.TWEAKER_HOME = previousHome;
+    }
+  });
+});
+
 test("the explicit adopt command preview rejects an unrecognized predecessor before any apply", async () => {
   await withFixtureAsync(async (fixture) => {
     const previousHome = process.env.TWEAKER_HOME;
@@ -413,6 +521,7 @@ interface Fixture {
   input(): { targetHome: string; userRoot: string; sourceRoot: string; report: McpLifecycleHealthReport };
   dependencies(overrides?: Record<string, unknown>): Parameters<typeof adoptMcpLifecycle>[1];
   eligibleReport(proof?: "ok" | "error"): McpLifecycleHealthReport;
+  labelStates(): readonly McpLifecycleLabelState[];
   receipt(): Record<string, unknown>;
   writeReceipt(patch: Record<string, unknown>): void;
   receiptBytesOrNull(): string | null;
@@ -423,6 +532,7 @@ interface Fixture {
   mutateInstalledDestination(): void;
   markReload(): void;
   reloads(): number;
+  reloadedLabels(): readonly string[][];
 }
 
 function withFixture(run: (fixture: Fixture) => void): void {
@@ -431,16 +541,37 @@ function withFixture(run: (fixture: Fixture) => void): void {
   const userRoot = join(root, "tweakers");
   const sourceRoot = join(root, "source");
   const receiptPath = join(userRoot, "mcp-lifecycle-managed.json");
-  const counts = new Map(MCP_LIFECYCLE_LABELS.map((label) => [label, 0]));
+  const counts = new Map(MCP_LIFECYCLE_LABELS.map((label) => [
+    label,
+    label === MCP_LIFECYCLE_LABELS[0] ? 1 : 0,
+  ]));
   let reloadCount = 0;
+  const reloadHistory: string[][] = [];
   try {
     cpSync(CANONICAL_MCP_LIFECYCLE_SOURCE_ROOT, sourceRoot, { recursive: true });
     writeStatus(home);
     installMcpLifecyclePackage({ sourceRoot, targetHome: home, temporaryRoot: home, labelInstances: () => 0 });
-    const assets = verifyMcpLifecyclePackage({ sourceRoot, targetHome: home }).assets;
+    const verification = verifyMcpLifecyclePackage({ sourceRoot, targetHome: home });
+    const assets = verification.assets;
+    const labelStates = (): readonly McpLifecycleLabelState[] => expectedMcpLifecycleLabelStates(verification).map((state) => {
+      const loadedInstances = counts.get(state.label) as 0 | 1;
+      return {
+        ...state,
+        disabled: state.label === MCP_LIFECYCLE_LABELS[1] ? loadedInstances === 0 : false,
+        loadedInstances,
+        plistSha256: createHash("sha256").update(readFileSync(state.plistPath)).digest("hex"),
+      };
+    });
     // A v2 installation differs from current immutable assets; this forces the
     // transaction through promotion, activation, and receipt publication.
     writeFileSync(assets[0].destinationPath, "v2 lifecycle module\n", { mode: assets[0].mode });
+    for (const asset of assets.filter((asset) => asset.asset.label)) {
+      writeFileSync(
+        asset.destinationPath,
+        `frozen old ${asset.asset.label} plist\n`,
+        { mode: asset.mode },
+      );
+    }
     mkdirSync(userRoot, { recursive: true });
     const writePrior = (patch: Record<string, unknown> = {}): void => {
       const receipt = {
@@ -476,6 +607,15 @@ function withFixture(run: (fixture: Fixture) => void): void {
         targetHome: home,
         changedAssets: [],
         labels: MCP_LIFECYCLE_LABELS,
+        labelStates: labelStates(),
+        labelTransitions: labelStates().map((before) => ({
+          label: before.label,
+          before,
+          intended: before,
+          operation: before.label === MCP_LIFECYCLE_LABELS[1]
+            ? before.disabled ? "preserve-disabled-unloaded" as const : "preserve-enabled-loaded" as const
+            : "reload-reaper" as const,
+        })),
         preservedRuntimeFiles: [],
         reloadEligible: true,
         reloadDeferredReason: null,
@@ -488,9 +628,11 @@ function withFixture(run: (fixture: Fixture) => void): void {
       receiptPath,
       input: () => ({ targetHome: home, userRoot, sourceRoot, report: eligibleReport() }),
       dependencies: (overrides = {}) => ({
+        labelStates,
         labelInstances: (label: string) => counts.get(label as typeof MCP_LIFECYCLE_LABELS[number]) ?? 0,
         reload: (_targetHome, labels, beforeEach) => {
           reloadCount += 1;
+          reloadHistory.push([...labels]);
           for (const label of labels) {
             beforeEach?.(label);
             counts.set(label as typeof MCP_LIFECYCLE_LABELS[number], 1);
@@ -501,6 +643,7 @@ function withFixture(run: (fixture: Fixture) => void): void {
         ...overrides,
       }) as Parameters<typeof adoptMcpLifecycle>[1],
       eligibleReport,
+      labelStates,
       receipt: () => JSON.parse(readFileSync(receiptPath, "utf8")) as Record<string, unknown>,
       writeReceipt: (patch) => {
         const current = JSON.parse(readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
@@ -525,6 +668,7 @@ function withFixture(run: (fixture: Fixture) => void): void {
       mutateInstalledDestination: () => writeFileSync(assets[1].destinationPath, "tampered\n", { mode: assets[1].mode }),
       markReload: () => { reloadCount += 1; },
       reloads: () => reloadCount,
+      reloadedLabels: () => reloadHistory,
     };
     run(fixture);
   } finally {
@@ -557,7 +701,7 @@ async function withFixtureAsync(run: (fixture: Fixture) => Promise<void>): Promi
       receiptPath,
       input: () => ({ targetHome: home, userRoot: root, sourceRoot, report: {
         schemaVersion: 1, checkedAt: "2026-07-24T00:00:00.000Z", status: "ok", title: "test", checks: [],
-        preview: { sourceRoot, targetHome: home, changedAssets: [], labels: MCP_LIFECYCLE_LABELS, preservedRuntimeFiles: [], reloadEligible: true, reloadDeferredReason: null, reloadPlan: [], rollbackPlan: [] },
+        preview: { sourceRoot, targetHome: home, changedAssets: [], labels: MCP_LIFECYCLE_LABELS, labelStates: null, labelTransitions: [], preservedRuntimeFiles: [], reloadEligible: true, reloadDeferredReason: null, reloadPlan: [], rollbackPlan: [] },
       } }),
       dependencies: () => ({}),
       eligibleReport: () => fixture.input().report,
@@ -566,7 +710,7 @@ async function withFixtureAsync(run: (fixture: Fixture) => Promise<void>): Promi
       receiptBytesOrNull: () => existsSync(receiptPath) ? readFileSync(receiptPath, "utf8") : null,
       assetSnapshot: () => ({}),
       snapshot: () => ({ assets: {}, receipt: existsSync(receiptPath) ? readFileSync(receiptPath, "utf8") : null }),
-      replaceReceiptWithIdenticalBytes: () => {}, mutateCanonicalSource: () => {}, mutateInstalledDestination: () => {}, markReload: () => {}, reloads: () => 0,
+      replaceReceiptWithIdenticalBytes: () => {}, mutateCanonicalSource: () => {}, mutateInstalledDestination: () => {}, markReload: () => {}, reloads: () => 0, reloadedLabels: () => [],
     };
     await run(fixture);
   } finally {
@@ -575,19 +719,50 @@ async function withFixtureAsync(run: (fixture: Fixture) => Promise<void>): Promi
 }
 
 function writeStatus(home: string): void {
+  const generatedAt = Date.parse("2026-07-24T00:00:00.000Z") / 1_000;
+  const manifest = readMcpLifecycleManifest(CANONICAL_MCP_LIFECYCLE_SOURCE_ROOT);
   const directory = join(home, ".codex", "tmp");
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, "codex-mcp-lifecycle-status.json"), JSON.stringify({
     schema_version: 2,
-    generated_at: Date.parse("2026-07-24T00:00:00.000Z") / 1_000,
+    generated_at: generatedAt,
+    matcher_registry_version: manifest.matcher_registry_version,
     job: { ok: true, mode: "automatic", error: null },
     counts: { would_kill: 0 },
     trees: [{ tree_key: "tree-a", state: "observed" }],
   }));
   writeFileSync(join(directory, "codex-mcp-guard-status.json"), JSON.stringify({
-    schema_version: 1,
-    generated_at: Date.parse("2026-07-24T00:00:00.000Z") / 1_000,
-    policy_version: "notification-only-v1",
+    schema: "mcp-guard-status.v3",
+    schema_version: 3,
+    generated_at: generatedAt,
+    producer_version: manifest.package.version,
+    authority: "observation-and-notification-only",
+    mutationCapabilities: [],
+    taskDataAccess: "none",
+    state: "healthy",
+    selected_producer: "healthy",
+    unavailable_reasons: [],
+    alerts: [],
+    explanations: ["Guard observes process health and may notify; it does not control processes or access task data."],
+    sample_count: 1,
+    reset_reason: "initial_sample",
+    schema_versions: { guard: 3, lifecycle: 2 },
+    matcher: {
+      expected: manifest.matcher_registry_version,
+      observed: manifest.matcher_registry_version,
+      freshness: "fresh",
+      lifecycle_generated_at: generatedAt,
+    },
+    ownership: {},
+    counts: {
+      loaded_task_stacks: 0,
+      logical_instances: {},
+      raw_processes: 0,
+      rss_mib: 0,
+      app_servers: 0,
+    },
+    cpu_window: { samples: 1, available: false },
+    system_memory: { available: false, swap: { available: false } },
     job: { ok: true, mode: "observation", error: null },
   }));
 }

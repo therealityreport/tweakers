@@ -65,15 +65,21 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("schema_version") != 1:
         fail("manifest schema_version must be 1")
     package = manifest.get("package")
-    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.5.0"}:
+    if package != {"name": "@therealityreport/tweakers-mcp-lifecycle", "version": "0.6.0"}:
         fail("manifest package identity/version changed")
     if (
-        manifest.get("lifecycle_schema_version") != 2
+        manifest.get("lifecycle_schema_version") != 3
         or manifest.get("policy_version") != "strict-detached-v5"
     ):
         fail("manifest lifecycle/policy schema changed")
-    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v5":
+    if manifest.get("matcher_registry_version") != "mcp-family-descriptors-v6":
         fail("manifest matcher registry version changed")
+    guard_source = (PACKAGE_ROOT / "assets" / "bin" / "codex-mcp-guard.py").read_text(encoding="utf-8")
+    if 'PRODUCER_VERSION = "0.6.0"' not in guard_source:
+        fail("Guard producer identity must match lifecycle package 0.6.0")
+    lifecycle_source = (PACKAGE_ROOT / "assets" / "lib" / "codex_mcp_lifecycle.py").read_text(encoding="utf-8")
+    if not re.search(r'^PRODUCER_VERSION = "0\.6\.0"$', lifecycle_source, re.MULTILINE):
+        fail("shared lifecycle producer identity must match lifecycle package 0.6.0")
     expected_policy = {
         "detached_stable_grace_seconds": 600,
         "termination_order": "children-first-term",
@@ -99,6 +105,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         "tmp/codex-mcp-lifecycle-state.json",
         "tmp/codex-mcp-lifecycle-status.json",
         "tmp/codex-mcp-lifecycle-actions.jsonl",
+        "tmp/codex-mcp-guard-window.json",
         "tmp/codex-mcp-guard-notify.json",
         "tmp/codex-mcp-guard-status.json",
     ]:
@@ -160,8 +167,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         fail("launchd labels must be exact and unique")
 
     tests = manifest.get("tests")
-    if not isinstance(tests, dict) or tests.get("baseline_count") != 79:
-        fail("manifest must declare the 79-test baseline")
+    if not isinstance(tests, dict) or tests.get("baseline_count") != 85:
+        fail("manifest must declare the 85-test baseline")
     fixture = PACKAGE_ROOT / checked_relative(str(tests.get("fixtures", "")), label="fixture")
     fixture_payload = json.loads(fixture.read_text(encoding="utf-8"))
     scenarios = fixture_payload.get("scenarios") if isinstance(fixture_payload, dict) else None
@@ -263,6 +270,14 @@ def validate_plists_if_available(manifest: dict[str, Any]) -> None:
             parsed = plistlib.loads(rendered.encode("utf-8"))
             if parsed.get("Label") != asset["label"]:
                 fail(f"plist label mismatch for {asset['id']}")
+            if asset["label"] == "com.thomashulihan.codex-mcp-guard":
+                if parsed.get("ProgramArguments", [])[-3:] != ["--scope", "process-only", "--quiet"]:
+                    fail("Guard plist must end with exact process-only quiet arguments")
+                environment = parsed.get("EnvironmentVariables")
+                if not isinstance(environment, dict) or environment.get("CODEX_MCP_LIFECYCLE_STATE_DIR") != f"{FROZEN_HOME}/.codex/tmp":
+                    fail("Guard plist must supply the explicit lifecycle state directory")
+                if any(key.startswith("CODEX_GUARD_") and key.endswith("_WARN") for key in environment):
+                    fail("Guard plist must not reintroduce arbitrary family-count thresholds")
             if plutil:
                 path = Path(directory) / f"{asset['id']}.plist"
                 path.write_text(rendered, encoding="utf-8")
@@ -296,7 +311,7 @@ def main() -> int:
     compile_python_assets(manifest)
     validate_plists_if_available(manifest)
     run_baseline(manifest)
-    print("mcp-lifecycle package validation passed (79 baseline tests; no live writes)")
+    print("mcp-lifecycle package validation passed (85 baseline tests; no live writes)")
     return 0
 
 
