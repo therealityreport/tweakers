@@ -516,6 +516,42 @@ test("authenticated router status accepts only the redacted mux projection", () 
   assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: { secret: "no" } })), requestId), null);
 });
 
+test("authenticated router status rejects unsafe and unknown public enum strings before presentation", () => {
+  const requestId = "router-enum-test";
+  const base = {
+    version: 1,
+    requestId,
+    status: {
+      schemaVersion: 1,
+      mode: "balanced",
+      protocolState: "supported",
+      fairnessPrecision: "exact_completed_spend",
+      accounts: [{ opaqueAccountId: "ar_" + "b".repeat(43), label: "Account A", eligibility: "active", normalizedSpend: 1, assignedThreadCount: 0 }],
+      restartRequired: false,
+      degradedReason: null,
+    },
+  };
+  for (const [field, value] of [
+    ["eligibility", "/private/router-secret-canary"],
+    ["eligibility", "Bearer enum-secret-canary"],
+    ["eligibility", "unknown_eligibility"],
+    ["degradedReason", "/private/router-secret-canary"],
+    ["degradedReason", "Bearer enum-secret-canary"],
+    ["degradedReason", "unknown_degraded_reason"],
+  ]) {
+    const candidate = structuredClone(base);
+    if (field === "eligibility") candidate.status.accounts[0].eligibility = value;
+    else candidate.status.degradedReason = value;
+    const parsed = _test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify(candidate)), requestId);
+    assert.equal(parsed, null, `${field}: ${value}`);
+    assert.notEqual(
+      _test.routerPresentation(candidate.status, { state: "active", status: parsed }, 2).label,
+      "Running Balanced",
+      `${field}: ${value} cannot reach the running projection`,
+    );
+  }
+});
+
 test("router controls use an accessible live status and require an explicit two-snapshot selection", async (t) => {
   const previousDocument = global.document;
   const nodes = [];

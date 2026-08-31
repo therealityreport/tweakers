@@ -30,6 +30,14 @@ const ROUTER_PUBLIC_ERROR_CODES = new Set([
   "router-not-idle",
   "router-operation-failed",
 ]);
+const ROUTER_PUBLIC_ELIGIBILITY = new Set([
+  "validating", "eligible", "reserved", "active", "cooldown", "quota_depleted",
+  "reauth_required", "plugin_blocked", "protocol_blocked", "disabled", "unhealthy",
+]);
+const ROUTER_PUBLIC_DEGRADED_REASONS = new Set([
+  "invalid_config", "unsupported_protocol", "startup_selfcheck_failed", "pool_depleted",
+  "capability_mismatch", "policy_stop", "post_start_failure",
+]);
 const ROUTER_CONTROL_FAILURE_MESSAGES = Object.freeze({
   "invalid-router-mode": "The requested router mode is unavailable.",
   "untrusted-router-directory": "Router storage could not be verified safely.",
@@ -1685,13 +1693,13 @@ function parseAuthenticatedRouterStatus(bytes, requestId) {
       || !["manual", "balanced", "direct_fallback"].includes(status.mode)
       || !["supported", "unsupported", "drifted", "unknown"].includes(status.protocolState)
       || !["projected", "exact_completed_spend", "estimated"].includes(status.fairnessPrecision)
-      || typeof status.restartRequired !== "boolean" || !(status.degradedReason === null || typeof status.degradedReason === "string")
+      || typeof status.restartRequired !== "boolean" || !(status.degradedReason === null || ROUTER_PUBLIC_DEGRADED_REASONS.has(status.degradedReason))
       || !Array.isArray(status.accounts) || status.accounts.length > 2) return null;
     const accounts = [];
     for (const account of status.accounts) {
       if (!isRecord(account) || Object.keys(account).sort().join("\0") !== ["assignedThreadCount", "eligibility", "label", "normalizedSpend", "opaqueAccountId"].join("\0")
         || !isOpaqueAccountId(account.opaqueAccountId) || !["Account A", "Account B"].includes(account.label)
-        || typeof account.eligibility !== "string" || !Number.isFinite(account.normalizedSpend) || account.normalizedSpend < 0
+        || !ROUTER_PUBLIC_ELIGIBILITY.has(account.eligibility) || !Number.isFinite(account.normalizedSpend) || account.normalizedSpend < 0
         || !Number.isInteger(account.assignedThreadCount) || account.assignedThreadCount < 0) return null;
       accounts.push({ label: account.label, eligibility: account.eligibility, normalizedSpend: account.normalizedSpend, assignedThreadCount: account.assignedThreadCount });
     }
