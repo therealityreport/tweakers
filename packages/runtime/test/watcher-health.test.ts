@@ -10,6 +10,7 @@ import {
   analyzeWatcherLogTail,
   classifyRuntimeFingerprints,
   getWatcherHealth,
+  launchdDisabledState,
   parseLaunchdLoadedCommand,
   publishWatcherHealthSnapshot,
   readRuntimeFingerprintEvidence,
@@ -159,6 +160,23 @@ test("an idle launchd service with unknown exit status needs review", () => {
 
   assert.equal(checks.find((check) => check.name === "launchd loaded")?.status, "warn");
   assert.match(checks.find((check) => check.name === "launchd loaded")?.detail ?? "", /unknown/i);
+});
+
+test("launchd disabled parser accepts macOS words and boolean forms, otherwise fails closed", () => {
+  const evidence = `
+    disabled services = {
+      "com.thomashulihan.codex-mcp-guard" => disabled
+      "com.thomashulihan.codex-mcp-idle-reaper" => enabled
+    }
+  `;
+  assert.equal(launchdDisabledState(evidence, "com.thomashulihan.codex-mcp-guard"), true);
+  assert.equal(launchdDisabledState(evidence, "com.thomashulihan.codex-mcp-idle-reaper"), false);
+  assert.equal(launchdDisabledState('"com.example.true" => true', "com.example.true"), true);
+  assert.equal(launchdDisabledState('"com.example.false" => false', "com.example.false"), false);
+  assert.equal(launchdDisabledState('"com.example.malformed" => pending', "com.example.malformed"), null);
+  assert.equal(launchdDisabledState('"com.example.malformed" => disabledish', "com.example.malformed"), null);
+  assert.equal(launchdDisabledState(evidence, "com.example.absent"), null);
+  assert.equal(launchdDisabledState(null, "com.thomashulihan.codex-mcp-guard"), null);
 });
 
 test("launchd health warns when the loaded legacy command differs from the current plist", () => {
@@ -338,9 +356,11 @@ test("watcher registry probes are hermetic through injected home and launchd sea
       job: { ok: true },
     }));
     writeFileSync(join(lifecycle, "codex-mcp-guard-status.json"), JSON.stringify({
-      schema_version: 1,
+      schema_version: 3,
       generated_at: generatedAt,
-      policy_version: "notification-only-v1",
+      authority: "observation-and-notification-only",
+      mutationCapabilities: [],
+      taskDataAccess: "none",
       job: { ok: true },
     }));
 
@@ -359,12 +379,59 @@ test("watcher registry probes are hermetic through injected home and launchd sea
     assert.equal(reaper?.status, "ok");
     assert.equal(reaper?.statusSchemaVersion, 2);
     assert.equal(guard?.status, "ok");
-    assert.equal(guard?.authority, "notification-only");
+    assert.equal(guard?.authority, "observation-and-notification-only");
     assert.deepEqual(seenLabels.sort(), [
       "com.therealityreport.tweakers.watcher",
       "com.thomashulihan.codex-mcp-guard",
       "com.thomashulihan.codex-mcp-idle-reaper",
     ]);
+  });
+});
+
+test("runtime health requires Guard v3 when enabled and treats disabled plus unloaded as intentionally disabled", () => {
+  withTempDir((root) => {
+    const home = join(root, "home");
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    const lifecycle = join(home, ".codex", "tmp");
+    mkdirSync(launchAgents, { recursive: true });
+    mkdirSync(lifecycle, { recursive: true });
+    for (const label of [
+      "com.therealityreport.tweakers.watcher",
+      "com.thomashulihan.codex-mcp-idle-reaper",
+      "com.thomashulihan.codex-mcp-guard",
+    ]) writeFileSync(join(launchAgents, `${label}.plist`), label);
+    const generatedAt = Date.now() / 1_000;
+    writeFileSync(join(lifecycle, "codex-mcp-lifecycle-status.json"), JSON.stringify({
+      schema_version: 2,
+      generated_at: generatedAt,
+      cleanup_policy_version: "strict-detached-v3",
+      job: { ok: true },
+    }));
+    writeFileSync(join(lifecycle, "codex-mcp-guard-status.json"), JSON.stringify({
+      schema_version: 1,
+      generated_at: generatedAt,
+      job: { ok: true },
+    }));
+    const enabledLegacy = getWatcherHealth(root, {
+      homeDirectory: home,
+      platformKind: "darwin",
+      launchdState: () => ({ loaded: true, disabled: false, running: false, lastExitCode: 0 }),
+    }).watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
+    assert.equal(enabledLegacy?.status, "error");
+    assert.equal(enabledLegacy?.legacyStatusSchemaVersion, 1);
+
+    const disabledUnloaded = getWatcherHealth(root, {
+      homeDirectory: home,
+      platformKind: "darwin",
+      launchdState(label) {
+        return label === "com.thomashulihan.codex-mcp-guard"
+          ? { loaded: false, disabled: true, running: false, lastExitCode: null }
+          : { loaded: true, disabled: false, running: false, lastExitCode: 0 };
+      },
+    }).watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
+    assert.equal(disabledUnloaded?.status, "ok");
+    assert.equal(disabledUnloaded?.lifecycleDisposition, "intentionally_disabled");
+    assert.equal(disabledUnloaded?.recommendedAction, null);
   });
 });
 
@@ -448,9 +515,11 @@ test("watcher health publication is atomic, redacted, and preserves last-known-g
       job: { ok: true },
     }));
     writeFileSync(join(lifecycle, "codex-mcp-guard-status.json"), JSON.stringify({
-      schema_version: 1,
+      schema_version: 3,
       generated_at: generatedAt,
-      policy_version: "notification-only-v1",
+      authority: "observation-and-notification-only",
+      mutationCapabilities: [],
+      taskDataAccess: "none",
       job: { ok: true },
     }));
 

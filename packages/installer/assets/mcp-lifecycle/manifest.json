@@ -2,11 +2,11 @@
   "schema_version": 1,
   "package": {
     "name": "@therealityreport/tweakers-mcp-lifecycle",
-    "version": "0.5.0"
+    "version": "0.6.0"
   },
-  "lifecycle_schema_version": 2,
+  "lifecycle_schema_version": 3,
   "policy_version": "strict-detached-v5",
-  "matcher_registry_version": "mcp-family-descriptors-v5",
+  "matcher_registry_version": "mcp-family-descriptors-v6",
   "policy": {
     "detached_stable_grace_seconds": 600,
     "termination_order": "children-first-term",
@@ -30,6 +30,7 @@
     "tmp/codex-mcp-lifecycle-state.json",
     "tmp/codex-mcp-lifecycle-status.json",
     "tmp/codex-mcp-lifecycle-actions.jsonl",
+    "tmp/codex-mcp-guard-window.json",
     "tmp/codex-mcp-guard-notify.json",
     "tmp/codex-mcp-guard-status.json"
   ],
@@ -40,7 +41,7 @@
       "source": "assets/lib/codex_mcp_lifecycle.py",
       "destination": "{{HOME}}/.codex/lib/codex_mcp_lifecycle.py",
       "mode": "0644",
-      "source_sha256": "08433cca3cd85be83eeb41c8f9ebbce3c1a8a7ffa3b95b983e0e0732bf3f8900"
+      "source_sha256": "08102330c18fdf1e3cfa3669b121a4c056842c3d7b3cfba220f9a7d8ff84a79b"
     },
     {
       "id": "idle-reaper",
@@ -56,7 +57,7 @@
       "source": "assets/bin/codex-mcp-guard.py",
       "destination": "{{HOME}}/.codex/bin/codex-mcp-guard.py",
       "mode": "0755",
-      "source_sha256": "f10b9e98d117929c2b2d19b4a651fcdb60dcfd4760a78bfc482ae031a449b3a9"
+      "source_sha256": "4dd0c66dd2c22d8fd4d5f32500fea124c2f07eaf4a061851fe35a9f0d47457ba"
     },
     {
       "id": "idle-reaper-launch-agent",
@@ -77,14 +78,14 @@
       "destination": "{{HOME}}/Library/LaunchAgents/com.thomashulihan.codex-mcp-guard.plist",
       "mode": "0644",
       "label": "com.thomashulihan.codex-mcp-guard",
-      "source_sha256": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
-      "template_sha256": "56c8127ff1b2adf539b2bff14df5c5dee2ae92481306c808366498353ddbb43c",
+      "source_sha256": "bc31a9b5fc1975c34cb2963398b4bb4eea3c07894dd1389509d2d0f86ae8b887",
+      "template_sha256": "bc31a9b5fc1975c34cb2963398b4bb4eea3c07894dd1389509d2d0f86ae8b887",
       "rendered_home": "/Users/thomashulihan",
-      "rendered_sha256": "20da3a72496d3a02be653f1445e0958cb587cb359fd791eb9f90d1ac606e8556"
+      "rendered_sha256": "a6b6c8cafd1b1c8e881ab552ef106c1aaf402e4fa4969e2e6e24f54500100df4"
     }
   ],
   "tests": {
-    "baseline_count": 79,
+    "baseline_count": 85,
     "path": "tests/test_mcp_lifecycle.py",
     "fixtures": "tests/fixtures/lifecycle-scenarios.json",
     "rust_patch_fixture": "tests/fixtures/codex-rust-turn-idle-v3.json"

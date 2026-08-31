@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -34,19 +36,6 @@ guard = load_script("codex_mcp_guard_under_test", "codex-mcp-guard.py")
 reaper = load_script("codex_mcp_idle_reaper_under_test", "codex-mcp-idle-reaper.py")
 
 
-def guard_proc(
-    pid: int,
-    ppid: int,
-    args: str,
-    *,
-    comm: str = "node",
-    rss_kib: int = 1024,
-    state: str = "S",
-    age: int = 7200,
-):
-    return guard.Proc(pid, ppid, rss_kib, state, age, comm, args)
-
-
 def reaper_proc(
     pid: int,
     ppid: int,
@@ -64,18 +53,14 @@ def reaper_proc(
 class AppServerMatchingTests(unittest.TestCase):
     def test_codex_flags_before_app_server_are_recognized(self):
         args = "/Users/test/.local/bin/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
-        gp = guard_proc(100, 50, args, comm="/Users/test/.local/bin/codex")
         rp = reaper_proc(100, 50, args, comm="/Users/test/.local/bin/codex")
 
-        self.assertTrue(guard.is_codex_appserver(gp))
         self.assertTrue(reaper.is_codex_appserver(rp))
 
     def test_wrapper_text_is_not_mistaken_for_app_server(self):
         args = "node -e wrapper -- /Users/test/.local/bin/codex -c x=y app-server"
-        gp = guard_proc(100, 50, args, comm="node")
         rp = reaper_proc(100, 50, args, comm="node")
 
-        self.assertFalse(guard.is_codex_appserver(gp))
         self.assertFalse(reaper.is_codex_appserver(rp))
 
     def test_direct_chrome_runtime_is_recognized(self):
@@ -83,10 +68,8 @@ class AppServerMatchingTests(unittest.TestCase):
             "/opt/node /tmp/runtime/node_modules/chrome-devtools-mcp/"
             "build/src/bin/chrome-devtools-mcp.js --headless=true"
         )
-        gp = guard_proc(110, 100, args, comm="/opt/node")
         rp = reaper_proc(110, 100, args, comm="/opt/node")
 
-        self.assertTrue(guard.is_chrome_devtools_mcp_root(gp.args))
         self.assertTrue(reaper.is_chrome_devtools_mcp_root(rp))
 
 
@@ -350,653 +333,655 @@ class ReaperSafetyTests(unittest.TestCase):
         self.assertEqual([], signals)
 
 
-class StatusCounterTests(unittest.TestCase):
-    def fixture_for_guard(self):
+class GuardV3ObserverTests(unittest.TestCase):
+    def lifecycle_document(self, generated_at=1_000):
         return {
-            p.pid: p
-            for p in (
-                guard_proc(400, 50, "codex -c x=y app-server", comm="/opt/codex", rss_kib=50000),
-                guard_proc(401, 400, "/opt/cua_node/bin/node_repl", comm="/opt/cua_node/bin/node_repl"),
-                guard_proc(
-                    402,
-                    400,
-                    "/opt/node /tmp/runtime/node_modules/chrome-devtools-mcp/"
-                    "build/src/bin/chrome-devtools-mcp.js",
-                    comm="/opt/node",
-                ),
-                guard_proc(403, 402, "<defunct>", comm="<defunct>", rss_kib=0, state="Z"),
-                guard_proc(404, 400, "node context7-app-compat", rss_kib=2048),
-                guard_proc(410, 1, "/opt/cua_node/bin/node_repl", comm="/opt/cua_node/bin/node_repl", age=4000),
-            )
+            "schema_version": lifecycle.SCHEMA_VERSION,
+            "generated_at": generated_at,
+            "matcher_registry_version": lifecycle.MATCHER_REGISTRY_VERSION,
+            "job": {"ok": True, "mode": "status", "error": None},
+            "counts": {},
+            "trees": [],
         }
 
-    def test_guard_pressure_status_is_truthful_and_observation_only(self):
-        counts, _warnings = guard.inspect_process_pressure(
-            self.fixture_for_guard(), swap_usage_reader=lambda: None,
-        )
-
-        self.assertEqual(1, counts["loaded_task_stacks"])
-        self.assertEqual(1, counts["chrome_zombies"])
-        self.assertEqual(2, counts["node_repls"])
-        self.assertEqual(5, counts["mcp_rss_mib"])
-        self.assertEqual(1, counts["actionable_orphans"])
-        self.assertEqual(1, counts["chrome_wrappers"])
-        self.assertEqual(0, counts["would_kill"])
-        self.assertEqual(0, counts["killed_pids"])
-
-
-class GuardPressureSignalTests(unittest.TestCase):
-    """Machine-wide swap and helper-count pressure signals (notification-only)."""
-
-    def fixture_with_helper_tree(self):
-        return {
-            p.pid: p
-            for p in (
-                guard_proc(400, 50, "codex -c x=y app-server", comm="/opt/codex"),
-                guard_proc(
-                    500,
-                    400,
-                    "/opt/node /tmp/runtime/node_modules/chrome-devtools-mcp/"
-                    "build/src/bin/chrome-devtools-mcp.js",
-                    comm="/opt/node",
-                ),
-                guard_proc(501, 500, "node helper-a"),
-                guard_proc(502, 500, "node helper-b"),
-                guard_proc(503, 502, "node helper-grandchild"),
-            )
-        }
-
-    def test_read_swap_usage_parses_sysctl_and_handles_absence(self):
-        def runner_for(stdout, returncode=0):
-            def runner(argv, **_kwargs):
-                self.assertEqual(["sysctl", "-n", "vm.swapusage"], argv)
-                return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
-
-            return runner
-
-        parsed = guard.read_swap_usage(
-            runner_for("total = 2048.00M  used = 1017.12M  free = 1030.88M  (encrypted)\n")
-        )
-        self.assertIsNotNone(parsed)
-        used_mib, total_mib = parsed
-        self.assertAlmostEqual(1017.12, used_mib, places=2)
-        self.assertAlmostEqual(2048.0, total_mib, places=2)
-
-        scaled = guard.read_swap_usage(
-            runner_for("vm.swapusage: total = 4.00G  used = 3.00G  free = 1.00G\n")
-        )
-        self.assertEqual((3072.0, 4096.0), scaled)
-
-        self.assertIsNone(guard.read_swap_usage(runner_for("")))
-        self.assertIsNone(guard.read_swap_usage(runner_for("no swap counters here")))
-        self.assertIsNone(guard.read_swap_usage(runner_for("total = 0.00M  used = 0.00M  free = 0.00M")))
-        self.assertIsNone(guard.read_swap_usage(runner_for("total = 2048.00M  used = 10.00M", returncode=1)))
-
-        def missing_sysctl(_argv, **_kwargs):
-            raise FileNotFoundError("sysctl not found")
-
-        self.assertIsNone(guard.read_swap_usage(missing_sysctl))
-
-    def test_swap_pressure_signal_reports_measured_values_above_threshold_only(self):
-        table = self.fixture_with_helper_tree()
-
-        counts, warnings = guard.inspect_process_pressure(
-            table, swap_usage_reader=lambda: (1536.0, 2048.0),
-        )
-        self.assertEqual(1536, counts["swap_used_mib"])
-        self.assertEqual(2048, counts["swap_total_mib"])
-        self.assertEqual(75, counts["swap_used_pct"])
-        swap_warnings = [w for w in warnings if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
-        self.assertEqual(1, len(swap_warnings))
-        self.assertIn("1536 MiB", swap_warnings[0])
-        self.assertIn("2048 MiB", swap_warnings[0])
-        self.assertIn("75%", swap_warnings[0])
-        self.assertIn(f"{guard.SWAP_PRESSURE_PCT}% threshold", swap_warnings[0])
-
-        _counts, at_threshold = guard.inspect_process_pressure(
-            table, swap_usage_reader=lambda: (1024.0, 2048.0),
-        )
-        self.assertEqual(
-            [], [w for w in at_threshold if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
-        )
-
-        absent_counts, absent = guard.inspect_process_pressure(
-            table, swap_usage_reader=lambda: None,
-        )
-        self.assertNotIn("swap_used_pct", absent_counts)
-        self.assertEqual(
-            [], [w for w in absent if w.startswith(f"{guard.SWAP_PRESSURE_SIGNAL_ID}:")]
-        )
-
-    def test_helper_count_pressure_reuses_process_tree_accounting(self):
-        table = self.fixture_with_helper_tree()
-
-        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 3):
-            counts, warnings = guard.inspect_process_pressure(
-                table, swap_usage_reader=lambda: None,
-            )
-        self.assertEqual(4, counts["mcp_helper_processes"])
-        helper_warnings = [
-            w for w in warnings if w.startswith(f"{guard.HELPER_PRESSURE_SIGNAL_ID}:")
+    def test_v3_selector_has_exact_four_state_precedence(self):
+        cases = [
+            ({"unavailable_reasons": [{"code": "missing", "detail": "x"}], "alerts": [{"id": "a"}], "loaded_task_stacks": 1, "ui_owned_logical_helpers": 1}, ("unavailable", "unavailable")),
+            ({"unavailable_reasons": [], "alerts": [{"id": "a"}], "loaded_task_stacks": 1, "ui_owned_logical_helpers": 1}, ("warning", "warning")),
+            ({"unavailable_reasons": [], "alerts": [], "loaded_task_stacks": 1, "ui_owned_logical_helpers": 1}, ("expected_fanout", "expected_fanout")),
+            ({"unavailable_reasons": [], "alerts": [], "loaded_task_stacks": 0, "ui_owned_logical_helpers": 1}, ("healthy", "healthy")),
         ]
-        self.assertEqual(1, len(helper_warnings))
-        self.assertIn("4 MCP helper processes", helper_warnings[0])
-        self.assertIn("3-process threshold", helper_warnings[0])
+        for arguments, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(expected, guard.select_v3_state(**arguments))
 
-        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 4):
-            _counts, at_threshold = guard.inspect_process_pressure(
-                table, swap_usage_reader=lambda: None,
-            )
-        self.assertEqual(
-            [], [w for w in at_threshold if w.startswith(f"{guard.HELPER_PRESSURE_SIGNAL_ID}:")]
+    def test_lifecycle_status_requires_current_schema_matcher_and_freshness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory)
+            path = state_directory / guard.LIFECYCLE_STATUS_FILE
+            path.write_text(json.dumps(self.lifecycle_document()))
+            document, reasons = guard.read_lifecycle_status(state_directory, now=1_100)
+            self.assertIsNotNone(document)
+            self.assertEqual([], reasons)
+
+            stale = self.lifecycle_document(generated_at=1)
+            path.write_text(json.dumps(stale))
+            _document, stale_reasons = guard.read_lifecycle_status(state_directory, now=1_000)
+            self.assertEqual("lifecycle_status_stale", stale_reasons[0]["code"])
+
+            mismatch = self.lifecycle_document()
+            mismatch["matcher_registry_version"] = "wrong"
+            path.write_text(json.dumps(mismatch))
+            _document, mismatch_reasons = guard.read_lifecycle_status(state_directory, now=1_100)
+            self.assertIn("matcher_version_mismatch", [reason["code"] for reason in mismatch_reasons])
+
+    def test_v3_document_declares_only_observation_authority_and_has_required_fields(self):
+        document = guard.build_guard_document(
+            {
+                "loaded_task_stacks": 3,
+                "ui_owned_logical_helpers": 2,
+                "logical_instances": {"chrome": 2},
+                "raw_processes": 4,
+                "rss_mib": 12,
+                "ownership": {"ui_owned": 1},
+            },
+            self.lifecycle_document(),
+            [],
+            generated_at=1_000,
+        )
+        self.assertEqual("mcp-guard-status.v3", document["schema"])
+        self.assertEqual(3, document["schema_version"])
+        self.assertEqual("observation-and-notification-only", document["authority"])
+        self.assertEqual([], document["mutationCapabilities"])
+        self.assertEqual("none", document["taskDataAccess"])
+        self.assertEqual("expected_fanout", document["state"])
+        self.assertEqual("expected_fanout", document["selected_producer"])
+        self.assertIn("schema_versions", document)
+        self.assertIn("matcher", document)
+        self.assertIn("counts", document)
+        self.assertIn("cpu_window", document)
+        self.assertIn("system_memory", document)
+
+    def test_actionable_detached_tree_is_a_warning_that_never_claims_signal_authority(self):
+        lifecycle_status = self.lifecycle_document()
+        lifecycle_status["trees"] = [{
+            "tree_key": "detached-example",
+            "ownership": "detached",
+            "actionable": True,
+        }]
+        alerts = guard.lifecycle_alerts(lifecycle_status)
+        document = guard.build_guard_document({}, lifecycle_status, [], alerts=alerts, generated_at=1_000)
+        self.assertEqual("warning", document["state"])
+        self.assertEqual("detached_actionable", document["alerts"][0]["kind"])
+        self.assertIn("did not signal", document["alerts"][0]["message"])
+
+    def test_guard_writes_only_its_bounded_state_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory)
+            document = guard.build_guard_document({}, self.lifecycle_document(), [], generated_at=1_000)
+            path = guard.write_guard_status(document, state_directory)
+            self.assertEqual((state_directory / guard.GUARD_STATUS_FILE).resolve(), path)
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            with self.assertRaises(ValueError):
+                guard.guard_owned_path(state_directory, "outside.json")
+            with self.assertRaises(ValueError):
+                guard.configured_state_directory("relative")
+
+    def test_snapshot_retry_is_bounded_and_records_unavailable_after_second_failure(self):
+        attempts = []
+
+        def unavailable():
+            attempts.append("attempt")
+            raise OSError("snapshot unavailable")
+
+        observation, reasons = guard.load_observation_with_retry(unavailable, sleeper=lambda seconds: attempts.append(seconds))
+        self.assertIsNone(observation)
+        self.assertEqual(["attempt", 0.25, "attempt"], attempts)
+        self.assertEqual("process_snapshot_unavailable", reasons[0]["code"])
+
+    def test_default_process_only_and_status_are_non_mutating_and_removed_scopes_fail(self):
+        self.assertEqual("process-only", guard.parse_args([]).scope)
+        self.assertEqual("status", guard.parse_args(["--scope", "status"]).scope)
+        for removed in ("all", "threads-only"):
+            with self.subTest(scope=removed), self.assertRaises(SystemExit):
+                guard.parse_args(["--scope", removed])
+
+    def test_cooldown_is_a_guard_owned_notification_seam(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory)
+            with mock.patch.dict("os.environ", {"CODEX_MCP_GUARD_NOTIFY_HELPER": "/tmp/notify"}, clear=False):
+                sent = guard.maybe_notify(
+                    {"id": "test-alert", "message": "observable warning"},
+                    state_directory,
+                    now=7_200,
+                    runner=lambda *_args, **_kwargs: mock.Mock(returncode=0),
+                )
+                cooldown = guard.maybe_notify(
+                    {"id": "test-alert", "message": "observable warning"},
+                    state_directory,
+                    now=7_201,
+                    runner=lambda *_args, **_kwargs: mock.Mock(returncode=0),
+                )
+            self.assertEqual("sent", sent)
+            self.assertEqual("cooldown", cooldown)
+            self.assertTrue((state_directory / guard.NOTIFY_FILE).exists())
+
+
+class GuardSustainedEvidenceTests(unittest.TestCase):
+    uid = os.getuid()
+    wrapper_executable = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    codex_executable = "/Applications/ChatGPT.app/Contents/Resources/codex"
+    node_repl_executable = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    computer_use_executable = (
+        Path.home() / ".codex" / "computer-use" / "Codex Computer Use.app" / "Contents"
+        / "SharedSupport" / "SkyComputerUseClient.app" / "Contents" / "MacOS" / "SkyComputerUseClient"
+    )
+
+    def proc(self, pid, ppid, executable, args, *, rss_kib=1024, cpu=0.0, state="S", birth=None, cwd=""):
+        return lifecycle.ProcessInfo(
+            pid=pid,
+            ppid=ppid,
+            uid=self.uid,
+            rss_kib=rss_kib,
+            state=state,
+            age_seconds=900,
+            cpu_seconds=cpu,
+            executable=str(executable),
+            args=args,
+            birth=birth or f"birth-{pid}",
+            cwd=cwd,
         )
 
-    def test_pressure_signals_reach_the_guard_status_heartbeat(self):
-        with mock.patch.object(guard, "HELPER_PRESSURE_COUNT", 3):
-            counts, warnings = guard.inspect_process_pressure(
-                self.fixture_with_helper_tree(),
-                swap_usage_reader=lambda: (1536.0, 2048.0),
-            )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "guard-status.json"
-            guard.write_guard_status(counts, warnings, None, path=path, generated_at=1_000)
-            payload = json.loads(path.read_text())
+    def ui_snapshot(self, *, task_stacks=1, helper_mode="event-stream", helper_child=False):
+        ui = self.proc(2, 1, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "ChatGPT")
+        wrapper = self.proc(
+            10,
+            2,
+            self.wrapper_executable,
+            "node -e 'x' Tweakers Codex parent: fixture -- "
+            f"{self.codex_executable} -c features.code_mode_host=true app-server",
+        )
+        app = self.proc(
+            11,
+            10,
+            self.codex_executable,
+            f"{self.codex_executable} -c features.code_mode_host=true app-server",
+        )
+        repls = [
+            self.proc(100 + index, 11, self.node_repl_executable, self.node_repl_executable)
+            for index in range(task_stacks)
+        ]
+        helper = self.proc(
+            300,
+            11,
+            self.computer_use_executable,
+            f"{self.computer_use_executable} {helper_mode} mcp",
+            rss_kib=2 * 1024,
+            cpu=10.0,
+        )
+        descendants = [
+            self.proc(301, 300, "/usr/bin/node", "node child.js", rss_kib=3 * 1024, cpu=5.0)
+        ] if helper_child else []
+        return {process.pid: process for process in [ui, wrapper, app, *repls, helper, *descendants]}
 
-        signal_ids = {signal.split(":", 1)[0] for signal in payload["pressure_signals"]}
-        self.assertIn(guard.SWAP_PRESSURE_SIGNAL_ID, signal_ids)
-        self.assertIn(guard.HELPER_PRESSURE_SIGNAL_ID, signal_ids)
-        self.assertEqual(4, payload["counts"]["mcp_helper_processes"])
-        self.assertEqual(75, payload["counts"]["swap_used_pct"])
-        self.assertEqual("notification-only", payload["authority"])
-
-    def test_pressure_thresholds_are_env_overridable(self):
-        with mock.patch.dict(
-            "os.environ",
-            {
-                "CODEX_GUARD_SWAP_PRESSURE_PCT": "90",
-                "CODEX_GUARD_HELPER_PRESSURE_COUNT": "7",
-            },
-        ):
-            override = load_script("codex_mcp_guard_env_override_under_test", "codex-mcp-guard.py")
-        self.assertEqual(90, override.SWAP_PRESSURE_PCT)
-        self.assertEqual(7, override.HELPER_PRESSURE_COUNT)
-
-
-class GuardLifecycleStatusTests(unittest.TestCase):
-    def valid_status(
+    def sample(
         self,
+        captured_at,
         *,
-        generated_at=1_000,
-        state="blocked_active_work",
-        schema_version=1,
-        ownership="detached",
-        computer_use=27,
+        helpers=1,
+        rss_mib=10,
+        cpu_seconds=0.0,
+        stacks=1,
+        owner=True,
+        ambiguous=False,
+        partial=False,
+        zombie=False,
+        available_pct=50.0,
+        physical_ram_mib=10_000,
     ):
         return {
-            "schema_version": schema_version,
-            "generated_at": generated_at,
-            "job": {"ok": True, "mode": "dry_run", "error": None},
-            "counts": {
-                "would_kill": 0,
-                "detached_trees": 1 if ownership == "detached" else 0,
+            "captured_at": captured_at,
+            "owner": {"pid": 11, "birth": "app-a", "executable": self.codex_executable} if owner else None,
+            "loaded_task_stacks": stacks,
+            "logical_helpers": helpers,
+            "rss_mib": rss_mib,
+            "mcp_cpu_seconds": cpu_seconds,
+            "lifecycle_integrity": {
+                "partial_reaper_failure": partial,
+                "zombie_under_mcp_root": zombie,
+                "ambiguous_ownership": ambiguous,
             },
-            "helper_family_counts": {"computer_use": computer_use},
-            "trees": [{
-                "tree_key": "wrapper:10@birth-a/app:11@birth-b",
-                "root_identity": {
-                    "pid": 10,
-                    "birth": "birth-a",
-                    "executable": "/opt/codex-wrapper",
-                    "command_shape": "codex-wrapper",
-                },
-                "app_server_identity": {
-                    "pid": 11,
-                    "birth": "birth-b",
-                    "executable": "/opt/codex",
-                    "command_shape": "codex app-server",
-                },
-                "ownership": ownership,
-                "state": state,
-                "actionable": False,
-                "blockers": [{
-                    "identity": {
-                        "pid": 12,
-                        "birth": "birth-c",
-                        "executable": "/usr/bin/python3",
-                        "command_shape": "python user command",
-                    },
-                    "name": "inventory reconcile",
-                    "command_summary": "object_storage_inventory_reconcile.py --apply",
-                }],
-                "idle_since": None,
-                "eligible_at": None,
-                "remaining_seconds": None,
-                "helper_family_counts": {"computer_use": computer_use},
-                "rss_kib": 2048,
-                "last_action": None,
-                "error": None,
-            }],
+            "system_memory": {
+                "available_pct": available_pct,
+                "physical_ram_mib": physical_ram_mib,
+            },
         }
 
-    def write_status(self, payload):
-        directory = tempfile.TemporaryDirectory()
-        path = Path(directory.name) / "status.json"
-        path.write_text(json.dumps(payload))
-        self.addCleanup(directory.cleanup)
-        return path
+    def alert_ids(self, samples):
+        return {alert["id"] for alert in guard.sustained_alerts(samples)}
 
-    def test_guard_loads_current_schema_and_rejects_corrupt_or_stale_status(self):
-        payload = self.valid_status()
-        loaded, error = guard.load_lifecycle_status(self.write_status(payload), now=1_100)
-        self.assertEqual(payload, loaded)
-        self.assertIsNone(error)
-
-        payload_v2 = self.valid_status(schema_version=2)
-        loaded, error = guard.load_lifecycle_status(self.write_status(payload_v2), now=1_100)
-        self.assertEqual(payload_v2, loaded)
-        self.assertIsNone(error)
-
-        corrupt = self.write_status({"schema_version": 99})
-        loaded, error = guard.load_lifecycle_status(corrupt, now=1_100)
-        self.assertIsNone(loaded)
-        self.assertIn("schema mismatch", error or "")
-
-        stale = self.valid_status(generated_at=1)
-        loaded, error = guard.load_lifecycle_status(self.write_status(stale), now=10_000)
-        self.assertEqual(stale, loaded)
-        self.assertIn("stale", error or "")
-
-    def test_guard_lifecycle_events_are_state_keyed_and_never_leak_raw_argv(self):
-        payload = self.valid_status()
-        payload["trees"][0]["blockers"][0]["raw_argv"] = "super-secret --token=do-not-display"
-        events = guard.lifecycle_notification_events(payload)
-
-        self.assertEqual(1, len(events))
-        self.assertIn("blocked_active_work", events[0].key)
-        self.assertIn("inventory reconcile", events[0].message)
-        self.assertNotIn("super-secret", events[0].message)
-        self.assertNotIn("super-secret", repr(events[0]))
-
-        payload["trees"][0]["state"] = "idle_pending"
-        changed = guard.lifecycle_notification_events(payload)
-        self.assertNotEqual(events[0].key, changed[0].key)
-
-    def test_ui_owned_pressure_escalates_without_claiming_cleanup_authority(self):
-        below = self.valid_status(
-            state="observed",
-            ownership="ui_owned",
-            computer_use=guard.COMPUTER_USE_WARN,
-        )
-        self.assertEqual([], guard.lifecycle_notification_events(below))
-
-        warning = self.valid_status(
-            state="observed",
-            ownership="ui_owned",
-            computer_use=guard.COMPUTER_USE_WARN + 1,
-        )
-        warning_events = guard.lifecycle_notification_events(warning)
-        self.assertEqual(1, len(warning_events))
-        self.assertIn("ui-pressure:warning", warning_events[0].key)
-
-        critical = self.valid_status(
-            state="observed",
-            ownership="ui_owned",
-            computer_use=guard.COMPUTER_USE_CRITICAL,
-        )
-        critical_events = guard.lifecycle_notification_events(critical)
-        self.assertEqual(1, len(critical_events))
-        self.assertIn("ui-pressure:critical", critical_events[0].key)
-        self.assertNotEqual(warning_events[0].key, critical_events[0].key)
-        self.assertIn("notification-only", critical_events[0].message)
-        self.assertIn("will not send process signals", critical_events[0].message)
-        self.assertNotIn("eligible", critical_events[0].message)
-
-        critical["trees"][0]["state"] = "partial_failure"
-        critical["trees"][0]["error"] = "classification failed"
-        failure_events = guard.lifecycle_notification_events(critical)
-        self.assertEqual(1, len(failure_events))
-        self.assertEqual("Codex MCP lifecycle failure", failure_events[0].title)
-
-    def test_valid_lifecycle_status_suppresses_duplicate_generic_computer_use_warning(self):
-        proc_table = {
-            proc.pid: proc
-            for proc in (
-                guard_proc(400, 50, "codex -c x=y app-server", comm="/opt/codex"),
-                guard_proc(401, 400, "/opt/SkyComputerUseClient --stdio"),
-                guard_proc(402, 400, "/opt/SkyComputerUseClient --stdio"),
-                guard_proc(403, 400, "/opt/SkyComputerUseClient --stdio"),
-            )
-        }
-        status = self.valid_status(
-            state="observed",
-            ownership="ui_owned",
-            computer_use=3,
-        )
-
-        counts, warnings = guard.inspect_process_pressure(
-            proc_table, status, swap_usage_reader=lambda: None,
-        )
-
-        self.assertEqual(3, counts["computer_use_helpers"])
-        self.assertEqual([], warnings)
-
-    def test_quiet_notifies_but_no_notify_and_cooldown_do_not(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "notifications.json"
-            notify_script = Path(directory) / "notify"
-            notify_script.write_text("#!/bin/sh\n")
-            calls = []
-
-            def runner(argv, **_kwargs):
-                calls.append(argv)
-                return mock.Mock(returncode=0, stdout="", stderr="")
-
-            sent = guard.maybe_notify(
-                "lifecycle:v1:tree:blocked_active_work",
-                "Detached Codex runtime protected",
-                "protected by user work",
-                quiet=True,
-                now=7_200,
-                runner=runner,
-                state_path=state_path,
-                notify_script=notify_script,
-            )
-            self.assertEqual("sent", sent)
-            self.assertEqual(1, len(calls))
-
-            disabled = guard.maybe_notify(
-                "another-key", "ignored", "ignored", no_notify=True,
-                now=7_201, runner=runner, state_path=state_path, notify_script=notify_script,
-            )
-            self.assertEqual("disabled", disabled)
-            self.assertEqual(1, len(calls))
-
-            cooldown = guard.maybe_notify(
-                "lifecycle:v1:tree:blocked_active_work", "same", "same",
-                now=7_201, runner=runner, state_path=state_path, notify_script=notify_script,
-            )
-            self.assertEqual("cooldown", cooldown)
-            self.assertEqual(1, len(calls))
-
-            transition = guard.maybe_notify(
-                "lifecycle:v1:tree:eligible", "eligible", "starting",
-                now=7_201, runner=runner, state_path=state_path, notify_script=notify_script,
-            )
-            self.assertEqual("sent", transition)
-            self.assertEqual(2, len(calls))
-
-    def test_notification_failure_does_not_create_a_cooldown_record(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "notifications.json"
-            notify_script = Path(directory) / "notify"
-            notify_script.write_text("#!/bin/sh\n")
-            outcome = guard.maybe_notify(
-                "lifecycle:v1:tree:partial_failure", "failed", "inspect",
-                now=7_200,
-                runner=lambda *_args, **_kwargs: mock.Mock(returncode=1, stdout="", stderr="boom"),
-                state_path=state_path,
-                notify_script=notify_script,
-            )
-            self.assertEqual("failed", outcome)
-            self.assertFalse(state_path.exists())
-
-    def test_guard_heartbeat_is_atomic_notification_only_and_redacted(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "guard-status.json"
-            guard.write_guard_status(
-                {"app_servers": 1, "would_kill": 0},
-                ["context7 pressure"],
-                "status path /Users/example/private",
-                path=path,
-                generated_at=1_000,
-            )
-            payload = json.loads(path.read_text())
-
-        self.assertEqual(1, payload["schema_version"])
-        self.assertEqual("0.3.1", payload["producer_version"])
-        self.assertEqual("notification-only-v2", payload["policy_version"])
-        self.assertEqual("notification-only", payload["authority"])
-        self.assertEqual("observation", payload["job"]["mode"])
-        self.assertEqual(["context7 pressure"], payload["pressure_signals"])
-        self.assertNotIn("/Users/example", payload["lifecycle_status_error"])
-        self.assertNotIn("actionable", json.dumps(payload))
-        redacted = guard._redact_watcher_text(
-            "Bearer secret --token=hidden sk-proj-abcdefghijk /Users/example/private",
-            Path("/Users/example"),
-        )
-        self.assertNotIn("secret", redacted)
-        self.assertNotIn("hidden", redacted)
-        self.assertNotIn("abcdefghijk", redacted)
-        self.assertNotIn("/Users/example", redacted)
-
-    def test_watcher_snapshot_has_three_private_entries_and_updates_last_known_good(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            home = base / "home"
-            root = home / "Library" / "Application Support" / "codex-plusplus"
-            agents = home / "Library" / "LaunchAgents"
-            lifecycle_dir = home / ".codex" / "tmp"
-            for label in (
-                "com.therealityreport.tweakers.watcher",
-                "com.thomashulihan.codex-mcp-idle-reaper",
-                "com.thomashulihan.codex-mcp-guard",
-            ):
-                agents.mkdir(parents=True, exist_ok=True)
-                (agents / f"{label}.plist").write_text("<plist />")
-            root.mkdir(parents=True, exist_ok=True)
-            lifecycle_dir.mkdir(parents=True, exist_ok=True)
-            root.joinpath("auto-repair-state.json").write_text(json.dumps({
-                "schemaVersion": 1,
-                "latestCompletedCycle": {
-                    "schemaVersion": 1,
-                    "completedAt": "1970-01-01T00:16:40Z",
-                    "outcome": "completed",
-                    "repair": {"status": "succeeded", "error": None},
-                },
-            }))
-            lifecycle_dir.joinpath("codex-mcp-lifecycle-status.json").write_text(json.dumps({
-                "schema_version": 2,
-                "generated_at": 1_000,
-                "cleanup_policy_version": "strict-detached-v3",
-                "job": {"ok": True, "error": None},
-            }))
-            guard_status = lifecycle_dir / "codex-mcp-guard-status.json"
-            guard.write_guard_status({}, [], None, path=guard_status, generated_at=1_000)
-            current = root / "watcher-health.json"
-            last_known_good = root / "watcher-health.last-known-good.json"
-            current.write_text("{}")
-            current.chmod(0o644)
-
-            snapshot = guard.publish_watcher_health_snapshot(
-                path=current,
-                last_known_good_path=last_known_good,
-                tweakers_root=root,
-                home_directory=home,
-                guard_status_path=guard_status,
-                checked_at=1_005,
-                launchd_state=lambda _label: {"loaded": True, "running": False, "lastExitCode": 0},
-            )
-
-            self.assertEqual("tweakers.health.v1", snapshot["schema"])
-            self.assertEqual(1, snapshot["schemaVersion"])
-            self.assertEqual(
-                ["tweakers-repair", "mcp-lifecycle-reaper", "mcp-pressure-guard"],
-                [entry["id"] for entry in snapshot["watchers"]],
-            )
-            self.assertEqual("ok", snapshot["status"])
-            self.assertTrue(all(entry["status"] == "ok" for entry in snapshot["watchers"]))
-            self.assertTrue(all(entry["installedPath"].startswith("~") for entry in snapshot["watchers"]))
-            self.assertEqual(0o600, current.stat().st_mode & 0o777)
-            self.assertEqual(0o600, last_known_good.stat().st_mode & 0o777)
-            original_last_known_good = last_known_good.read_text()
-            root.joinpath("auto-repair-state.json").write_text(json.dumps({
-                "schemaVersion": 1,
-                "latestCompletedCycle": {
-                    "schemaVersion": 1,
-                    "completedAt": "1970-01-01T00:16:40Z",
-                    "outcome": "failed",
-                    "repair": {"status": "failed", "error": "/Users/test/private --token=hidden"},
-                },
-            }))
-            failed = guard.publish_watcher_health_snapshot(
-                path=current,
-                last_known_good_path=last_known_good,
-                tweakers_root=root,
-                home_directory=home,
-                guard_status_path=guard_status,
-                checked_at=1_005,
-                launchd_state=lambda _label: {"loaded": True, "running": False, "lastExitCode": 0},
-            )
-            repair = failed["watchers"][0]
-            self.assertEqual("error", repair["status"])
-            self.assertNotIn("/Users/test", repair["error"])
-            self.assertNotIn("hidden", repair["error"])
-            self.assertEqual(original_last_known_good, last_known_good.read_text())
-
-    def test_watcher_snapshot_rejects_corrupt_or_schema_less_evidence_and_redacts_policy(self):
-        self.assertIsNone(guard._iso8601(float("nan")))
-        self.assertIsNone(guard._iso8601(float("inf")))
-        self.assertIsNone(guard._iso8601("999999999999999999999999999999-01-01T00:00:00Z"))
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            non_utf8 = base / "non-utf8.json"
-            non_utf8.write_bytes(b"\xff\xfe")
-            self.assertIsNone(guard._read_json_object(non_utf8))
-            missing_repair = guard._repair_watcher_status(
-                base / "missing-repair.json", home_directory=base, read_json=guard._read_json_object,
-            )
-            self.assertIn("missing", missing_repair["error"])
-            wrong_repair = base / "wrong-repair.json"
-            wrong_repair.write_text(json.dumps({"schemaVersion": 99}))
-            self.assertIn(
-                "unsupported",
-                guard._repair_watcher_status(
-                    wrong_repair, home_directory=base, read_json=guard._read_json_object,
-                )["error"],
-            )
-
-            home = base / "home"
-            root = home / "Library" / "Application Support" / "codex-plusplus"
-            agents = home / "Library" / "LaunchAgents"
-            lifecycle_dir = home / ".codex" / "tmp"
-            for label in (
-                "com.therealityreport.tweakers.watcher",
-                "com.thomashulihan.codex-mcp-idle-reaper",
-                "com.thomashulihan.codex-mcp-guard",
-            ):
-                agents.mkdir(parents=True, exist_ok=True)
-                (agents / f"{label}.plist").write_text("<plist />")
-            root.mkdir(parents=True, exist_ok=True)
-            lifecycle_dir.mkdir(parents=True, exist_ok=True)
-            root.joinpath("auto-repair-state.json").write_text(json.dumps({
-                "schemaVersion": 1,
-                "latestCompletedCycle": {
-                    "schemaVersion": 1,
-                    "completedAt": "1970-01-01T00:16:40Z",
-                    "outcome": "completed",
-                    "repair": {"status": "succeeded", "error": None},
-                },
-            }))
-            lifecycle_dir.joinpath("codex-mcp-lifecycle-status.json").write_text(json.dumps({
-                "generated_at": 1_000,
-                "policyVersion": f"{home}/private Bearer secret --token=hidden {('x' * 600)}",
-                "job": {"ok": True, "error": None},
-            }))
-            guard_status = lifecycle_dir / "codex-mcp-guard-status.json"
-            guard_status.write_text(json.dumps({
-                "schema_version": 99,
-                "generated_at": 1_000,
-                "job": {"ok": True, "error": None},
-            }))
-
-            snapshot = guard.build_watcher_health_snapshot(
-                tweakers_root=root,
-                home_directory=home,
-                guard_status_path=guard_status,
-                checked_at=1_005,
-                launchd_state=lambda _label: {"loaded": True, "running": False, "lastExitCode": 0},
-            )
-
-            reaper = snapshot["watchers"][1]
-            pressure_guard = snapshot["watchers"][2]
-            self.assertEqual("unsupported", reaper["freshness"])
-            self.assertEqual("error", reaper["status"])
-            self.assertEqual("error", pressure_guard["status"])
-            rendered = json.dumps(snapshot)
-            self.assertNotIn(str(home), rendered)
-            self.assertNotIn("secret", rendered)
-            self.assertNotIn("hidden", rendered)
-            self.assertNotIn("x" * 513, rendered)
-
-    def test_watcher_snapshot_failure_does_not_change_guard_exit_result(self):
-        counts = {"app_servers": 0}
-        args = mock.Mock(scope="process-only", quiet=True, dry_run=False, no_notify=True)
-        with tempfile.TemporaryDirectory() as directory, \
-             mock.patch.object(guard, "TMP_DIR", Path(directory)), \
-             mock.patch.object(guard, "parse_args", return_value=args), \
-             mock.patch.object(guard, "load_lifecycle_status", return_value=(None, None)), \
-             mock.patch.object(guard, "load_processes", return_value={}), \
-             mock.patch.object(guard, "inspect_process_pressure", return_value=(counts, [])), \
-             mock.patch.object(guard, "write_guard_status") as heartbeat:
-            result = guard.main(publisher=lambda: (_ for _ in ()).throw(OSError("/Users/test/private --token=hidden")))
-
-        self.assertEqual(0, result)
-        heartbeat.assert_called_once()
-
-    def test_watcher_snapshot_is_degraded_without_status_evidence_and_preserves_last_known_good(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            home = base / "home"
-            root = home / "Library" / "Application Support" / "codex-plusplus"
-            root.mkdir(parents=True)
-            current = root / "watcher-health.json"
-            last_known_good = root / "watcher-health.last-known-good.json"
-            sentinel = {"schema": "tweakers.health.v1", "status": "ok", "watchers": []}
-            last_known_good.write_text(json.dumps(sentinel))
-
-            snapshot = guard.publish_watcher_health_snapshot(
-                path=current,
-                last_known_good_path=last_known_good,
-                tweakers_root=root,
-                home_directory=home,
-                checked_at=1_005,
-                launchd_state=lambda _label: {"loaded": False, "running": False, "lastExitCode": None},
-            )
-
-            self.assertEqual("error", snapshot["status"])
-            self.assertEqual(3, len(snapshot["watchers"]))
-            self.assertTrue(all(entry["status"] == "error" for entry in snapshot["watchers"]))
-            self.assertNotIn(str(home), json.dumps(snapshot))
-            self.assertEqual(sentinel, json.loads(last_known_good.read_text()))
-
-    def test_reaper_status_reports_targets_without_counting_live_stacks(self):
-        procs = [
-            reaper_proc(500, 50, "codex -c x=y app-server", comm="/opt/codex", rss_kib=50000),
-            reaper_proc(501, 500, "/opt/cua_node/bin/node_repl", comm="/opt/cua_node/bin/node_repl"),
-            reaper_proc(
-                502,
-                500,
-                "/opt/node /tmp/runtime/node_modules/chrome-devtools-mcp/"
-                "build/src/bin/chrome-devtools-mcp.js",
-                comm="/opt/node",
-            ),
-            reaper_proc(503, 502, "<defunct>", comm="<defunct>", rss_kib=0, state="Z"),
-            reaper_proc(504, 502, "node chrome-child", rss_kib=2048),
-            reaper_proc(510, 1, "npm exec @decodo/mcp-server", comm="npm", age=500),
+    def test_shared_registry_covers_every_exact_computer_use_mode_without_substring_trust(self):
+        descriptors = [
+            lifecycle._mcp_descriptor(self.proc(
+                20 + index,
+                11,
+                self.computer_use_executable,
+                f"{self.computer_use_executable} {mode} mcp",
+            ))
+            for index, mode in enumerate(("event-stream", "messages", "computer-history"))
         ]
-        with mock.patch.object(reaper, "load_procs", return_value={p.pid: p for p in procs}):
-            instance = reaper.Reaper(dry_run=True)
-        instance.reap_orphans()
+        self.assertEqual(
+            [
+                "app.computer-use.event-stream",
+                "app.computer-use.messages",
+                "app.computer-use.computer-history",
+            ],
+            [descriptor.identifier if descriptor else None for descriptor in descriptors],
+        )
+        negative = [
+            self.proc(30, 11, self.computer_use_executable, f"{self.computer_use_executable} messages mcp --extra"),
+            self.proc(31, 11, "/usr/bin/python3", "python3 report.py --note event-stream mcp"),
+            self.proc(32, 11, "/tmp/SkyComputerUseClient", "/tmp/SkyComputerUseClient computer-history mcp"),
+        ]
+        self.assertEqual([None, None, None], [lifecycle._mcp_descriptor(process) for process in negative])
 
-        counts = reaper.status_counts(instance)
+    def test_context7_compatibility_requires_its_declared_wrapper_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "context7" / "1.0.0"
+            script = root / "dist" / "context7-app-compat-mcp.mjs"
+            wrapper = root / "scripts" / "start-context7-mcp.sh"
+            script.parent.mkdir(parents=True)
+            wrapper.parent.mkdir()
+            script.write_text("// fixture", encoding="utf-8")
+            wrapper.write_text('exec node "$script_dir/context7-app-compat-mcp.mjs"\n', encoding="utf-8")
+            (root / ".mcp.json").write_text(json.dumps({"mcpServers": {
+                "context7": {"type": "stdio", "command": "./scripts/start-context7-mcp.sh", "args": []},
+            }}), encoding="utf-8")
+            process = self.proc(40, 11, "/usr/bin/node", f"node {script}")
+            with mock.patch.object(lifecycle, "TRUSTED_SCRIPT_ROOTS", {root}):
+                descriptor = lifecycle._mcp_descriptor(process)
+            self.assertEqual("context7", descriptor.family if descriptor else None)
 
-        self.assertEqual(1, counts["loaded_task_stacks"])
-        self.assertEqual(1, counts["chrome_zombies"])
-        self.assertEqual(1, counts["node_repls"])
-        self.assertEqual(0, counts["actionable_orphans"])
-        self.assertEqual(1, counts["observed_standalone_orphans"])
-        self.assertEqual(0, counts["would_kill"])
-        self.assertEqual(5, counts["mcp_rss_mib"])
+            wrapper.write_text("node context7-app-compat-mcp.mjs\n", encoding="utf-8")
+            with mock.patch.object(lifecycle, "TRUSTED_SCRIPT_ROOTS", {root}):
+                self.assertIsNone(lifecycle._mcp_descriptor(process))
+            with mock.patch.object(lifecycle, "TRUSTED_SCRIPT_ROOTS", {root}):
+                self.assertIsNone(lifecycle._mcp_descriptor(self.proc(
+                    41, 11, "/usr/bin/node", f"node {script} --note context7-app-compat-mcp.mjs",
+                )))
+            self.assertIsNone(lifecycle._mcp_descriptor(self.proc(
+                42, 11, "/usr/bin/uvx", "uvx context7-mcp-untrusted",
+            )))
+
+    def test_topology_keeps_logical_roots_raw_descendants_rss_and_ownership_separate(self):
+        snapshot = self.ui_snapshot(task_stacks=12, helper_child=True)
+        topology = lifecycle.classify_mcp_topology(snapshot, uid=self.uid)
+        self.assertEqual({"computer_use": 1}, topology.logical_family_counts)
+        self.assertEqual(2, len(topology.raw_process_ids))
+        self.assertEqual(5 * 1024, topology.raw_rss_kib)
+        self.assertEqual(15.0, topology.raw_cpu_seconds)
+        self.assertEqual({"ui_owned": 1}, topology.ownership_counts)
+        self.assertEqual(12, topology.loaded_task_stacks)
+        self.assertFalse(topology.zombie_under_mcp_root)
+        observation = guard.collect_process_observation(snapshot)
+        self.assertEqual({"computer_use": 1}, observation["logical_instances"])
+        self.assertEqual(2, observation["raw_processes"])
+        self.assertEqual(5, observation["rss_mib"])
+
+    def test_twelve_stable_ui_task_stacks_are_expected_fanout_not_a_family_warning(self):
+        snapshot = self.ui_snapshot(task_stacks=12)
+        lifecycle_status = {
+            "schema_version": lifecycle.SCHEMA_VERSION,
+            "matcher_registry_version": lifecycle.MATCHER_REGISTRY_VERSION,
+            "generated_at": 1_000,
+            "job": {"ok": True},
+            "counts": {},
+            "trees": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory)
+            (state_directory / guard.LIFECYCLE_STATUS_FILE).write_text(json.dumps(lifecycle_status))
+            document = None
+            for index in range(5):
+                lifecycle_status["generated_at"] = 1_000 + (index * 60)
+                (state_directory / guard.LIFECYCLE_STATUS_FILE).write_text(json.dumps(lifecycle_status))
+                document = guard.observe_once(
+                    state_directory,
+                    now=1_000 + (index * 60),
+                    process_loader=lambda: snapshot,
+                    sleeper=lambda _seconds: None,
+                    system_memory_loader=lambda: {"available": False, "swap": {"available": False}},
+                )
+        self.assertIsNotNone(document)
+        self.assertEqual("expected_fanout", document["state"])
+        self.assertEqual([], document["alerts"])
+        self.assertEqual(5, document["sample_count"])
+
+    def test_stable_growth_requires_exact_five_sample_boundary_and_retention(self):
+        samples = [
+            self.sample(1_000 + index * 60, helpers=helpers, rss_mib=rss)
+            for index, (helpers, rss) in enumerate(((1, 10), (2, 20), (3, 30), (4, 40), (4, 40)))
+        ]
+        self.assertNotIn("stable_load_growth", self.alert_ids(samples[:4]))
+        self.assertIn("stable_load_growth", self.alert_ids(samples))
+        dropped = [*samples[:-1], self.sample(1_240, helpers=1, rss_mib=1)]
+        self.assertNotIn("stable_load_growth", self.alert_ids(dropped))
+
+    def test_cpu_and_memory_need_their_exact_sustained_evidence(self):
+        cpu_samples = [
+            self.sample(1_000 + index * 60, cpu_seconds=index * 30.0)
+            for index in range(5)
+        ]
+        self.assertIn("sustained_mcp_cpu", self.alert_ids(cpu_samples))
+        below_cpu = [*cpu_samples[:-1], self.sample(1_240, cpu_seconds=119.0)]
+        self.assertNotIn("sustained_mcp_cpu", self.alert_ids(below_cpu))
+
+        memory_samples = [
+            self.sample(2_000 + index * 60, rss_mib=2_500, available_pct=10.0)
+            for index in range(3)
+        ]
+        self.assertNotIn("system_memory_corroborated", self.alert_ids(memory_samples[:2]))
+        self.assertIn("system_memory_corroborated", self.alert_ids(memory_samples))
+        swap_only = [
+            self.sample(3_000 + index * 60, rss_mib=2_500, available_pct=30.0)
+            for index in range(3)
+        ]
+        self.assertNotIn("system_memory_corroborated", self.alert_ids(swap_only))
+
+    def test_sustained_resource_predicates_require_one_exact_owner(self):
+        no_owner = [
+            self.sample(
+                4_000 + index * 60,
+                owner=False,
+                helpers=index + 1,
+                rss_mib=2_500,
+                cpu_seconds=index * 30.0,
+                available_pct=10.0,
+            )
+            for index in range(5)
+        ]
+        window: list[dict[str, object]] = []
+        for sample in no_owner:
+            window, reason = guard.advance_pressure_window(window, sample, prior_valid=True)
+            self.assertEqual("owner_identity_unavailable", reason)
+            self.assertEqual([sample], window)
+        self.assertEqual(
+            set(),
+            self.alert_ids(no_owner) & {
+                "stable_load_growth",
+                "sustained_mcp_cpu",
+                "system_memory_corroborated",
+            },
+        )
+
+        exact_owner = [
+            self.sample(
+                5_000 + index * 60,
+                helpers=index + 1,
+                rss_mib=2_500,
+                cpu_seconds=index * 30.0,
+                available_pct=10.0,
+            )
+            for index in range(5)
+        ]
+        window = []
+        for index, sample in enumerate(exact_owner):
+            window, reason = guard.advance_pressure_window(window, sample, prior_valid=True)
+            self.assertEqual("initial_sample" if index == 0 else None, reason)
+        self.assertEqual(exact_owner, window)
+        self.assertTrue({
+            "stable_load_growth",
+            "sustained_mcp_cpu",
+            "system_memory_corroborated",
+        }.issubset(self.alert_ids(exact_owner)))
+
+    def test_window_resets_on_owner_stack_counter_and_gap_boundaries(self):
+        prior = self.sample(1_000, cpu_seconds=100.0)
+        cases = [
+            (self.sample(1_060, owner=False), "owner_identity_unavailable"),
+            (self.sample(1_060, stacks=2), "task_stack_count_changed"),
+            (self.sample(1_060, cpu_seconds=1.0), "cpu_counter_reset"),
+            (self.sample(1_151, cpu_seconds=101.0), "sample_gap_exceeded"),
+        ]
+        for current, expected in cases:
+            with self.subTest(expected=expected):
+                samples, reason = guard.advance_pressure_window([prior], current, prior_valid=True)
+                self.assertEqual(expected, reason)
+                self.assertEqual([current], samples)
+
+    def test_lifecycle_integrity_detached_recovery_and_dedup_are_explicit(self):
+        partial = self.sample(1_000, partial=True)
+        self.assertIn("lifecycle_integrity:partial_reaper_failure", self.alert_ids([partial]))
+        ambiguous = [self.sample(1_000, ambiguous=True), self.sample(1_060, ambiguous=True)]
+        self.assertIn("lifecycle_integrity:ambiguous_ownership", self.alert_ids(ambiguous))
+        recovered = [ambiguous[-1], self.sample(1_120, ambiguous=False)]
+        self.assertNotIn("lifecycle_integrity:ambiguous_ownership", self.alert_ids(recovered))
+        detached = guard.lifecycle_alerts({"trees": [{
+            "ownership": "detached", "actionable": True, "state": "partial_failure",
+        }]})
+        self.assertEqual(
+            {"detached_actionable", "detached_actionable:failed_signal_attempt"},
+            {alert["id"] for alert in detached},
+        )
+        self.assertEqual({"detached_actionable"}, {alert["kind"] for alert in detached})
+        self.assertEqual(1, len(guard.dedupe_alerts([detached[0], detached[0]])))
+
+    def test_window_persistence_contains_only_safe_observation_fields(self):
+        sample = self.sample(1_000)
+        with tempfile.TemporaryDirectory() as directory:
+            state_directory = Path(directory)
+            guard.write_pressure_window([sample], state_directory)
+            loaded, valid = guard.load_pressure_window(state_directory)
+            serialized = (state_directory / guard.WINDOW_FILE).read_text(encoding="utf-8")
+            poisoned = dict(sample)
+            poisoned["args"] = "must-not-persist"
+            (state_directory / guard.WINDOW_FILE).write_text(json.dumps({
+                "schema_version": guard.PRESSURE_WINDOW_SCHEMA_VERSION,
+                "samples": [poisoned],
+            }), encoding="utf-8")
+            rejected, rejected_valid = guard.load_pressure_window(state_directory)
+        self.assertTrue(valid)
+        self.assertEqual([sample], loaded)
+        self.assertNotIn("args", serialized)
+        self.assertNotIn("title", serialized)
+        self.assertNotIn("session", serialized)
+        self.assertEqual([], rejected)
+        self.assertFalse(rejected_valid)
+
+    def test_installed_candidate_audit_fails_closed_for_static_task_store_authority(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "unsafe-guard.py"
+            candidate.write_text("import sqlite3\n", encoding="utf-8")
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({}), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(audit),
+                    "--candidate", str(candidate),
+                    "--state-dir", str(root / "state"),
+                    "--process-fixture", str(process_fixture),
+                    "--lifecycle-fixture", str(lifecycle_fixture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("static_forbidden", completed.stdout)
+
+    def test_installed_candidate_audit_fails_closed_for_exact_codex_store_identifiers(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        identifiers = ("history.jsonl", "archived_sessions", "rollout_summaries")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({}), encoding="utf-8")
+            for identifier in identifiers:
+                with self.subTest(identifier=identifier):
+                    candidate = root / f"unsafe-{identifier}.py"
+                    candidate.write_text(
+                        f'forbidden_store = "{identifier}"\n', encoding="utf-8"
+                    )
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(audit),
+                            "--candidate", str(candidate),
+                            "--state-dir", str(root / "state"),
+                            "--process-fixture", str(process_fixture),
+                            "--lifecycle-fixture", str(lifecycle_fixture),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(1, completed.returncode)
+                    self.assertIn("static_forbidden", completed.stdout)
+
+    def test_candidate_audit_blocks_runtime_exact_codex_store_opens(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        identifiers = ("history.jsonl", "archived_sessions", "rollout_summaries")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for identifier in identifiers:
+                (root / identifier).write_text("forbidden", encoding="utf-8")
+            candidate = root / "candidate.py"
+            candidate.write_text(
+                (BIN / "codex-mcp-guard.py").read_text(encoding="utf-8")
+                + '''\nfor _store_name in ("history" + ".jsonl", "archived" + "_sessions", "rollout" + "_summaries"):
+    Path(os.environ["MCP_GUARD_AUDIT_STATE_DIR"]).parent.joinpath(_store_name).read_text(encoding="utf-8")
+''',
+                encoding="utf-8",
+            )
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({}), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(audit),
+                    "--candidate", str(candidate),
+                    "--state-dir", str(root / "state"),
+                    "--process-fixture", str(process_fixture),
+                    "--lifecycle-fixture", str(lifecycle_fixture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(1, completed.returncode)
+        for identifier in identifiers:
+            self.assertIn(f"forbidden_store_open:{identifier}", completed.stdout)
+
+    def test_candidate_audit_clears_the_notification_helper_environment(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.py"
+            candidate.write_text(
+                (BIN / "codex-mcp-guard.py").read_text(encoding="utf-8")
+                + '''\nif os.environ.get("CODEX_MCP_GUARD_NOTIFY_HELPER"):
+    subprocess.run(["unexpected-notification-helper"])
+''',
+                encoding="utf-8",
+            )
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_MCP_GUARD_NOTIFY_HELPER": "/tmp/unexpected"}, clear=False):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(audit),
+                        "--candidate", str(candidate),
+                        "--state-dir", str(root / "state"),
+                        "--process-fixture", str(process_fixture),
+                        "--lifecycle-fixture", str(lifecycle_fixture),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertIn('"subprocesses": []', completed.stdout)
+
+    def test_candidate_audit_accepts_the_staged_process_only_guard_with_fixture_inputs(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        candidate = BIN / "codex-mcp-guard.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({
+                "schema_version": lifecycle.SCHEMA_VERSION,
+                "matcher_registry_version": lifecycle.MATCHER_REGISTRY_VERSION,
+                "generated_at": 1_000,
+                "job": {"ok": True, "mode": "status", "error": None},
+                "counts": {},
+                "trees": [],
+            }), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(audit),
+                    "--candidate", str(candidate),
+                    "--state-dir", str(root / "state"),
+                    "--process-fixture", str(process_fixture),
+                    "--lifecycle-fixture", str(lifecycle_fixture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertIn('"violations": []', completed.stdout)
+
+    def test_candidate_audit_blocks_a_runtime_write_outside_guard_owned_state(self):
+        audit = PACKAGE_ROOT / "scripts" / "audit_guard_file_access.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.py"
+            escaped_write = root / "outside-guard-state.json"
+            candidate.write_text(
+                (BIN / "codex-mcp-guard.py").read_text(encoding="utf-8")
+                + f"\nPath({str(escaped_write)!r}).write_text('unexpected', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            process_fixture = root / "process.json"
+            process_fixture.write_text(json.dumps({"processes": []}), encoding="utf-8")
+            lifecycle_fixture = root / "lifecycle.json"
+            lifecycle_fixture.write_text(json.dumps({}), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(audit),
+                    "--candidate", str(candidate),
+                    "--state-dir", str(root / "state"),
+                    "--process-fixture", str(process_fixture),
+                    "--lifecycle-fixture", str(lifecycle_fixture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("out_of_contract_write", completed.stdout)
 
 
 class SharedLifecycleTests(unittest.TestCase):
@@ -1641,7 +1626,7 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertNotIn("raw_argv", encoded)
         self.assertEqual(2, status["schema_version"])
         self.assertEqual("strict-detached-v5", status["cleanup_policy_version"])
-        self.assertEqual("mcp-family-descriptors-v5", status["matcher_registry_version"])
+        self.assertEqual(lifecycle.MATCHER_REGISTRY_VERSION, status["matcher_registry_version"])
         self.assertEqual("automatic", status["lane_modes"]["exact_standalone_app_server"])
         self.assertEqual("observation_only", status["lane_modes"]["standalone_orphan"])
         self.assertEqual("observation_only", status["lane_modes"]["claude_idle"])

@@ -1,9 +1,11 @@
 export type WatcherRegistryStatus = "ok" | "warn" | "error";
-export type WatcherFreshness = "fresh" | "stale" | "missing" | "unsupported" | "unknown";
+export type WatcherFreshness = "fresh" | "stale" | "missing" | "unsupported" | "unknown" | "intentionally_disabled";
+export type GuardLifecycleDisposition = "active" | "intentionally_disabled" | "inconsistent" | "unknown";
 
 export interface WatcherProbe {
   installed: boolean;
   loaded: boolean;
+  disabled?: boolean | null;
   running: boolean;
   lastExitCode: number | null;
   lastRunAt: string | null;
@@ -13,12 +15,13 @@ export interface WatcherProbe {
   deferredReason: string | null;
   error: string | null;
   supportedStatusSchemas?: number[];
+  legacyStatusSchemaVersion?: number | null;
 }
 
 export interface WatcherHealthEntry {
   id: "tweakers-repair" | "mcp-lifecycle-reaper" | "mcp-pressure-guard";
   purpose: string;
-  authority: "repair-only" | "automatic-process-signals" | "notification-only";
+  authority: "repair-only" | "automatic-process-signals" | "observation-and-notification-only";
   platformKind: string;
   label: string;
   installedPath: string;
@@ -26,6 +29,7 @@ export interface WatcherHealthEntry {
   triggers: string[];
   installed: boolean;
   loaded: boolean;
+  disabled: boolean | null;
   running: boolean;
   lastRunAt: string | null;
   lastExitCode: number | null;
@@ -39,6 +43,8 @@ export interface WatcherHealthEntry {
   receiptPath: string | null;
   deferredReason: string | null;
   error: string | null;
+  legacyStatusSchemaVersion: number | null;
+  lifecycleDisposition: GuardLifecycleDisposition;
   recommendedAction: string | null;
 }
 
@@ -92,13 +98,13 @@ const DEFINITIONS: WatcherDefinition[] = [
   },
   {
     id: "mcp-pressure-guard",
-    purpose: "Observe MCP pressure and publish notification-only warnings.",
-    authority: "notification-only",
+    purpose: "Observe MCP process health and publish non-mutating notifications.",
+    authority: "observation-and-notification-only",
     label: "com.thomashulihan.codex-mcp-guard",
     installedPath: ({ homeDirectory }) => `${homeDirectory}/Library/LaunchAgents/com.thomashulihan.codex-mcp-guard.plist`,
     cadenceSeconds: 60,
     triggers: ["login", "every-60-seconds"],
-    statePath: ({ homeDirectory }) => `${homeDirectory}/.codex/tmp/codex-mcp-guard-notify.json`,
+    statePath: ({ homeDirectory }) => `${homeDirectory}/.codex/tmp/codex-mcp-guard-status.json`,
     receiptPath: () => null,
     recommendedAction: "Run Tweakers lifecycle repair and verify the guard heartbeat.",
   },
@@ -122,6 +128,7 @@ export function deriveWatcherFreshness(input: {
   cadenceSeconds: number;
   installed: boolean;
   loaded: boolean;
+  disabled?: boolean | null;
   lastRunAt: string | null;
   statusSchemaVersion: number | null;
   supportedStatusSchemas?: number[];
@@ -131,10 +138,14 @@ export function deriveWatcherFreshness(input: {
     cadenceSeconds,
     installed,
     loaded,
+    disabled,
     lastRunAt,
     statusSchemaVersion,
     supportedStatusSchemas,
   } = input;
+  if (disabled === true && !loaded) {
+    return { freshness: "intentionally_disabled", nextExpectedAt: null };
+  }
   if (!installed || !loaded) return { freshness: "missing", nextExpectedAt: null };
   if (
     supportedStatusSchemas
@@ -168,11 +179,13 @@ function buildWatcherEntry(
     cadenceSeconds: definition.cadenceSeconds,
     installed: probe.installed,
     loaded: probe.loaded,
+    disabled: probe.disabled,
     lastRunAt: probe.lastRunAt,
     statusSchemaVersion: probe.statusSchemaVersion,
-    supportedStatusSchemas: probe.supportedStatusSchemas,
+    supportedStatusSchemas: definition.id === "mcp-pressure-guard" ? [3] : probe.supportedStatusSchemas,
   });
-  const status = watcherStatus(probe, timing.freshness);
+  const lifecycleDisposition = guardLifecycleDisposition(definition.id, probe);
+  const status = watcherStatus(probe, timing.freshness, lifecycleDisposition);
   return {
     id: definition.id,
     purpose: definition.purpose,
@@ -184,6 +197,7 @@ function buildWatcherEntry(
     triggers: definition.triggers,
     installed: probe.installed,
     loaded: probe.loaded,
+    disabled: probe.disabled ?? null,
     running: probe.running,
     lastRunAt: probe.lastRunAt,
     lastExitCode: probe.lastExitCode,
@@ -197,11 +211,30 @@ function buildWatcherEntry(
     receiptPath: definition.receiptPath(input),
     deferredReason: probe.deferredReason,
     error: probe.error,
+    legacyStatusSchemaVersion: probe.legacyStatusSchemaVersion ?? null,
+    lifecycleDisposition,
     recommendedAction: status === "ok" ? null : definition.recommendedAction,
   };
 }
 
-function watcherStatus(probe: WatcherProbe, freshness: WatcherFreshness): WatcherRegistryStatus {
+function guardLifecycleDisposition(
+  watcherId: WatcherHealthEntry["id"],
+  probe: WatcherProbe,
+): GuardLifecycleDisposition {
+  if (watcherId !== "mcp-pressure-guard") return "active";
+  if (probe.disabled === true && !probe.loaded) return "intentionally_disabled";
+  if (probe.disabled === true && probe.loaded) return "inconsistent";
+  if (probe.disabled === false && !probe.loaded) return "inconsistent";
+  return probe.disabled === null ? "unknown" : "active";
+}
+
+function watcherStatus(
+  probe: WatcherProbe,
+  freshness: WatcherFreshness,
+  lifecycleDisposition: GuardLifecycleDisposition,
+): WatcherRegistryStatus {
+  if (lifecycleDisposition === "intentionally_disabled") return "ok";
+  if (lifecycleDisposition === "inconsistent" || lifecycleDisposition === "unknown") return "error";
   if (
     !probe.installed
     || !probe.loaded

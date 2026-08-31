@@ -25,20 +25,24 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME_TOKEN = "{{HOME}}";
 
 export const MCP_LIFECYCLE_PACKAGE_NAME = "@therealityreport/tweakers-mcp-lifecycle";
-export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.5.0";
+export const MCP_LIFECYCLE_PACKAGE_VERSION = "0.6.0";
 export const MCP_LIFECYCLE_MANIFEST_SCHEMA_VERSION = 1;
-export const MCP_LIFECYCLE_SCHEMA_VERSION = 2;
+export const MCP_LIFECYCLE_SCHEMA_VERSION = 3;
 export const MCP_LIFECYCLE_POLICY_VERSION = "strict-detached-v5";
-export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v5";
+export const MCP_LIFECYCLE_MATCHER_REGISTRY_VERSION = "mcp-family-descriptors-v6";
 export const MCP_LIFECYCLE_LABELS = [
   "com.thomashulihan.codex-mcp-idle-reaper",
   "com.thomashulihan.codex-mcp-guard",
 ] as const;
+export type McpLifecycleLabel = typeof MCP_LIFECYCLE_LABELS[number];
+export const MCP_LIFECYCLE_REAPER_LABEL: McpLifecycleLabel = MCP_LIFECYCLE_LABELS[0];
+export const MCP_LIFECYCLE_GUARD_LABEL: McpLifecycleLabel = MCP_LIFECYCLE_LABELS[1];
 export const MCP_LIFECYCLE_PRESERVED_RUNTIME_FILES = [
   "tmp/codex-mcp-idle-reaper-state.json",
   "tmp/codex-mcp-lifecycle-state.json",
   "tmp/codex-mcp-lifecycle-status.json",
   "tmp/codex-mcp-lifecycle-actions.jsonl",
+  "tmp/codex-mcp-guard-window.json",
   "tmp/codex-mcp-guard-notify.json",
   "tmp/codex-mcp-guard-status.json",
 ] as const;
@@ -85,6 +89,28 @@ export interface McpLifecycleManifest {
   preserved_runtime_files: string[];
   assets: McpLifecycleAsset[];
   tests: { baseline_count: number; path: string; fixtures: string };
+}
+
+/**
+ * The lifecycle state frozen around a repair transaction. `plistPath` binds
+ * the launchd observation to the package-owned destination, while
+ * `plistSha256` records the actual bytes observed at that point. Absence is
+ * expressed by an unavailable state provider, never by a partial record.
+ */
+export interface McpLifecycleLabelState {
+  label: McpLifecycleLabel;
+  disabled: boolean;
+  loadedInstances: 0 | 1;
+  plistPath: string;
+  plistSha256: string;
+}
+
+export interface McpLifecycleLabelTransition {
+  label: McpLifecycleLabel;
+  before: McpLifecycleLabelState;
+  intended: McpLifecycleLabelState;
+  observed: McpLifecycleLabelState | null;
+  operationsAttempted: string[];
 }
 
 /** Small filesystem seam for hermetic temporary-root and failure tests. */
@@ -150,6 +176,13 @@ export interface McpLifecycleInstallRequest {
    * than one fails closed because exact-one label ownership cannot be proven.
    */
   labelInstances?(label: string): number | undefined;
+  /**
+   * Optional exact per-label proof.  Package staging intentionally does not
+   * require this seam so isolated candidate installs remain launchctl-free;
+   * when a lifecycle owner supplies it, unknown, duplicate, or inconsistent
+   * state defers before the first file write.
+   */
+  labelStates?(): readonly McpLifecycleLabelState[] | undefined;
   /** Defers before staging when the reaper has a live termination in flight. */
   activeTermination?(): ActiveMcpLifecycleTermination | null;
   /** Test seam for deterministic promotion and rollback failures. */
@@ -364,7 +397,7 @@ function resolveVerifiedCandidate(
  * one; duplicate labels and active termination actions defer promotion.
  */
 export function preflightMcpLifecycleInstall(
-  request: Pick<McpLifecycleInstallRequest, "sourceRoot" | "verifiedCandidate" | "targetHome" | "targetRoot" | "launchAgentsRoot" | "filesystem" | "labelInstances" | "activeTermination">,
+  request: Pick<McpLifecycleInstallRequest, "sourceRoot" | "verifiedCandidate" | "targetHome" | "targetRoot" | "launchAgentsRoot" | "filesystem" | "labelInstances" | "labelStates" | "activeTermination">,
 ): McpLifecycleInstallResult | null {
   const targetHome = requireAbsolutePath(request.targetHome, "MCP lifecycle target home");
   const targetRoot = resolveTargetRoot(targetHome, request.targetRoot);
@@ -380,6 +413,21 @@ export function preflightMcpLifecycleInstall(
       targetHome,
       reason: "MCP lifecycle termination is active" + tree + detail,
     };
+  }
+  if (request.labelStates) {
+    const expectedStates = expectedMcpLifecycleLabelStates(verified);
+    let observed: readonly McpLifecycleLabelState[] | undefined;
+    try {
+      observed = request.labelStates();
+      assertMcpLifecycleLabelStates(observed, expectedStates);
+    } catch (error) {
+      return {
+        status: "deferred",
+        sourceRoot: verified.sourceRoot,
+        targetHome,
+        reason: `MCP lifecycle label state is not safely known: ${errorMessage(error)}`,
+      };
+    }
   }
   for (const label of MCP_LIFECYCLE_LABELS) {
     const count = request.labelInstances?.(label);
@@ -398,6 +446,107 @@ export function preflightMcpLifecycleInstall(
     }
   }
   return null;
+}
+
+/** Derive the immutable plist identity each launchd-state read must bind to. */
+export function expectedMcpLifecycleLabelStates(
+  verification: McpLifecycleVerification,
+): readonly McpLifecycleLabelState[] {
+  return MCP_LIFECYCLE_LABELS.map((label) => {
+    const asset = verification.assets.find((candidate) => candidate.asset.label === label);
+    if (!asset) throw new McpLifecycleInstallError(`MCP lifecycle manifest is missing ${label}.`);
+    return {
+      label,
+      disabled: label === MCP_LIFECYCLE_GUARD_LABEL,
+      loadedInstances: label === MCP_LIFECYCLE_REAPER_LABEL ? 1 : 0,
+      plistPath: asset.destinationPath,
+      plistSha256: sha256(asset.content),
+    };
+  });
+}
+
+/**
+ * Preserve the verified disabled/loaded policy while switching plist identity
+ * to the exact rendered candidate. Callers record the actual installed hashes
+ * in `before`, and only use this derived value after promotion.
+ */
+export function intendedMcpLifecycleLabelStates(
+  before: readonly McpLifecycleLabelState[],
+  verification: McpLifecycleVerification,
+): readonly McpLifecycleLabelState[] {
+  const candidate = expectedMcpLifecycleLabelStates(verification);
+  assertMcpLifecycleLabelStates(before, candidate);
+  const byLabel = new Map(before.map((state) => [state.label, state]));
+  return candidate.map((state) => {
+    const preserved = byLabel.get(state.label);
+    if (!preserved) throw new McpLifecycleInstallError(`MCP lifecycle label state is missing: ${state.label}`);
+    return {
+      ...state,
+      disabled: preserved.disabled,
+      loadedInstances: preserved.loadedInstances,
+    };
+  });
+}
+
+/**
+ * Reject partial, duplicate, wrong-path, and policy-inconsistent state. A
+ * frozen-before record intentionally need not have the candidate plist hash:
+ * it describes the currently installed bytes before promotion. A
+ * disabled/unloaded Guard is the intentional default; the reaper is always
+ * enabled and registered. An enabled/loaded Guard is preservable only as an
+ * already-observed pair and this function never interprets it as activation.
+ */
+export function assertMcpLifecycleLabelStates(
+  observed: readonly McpLifecycleLabelState[] | undefined,
+  expected: readonly McpLifecycleLabelState[],
+): asserts observed is readonly McpLifecycleLabelState[] {
+  if (!observed || observed.length !== MCP_LIFECYCLE_LABELS.length) {
+    throw new McpLifecycleInstallError("MCP lifecycle label state is unknown or incomplete");
+  }
+  const byLabel = new Map<McpLifecycleLabel, McpLifecycleLabelState>();
+  for (const state of observed) {
+    if (!MCP_LIFECYCLE_LABELS.includes(state.label)
+      || byLabel.has(state.label)
+      || typeof state.disabled !== "boolean"
+      || (state.loadedInstances !== 0 && state.loadedInstances !== 1)
+      || typeof state.plistPath !== "string"
+      || !/^[a-f0-9]{64}$/.test(state.plistSha256)) {
+      throw new McpLifecycleInstallError("MCP lifecycle label state is invalid or duplicated");
+    }
+    byLabel.set(state.label, state);
+  }
+  for (const desired of expected) {
+    const state = byLabel.get(desired.label);
+    if (!state || state.plistPath !== desired.plistPath) {
+      throw new McpLifecycleInstallError(`MCP lifecycle label ${desired.label} does not bind the verified plist path`);
+    }
+    if (state.label === MCP_LIFECYCLE_GUARD_LABEL
+      && !((state.disabled && state.loadedInstances === 0) || (!state.disabled && state.loadedInstances === 1))) {
+      throw new McpLifecycleInstallError("MCP Guard disabled/loaded state is inconsistent");
+    }
+    if (state.label === MCP_LIFECYCLE_REAPER_LABEL
+      && (state.disabled || state.loadedInstances !== 1)) {
+      throw new McpLifecycleInstallError("MCP idle reaper must be enabled and registered exactly once");
+    }
+  }
+}
+
+/** Require an observed state to match an exact frozen or intended identity. */
+export function assertMcpLifecycleLabelStateIdentity(
+  observed: readonly McpLifecycleLabelState[] | undefined,
+  expected: readonly McpLifecycleLabelState[],
+): asserts observed is readonly McpLifecycleLabelState[] {
+  assertMcpLifecycleLabelStates(observed, expected);
+  const observedByLabel = new Map(observed.map((state) => [state.label, state]));
+  for (const desired of expected) {
+    const state = observedByLabel.get(desired.label);
+    if (!state
+      || state.disabled !== desired.disabled
+      || state.loadedInstances !== desired.loadedInstances
+      || state.plistSha256 !== desired.plistSha256) {
+      throw new McpLifecycleInstallError(`MCP lifecycle label ${desired.label} does not match the frozen plist identity`);
+    }
+  }
 }
 
 /**
@@ -629,6 +778,14 @@ function validateRenderedPlist(asset: McpLifecycleAsset, content: Buffer): void 
   const text = content.toString("utf8");
   if (!asset.label || !text.includes("<plist") || !text.includes("<string>" + asset.label + "</string>") || text.includes(HOME_TOKEN)) {
     throw new McpLifecycleInstallError("MCP lifecycle plist failed structural validation: " + asset.id);
+  }
+  if (asset.label === MCP_LIFECYCLE_GUARD_LABEL) {
+    const exactSuffix = /<string>--scope<\/string>\s*<string>process-only<\/string>\s*<string>--quiet<\/string>/;
+    if (!exactSuffix.test(text)
+      || !text.includes("<key>CODEX_MCP_LIFECYCLE_STATE_DIR</key>")
+      || !text.includes("<string>") || !text.includes("/.codex/tmp</string>")) {
+      throw new McpLifecycleInstallError("MCP Guard plist must declare process-only mode and an explicit state directory");
+    }
   }
 }
 

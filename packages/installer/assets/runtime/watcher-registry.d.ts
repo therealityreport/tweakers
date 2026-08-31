@@ -1,8 +1,10 @@
 export type WatcherRegistryStatus = "ok" | "warn" | "error";
-export type WatcherFreshness = "fresh" | "stale" | "missing" | "unsupported" | "unknown";
+export type WatcherFreshness = "fresh" | "stale" | "missing" | "unsupported" | "unknown" | "intentionally_disabled";
+export type GuardLifecycleDisposition = "active" | "intentionally_disabled" | "inconsistent" | "unknown";
 export interface WatcherProbe {
     installed: boolean;
     loaded: boolean;
+    disabled?: boolean | null;
     running: boolean;
     lastExitCode: number | null;
     lastRunAt: string | null;
@@ -12,11 +14,12 @@ export interface WatcherProbe {
     deferredReason: string | null;
     error: string | null;
     supportedStatusSchemas?: number[];
+    legacyStatusSchemaVersion?: number | null;
 }
 export interface WatcherHealthEntry {
     id: "tweakers-repair" | "mcp-lifecycle-reaper" | "mcp-pressure-guard";
     purpose: string;
-    authority: "repair-only" | "automatic-process-signals" | "notification-only";
+    authority: "repair-only" | "automatic-process-signals" | "observation-and-notification-only";
     platformKind: string;
     label: string;
     installedPath: string;
@@ -24,6 +27,7 @@ export interface WatcherHealthEntry {
     triggers: string[];
     installed: boolean;
     loaded: boolean;
+    disabled: boolean | null;
     running: boolean;
     lastRunAt: string | null;
     lastExitCode: number | null;
@@ -37,6 +41,8 @@ export interface WatcherHealthEntry {
     receiptPath: string | null;
     deferredReason: string | null;
     error: string | null;
+    legacyStatusSchemaVersion: number | null;
+    lifecycleDisposition: GuardLifecycleDisposition;
     recommendedAction: string | null;
 }
 export interface WatcherRegistryInput {
@@ -54,6 +60,7 @@ export declare function deriveWatcherFreshness(input: {
     cadenceSeconds: number;
     installed: boolean;
     loaded: boolean;
+    disabled?: boolean | null;
     lastRunAt: string | null;
     statusSchemaVersion: number | null;
     supportedStatusSchemas?: number[];

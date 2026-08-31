@@ -29,13 +29,13 @@ const DEFINITIONS = [
     },
     {
         id: "mcp-pressure-guard",
-        purpose: "Observe MCP pressure and publish notification-only warnings.",
-        authority: "notification-only",
+        purpose: "Observe MCP process health and publish non-mutating notifications.",
+        authority: "observation-and-notification-only",
         label: "com.thomashulihan.codex-mcp-guard",
         installedPath: ({ homeDirectory }) => `${homeDirectory}/Library/LaunchAgents/com.thomashulihan.codex-mcp-guard.plist`,
         cadenceSeconds: 60,
         triggers: ["login", "every-60-seconds"],
-        statePath: ({ homeDirectory }) => `${homeDirectory}/.codex/tmp/codex-mcp-guard-notify.json`,
+        statePath: ({ homeDirectory }) => `${homeDirectory}/.codex/tmp/codex-mcp-guard-status.json`,
         receiptPath: () => null,
         recommendedAction: "Run Tweakers lifecycle repair and verify the guard heartbeat.",
     },
@@ -49,7 +49,10 @@ function buildWatcherRegistry(input) {
     return DEFINITIONS.map((definition) => buildWatcherEntry(definition, probes[definition.id], input));
 }
 function deriveWatcherFreshness(input) {
-    const { checkedAt, cadenceSeconds, installed, loaded, lastRunAt, statusSchemaVersion, supportedStatusSchemas, } = input;
+    const { checkedAt, cadenceSeconds, installed, loaded, disabled, lastRunAt, statusSchemaVersion, supportedStatusSchemas, } = input;
+    if (disabled === true && !loaded) {
+        return { freshness: "intentionally_disabled", nextExpectedAt: null };
+    }
     if (!installed || !loaded)
         return { freshness: "missing", nextExpectedAt: null };
     if (supportedStatusSchemas
@@ -76,11 +79,13 @@ function buildWatcherEntry(definition, probe, input) {
         cadenceSeconds: definition.cadenceSeconds,
         installed: probe.installed,
         loaded: probe.loaded,
+        disabled: probe.disabled,
         lastRunAt: probe.lastRunAt,
         statusSchemaVersion: probe.statusSchemaVersion,
-        supportedStatusSchemas: probe.supportedStatusSchemas,
+        supportedStatusSchemas: definition.id === "mcp-pressure-guard" ? [3] : probe.supportedStatusSchemas,
     });
-    const status = watcherStatus(probe, timing.freshness);
+    const lifecycleDisposition = guardLifecycleDisposition(definition.id, probe);
+    const status = watcherStatus(probe, timing.freshness, lifecycleDisposition);
     return {
         id: definition.id,
         purpose: definition.purpose,
@@ -92,6 +97,7 @@ function buildWatcherEntry(definition, probe, input) {
         triggers: definition.triggers,
         installed: probe.installed,
         loaded: probe.loaded,
+        disabled: probe.disabled ?? null,
         running: probe.running,
         lastRunAt: probe.lastRunAt,
         lastExitCode: probe.lastExitCode,
@@ -105,10 +111,27 @@ function buildWatcherEntry(definition, probe, input) {
         receiptPath: definition.receiptPath(input),
         deferredReason: probe.deferredReason,
         error: probe.error,
+        legacyStatusSchemaVersion: probe.legacyStatusSchemaVersion ?? null,
+        lifecycleDisposition,
         recommendedAction: status === "ok" ? null : definition.recommendedAction,
     };
 }
-function watcherStatus(probe, freshness) {
+function guardLifecycleDisposition(watcherId, probe) {
+    if (watcherId !== "mcp-pressure-guard")
+        return "active";
+    if (probe.disabled === true && !probe.loaded)
+        return "intentionally_disabled";
+    if (probe.disabled === true && probe.loaded)
+        return "inconsistent";
+    if (probe.disabled === false && !probe.loaded)
+        return "inconsistent";
+    return probe.disabled === null ? "unknown" : "active";
+}
+function watcherStatus(probe, freshness, lifecycleDisposition) {
+    if (lifecycleDisposition === "intentionally_disabled")
+        return "ok";
+    if (lifecycleDisposition === "inconsistent" || lifecycleDisposition === "unknown")
+        return "error";
     if (!probe.installed
         || !probe.loaded
         || probe.error

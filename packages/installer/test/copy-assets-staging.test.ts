@@ -134,6 +134,41 @@ test("copy-assets preserves committed mcp-lifecycle assets when the source is mi
   }
 });
 
+test("scoped MCP lifecycle copy transaction cannot touch runtime, manager, catalog, loader, or tweaks", () => {
+  const root = fixture();
+  try {
+    const source = addMcpLifecycleSource(root);
+    const shipped = addStaleShippedAssets(root);
+    const protectedPaths = [
+      join(root, "packages", "installer", "assets", "runtime"),
+      join(root, "packages", "installer", "assets", "manager-launcher"),
+      join(root, "packages", "installer", "assets", "loader.cjs"),
+      join(root, "store", "index.json"),
+      join(root, "tweaks", "alpha"),
+    ];
+    mkdirSync(protectedPaths[0], { recursive: true });
+    mkdirSync(protectedPaths[1], { recursive: true });
+    writeFileSync(join(protectedPaths[0], "sentinel.js"), "runtime before\n");
+    writeFileSync(join(protectedPaths[1], "sentinel.mjs"), "manager before\n");
+    const snapshotProtected = () => [
+      hashTree(protectedPaths[0]),
+      hashTree(protectedPaths[1]),
+      readFileSync(protectedPaths[2], "utf8"),
+      readFileSync(protectedPaths[3], "utf8"),
+      hashTree(protectedPaths[4]),
+    ];
+    const before = snapshotProtected();
+
+    const result = copyInstallerAssets(root, { only: "mcp-lifecycle" });
+
+    assert.equal(result.scoped, "mcp-lifecycle");
+    assert.deepEqual(hashTree(shipped), hashTree(source));
+    assert.deepEqual(snapshotProtected(), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("shipped mcp-lifecycle assets are content-identical to packages/mcp-lifecycle", () => {
   const source = join(repoRoot, "packages", "mcp-lifecycle");
   const shipped = join(repoRoot, "packages", "installer", "assets", "mcp-lifecycle");
