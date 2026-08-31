@@ -1,6 +1,6 @@
 # Account Router
 
-`co.tweakers.account-switcher` 0.2.0 retains its existing Manual account-switching behavior and can stage a two-account Balanced mode for a later, separately authorized restart. It is an unsupported local integration, not an OpenAI-approved feature. It never creates accounts, changes provider limits, shares credentials, retries uncertain requests on a second account, or makes an ineligible account eligible.
+`co.tweakers.account-switcher` 0.3.0 retains its existing Manual account-switching behavior and can stage a two-account Balanced mode for a later, separately authorized restart. It is an unsupported local integration, not an OpenAI-approved feature. It never creates accounts, changes provider limits, shares credentials, retries uncertain requests on a second account, or makes an ineligible account eligible.
 
 Balanced mode remains deliberately inactive until its separately authorized restart and later acceptance gates. Staging it does not restart the app, use a provider account, or publish any configuration outside the local owner-private data directory.
 
@@ -18,7 +18,7 @@ Balanced mode remains deliberately inactive until its separately authorized rest
 
 | Layer | Meaning | Does not prove |
 | --- | --- | --- |
-| Source | The Account Switcher manifest in the installer state’s recorded source checkout. | Candidate, installed, or live bytes. |
+| Source | The Account Switcher manifest in the one development checkout registered in Tweakers configuration. An absent or stale registration is reported explicitly. | Candidate, installed, or live bytes. |
 | Candidate | The runtime bundled with the currently running installer package. | That user-dir runtime assets have been promoted. |
 | Installed | The runtime files currently staged in the user directory. | That the desktop app has been restarted into them. |
 | Live | A successful authenticated read from the currently running mux. | Provider identity, quota, token-refresh, cancellation, delivery, or any authenticated acceptance gate. |

@@ -19,10 +19,13 @@ import {
 } from "../mcp-lifecycle-health.js";
 import { loadEnvironmentState } from "../environment-profile.js";
 import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
+import { readConfigFile } from "../config.js";
 import {
   inspectAccountRouter,
+  readRegisteredDevelopmentSourceRoot,
   type AccountRouterArtifactEvidence,
   type AccountRouterEvidence,
+  type AccountRouterSourceEvidence,
 } from "../account-router-status.js";
 
 interface Check {
@@ -49,7 +52,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   });
   const accountRouter = await inspectAccountRouter({
     userRoot: paths.root,
-    sourceRoot: state?.sourceRoot ?? null,
+    registeredDevelopmentSourceRoot: readRegisteredDevelopmentSourceRoot(readConfigFile(paths.configFile)),
     installedRuntimeRoot: paths.runtime,
   });
 
@@ -264,7 +267,11 @@ export function accountRouterDoctorChecks(evidence: AccountRouterEvidence): Chec
   return [source, candidate, installed, live];
 }
 
-function artifactCheck(name: string, artifact: AccountRouterArtifactEvidence, expectedVersion: string | null): Check {
+function artifactCheck(
+  name: string,
+  artifact: AccountRouterArtifactEvidence | AccountRouterSourceEvidence,
+  expectedVersion: string | null,
+): Check {
   if (artifact.state === "present") {
     const matchesExpected = expectedVersion === null || artifact.version === expectedVersion;
     return {
@@ -273,6 +280,15 @@ function artifactCheck(name: string, artifact: AccountRouterArtifactEvidence, ex
       detail: matchesExpected
         ? `present${artifact.version ? ` (${artifact.version})` : ""}`
         : `version ${artifact.version ?? "unknown"} differs from preceding evidence ${expectedVersion}`,
+    };
+  }
+  if (artifact.state === "unavailable") {
+    return {
+      name,
+      ok: "warn",
+      detail: artifact.unavailableReason === "registration_stale"
+        ? "registered development checkout is stale"
+        : "no registered development checkout",
     };
   }
   return {

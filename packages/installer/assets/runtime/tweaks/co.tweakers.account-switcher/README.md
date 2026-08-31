@@ -1,8 +1,8 @@
 # Easy Account Switcher
 
 `co.tweakers.account-switcher` keeps the existing manual saved-session switcher
-and optional remote-plugin receipt protection. Version 0.2 adds a staged,
-two-account balanced routing control plane for the local runtime.
+and optional remote-plugin receipt protection. Version 0.3 adds a visible,
+truthful routing control plane to the existing Accounts page.
 
 ## Modes
 
@@ -42,6 +42,22 @@ credential copying is performed while staging routing.
 Balanced mode is source-stage functionality only until the runtime candidate,
 independent evidence, explicit live-account bindings, and separately authorized
 restart have all been completed.
+
+## 0.3.0 Accounts-page state
+
+- The Account Switcher row opens the stable `Accounts` settings page. Its routing
+  card is always present and names one state: `Not configured`, `Save two
+  accounts`, `Ready to stage`, `Manual`, `Balanced staged - restart required`,
+  `Running Balanced`, `Direct fallback`, or `Degraded`.
+- Two ordinary signed-in sessions are not router snapshots. The page shows only
+  a saved-snapshot count for setup, and Balanced mode stays disabled until the
+  user explicitly selects exactly two distinct snapshots with valid weights.
+- Staging is an explicit button click. It does not save an account, switch an
+  account, or restart ChatGPT/Codex.
+- `Running Balanced` and its Account A/B assigned-thread counts are displayed
+  only after the owner-private mux control socket returns an authenticated,
+  redacted status. A staged configuration or local state file never creates a
+  live routing badge.
 
 ## 0.2.1 routing repair
 

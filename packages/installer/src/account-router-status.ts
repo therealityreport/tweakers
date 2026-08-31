@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,11 +12,21 @@ const CONTROL_FRAME_LIMIT = 4 * 1024;
 const CONTROL_TIMEOUT_MS = 2_000;
 const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES = 100;
 
-export type EvidenceState = "present" | "missing" | "invalid" | "unobserved";
+export type EvidenceState = "present" | "missing" | "invalid";
 
 export interface AccountRouterArtifactEvidence {
   state: EvidenceState;
   version: string | null;
+}
+
+/**
+ * Source provenance is intentionally more specific than a bundled artifact:
+ * it must come from the one checkout registered for development snapshots.
+ */
+export interface AccountRouterSourceEvidence {
+  state: EvidenceState | "unavailable";
+  version: string | null;
+  unavailableReason?: "not_registered" | "registration_stale";
 }
 
 export interface AccountRouterConfigurationEvidence {
@@ -45,7 +55,7 @@ export interface AccountRouterLiveEvidence {
 }
 
 export interface AccountRouterEvidence {
-  source: AccountRouterArtifactEvidence;
+  source: AccountRouterSourceEvidence;
   candidate: AccountRouterArtifactEvidence;
   installed: AccountRouterArtifactEvidence;
   configuration: AccountRouterConfigurationEvidence;
@@ -54,7 +64,8 @@ export interface AccountRouterEvidence {
 
 export interface InspectAccountRouterOptions {
   userRoot: string;
-  sourceRoot?: string | null;
+  /** The one development checkout registered in config.json, if any. */
+  registeredDevelopmentSourceRoot?: string | null;
   candidateRuntimeRoot?: string;
   installedRuntimeRoot?: string;
 }
@@ -68,7 +79,7 @@ export async function inspectAccountRouter(options: InspectAccountRouterOptions)
   const routerRoot = accountRouterDataRoot(options.userRoot);
   const configuration = inspectRouterConfiguration(routerRoot);
   return {
-    source: inspectSourceManifest(options.sourceRoot ?? null),
+    source: inspectRegisteredSourceManifest(options.registeredDevelopmentSourceRoot ?? null),
     candidate: inspectRuntimeArtifacts(options.candidateRuntimeRoot ?? bundledRuntimeRoot()),
     installed: inspectRuntimeArtifacts(options.installedRuntimeRoot ?? join(options.userRoot, "runtime")),
     configuration,
@@ -76,6 +87,16 @@ export async function inspectAccountRouter(options: InspectAccountRouterOptions)
       ? await readLiveAccountRouterStatus(routerRoot)
       : { state: "not_applicable", status: null },
   };
+}
+
+/**
+ * Reads the single development-checkout registration without exposing its path
+ * in Account Router evidence. Callers still validate the realpath before use.
+ */
+export function readRegisteredDevelopmentSourceRoot(config: unknown): string | null {
+  if (!isRecord(config) || !isRecord(config.tweaker)) return null;
+  const sourceRoot = config.tweaker.developmentSourceRoot;
+  return typeof sourceRoot === "string" && sourceRoot.length > 0 ? sourceRoot : null;
 }
 
 export function accountRouterDataRoot(userRoot: string): string {
@@ -126,9 +147,17 @@ function bundledRuntimeRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..", "assets", "runtime");
 }
 
-function inspectSourceManifest(sourceRoot: string | null): AccountRouterArtifactEvidence {
-  if (!sourceRoot) return { state: "unobserved", version: null };
-  const manifestPath = join(resolve(sourceRoot), "tweaks", ACCOUNT_SWITCHER_TWEAK_ID, "manifest.json");
+function inspectRegisteredSourceManifest(registeredSourceRoot: string | null): AccountRouterSourceEvidence {
+  if (!registeredSourceRoot) {
+    return { state: "unavailable", version: null, unavailableReason: "not_registered" };
+  }
+  let sourceRoot: string;
+  try {
+    sourceRoot = realpathSync(resolve(registeredSourceRoot));
+  } catch {
+    return { state: "unavailable", version: null, unavailableReason: "registration_stale" };
+  }
+  const manifestPath = join(sourceRoot, "tweaks", ACCOUNT_SWITCHER_TWEAK_ID, "manifest.json");
   return inspectManifest(manifestPath);
 }
 
@@ -313,8 +342,13 @@ function parseLiveResponse(bytes: Buffer, requestId: string): AccountRouterLiveS
   }
 }
 
-function formatArtifact(artifact: AccountRouterArtifactEvidence): string {
+function formatArtifact(artifact: AccountRouterArtifactEvidence | AccountRouterSourceEvidence): string {
   if (artifact.state === "present") return artifact.version ? `present (${artifact.version})` : "present";
+  if (artifact.state === "unavailable") {
+    return artifact.unavailableReason === "registration_stale"
+      ? "unavailable (registered checkout is stale)"
+      : "unavailable (no registered checkout)";
+  }
   return artifact.state.replaceAll("_", " ");
 }
 

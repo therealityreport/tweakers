@@ -17,7 +17,10 @@ const ACCOUNT_ROUTER_CONFIG_NAME = "account-router-config.json";
 const ACCOUNT_ROUTER_STATE_NAME = "router-state.json";
 const ACCOUNT_ROUTER_CONTROL_SECRET_NAME = "control-secret.v1";
 const ACCOUNT_ROUTER_RECEIPTS_NAME = "migration-receipts.v1.json";
+const ACCOUNT_ROUTER_CONTROL_SOCKET_NAME = "router-control.v1.sock";
 const MAX_ROUTER_STATE_BYTES = 512 * 1024;
+const ROUTER_CONTROL_FRAME_LIMIT = 4 * 1024;
+const ROUTER_CONTROL_TIMEOUT_MS = 2_000;
 const ROUTER_PUBLIC_ERROR_CODES = new Set([
   "invalid-router-mode",
   "untrusted-router-directory",
@@ -128,7 +131,8 @@ module.exports = {
     makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
     accountRouterPaths, opaqueAccountId, validateRouterConfig, routerPublicStatus,
     stageBalancedRouterConfig, stageManualRouterConfig, resetRouterBalanceEpoch,
-    readRouterConfig, readRouterState, routerControlFailure,
+    readRouterConfig, readRouterState, routerControlFailure, routerPresentation,
+    authenticatedRouterStatus, routerControlSocketPath, parseAuthenticatedRouterStatus, routerControlCard,
   },
 };
 
@@ -1597,12 +1601,102 @@ async function routerStatus(_api, deps, paths) {
   try {
     const config = readRouterConfig(deps, routerPaths);
     const state = readRouterState(deps, routerPaths);
-    return { ok: true, router: routerPublicStatus(deps, config, state) };
+    const router = routerPublicStatus(deps, config, state);
+    // The staged config and its local state are not runtime evidence. Only an
+    // authenticated mux response may carry a live account/thread projection.
+    const live = config?.mode === "balanced"
+      ? await authenticatedRouterStatus(deps, routerPaths)
+      : { state: "not_applicable", status: null };
+    return { ok: true, router, live };
   } catch {
     // A malformed/stale persisted control record never blocks manual behavior.
     // The runtime will select direct mode; the renderer receives only its code.
-    return { ok: true, router: { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "direct_fallback", protocolState: "unknown", fairnessPrecision: "estimated", accounts: [], restartRequired: true, degradedReason: "invalid_config" } };
+    return {
+      ok: true,
+      router: { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "direct_fallback", protocolState: "unknown", fairnessPrecision: "estimated", accounts: [], restartRequired: true, degradedReason: "invalid_config" },
+      live: { state: "unavailable", status: null },
+    };
   }
+}
+
+function routerControlSocketPath(deps, routerPaths) {
+  const { createHash } = require("node:crypto");
+  const rootHash = createHash("sha256").update(deps.path.resolve(routerPaths.routerDir), "utf8").digest("hex").slice(0, 24);
+  return deps.path.join("/tmp", `arc-${routerUid(deps)}`, `${rootHash}-${ACCOUNT_ROUTER_CONTROL_SOCKET_NAME}`);
+}
+
+function authenticatedRouterStatus(deps, routerPaths) {
+  const fs = deps.fs;
+  let secret = null;
+  try {
+    secret = withOptionalSecureBytes(fs, routerPaths.controlSecretFile, 64, (bytes) => {
+      if (!bytes || bytes.length !== 32) return null;
+      return Buffer.from(bytes);
+    });
+    if (!secret || typeof deps?.net?.createConnection !== "function") return Promise.resolve({ state: "unavailable", status: null });
+    const socketPath = routerControlSocketPath(deps, routerPaths);
+    const socketStat = fs.lstatSync(socketPath);
+    const parentStat = fs.lstatSync(deps.path.dirname(socketPath));
+    if (!socketStat.isSocket?.() || socketStat.isSymbolicLink?.() || socketStat.uid !== routerUid(deps) || (socketStat.mode & 0o077) !== 0
+      || !parentStat.isDirectory?.() || parentStat.isSymbolicLink?.() || parentStat.uid !== routerUid(deps) || (parentStat.mode & 0o077) !== 0) {
+      secret.fill(0);
+      return Promise.resolve({ state: "unavailable", status: null });
+    }
+    return requestAuthenticatedRouterStatus(deps, socketPath, secret);
+  } catch (error) {
+    try { secret?.fill(0); } catch {}
+    return Promise.resolve({ state: error?.code === "ENOENT" || error?.code === "ECONNREFUSED" ? "not_running" : "unavailable", status: null });
+  }
+}
+
+function requestAuthenticatedRouterStatus(deps, socketPath, secret) {
+  return new Promise((resolve) => {
+    const requestId = `account-switcher-${deps.randomUUID()}`;
+    const request = Buffer.from(`${JSON.stringify({ version: 1, requestId, method: "status", secret: secret.toString("base64url") })}\n`);
+    let response = Buffer.alloc(0);
+    let settled = false;
+    const socket = deps.net.createConnection(socketPath);
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      request.fill(0); response.fill(0); secret.fill(0);
+      try { socket.destroy(); } catch {}
+      resolve(result);
+    };
+    socket.setTimeout?.(ROUTER_CONTROL_TIMEOUT_MS, () => finish({ state: "unavailable", status: null }));
+    socket.once?.("connect", () => socket.end(request));
+    socket.on?.("data", (chunk) => {
+      if (response.length + chunk.length > ROUTER_CONTROL_FRAME_LIMIT) return finish({ state: "unavailable", status: null });
+      response = Buffer.concat([response, chunk]);
+    });
+    socket.once?.("end", () => finish({ state: "active", status: parseAuthenticatedRouterStatus(response, requestId) }));
+    socket.once?.("error", (error) => finish({ state: error?.code === "ENOENT" || error?.code === "ECONNREFUSED" ? "not_running" : "unavailable", status: null }));
+  }).then((result) => result.status ? result : { ...result, state: "unavailable" });
+}
+
+function parseAuthenticatedRouterStatus(bytes, requestId) {
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["requestId", "status", "version"].join("\0")
+      || value.version !== 1 || value.requestId !== requestId || !isRecord(value.status)) return null;
+    const status = value.status;
+    const allowed = ["accounts", "degradedReason", "fairnessPrecision", "mode", "protocolState", "restartRequired", "schemaVersion"];
+    if (Object.keys(status).some((key) => !allowed.includes(key)) || status.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+      || !["manual", "balanced", "direct_fallback"].includes(status.mode)
+      || !["supported", "unsupported", "drifted", "unknown"].includes(status.protocolState)
+      || !["projected", "exact_completed_spend", "estimated"].includes(status.fairnessPrecision)
+      || typeof status.restartRequired !== "boolean" || !(status.degradedReason === null || typeof status.degradedReason === "string")
+      || !Array.isArray(status.accounts) || status.accounts.length > 2) return null;
+    const accounts = [];
+    for (const account of status.accounts) {
+      if (!isRecord(account) || Object.keys(account).sort().join("\0") !== ["assignedThreadCount", "eligibility", "label", "normalizedSpend", "opaqueAccountId"].join("\0")
+        || !isOpaqueAccountId(account.opaqueAccountId) || !["Account A", "Account B"].includes(account.label)
+        || typeof account.eligibility !== "string" || !Number.isFinite(account.normalizedSpend) || account.normalizedSpend < 0
+        || !Number.isInteger(account.assignedThreadCount) || account.assignedThreadCount < 0) return null;
+      accounts.push({ label: account.label, eligibility: account.eligibility, normalizedSpend: account.normalizedSpend, assignedThreadCount: account.assignedThreadCount });
+    }
+    return redact({ schemaVersion: status.schemaVersion, mode: status.mode, protocolState: status.protocolState, fairnessPrecision: status.fairnessPrecision, accounts, restartRequired: status.restartRequired, degradedReason: status.degradedReason });
+  } catch { return null; }
 }
 
 async function configureRouter(_api, deps, paths, refs, message) {
@@ -1689,6 +1783,7 @@ function nodeDeps() {
   const { spawn, spawnSync } = require("node:child_process");
   return {
     fs: require("node:fs"),
+    net: require("node:net"),
     path: require("node:path"),
     homedir: require("node:os").homedir,
     codexHome: typeof process !== "undefined" ? (process.env.CODEX_HOME || null) : null,
@@ -1777,18 +1872,40 @@ function routerControlCard(state, accounts) {
   title.textContent = "Account routing";
   const description = document.createElement("div");
   description.className = "text-sm text-token-text-secondary";
-  description.textContent = "Manual switching remains the default. Balanced routing stages two saved accounts for the next separately authorized restart; it does not restart ChatGPT from this page.";
+  description.textContent = "Manual switching remains the default. Two active ChatGPT sessions are not saved router snapshots. Balanced routing is staged only after you explicitly choose exactly two saved snapshots, and this page never restarts ChatGPT.";
   summary.append(title, description);
   const body = document.createElement("div");
   body.className = "flex flex-col gap-3 p-3";
   const status = document.createElement("div");
   status.className = "text-sm text-token-text-secondary";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
   status.textContent = "Checking staged router status…";
-  const selected = new Set(accounts.slice(0, 2).map((account) => account.ref));
+  const selected = new Set();
   const weights = new Map(accounts.map((account) => [account.ref, 1]));
+  const selectionNote = document.createElement("div");
+  selectionNote.className = "text-sm text-token-text-secondary";
   const choices = document.createElement("div");
   choices.className = "flex flex-col gap-2";
-  for (const account of accounts) {
+  const controls = document.createElement("div");
+  controls.className = "flex flex-wrap items-center gap-2";
+  const balanced = document.createElement("button");
+  balanced.type = "button";
+  balanced.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary disabled:cursor-not-allowed disabled:opacity-60";
+  balanced.textContent = "Stage Balanced Mode";
+  balanced.setAttribute("aria-describedby", "account-router-selection-readiness");
+  const refreshStageAvailability = () => {
+    const selectedRefs = [...selected];
+    const validWeights = selectedRefs.length === 2 && selectedRefs.every((ref) => Number.isInteger(weights.get(ref)) && weights.get(ref) >= 1 && weights.get(ref) <= 100);
+    balanced.disabled = !validWeights;
+    selectionNote.id = "account-router-selection-readiness";
+    selectionNote.textContent = accounts.length === 0
+      ? "Not configured: save two account snapshots before Balanced mode can be staged."
+      : accounts.length === 1
+        ? "Save two accounts: one saved snapshot is available."
+        : `Saved snapshots: ${accounts.length}. Select exactly two distinct snapshots and give each a weight from 1 to 100.`;
+  };
+  for (const [index, account] of accounts.entries()) {
     const row = document.createElement("label");
     row.className = "flex items-center justify-between gap-3 text-sm text-token-text-primary";
     const inclusion = document.createElement("input");
@@ -1796,31 +1913,27 @@ function routerControlCard(state, accounts) {
     inclusion.checked = selected.has(account.ref);
     const label = document.createElement("span");
     label.className = "min-w-0 flex-1 truncate";
-    label.textContent = account.label;
+    label.textContent = `Saved snapshot ${index + 1}`;
     const weight = document.createElement("input");
     weight.type = "number"; weight.min = "1"; weight.max = "100"; weight.value = "1";
+    weight.setAttribute("aria-label", `Weight for saved snapshot ${index + 1}`);
     weight.className = "border-token-border bg-token-foreground/5 w-16 rounded-md border px-2 py-1 text-sm text-token-text-primary";
     inclusion.addEventListener("change", () => {
       if (inclusion.checked && selected.size >= 2) { inclusion.checked = false; return; }
       if (inclusion.checked) selected.add(account.ref); else selected.delete(account.ref);
+      refreshStageAvailability();
     });
-    weight.addEventListener("change", () => weights.set(account.ref, Number(weight.value)));
+    weight.addEventListener("input", () => { weights.set(account.ref, Number(weight.value)); refreshStageAvailability(); });
     row.append(inclusion, label, weight);
     choices.append(row);
   }
-  const controls = document.createElement("div");
-  controls.className = "flex flex-wrap items-center gap-2";
-  const balanced = document.createElement("button");
-  balanced.type = "button";
-  balanced.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
-  balanced.textContent = "Stage Balanced Mode";
   balanced.addEventListener("click", async () => {
     const refs = [...selected];
     if (refs.length !== 2) { reportRouterControlFailure(state, status, "router-requires-exactly-two-accounts"); return; }
     status.textContent = "Staging isolated account homes…";
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "balanced", refs, primaryRef: refs[0], weights: refs.map((ref) => weights.get(ref)) });
-      if (result?.ok) status.textContent = "Balanced mode is staged for the next authorized restart.";
+      if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts.length);
       else reportRouterControlFailure(state, status, result?.error?.code);
     } catch { reportRouterControlFailure(state, status); }
   });
@@ -1831,7 +1944,7 @@ function routerControlCard(state, accounts) {
   manual.addEventListener("click", async () => {
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
-      if (result?.ok) status.textContent = "Manual mode is staged. Existing saved sessions remain unchanged.";
+      if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts.length);
       else reportRouterControlFailure(state, status, result?.error?.code);
     } catch { reportRouterControlFailure(state, status); }
   });
@@ -1847,15 +1960,55 @@ function routerControlCard(state, accounts) {
     } catch { reportRouterControlFailure(state, status); }
   });
   controls.append(balanced, manual, reset);
-  body.append(status, choices, controls);
+  refreshStageAvailability();
+  body.append(status, selectionNote, choices, controls);
   card.append(summary, body);
   void state.api.ipc.invoke(IPC, { action: "router-status" }).then((result) => {
     if (!result?.ok) { status.textContent = "Router status is unavailable; manual switching remains available."; return; }
-    const router = result.router;
-    const degraded = router.degradedReason ? ` Degraded: ${router.degradedReason.replace(/_/g, " ")}.` : "";
-    status.textContent = `${router.mode === "balanced" ? "Balanced mode is staged." : "Manual mode is active."}${degraded}`;
+    applyRouterPresentation(status, result.router, result.live, accounts.length);
   }).catch(() => { status.textContent = "Router status is unavailable; manual switching remains available."; });
   return card;
+}
+
+function routerPresentation(router, live, savedSnapshotCount) {
+  const savedCount = Number.isInteger(savedSnapshotCount) && savedSnapshotCount >= 0 ? savedSnapshotCount : 0;
+  const liveStatus = live?.state === "active" && isRecord(live.status) ? live.status : null;
+  const degraded = liveStatus?.degradedReason || router?.degradedReason;
+  if (degraded) return { label: "Degraded", message: `Direct fallback is active because ${String(degraded).replace(/_/g, " ")}.`, accounts: [] };
+  if (liveStatus?.mode === "balanced") {
+    return {
+      label: "Running Balanced",
+      message: "Balanced routing is running. Account and thread counts below come from the authenticated local mux.",
+      accounts: Array.isArray(liveStatus.accounts) ? liveStatus.accounts : [],
+    };
+  }
+  if (router?.mode === "direct_fallback") return { label: "Direct fallback", message: "The direct app-server is active. No live Balanced routing claim is being shown.", accounts: [] };
+  if (router?.mode === "balanced" || router?.restartRequired) return { label: "Balanced staged - restart required", message: "Balanced mode is staged but not running yet. A later separately authorized restart is required.", accounts: [] };
+  if (savedCount === 0) return { label: "Not configured", message: "Manual switching is active. Save two account snapshots before Balanced mode can be staged.", accounts: [] };
+  if (savedCount === 1) return { label: "Save two accounts", message: "Manual switching is active. One more saved snapshot is needed before Balanced mode can be staged.", accounts: [] };
+  if (savedCount === 2) return { label: "Ready to stage", message: "Manual switching is active. Select the two saved snapshots and explicitly stage Balanced mode when ready.", accounts: [] };
+  return { label: "Manual", message: "Manual switching is active. Choose exactly two saved snapshots if you want to stage Balanced mode.", accounts: [] };
+}
+
+function applyRouterPresentation(status, router, live, savedCount) {
+  const presentation = routerPresentation(router, live, savedCount);
+  status.replaceChildren?.();
+  const label = document.createElement("span");
+  label.className = "font-medium text-token-text-primary";
+  label.textContent = `${presentation.label}. `;
+  const message = document.createElement("span");
+  message.textContent = presentation.message;
+  status.append(label, message);
+  if (presentation.accounts.length > 0) {
+    const list = document.createElement("ul");
+    list.className = "mt-2 list-disc pl-5 text-token-text-secondary";
+    for (const account of presentation.accounts) {
+      const item = document.createElement("li");
+      item.textContent = `${account.label}: ${account.assignedThreadCount} assigned ${account.assignedThreadCount === 1 ? "thread" : "threads"} (${account.eligibility}).`;
+      list.append(item);
+    }
+    status.append(list);
+  }
 }
 
 function pluginProtectionCard(state, protection) {
@@ -1947,6 +2100,16 @@ async function injectAccountMenus(state) {
   title.className = "px-2 pb-1 text-xs font-medium text-token-text-secondary";
   title.textContent = "Switch ChatGPT account";
   panel.append(title);
+  const openAccounts = document.createElement("button");
+  openAccounts.type = "button";
+  openAccounts.className = menuButtonClass();
+  openAccounts.textContent = "Open Accounts";
+  openAccounts.setAttribute("aria-label", "Open Accounts settings");
+  openAccounts.addEventListener("click", async () => {
+    const result = await state.api.settings?.openPage?.("accounts");
+    if (!result?.ok) state.api.log?.warn?.("Account settings page could not be opened", result?.reason || "unavailable");
+  });
+  panel.append(openAccounts);
   for (const account of response.accounts) panel.append(accountButton(state, account));
   const save = document.createElement("button");
   save.type = "button"; save.className = menuButtonClass(); save.textContent = "Save current session…";

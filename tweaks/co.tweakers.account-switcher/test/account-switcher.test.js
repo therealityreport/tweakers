@@ -466,15 +466,106 @@ test("secure snapshot buffers are cleared after thrown reads and writes", async 
   assert.equal(thrownWriteBuffer.every((byte) => byte === 0), true);
 });
 
-test("account metadata declares the settings surface and has a synchronized patch version", () => {
+test("account metadata declares the settings surface and has a synchronized minor version", () => {
   const tweakRoot = path.join(__dirname, "..");
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.2.1");
+  assert.equal(manifest.version, "0.3.0");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
+});
+
+test("router presentation distinguishes setup, staged, live, fallback, and degraded state without account identities", () => {
+  const manual = { mode: "manual", restartRequired: false, degradedReason: null };
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 0).label, "Not configured");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 1).label, "Save two accounts");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 2).label, "Ready to stage");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Manual");
+  assert.equal(_test.routerPresentation({ mode: "balanced", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Balanced staged - restart required");
+  const running = _test.routerPresentation(
+    { mode: "balanced", restartRequired: true, degradedReason: null },
+    { state: "active", status: { mode: "balanced", degradedReason: null, accounts: [{ label: "Account A", eligibility: "active", assignedThreadCount: 2 }] } },
+    2,
+  );
+  assert.equal(running.label, "Running Balanced");
+  assert.deepEqual(running.accounts, [{ label: "Account A", eligibility: "active", assignedThreadCount: 2 }]);
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Direct fallback");
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: "post_start_failure" }, { state: "not_running", status: null }, 2).label, "Degraded");
+});
+
+test("authenticated router status accepts only the redacted mux projection", () => {
+  const requestId = "router-test";
+  const opaque = "ar_" + "a".repeat(43);
+  const parsed = _test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({
+    version: 1,
+    requestId,
+    status: {
+      schemaVersion: 1,
+      mode: "balanced",
+      protocolState: "supported",
+      fairnessPrecision: "exact_completed_spend",
+      accounts: [{ opaqueAccountId: opaque, label: "Account A", eligibility: "active", normalizedSpend: 1, assignedThreadCount: 2 }],
+      restartRequired: false,
+      degradedReason: null,
+    },
+  })), requestId);
+  assert.deepEqual(parsed.accounts, [{ label: "Account A", eligibility: "active", normalizedSpend: 1, assignedThreadCount: 2 }]);
+  assert.equal(JSON.stringify(parsed).includes(opaque), false);
+  assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: { secret: "no" } })), requestId), null);
+});
+
+test("router controls use an accessible live status and require an explicit two-snapshot selection", async (t) => {
+  const previousDocument = global.document;
+  const nodes = [];
+  const element = (tagName) => {
+    const node = {
+      tagName,
+      children: [],
+      attrs: {},
+      className: "",
+      textContent: "",
+      type: "",
+      disabled: false,
+      value: "",
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = []; this.append(...children); },
+      setAttribute(key, value) { this.attrs[key] = value; },
+      getAttribute(key) { return this.attrs[key] || null; },
+      addEventListener(name, listener) { this[`on_${name}`] = listener; },
+    };
+    nodes.push(node);
+    return node;
+  };
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const calls = [];
+  _test.routerControlCard({
+    api: {
+      ipc: {
+        async invoke(_channel, request) {
+          calls.push(request);
+          if (request.action === "router-status") return { ok: true, router: { mode: "manual", restartRequired: false, degradedReason: null }, live: { state: "not_applicable", status: null } };
+          return { ok: true, router: { mode: "balanced", restartRequired: true, degradedReason: null } };
+        },
+      },
+      log: { warn() {} },
+    },
+  }, [{ ref: "one", label: "hidden-one" }, { ref: "two", label: "hidden-two" }]);
+  await Promise.resolve();
+  await Promise.resolve();
+  const status = nodes.find((node) => node.attrs.role === "status");
+  const balanced = nodes.find((node) => node.textContent === "Stage Balanced Mode");
+  const checks = nodes.filter((node) => node.type === "checkbox");
+  assert.equal(status.attrs["aria-live"], "polite");
+  assert.equal(balanced.disabled, true);
+  assert.deepEqual(calls, [{ action: "router-status" }]);
+  checks[0].checked = true; checks[0].on_change();
+  assert.equal(balanced.disabled, true);
+  checks[1].checked = true; checks[1].on_change();
+  assert.equal(balanced.disabled, false);
+  assert.equal(nodes.some((node) => node.textContent === "hidden-one" || node.textContent === "hidden-two"), false);
 });
 
 function addSavedAccount(setup, name, token, accountId) {
@@ -1171,6 +1262,8 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
   let hostListener;
   let hostDisconnects = 0;
   let unregisters = 0;
+  let registeredPage;
+  let openPageCalls = 0;
   let listCalls = 0;
   let deferNextList = false;
   let resolveDeferredList;
@@ -1189,6 +1282,7 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
       attrs: options.attrs || {},
       listeners: new Map(),
       getAttribute(key) { return this.attrs[key] || null; },
+      setAttribute(key, value) { this.attrs[key] = value; },
       getBoundingClientRect() {
         return options.rect || { width: 420, height: 420, top: 80, left: 20, right: 440, bottom: 500 };
       },
@@ -1292,16 +1386,31 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
       },
     },
     settings: {
-      registerPage() {
+      registerPage(page) {
+        registeredPage = page;
         return { unregister() { unregisters += 1; } };
+      },
+      async openPage(pageId) {
+        assert.equal(pageId, "accounts");
+        openPageCalls += 1;
+        return { ok: true };
       },
     },
   });
+
+  assert.equal(registeredPage.id, "accounts");
+  assert.equal(registeredPage.title, "Accounts");
+  assert.equal(typeof registeredPage.render, "function");
 
   hostListener([{ kind: "account-menu", count: 1, matches: [{ kind: "account-menu", confidence: "high", element: menu }] }]);
   await flushTimers();
   assert.equal(menu.children.filter((child) => child.dataset.tweakersAccountSwitcher === "true").length, 1);
   assert.equal(listCalls, 1);
+  const panel = menu.children.find((child) => child.dataset.tweakersAccountSwitcher === "true");
+  const openAccounts = panel.children.find((child) => child.textContent === "Open Accounts");
+  assert.equal(openAccounts.attrs["aria-label"], "Open Accounts settings");
+  await openAccounts.listeners.get("click")();
+  assert.equal(openPageCalls, 1);
 
   hostListener([{
     kind: "account-menu",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   accountRouterDataRoot,
   formatAccountRouterEvidence,
   inspectAccountRouter,
+  readRegisteredDevelopmentSourceRoot,
   readLiveAccountRouterStatus,
 } from "../src/account-router-status";
 
@@ -47,6 +48,27 @@ function writeRuntime(root: string): void {
   }));
 }
 
+function writeSource(root: string): void {
+  const manifestPath = join(root, "tweaks", "co.tweakers.account-switcher", "manifest.json");
+  mkdirSync(join(manifestPath, ".."), { recursive: true });
+  writeFileSync(manifestPath, JSON.stringify({
+    id: "co.tweakers.account-switcher", version: "0.2.1",
+  }));
+}
+
+function listTree(root: string): string[] {
+  const entries: string[] = [];
+  const visit = (directory: string, prefix = "") => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      entries.push(relative);
+      if (entry.isDirectory()) visit(join(directory, entry.name), relative);
+    }
+  };
+  visit(root);
+  return entries.sort();
+}
+
 test("installer status keeps source, candidate, installed, and authenticated live evidence distinct and redacted", async () => {
   const fixture = mkdtempSync(join(tmpdir(), "tweakers-account-router-status-"));
   const userRoot = join(fixture, "user");
@@ -72,7 +94,12 @@ test("installer status keeps source, candidate, installed, and authenticated liv
   writeRuntime(installedRuntimeRoot);
   const control = await startRouterControlSocket({ root: routerRoot, secret: Buffer.from(secret), status });
   try {
-    const evidence = await inspectAccountRouter({ userRoot, sourceRoot, candidateRuntimeRoot, installedRuntimeRoot });
+    const evidence = await inspectAccountRouter({
+      userRoot,
+      registeredDevelopmentSourceRoot: sourceRoot,
+      candidateRuntimeRoot,
+      installedRuntimeRoot,
+    });
     assert.deepEqual(evidence.source, { state: "present", version: "0.2.0" });
     assert.deepEqual(evidence.candidate, { state: "present", version: "0.2.0" });
     assert.deepEqual(evidence.installed, { state: "present", version: "0.2.0" });
@@ -90,6 +117,94 @@ test("installer status keeps source, candidate, installed, and authenticated liv
     assert.doesNotMatch(JSON.stringify(evidence), new RegExp(secret.toString("base64url")));
   } finally {
     await control.close();
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("registered source provenance resolves the checkout realpath and reports absent or stale registrations without paths", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-account-router-source-"));
+  const sourceRoot = join(fixture, "registered-source");
+  const sourceLink = join(fixture, "registered-link");
+  const missingManifestRoot = join(fixture, "missing-manifest");
+  try {
+    writeSource(sourceRoot);
+    mkdirSync(missingManifestRoot, { recursive: true });
+    symlinkSync(sourceRoot, sourceLink);
+
+    const config = { tweaker: { developmentSourceRoot: sourceLink } };
+    assert.equal(readRegisteredDevelopmentSourceRoot(config), sourceLink);
+    assert.equal(readRegisteredDevelopmentSourceRoot({ tweaker: {} }), null);
+    assert.equal(readRegisteredDevelopmentSourceRoot({ tweaker: { developmentSourceRoot: 1 } }), null);
+
+    const present = await inspectAccountRouter({
+      userRoot: join(fixture, "user"),
+      registeredDevelopmentSourceRoot: readRegisteredDevelopmentSourceRoot(config),
+      candidateRuntimeRoot: join(fixture, "no-candidate"),
+      installedRuntimeRoot: join(fixture, "no-installed"),
+    });
+    assert.deepEqual(present.source, { state: "present", version: "0.2.1" });
+
+    const missing = await inspectAccountRouter({
+      userRoot: join(fixture, "user"),
+      registeredDevelopmentSourceRoot: missingManifestRoot,
+      candidateRuntimeRoot: join(fixture, "no-candidate"),
+      installedRuntimeRoot: join(fixture, "no-installed"),
+    });
+    assert.deepEqual(missing.source, { state: "missing", version: null });
+
+    const stale = await inspectAccountRouter({
+      userRoot: join(fixture, "user"),
+      registeredDevelopmentSourceRoot: join(fixture, "stale-registration"),
+      candidateRuntimeRoot: join(fixture, "no-candidate"),
+      installedRuntimeRoot: join(fixture, "no-installed"),
+    });
+    assert.deepEqual(stale.source, {
+      state: "unavailable", version: null, unavailableReason: "registration_stale",
+    });
+    const rendered = formatAccountRouterEvidence(stale).join("\n");
+    assert.match(rendered, /source:\s+unavailable \(registered checkout is stale\)/);
+    assert.doesNotMatch(rendered, new RegExp(fixture.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("not-staged source, candidate, and installed observations are independent and read-only", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-account-router-read-only-"));
+  const candidateRuntimeRoot = join(fixture, "candidate-runtime");
+  const installedRuntimeRoot = join(fixture, "installed-runtime");
+  try {
+    writeRuntime(candidateRuntimeRoot);
+    const beforeCandidateOnly = listTree(fixture);
+    const candidateOnly = await inspectAccountRouter({
+      userRoot: join(fixture, "user"),
+      registeredDevelopmentSourceRoot: null,
+      candidateRuntimeRoot,
+      installedRuntimeRoot,
+    });
+    assert.deepEqual(candidateOnly.source, {
+      state: "unavailable", version: null, unavailableReason: "not_registered",
+    });
+    assert.deepEqual(candidateOnly.candidate, { state: "present", version: "0.2.0" });
+    assert.deepEqual(candidateOnly.installed, { state: "missing", version: null });
+    assert.deepEqual(candidateOnly.configuration, { state: "not_staged" });
+    assert.deepEqual(candidateOnly.live, { state: "not_applicable", status: null });
+    assert.deepEqual(listTree(fixture), beforeCandidateOnly);
+
+    writeRuntime(installedRuntimeRoot);
+    const beforeInstalledOnly = listTree(fixture);
+    const installedOnly = await inspectAccountRouter({
+      userRoot: join(fixture, "user"),
+      registeredDevelopmentSourceRoot: null,
+      candidateRuntimeRoot: join(fixture, "no-candidate"),
+      installedRuntimeRoot,
+    });
+    assert.deepEqual(installedOnly.candidate, { state: "missing", version: null });
+    assert.deepEqual(installedOnly.installed, { state: "present", version: "0.2.0" });
+    assert.deepEqual(installedOnly.configuration, { state: "not_staged" });
+    assert.deepEqual(installedOnly.live, { state: "not_applicable", status: null });
+    assert.deepEqual(listTree(fixture), beforeInstalledOnly);
+  } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
 });

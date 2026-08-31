@@ -44,3 +44,23 @@ test("doctor leaves manual mode healthy while flagging a staged balanced router 
   assert.equal(live.ok, "warn");
   assert.match(live.detail, /not running/);
 });
+
+test("doctor keeps not-staged direct mode healthy and names unavailable source provenance safely", () => {
+  const notStaged = {
+    ...balanced,
+    source: { state: "unavailable" as const, version: null, unavailableReason: "not_registered" as const },
+    configuration: { state: "not_staged" as const },
+    live: { state: "not_applicable" as const, status: null },
+  };
+  assert.deepEqual(accountRouterDoctorChecks(notStaged), []);
+
+  const staleSource = {
+    ...balanced,
+    source: { state: "unavailable" as const, version: null, unavailableReason: "registration_stale" as const },
+  };
+  const source = accountRouterDoctorChecks(staleSource).at(0)!;
+  assert.equal(source.name, "account router source");
+  assert.equal(source.ok, "warn");
+  assert.equal(source.detail, "registered development checkout is stale");
+  assert.doesNotMatch(JSON.stringify(source), /\/Users\/|auth\.json|secret|token/i);
+});

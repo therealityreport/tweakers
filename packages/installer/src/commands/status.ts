@@ -17,6 +17,7 @@ import { environmentModeCachePaths, observeEnvironmentModeCache } from "../envir
 import {
   formatAccountRouterEvidence,
   inspectAccountRouter,
+  readRegisteredDevelopmentSourceRoot,
   type AccountRouterEvidence,
 } from "../account-router-status.js";
 
@@ -25,7 +26,7 @@ export async function status(): Promise<void> {
   const state = readState(paths.stateFile);
   const accountRouter = await inspectAccountRouter({
     userRoot: paths.root,
-    sourceRoot: state?.sourceRoot ?? null,
+    registeredDevelopmentSourceRoot: readRegisteredDevelopmentSourceRoot(readConfigFile(paths.configFile)),
     installedRuntimeRoot: paths.runtime,
   });
 
