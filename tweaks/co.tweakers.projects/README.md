@@ -5,13 +5,18 @@ repository inventory to the native Projects sidebar.
 
 ## Project menu
 
-When Codex opens a project menu, Projects replaces that one visible portal with
-an owned Codex-styled menu in the same position. It snapshots the actual native
-commands in their original order, including their disabled state and icons, and
-replays the selected native command itself. This keeps Edit, Reveal, Remove,
-and future Codex commands under Codex's own semantics while also adding the
-Project color and task Sort controls. If the project identity or native portal
-is ambiguous, Projects leaves the native menu untouched.
+When current Codex routes a project dropdown through Electron, Projects pauses
+only that project-shaped native popup and sends a bounded snapshot to the
+owning renderer. The renderer draws Codex's compact rounded menu surface with
+the original command order, disabled state, icons, and nested submenus, then
+adds **Project color** and **Task sorting**. Selecting a Codex command calls its
+original Electron menu-item handler; the tweak does not reimplement Edit,
+Reveal, Section, Archive, Remove, or future host behavior.
+
+If the renderer does not confirm the exact project gesture promptly, or the
+project identity and menu signature are ambiguous, the bridge fails open to
+Electron's untouched native menu. The older renderer-portal path remains as a
+compatibility fallback for Codex versions that expose their menu in the DOM.
 
 ## Task ordering
 

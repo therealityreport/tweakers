@@ -79,6 +79,434 @@ test("legacy UI Improvements color preferences import by normalized project name
   assert.equal(result.state.nodes[0].overlayIntensity, "strong");
 });
 
+test("Electron project menu bridge routes only project menus and replays the original host command", () => {
+  let nativePopupCalls = 0;
+  let clock = 1000;
+  const logs = [];
+  class FakeMenu {
+    popup(...args) {
+      nativePopupCalls += 1;
+      this.nativePopupArgs = args;
+    }
+  }
+  let actionHandler = null;
+  let sentRequest = null;
+  const clearedTimers = [];
+  const api = {
+    ipc: {
+      handleWithContext(channel, handler) {
+        assert.equal(channel, _test.ACTION_CHANNEL);
+        actionHandler = handler;
+        return () => { actionHandler = null; };
+      },
+      sendToRenderer(rendererId, channel, payload) {
+        sentRequest = { rendererId, channel, payload };
+        return true;
+      },
+    },
+    log: {
+      info(message, details) { logs.push({ level: "info", message, details }); },
+      warn(message, details) { logs.push({ level: "warn", message, details }); },
+      debug(message, details) { logs.push({ level: "debug", message, details }); },
+    },
+  };
+  let selected = null;
+  let closed = 0;
+  const projectMenu = new FakeMenu();
+  projectMenu.items = [
+    { type: "normal", label: "Edit", enabled: true, visible: true, click: (...args) => { selected = args; } },
+    { type: "submenu", label: "Section", enabled: true, visible: true, submenu: { items: [
+      { type: "normal", label: "Work", enabled: true, visible: true, click() {} },
+    ] } },
+    { type: "normal", label: "Archive chats", enabled: true, visible: true, click() {} },
+    { type: "separator", visible: true },
+    { type: "normal", label: "Remove project", enabled: true, visible: true, click() {} },
+  ];
+  const bridge = _test.installNativeProjectMenuBridge(api, {
+    electron: { Menu: FakeMenu },
+    randomUUID: () => "11111111-1111-4111-8111-111111111111",
+    setTimeout: () => 42,
+    clearTimeout: (timer) => clearedTimers.push(timer),
+    now: () => clock,
+  });
+  const window = { webContents: { id: 17 } };
+  projectMenu.popup({ window, callback: () => { closed += 1; } });
+
+  assert.equal(nativePopupCalls, 0, "the AppKit popup is paused while the renderer accepts ownership");
+  assert.equal(sentRequest.rendererId, 17);
+  assert.equal(sentRequest.channel, _test.REQUEST_CHANNEL);
+  assert.deepEqual(logs.find(({ message }) => message === "Project menu bridge request dispatched")?.details, {
+    requestId: sentRequest.payload.requestId,
+    rendererId: 17,
+    itemCount: 5,
+    timeoutMs: 350,
+    delivered: true,
+  });
+  assert.deepEqual(sentRequest.payload.items.map(({ path, label, type }) => ({ path, label, type })), [
+    { path: "0", label: "Edit", type: "normal" },
+    { path: "1", label: "Section", type: "submenu" },
+    { path: "2", label: "Archive chats", type: "normal" },
+    { path: "3", label: undefined, type: "separator" },
+    { path: "4", label: "Remove project", type: "normal" },
+  ]);
+  clock = 1020;
+  assert.equal(actionHandler({ sender: { webContentsId: 99 } }, {
+    action: "accept",
+    requestId: sentRequest.payload.requestId,
+  }).error, "unknown-request", "a different renderer cannot claim the paused menu");
+  assert.deepEqual(logs.find(({ message, details }) => message === "Project menu bridge action received" && details.senderRendererId === 99)?.details, {
+    requestId: sentRequest.payload.requestId,
+    action: "accept",
+    senderRendererId: 99,
+    expectedRendererId: 17,
+    rendererMatches: false,
+    state: "waiting",
+    elapsedMs: 20,
+  });
+  clock = 1030;
+  assert.deepEqual(actionHandler({ sender: { webContentsId: 17 } }, {
+    action: "accept",
+    requestId: sentRequest.payload.requestId,
+  }), { ok: true });
+  assert.deepEqual(logs.find(({ message }) => message === "Project menu routed to Codex-styled renderer surface")?.details, {
+    requestId: sentRequest.payload.requestId,
+    rendererId: 17,
+    elapsedMs: 30,
+  });
+  assert.deepEqual(actionHandler({ sender: { webContentsId: 17 } }, {
+    action: "select",
+    requestId: sentRequest.payload.requestId,
+    path: "0",
+  }), { ok: true });
+  assert.equal(selected[1], window, "the original Electron MenuItem receives its owning window");
+  assert.equal(selected[2], window.webContents, "the original Electron MenuItem receives its renderer");
+  assert.equal(closed, 1, "the original popup callback is completed after replay");
+  assert.equal(bridge.pendingCount(), 0);
+  assert.ok(clearedTimers.includes(42));
+
+  const unrelated = new FakeMenu();
+  unrelated.items = [{ type: "normal", label: "Copy", enabled: true, visible: true, click() {} }];
+  unrelated.popup({ window });
+  assert.equal(nativePopupCalls, 1, "unrelated native menus retain Electron's original popup path");
+  bridge.dispose();
+  assert.equal(FakeMenu.prototype.popup.name, "popup", "teardown restores Electron's original method");
+});
+
+test("Electron project menu bridge fails open exactly once when the renderer is unavailable or times out", () => {
+  let nativePopupCalls = 0;
+  let clock = 2000;
+  const logs = [];
+  class FakeMenu { popup() { nativePopupCalls += 1; } }
+  let deliver = false;
+  let actionHandler = null;
+  const timers = new Map();
+  let nextTimer = 0;
+  let nextRequest = 0;
+  const api = {
+    ipc: {
+      handleWithContext(_channel, handler) { actionHandler = handler; return () => { actionHandler = null; }; },
+      sendToRenderer() { return deliver; },
+    },
+    log: {
+      info(message, details) { logs.push({ level: "info", message, details }); },
+      warn(message, details) { logs.push({ level: "warn", message, details }); },
+      debug(message, details) { logs.push({ level: "debug", message, details }); },
+    },
+  };
+  const bridge = _test.installNativeProjectMenuBridge(api, {
+    electron: { Menu: FakeMenu },
+    randomUUID: () => `44444444-4444-4444-8444-${String(++nextRequest).padStart(12, "0")}`,
+    setTimeout: (callback) => { const id = ++nextTimer; timers.set(id, callback); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    now: () => clock,
+  });
+  const makeMenu = () => {
+    const menu = new FakeMenu();
+    menu.items = [
+      { type: "normal", label: "Edit", enabled: true, visible: true, click() {} },
+      { type: "normal", label: "Archive chats", enabled: true, visible: true, click() {} },
+      { type: "normal", label: "Remove project", enabled: true, visible: true, click() {} },
+    ];
+    return menu;
+  };
+  const options = { window: { webContents: { id: 18 } } };
+
+  makeMenu().popup(options);
+  assert.equal(nativePopupCalls, 1, "failed delivery immediately uses Electron's untouched menu");
+  assert.equal(timers.size, 0, "failed delivery cannot leave a second fallback timer behind");
+  assert.equal(logs.find(({ message, details }) => message === "Project menu bridge fell back to native popup" && details.reason === "renderer-unavailable")?.details.rendererId, 18);
+
+  deliver = true;
+  makeMenu().popup(options);
+  assert.equal(nativePopupCalls, 1, "successful delivery waits for renderer acceptance");
+  assert.equal(timers.size, 1);
+  const timeout = [...timers.values()][0];
+  clock = 2380;
+  timeout();
+  assert.equal(nativePopupCalls, 2, "an unanswered project request falls back once");
+  assert.deepEqual(logs.find(({ message, details }) => message === "Project menu bridge fell back to native popup" && details.reason === "renderer-timeout")?.details, {
+    requestId: "44444444-4444-4444-8444-000000000002",
+    rendererId: 18,
+    elapsedMs: 380,
+    reason: "renderer-timeout",
+  });
+  timeout();
+  assert.equal(nativePopupCalls, 2, "a stale timeout cannot reopen the same native menu");
+  assert.equal(bridge.pendingCount(), 0);
+  bridge.dispose();
+  assert.equal(actionHandler, null);
+});
+
+test("Electron project menu bridge bounds owned requests and completes invalid selections", () => {
+  class FakeMenu { popup() { throw new Error("native popup should remain paused"); } }
+  let actionHandler = null;
+  let request = null;
+  const timers = new Map();
+  let nextTimer = 0;
+  let nextRequest = 0;
+  const api = {
+    ipc: {
+      handleWithContext(_channel, handler) { actionHandler = handler; return () => { actionHandler = null; }; },
+      sendToRenderer(_rendererId, _channel, payload) { request = payload; return true; },
+    },
+    log: { info() {}, warn() {}, debug() {} },
+  };
+  const bridge = _test.installNativeProjectMenuBridge(api, {
+    electron: { Menu: FakeMenu },
+    randomUUID: () => `55555555-5555-4555-8555-${String(++nextRequest).padStart(12, "0")}`,
+    setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    ownedTimeoutMs: 500,
+  });
+  const window = { webContents: { id: 19 } };
+  const makeMenu = (onClose) => {
+    const menu = new FakeMenu();
+    menu.items = [
+      { type: "normal", label: "Edit", enabled: true, visible: true, click() {} },
+      { type: "normal", label: "Archive chats", enabled: true, visible: true, click() {} },
+      { type: "normal", label: "Remove project", enabled: true, visible: true, click() {} },
+    ];
+    menu.popup({ window, callback: onClose });
+  };
+  let closed = 0;
+  makeMenu(() => { closed += 1; });
+  assert.deepEqual(actionHandler({ sender: { webContentsId: 19 } }, { action: "accept", requestId: request.requestId }), { ok: true });
+  assert.equal([...timers.values()][0].delay, 500);
+  [...timers.values()][0].callback();
+  assert.equal(closed, 1, "an abandoned renderer-owned menu completes its original popup callback");
+  assert.equal(bridge.pendingCount(), 0);
+
+  makeMenu(() => { closed += 1; });
+  assert.deepEqual(actionHandler({ sender: { webContentsId: 19 } }, { action: "accept", requestId: request.requestId }), { ok: true });
+  assert.deepEqual(actionHandler({ sender: { webContentsId: 19 } }, {
+    action: "select",
+    requestId: request.requestId,
+    path: "99",
+  }), { ok: false, error: "invalid-command" });
+  assert.equal(closed, 2, "an invalid renderer path cannot strand Codex's popup promise");
+  assert.equal(bridge.pendingCount(), 0);
+  bridge.dispose();
+});
+
+test("Electron project menu bridge preserves a non-writable popup hook", () => {
+  class LockedMenu {}
+  const originalPopup = function originalPopup() {};
+  Object.defineProperty(LockedMenu.prototype, "popup", {
+    value: originalPopup,
+    writable: false,
+    configurable: true,
+  });
+  let unregistered = 0;
+  const bridge = _test.installNativeProjectMenuBridge({
+    ipc: {
+      handleWithContext() { return () => { unregistered += 1; }; },
+      sendToRenderer() { return true; },
+    },
+    log: { info() {}, warn() {}, debug() {} },
+  }, { electron: { Menu: LockedMenu } });
+  assert.equal(bridge.active, false);
+  assert.equal(LockedMenu.prototype.popup, originalPopup);
+  assert.equal(unregistered, 1, "a rejected hook unregisters its unused action handler");
+  bridge.dispose();
+});
+
+test("native project menu payload validation is bounded and project-specific", () => {
+  const requestId = "22222222-2222-4222-8222-222222222222";
+  assert.equal(_test.validateNativeProjectMenuRequest({
+    schemaVersion: 1,
+    requestId,
+    items: [
+      { path: "0", type: "normal", label: "Edit", enabled: true },
+      { path: "1", type: "normal", label: "Archive chats", enabled: true },
+      { path: "2", type: "normal", label: "Remove project", enabled: true },
+    ],
+  })?.requestId, requestId);
+  assert.equal(_test.validateNativeProjectMenuRequest({
+    schemaVersion: 1,
+    requestId,
+    items: [
+      { path: "0", type: "normal", label: "Copy", enabled: true },
+      { path: "1", type: "normal", label: "Delete", enabled: true },
+    ],
+  }), null, "a generic native menu cannot enter the project renderer path");
+  assert.equal(_test.validateNativeProjectMenuRequest({
+    schemaVersion: 1,
+    requestId,
+    items: [
+      { path: "0", type: "normal", label: "Pin", enabled: true },
+      { path: "1", type: "normal", label: "Section", enabled: true },
+      { path: "2", type: "normal", label: "Remove project", enabled: true },
+    ],
+  }), null, "generic labels plus Remove project are insufficient without a project-specific command");
+  assert.equal(_test.isNativeProjectMenu({ items: [
+    { type: "normal", label: "Pin" },
+    { type: "normal", label: "Section" },
+    { type: "normal", label: "Archive chats" },
+    { type: "normal", label: "Remove" },
+  ] }), false, "a bare Remove command cannot collide with the project signature");
+  assert.equal(_test.validateNativeProjectMenuRequest({
+    schemaVersion: 1,
+    requestId,
+    items: [{ path: "../../0", type: "normal", label: "Remove project", enabled: true }],
+  }), null, "selection paths cannot escape the serialized menu tree");
+  const supportedShape = [
+    { type: "normal", label: "Edit", enabled: true, visible: true, click() {} },
+    { type: "normal", label: "Archive chats", enabled: true, visible: true, click() {} },
+    { type: "normal", label: "Remove project", enabled: true, visible: true, click() {} },
+  ];
+  assert.ok(_test.serializeNativeMenuItems(supportedShape));
+  const screenshotMenu = [
+    { type: "normal", label: "Pin", enabled: true, visible: true, click() {} },
+    { type: "normal", label: "Edit", enabled: true, visible: true, click() {} },
+    { type: "separator", visible: true },
+    { type: "submenu", label: "Section", enabled: true, visible: true, submenu: { items: [
+      { type: "normal", label: "Work", enabled: true, visible: true, click() {} },
+    ] } },
+    { type: "normal", label: "Reveal in Finder", enabled: true, visible: true, click() {} },
+    { type: "normal", label: "Create permanent worktree", enabled: true, visible: true, click() {} },
+    { type: "separator", visible: true },
+    { type: "normal", label: "Mark all as read", enabled: true, visible: true, click() {} },
+    { type: "normal", label: "Archive chats", enabled: true, visible: true, click() {} },
+    { type: "separator", visible: true },
+    { type: "normal", label: "Remove project", enabled: true, visible: true, click() {} },
+  ];
+  const screenshotItems = _test.serializeNativeMenuItems(screenshotMenu);
+  assert.equal(_test.isNativeProjectMenu({ items: screenshotMenu }), true, "the exact visible Codex menu reaches the bridge");
+  assert.deepEqual(screenshotItems.filter(({ type }) => type !== "separator").map(({ label }) => label), [
+    "Pin",
+    "Edit",
+    "Section",
+    "Reveal in Finder",
+    "Create permanent worktree",
+    "Mark all as read",
+    "Archive chats",
+    "Remove project",
+  ]);
+  assert.ok(_test.validateNativeProjectMenuRequest({ schemaVersion: 1, requestId, items: screenshotItems }));
+  assert.equal(_test.serializeNativeMenuItems([
+    ...supportedShape.slice(0, 1),
+    { type: "checkbox", label: "Pin", checked: true, enabled: true, visible: true, click() {} },
+    ...supportedShape.slice(1),
+  ]), null, "checkbox state remains owned by Electron's native selection path");
+  assert.equal(_test.serializeNativeMenuItems([
+    ...supportedShape.slice(0, 1),
+    { type: "normal", role: "selectAll", label: "Archive chats", enabled: true, visible: true, click() {} },
+    ...supportedShape.slice(2),
+  ]), null, "role-backed first-responder behavior remains owned by Electron");
+});
+
+test("bridged project menu uses the Codex renderer surface, nested host commands, and project controls", async () => {
+  const document = new FakeDocument();
+  document.defaultView = { innerHeight: 800, innerWidth: 1200 };
+  const request = {
+    requestId: "33333333-3333-4333-8333-333333333333",
+    items: [
+      { path: "0", type: "normal", label: "Edit", enabled: true, iconDataUrl: "data:image/png;base64,AA==" },
+      { path: "1", type: "submenu", label: "Section", enabled: true, submenu: [
+        { path: "1.0", type: "normal", label: "Work", enabled: true },
+      ] },
+      { path: "2", type: "separator" },
+      { path: "3", type: "normal", label: "Remove project", enabled: true },
+    ],
+  };
+  const context = {
+    x: 120,
+    y: 90,
+    project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" },
+  };
+  const selected = [];
+  let dismissed = 0;
+  const saves = [];
+  let overlay = _test.openBridgedProjectMenu(document, request, context, {
+    select: (path) => selected.push(path),
+    dismiss: () => { dismissed += 1; },
+    saveAppearance: (projectId, choice) => saves.push({ projectId, choice }),
+  });
+  assert.match(overlay.className, /rounded-2xl/);
+  assert.match(overlay.className, /bg-surface-elevated-secondary\/90/);
+  assert.equal(overlay.getAttribute("data-tweaker-project-menu-source"), "electron");
+  assert.equal(overlay.querySelector('[data-tweaker-project-native-command="0"]').children[0].tagName, "IMG");
+  const colorTrigger = overlay.querySelector('[data-tweaker-project-color-menu="trigger"]');
+  assert.ok(colorTrigger);
+  assert.ok(overlay.querySelector('[data-tweaker-project-task-menu="sort"]'));
+  assert.ok(overlay.children.indexOf(colorTrigger) < overlay.children.indexOf(overlay.querySelector('[data-tweaker-project-native-command="3"]')), "tweak controls stay above Codex's final destructive group");
+  overlay.querySelector('[data-tweaker-project-native-command="1"]').click();
+  const section = document.body.querySelector('[data-tweaker-project-host-menu="submenu"]');
+  assert.ok(section, "Electron submenus are rendered as nested Codex surfaces");
+  assert.equal(section.parentElement, document.body, "fixed host submenus escape the parent's blur and overflow clipping");
+  assert.equal(overlay.contains(section), false);
+  section.querySelector('[data-tweaker-project-native-command="1.0"]').click();
+  await Promise.resolve();
+  assert.deepEqual(selected, ["1.0"]);
+  assert.equal(dismissed, 0, "host selections resolve through their original command instead of null dismissal");
+  assert.equal(overlay.parentElement, null);
+
+  overlay = _test.openBridgedProjectMenu(document, request, context, {
+    select: (path) => selected.push(path),
+    dismiss: () => { dismissed += 1; },
+    saveAppearance: (projectId, choice) => saves.push({ projectId, choice }),
+  });
+  overlay.querySelector('[data-tweaker-project-color-menu="trigger"]').click();
+  const colorMenu = document.body.querySelector('[data-tweaker-project-color-menu="submenu"]');
+  assert.equal(colorMenu.parentElement, document.body, "fixed color menus use viewport coordinates from a body portal");
+  colorMenu.querySelector('[data-color-id="green"]').click();
+  await Promise.resolve();
+  assert.equal(dismissed, 1, "a tweak-owned choice closes the paused native menu without invoking a host command");
+  assert.deepEqual(saves, [{ projectId: "p", choice: { colorMode: "manual", color: "#15803d" } }]);
+  assert.equal(document.listenerCount(), 0, "selection removes root and submenu listeners");
+});
+
+test("body-portaled project submenus clamp fixed placement to the viewport", () => {
+  const document = new FakeDocument();
+  document.defaultView = { innerHeight: 200, innerWidth: 300 };
+  const anchor = document.createElement("button");
+  anchor.rect = { left: 260, top: 180, right: 290, bottom: 198, width: 30, height: 18 };
+  document.body.appendChild(anchor);
+  const context = {
+    project: { id: "p", name: "Alpha", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "medium" },
+  };
+  const assertPlacement = (submenu) => {
+    assert.equal(submenu.parentElement, document.body);
+    assert.equal(submenu.style.values.get("left"), "160px", "right-edge submenus flip to the anchor's left");
+    assert.equal(submenu.style.values.get("top"), "162px", "bottom-edge submenus shift above the viewport margin");
+    assert.equal(submenu.style.values.get("max-height"), "140px");
+  };
+
+  const color = _test.openProjectColorSubmenu(document, anchor, context, () => {});
+  assertPlacement(color);
+  document.dispatchEvent({ type: "pointerdown", target: document.body });
+
+  const sort = _test.openProjectTaskSortSubmenu(document, anchor, context, () => {});
+  assertPlacement(sort);
+  document.dispatchEvent({ type: "pointerdown", target: document.body });
+
+  const nativeMenu = document.createElement("div");
+  const settings = _test.openProjectSettingsSubmenu(document, nativeMenu, anchor, context);
+  assertPlacement(settings);
+  document.dispatchEvent({ type: "pointerdown", target: document.body });
+  assert.equal(document.listenerCount(), 0, "viewport probes leave no submenu listeners behind");
+});
+
 test("project menu interception snapshots native commands in order and replays their own handlers", () => {
   const document = new FakeDocument();
   document.defaultView = { innerHeight: 800, innerWidth: 400 };
@@ -204,12 +632,14 @@ test("current Codex project menu keeps native commands and gains a native-shaped
   assert.deepEqual(calls, [], "native commands are never replayed during injection");
 
   trigger.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  const settings = menu.querySelector('[data-tweaker-project-menu="settings-submenu"]');
+  const settings = document.body.querySelector('[data-tweaker-project-menu="settings-submenu"]');
+  assert.equal(settings.parentElement, document.body, "the fixed settings surface escapes native-menu clipping");
   assert.equal(settings.className, menu.className, "the submenu inherits the native menu surface styling");
   assert.ok(settings.querySelector('[data-tweaker-project-color-menu="trigger"]'));
   assert.ok(settings.querySelector('[data-tweaker-project-task-menu="sort"]'));
   settings.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  const sort = settings.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
+  const sort = document.body.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
+  assert.equal(sort.parentElement, document.body, "the fixed task-sort surface escapes settings-menu clipping");
   sort.children[1].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
   await Promise.resolve();
   assert.deepEqual(saves, [{ projectId: "p", choice: { taskSort: "created-desc" } }]);
@@ -262,8 +692,10 @@ test("owned project menu keeps Project color and Sort controls on its saved proj
 
   let overlay = _test.interceptNativeProjectMenu(document, menu, context, { saveAppearance });
   overlay.querySelector('[data-tweaker-project-color-menu="trigger"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  const blue = overlay.querySelector('[data-color-id="blue"]');
-  assert.ok(blue, "the color picker stays inside the owned portal");
+  let submenu = document.body.querySelector('[data-tweaker-project-color-menu="submenu"]');
+  assert.equal(submenu.parentElement, document.body, "the color picker escapes the owned menu's clipping boundary");
+  const blue = submenu.querySelector('[data-color-id="blue"]');
+  assert.ok(blue);
   blue.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
   await Promise.resolve();
   assert.deepEqual(saves, [{ projectId: "p", choice: { colorMode: "manual", color: "#1d4ed8" } }]);
@@ -271,8 +703,8 @@ test("owned project menu keeps Project color and Sort controls on its saved proj
 
   overlay = _test.interceptNativeProjectMenu(document, menu, context, { saveAppearance });
   overlay.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
-  const sort = overlay.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
-  assert.ok(sort, "the Sort picker stays inside the owned portal");
+  const sort = document.body.querySelector('[data-tweaker-project-task-menu="sort-submenu"]');
+  assert.equal(sort.parentElement, document.body, "the Sort picker escapes the owned menu's clipping boundary");
   sort.children[1].dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
   await Promise.resolve();
   assert.deepEqual(saves[1], { projectId: "p", choice: { taskSort: "created-desc" } });
@@ -317,7 +749,7 @@ test("owned project menu supports keyboard, outside pointer, stale portal, and t
   assert.equal(document.activeElement?.getAttribute("data-tweaker-project-native-command"), "1");
   document.dispatchEvent({ type: "keydown", key: "ArrowDown", target: overlay, preventDefault() {} });
   document.dispatchEvent({ type: "keydown", key: "ArrowRight", target: colorTrigger, preventDefault() {} });
-  assert.ok(overlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), "ArrowRight opens the submenu without invalid dispatchEvent input");
+  assert.equal(document.body.querySelector('[data-tweaker-project-color-menu="submenu"]')?.parentElement, document.body, "ArrowRight opens a body-portaled submenu without invalid dispatchEvent input");
   document.dispatchEvent({ type: "keydown", key: "Escape", target: overlay, preventDefault() {} });
   assert.equal(overlay.parentElement, null, "Escape closes the owned menu");
 
@@ -363,18 +795,20 @@ test("parent, stale, and replacement disposal close nested project menu submenus
   const colorMenu = makeNativeMenu();
   const colorOverlay = _test.interceptNativeProjectMenu(document, colorMenu, context);
   colorOverlay.querySelector('[data-tweaker-project-color-menu="trigger"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.equal(document.body.querySelector('[data-tweaker-project-color-menu="submenu"]')?.parentElement, document.body);
   assert.equal(document.listenerCount(), 4, "parent plus Color submenu listeners are registered");
   document.dispatchEvent({ type: "keydown", key: "Escape", target: colorOverlay, preventDefault() {} });
-  assert.equal(colorOverlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
+  assert.equal(document.body.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
   assert.equal(document.listenerCount(), 0, "parent close disposes Color submenu listeners");
 
   const sortMenu = makeNativeMenu();
   const sortOverlay = _test.interceptNativeProjectMenu(document, sortMenu, context);
   sortOverlay.querySelector('[data-tweaker-project-task-menu="sort"]').dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  assert.equal(document.body.querySelector('[data-tweaker-project-task-menu="sort-submenu"]')?.parentElement, document.body);
   assert.equal(document.listenerCount(), 4, "parent plus Sort submenu listeners are registered");
   sortMenu.setAttribute("data-state", "closed");
   observers.at(-1)();
-  assert.equal(sortOverlay.querySelector('[data-tweaker-project-task-menu="sort-submenu"]'), null);
+  assert.equal(document.body.querySelector('[data-tweaker-project-task-menu="sort-submenu"]'), null);
   assert.equal(document.listenerCount(), 0, "stale portal close disposes Sort submenu listeners");
 
   const replacedMenu = makeNativeMenu();
@@ -383,7 +817,7 @@ test("parent, stale, and replacement disposal close nested project menu submenus
   assert.equal(document.listenerCount(), 4);
   const nextMenu = makeNativeMenu();
   const nextOverlay = _test.interceptNativeProjectMenu(document, nextMenu, context);
-  assert.equal(replacedOverlay.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
+  assert.equal(document.body.querySelector('[data-tweaker-project-color-menu="submenu"]'), null);
   assert.equal(document.listenerCount(), 2, "replacement disposes the previous overlay and child listeners before installing itself");
   document.dispatchEvent({ type: "keydown", key: "Escape", target: nextOverlay, preventDefault() {} });
   assert.equal(document.listenerCount(), 0);
@@ -1471,6 +1905,10 @@ test("renderer owns bounded native project menu integration and reversible tint 
   assert.match(source, /document\.addEventListener\("click"/);
   assert.match(source, /new MutationObserver\(\(\) => inject\(pending, id\)\)/);
   assert.match(source, /window\.setTimeout\(\(\) => \{[\s\S]*?\}, 1500\)/);
+  assert.match(source, /Project menu bridge request dispatched/);
+  assert.match(source, /Project menu bridge request received/);
+  assert.match(source, /Project menu bridge acceptance submitted/);
+  assert.match(source, /Project menu bridge acceptance completed/);
   assert.doesNotMatch(source, /for \(const delay of \[0, 50, 150, 350\]\)/);
   assert.match(source, /PROJECT_COLOR_STYLE_ID/);
   assert.match(source, /data-tweaker-project-color-group/);

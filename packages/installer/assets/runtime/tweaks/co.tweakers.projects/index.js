@@ -1903,6 +1903,375 @@ module.exports = {
 };
 
 },
+  "/lib/native-project-menu.js": function (module, exports, require) {
+"use strict";
+
+// Codex currently sends project dropdowns through Electron's native Menu API.
+// This bridge recognizes only those project-shaped menus, pauses their popup,
+// and lets the Projects renderer draw the same commands with Codex's own menu
+// surface. Selecting a host command calls the original Electron MenuItem click
+// function, so Codex keeps ownership of edits, dialogs, Finder actions, and
+// destructive behavior.
+
+const REQUEST_CHANNEL = "native-project-menu.request";
+const ACTION_CHANNEL = "native-project-menu.action";
+const BRIDGE_MARKER = Symbol.for("co.tweakers.projects.nativeProjectMenuBridge");
+const DEFAULT_ACCEPT_TIMEOUT_MS = 350;
+const DEFAULT_OWNED_TIMEOUT_MS = 60 * 1000;
+const MAX_MENU_DEPTH = 4;
+const MAX_MENU_ITEMS = 48;
+const MAX_LABEL_LENGTH = 160;
+const MAX_ICON_DATA_URL_LENGTH = 256 * 1024;
+
+function normalizedMenuLabel(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_LENGTH) : "";
+}
+
+function projectMenuLabelSignature(items) {
+  const labels = (Array.isArray(items) ? items : [])
+    .filter((item) => item?.visible !== false && item?.type !== "separator")
+    .map((item) => normalizedMenuLabel(item?.label));
+  const hasRemoveProject = labels.some((label) => /^(?:remove|delete) (?:local )?project$/i.test(label));
+  const projectSignals = labels.filter((label) => /^(?:pin|unpin|edit(?: project)?|section|reveal in finder|create permanent worktree|archive chats)$/i.test(label));
+  const hasProjectSpecificSignal = labels.some((label) => /^(?:reveal in finder|create permanent worktree|archive chats)$/i.test(label));
+  return {
+    labels,
+    hasRemoveProject,
+    hasProjectSpecificSignal,
+    projectSignalCount: new Set(projectSignals.map((label) => label.toLowerCase())).size,
+  };
+}
+
+function isNativeProjectMenu(menu) {
+  const signature = projectMenuLabelSignature(menu?.items);
+  return signature.hasRemoveProject && signature.hasProjectSpecificSignal && signature.projectSignalCount >= 2;
+}
+
+function menuItemIconDataUrl(item) {
+  const icon = item?.icon;
+  let value = null;
+  try {
+    if (typeof icon === "string" && /^data:image\/(?:png|webp|svg\+xml);base64,/i.test(icon)) value = icon;
+    else if (icon && typeof icon.toDataURL === "function" && icon.isEmpty?.() !== true) value = icon.toDataURL();
+  } catch {
+    value = null;
+  }
+  return typeof value === "string" && value.length <= MAX_ICON_DATA_URL_LENGTH ? value : null;
+}
+
+function serializeNativeMenuItems(items, depth = 0, budget = { count: 0 }, prefix = "") {
+  if (!Array.isArray(items) || depth > MAX_MENU_DEPTH) return null;
+  const serialized = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (!item || item.visible === false) continue;
+    budget.count += 1;
+    if (budget.count > MAX_MENU_ITEMS) return null;
+    const path = prefix ? `${prefix}.${index}` : String(index);
+    if (item.type === "separator") {
+      serialized.push({ path, type: "separator" });
+      continue;
+    }
+    // Native role, toggle, header, and palette behavior is implemented by
+    // Electron itself. Do not replace a menu containing any of those item
+    // types because calling a raw click function would not reproduce native
+    // state transitions or first-responder actions.
+    if (item.role || ["checkbox", "radio", "header", "palette"].includes(item.type)) return null;
+    const label = normalizedMenuLabel(item.label);
+    if (!label) continue;
+    const submenuItems = Array.isArray(item.submenu?.items)
+      ? serializeNativeMenuItems(item.submenu.items, depth + 1, budget, path)
+      : null;
+    if (Array.isArray(item.submenu?.items) && submenuItems === null) return null;
+    const hasSubmenu = Array.isArray(item.submenu?.items);
+    if (hasSubmenu && !submenuItems?.length) return null;
+    if (!hasSubmenu && typeof item.click !== "function") return null;
+    const type = hasSubmenu ? "submenu" : "normal";
+    serialized.push({
+      path,
+      type,
+      label,
+      sublabel: normalizedMenuLabel(item.sublabel) || null,
+      accelerator: normalizedMenuLabel(item.accelerator) || null,
+      toolTip: normalizedMenuLabel(item.toolTip) || null,
+      enabled: item.enabled !== false,
+      iconDataUrl: menuItemIconDataUrl(item),
+      submenu: submenuItems?.length ? submenuItems : null,
+    });
+  }
+  return serialized;
+}
+
+function sanitizedSerializedMenuItems(items, depth = 0, budget = { count: 0 }) {
+  if (!Array.isArray(items) || depth > MAX_MENU_DEPTH) return null;
+  const result = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") return null;
+    budget.count += 1;
+    if (budget.count > MAX_MENU_ITEMS) return null;
+    const path = typeof item.path === "string" && /^\d+(?:\.\d+){0,4}$/.test(item.path) ? item.path : null;
+    if (!path) return null;
+    if (item.type === "separator") {
+      result.push({ path, type: "separator" });
+      continue;
+    }
+    const label = normalizedMenuLabel(item.label);
+    if (!label) return null;
+    const submenu = item.submenu === null || item.submenu === undefined
+      ? null
+      : sanitizedSerializedMenuItems(item.submenu, depth + 1, budget);
+    if (item.submenu && submenu === null) return null;
+    if (!["normal", "submenu"].includes(item.type)) return null;
+    const type = item.type;
+    const iconDataUrl = typeof item.iconDataUrl === "string"
+      && item.iconDataUrl.length <= MAX_ICON_DATA_URL_LENGTH
+      && /^data:image\/(?:png|webp|svg\+xml);base64,/i.test(item.iconDataUrl)
+      ? item.iconDataUrl
+      : null;
+    result.push({
+      path,
+      type,
+      label,
+      sublabel: normalizedMenuLabel(item.sublabel) || null,
+      accelerator: normalizedMenuLabel(item.accelerator) || null,
+      toolTip: normalizedMenuLabel(item.toolTip) || null,
+      enabled: item.enabled !== false,
+      iconDataUrl,
+      submenu: submenu?.length ? submenu : null,
+    });
+  }
+  return result;
+}
+
+function validateNativeProjectMenuRequest(payload) {
+  if (!payload || typeof payload !== "object" || payload.schemaVersion !== 1) return null;
+  const requestId = typeof payload.requestId === "string" && /^[a-f0-9-]{16,80}$/i.test(payload.requestId)
+    ? payload.requestId
+    : null;
+  if (!requestId) return null;
+  const items = sanitizedSerializedMenuItems(payload.items);
+  if (!items?.length) return null;
+  const signature = projectMenuLabelSignature(items);
+  if (!signature.hasRemoveProject || !signature.hasProjectSpecificSignal || signature.projectSignalCount < 2) return null;
+  return { schemaVersion: 1, requestId, items };
+}
+
+function nativeMenuItemAtPath(menu, path) {
+  if (!menu || typeof path !== "string" || !/^\d+(?:\.\d+){0,4}$/.test(path)) return null;
+  const indexes = path.split(".").map((value) => Number(value));
+  let currentMenu = menu;
+  let item = null;
+  for (let depth = 0; depth < indexes.length; depth += 1) {
+    const items = currentMenu?.items;
+    const index = indexes[depth];
+    if (!Array.isArray(items) || !Number.isSafeInteger(index) || index < 0 || index >= items.length) return null;
+    item = items[index];
+    if (depth < indexes.length - 1) currentMenu = item?.submenu;
+  }
+  return item || null;
+}
+
+function installNativeProjectMenuBridge(api, dependencies = {}) {
+  const electron = dependencies.electron || require("electron");
+  const Menu = electron?.Menu;
+  const popupPrototype = Menu?.prototype;
+  const originalPopup = popupPrototype?.popup;
+  const timeoutMs = Number.isFinite(dependencies.acceptTimeoutMs)
+    ? Math.max(25, dependencies.acceptTimeoutMs)
+    : DEFAULT_ACCEPT_TIMEOUT_MS;
+  const ownedTimeoutMs = Number.isFinite(dependencies.ownedTimeoutMs)
+    ? Math.max(250, dependencies.ownedTimeoutMs)
+    : DEFAULT_OWNED_TIMEOUT_MS;
+  const setTimer = dependencies.setTimeout || setTimeout;
+  const clearTimer = dependencies.clearTimeout || clearTimeout;
+  const randomUUID = dependencies.randomUUID || (() => require("node:crypto").randomUUID());
+  const now = dependencies.now || Date.now;
+  if (!popupPrototype || typeof originalPopup !== "function"
+    || typeof api?.ipc?.handleWithContext !== "function"
+    || typeof api?.ipc?.sendToRenderer !== "function") {
+    api?.log?.warn?.("Native project menu bridge unavailable; preserving Codex native menus");
+    return { dispose() {}, active: false };
+  }
+
+  const pending = new Map();
+  let disposed = false;
+
+  const settle = (entry) => {
+    if (!entry || entry.settled) return false;
+    entry.settled = true;
+    if (entry.timer !== null) clearTimer(entry.timer);
+    entry.timer = null;
+    pending.delete(entry.requestId);
+    return true;
+  };
+
+  const completeDismiss = (entry) => {
+    if (!settle(entry)) return false;
+    try { entry.options?.callback?.(); } catch (error) { api.log?.warn?.("Project menu dismiss callback failed", String(error)); }
+    return true;
+  };
+
+  const fallback = (entry, reason) => {
+    if (!settle(entry)) return false;
+    api.log?.debug?.("Project menu bridge fell back to native popup", {
+      requestId: entry.requestId,
+      rendererId: entry.rendererId,
+      elapsedMs: Math.max(0, now() - entry.createdAt),
+      reason,
+    });
+    try {
+      Reflect.apply(originalPopup, entry.menu, entry.args);
+    } catch (error) {
+      api.log?.warn?.("Native project menu fallback failed", String(error));
+      try { entry.options?.callback?.(); } catch {}
+    }
+    return true;
+  };
+
+  const unregisterAction = api.ipc.handleWithContext(ACTION_CHANNEL, (context, message) => {
+    const requestId = typeof message?.requestId === "string" ? message.requestId : "";
+    const entry = pending.get(requestId);
+    const senderRendererId = Number.isSafeInteger(context?.sender?.webContentsId)
+      ? context.sender.webContentsId
+      : null;
+    api.log?.debug?.("Project menu bridge action received", {
+      requestId: /^[a-f0-9-]{16,80}$/i.test(requestId) ? requestId : null,
+      action: ["accept", "reject", "dismiss", "select"].includes(message?.action) ? message.action : "invalid",
+      senderRendererId,
+      expectedRendererId: entry?.rendererId || null,
+      rendererMatches: Boolean(entry && entry.rendererId === senderRendererId),
+      state: entry?.state || "missing",
+      elapsedMs: entry ? Math.max(0, now() - entry.createdAt) : null,
+    });
+    if (!entry || entry.rendererId !== context?.sender?.webContentsId) return { ok: false, error: "unknown-request" };
+    if (message?.action === "accept") {
+      if (entry.state !== "waiting") return { ok: false, error: "already-owned" };
+      entry.state = "owned";
+      if (entry.timer !== null) clearTimer(entry.timer);
+      entry.timer = setTimer(() => completeDismiss(entry), ownedTimeoutMs);
+      api.log?.info?.("Project menu routed to Codex-styled renderer surface", {
+        requestId,
+        rendererId: entry.rendererId,
+        elapsedMs: Math.max(0, now() - entry.createdAt),
+      });
+      return { ok: true };
+    }
+    if (message?.action === "reject") {
+      if (entry.state !== "waiting") return { ok: false, error: "already-owned" };
+      fallback(entry, "renderer-rejected");
+      return { ok: true, fallback: true };
+    }
+    if (message?.action === "dismiss") {
+      if (entry.state !== "owned") return { ok: false, error: "not-owned" };
+      completeDismiss(entry);
+      return { ok: true };
+    }
+    if (message?.action === "select") {
+      if (entry.state !== "owned") return { ok: false, error: "not-owned" };
+      const item = nativeMenuItemAtPath(entry.menu, message.path);
+      if (!item || item.visible === false || item.enabled === false || item.submenu || typeof item.click !== "function") {
+        completeDismiss(entry);
+        return { ok: false, error: "invalid-command" };
+      }
+      settle(entry);
+      try {
+        // Electron documents MenuItem.click as (event, focusedWindow,
+        // focusedWebContents). The original Codex callback then resolves the
+        // bridge promise with this item's untouched host ID.
+        item.click(undefined, entry.options?.window, entry.options?.window?.webContents);
+        try { entry.options?.callback?.(); } catch {}
+        return { ok: true };
+      } catch (error) {
+        api.log?.warn?.("Original Codex project command failed", String(error));
+        try { entry.options?.callback?.(); } catch {}
+        return { ok: false, error: "command-failed" };
+      }
+    }
+    return { ok: false, error: "invalid-action" };
+  });
+
+  const wrappedPopup = function projectsNativeMenuPopup(...args) {
+    if (disposed || !isNativeProjectMenu(this)) return Reflect.apply(originalPopup, this, args);
+    const options = args[0] && typeof args[0] === "object" ? args[0] : {};
+    const rendererId = options.window?.webContents?.id;
+    if (!Number.isSafeInteger(rendererId) || rendererId <= 0) return Reflect.apply(originalPopup, this, args);
+    const items = serializeNativeMenuItems(this.items);
+    if (!items?.length) return Reflect.apply(originalPopup, this, args);
+    const requestId = randomUUID();
+    const entry = {
+      requestId,
+      rendererId,
+      menu: this,
+      args,
+      options,
+      state: "waiting",
+      settled: false,
+      timer: null,
+      createdAt: now(),
+    };
+    pending.set(requestId, entry);
+    entry.timer = setTimer(() => fallback(entry, "renderer-timeout"), timeoutMs);
+    const sent = api.ipc.sendToRenderer(rendererId, REQUEST_CHANNEL, {
+      schemaVersion: 1,
+      requestId,
+      items,
+    });
+    api.log?.info?.("Project menu bridge request dispatched", {
+      requestId,
+      rendererId,
+      itemCount: items.length,
+      timeoutMs,
+      delivered: Boolean(sent),
+    });
+    if (!sent) {
+      fallback(entry, "renderer-unavailable");
+      return undefined;
+    }
+    return undefined;
+  };
+  wrappedPopup[BRIDGE_MARKER] = true;
+  try {
+    popupPrototype.popup = wrappedPopup;
+  } catch (error) {
+    try { unregisterAction?.(); } catch {}
+    api.log?.warn?.("Native project menu popup hook could not be installed", String(error));
+    return { dispose() {}, active: false };
+  }
+  if (popupPrototype.popup !== wrappedPopup) {
+    try { unregisterAction?.(); } catch {}
+    api.log?.warn?.("Native project menu popup hook was rejected; preserving Codex native menus");
+    return { dispose() {}, active: false };
+  }
+
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (popupPrototype.popup === wrappedPopup) popupPrototype.popup = originalPopup;
+    for (const entry of [...pending.values()]) {
+      if (entry.state === "waiting") fallback(entry, "bridge-disposed");
+      else completeDismiss(entry);
+    }
+    try { unregisterAction?.(); } catch {}
+  };
+
+  api.log?.info?.("Native project menu bridge ready");
+  return { dispose, active: true, pendingCount: () => pending.size };
+}
+
+module.exports = {
+  REQUEST_CHANNEL,
+  ACTION_CHANNEL,
+  normalizedMenuLabel,
+  projectMenuLabelSignature,
+  isNativeProjectMenu,
+  serializeNativeMenuItems,
+  sanitizedSerializedMenuItems,
+  validateNativeProjectMenuRequest,
+  nativeMenuItemAtPath,
+  installNativeProjectMenuBridge,
+};
+
+},
   "/lib/sidebar.js": function (module, exports, require) {
 "use strict";
 
@@ -1916,6 +2285,7 @@ const {
   projectForNativeIdentity,
   projectNativeNames,
 } = require("./state");
+const nativeProjectMenu = require("./native-project-menu");
 
 const PROJECT_COLOR_MENU_ATTR = "data-tweaker-project-color-menu";
 const PROJECT_COLOR_STYLE_ID = "tweaker-project-colors";
@@ -1924,7 +2294,13 @@ const PROJECT_TASK_MENU_ATTR = "data-tweaker-project-task-menu";
 const PROJECT_TASK_DISPOSE = Symbol("projectTaskDispose");
 const PROJECT_MENU_ATTR = "data-tweaker-project-menu";
 const PROJECT_MENU_DISPOSE = Symbol("projectMenuDispose");
+const PROJECT_MENU_OPEN_SUBMENU = Symbol("projectMenuOpenSubmenu");
+const PROJECT_HOST_MENU_ATTR = "data-tweaker-project-host-menu";
+const PROJECT_HOST_MENU_DISPOSE = Symbol("projectHostMenuDispose");
 const PROJECT_NATIVE_MENU_ATTR = "data-tweaker-project-native-menu";
+const CODEX_MENU_SURFACE_CLASS = "fixed z-50 m-px flex min-w-[200px] max-h-[70vh] flex-col overflow-y-auto rounded-2xl bg-surface-elevated-secondary/90 p-[var(--menu-gutter,var(--spacing))] text-default shadow-lg ring-[0.5px] ring-border backdrop-blur-sm select-none";
+const CODEX_MENU_ITEM_CLASS = "outline-hidden flex min-h-8 w-full items-center gap-2 rounded-xl px-2 py-1.5 text-left text-sm text-default cursor-interaction hover:bg-primary-ghost-hover focus:bg-primary-ghost-hover disabled:pointer-events-none disabled:opacity-50";
+const CODEX_MENU_SEPARATOR_CLASS = "mx-1 my-1 h-px bg-border";
 const NATIVE_TASK_PLACEMENTS = new Map();
 const MAX_PROJECT_ROW_END_INSET = 64;
 const TASK_SORT_LABELS = {
@@ -2028,27 +2404,28 @@ function ownedProjectMenuSubmenuContains(doc, target) {
   return [
     ...(doc?.querySelectorAll?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`) || []),
     ...(doc?.querySelectorAll?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`) || []),
+    ...(doc?.querySelectorAll?.(`[${PROJECT_HOST_MENU_ATTR}="submenu"]`) || []),
   ].some((submenu) => submenu.contains?.(target));
 }
 
 function disposeOwnedProjectMenuSubmenus(overlay) {
+  const scope = overlay?.ownerDocument || overlay;
   const submenus = [
-    ...(overlay?.querySelectorAll?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`) || []),
-    ...(overlay?.querySelectorAll?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`) || []),
+    ...(scope?.querySelectorAll?.(`[${PROJECT_COLOR_MENU_ATTR}="submenu"]`) || []),
+    ...(scope?.querySelectorAll?.(`[${PROJECT_TASK_MENU_ATTR}="sort-submenu"]`) || []),
+    ...(scope?.querySelectorAll?.(`[${PROJECT_HOST_MENU_ATTR}="submenu"]`) || []),
   ];
   for (const submenu of submenus) {
     if (typeof submenu[PROJECT_COLOR_DISPOSE] === "function") submenu[PROJECT_COLOR_DISPOSE]();
     else if (typeof submenu[PROJECT_TASK_DISPOSE] === "function") submenu[PROJECT_TASK_DISPOSE]();
+    else if (typeof submenu[PROJECT_HOST_MENU_DISPOSE] === "function") submenu[PROJECT_HOST_MENU_DISPOSE]();
     else submenu.remove?.();
   }
 }
 
-function projectMenuSubmenuHost(doc, anchor) {
-  let cursor = anchor;
-  while (cursor) {
-    if (["overlay", "settings-submenu"].includes(cursor.getAttribute?.(PROJECT_MENU_ATTR))) return cursor;
-    cursor = cursor.parentElement;
-  }
+function projectMenuSubmenuHost(doc) {
+  // Fixed popups must escape the parent menu's backdrop-filter containing block
+  // and overflow clipping while retaining viewport-relative placement.
   return doc?.body || null;
 }
 
@@ -2058,7 +2435,7 @@ function ownedProjectMenuItem(doc, label, template, onSelect, options = {}) {
   item.setAttribute("role", options.role || "menuitem");
   item.setAttribute("tabindex", "-1");
   if (options.ariaChecked !== null && options.ariaChecked !== undefined) item.setAttribute("aria-checked", options.ariaChecked);
-  item.className = template?.className || "text-token-text-primary hover:bg-token-foreground/10 flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm cursor-interaction";
+  item.className = template?.className || CODEX_MENU_ITEM_CLASS;
   if (options.disabled) {
     item.disabled = true;
     item.setAttribute("disabled", "");
@@ -2069,11 +2446,24 @@ function ownedProjectMenuItem(doc, label, template, onSelect, options = {}) {
     icon.setAttribute?.("aria-hidden", "true");
     icon.classList?.add?.("size-4", "shrink-0");
     item.appendChild(icon);
+  } else if (options.iconDataUrl) {
+    const image = doc.createElement("img");
+    image.setAttribute("aria-hidden", "true");
+    image.setAttribute("src", options.iconDataUrl);
+    image.className = "size-4 shrink-0";
+    item.appendChild(image);
   }
   const text = doc.createElement("span");
   text.textContent = label;
   text.className = "min-w-0 flex-1 truncate";
   item.appendChild(text);
+  if (options.accelerator) {
+    const accelerator = doc.createElement("span");
+    accelerator.textContent = options.accelerator;
+    accelerator.className = "text-secondary ml-auto shrink-0 text-xs";
+    item.appendChild(accelerator);
+  }
+  if (options.toolTip || options.sublabel) item.setAttribute("title", options.toolTip || options.sublabel);
   if (options.submenu) {
     const chevron = doc.createElement("span");
     chevron.textContent = "›";
@@ -2109,6 +2499,239 @@ function projectMenuOverlayPlacement(rect, view) {
   return { top, maxHeight };
 }
 
+function ownedMenuSeparator(doc) {
+  const divider = doc.createElement("div");
+  divider.setAttribute("role", "separator");
+  divider.className = CODEX_MENU_SEPARATOR_CLASS;
+  return divider;
+}
+
+function placeOwnedMenuSurface(surface, point, view, options = {}) {
+  const viewportWidth = Number(view?.innerWidth) || 1200;
+  const viewportHeight = Number(view?.innerHeight) || 800;
+  const margin = 8;
+  const maxHeight = Math.max(96, Math.min(Math.floor(viewportHeight * 0.7), viewportHeight - (margin * 2)));
+  let left = Math.max(margin, Number(point?.x) || margin);
+  let top = Math.max(margin, Number(point?.y) || margin);
+  surface.style?.setProperty?.("left", `${left}px`);
+  surface.style?.setProperty?.("top", `${top}px`);
+  surface.style?.setProperty?.("max-height", `${maxHeight}px`);
+  surface.style?.setProperty?.("overflow-y", "auto");
+  surface.style?.setProperty?.("overscroll-behavior", "contain");
+  const rect = surface.getBoundingClientRect?.();
+  const width = Math.max(0, Number(rect?.width) || 0);
+  const height = Math.max(0, Number(rect?.height) || 0);
+  if (left + width > viewportWidth - margin) {
+    left = options.preferLeft
+      ? Math.max(margin, (Number(options.anchorLeft) || left) - width)
+      : Math.max(margin, viewportWidth - width - margin);
+  }
+  if (top + height > viewportHeight - margin) top = Math.max(margin, viewportHeight - height - margin);
+  surface.style?.setProperty?.("left", `${left}px`);
+  surface.style?.setProperty?.("top", `${top}px`);
+}
+
+function installOwnedMenuKeyboardNavigation(doc, interactive, options = {}) {
+  let activeIndex = -1;
+  const enabledIndexes = () => interactive
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !item.disabled && item.getAttribute?.("aria-disabled") !== "true")
+    .map(({ index }) => index);
+  const focusAt = (position) => {
+    const enabled = enabledIndexes();
+    if (!enabled.length) return;
+    const enabledPosition = ((position % enabled.length) + enabled.length) % enabled.length;
+    activeIndex = enabled[enabledPosition];
+    interactive.forEach((item, index) => item.setAttribute("tabindex", index === activeIndex ? "0" : "-1"));
+    interactive[activeIndex]?.focus?.();
+  };
+  const focusRelative = (delta) => {
+    const enabled = enabledIndexes();
+    const current = Math.max(0, enabled.indexOf(activeIndex));
+    focusAt(current + delta);
+  };
+  const onKeydown = (event) => {
+    if (options.contains && !options.contains(event.target)) return;
+    if (event.key === "ArrowDown") { event.preventDefault?.(); focusRelative(1); return; }
+    if (event.key === "ArrowUp") { event.preventDefault?.(); focusRelative(-1); return; }
+    if (event.key === "Home") { event.preventDefault?.(); focusAt(0); return; }
+    if (event.key === "End") { event.preventDefault?.(); focusAt(-1); return; }
+    if (event.key === "ArrowRight" && typeof interactive[activeIndex]?.[PROJECT_MENU_OPEN_SUBMENU] === "function") {
+      event.preventDefault?.();
+      interactive[activeIndex][PROJECT_MENU_OPEN_SUBMENU]();
+      return;
+    }
+    if (event.key === "ArrowLeft" && options.onArrowLeft) {
+      event.preventDefault?.();
+      options.onArrowLeft();
+      return;
+    }
+    if (event.key === "Escape" && options.onEscape) {
+      event.preventDefault?.();
+      options.onEscape();
+    }
+  };
+  doc.addEventListener?.("keydown", onKeydown, true);
+  focusAt(0);
+  return () => doc.removeEventListener?.("keydown", onKeydown, true);
+}
+
+function appendBridgedNativeMenuItems(doc, surface, items, handlers, interactive) {
+  for (const command of items || []) {
+    if (command.type === "separator") {
+      surface.appendChild(ownedMenuSeparator(doc));
+      continue;
+    }
+    const hasSubmenu = Array.isArray(command.submenu) && command.submenu.length > 0;
+    let item = null;
+    const openSubmenu = () => {
+      if (!hasSubmenu || !item) return;
+      openBridgedHostSubmenu(doc, item, command.submenu, handlers);
+    };
+    item = ownedProjectMenuItem(doc, command.label, null, () => {
+      if (hasSubmenu) {
+        openSubmenu();
+        return;
+      }
+      handlers.select?.(command.path);
+    }, {
+      role: "menuitem",
+      disabled: command.enabled === false,
+      iconDataUrl: command.iconDataUrl,
+      accelerator: command.accelerator,
+      sublabel: command.sublabel,
+      toolTip: command.toolTip,
+      submenu: hasSubmenu,
+    });
+    item.setAttribute("data-tweaker-project-native-command", command.path);
+    if (hasSubmenu) {
+      item.setAttribute("aria-haspopup", "menu");
+      item[PROJECT_MENU_OPEN_SUBMENU] = openSubmenu;
+    }
+    interactive.push(item);
+    surface.appendChild(item);
+  }
+}
+
+function openBridgedHostSubmenu(doc, anchor, commands, handlers) {
+  const host = projectMenuSubmenuHost(doc, anchor);
+  const previous = firstDocumentMatch(doc, `[${PROJECT_HOST_MENU_ATTR}="submenu"]`);
+  if (typeof previous?.[PROJECT_HOST_MENU_DISPOSE] === "function") previous[PROJECT_HOST_MENU_DISPOSE]();
+  else previous?.remove?.();
+  const submenu = doc.createElement("div");
+  submenu.setAttribute("role", "menu");
+  submenu.setAttribute(PROJECT_HOST_MENU_ATTR, "submenu");
+  submenu.className = CODEX_MENU_SURFACE_CLASS;
+  const interactive = [];
+  appendBridgedNativeMenuItems(doc, submenu, commands, handlers, interactive);
+  let disposed = false;
+  let removeKeyboard = null;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    removeKeyboard?.();
+    submenu[PROJECT_HOST_MENU_DISPOSE] = null;
+    submenu.remove?.();
+    anchor?.focus?.();
+  };
+  submenu[PROJECT_HOST_MENU_DISPOSE] = dispose;
+  host?.appendChild(submenu);
+  const rect = anchor?.getBoundingClientRect?.();
+  placeOwnedMenuSurface(submenu, { x: Number(rect?.right) || 8, y: Number(rect?.top) || 8 }, doc.defaultView, {
+    preferLeft: true,
+    anchorLeft: Number(rect?.left) || 8,
+  });
+  removeKeyboard = installOwnedMenuKeyboardNavigation(doc, interactive, {
+    contains: (target) => submenu.contains?.(target),
+    onArrowLeft: dispose,
+    onEscape: dispose,
+  });
+  return submenu;
+}
+
+function openBridgedProjectMenu(doc, request, context, handlers = {}) {
+  if (!doc?.createElement || !request?.items?.length || !context?.project?.id) return null;
+  const previous = firstDocumentMatch(doc, `[${PROJECT_MENU_ATTR}="overlay"]`);
+  if (typeof previous?.[PROJECT_MENU_DISPOSE] === "function") previous[PROJECT_MENU_DISPOSE]();
+  else previous?.remove?.();
+
+  const overlay = doc.createElement("div");
+  overlay.setAttribute("role", "menu");
+  overlay.setAttribute("tabindex", "-1");
+  overlay.setAttribute(PROJECT_MENU_ATTR, "overlay");
+  overlay.setAttribute("data-tweaker-project-menu-source", "electron");
+  overlay.className = CODEX_MENU_SURFACE_CLASS;
+  const interactive = [];
+  let closed = false;
+  let removeKeyboard = null;
+  const close = (reason = "dismiss") => {
+    if (closed) return;
+    closed = true;
+    doc.removeEventListener?.("pointerdown", onOutside, true);
+    removeKeyboard?.();
+    disposeOwnedProjectMenuSubmenus(overlay);
+    overlay[PROJECT_MENU_DISPOSE] = null;
+    overlay.remove?.();
+    if (reason === "dismiss") Promise.resolve(handlers.dismiss?.()).catch(() => {});
+  };
+  const selectHostCommand = (path) => {
+    close("host-command");
+    Promise.resolve(handlers.select?.(path)).catch(() => {});
+  };
+  const hostHandlers = {
+    ...handlers,
+    select: selectHostCommand,
+  };
+  const finalHostGroupIndex = request.items.findIndex((item) => /^(?:archive chats|remove project|remove local project|delete project)$/i.test(item?.label || ""));
+  let insertionIndex = finalHostGroupIndex < 0 ? request.items.length : finalHostGroupIndex;
+  if (insertionIndex > 0 && request.items[insertionIndex - 1]?.type === "separator") insertionIndex -= 1;
+  const leadingHostItems = request.items.slice(0, insertionIndex);
+  const trailingHostItems = request.items.slice(insertionIndex);
+  appendBridgedNativeMenuItems(doc, overlay, leadingHostItems, hostHandlers, interactive);
+  if (leadingHostItems.length && leadingHostItems.at(-1)?.type !== "separator") overlay.appendChild(ownedMenuSeparator(doc));
+  const openColor = () => openProjectColorSubmenu(doc, colorTrigger, context, (choice) => {
+    close("custom-command");
+    Promise.resolve(handlers.dismiss?.()).catch(() => {});
+    Promise.resolve(handlers.saveAppearance?.(context.project.id, choice)).catch(() => {});
+  });
+  const openSort = () => openProjectTaskSortSubmenu(doc, sortTrigger, context, (taskSort) => {
+    close("custom-command");
+    Promise.resolve(handlers.dismiss?.()).catch(() => {});
+    Promise.resolve(handlers.saveAppearance?.(context.project.id, { taskSort })).catch(() => {});
+  });
+  const colorIcon = doc.createElement("span");
+  colorIcon.className = "size-4 shrink-0 rounded-full ring-[0.5px] ring-border";
+  colorIcon.style?.setProperty?.("background-color", context.project.color);
+  const colorTrigger = ownedProjectMenuItem(doc, "Project color", null, openColor, { icon: colorIcon, submenu: true });
+  colorTrigger.setAttribute(PROJECT_COLOR_MENU_ATTR, "trigger");
+  colorTrigger.setAttribute("aria-haspopup", "menu");
+  colorTrigger[PROJECT_MENU_OPEN_SUBMENU] = openColor;
+  interactive.push(colorTrigger);
+  overlay.appendChild(colorTrigger);
+  const sortTrigger = ownedProjectMenuItem(doc, "Task sorting", null, openSort, { submenu: true });
+  sortTrigger.setAttribute(PROJECT_TASK_MENU_ATTR, "sort");
+  sortTrigger.setAttribute("aria-haspopup", "menu");
+  sortTrigger[PROJECT_MENU_OPEN_SUBMENU] = openSort;
+  interactive.push(sortTrigger);
+  overlay.appendChild(sortTrigger);
+  if (trailingHostItems.length && trailingHostItems[0]?.type !== "separator") overlay.appendChild(ownedMenuSeparator(doc));
+  appendBridgedNativeMenuItems(doc, overlay, trailingHostItems, hostHandlers, interactive);
+
+  const onOutside = (event) => {
+    if (overlay.contains?.(event.target) || ownedProjectMenuSubmenuContains(doc, event.target)) return;
+    close();
+  };
+  overlay[PROJECT_MENU_DISPOSE] = close;
+  doc.body?.appendChild(overlay);
+  placeOwnedMenuSurface(overlay, { x: context.x, y: context.y }, doc.defaultView);
+  doc.addEventListener?.("pointerdown", onOutside, true);
+  removeKeyboard = installOwnedMenuKeyboardNavigation(doc, interactive, {
+    contains: (target) => overlay.contains?.(target) && !ownedProjectMenuSubmenuContains(doc, target),
+    onEscape: () => close(),
+  });
+  return overlay;
+}
+
 function firstDocumentMatch(doc, selector) {
   return doc?.querySelector?.(selector) || doc?.querySelectorAll?.(selector)?.[0] || null;
 }
@@ -2127,8 +2750,7 @@ function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
   overlay.setAttribute("role", "menu");
   overlay.setAttribute("tabindex", "-1");
   overlay.setAttribute(PROJECT_MENU_ATTR, "overlay");
-  overlay.className = "fixed z-[10000] flex min-w-[220px] max-h-[70vh] flex-col overflow-y-auto rounded-xl border border-token-border p-1 shadow-lg";
-  overlay.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
+  overlay.className = CODEX_MENU_SURFACE_CLASS;
   const placement = projectMenuOverlayPlacement(rect, doc.defaultView);
   overlay.style?.setProperty?.("left", `${Math.max(8, Number(rect.left) || 8)}px`);
   overlay.style?.setProperty?.("top", `${placement.top}px`);
@@ -2149,10 +2771,7 @@ function interceptNativeProjectMenu(doc, nativeMenu, context, handlers = {}) {
     item.setAttribute("data-tweaker-project-native-command", String(command.order));
     add(item);
   }
-  const divider = doc.createElement("div");
-  divider.setAttribute("role", "separator");
-  divider.className = "my-1 h-px bg-token-border";
-  overlay.appendChild(divider);
+  overlay.appendChild(ownedMenuSeparator(doc));
   const openColor = () => openProjectColorSubmenu(doc, colorTrigger, context, async (choice) => {
     await handlers.saveAppearance?.(context.project.id, choice);
     close();
@@ -2289,14 +2908,8 @@ function openProjectSettingsSubmenu(doc, nativeMenu, anchor, context, handlers =
   submenu.setAttribute("role", "menu");
   submenu.setAttribute(PROJECT_MENU_ATTR, "settings-submenu");
   submenu.setAttribute("data-state", "open");
-  submenu.className = nativeMenu.className || "fixed z-[10000] flex min-w-[220px] flex-col rounded-xl border border-token-border p-1 shadow-lg";
-  submenu.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
-  const rect = anchor?.getBoundingClientRect?.();
-  const viewportWidth = Number(doc.defaultView?.innerWidth) || 1200;
-  const right = Number(rect?.right) || 8;
+  submenu.className = nativeMenu.className || CODEX_MENU_SURFACE_CLASS;
   submenu.style?.setProperty?.("position", "fixed");
-  submenu.style?.setProperty?.("left", `${right + 220 <= viewportWidth - 8 ? right : Math.max(8, (Number(rect?.left) || right) - 220)}px`);
-  submenu.style?.setProperty?.("top", `${Math.max(8, Number(rect?.top) || 8)}px`);
 
   let disposed = false;
   const dispose = () => {
@@ -2335,7 +2948,12 @@ function openProjectSettingsSubmenu(doc, nativeMenu, anchor, context, handlers =
     if (event.key === "ArrowRight" && event.target === sortTrigger) openSort();
   };
   submenu[PROJECT_MENU_DISPOSE] = dispose;
-  nativeMenu.appendChild(submenu);
+  projectMenuSubmenuHost(doc)?.appendChild(submenu);
+  const rect = anchor?.getBoundingClientRect?.();
+  placeOwnedMenuSurface(submenu, { x: Number(rect?.right) || 8, y: Number(rect?.top) || 8 }, doc.defaultView, {
+    preferLeft: true,
+    anchorLeft: Number(rect?.left) || 8,
+  });
   anchor?.setAttribute?.("data-state", "open");
   doc.addEventListener?.("pointerdown", onOutside, true);
   doc.addEventListener?.("keydown", onKeydown, true);
@@ -2351,21 +2969,8 @@ function openProjectColorSubmenu(doc, anchor, context, onSelect) {
   const submenu = doc.createElement("div");
   submenu.setAttribute("role", "menu");
   submenu.setAttribute(PROJECT_COLOR_MENU_ATTR, "submenu");
-  submenu.className = "fixed z-[10000] flex max-h-[70vh] min-w-[220px] flex-col overflow-y-auto rounded-xl border border-token-border p-1 shadow-lg";
-  submenu.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
-  const rect = anchor?.getBoundingClientRect?.();
+  submenu.className = CODEX_MENU_SURFACE_CLASS;
   if (submenu.style?.setProperty) {
-    const viewportHeight = Number(doc.defaultView?.innerHeight) || 800;
-    const viewportWidth = Number(doc.defaultView?.innerWidth) || 1200;
-    const maxHeight = Math.min(Math.max(160, Math.floor(viewportHeight * 0.7)), Math.max(96, viewportHeight - 16));
-    const top = Math.max(8, Math.min(Number(rect?.top) || 8, viewportHeight - maxHeight - 8));
-    const right = Number(rect?.right) || 8;
-    const left = right + 220 <= viewportWidth - 8 ? right : Math.max(8, (Number(rect?.left) || right) - 220);
-    submenu.style.setProperty("left", `${left}px`);
-    submenu.style.setProperty("top", `${top}px`);
-    submenu.style.setProperty("max-height", `${maxHeight}px`);
-    submenu.style.setProperty("overflow-y", "auto");
-    submenu.style.setProperty("overscroll-behavior", "contain");
     submenu.style.setProperty("scrollbar-gutter", "stable");
   }
   const title = doc.createElement("div");
@@ -2381,7 +2986,7 @@ function openProjectColorSubmenu(doc, anchor, context, onSelect) {
     item.setAttribute("data-color-id", option.id);
     item.setAttribute("aria-checked", String(option.id === "auto" ? project.colorMode === "auto" : project.colorMode !== "auto" && project.color === option.value));
     if (item.getAttribute("aria-checked") === "true") checkedItem = item;
-    item.className = "flex min-h-8 items-center gap-2 rounded-md px-2 text-left text-sm text-token-text-primary hover:bg-token-foreground/10";
+    item.className = CODEX_MENU_ITEM_CLASS;
     const swatch = doc.createElement("span");
     swatch.className = "size-3 shrink-0 rounded-full border border-token-border";
     swatch.style?.setProperty?.("background-color", option.value);
@@ -2410,7 +3015,7 @@ function openProjectColorSubmenu(doc, anchor, context, onSelect) {
     item.setAttribute("data-overlay-id", intensity);
     item.setAttribute("aria-checked", String(project.overlayIntensity === intensity));
     item.textContent = titleCase(intensity);
-    item.className = "flex min-h-8 items-center rounded-md px-2 text-left text-sm text-token-text-primary hover:bg-token-foreground/10";
+    item.className = CODEX_MENU_ITEM_CLASS;
     item.addEventListener("click", (event) => {
       event?.preventDefault?.();
       event?.stopPropagation?.();
@@ -2434,7 +3039,12 @@ function openProjectColorSubmenu(doc, anchor, context, onSelect) {
   };
   const onKeydown = (event) => { if (event.key === "Escape") close(); };
   submenu[PROJECT_COLOR_DISPOSE] = close;
-  projectMenuSubmenuHost(doc, anchor)?.appendChild(submenu);
+  projectMenuSubmenuHost(doc)?.appendChild(submenu);
+  const rect = anchor?.getBoundingClientRect?.();
+  placeOwnedMenuSurface(submenu, { x: Number(rect?.right) || 8, y: Number(rect?.top) || 8 }, doc.defaultView, {
+    preferLeft: true,
+    anchorLeft: Number(rect?.left) || 8,
+  });
   checkedItem?.scrollIntoView?.({ block: "nearest" });
   doc.addEventListener?.("pointerdown", onOutside, true);
   doc.addEventListener?.("keydown", onKeydown, true);
@@ -2496,6 +3106,82 @@ function installProjectColorControls(api, getState, saveAppearance) {
     if (menuObserverTimer !== null) window.clearTimeout(menuObserverTimer);
     menuObserverTimer = null;
   };
+  const sendNativeMenuAction = (request, action, extra = {}) => api.ipc.invoke(nativeProjectMenu.ACTION_CHANNEL, {
+    requestId: request.requestId,
+    action,
+    ...extra,
+  });
+  const removeNativeMenuRequests = api.ipc.on?.(nativeProjectMenu.REQUEST_CHANNEL, (payload) => {
+    const receivedAt = Date.now();
+    const request = nativeProjectMenu.validateNativeProjectMenuRequest(payload);
+    const diagnosticRequestId = request?.requestId || (
+      typeof payload?.requestId === "string" && /^[a-f0-9-]{16,80}$/i.test(payload.requestId)
+        ? payload.requestId
+        : null
+    );
+    const pendingAgeMs = pending ? Math.max(0, receivedAt - pending.createdAt) : null;
+    api.log?.info?.("Project menu bridge request received", {
+      requestId: diagnosticRequestId,
+      valid: Boolean(request),
+      hasPendingContext: Boolean(pending),
+      pendingAgeMs,
+    });
+    if (!request) return;
+    const context = pending;
+    const contextRequestId = requestId;
+    if (!context || pendingAgeMs > 2000) {
+      api.log?.info?.("Project menu bridge request rejected by renderer", {
+        requestId: request.requestId,
+        reason: context ? "stale-pending-context" : "missing-pending-context",
+        pendingAgeMs,
+      });
+      sendNativeMenuAction(request, "reject").catch(() => {});
+      return;
+    }
+    const acceptanceStartedAt = Date.now();
+    api.log?.info?.("Project menu bridge acceptance submitted", {
+      requestId: request.requestId,
+      pendingAgeMs,
+    });
+    sendNativeMenuAction(request, "accept").then((response) => {
+      api.log?.info?.("Project menu bridge acceptance completed", {
+        requestId: request.requestId,
+        ok: Boolean(response?.ok),
+        error: typeof response?.error === "string" ? response.error.slice(0, 64) : null,
+        elapsedMs: Math.max(0, Date.now() - acceptanceStartedAt),
+      });
+      if (!response?.ok) return;
+      if (pending !== context || requestId !== contextRequestId) {
+        sendNativeMenuAction(request, "dismiss").catch(() => {});
+        return;
+      }
+      pending = null;
+      requestId += 1;
+      stopMenuObserver();
+      const overlay = openBridgedProjectMenu(document, request, context, {
+        saveAppearance,
+        select: (path) => sendNativeMenuAction(request, "select", { path }).then((result) => {
+          if (!result?.ok) api.log?.warn?.("Project menu command was not accepted", result?.error || "unknown");
+          return result;
+        }),
+        dismiss: () => sendNativeMenuAction(request, "dismiss").catch(() => {}),
+      });
+      if (!overlay) {
+        sendNativeMenuAction(request, "dismiss").catch(() => {});
+        return;
+      }
+      api.log?.info?.("Codex-styled project menu opened", { projectId: context.project.id, source: context.source });
+    }).catch((error) => {
+      api.log?.warn?.("Project menu bridge acceptance failed", {
+        requestId: request.requestId,
+        elapsedMs: Math.max(0, Date.now() - acceptanceStartedAt),
+        error: String(error),
+      });
+      sendNativeMenuAction(request, "dismiss").then((result) => {
+        if (!result?.ok) sendNativeMenuAction(request, "reject").catch(() => {});
+      }).catch(() => sendNativeMenuAction(request, "reject").catch(() => {}));
+    });
+  });
   const seed = (event) => {
     const context = resolveProjectContext(api, getState?.(), event.target);
     if (!context) return;
@@ -2505,10 +3191,12 @@ function installProjectColorControls(api, getState, saveAppearance) {
     }
     const anchor = event.target?.closest?.('button, [role="button"]') || context.container;
     const rect = anchor?.getBoundingClientRect?.();
-    const x = Number.isFinite(event.clientX) ? event.clientX : (rect?.right || rect?.left || 0);
-    const y = Number.isFinite(event.clientY) ? event.clientY : (rect?.top || 0);
+    const hasPointerCoordinates = Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+      && (event.type === "contextmenu" || event.clientX !== 0 || event.clientY !== 0);
+    const x = hasPointerCoordinates ? event.clientX : (rect?.right || rect?.left || 0);
+    const y = hasPointerCoordinates ? event.clientY : (rect?.top || 0);
     stopMenuObserver();
-    pending = { ...context, x, y };
+    pending = { ...context, x, y, createdAt: Date.now() };
     const id = ++requestId;
     api.log?.info?.("Project color menu target resolved", { projectId: pending.project.id, source: pending.source, eventType: event.type });
     inject(pending, id);
@@ -2526,6 +3214,7 @@ function installProjectColorControls(api, getState, saveAppearance) {
     document.removeEventListener("contextmenu", seed, true);
     document.removeEventListener("pointerdown", seed, true);
     document.removeEventListener("click", seed, true);
+    removeNativeMenuRequests?.();
     stopMenuObserver();
     requestId += 1;
     pending = null;
@@ -2916,13 +3605,7 @@ function openProjectTaskSortSubmenu(doc, anchor, context, onSelect) {
   const submenu = doc.createElement("div");
   submenu.setAttribute("role", "menu");
   submenu.setAttribute(PROJECT_TASK_MENU_ATTR, "sort-submenu");
-  submenu.className = "fixed z-[10000] flex min-w-[220px] flex-col rounded-xl border border-token-border p-1 shadow-lg";
-  submenu.style?.setProperty?.("background-color", "var(--color-background-panel, var(--color-token-bg-fog))");
-  const rect = anchor?.getBoundingClientRect?.();
-  const viewportWidth = Number(doc.defaultView?.innerWidth) || 1200;
-  const right = Number(rect?.right) || 8;
-  submenu.style?.setProperty?.("left", `${right + 220 <= viewportWidth - 8 ? right : Math.max(8, (Number(rect?.left) || right) - 220)}px`);
-  submenu.style?.setProperty?.("top", `${Math.max(8, Number(rect?.top) || 8)}px`);
+  submenu.className = CODEX_MENU_SURFACE_CLASS;
   const current = normalizeTaskSort(context?.project?.taskSort);
   let closed = false;
   const close = () => {
@@ -2943,7 +3626,7 @@ function openProjectTaskSortSubmenu(doc, anchor, context, onSelect) {
     item.type = "button";
     item.setAttribute("role", "menuitemradio");
     item.setAttribute("aria-checked", String(option.value === current));
-    item.className = "flex min-h-8 items-center justify-between rounded-md px-2 text-left text-sm text-token-text-primary hover:bg-token-foreground/10";
+    item.className = `${CODEX_MENU_ITEM_CLASS} justify-between`;
     item.textContent = option.label;
     if (option.value === current) {
       const check = doc.createElement("span");
@@ -2959,7 +3642,12 @@ function openProjectTaskSortSubmenu(doc, anchor, context, onSelect) {
     submenu.appendChild(item);
   }
   submenu[PROJECT_TASK_DISPOSE] = close;
-  projectMenuSubmenuHost(doc, anchor)?.appendChild(submenu);
+  projectMenuSubmenuHost(doc)?.appendChild(submenu);
+  const rect = anchor?.getBoundingClientRect?.();
+  placeOwnedMenuSurface(submenu, { x: Number(rect?.right) || 8, y: Number(rect?.top) || 8 }, doc.defaultView, {
+    preferLeft: true,
+    anchorLeft: Number(rect?.left) || 8,
+  });
   doc.addEventListener?.("pointerdown", onOutside, true);
   doc.addEventListener?.("keydown", onKeydown, true);
   return submenu;
@@ -3635,6 +4323,7 @@ module.exports = {
   PROJECT_NATIVE_MENU_ATTR,
   snapshotNativeProjectMenuCommands,
   interceptNativeProjectMenu,
+  openBridgedProjectMenu,
   injectNativeProjectSettingsMenu,
   openProjectSettingsSubmenu,
   openProjectColorSubmenu,
@@ -4459,12 +5148,14 @@ const state = require("./state");
 const policy = require("./policy");
 const inventory = require("./inventory");
 const service = require("./service");
+const nativeProjectMenu = require("./native-project-menu");
 const sidebar = require("./sidebar");
 const settings = require("./settings");
 
 const IPC = "projects";
 const SERVICE_KEY = "__tweakersProjectsServiceV1";
 const HANDLER_KEY = "__tweakersProjectsHandlerV1";
+const NATIVE_MENU_BRIDGE_KEY = "__tweakersProjectsNativeMenuBridgeV1";
 const settingsPresenter = settings.createSettingsPresenter({
   openNativeProjectEditDialog: sidebar.openNativeProjectEditDialog,
 });
@@ -4480,6 +5171,8 @@ function startMain(api) {
     });
     globalThis[HANDLER_KEY] = typeof unregister === "function" ? unregister : true;
   }
+  globalThis[NATIVE_MENU_BRIDGE_KEY]?.dispose?.();
+  globalThis[NATIVE_MENU_BRIDGE_KEY] = nativeProjectMenu.installNativeProjectMenuBridge(api);
   api.log?.info?.("Projects service ready");
 }
 
@@ -4618,6 +5311,9 @@ const tweak = {
       const unregister = globalThis[HANDLER_KEY];
       if (typeof unregister === "function") { try { unregister(); } catch {} }
       globalThis[HANDLER_KEY] = null;
+      const nativeMenuBridge = globalThis[NATIVE_MENU_BRIDGE_KEY];
+      nativeMenuBridge?.dispose?.();
+      if (globalThis[NATIVE_MENU_BRIDGE_KEY] === nativeMenuBridge) globalThis[NATIVE_MENU_BRIDGE_KEY] = null;
     }
     this._page?.unregister?.();
     this._page = null;
@@ -4633,6 +5329,7 @@ const tweak = {
     detectConnections: service.detectConnections,
     normalizeGitHubArgs: service.normalizeGitHubArgs,
     runGitHubForProject: service.runGitHubForProject,
+    ...nativeProjectMenu,
     ...sidebar,
     projectAppearanceEditor: settings.projectAppearanceEditor,
     branchInventoryDisclosure: settings.branchInventoryDisclosure,

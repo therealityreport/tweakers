@@ -968,19 +968,43 @@ function constrainSidebarIconSvg(icon, size = 20) {
     }
     icon.classList?.add("icon-sm", "inline-block", "shrink-0", "align-middle");
 }
+function nativeSidebarItemTemplate() {
+    const root = state.sidebarRoot;
+    if (!root)
+        return null;
+    return root.querySelector("button[data-settings-panel-slug]:not([aria-current='page'])") ?? root.querySelector("button[data-settings-panel-slug]");
+}
 function makeSidebarItem(label, iconSvg) {
-    // Class string copied verbatim from Codex's sidebar buttons (General etc).
+    // Use a live Codex-owned row as the template so typography, height, padding,
+    // alignment, and future host changes stay identical to the surrounding
+    // Settings rows. The fallback mirrors the current native structure for the
+    // brief interval where Codex has not mounted a reusable row yet.
+    const template = nativeSidebarItemTemplate();
+    const templateInner = template?.firstElementChild;
+    const templateChildren = templateInner ? Array.from(templateInner.children) : [];
+    const templateIconSlot = templateChildren.find((child) => child.querySelector("svg"));
+    const templateLabel = templateChildren.find((child) => !child.querySelector("svg"));
     const btn = document.createElement("button");
     btn.type = "button";
     btn.dataset.tweaker = `nav-${label.toLowerCase()}`;
     btn.setAttribute("aria-label", label);
-    btn.className =
-        "focus-visible:outline-token-border relative px-row-x py-row-y cursor-interaction shrink-0 items-center overflow-hidden rounded-lg text-left text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50 gap-2 flex w-full hover:bg-token-list-hover-background font-normal";
+    btn.className = template?.className ||
+        "sidebar-item focus-visible:outline-token-border relative h-[var(--height-token-row)] px-[var(--padding-row-cell-x,var(--padding-row-x))] py-row-y cursor-interaction shrink-0 items-center overflow-hidden text-start text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50 gap-2 flex w-full hover:bg-token-list-hover-background font-normal";
+    btn.classList.remove("bg-token-list-hover-background");
+    btn.classList.add("hover:bg-token-list-hover-background", "font-normal");
     const inner = document.createElement("div");
-    inner.className =
+    inner.className = templateInner?.className ||
         "flex min-w-0 items-center text-base gap-2 flex-1 text-token-foreground";
-    inner.innerHTML = `${iconSvg}<span class="truncate">${label}</span>`;
-    constrainSidebarIconSvg(inner.querySelector("svg"));
+    inner.classList.remove("text-token-list-active-selection-foreground");
+    inner.classList.add("text-token-foreground");
+    const iconSlot = document.createElement("span");
+    iconSlot.className = templateIconSlot?.className || "flex w-4 shrink-0 items-center justify-center";
+    iconSlot.innerHTML = iconSvg;
+    constrainSidebarIconSvg(iconSlot.querySelector("svg"));
+    const text = document.createElement("span");
+    text.className = templateLabel?.className || "text-fade-truncate";
+    text.textContent = label;
+    inner.append(iconSlot, text);
     btn.appendChild(inner);
     return btn;
 }
