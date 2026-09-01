@@ -1,9 +1,9 @@
 {
   "id": "co.tweakers.account-switcher",
   "name": "Accounts",
-  "version": "0.4.0",
+  "version": "0.4.3",
   "githubRepo": "therealityreport/tweakers",
-  "description": "See two saved ChatGPT accounts, their redacted quota status, and stage owner-private isolated account homes while preserving the original snapshots.",
+  "description": "Use two saved ChatGPT accounts with clear profile names, simple setup language, and automatic routing for new conversations.",
   "author": "hulibrands",
   "tags": [
     "accounts",

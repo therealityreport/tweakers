@@ -119,7 +119,7 @@ test("list is redacted, side-effect-free, and reports a dangling marker", async 
   assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "missing.json\n", "listing must not reconcile a marker");
 });
 
-test("list projection never exposes an email or provider account id", async (t) => {
+test("list projection exposes an account email but never provider ids or auth secrets", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   const snapshot = JSON.parse(auth("work", "provider-account-id-should-not-render"));
@@ -128,8 +128,9 @@ test("list projection never exposes an email or provider account id", async (t) 
 
   const listed = await setup.service.handle({ action: "list" });
   assert.equal(listed.ok, true);
-  assert.equal(JSON.stringify(listed).includes("private@example.test"), false);
+  assert.equal(listed.accounts[0].email, "private@example.test");
   assert.equal(JSON.stringify(listed).includes("provider-account-id-should-not-render"), false);
+  assert.equal(JSON.stringify(listed).includes("access_token"), false);
   assert.equal(listed.accounts[0].identifierMasked, "••••••••");
   assert.equal(listed.accounts[0].label, "work");
 });
@@ -147,11 +148,82 @@ test("duplicate safe profile names use distinct stable snapshot labels shared by
 
   const listed = await setup.service.handle({ action: "list" });
   assert.deepEqual(listed.accounts.map((account) => account.label), ["alpha", "beta"]);
-  assert.equal(JSON.stringify(listed).includes("@example.test"), false);
+  assert.deepEqual(listed.accounts.map((account) => account.displayLabel), ["Taylor · Account 1", "Taylor · Account 2"]);
+  assert.deepEqual(listed.accounts.map((account) => account.email), ["alpha@example.test", "beta@example.test"]);
   const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
   assert.equal(staged.ok, true);
   const config = JSON.parse(fs.readFileSync(_test.accountRouterPaths(setup.deps, setup.paths).configFile, "utf8"));
   assert.deepEqual(config.accounts.map((account) => account.label), ["alpha", "beta"]);
+  assert.equal(JSON.stringify(config).includes("@example.test"), false, "emails stay out of routing configuration");
+});
+
+test("generic saved filenames use safe profile names for display without changing routing labels", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  fs.renameSync(path.join(setup.paths.accountsDir, "work.json"), path.join(setup.paths.accountsDir, "account-2.json"));
+  const profileAuth = (token, accountId, name, email) => {
+    const value = JSON.parse(auth(token, accountId));
+    value.tokens.id_token = `x.${Buffer.from(JSON.stringify({ name, email })).toString("base64url")}.x`;
+    return JSON.stringify(value);
+  };
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "account-2.json"), profileAuth("two", "acct-2", "Thomas Hulihan", "two@example.test"), { mode: 0o600 });
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "account-3.json"), profileAuth("three", "acct-3", "The Reality Report", "three@example.test"), { mode: 0o600 });
+
+  const listed = await setup.service.handle({ action: "list" });
+  assert.deepEqual(listed.accounts.map((account) => account.label), ["account-2", "account-3"]);
+  assert.deepEqual(listed.accounts.map((account) => account.displayLabel), ["Thomas Hulihan", "The Reality Report"]);
+  assert.deepEqual(listed.accounts.map((account) => account.email), ["two@example.test", "three@example.test"]);
+  const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(staged.ok, true);
+  const config = JSON.parse(fs.readFileSync(_test.accountRouterPaths(setup.deps, setup.paths).configFile, "utf8"));
+  assert.deepEqual(config.accounts.map((account) => account.label), ["account-2", "account-3"], "display names never replace stable routing labels");
+  assert.equal(JSON.stringify(config).includes("@example.test"), false, "display identity never becomes a routing join");
+});
+
+test("the current account marker requires one unique saved identity match", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  fs.writeFileSync(setup.paths.authFile, auth("live", "account-work"), { mode: 0o600 });
+  fs.writeFileSync(setup.paths.currentMarker, "work.json\n", { mode: 0o600 });
+
+  const unique = await setup.service.handle({ action: "list" });
+  assert.deepEqual(unique.accounts.map((account) => account.active), [true]);
+
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "duplicate.json"), auth("duplicate", "account-work"), { mode: 0o600 });
+  const duplicate = await setup.service.handle({ action: "list" });
+  assert.equal(duplicate.accounts.some((account) => account.active), false, "duplicate saved identities must not claim a current account");
+  assert.equal(duplicate.markerStatus, "identity-mismatch");
+});
+
+test("a local username can be added, changed, and removed without entering auth or routing files", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const saved = JSON.parse(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"), "utf8"));
+  saved.tokens.id_token = `x.${Buffer.from(JSON.stringify({ preferred_username: "provider-account-id-should-not-render" })).toString("base64url")}.x`;
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "work.json"), JSON.stringify(saved), { mode: 0o600 });
+  const initial = await setup.service.handle({ action: "list" });
+  const ref = initial.accounts[0].ref;
+  assert.equal(initial.accounts[0].username, null, "provider claims never become a local username");
+
+  const added = await setup.service.handle({ action: "account-username-set", ref, username: "@thommyhuli" });
+  assert.deepEqual(added, { ok: true, username: "thommyhuli" });
+  assert.equal((await setup.service.handle({ action: "list" })).accounts[0].username, "thommyhuli");
+  assert.equal(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"), "utf8").includes("thommyhuli"), false);
+
+  const originalSnapshot = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "work.json"), auth("replacement", "different-account"), { mode: 0o600 });
+  assert.equal((await setup.service.handle({ action: "list" })).accounts[0].username, null,
+    "a username must not follow a different account that reuses the filename");
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "work.json"), originalSnapshot, { mode: 0o600 });
+  assert.equal((await setup.service.handle({ action: "list" })).accounts[0].username, "thommyhuli");
+
+  const rejected = await setup.service.handle({ action: "account-username-set", ref, username: "private@example.test" });
+  assert.equal(rejected.ok, false);
+  assert.equal((await setup.service.handle({ action: "list" })).accounts[0].username, "thommyhuli");
+
+  const removed = await setup.service.handle({ action: "account-username-set", ref, username: "" });
+  assert.deepEqual(removed, { ok: true, username: null });
+  assert.equal((await setup.service.handle({ action: "list" })).accounts[0].username, null);
 });
 
 test("first use lists an absent snapshot directory as empty and saves safely", async (t) => {
@@ -362,6 +434,41 @@ test("account labels use a safe saved name and never use an email identity", () 
   assert.equal(_test.displayLabelFromAuth({}, "Work Account"), "Work Account");
 });
 
+test("account identity accepts a bounded account email but never infers a username from provider claims", () => {
+  const token = "x." + Buffer.from(JSON.stringify({
+    preferred_username: "thommyhuli",
+    email: "private@example.test",
+    email_verified: true,
+  })).toString("base64url") + ".x";
+  const value = {
+    account: { name: "provider-account-id-should-not-render" },
+    name: "top-level-provider-id-should-not-render",
+    tokens: { id_token: token },
+  };
+
+  assert.equal(_test.displayLabelFromAuth(value, "Account 1"), "Account 1");
+  assert.equal(_test.displayLabelFromAuth(value, ""), "");
+  assert.deepEqual(_test.accountIdentityFromAuth(value, "Account 1"), {
+    displayName: "Account 1",
+    email: "private@example.test",
+    username: null,
+  });
+  assert.equal(_test.safeUsername("@thommyhuli"), "thommyhuli");
+  assert.equal(_test.safeUsername("private@example.test"), "");
+  assert.equal(_test.safeEmail("Private@Example.Test"), "private@example.test");
+  assert.equal(_test.safeEmail("Bearer SECRET_CANARY"), "");
+  const unverified = "x." + Buffer.from(JSON.stringify({
+    email: "claim@example.test",
+    email_verified: false,
+  })).toString("base64url") + ".x";
+  assert.equal(_test.accountIdentityFromAuth({
+    user: { email: "direct@example.test", username: "provider-account-id-should-not-render" },
+    tokens: { id_token: unverified },
+  }, "Account 1").email, null, "an explicit negative verification claim fails closed");
+  const incomplete = "x." + Buffer.from(JSON.stringify({ email: "two-segment@example.test" })).toString("base64url");
+  assert.equal(_test.accountIdentityFromAuth({ tokens: { id_token: incomplete } }, "Account 1").email, null);
+});
+
 test("active snapshot sync propagates rotated tokens only for the same account", (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
@@ -507,18 +614,41 @@ test("account metadata declares the settings surface and has a synchronized mino
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
   assert.equal(manifest.name, "Accounts");
-  assert.equal(manifest.version, "0.4.0");
+  assert.equal(manifest.version, "0.4.3");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
 });
 
+test("visible Accounts controls use plain language instead of router and receipt jargon", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  for (const phrase of [
+    "Automatic routing for new conversations",
+    "Which account should keep my existing conversations?",
+    "Set up automatic routing",
+    "Connect or repair accounts",
+    "Use manual routing after restart",
+    "Plugin check before switching",
+    "Check plugins",
+    "Block unchecked switches",
+    "Old saved-account numbers can skip, so a missing number does not mean an account is missing.",
+  ]) assert.equal(source.includes(phrase), true, phrase);
+  for (const oldPhrase of [
+    "Reconcile & Verify",
+    "Enable Enforcement",
+    "Use Observation",
+    "Stage quota-aware routing",
+    "Keep my existing history with",
+    "2 connected subscriptions",
+  ]) assert.equal(source.includes(oldPhrase), false, oldPhrase);
+});
+
 test("router presentation separates active v2 truth from a pending generation", () => {
   const manual = { mode: "manual", restartRequired: false, degradedReason: null };
-  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 0).label, "Not configured");
-  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 1).label, "Save two accounts");
-  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 2).label, "Ready to stage");
-  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Manual");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 0).label, "Save two accounts");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 1).label, "Save one more account");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 2).label, "Ready to set up");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Automatic routing unavailable");
   const active = { mode: "quota_aware", policy: "quota_aware_v1", generation: 4, fingerprint: "sha256:" + "a".repeat(64) };
   const pending = { mode: "manual", policy: null, generation: 5, fingerprint: "sha256:" + "b".repeat(64) };
   const running = _test.routerPresentation(
@@ -526,13 +656,12 @@ test("router presentation separates active v2 truth from a pending generation", 
     { state: "active", status: { schemaVersion: 2, active, pending, degradedReason: null, accounts: [{ label: "Taylor", eligibility: "active", assignedThreadCount: 2 }] } },
     2,
   );
-  assert.equal(running.label, "Quota-aware routing is active");
-  assert.match(running.message, /Active generation 4/);
-  assert.match(running.message, /Pending generation 5/);
+  assert.equal(running.label, "Automatic routing is on");
+  assert.match(running.message, /saved routing change will apply after you restart Codex/);
   assert.deepEqual(running.accounts, [{ label: "Taylor", eligibility: "active", assignedThreadCount: 2 }]);
-  assert.equal(_test.routerPresentation({ schemaVersion: 2, pending, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Routing change staged");
-  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Fallback staged");
-  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: "post_start_failure" }, { state: "not_running", status: null }, 2).label, "Router needs attention");
+  assert.equal(_test.routerPresentation({ schemaVersion: 2, pending, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Automatic routing setup is saved — not active yet");
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Manual fallback is saved");
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: "post_start_failure" }, { state: "not_running", status: null }, 2).label, "Automatic routing needs attention");
 });
 
 test("authenticated router status accepts only the redacted mux projection", () => {
@@ -647,7 +776,7 @@ test("legacy v1 config remains readable and manual rollback writes a v2 pending 
   assert.equal(manual.fingerprint, _test.routerConfigFingerprint(manual));
 });
 
-test("profile menu uses native rows for two masked accounts and a manage navigation", (t) => {
+test("profile menu shows account identity but no global current account while automatic routing is active", (t) => {
   const previousDocument = global.document;
   const nodes = [];
   const element = (tagName) => {
@@ -671,20 +800,77 @@ test("profile menu uses native rows for two masked accounts and a manage navigat
       { label: "Morgan", plan: "Plus", identifierMasked: "••••••••", eligibility: "reauth_required", weekly: { remainingPercent: 65, resetAt: null, freshness: "stale" }, shortWindowPressure: null, assignedThreadCount: 0 },
     ],
   };
-  const panel = _test.accountMenuRows({ api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } }, [{ label: "Taylor" }, { label: "Morgan" }], { live: { state: "active", status } });
+  const accounts = [
+    { label: "Taylor", displayLabel: "Taylor", email: "taylor@example.test", username: "taylorh", active: true },
+    { label: "Morgan", displayLabel: "Morgan", email: "morgan@example.test", username: null, active: false },
+  ];
+  const panel = _test.accountMenuRows({ api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } }, accounts, { live: { state: "active", status } });
   const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
   const text = flatten(panel);
-  assert.match(text, /Usage remaining/);
-  assert.match(text, /2 connected subscriptions/);
-  assert.match(text, /Usage unavailable/);
-  assert.match(text, /Manage Accounts/);
+  assert.match(text, /Weekly usage left/);
+  assert.match(text, /2 connected accounts/);
+  assert.match(text, /Cannot check right now/);
+  assert.match(text, /Manage accounts/);
+  assert.match(text, /@taylorh/);
+  assert.match(text, /taylor@example\.test/);
+  assert.match(text, /morgan@example\.test/);
+  assert.equal(text.includes("Using now"), false, "automatic routing has no single global current account");
   assert.equal(text.includes("Switch ChatGPT account"), false);
   assert.equal(text.includes("Saved snapshot"), false);
-  assert.equal(text.includes("private@example.test"), false);
+  assert.equal(text.includes("provider-account-id-should-not-render"), false);
   assert.equal(nodes.filter((node) => node.className.includes("hover:bg-token-foreground\/5") && node.children.length > 0).length, 2);
 });
 
-test("profile menu leaves quota details unknown when safe labels drift or are ambiguous", (t) => {
+test("profile menu marks exactly one directly signed-in saved account as Using now", (t) => {
+  const previousDocument = global.document;
+  const element = (tagName) => ({
+    tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", type: "",
+    append(...children) { this.children.push(...children); },
+    setAttribute(key, value) { this.attrs[key] = value; },
+    addEventListener(name, listener) { this[`on_${name}`] = listener; },
+  });
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const panel = _test.accountMenuRows(
+    { api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } },
+    [
+      { label: "Thomas", displayLabel: "Thomas Hulihan", email: "thomas@example.test", username: "thommyhuli", active: true },
+      { label: "TRR", displayLabel: "The Reality Report", email: "trr@example.test", username: null, active: false },
+    ],
+    { live: { state: "not_running", status: null } },
+  );
+  const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
+  const text = flatten(panel);
+  assert.equal((text.match(/Using now/g) || []).length, 1);
+  assert.match(text, /Thomas Hulihan/);
+  assert.match(text, /@thommyhuli/);
+  assert.equal(_test.accountUsingNow({ active: true }, { state: "active" }), false);
+  assert.equal(_test.accountUsingNow({ active: true }, { state: "not_running" }), true);
+});
+
+test("conversation ownership never falls back to an internal generic snapshot label", (t) => {
+  const previousDocument = global.document;
+  const element = (tagName) => ({
+    tagName, children: [], className: "", textContent: "",
+    append(...children) { this.children.push(...children); },
+  });
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const card = _test.historyAdoptionCard({
+    state: "pending_offline_adoption",
+    ownerRef: null,
+    ownerLabel: "account-2",
+    importedThreadCount: 0,
+    databaseCount: 0,
+    historyCount: 0,
+  }, [{ ref: "known", displayLabel: "Thomas Hulihan", email: "thomas@example.test" }]);
+  const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
+  const text = flatten(card);
+  assert.match(text, /The selected account will keep your current conversations/);
+  assert.equal(text.includes("account-2"), false);
+});
+
+test("profile menu associates quota details by safe ref instead of visible labels", (t) => {
   const previousDocument = global.document;
   const element = (tagName) => ({
     tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", type: "",
@@ -697,25 +883,26 @@ test("profile menu leaves quota details unknown when safe labels drift or are am
   const status = {
     schemaVersion: 2,
     accounts: [
-      { label: "Taylor", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 99, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
-      { label: "Taylor", plan: "Enterprise", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 20, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+      { ref: "one", label: "Same visible label", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 99, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+      { ref: "two", label: "Same visible label", plan: "Enterprise", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 20, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
     ],
   };
-  assert.equal(_test.accountDetailsFor({ label: "Taylor" }, status), null, "duplicate safe labels are not a join key");
-  assert.equal(_test.accountDetailsFor({ label: "Renamed locally" }, status), null, "label drift is not positionally joined");
+  assert.equal(_test.accountDetailsFor({ ref: "one", label: "Renamed locally" }, status).plan, "Pro");
+  assert.equal(_test.accountDetailsFor({ ref: "two", label: "Taylor" }, status).plan, "Enterprise");
+  assert.equal(_test.accountDetailsFor({ ref: "missing", label: "Same visible label" }, status), null);
+  assert.equal(_test.accountDetailsFor({ ref: "one" }, { ...status, accounts: status.accounts.map((account) => ({ ...account, ref: "one" })) }), null,
+    "duplicate refs fail closed");
   const panel = _test.accountMenuRows(
     { api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } },
-    [{ label: "Taylor" }, { label: "Renamed locally" }],
+    [{ ref: "one", label: "Taylor" }, { ref: "two", label: "Renamed locally" }],
     { live: { state: "active", status } },
   );
   const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
   const text = flatten(panel);
-  assert.equal(text.includes("Pro"), false);
-  assert.equal(text.includes("Enterprise"), false);
-  assert.equal(text.includes("99% weekly"), false);
-  assert.equal(text.includes("20% weekly"), false);
-  assert.equal((text.match(/Plan unavailable/g) || []).length, 2);
-  assert.equal((text.match(/Weekly usage unavailable/g) || []).length, 2);
+  assert.match(text, /Pro/);
+  assert.match(text, /Enterprise/);
+  assert.match(text, /99% weekly/);
+  assert.match(text, /20% weekly/);
 });
 
 test("profile menu keeps every manual switch visible outside the exact two-account routing pool", (t) => {
@@ -734,8 +921,8 @@ test("profile menu keeps every manual switch visible outside the exact two-accou
   const three = _test.accountMenuRows(state, [
     { label: "One", ref: "one" }, { label: "Two", ref: "two" }, { label: "Three", ref: "three" },
   ], null);
-  assert.deepEqual(labels(one), ["One", "Manage Accounts"]);
-  assert.deepEqual(labels(three), ["One", "Two", "Three", "Manage Accounts"]);
+  assert.deepEqual(labels(one), ["One", "Manage accounts"]);
+  assert.deepEqual(labels(three), ["One", "Two", "Three", "Manage accounts"]);
   const buttons = (node) => [
     ...(node.type === "button" ? [node.textContent] : []),
     ...node.children.flatMap(buttons),
@@ -820,8 +1007,8 @@ test("router controls require an explicit history owner before staging quota-awa
     },
   }, [{ ref: "one", label: "Account One" }, { ref: "two", label: "Account Two" }]);
   const status = nodes.find((node) => node.attrs.role === "status");
-  const historyOwner = nodes.find((node) => node.attrs["aria-label"] === "Keep my existing history with");
-  const stage = nodes.find((node) => node.textContent === "Stage quota-aware routing");
+  const historyOwner = nodes.find((node) => node.attrs["aria-label"] === "Which account should keep my existing conversations?");
+  const stage = nodes.find((node) => node.textContent === "Set up automatic routing");
   assert.equal(status.attrs["aria-live"], "polite");
   assert.equal(historyOwner.value, "");
   assert.equal(stage.disabled, true, "there is no default history owner");
@@ -1105,8 +1292,8 @@ test("a deliberate pre-adoption restage replaces stale intent and projects only 
   assert.equal(JSON.stringify(status.router.historyAdoption).includes(after.legacyOwnerOpaqueAccountId), false);
   assert.equal(JSON.stringify(status.router.historyAdoption).includes("access_token"), false);
   const manualPresentation = _test.routerPresentation({ schemaVersion: 2, pending: { mode: "manual", policy: null }, historyAdoption: { state: "adopted" } }, { state: "not_running", status: null }, 2);
-  assert.equal(manualPresentation.label, "Manual new-thread assignment pending");
-  assert.match(manualPresentation.message, /not globally restored or reassigned/);
+  assert.equal(manualPresentation.label, "Manual routing is saved — not active yet");
+  assert.match(manualPresentation.message, /Current conversations will stay with their assigned account/);
 });
 
 test("quota-aware v2 stages exactly two isolated snapshot homes and immutable pending intent", async (t) => {
@@ -1659,10 +1846,34 @@ test("manual rollback stages a new pending generation while preserving isolated 
   assert.equal(secondManual.mode, "manual");
   assert.equal(secondManual.generation, firstManual.generation + 1);
   assert.equal(secondManual.fingerprint, _test.routerConfigFingerprint(secondManual));
-  setup.service.disableRouter();
-  const disabled = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
-  assert.equal(disabled.mode, "manual");
-  assert.equal(disabled.generation, secondManual.generation + 1);
+});
+
+test("main lifecycle stop disposes resources without changing routing", () => {
+  const serviceKey = "__tweakersAccountServiceV1";
+  const handlerKey = "__tweakersAccountHandlerV1";
+  const previousService = globalThis[serviceKey];
+  const previousHandler = globalThis[handlerKey];
+  let manualStages = 0;
+  let disposals = 0;
+  let unregisters = 0;
+  globalThis[serviceKey] = {
+    disableRouter() { manualStages += 1; },
+    dispose() { disposals += 1; },
+  };
+  globalThis[handlerKey] = () => { unregisters += 1; };
+  try {
+    tweak.stop();
+    assert.equal(manualStages, 0, "routine teardown must not stage manual routing");
+    assert.equal(disposals, 1);
+    assert.equal(unregisters, 1);
+    assert.equal(globalThis[serviceKey], null);
+    assert.equal(globalThis[handlerKey], null);
+  } finally {
+    if (previousService === undefined) delete globalThis[serviceKey];
+    else globalThis[serviceKey] = previousService;
+    if (previousHandler === undefined) delete globalThis[handlerKey];
+    else globalThis[handlerKey] = previousHandler;
+  }
 });
 
 test("balance epoch reset is durably allowed only while the router is idle", async (t) => {
@@ -1716,6 +1927,8 @@ test("router status keeps a v2 disk intent pending and projects only redacted st
   assert.equal(status.router.active, null);
   assert.equal(status.router.degradedReason, "post_start_failure");
   assert.equal(status.router.accounts.length, 2);
+  assert.deepEqual(status.router.accounts.map((account) => account.ref).sort(), listed.accounts.map((account) => account.ref).sort());
+  assert.equal(status.router.historyAdoption.ownerRef, listed.accounts[0].ref);
   assert.equal(JSON.stringify(status.router.accounts).includes("opaqueAccountId"), false);
   assert.equal(JSON.stringify(status).includes("account-work"), false);
   assert.equal(JSON.stringify(status).includes("access_token"), false);
@@ -1762,8 +1975,10 @@ test("router status preserves authenticated v2 active truth when later pending d
     assert.equal(result.live.state, "active", corruptTarget);
     assert.equal(result.live.status.schemaVersion, 2, corruptTarget);
     assert.equal(result.live.status.active.generation, config.generation, corruptTarget);
-    assert.equal(_test.routerPresentation(result.router, result.live, 2).label, "Quota-aware routing is active", corruptTarget);
-    assert.match(_test.routerPresentation(result.router, result.live, 2).message, /staged local record needs attention/, corruptTarget);
+    assert.deepEqual(result.live.status.accounts.map((account) => account.ref).sort(), listed.accounts.map((account) => account.ref).sort(), corruptTarget);
+    assert.equal(JSON.stringify(result.live).includes("opaqueAccountId"), false, corruptTarget);
+    assert.equal(_test.routerPresentation(result.router, result.live, 2).label, "Automatic routing is on", corruptTarget);
+    assert.match(_test.routerPresentation(result.router, result.live, 2).message, /saved setup needs attention/, corruptTarget);
   }
 });
 
@@ -1829,6 +2044,25 @@ test("verification writes only non-secret positive proof for the current active 
   assert.equal(JSON.stringify(saved).includes("access_token"), false);
   assert.equal(JSON.stringify(saved).includes("refresh-current"), false);
   assert.equal(JSON.stringify(saved).includes("id-current"), false);
+});
+
+test("plugin protection status never exposes raw account IDs or stored receipts to renderer IPC", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const profile = _test.defaultPluginProfile();
+  setup.store.set("remote-plugin-receipts-v1", {
+    schemaVersion: 1,
+    receipts: {
+      "account-current": _test.makePluginReceipt(profile, "account-current", testRuntimeBinding(), requiredInventory(), Date.now()),
+    },
+  });
+
+  const result = await setup.service.handle({ action: "plugin-protection-status" });
+  assert.equal(result.ok, true);
+  assert.equal(result.pluginProtection.active.valid, true);
+  assert.equal(Object.hasOwn(result.pluginProtection, "receipts"), false);
+  assert.equal(Object.hasOwn(result.pluginProtection, "accountId"), false);
+  assert.equal(JSON.stringify(result).includes("account-current"), false);
 });
 
 test("incomplete inventory never refreshes a receipt and observation mode keeps switching available", async (t) => {
@@ -2288,8 +2522,8 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
   assert.equal(menu.children.filter((child) => child.dataset.tweakersAccountSwitcher === "true").length, 1);
   assert.equal(listCalls, 1);
   const panel = menu.children.find((child) => child.dataset.tweakersAccountSwitcher === "true");
-  const manageAccounts = panel.children.find((child) => child.textContent === "Manage Accounts");
-  assert.equal(manageAccounts.attrs["aria-label"], "Manage Accounts settings");
+  const manageAccounts = panel.children.find((child) => child.textContent === "Manage accounts");
+  assert.equal(manageAccounts.attrs["aria-label"], "Manage accounts settings");
   await manageAccounts.listeners.get("click")();
   assert.equal(openPageCalls, 1);
 

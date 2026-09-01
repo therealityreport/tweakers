@@ -1,20 +1,37 @@
 # Accounts
 
-`co.tweakers.account-switcher` keeps the existing manual saved-session controls
-and optional remote-plugin receipt protection. Version 0.4 makes the native
-Accounts page and profile menu a two-account, quota-aware experience.
+`co.tweakers.account-switcher` is the stable internal ID for the user-facing
+**Accounts** feature. Keeping that ID preserves saved accounts, settings, and
+receipts. Version 0.4.3 makes the two saved identities recognizable with a
+profile name, account email, and optional local username. When no authenticated
+account router is running, it also marks the one uniquely matched saved account
+that Codex is using now. Routine hot reloads still never change the saved
+routing mode.
 
 ## What it shows
 
-- A native-style profile-menu summary with **Usage remaining**, **2 connected
-  subscriptions**, a 0–200% pool calculated from the two weekly values, two
-  account rows, and **Manage Accounts**.
-- Safe local labels, plan names, fixed permanent masks, weekly remaining
-  values, reset/freshness state, assigned-thread counts, and router eligibility.
-  It never renders emails, provider IDs, tokens, paths, opaque account ids, or
-  private configuration.
-- A Settings > Accounts page with account cards, setup/recovery guidance, and
-  manual switching plus remote-plugin protection under Advanced.
+- A native-style profile-menu summary with **Weekly usage left**, **2 connected
+  accounts**, a combined 0–200% total when both weekly values are current, two
+  account rows, and **Manage accounts**.
+- Friendly profile names and account emails for generic saved
+  filenames. A username can be added or changed locally from Accounts; Codex's
+  current structured account data does not provide a username, so Accounts
+  never guesses one from the email address. Duplicate profile names receive
+  clear `Account 1` and `Account 2` suffixes. Old saved-file numbers can skip,
+  so filenames such as `account-2.json` and `account-3.json` do not mean an
+  account is missing.
+- Safe plan, weekly-usage, reset, assigned-conversation, and eligibility text.
+  It never renders provider IDs, tokens, paths, opaque account IDs, or private
+  configuration. Email and optional username are presentation only; they never
+  become routing, history, quota, plugin, or recovery join keys.
+- **Using now** appears only when no authenticated router is running and the
+  live direct sign-in, saved marker, and exactly one saved account all match.
+  A running router deliberately has no single global **Using now** account:
+  automatic routing can start new conversations on either account, and adopted
+  existing conversations remain pinned to their assigned account.
+- A Settings > Accounts page with **Automatic routing for new conversations**,
+  **Your current conversations**, **Connect or repair accounts**, manual
+  switching, and a plain-language plugin check.
 
 ## Routing states
 
@@ -26,8 +43,9 @@ Accounts page and profile menu a two-account, quota-aware experience.
   increasing generation and an immutable SHA-256 fingerprint over the routing
   intent. Its timestamp uses the runtime's strict UTC ISO form; a timestamp-only
   change cannot alter the fingerprint.
-- Before quota-aware routing can be staged, choose exactly one of the two
-  selected saved accounts in **Keep my existing history with**. There is no
+- Before automatic routing can be saved, choose exactly one of the two
+  selected saved accounts in **Which account should keep my existing
+  conversations?** There is no
   default and the choice is never inferred from the current sign-in, primary
   account, order, label, or account metadata. Staging records a signed,
   private offline-adoption intent; it does not move history or change live
@@ -38,8 +56,11 @@ Accounts page and profile menu a two-account, quota-aware experience.
 
 ## Safety and recovery
 
-- Saved snapshots keep their names and remain the source of the two enrolled
-  identities. Each staged home has its own
+- Saved snapshots keep their filenames and remain the source of the two
+  enrolled identities. Profile name and account email are projected only for
+  display; an optional username is stored separately under the tweak's existing
+  data namespace. None of these visible fields is an identity join.
+  Each prepared home has its own
   private `auth.json`, SQLite home, and empty strict `config.toml`; global
   configuration, environment values, plugin OAuth state, and private plugins
   are not copied.
@@ -67,6 +88,8 @@ Accounts page and profile menu a two-account, quota-aware experience.
 - Staging, recovery guidance, and rollback staging never restart ChatGPT. A
   separately confirmed restart is required for a pending policy to become
   active.
+- Reloading or disabling the Accounts UI does not change the saved routing
+  mode. Manual routing must be chosen explicitly before a later restart.
 - After history adoption, a Manual pending state applies only to new-thread
   assignment after that separately confirmed restart. It does not globally
   restore or reassign existing adopted history.

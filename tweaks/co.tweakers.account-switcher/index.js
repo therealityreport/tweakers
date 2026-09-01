@@ -7,6 +7,8 @@ const MAX_AUTH_BYTES = 1024 * 1024;
 const INTENT_TTL_MS = 30_000;
 const PLUGIN_PROFILE_KEY = "remote-plugin-profile-v1";
 const PLUGIN_RECEIPTS_KEY = "remote-plugin-receipts-v1";
+const ACCOUNT_USERNAMES_KEY = "account-usernames-v1";
+const MAX_IDENTITY_CLAIMS_BYTES = 64 * 1024;
 const PLUGIN_PROFILE_SCHEMA_VERSION = 1;
 const PLUGIN_RECEIPT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 const PLUGIN_PROBE_TIMEOUT_MS = 8_000;
@@ -59,20 +61,20 @@ const ROUTER_PUBLIC_DEGRADED_REASONS = new Set([
 const ROUTER_CONTROL_FAILURE_MESSAGES = Object.freeze({
   "invalid-router-mode": "The requested router mode is unavailable.",
   "untrusted-router-directory": "Router storage could not be verified safely.",
-  "router-requires-exactly-two-accounts": "Choose exactly two saved accounts before staging balanced mode.",
-  "invalid-router-weight": "Each selected account needs a routing weight from 1 to 100.",
-  "router-requires-distinct-accounts": "Choose two different saved accounts before staging balanced mode.",
-  "router-history-owner-required": "Choose which selected account should keep your existing history before staging.",
-  "router-history-owner-not-selected": "The history owner must be one of the two selected saved accounts.",
-  "router-history-adoption-invalid": "The saved offline history-adoption record could not be verified safely.",
-  "router-history-adoption-mismatch": "Existing adopted history belongs to a different selected account pool or owner.",
-  "router-state-mismatch-requires-reset": "Existing router history does not match this account pool or weights. Restore its original pool, or keep Manual pending until explicit recovery is available.",
-  "router-not-idle": "Balance reset requires an idle router.",
-  "router-recovery-router-running": "Recovery is blocked while the router is running. Stop it first, then retry recovery.",
-  "router-recovery-router-status-unavailable": "Recovery needs a confirmed stopped router, but its status could not be verified.",
-  "router-recovery-account-mismatch": "The current sign-in does not match the saved account selected for recovery.",
-  "router-recovery-not-needed": "The isolated account home already matches the current saved authentication.",
-  "router-operation-failed": "The router action could not be completed safely.",
+  "router-requires-exactly-two-accounts": "Save exactly two different accounts before setting up automatic routing.",
+  "invalid-router-weight": "The saved routing setup is invalid.",
+  "router-requires-distinct-accounts": "The two saved accounts must be different.",
+  "router-history-owner-required": "Choose which account should keep the conversations you already have.",
+  "router-history-owner-not-selected": "Choose one of the two saved accounts for your current conversations.",
+  "router-history-adoption-invalid": "We could not verify the saved conversation setup. Nothing was moved.",
+  "router-history-adoption-mismatch": "The saved conversation setup belongs to different accounts. Nothing was moved.",
+  "router-state-mismatch-requires-reset": "This setup does not match the accounts used before. Keep manual routing on until the account setup is repaired.",
+  "router-not-idle": "Wait for current work to finish before resetting routing usage.",
+  "router-recovery-router-running": "Turn automatic routing off before repairing this saved account.",
+  "router-recovery-router-status-unavailable": "We could not confirm that routing is stopped, so this account was not changed.",
+  "router-recovery-account-mismatch": "The account signed in now is not the saved account you chose to repair.",
+  "router-recovery-not-needed": "This saved account is already up to date.",
+  "router-operation-failed": "The account routing change could not be completed safely.",
 });
 // These are stable remote package identifiers returned by Codex's experimental
 // app-server `plugin/installed` reconciliation endpoint. Keep this list free of
@@ -143,11 +145,9 @@ module.exports = {
   stop() {
     if (typeof window === "undefined") {
       const service = globalThis[SERVICE_KEY];
-      // Disabling this tweak is a staged rollback: retain diagnostic state and
-      // isolated homes, but make the next authorized startup keep the adopted
-      // history mux while assigning new threads to the primary account only.
-      // It never interrupts an already-open stdio session.
-      try { service?.disableRouter?.(); } catch {}
+      // stop() also runs during ordinary source hot reloads. It must only
+      // release process resources; routing changes require an explicit Accounts
+      // action and are never inferred from lifecycle teardown.
       service?.dispose?.();
       if (globalThis[SERVICE_KEY] === service) globalThis[SERVICE_KEY] = null;
       // Remove the IPC handler and reset the guard so a later start() re-registers
@@ -161,7 +161,9 @@ module.exports = {
   },
   _test: {
     validateReferenceName, validateAuthObject, redact, createAccountService,
-    stableRef, authPaths, displayLabelFromAuth, safeSnapshotLabel, syncActiveSnapshot,
+    stableRef, authPaths, accountIdentityFromAuth, displayLabelFromAuth, safeEmail, safeUsername,
+    safeSnapshotLabel, displaySnapshotLabels, displaySnapshotIdentities, readAccountUsernames, updateAccountUsername,
+    syncActiveSnapshot,
     cleanupLegacyAnalytics, accountMenuTargetFromCandidates, startRenderer, disposeRenderer,
     defaultPluginProfile, normalizePluginProfile, profileHash, evaluatePluginReceipt,
     makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
@@ -173,7 +175,9 @@ module.exports = {
     stageBalancedRouterConfig, stageManualRouterConfig, recoverRouterAccount, resetRouterBalanceEpoch,
     readRouterConfig, readRouterState, routerControlFailure, routerPresentation,
     authenticatedRouterStatus, routerControlSocketPath, parseAuthenticatedRouterStatus, routerControlCard,
-    quotaPoolRemainingPercent, accountDetailsFor, accountMenuRows, advancedAccountsCard, accountRecoveryCard, maskIdentifier, safeAccountLabel,
+    quotaPoolRemainingPercent, accountDetailsFor, accountDisplayLabel, accountIdentitySummary,
+    accountChoiceLabel, accountUsingNow, accountCards, accountMenuRows, advancedAccountsCard,
+    accountRecoveryCard, historyAdoptionCard, maskIdentifier, safeAccountLabel,
   },
 };
 
@@ -226,6 +230,7 @@ function createAccountService(api, options = {}) {
       if (message?.action === "plugin-protection-status") return service.pluginProtectionStatus();
       if (message?.action === "plugin-protection-verify-current") return service.verifyCurrentPlugins();
       if (message?.action === "plugin-protection-configure") return service.configurePluginProtection(message);
+      if (message?.action === "account-username-set") return service.setAccountUsername(message);
       if (message?.action === "prepare-switch") return service.prepareSwitch(message.ref, false);
       if (message?.action === "prepare-switch-bypass") return service.prepareSwitch(message.ref, true);
       if (message?.action === "prepare-save") return service.prepareSave(message.name);
@@ -237,14 +242,24 @@ function createAccountService(api, options = {}) {
       if (message?.action === "router-reset-balance-epoch") return service.resetRouterBalanceEpoch();
       return Promise.resolve(safeFailure("invalid-request"));
     },
-    async list() { return listAccounts(deps, paths, refs, await pluginProtectionSnapshot(api, deps, paths)); },
-    async pluginProtectionStatus() { return pluginProtectionSnapshot(api, deps, paths); },
+    async list() {
+      const [protection, usernames] = await Promise.all([
+        pluginProtectionSnapshot(api, deps, paths),
+        readAccountUsernames(api),
+      ]);
+      return listAccounts(deps, paths, refs, protection, usernames);
+    },
+    async pluginProtectionStatus() {
+      const protection = await pluginProtectionSnapshot(api, deps, paths);
+      return { ok: true, pluginProtection: publicPluginProtection(protection) };
+    },
     // Verification may invoke Codex's reconciliation endpoint. Serialize it
     // with auth-changing operations, then re-check active auth immediately
     // before receipt persistence so a receipt can never be written for the
     // account that was active only when the probe began.
     verifyCurrentPlugins() { return enqueue(() => verifyCurrentPluginReceipt(api, deps, paths, options)); },
     configurePluginProtection(message) { return enqueue(() => configurePluginProtection(api, message)); },
+    setAccountUsername(message) { return enqueue(() => updateAccountUsername(api, deps, paths, refs, message)); },
     async prepareSwitch(ref, bypass) {
       return prepareSwitchWithPluginGuard(api, deps, paths, refs, intents, ref, bypass, options);
     },
@@ -255,7 +270,6 @@ function createAccountService(api, options = {}) {
     configureRouter(message) { return enqueue(() => configureRouter(api, deps, paths, refs, message)); },
     recoverRouterAccount(message) { return enqueue(() => recoverRouterAccount(api, deps, paths, refs, message)); },
     resetRouterBalanceEpoch() { return enqueue(() => resetRouterBalanceEpoch(deps, accountRouterPaths(deps, paths))); },
-    disableRouter() { return stageManualRouterConfig(deps, paths); },
     dispose() { disposed = true; stopSnapshotSync(); intents.clear(); refs.clear(); },
     async observeStartup() {
       const result = await pluginProtectionSnapshot(api, deps, paths);
@@ -504,7 +518,65 @@ function reconcileCurrentMarker(deps, paths, expectedMarker, expectedLive) {
   writeReconciledMarker(deps, paths, selected.filename, expectedMarker);
 }
 
-function listAccounts(deps, paths, refs, protection = null) {
+async function readAccountUsernames(api) {
+  try {
+    const stored = await api?.storage?.get?.(ACCOUNT_USERNAMES_KEY);
+    if (!isRecord(stored)) return {};
+    const usernames = {};
+    for (const [ref, value] of Object.entries(stored).slice(0, 64)) {
+      if (!/^[a-f0-9]{32}$/.test(ref)) continue;
+      if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["binding", "username"].join("\0")) continue;
+      const username = safeUsername(value.username);
+      if (username && /^sha256:[a-f0-9]{64}$/.test(value.binding)) {
+        usernames[ref] = { username, binding: value.binding };
+      }
+    }
+    return usernames;
+  } catch {
+    return {};
+  }
+}
+
+function accountUsernameBinding(rawAccountId) {
+  if (typeof rawAccountId !== "string" || !rawAccountId || rawAccountId.length > 1024) return "";
+  const { createHash } = require("node:crypto");
+  return `sha256:${createHash("sha256").update(`account-username:v1:${rawAccountId}`, "utf8").digest("hex")}`;
+}
+
+function storedAccountUsername(record, rawAccountId) {
+  const binding = accountUsernameBinding(rawAccountId);
+  return binding && record?.binding === binding ? safeUsername(record.username) : "";
+}
+
+async function updateAccountUsername(api, deps, paths, refs, message) {
+  try {
+    const ref = typeof message?.ref === "string" ? message.ref : "";
+    const filename = refs.get(ref);
+    if (!filename) throw coded("unknown-reference");
+    const requested = typeof message?.username === "string" ? message.username.trim() : null;
+    if (requested === null) throw coded("invalid-account-username");
+    const username = requested === "" ? "" : safeUsername(requested);
+    if (requested !== "" && !username) throw coded("invalid-account-username");
+    const rawAccountId = withSecureAuth(
+      deps.fs,
+      sourceFilePath(deps.path, paths.accountsDir, filename),
+      (snapshot) => authAccountId(snapshot.value),
+    );
+    const binding = accountUsernameBinding(rawAccountId);
+    if (!binding) throw coded("invalid-account-identity");
+    const usernames = await readAccountUsernames(api);
+    if (username) usernames[ref] = { username, binding };
+    else delete usernames[ref];
+    if (typeof api?.storage?.set !== "function") throw coded("account-username-unavailable");
+    await api.storage.set(ACCOUNT_USERNAMES_KEY, usernames);
+    await api.storage.flush?.();
+    return { ok: true, username: username || null };
+  } catch (error) {
+    return safeFailure(errorCode(error));
+  }
+}
+
+function listAccounts(deps, paths, refs, protection = null, usernames = {}) {
   try {
     refs.clear();
     const accountsDirectoryExists = deps.fs.existsSync(paths.accountsDir);
@@ -515,11 +587,15 @@ function listAccounts(deps, paths, refs, protection = null) {
       liveAccountId = withSecureAuth(deps.fs, paths.authFile, (live) => authAccountId(live.value));
     } catch {}
     const accounts = [];
+    const accountRecords = [];
+    let entryNames = [];
     if (accountsDirectoryExists) {
       const entries = deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })
         .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
         .sort((left, right) => left.name.localeCompare(right.name));
+      entryNames = entries.map((entry) => entry.name);
       const labels = savedSnapshotLabels(entries);
+      const identities = displaySnapshotIdentities(deps, paths, entries);
       for (const entry of entries) {
         const name = entry.name.slice(0, -5);
         try {
@@ -529,35 +605,83 @@ function listAccounts(deps, paths, refs, protection = null) {
           // already rendered on the buttons, so Switch failed with
           // "unknown-reference". A filename-derived hash stays valid across lists.
           const opaque = stableRef(entry.name);
-          const account = withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, entry.name), (auth) => ({
-            ref: opaque,
-            // This is the renderer boundary. `displayLabelFromAuth` deliberately
-            // excludes emails and provider fields; only a safe local label and a
-            // fixed permanent mask may cross into renderer-facing account rows.
-            label: labels.get(entry.name) || safeSnapshotLabel(auth.value, entry.name, 1),
-            identifierMasked: maskIdentifier(),
-            active: current.value === entry.name
-              && Boolean(liveAccountId)
-              && authAccountId(auth.value) === liveAccountId,
-            pluginProtection: publicReceiptStatus(
-              evaluatePluginReceipt(
-                protection?.receipts?.[authAccountId(auth.value)],
-                protection?.profile,
-                authAccountId(auth.value),
-                protection?.runtimeBinding,
-                deps.now(),
-              ),
-            ),
-          }));
+          const projectedIdentity = identities.get(entry.name) || {};
+          const record = withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, entry.name), (auth) => {
+            const rawAccountId = authAccountId(auth.value);
+            return {
+              filename: entry.name,
+              rawAccountId,
+              snapshotIdentity: auth.identity,
+              snapshotHash: auth.hash,
+              account: {
+                ref: opaque,
+                // This is the renderer boundary. Only explicit identity fields
+                // cross it: a safe display name, account email, and optional
+                // local username. Provider ids, tokens, paths, and filenames do not.
+                label: labels.get(entry.name) || safeSnapshotLabel(auth.value, entry.name, 1),
+                displayLabel: projectedIdentity.displayLabel || labels.get(entry.name) || "Saved account",
+                email: projectedIdentity.email || null,
+                username: storedAccountUsername(usernames?.[opaque], rawAccountId) || null,
+                identifierMasked: maskIdentifier(),
+                active: false,
+                pluginProtection: publicReceiptStatus(
+                  evaluatePluginReceipt(
+                    protection?.receipts?.[rawAccountId],
+                    protection?.profile,
+                    rawAccountId,
+                    protection?.runtimeBinding,
+                    deps.now(),
+                  ),
+                ),
+              },
+            };
+          });
           refs.set(opaque, entry.name);
-          accounts.push(account);
+          accountRecords.push(record);
+          accounts.push(record.account);
         } catch {}
       }
     }
+    let proofStable = false;
+    let finalCurrent = current;
+    try {
+      finalCurrent = readCurrentMarker(deps.fs, paths.currentMarker);
+      const finalLiveAccountId = withSecureAuth(deps.fs, paths.authFile, (live) => authAccountId(live.value));
+      const finalEntryNames = accountsDirectoryExists
+        ? deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+          .map((entry) => entry.name)
+          .sort((left, right) => left.localeCompare(right))
+        : [];
+      const snapshotsStable = entryNames.length === finalEntryNames.length
+        && entryNames.every((name, index) => name === finalEntryNames[index])
+        && accountRecords.every((record) => {
+          const observed = readSnapshotMetadata(deps, paths, record.filename);
+          return observed.accountId === record.rawAccountId
+            && observed.identity === record.snapshotIdentity
+            && observed.hash === record.snapshotHash;
+        });
+      proofStable = sameMarker(current, finalCurrent)
+        && liveAccountId === finalLiveAccountId
+        && snapshotsStable;
+    } catch {
+      proofStable = false;
+    }
+    const liveMatches = liveAccountId
+      ? accountRecords.filter((record) => record.rawAccountId === liveAccountId)
+      : [];
+    // Claim one current account only when the marker, live identity, and unique
+    // saved snapshot all agree. Duplicate or stale snapshots fail closed.
+    if (proofStable && current.status === "ok" && current.value && liveMatches.length === 1
+      && liveMatches[0].filename === current.value) {
+      liveMatches[0].account.active = true;
+    }
     accounts.sort((a, b) => a.label.localeCompare(b.label));
-    const markerStatus = current.value && !accounts.some((item) => item.active)
-      ? (accounts.some((item) => refs.get(item.ref) === current.value) ? "identity-mismatch" : "dangling-reference")
-      : current.status;
+    const markerStatus = !proofStable
+      ? "identity-mismatch"
+      : finalCurrent.value && !accounts.some((item) => item.active)
+        ? (accounts.some((item) => refs.get(item.ref) === finalCurrent.value) ? "identity-mismatch" : "dangling-reference")
+        : finalCurrent.status;
     return redact({ ok: true, accounts, markerStatus, pluginProtection: publicPluginProtection(protection) });
   } catch {
     return safeFailure("account-list-unavailable");
@@ -577,7 +701,7 @@ function prepareIntent(deps, paths, refs, intents, action, rawValue) {
       pruneIntents(intents, deps.now());
       const intent = deps.randomUUID();
       intents.set(intent, { action, target, snapshot, expiresAt: deps.now() + INTENT_TTL_MS });
-      return { ok: true, intent, confirmation: "Switch Codex to this saved session?" };
+      return { ok: true, intent, confirmation: "Switch to this saved account? Codex will restart to finish." };
     } else {
       target = validateReferenceName(rawValue);
       if (deps.fs.existsSync(sourcePath(deps.path, paths.accountsDir, target))) throw coded("account-exists");
@@ -586,7 +710,7 @@ function prepareIntent(deps, paths, refs, intents, action, rawValue) {
     pruneIntents(intents, deps.now());
     const intent = deps.randomUUID();
     intents.set(intent, { action, target, expiresAt: deps.now() + INTENT_TTL_MS });
-    return { ok: true, intent, confirmation: action === "switch" ? "Switch Codex to this saved session?" : "Save the current Codex session under this name?" };
+    return { ok: true, intent, confirmation: action === "switch" ? "Switch to this saved account? Codex will restart to finish." : "Save the account in use now under this name?" };
   } catch (error) {
     return safeFailure(errorCode(error));
   }
@@ -605,7 +729,7 @@ async function prepareSwitchWithPluginGuard(api, deps, paths, refs, intents, ref
     if (protection.profile.enforcement && !receipt.valid && !bypass) {
       return {
         ok: false,
-        error: { code: "plugin-protection-receipt-required", message: "A current remote plugin receipt is required before switching." },
+        error: { code: "plugin-protection-receipt-required", message: "This account must pass the plugin check before switching." },
         pluginProtection: publicReceiptStatus(receipt),
       };
     }
@@ -623,7 +747,7 @@ async function prepareSwitchWithPluginGuard(api, deps, paths, refs, intents, ref
     return {
       ...prepared,
       confirmation: intent.pluginProtection.bypass
-        ? "Switch once without a current plugin receipt? This bypass is only valid for this one switch."
+        ? "Switch once without a current plugin check? This approval applies only to this switch."
         : prepared.confirmation,
       pluginProtection: publicReceiptStatus(receipt),
     };
@@ -666,7 +790,7 @@ async function recheckPluginGuard(api, deps, paths, intent) {
   if (!receipt.valid) {
     return {
       ok: false,
-      error: { code: "plugin-protection-receipt-required", message: "A current remote plugin receipt is required before switching." },
+      error: { code: "plugin-protection-receipt-required", message: "This account must pass the plugin check before switching." },
       pluginProtection: publicReceiptStatus(receipt),
     };
   }
@@ -1738,8 +1862,16 @@ function completedHistoryAdoptionState(config, state, records) {
   return "adopted";
 }
 
-function historyAdoptionProjection(config, records = null, state = null) {
-  const required = { state: "required", ownerLabel: null, importedThreadCount: 0, databaseCount: 0, historyCount: 0 };
+function historyAdoptionProjection(config, records = null, state = null, refsByOpaqueId = null) {
+  const includeOwnerRef = refsByOpaqueId instanceof Map;
+  const required = {
+    state: "required",
+    ownerLabel: null,
+    ...(includeOwnerRef ? { ownerRef: null } : {}),
+    importedThreadCount: 0,
+    databaseCount: 0,
+    historyCount: 0,
+  };
   const source = records || {
     intent: null, receipt: null, owners: null, intentInvalid: false, receiptInvalid: false, ownersInvalid: false,
   };
@@ -1747,11 +1879,13 @@ function historyAdoptionProjection(config, records = null, state = null) {
   if (completed === "invalid" || completed === "mismatch") return { ...required, state: completed };
   const usableConfig = config?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && Array.isArray(config.accounts) && config.accounts.length === 2;
   if (completed === "adopted") {
-    const ownerLabel = historyOwnerLabel(config, source.receipt.legacyOwnerOpaqueAccountId);
+    const ownerOpaqueId = source.receipt.legacyOwnerOpaqueAccountId;
+    const ownerLabel = historyOwnerLabel(config, ownerOpaqueId);
     if (!ownerLabel) return { ...required, state: "mismatch" };
     return {
       state: "adopted",
       ownerLabel,
+      ...(includeOwnerRef ? { ownerRef: refsByOpaqueId.get(ownerOpaqueId) || null } : {}),
       importedThreadCount: source.receipt.importedThreadCount,
       databaseCount: source.receipt.databases.filter((entry) => entry.present).length,
       historyCount: source.receipt.histories.filter((entry) => entry.present).length,
@@ -1761,10 +1895,16 @@ function historyAdoptionProjection(config, records = null, state = null) {
   if (!source.intent) return required;
   if (!usableConfig) return { ...required, state: "mismatch" };
   const poolFingerprint = historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId));
-  const ownerLabel = historyOwnerLabel(config, source.intent.legacyOwnerOpaqueAccountId);
+  const ownerOpaqueId = source.intent.legacyOwnerOpaqueAccountId;
+  const ownerLabel = historyOwnerLabel(config, ownerOpaqueId);
   if (source.intent.poolFingerprint !== poolFingerprint || source.intent.configGeneration !== config.generation
     || source.intent.configFingerprint !== config.fingerprint || !ownerLabel) return { ...required, state: "mismatch" };
-  return { ...required, state: "pending_offline_adoption", ownerLabel };
+  return {
+    ...required,
+    state: "pending_offline_adoption",
+    ownerLabel,
+    ...(includeOwnerRef ? { ownerRef: refsByOpaqueId.get(ownerOpaqueId) || null } : {}),
+  };
 }
 
 function createHistoryAdoptionIntent(deps, config, legacyOwnerOpaqueAccountId, secret) {
@@ -2291,7 +2431,8 @@ async function recoverRouterAccount(_api, deps, paths, refs, message) {
     configPublished = true;
     const state = readRouterState(deps, routerPaths);
     const historyRecords = readHistoryAdoptionRecords(deps, routerPaths);
-    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords), live: { state: "not_running", status: null } };
+    const refsByOpaqueId = savedAccountRefsByOpaqueId(deps, paths, routerPaths);
+    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords, refsByOpaqueId), live: { state: "not_running", status: null } };
   } catch (error) {
     if (!configPublished) {
       try {
@@ -2332,7 +2473,58 @@ function routerDegradedReason(state) {
   return ({ protocol_drift: "unsupported_protocol", isolation_failure: "capability_mismatch", policy_stop: "policy_stop", post_start_failure: "post_start_failure" })[code] || null;
 }
 
-function routerPublicStatus(deps, config, state, historyRecords = null) {
+function savedAccountRefsByOpaqueId(deps, paths, routerPaths) {
+  let secret = null;
+  try {
+    secret = existingRouterSecret(deps, routerPaths);
+    const entries = deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const candidates = new Map();
+    for (const entry of entries) {
+      try {
+        validateReferenceName(entry.name.slice(0, -5));
+        const rawAccountId = withSecureAuth(
+          deps.fs,
+          sourceFilePath(deps.path, paths.accountsDir, entry.name),
+          (snapshot) => authAccountId(snapshot.value),
+        );
+        if (!rawAccountId) continue;
+        const opaqueId = opaqueAccountId(secret, rawAccountId);
+        const refs = candidates.get(opaqueId) || [];
+        refs.push(stableRef(entry.name));
+        candidates.set(opaqueId, refs);
+      } catch {}
+    }
+    const unique = new Map();
+    for (const [opaqueId, refs] of candidates) {
+      if (refs.length === 1) unique.set(opaqueId, refs[0]);
+    }
+    return unique;
+  } catch {
+    return new Map();
+  } finally {
+    clearSecretBuffer(secret);
+  }
+}
+
+function projectAuthenticatedRouterRefs(live, refsByOpaqueId) {
+  if (live?.state !== "active" || !isRecord(live.status) || !Array.isArray(live.status.accounts)) {
+    return live?.state ? { state: live.state, status: null } : { state: "unavailable", status: null };
+  }
+  const accounts = live.status.accounts.map((account) => {
+    const { opaqueAccountId: rawOpaqueId, ...publicAccount } = account;
+    return {
+      ...publicAccount,
+      ref: isOpaqueAccountId(rawOpaqueId) ? (refsByOpaqueId.get(rawOpaqueId) || null) : null,
+    };
+  });
+  return redact({ state: "active", status: { ...live.status, accounts } });
+}
+
+function routerPublicStatus(deps, config, state, historyRecords = null, refsByOpaqueId = null) {
+  const includeRefs = refsByOpaqueId instanceof Map;
+  const refMap = refsByOpaqueId instanceof Map ? refsByOpaqueId : new Map();
   if (!config) return {
     schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
     mode: "manual",
@@ -2343,7 +2535,7 @@ function routerPublicStatus(deps, config, state, historyRecords = null) {
     accounts: [],
     restartRequired: false,
     degradedReason: null,
-    historyAdoption: historyAdoptionProjection(null, historyRecords, state),
+    historyAdoption: historyAdoptionProjection(null, historyRecords, state, refsByOpaqueId),
   };
   if (config.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) {
     const invalid = config.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT;
@@ -2363,6 +2555,7 @@ function routerPublicStatus(deps, config, state, historyRecords = null) {
       },
       protocolState: invalid ? "unknown" : "supported",
       accounts: config.accounts.map((account, index) => ({
+        ...(includeRefs ? { ref: refMap.get(account.opaqueAccountId) || null } : {}),
         label: safeAccountLabel(account.label, `Account ${index + 1}`),
         eligibility: state?.accountEligibility?.[account.opaqueAccountId] || "validating",
         assignedThreadCount: Number.isInteger(state?.ledger?.[account.opaqueAccountId]?.assignedThreadCount)
@@ -2370,7 +2563,7 @@ function routerPublicStatus(deps, config, state, historyRecords = null) {
       })),
       restartRequired: true,
       degradedReason,
-      historyAdoption: historyAdoptionProjection(config, historyRecords, state),
+      historyAdoption: historyAdoptionProjection(config, historyRecords, state, refsByOpaqueId),
     });
   }
   const invalid = config.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT;
@@ -2382,6 +2575,7 @@ function routerPublicStatus(deps, config, state, historyRecords = null) {
     const output = Number.isInteger(ledger?.completedOutputTokens) ? ledger.completedOutputTokens : 0;
     const reserved = Number.isInteger(ledger?.reservedRequestCost) ? ledger.reservedRequestCost : 0;
     return {
+      ...(includeRefs ? { ref: refMap.get(account.opaqueAccountId) || null } : {}),
       label: index === 0 ? "Account A" : "Account B",
       eligibility: state?.accountEligibility?.[account.opaqueAccountId] || "validating",
       normalizedSpend: (completed + output + reserved) / account.weight,
@@ -2389,7 +2583,7 @@ function routerPublicStatus(deps, config, state, historyRecords = null) {
     };
   });
   const inFlight = Boolean(state?.reservations?.length || state?.correlations?.length || accounts.some((account) => ["validating", "reserved", "active"].includes(account.eligibility)));
-  return redact({ schemaVersion: ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION, mode, protocolState: invalid ? "unknown" : "supported", fairnessPrecision: inFlight ? "projected" : "exact_completed_spend", accounts, restartRequired: mode === "balanced" || mode === "direct_fallback", degradedReason, historyAdoption: historyAdoptionProjection(config, historyRecords, state) });
+  return redact({ schemaVersion: ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION, mode, protocolState: invalid ? "unknown" : "supported", fairnessPrecision: inFlight ? "projected" : "exact_completed_spend", accounts, restartRequired: mode === "balanced" || mode === "direct_fallback", degradedReason, historyAdoption: historyAdoptionProjection(config, historyRecords, state, refsByOpaqueId) });
 }
 
 async function routerStatus(_api, deps, paths) {
@@ -2400,11 +2594,13 @@ async function routerStatus(_api, deps, paths) {
   let live;
   try { live = await authenticatedRouterStatus(deps, routerPaths); }
   catch { live = { state: "unavailable", status: null }; }
+  const refsByOpaqueId = savedAccountRefsByOpaqueId(deps, paths, routerPaths);
+  live = projectAuthenticatedRouterRefs(live, refsByOpaqueId);
   try {
     const config = readRouterConfig(deps, routerPaths);
     const state = readRouterState(deps, routerPaths);
     const historyRecords = readHistoryAdoptionRecords(deps, routerPaths);
-    const router = routerPublicStatus(deps, config, state, historyRecords);
+    const router = routerPublicStatus(deps, config, state, historyRecords, refsByOpaqueId);
     return { ok: true, router, live };
   } catch {
     // A malformed/stale persisted control record never blocks manual behavior.
@@ -2482,23 +2678,28 @@ function requestAuthenticatedRouterStatus(deps, socketPath, secret) {
       if (response.length + chunk.length > ROUTER_CONTROL_FRAME_LIMIT) return finish({ state: "unavailable", status: null });
       response = Buffer.concat([response, chunk]);
     });
-    socket.once?.("end", () => finish({ state: "active", status: parseAuthenticatedRouterStatus(response, requestId) }));
+    socket.once?.("end", () => finish({
+      state: "active",
+      // Opaque ids exist only long enough for the main process to associate
+      // each runtime row with a renderer-safe saved-account ref.
+      status: parseAuthenticatedRouterStatus(response, requestId, true),
+    }));
     socket.once?.("error", (error) => finish({ state: error?.code === "ENOENT" || error?.code === "ECONNREFUSED" ? "not_running" : "unavailable", status: null }));
   }).then((result) => result.status ? result : { ...result, state: "unavailable" });
 }
 
-function parseAuthenticatedRouterStatus(bytes, requestId) {
+function parseAuthenticatedRouterStatus(bytes, requestId, includeOpaqueAccountIds = false) {
   try {
     const value = JSON.parse(bytes.toString("utf8"));
     if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["requestId", "status", "version"].join("\0")
       || value.version !== 1 || value.requestId !== requestId || !isRecord(value.status)) return null;
     const status = value.status;
-    if (status.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) return parseQuotaAwareRouterStatus(status);
-    return parseLegacyRouterStatus(status);
+    if (status.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) return parseQuotaAwareRouterStatus(status, includeOpaqueAccountIds);
+    return parseLegacyRouterStatus(status, includeOpaqueAccountIds);
   } catch { return null; }
 }
 
-function parseLegacyRouterStatus(status) {
+function parseLegacyRouterStatus(status, includeOpaqueAccountIds = false) {
   try {
     const allowed = ["accounts", "degradedReason", "fairnessPrecision", "mode", "protocolState", "restartRequired", "schemaVersion"];
     if (Object.keys(status).some((key) => !allowed.includes(key)) || status.schemaVersion !== ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION
@@ -2513,7 +2714,13 @@ function parseLegacyRouterStatus(status) {
         || !isOpaqueAccountId(account.opaqueAccountId) || !["Account A", "Account B"].includes(account.label)
         || !ROUTER_PUBLIC_ELIGIBILITY.has(account.eligibility) || !Number.isFinite(account.normalizedSpend) || account.normalizedSpend < 0
         || !Number.isInteger(account.assignedThreadCount) || account.assignedThreadCount < 0) return null;
-      accounts.push({ label: account.label, eligibility: account.eligibility, normalizedSpend: account.normalizedSpend, assignedThreadCount: account.assignedThreadCount });
+      accounts.push({
+        ...(includeOpaqueAccountIds ? { opaqueAccountId: account.opaqueAccountId } : {}),
+        label: account.label,
+        eligibility: account.eligibility,
+        normalizedSpend: account.normalizedSpend,
+        assignedThreadCount: account.assignedThreadCount,
+      });
     }
     return redact({ schemaVersion: status.schemaVersion, mode: status.mode, protocolState: status.protocolState, fairnessPrecision: status.fairnessPrecision, accounts, restartRequired: status.restartRequired, degradedReason: status.degradedReason });
   } catch { return null; }
@@ -2540,7 +2747,7 @@ function parseQuotaAwarePressure(value) {
   return Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value) : undefined;
 }
 
-function parseQuotaAwareRouterAccount(value) {
+function parseQuotaAwareRouterAccount(value, includeOpaqueAccountIds = false) {
   const allowed = ["assignedThreadCount", "eligibility", "identifierMasked", "label", "opaqueAccountId", "plan", "shortWindowPressure", "weekly"];
   if (!isRecord(value) || Object.keys(value).sort().join("\0") !== allowed.join("\0")
     || !isOpaqueAccountId(value.opaqueAccountId) || !ROUTER_PUBLIC_ELIGIBILITY.has(value.eligibility)
@@ -2551,6 +2758,7 @@ function parseQuotaAwareRouterAccount(value) {
   const shortWindowPressure = parseQuotaAwarePressure(value.shortWindowPressure);
   if (!weekly || shortWindowPressure === undefined) return null;
   return {
+    ...(includeOpaqueAccountIds ? { opaqueAccountId: value.opaqueAccountId } : {}),
     label: value.label,
     eligibility: value.eligibility,
     plan: value.plan,
@@ -2561,7 +2769,7 @@ function parseQuotaAwareRouterAccount(value) {
   };
 }
 
-function parseQuotaAwareRouterStatus(status) {
+function parseQuotaAwareRouterStatus(status, includeOpaqueAccountIds = false) {
   const allowed = ["accounts", "active", "degradedReason", "pending", "poolRemainingPercent", "protocolState", "restartRequired", "schemaVersion"];
   const active = parseQuotaAwareRouterIntent(status.active);
   const pending = status.pending === null ? null : parseQuotaAwareRouterIntent(status.pending);
@@ -2573,7 +2781,7 @@ function parseQuotaAwareRouterStatus(status) {
     || !(status.poolRemainingPercent === null || (Number.isFinite(status.poolRemainingPercent) && status.poolRemainingPercent >= 0 && status.poolRemainingPercent <= 200))
     || !active || (status.pending !== null && !pending)
     || !Array.isArray(status.accounts) || status.accounts.length !== 2) return null;
-  const accounts = status.accounts.map(parseQuotaAwareRouterAccount);
+  const accounts = status.accounts.map((account) => parseQuotaAwareRouterAccount(account, includeOpaqueAccountIds));
   if (accounts.some((account) => account === null)) return null;
   return redact({
     schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
@@ -2597,7 +2805,8 @@ async function configureRouter(_api, deps, paths, refs, message) {
     const routerPaths = config ? accountRouterPaths(deps, paths) : null;
     const historyRecords = routerPaths ? readHistoryAdoptionRecords(deps, routerPaths) : null;
     const state = routerPaths ? readRouterState(deps, routerPaths) : null;
-    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords) };
+    const refsByOpaqueId = savedAccountRefsByOpaqueId(deps, paths, routerPaths);
+    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords, refsByOpaqueId) };
   } catch (error) { return safeRouterFailure(error); }
 }
 
@@ -2713,7 +2922,7 @@ function startRenderer(api) {
   state.page = api.settings?.registerPage?.({
     id: "accounts",
     title: "Accounts",
-    description: "Saved ChatGPT accounts available on this Mac.",
+    description: "Use two saved ChatGPT accounts on this Mac.",
     iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="6.5" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M4 16c.7-3 2.7-4.5 6-4.5s5.3 1.5 6 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
     render(root) { return renderAccountsPage(state, root); },
   });
@@ -2729,7 +2938,7 @@ function renderAccountsPage(state, root) {
   ]).then(([response, routerStatus]) => {
     if (disposed) return;
     root.replaceChildren();
-    if (!response?.ok) { root.textContent = "Accounts are unavailable."; return; }
+    if (!response?.ok) { root.textContent = "Accounts cannot be loaded right now. Nothing was changed. Reopen Accounts to try again."; return; }
     state.pluginProtectionMode = response.pluginProtection?.mode || "observation";
     const savedAccounts = Array.isArray(response.accounts) ? response.accounts : [];
     // Routing is a fixed two-account pool. Manual access remains independent
@@ -2741,19 +2950,19 @@ function renderAccountsPage(state, root) {
     status.className = "text-token-text-secondary text-sm";
     status.setAttribute("role", "status");
     status.setAttribute("aria-live", "polite");
-    applyRouterPresentation(status, routerStatus?.router, routerStatus?.live, savedAccounts.length);
+    applyRouterPresentation(status, routerStatus?.router, routerStatus?.live, savedAccounts);
     state.statusElement = status;
     const page = document.createElement("div");
     page.className = "flex flex-col gap-6";
     page.append(usageSummaryCard(accounts, liveStatus));
-    page.append(accountCards(accounts, liveStatus));
+    page.append(accountCards(state, accounts, liveStatus, routerStatus?.live));
     page.append(routerControlCard(state, accounts, routerStatus));
-    page.append(historyAdoptionCard(routerStatus?.router?.historyAdoption));
+    page.append(historyAdoptionCard(routerStatus?.router?.historyAdoption, accounts));
     page.append(accountRecoveryCard(state, accounts, savedAccounts.length, liveStatus, status));
-    page.append(advancedAccountsCard(state, savedAccounts, response.pluginProtection, status));
+    page.append(advancedAccountsCard(state, savedAccounts, response.pluginProtection, status, routerStatus?.live));
     page.append(status);
     root.append(page);
-  }).catch(() => { if (!disposed) root.textContent = "Accounts are unavailable."; });
+  }).catch(() => { if (!disposed) root.textContent = "Accounts cannot be loaded right now. Nothing was changed. Reopen Accounts to try again."; });
   return () => { disposed = true; root.replaceChildren(); };
 }
 
@@ -2774,11 +2983,35 @@ function quotaPoolRemainingPercent(accounts) {
 
 function accountDetailsFor(account, liveStatus) {
   if (liveStatus?.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION || !Array.isArray(liveStatus.accounts)) return null;
-  // The safe local label is the only renderer-visible join key. Opaque account
-  // ids stay inside the router boundary and are never rendered or persisted by
-  // this UI layer.
-  const candidates = liveStatus.accounts.filter((candidate) => candidate?.label === account.label);
+  // The main process privately associates opaque router identity with the
+  // filename-derived renderer ref. Visible labels, emails, and usernames never
+  // decide which quota or eligibility row belongs to an account.
+  const candidates = liveStatus.accounts.filter((candidate) => candidate?.ref === account.ref);
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+function accountDisplayLabel(account) {
+  return safeAccountLabel(account?.displayLabel, safeAccountLabel(account?.label, "Saved account"));
+}
+
+function accountIdentitySummary(account) {
+  const parts = [];
+  const username = safeUsername(account?.username);
+  const email = safeEmail(account?.email);
+  if (username) parts.push(`@${username}`);
+  if (email) parts.push(email);
+  return parts.join(" · ");
+}
+
+function accountUsingNow(account, live) {
+  return account?.active === true && live?.state === "not_running";
+}
+
+function accountChoiceLabel(account, usingNow = false) {
+  const identity = accountIdentitySummary(account);
+  const parts = [accountDisplayLabel(account)];
+  if (identity) parts.push(identity);
+  return `${parts.join(" — ")}${usingNow ? " (Using now)" : ""}`;
 }
 
 function initials(label) {
@@ -2796,7 +3029,8 @@ function accountAvatar(label) {
 
 function quotaSummaryText(liveStatus) {
   const pool = quotaPoolRemainingPercent(liveStatus?.accounts);
-  return pool === null ? "Usage unavailable" : `${pool}% left`;
+  if (pool === null) return liveStatus ? "Cannot check right now" : "Not available yet";
+  return `${pool}% total`;
 }
 
 function usageSummaryCard(accounts, liveStatus) {
@@ -2807,10 +3041,10 @@ function usageSummaryCard(accounts, liveStatus) {
   copy.className = "flex min-w-0 flex-col gap-1";
   const title = document.createElement("div");
   title.className = "min-w-0 text-sm text-token-text-primary";
-  title.textContent = "Usage remaining";
+  title.textContent = "Weekly usage left";
   const detail = document.createElement("div");
   detail.className = "text-token-text-secondary min-w-0 text-sm";
-  detail.textContent = accounts.length === 2 ? "2 connected subscriptions" : "Set up exactly two saved subscriptions";
+  detail.textContent = accounts.length === 2 ? "2 connected accounts" : "Save exactly two accounts";
   copy.append(title, detail);
   const value = document.createElement("div");
   value.className = "shrink-0 text-sm text-token-text-secondary";
@@ -2820,12 +3054,55 @@ function usageSummaryCard(accounts, liveStatus) {
   return card;
 }
 
-function accountCards(accounts, liveStatus) {
+function usernameEditorButton(state, account, identityText) {
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "text-token-text-secondary hover:text-token-text-primary text-xs underline underline-offset-2";
+  edit.textContent = safeUsername(account?.username) ? "Edit username" : "Add username";
+  edit.setAttribute("aria-label", `${edit.textContent} for ${accountDisplayLabel(account)}`);
+  edit.addEventListener("click", async () => {
+    const entered = window.prompt(
+      `Username for ${accountDisplayLabel(account)} (without @). Leave blank to remove it.`,
+      safeUsername(account?.username),
+    );
+    if (entered === null) return;
+    const requested = entered.trim();
+    if (requested && !safeUsername(requested)) {
+      window.alert("Use only letters, numbers, dots, dashes, or underscores for the username.");
+      return;
+    }
+    try {
+      const result = await state.api.ipc.invoke(IPC, {
+        action: "account-username-set",
+        ref: account.ref,
+        username: requested,
+      });
+      if (!result?.ok) {
+        alertFailure(state, "The username could not be saved safely.", result);
+        return;
+      }
+      account.username = result.username || null;
+      identityText.textContent = accountIdentitySummary(account) || "Account email not available yet";
+      edit.textContent = account.username ? "Edit username" : "Add username";
+      edit.setAttribute("aria-label", `${edit.textContent} for ${accountDisplayLabel(account)}`);
+      if (state.statusElement) {
+        state.statusElement.textContent = account.username
+          ? `Username @${account.username} was saved locally for ${accountDisplayLabel(account)}.`
+          : `The local username was removed from ${accountDisplayLabel(account)}.`;
+      }
+    } catch {
+      window.alert("The username could not be saved safely.");
+    }
+  });
+  return edit;
+}
+
+function accountCards(state, accounts, liveStatus, live) {
   const card = settingsCard();
   if (accounts.length !== 2) {
     const row = document.createElement("div");
     row.className = "p-3 text-sm text-token-text-secondary";
-    row.textContent = "Quota-aware routing uses exactly two saved subscriptions. Manual switching remains available in Advanced for every saved account.";
+    row.textContent = "Automatic routing needs exactly two saved accounts. You can still switch to any saved account yourself below.";
     card.append(row);
     return card;
   }
@@ -2839,23 +3116,29 @@ function accountCards(accounts, liveStatus) {
     copy.className = "flex min-w-0 flex-col gap-1";
     const title = document.createElement("div");
     title.className = "truncate text-sm text-token-text-primary";
-    title.textContent = account.label;
+    title.textContent = accountDisplayLabel(account);
+    const identityRow = document.createElement("div");
+    identityRow.className = "flex min-w-0 items-center gap-2";
+    const identityText = document.createElement("span");
+    identityText.className = "text-token-text-secondary truncate text-xs";
+    identityText.textContent = accountIdentitySummary(account) || "Account email not available yet";
+    identityRow.append(identityText, usernameEditorButton(state, account, identityText));
     const meta = document.createElement("div");
     meta.className = "text-token-text-secondary truncate text-sm";
-    const plan = detail?.plan || "Plan unavailable";
-    const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly remaining` : "Weekly usage unavailable";
-    meta.textContent = `${plan} · ${maskIdentifier(detail?.identifierMasked)} · ${weekly}`;
-    copy.append(title, meta);
-    identity.append(accountAvatar(account.label), copy);
-    const state = document.createElement("div");
-    state.className = "text-token-text-secondary shrink-0 text-right text-sm";
-    const freshness = detail?.weekly?.freshness || "unknown";
+    const plan = detail?.plan || "Plan not available yet";
+    const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly usage left` : "Weekly usage not available yet";
+    meta.textContent = `${plan} · ${weekly}`;
+    copy.append(title, identityRow, meta);
+    identity.append(accountAvatar(accountDisplayLabel(account)), copy);
+    const statusNode = document.createElement("div");
+    statusNode.className = "text-token-text-secondary shrink-0 text-right text-sm";
+    const freshness = detail?.weekly?.freshness === "fresh" ? "Usage is current" : "Usage not checked";
     const reset = detail?.weekly?.resetAt ? ` · resets ${formatResetAt(detail.weekly.resetAt)}` : "";
     const threads = Number.isInteger(detail?.assignedThreadCount) ? ` · ${detail.assignedThreadCount} assigned ${detail.assignedThreadCount === 1 ? "thread" : "threads"}` : "";
-    const pressure = detail?.shortWindowPressure === null || detail?.shortWindowPressure === undefined
-      ? "" : ` · short window ${String(detail.shortWindowPressure)}`;
-    state.textContent = `${routerEligibilityLabel(detail?.eligibility)} · ${freshness}${reset}${threads}${pressure}`;
-    row.append(identity, state);
+    const usingNow = accountUsingNow(account, live);
+    statusNode.textContent = `${usingNow ? "Using now" : routerEligibilityLabel(detail?.eligibility)} · ${freshness}${reset}${threads}`;
+    statusNode.setAttribute("aria-label", usingNow ? `${accountDisplayLabel(account)} is the account in use now` : `${accountDisplayLabel(account)} account status`);
+    row.append(identity, statusNode);
     card.append(row);
   }
   return card;
@@ -2867,13 +3150,13 @@ function formatResetAt(value) {
 }
 
 function routerEligibilityLabel(value) {
-  if (value === "reauth_required") return "Reauthentication needed";
-  if (value === "quota_depleted") return "Weekly quota used";
-  if (value === "active") return "Active";
-  if (value === "eligible") return "Ready";
-  if (value === "validating") return "Checking";
-  if (value === "plugin_blocked") return "Plugin protection blocked";
-  return "Status unavailable";
+  if (value === "reauth_required") return "Sign in again";
+  if (value === "quota_depleted") return "Weekly usage used up";
+  if (value === "active") return "Ready for new conversations";
+  if (value === "eligible") return "Ready for new conversations";
+  if (value === "validating") return "Checking account";
+  if (value === "plugin_blocked") return "Plugin check is blocking this account";
+  return "Status not available yet";
 }
 
 function routerControlCard(state, accounts, initialStatus = null) {
@@ -2882,10 +3165,10 @@ function routerControlCard(state, accounts, initialStatus = null) {
   summary.className = "flex flex-col gap-1 p-3";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Quota-aware routing";
+  title.textContent = "Automatic routing for new conversations";
   const description = document.createElement("div");
   description.className = "text-sm text-token-text-secondary";
-  description.textContent = "New work can use the two enrolled accounts according to their available weekly quota. Staging a change never restarts ChatGPT.";
+  description.textContent = "New conversations can use either saved account based on weekly usage left. Each conversation stays with the account that started it. Saving this setup does not restart Codex.";
   summary.append(title, description);
   const body = document.createElement("div");
   body.className = "flex flex-wrap items-center justify-between gap-3 p-3";
@@ -2893,29 +3176,29 @@ function routerControlCard(state, accounts, initialStatus = null) {
   status.className = "text-token-text-secondary min-w-0 text-sm";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  applyRouterPresentation(status, initialStatus?.router, initialStatus?.live, accounts.length);
+  applyRouterPresentation(status, initialStatus?.router, initialStatus?.live, accounts);
   const controls = document.createElement("div");
   controls.className = "flex flex-wrap items-center gap-2";
   const historyOwner = document.createElement("select");
   historyOwner.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer max-w-[240px] rounded-md border px-3 text-sm text-token-text-primary";
-  historyOwner.setAttribute("aria-label", "Keep my existing history with");
+  historyOwner.setAttribute("aria-label", "Which account should keep my existing conversations?");
   const historyPrompt = document.createElement("option");
   historyPrompt.value = "";
-  historyPrompt.textContent = "Keep my existing history with…";
+  historyPrompt.textContent = "Choose where current conversations stay";
   historyPrompt.disabled = true;
   historyPrompt.selected = true;
   historyOwner.append(historyPrompt);
   for (const account of accounts) {
     const option = document.createElement("option");
     option.value = account.ref;
-    option.textContent = account.label;
+    option.textContent = accountChoiceLabel(account, accountUsingNow(account, initialStatus?.live));
     historyOwner.append(option);
   }
   let legacyOwnerRef = null;
   const stage = document.createElement("button");
   stage.type = "button";
   stage.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary disabled:cursor-not-allowed disabled:opacity-60";
-  stage.textContent = "Stage quota-aware routing";
+  stage.textContent = "Set up automatic routing";
   const updateStageAvailability = () => { stage.disabled = accounts.length !== 2 || legacyOwnerRef === null; };
   updateStageAvailability();
   historyOwner.addEventListener("change", () => {
@@ -2925,11 +3208,11 @@ function routerControlCard(state, accounts, initialStatus = null) {
   stage.addEventListener("click", async () => {
     if (accounts.length !== 2) { reportRouterControlFailure(state, status, "router-requires-exactly-two-accounts"); return; }
     if (!legacyOwnerRef) { reportRouterControlFailure(state, status, "router-history-owner-required"); return; }
-    status.textContent = "Staging selected account homes and offline history adoption intent…";
+    status.textContent = "Saving the two-account setup. Nothing changes until the conversation step is finished and Codex restarts.";
     try {
       const primary = accounts.find((account) => account.active) || accounts[0];
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "quota_aware", refs: accounts.map((account) => account.ref), primaryRef: primary.ref, legacyOwnerRef, weights: [1, 1] });
-      if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts.length);
+      if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts);
       else reportRouterControlFailure(state, status, result?.error?.code);
     } catch { reportRouterControlFailure(state, status); }
   });
@@ -2939,7 +3222,7 @@ function routerControlCard(state, accounts, initialStatus = null) {
   return card;
 }
 
-function historyAdoptionCard(projection) {
+function historyAdoptionCard(projection, accounts = []) {
   const history = projection && ["required", "pending_offline_adoption", "adopted", "invalid", "mismatch"].includes(projection.state)
     ? projection : { state: "required", ownerLabel: null, importedThreadCount: 0, databaseCount: 0, historyCount: 0 };
   const card = settingsCard();
@@ -2947,19 +3230,23 @@ function historyAdoptionCard(projection) {
   row.className = "flex min-w-0 flex-col gap-1 p-3";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Existing history";
+  title.textContent = "Your current conversations";
   const detail = document.createElement("div");
   detail.className = "text-token-text-secondary text-sm";
+  const ownerAccount = accounts.find((account) => history.ownerRef && account.ref === history.ownerRef);
+  // The saved router label may be an old generic filename such as account-2.
+  // Only a main-projected, renderer-safe ref may select a visible identity.
+  const ownerDisplayLabel = ownerAccount ? accountDisplayLabel(ownerAccount) : "";
   if (history.state === "pending_offline_adoption") {
-    detail.textContent = `${history.ownerLabel || "The selected account"} is selected for an offline history-adoption step later. No live routing or history has changed.`;
+    detail.textContent = `${ownerDisplayLabel || "The selected account"} will keep your current conversations. Next, quit Codex and finish the offline conversation setup. Nothing has moved yet.`;
   } else if (history.state === "adopted") {
-    detail.textContent = `${history.ownerLabel || "The selected account"} has adopted existing history offline: ${history.importedThreadCount} threads across ${history.databaseCount} data stores and ${history.historyCount} history groups. Live routing remains separately reported.`;
+    detail.textContent = `Current conversations are assigned to ${ownerDisplayLabel || "the selected account"}: ${history.importedThreadCount} conversations across ${history.databaseCount} data stores and ${history.historyCount} history groups.`;
   } else if (history.state === "invalid") {
-    detail.textContent = "The saved offline history-adoption record could not be verified. No live routing or history change is being claimed.";
+    detail.textContent = "We could not verify the saved conversation setup. No new conversation change was made.";
   } else if (history.state === "mismatch") {
-    detail.textContent = "The saved history-adoption record belongs to a different account pool or selected owner. No live routing or history change is being claimed.";
+    detail.textContent = "The saved conversation setup belongs to different accounts. No new conversation change was made.";
   } else {
-    detail.textContent = "Choose one of the two selected saved accounts before staging. History adoption is an offline step later; no live routing or history changes now.";
+    detail.textContent = "Choose which account should keep the conversations you already have. Saving this choice does not move anything or restart Codex.";
   }
   row.append(title, detail);
   card.append(row);
@@ -2969,61 +3256,58 @@ function historyAdoptionCard(projection) {
 function routerPresentation(router, live, savedSnapshotCount) {
   const savedCount = Number.isInteger(savedSnapshotCount) && savedSnapshotCount >= 0 ? savedSnapshotCount : 0;
   const liveStatus = live?.state === "active" && isRecord(live.status) ? live.status : null;
-  if (liveStatus?.degradedReason) return { label: "Router needs attention", message: `The router reported ${String(liveStatus.degradedReason).replace(/_/g, " ")}. No live fallback state is being claimed here.`, accounts: [] };
+  if (liveStatus?.degradedReason) return { label: "Automatic routing needs attention", message: "Codex reported a routing problem. New conversations will pause rather than use the wrong account.", accounts: [] };
   if (liveStatus?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) {
     const active = liveStatus.active;
     const pending = liveStatus.pending;
-    const diskNotice = router?.degradedReason
-      ? " The staged local record needs attention, but it does not replace authenticated live status."
+    const savedSetupNotice = router?.degradedReason
+      ? " The saved setup needs attention, but it does not replace the routing already running."
       : "";
     if (active?.mode === "quota_aware") return {
-      label: "Quota-aware routing is active",
+      label: "Automatic routing is on",
       message: pending
-        ? `Active ${routerIntentSummary(active)}. Pending ${routerIntentSummary(pending)} will apply only after a separately confirmed restart.${diskNotice}`
-        : `Active ${routerIntentSummary(active)} from the authenticated local router.${diskNotice}`,
+        ? `Automatic routing is running for new conversations. A saved routing change will apply after you restart Codex. Current conversations stay with their assigned account.${savedSetupNotice}`
+        : `New conversations can use either account. Current conversations stay with the account that started them.${savedSetupNotice}`,
       accounts: Array.isArray(liveStatus.accounts) ? liveStatus.accounts : [],
     };
     if (pending) return {
-      label: "Routing change staged",
-      message: `Pending ${routerIntentSummary(pending)} will take effect only after a separately confirmed restart. Current live routing is unchanged.${diskNotice}`,
+      label: "Routing change saved — not active yet",
+      message: "The saved change will apply after you restart Codex. The running app has not changed.",
       accounts: [],
     };
-    if (active?.mode === "manual") return { label: "Manual routing is active", message: `Active ${routerIntentSummary(active)} from the authenticated local router.${diskNotice}`, accounts: [] };
-    return { label: "Router status unavailable", message: `No active router generation was provided by the authenticated local socket.${diskNotice}`, accounts: [] };
+    if (active?.mode === "manual") return { label: "Manual routing is on", message: "You choose which account to use for new conversations.", accounts: [] };
+    return { label: "Routing status cannot be checked", message: "No routing change is being claimed.", accounts: [] };
   }
   if (liveStatus?.mode === "balanced") {
     return {
-      label: "Running Balanced",
-      message: "Balanced routing is running. Account and thread counts below come from the authenticated local mux.",
+      label: "Automatic routing is on",
+      message: "New conversations can use either account. Current conversations stay with their assigned account.",
       accounts: Array.isArray(liveStatus.accounts) ? liveStatus.accounts : [],
     };
   }
-  if (router?.degradedReason) return { label: "Router needs attention", message: `The staged router record reported ${String(router.degradedReason).replace(/_/g, " ")}. No live fallback state is being claimed here.`, accounts: [] };
+  if (router?.degradedReason) return { label: "Automatic routing needs attention", message: "The saved setup could not be verified. The running routing has not changed.", accounts: [] };
   if (router?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && router?.pending?.mode === "manual"
     && router?.historyAdoption?.state === "adopted") return {
-    label: "Manual new-thread assignment pending",
-    message: "Manual routing is staged only for new-thread assignment after a separately confirmed restart. Existing adopted history is not globally restored or reassigned.",
+    label: "Manual routing is saved — not active yet",
+    message: "After the next restart, you will choose the account for new conversations. Current conversations will stay with their assigned account.",
     accounts: [],
   };
   if (router?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && router?.pending) return {
-    label: "Routing change staged",
-    message: "The saved policy is pending. It does not claim that live routing has changed.",
+    label: "Automatic routing setup is saved — not active yet",
+    message: "Finish the conversation setup, then restart Codex when you are ready. The running app has not changed.",
     accounts: [],
   };
-  if (router?.mode === "direct_fallback") return { label: "Fallback staged", message: "A direct fallback is staged. Live state could not be verified from the authenticated local router.", accounts: [] };
-  if (router?.mode === "balanced" || router?.restartRequired) return { label: "Balanced staged - restart required", message: "Balanced mode is staged but not running yet. A later separately authorized restart is required.", accounts: [] };
-  if (savedCount === 0) return { label: "Not configured", message: "Manual switching is active. Save two account snapshots before quota-aware routing can be staged.", accounts: [] };
-  if (savedCount === 1) return { label: "Save two accounts", message: "Manual switching is active. One more saved snapshot is needed before quota-aware routing can be staged.", accounts: [] };
-  if (savedCount === 2) return { label: "Ready to stage", message: "Manual switching is active. Explicitly stage quota-aware routing when ready.", accounts: [] };
-  return { label: "Manual", message: "Manual switching is active. Quota-aware routing is available only while exactly two snapshots are saved.", accounts: [] };
+  if (router?.mode === "direct_fallback") return { label: "Manual fallback is saved", message: "Restart Codex to apply it. Current routing could not be checked.", accounts: [] };
+  if (router?.mode === "balanced" || router?.restartRequired) return { label: "Automatic routing setup is saved — not active yet", message: "Restart Codex later to apply it. The running app has not changed.", accounts: [] };
+  if (savedCount === 0) return { label: "Save two accounts", message: "Save this account, switch to your other account, then save that one too.", accounts: [] };
+  if (savedCount === 1) return { label: "Save one more account", message: "Switch to your other account and save it here.", accounts: [] };
+  if (savedCount === 2) return { label: "Ready to set up", message: "Both accounts are saved. Choose where current conversations stay, then set up automatic routing.", accounts: [] };
+  return { label: "Automatic routing unavailable", message: "Automatic routing needs exactly two saved accounts. You can still switch accounts yourself below.", accounts: [] };
 }
 
-function routerIntentSummary(intent) {
-  const fingerprint = typeof intent?.fingerprint === "string" ? intent.fingerprint.slice(7, 19) : "unknown";
-  return `generation ${intent?.generation ?? "unknown"} (${fingerprint})`;
-}
-
-function applyRouterPresentation(status, router, live, savedCount) {
+function applyRouterPresentation(status, router, live, savedAccountsOrCount) {
+  const savedAccounts = Array.isArray(savedAccountsOrCount) ? savedAccountsOrCount : [];
+  const savedCount = Array.isArray(savedAccountsOrCount) ? savedAccountsOrCount.length : savedAccountsOrCount;
   const presentation = routerPresentation(router, live, savedCount);
   status.replaceChildren?.();
   const label = document.createElement("span");
@@ -3037,7 +3321,9 @@ function applyRouterPresentation(status, router, live, savedCount) {
     list.className = "mt-2 list-disc pl-5 text-token-text-secondary";
     for (const account of presentation.accounts) {
       const item = document.createElement("li");
-      item.textContent = `${account.label}: ${account.assignedThreadCount} assigned ${account.assignedThreadCount === 1 ? "thread" : "threads"} (${account.eligibility}).`;
+      const saved = savedAccounts.find((candidate) => account.ref && candidate.ref === account.ref);
+      const displayLabel = accountDisplayLabel(saved || account);
+      item.textContent = `${displayLabel}: ${account.assignedThreadCount} assigned ${account.assignedThreadCount === 1 ? "conversation" : "conversations"} · ${routerEligibilityLabel(account.eligibility)}.`;
       list.append(item);
     }
     status.append(list);
@@ -3052,75 +3338,81 @@ function accountRecoveryCard(state, accounts, savedSnapshotCount, liveStatus, st
   copy.className = "flex min-w-0 flex-col gap-1";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Set up and recover";
+  title.textContent = "Connect or repair accounts";
   const note = document.createElement("div");
   note.className = "text-token-text-secondary text-sm";
   const stale = accounts.find((account) => accountDetailsFor(account, liveStatus)?.eligibility === "reauth_required");
+  const staleLabel = stale ? accountDisplayLabel(stale) : null;
   note.textContent = stale
-    ? `${stale.label} needs reauthentication. Use its Manual switch row to sign in, then refresh this existing saved account while the router is stopped.`
+    ? `${staleLabel} needs you to sign in again. Switch to it below, sign in, then return here and refresh it.`
     : savedSnapshotCount === 2
-      ? "The two saved subscriptions are ready to review. Original snapshots stay unchanged during router setup."
+      ? "Both accounts are saved. Check their names before setting up automatic routing."
       : savedSnapshotCount > 2
-        ? "Quota-aware routing needs exactly two saved subscriptions. Manual switching remains available below for every saved account."
-        : "Save the current account until exactly two subscriptions are available.";
+        ? "Automatic routing needs exactly two saved accounts. Every saved account is still available for manual switching below."
+        : savedSnapshotCount === 1
+          ? "One account is saved. Switch to your other account and save it here too."
+          : "Save this account, switch to your other account, then save that account too.";
+  if (accounts.some((account) => /^account-\d+$/i.test(account?.label || ""))) {
+    note.textContent += " Old saved-account numbers can skip, so a missing number does not mean an account is missing.";
+  }
   copy.append(title, note);
   const save = document.createElement("button");
   save.type = "button";
   save.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer shrink-0 rounded-md border px-3 text-sm text-token-text-primary";
-  save.textContent = stale ? "Refresh reauthenticated account" : "Save current account";
+  save.textContent = stale ? `Refresh ${staleLabel}` : "Save this account";
   save.addEventListener("click", async () => {
     if (stale) {
-      status.textContent = "Checking that the router is stopped before refreshing this account…";
+      status.textContent = `Checking that routing is stopped before refreshing ${staleLabel}…`;
       try {
         const refreshed = await state.api.ipc.invoke(IPC, { action: "router-recover", ref: stale.ref });
         status.textContent = refreshed?.ok
-          ? "The existing saved account and isolated home were refreshed. The pending generation needs a separately confirmed restart; no live routing change is claimed."
+          ? `${staleLabel} was refreshed. Restart Codex later to use the updated routing. Current routing has not changed.`
           : routerControlFailure(refreshed?.error?.code).message;
       } catch { status.textContent = "The reauthenticated account could not be refreshed safely."; }
       return;
     }
-    status.textContent = "Saving the current account…";
+    status.textContent = "Saving this account…";
     const saved = await saveCurrentFromMenu(state);
-    status.textContent = saved ? "Current account saved. Reopen Accounts to refresh the two subscriptions." : "No account was saved.";
+    status.textContent = saved ? "Account saved. Reopen Accounts to refresh the list." : "No account was saved.";
   });
   row.append(copy, save);
   card.append(row);
   return card;
 }
 
-function advancedAccountsCard(state, accounts, protection, status) {
+function advancedAccountsCard(state, accounts, protection, status, live = null) {
   const card = settingsCard();
   const header = document.createElement("div");
   header.className = "flex flex-col gap-1 p-3";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Advanced";
+  title.textContent = "Choose an account yourself";
   const note = document.createElement("div");
   note.className = "text-token-text-secondary text-sm";
-  note.textContent = "Manual switching, staged rollback, and remote-plugin protection.";
+  note.textContent = "Manual switching is always available. Routing changes apply only after Codex restarts.";
   header.append(title, note);
   const manualRow = document.createElement("div");
   manualRow.className = "flex flex-wrap items-center justify-between gap-3 p-3";
   const manualCopy = document.createElement("div");
   manualCopy.className = "text-token-text-secondary text-sm";
-  manualCopy.textContent = "Stage manual routing for the next confirmed restart. Existing isolated account homes are preserved.";
+  manualCopy.textContent = "Use one account at a time after your next restart. Both saved accounts and their conversation setup will be kept.";
   const manual = document.createElement("button");
   manual.type = "button";
   manual.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
-  manual.textContent = "Stage manual routing";
+  manual.textContent = "Use manual routing after restart";
   manual.disabled = false;
   manual.addEventListener("click", async () => {
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
       status.textContent = result?.ok
-        ? "Manual routing is staged for the next confirmed restart; current live routing is unchanged."
+        ? "Manual routing is ready for the next restart. Current routing has not changed."
         : routerControlFailure(result?.error?.code).message;
-    } catch { status.textContent = "Manual routing could not be staged safely."; }
+    } catch { status.textContent = "Manual routing could not be saved."; }
   });
   manualRow.append(manualCopy, manual);
   const switches = document.createElement("div");
   switches.className = "flex flex-col divide-y-[0.5px] divide-token-border";
-  for (const account of accounts) switches.append(accountButton(state, account));
+  for (const account of accounts) switches.append(accountButton(state, account, live));
   card.append(header, manualRow, switches, pluginProtectionCard(state, protection));
   return card;
 }
@@ -3133,47 +3425,47 @@ function pluginProtectionCard(state, protection) {
   summary.className = "flex flex-col gap-1 p-3";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Remote plugin protection";
+  title.textContent = "Plugin check before switching";
   const description = document.createElement("div");
   description.className = "text-sm text-token-text-secondary";
   const names = (info.baseline || []).map((plugin) => plugin.name || plugin.id).join(", ");
-  description.textContent = `Required baseline: ${names || "None"}. Current receipt: ${pluginStatusLabel(info.active)}.`;
+  description.textContent = `Checks whether this account has the required plugins: ${names || "none"}. Last check: ${pluginStatusLabel(info.active)}.`;
   summary.append(title, description);
   const actions = document.createElement("div");
   actions.className = "flex flex-wrap items-center justify-between gap-3 p-3";
   const note = document.createElement("div");
   note.className = "max-w-xl text-sm text-token-text-secondary";
   note.textContent = info.mode === "enforcement"
-    ? "Enforcement blocks switches to accounts without a current receipt."
-    : "Observation mode shows receipt status and warns before switching, but does not block it.";
+    ? "Blocking is on. An account must pass the plugin check before switching, but you can approve one switch when needed."
+    : "Warnings only are on. You will see a warning when an account has not passed the plugin check, but you can still switch.";
   const controls = document.createElement("div");
   controls.className = "flex items-center gap-2";
   const verify = document.createElement("button");
   verify.type = "button";
   verify.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
-  verify.textContent = "Reconcile & Verify";
-  verify.title = "Codex will reconcile the current account's remote plugin bundles. It may add or remove locally cached bundles; it does not change server-installed plugins or OAuth connections.";
+  verify.textContent = "Check plugins";
+  verify.title = "Check and refresh local plugin copies for this account. This does not change plugins installed on the account or its connections.";
   verify.addEventListener("click", async () => {
-    if (!window.confirm("Reconcile and verify the current account’s remote plugins? Codex may add or remove locally cached remote bundles for this account. This does not change the server-installed profile or OAuth connections.")) return;
-    if (state.statusElement) state.statusElement.textContent = "Verifying the current account’s remote plugin inventory…";
+    if (!window.confirm("Check plugins for the account in use now? Codex may add or remove local cached copies. It will not change plugins installed on the account or its connections.")) return;
+    if (state.statusElement) state.statusElement.textContent = "Checking plugins for the account in use now…";
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "plugin-protection-verify-current" });
       if (state.statusElement) state.statusElement.textContent = result?.ok
-        ? "Current account receipt verified. Reopen this page to refresh status."
-        : "Verification did not prove the required remote plugins; no receipt was refreshed.";
-    } catch { if (state.statusElement) state.statusElement.textContent = "Verification was unavailable; no receipt was refreshed."; }
+        ? "Plugin check passed. Reopen Accounts to refresh the status."
+        : "The check did not find every required plugin. This account was not marked as checked.";
+    } catch { if (state.statusElement) state.statusElement.textContent = "Plugin checking is unavailable right now. Nothing was changed."; }
   });
   const mode = document.createElement("button");
   mode.type = "button";
   mode.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
-  mode.textContent = info.mode === "enforcement" ? "Use Observation" : "Enable Enforcement";
+  mode.textContent = info.mode === "enforcement" ? "Use warnings only" : "Block unchecked switches";
   mode.addEventListener("click", async () => {
     const enabling = info.mode !== "enforcement";
-    if (enabling && !window.confirm("Enable enforcement? A target account without a current plugin receipt will be blocked, but you can explicitly bypass one switch.")) return;
+    if (enabling && !window.confirm("Block switches to accounts that have not passed the plugin check? You can still approve a one-time switch.")) return;
     try {
       const result = await state.api.ipc.invoke(IPC, { action: "plugin-protection-configure", enforcement: enabling });
-      if (state.statusElement) state.statusElement.textContent = result?.ok ? "Protection setting saved. Reopen this page to refresh status." : "Protection setting could not be saved.";
-    } catch { if (state.statusElement) state.statusElement.textContent = "Protection setting could not be saved."; }
+      if (state.statusElement) state.statusElement.textContent = result?.ok ? "Plugin switch setting saved. Reopen Accounts to refresh the status." : "The plugin switch setting could not be saved.";
+    } catch { if (state.statusElement) state.statusElement.textContent = "The plugin switch setting could not be saved."; }
   });
   controls.append(verify, mode);
   actions.append(note, controls);
@@ -3182,9 +3474,12 @@ function pluginProtectionCard(state, protection) {
 }
 
 function pluginStatusLabel(status) {
-  if (status?.valid) return "current";
+  if (status?.valid) return "Up to date";
   const code = status?.code || "unavailable";
-  return code.replace(/-/g, " ");
+  if (["missing", "unavailable"].includes(code)) return "Not checked";
+  if (code === "stale") return "Out of date";
+  if (["wrong-account", "wrong-profile", "wrong-build"].includes(code)) return "Check again";
+  return "Cannot check right now";
 }
 
 async function injectAccountMenus(state) {
@@ -3228,10 +3523,10 @@ function accountMenuRows(state, suppliedAccounts, routerStatus) {
   const usageCopy = document.createElement("div");
   usageCopy.className = "flex min-w-0 flex-col";
   const usageTitle = document.createElement("span");
-  usageTitle.textContent = "Usage remaining";
+  usageTitle.textContent = "Weekly usage left";
   const subscriptions = document.createElement("span");
   subscriptions.className = "text-token-text-secondary text-xs";
-  subscriptions.textContent = accounts.length === 2 ? "2 connected subscriptions" : "Set up exactly two saved subscriptions";
+  subscriptions.textContent = accounts.length === 2 ? "2 connected accounts" : "Save exactly two accounts";
   usageCopy.append(usageTitle, subscriptions);
   const pool = document.createElement("span");
   pool.className = "text-token-text-secondary shrink-0";
@@ -3250,36 +3545,46 @@ function accountMenuRows(state, suppliedAccounts, routerStatus) {
       copy.className = "flex min-w-0 flex-col";
       const label = document.createElement("span");
       label.className = "truncate";
-      label.textContent = account.label;
+      label.textContent = accountDisplayLabel(account);
+      const identityText = document.createElement("span");
+      identityText.className = "text-token-text-secondary truncate text-xs";
+      identityText.textContent = accountIdentitySummary(account) || "Account email not available yet";
       const detailText = document.createElement("span");
       detailText.className = "text-token-text-secondary truncate text-xs";
-      const plan = detail?.plan || "Plan unavailable";
-      const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly` : "Weekly usage unavailable";
-      detailText.textContent = `${plan} · ${maskIdentifier(detail?.identifierMasked)} · ${weekly}`;
-      copy.append(label, detailText);
-      identity.append(accountAvatar(account.label), copy);
+      const plan = detail?.plan || "Plan not available yet";
+      const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly usage left` : "Weekly usage not available yet";
+      detailText.textContent = `${plan} · ${weekly}`;
+      copy.append(label, identityText, detailText);
+      identity.append(accountAvatar(accountDisplayLabel(account)), copy);
       row.append(identity);
+      if (accountUsingNow(account, routerStatus?.live)) {
+        const usingNow = document.createElement("span");
+        usingNow.className = "text-token-text-primary shrink-0 text-xs font-medium";
+        usingNow.textContent = "Using now";
+        usingNow.setAttribute("aria-label", `${accountDisplayLabel(account)} is the account in use now`);
+        row.append(usingNow);
+      }
       panel.append(row);
     }
   } else {
     const setup = document.createElement("div");
     setup.className = "px-2 py-1.5 text-sm text-token-text-secondary";
-    setup.textContent = "Set up exactly two saved subscriptions in Accounts.";
+    setup.textContent = "Save exactly two accounts to use automatic routing.";
     panel.append(setup);
     if (savedAccounts.length > 0) {
       const manualTitle = document.createElement("div");
       manualTitle.className = "px-2 pt-2 text-xs text-token-text-secondary";
-      manualTitle.textContent = "Manual switching";
+      manualTitle.textContent = "Choose an account yourself";
       panel.append(manualTitle);
-      for (const account of savedAccounts) panel.append(accountButton(state, account));
+      for (const account of savedAccounts) panel.append(accountButton(state, account, routerStatus?.live));
     }
   }
 
   const manage = document.createElement("button");
   manage.type = "button";
   manage.className = menuButtonClass();
-  manage.textContent = "Manage Accounts";
-  manage.setAttribute("aria-label", "Manage Accounts settings");
+  manage.textContent = "Manage accounts";
+  manage.setAttribute("aria-label", "Manage accounts settings");
   manage.addEventListener("click", async () => {
     const result = await state.api.settings?.openPage?.("accounts");
     if (!result?.ok) state.api.log?.warn?.("Accounts settings page could not be opened", result?.reason || "unavailable");
@@ -3288,29 +3593,31 @@ function accountMenuRows(state, suppliedAccounts, routerStatus) {
   return panel;
 }
 
-function accountButton(state, account) {
+function accountButton(state, account, live = null) {
   const button = document.createElement("button");
   button.type = "button"; button.className = menuButtonClass();
-  button.textContent = `${account.active ? "✓ " : ""}${account.label}`;
-  button.disabled = account.active;
+  const displayLabel = accountDisplayLabel(account);
+  const usingNow = accountUsingNow(account, live);
+  button.textContent = accountChoiceLabel(account, usingNow);
+  button.disabled = usingNow;
   button.addEventListener("click", async () => {
     try {
       if (state.pluginProtectionMode === "observation" && account.pluginProtection && !account.pluginProtection.valid) {
-        const proceed = window.confirm(`This saved account has no current remote-plugin receipt (${pluginStatusLabel(account.pluginProtection)}). Switch anyway? Observation mode will not block this switch.`);
+        const proceed = window.confirm(`${displayLabel} has not passed the latest plugin check. Switch anyway?`);
         if (!proceed) return;
       }
-      if (state.statusElement) state.statusElement.textContent = `Preparing to switch to ${account.label}…`;
+      if (state.statusElement) state.statusElement.textContent = `Preparing to switch to ${displayLabel}…`;
       const prepared = await state.api.ipc.invoke(IPC, { action: "prepare-switch", ref: account.ref });
       if (!prepared?.ok) {
         if (prepared?.error?.code === "plugin-protection-receipt-required") {
-          const bypass = window.confirm("This account does not have a current plugin receipt. Switch once anyway? This bypass is only for this one confirmed switch.");
+          const bypass = window.confirm(`${displayLabel} has not passed the latest plugin check. Switch once anyway? This approval applies only to this switch.`);
           if (!bypass) return;
           const bypassPrepared = await state.api.ipc.invoke(IPC, { action: "prepare-switch-bypass", ref: account.ref });
           if (!bypassPrepared?.ok) { alertFailure(state, "The account could not be switched safely.", bypassPrepared); return; }
           if (!window.confirm(bypassPrepared.confirmation)) return;
           const bypassResult = await state.api.ipc.invoke(IPC, { action: "switch", intent: bypassPrepared.intent });
           if (!bypassResult?.ok) { alertFailure(state, "The account could not be switched safely.", bypassResult); return; }
-          if (state.statusElement) state.statusElement.textContent = `Switching to ${account.label}; ChatGPT will restart to finish.`;
+          if (state.statusElement) state.statusElement.textContent = `Switching to ${displayLabel}; ChatGPT will restart to finish.`;
           if (!bypassResult.restartScheduled) window.alert("The account was changed. Restart ChatGPT to finish switching.");
           return;
         }
@@ -3319,7 +3626,7 @@ function accountButton(state, account) {
       if (!window.confirm(prepared.confirmation)) return;
       const result = await state.api.ipc.invoke(IPC, { action: "switch", intent: prepared.intent });
       if (result?.ok) {
-        if (state.statusElement) state.statusElement.textContent = `Switching to ${account.label}; ChatGPT will restart to finish.`;
+        if (state.statusElement) state.statusElement.textContent = `Switching to ${displayLabel}; ChatGPT will restart to finish.`;
         if (!result.restartScheduled) window.alert("The account was changed. Restart ChatGPT to finish switching.");
       } else {
         alertFailure(state, "The account could not be switched safely.", result);
@@ -3333,18 +3640,18 @@ function accountButton(state, account) {
 }
 
 async function saveCurrentFromMenu(state) {
-  const name = window.prompt("Session name (letters, numbers, dots, dashes, or underscores)");
+  const name = window.prompt("Name this account (letters, numbers, dots, dashes, or underscores)");
   if (!name) return false;
   try {
     const prepared = await state.api.ipc.invoke(IPC, { action: "prepare-save", name });
-    if (!prepared?.ok) { alertFailure(state, "The session could not be saved safely.", prepared); return false; }
+    if (!prepared?.ok) { alertFailure(state, "The account could not be saved safely.", prepared); return false; }
     if (!window.confirm(prepared.confirmation)) return false;
     const result = await state.api.ipc.invoke(IPC, { action: "save", intent: prepared.intent });
-    if (!result?.ok) { alertFailure(state, "The session could not be saved safely.", result); return false; }
+    if (!result?.ok) { alertFailure(state, "The account could not be saved safely.", result); return false; }
     return true;
   } catch (error) {
     state.api?.log?.warn?.("account save failed", String(error));
-    window.alert("The session could not be saved safely.");
+    window.alert("The account could not be saved safely.");
     return false;
   }
 }
@@ -3402,25 +3709,65 @@ function hasDirectAccountSwitcherPanel(menu) {
   return Array.from(menu?.children || []).some((child) => child?.dataset?.tweakersAccountSwitcher === "true");
 }
 function uniqueElements(elements) { return [...new Set(elements)].filter(Boolean); }
-function displayLabelFromAuth(value, fallback) {
-  const directName = [value?.user?.name, value?.account?.name, value?.name]
-    .find((item) => typeof item === "string" && item.trim() && !/@/.test(item));
+function safeEmail(value) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized.length > 254 || !validLabel(normalized)
+    || /[\s<>/\\]/.test(normalized)
+    || !/^[^@]{1,64}@[^@.]{1,63}(?:\.[^@.]{1,63})+$/.test(normalized)) return "";
+  return normalized;
+}
+
+function safeUsername(value) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim().replace(/^@/, "");
+  if (!normalized || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(normalized)
+    || !validLabel(normalized)) return "";
+  return normalized;
+}
+
+function boundedIdentityClaims(value) {
   const token = value?.tokens?.id_token;
-  if (typeof token === "string") {
-    try {
-      const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-      const claim = [claims.name, claims.preferred_username].find((item) => typeof item === "string" && item.trim() && !/@/.test(item));
-      if (claim) {
-        const label = safeAccountLabel(claim, "");
-        if (label) return label;
-      }
-    } catch {}
+  if (typeof token !== "string") return null;
+  const segments = token.split(".");
+  if (segments.length !== 3 || segments.some((segment) => segment.length === 0)) return null;
+  const payload = segments[1];
+  if (typeof payload !== "string" || payload.length === 0
+    || payload.length > Math.ceil(MAX_IDENTITY_CLAIMS_BYTES * 4 / 3) + 4) return null;
+  let bytes = null;
+  try {
+    bytes = Buffer.from(payload, "base64url");
+    if (bytes.length === 0 || bytes.length > MAX_IDENTITY_CLAIMS_BYTES) return null;
+    const claims = JSON.parse(bytes.toString("utf8"));
+    return isRecord(claims) ? claims : null;
+  } catch {
+    return null;
+  } finally {
+    try { bytes?.fill(0); } catch {}
   }
-  if (directName) {
-    const label = safeAccountLabel(directName, "");
-    if (label) return label;
-  }
-  return safeAccountLabel(typeof fallback === "string" ? fallback : "", "");
+}
+
+function accountIdentityFromAuth(value, fallback = "") {
+  const claims = boundedIdentityClaims(value);
+  const displayName = safeAccountLabel(
+    typeof claims?.name === "string" ? claims.name : value?.user?.name,
+    safeAccountLabel(typeof fallback === "string" ? fallback : "", ""),
+  );
+  const email = claims?.email_verified === false
+    ? ""
+    : safeEmail(claims?.email) || safeEmail(value?.user?.email);
+  return {
+    displayName,
+    email: email || null,
+    // Codex's current structured account schema has no username/handle. That
+    // field is user-authored local presentation data only and is never inferred
+    // from provider objects, JWT claims, or an email local-part.
+    username: null,
+  };
+}
+
+function displayLabelFromAuth(value, fallback) {
+  return accountIdentityFromAuth(value, fallback).displayName;
 }
 function safeSnapshotLabel(value, filename, ordinal = 1) {
   const filenameLabel = typeof filename === "string" ? filename.replace(/\.json$/i, "") : "";
@@ -3456,6 +3803,54 @@ function savedSnapshotLabels(entries) {
     next.set(record.filename, label);
   }
   return next;
+}
+
+function displaySnapshotIdentities(deps, paths, entries) {
+  const records = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.isFile?.() && typeof entry.name === "string" && entry.name.endsWith(".json"))
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((entry, index) => {
+      try {
+        validateReferenceName(entry.name.slice(0, -5));
+        const filenameLabel = safeAccountLabel(entry.name.replace(/\.json$/i, ""), "");
+        const identity = withSecureAuth(
+          deps.fs,
+          sourceFilePath(deps.path, paths.accountsDir, entry.name),
+          (snapshot) => accountIdentityFromAuth(snapshot.value, ""),
+        );
+        const genericFilename = /^account-\d+$/i.test(filenameLabel);
+        const base = identity.displayName || (!genericFilename && filenameLabel) || `Account ${index + 1}`;
+        return [{ filename: entry.name, base, email: identity.email, username: identity.username }];
+      } catch { return []; }
+    });
+  const counts = new Map();
+  for (const record of records) {
+    const key = record.base.toLocaleLowerCase();
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const next = new Map();
+  const ordinals = new Map();
+  for (const record of records) {
+    const key = record.base.toLocaleLowerCase();
+    const ordinal = (ordinals.get(key) || 0) + 1;
+    ordinals.set(key, ordinal);
+    const label = counts.get(key) > 1
+      ? safeAccountLabel(`${record.base.slice(0, 68)} · Account ${ordinal}`, `Account ${ordinal}`)
+      : record.base;
+    next.set(record.filename, {
+      displayLabel: label,
+      email: record.email || null,
+      username: record.username || null,
+    });
+  }
+  return next;
+}
+
+function displaySnapshotLabels(deps, paths, entries) {
+  return new Map(
+    [...displaySnapshotIdentities(deps, paths, entries)]
+      .map(([filename, identity]) => [filename, identity.displayLabel]),
+  );
 }
 function safeFailure(code) { return { ok: false, error: { code, message: "The account request could not be completed safely." } }; }
 function routerPublicErrorCode(code) {

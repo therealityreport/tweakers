@@ -8,6 +8,7 @@
 - The router does not fail over or migrate an existing thread. If either account is unavailable, stale in a way that cannot establish eligibility, reauthentication-blocked, depleted, or protocol-blocked, it pauses new-thread assignment rather than silently sending all work to the other account.
 - A configuration change is staged disk intent. It applies only to the next qualified app-server start. It cannot switch an existing stdio session or prove a runtime was activated.
 - Staging Manual is a rollback request for the next restart. Until that restart, an already-running quota-aware mux can remain active. Likewise, staging quota-aware mode does not turn it on.
+- A tweak hot reload or lifecycle stop never stages Manual. Only the explicit Accounts control may change the saved routing mode.
 
 ## Operator evidence
 
@@ -27,9 +28,11 @@ V1 config and socket responses remain readable. A v1 `balanced` projection is le
 
 ## Redacted quota projection
 
-For each account, v2 output accepts only a safe local label, eligibility, a safe plan label, a masked identifier, weekly remaining percentage/reset/freshness, short-window pressure, and assigned-thread count. The pool display is the sum of the two weekly remaining percentages and is explicitly `0–200%`, not a provider guarantee or a single-account percentage.
+For each account, v2 output accepts only a safe local routing label, eligibility, a safe plan label, a masked identifier, weekly remaining percentage/reset/freshness, short-window pressure, and assigned-thread count. The saved-account list separately supplies a safe display-only profile name. Generic storage filenames such as `account-2.json` remain stable routing joins but are not shown to the user. Their old sequence numbers can skip, so non-contiguous filenames do not mean an account is missing. The pool display is the sum of the two weekly remaining percentages and is explicitly `0–200%`, not a provider guarantee or a single-account percentage.
 
-The status reader rejects unexpected fields and never reports raw account or provider IDs, email addresses, auth payloads, tokens, local paths, thread IDs, request content, control capabilities, or provider error bodies. Missing or stale quota is shown as unavailable/unknown rather than zero.
+The Accounts list may separately show the email from the saved ChatGPT identity and an optional username stored locally by the user. Those presentation fields never enter router configuration, control-socket status, CLI status, logs, quota joins, history joins, plugin receipts, or recovery matching. The current structured account response has no username field, so Accounts does not derive a handle from an email address or provider claims.
+
+The router status reader rejects unexpected fields and never reports raw account or provider IDs, email addresses, usernames, auth payloads, tokens, local paths, thread IDs, request content, control capabilities, or provider error bodies. Missing or stale quota is shown as unavailable/unknown rather than zero. When no authenticated router is running, the settings and profile-menu UI may show **Using now** only when the live account ID, the saved marker, and one unique saved snapshot match across a stable observation. A running router has no single global current account, so router eligibility is shown as **Ready for new conversations**, never **Using now**.
 
 ## Local control status
 
