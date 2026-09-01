@@ -1,9 +1,9 @@
 {
   "id": "co.tweakers.account-switcher",
-  "name": "Easy Account Switcher",
-  "version": "0.3.0",
+  "name": "Accounts",
+  "version": "0.4.0",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Switch existing local Codex sessions, protect remote-plugin receipts, and stage an optional two-account balanced router without duplicating credentials.",
+  "description": "See two saved ChatGPT accounts, their redacted quota status, and stage owner-private isolated account homes while preserving the original snapshots.",
   "author": "hulibrands",
   "tags": [
     "accounts",

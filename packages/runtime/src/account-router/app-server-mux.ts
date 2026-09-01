@@ -1,24 +1,59 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { defaultAccountRouterConfigPath, readRouterLaunchSelection } from "./config";
+import { defaultAccountRouterConfigPath, isRouterConfigV2, readRouterLaunchSelection } from "./config";
+import {
+  ACCOUNT_HISTORY_ADOPTION_INTENT_FILE,
+  ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE,
+  ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE,
+  HISTORY_ADOPTION_MAX_ARTIFACT_BYTES,
+  HISTORY_ADOPTION_MAX_OWNERS_BYTES,
+  validateHistoryAdoptionArtifacts,
+  validateHistoryAdoptionEvidence,
+  type HistoryAdoptionFailure,
+} from "./history-adoption";
 import { AccountRouterMux, type RouterChild, type RouterChildFactory } from "./mux";
 import { startRouterControlSocket, type RouterControlSocket } from "./control-socket";
 import { parseJsonRpcLine } from "./protocol";
-import { assertPrivateRegularFile, ensurePrivateDirectory, RouterStateStore } from "./state-store";
-import type { JsonRpcMessage, OpaqueAccountId, RouterConfig } from "./types";
+import { assertPrivateRegularFile, ensurePrivateDirectory, RouterStateStore, validateRouterState } from "./state-store";
+import type { JsonRpcMessage, OpaqueAccountId, RouterConfig, RouterConfigV2, RouterState } from "./types";
 import { isPlainRecord } from "./types";
 
 const CHILD_INITIALIZE_TIMEOUT_MS = 10_000;
 const GRACEFUL_SHUTDOWN_MS = 2_000;
 const FORCED_SHUTDOWN_OBSERVATION_MS = 1_000;
+const MAX_AUTH_BYTES = 256 * 1024;
+const MAX_CHILD_CONFIG_BYTES = 4 * 1024;
 
 interface MuxCliArguments {
   configPath: string;
   stateRoot: string;
   command: string;
   args: string[];
+}
+
+interface MuxShutdownTarget {
+  shutdown(): void;
+}
+
+/** Shared EOF/signal cleanup: idempotent and deliberately does not close stdin. */
+export function createMuxCliShutdown(
+  mux: MuxShutdownTarget,
+  closeControl: () => void | Promise<void>,
+  pauseInput: () => void,
+  scheduleForceExit: () => void,
+): () => void {
+  let started = false;
+  return () => {
+    if (started) return;
+    started = true;
+    mux.shutdown();
+    void closeControl();
+    pauseInput();
+    scheduleForceExit();
+  };
 }
 
 /** Executable entry point run under ChatGPT's bundled signed Node parent. */
@@ -58,6 +93,9 @@ export async function runAccountRouterMuxCli(argv = process.argv.slice(2)): Prom
     controlSecret: secret,
     childFactory: new ProcessRouterChildFactory(parsed.command, parsed.args, parsed.stateRoot),
     writeDesktop: (message) => process.stdout.write(`${JSON.stringify(message)}\n`),
+    // A later v2 config is pending intent only. The running mux keeps the
+    // startup config as active truth and never changes its route mid-session.
+    readPendingConfig: () => readRouterLaunchSelection(parsed.configPath).config,
     onFatal: scheduleFatalExit,
     onShutdown: () => { void control?.close(); },
   });
@@ -78,21 +116,58 @@ export async function runAccountRouterMuxCli(argv = process.argv.slice(2)): Prom
   }
   input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on("line", (line) => mux.receiveDesktopLine(line));
-  const shutdown = () => {
-    input.close();
-    mux.shutdown();
-    void control?.close();
-    const force = setTimeout(() => process.exit(1), GRACEFUL_SHUTDOWN_MS + FORCED_SHUTDOWN_OBSERVATION_MS);
-    force.unref();
-  };
+  const shutdown = createMuxCliShutdown(
+    mux,
+    () => control?.close(),
+    () => process.stdin.pause(),
+    () => {
+      const force = setTimeout(() => process.exit(1), GRACEFUL_SHUTDOWN_MS + FORCED_SHUTDOWN_OBSERVATION_MS);
+      force.unref();
+    },
+  );
+  // `close` is also raised on stdin EOF. This shared callback must not call
+  // input.close(), otherwise EOF recursively re-enters readline shutdown.
+  input.once("close", shutdown);
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
 }
 
 export function preflightRouterHomes(config: RouterConfig, stateRoot: string): boolean {
+  return preflightRouterHomesDetail(config, stateRoot).ok;
+}
+
+/**
+ * Non-secret startup evidence for the parent/direct-fallback decision. File
+ * names, homes, identities, and provider data deliberately never escape it.
+ */
+export function preflightRouterHomesDetail(
+  config: RouterConfig,
+  stateRoot: string,
+): { ok: true } | { ok: false; reason: HistoryAdoptionFailure | "startup_selfcheck_failed" } {
+  if (!isRouterConfigV2(config)) return { ok: false, reason: "history_adoption_required" };
+  const secret = readControlSecret(stateRoot);
+  if (!secret) return { ok: false, reason: "startup_selfcheck_failed" };
+  let intentBytes: Buffer | null = null;
+  let receiptBytes: Buffer | null = null;
+  let ownersBytes: Buffer | null = null;
   try {
     ensurePrivateDirectory(stateRoot);
-    if (!stateAllowsBalancedStartup(stateRoot)) return false;
+    const state = stateAllowsBalancedStartup(config, stateRoot);
+    if (!state) return { ok: false, reason: "startup_selfcheck_failed" };
+    intentBytes = readOwnerPrivateRegularFile(join(stateRoot, ACCOUNT_HISTORY_ADOPTION_INTENT_FILE), HISTORY_ADOPTION_MAX_ARTIFACT_BYTES, false);
+    receiptBytes = readOwnerPrivateRegularFile(join(stateRoot, ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE), HISTORY_ADOPTION_MAX_ARTIFACT_BYTES, false);
+    ownersBytes = readOwnerPrivateRegularFile(join(stateRoot, ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE), HISTORY_ADOPTION_MAX_OWNERS_BYTES, false);
+    if (!intentBytes || !receiptBytes || !ownersBytes) return { ok: false, reason: "history_adoption_required" };
+    const adoption = validateHistoryAdoptionEvidence(config, state, secret, {
+      intent: intentBytes, receipt: receiptBytes, owners: ownersBytes,
+    });
+    if (!adoption.ok) return adoption;
+    const owner = adoption.evidence.receipt.legacyOwnerOpaqueAccountId;
+    if (!validateHistoryAdoptionArtifacts(
+      adoption.evidence.receipt,
+      join(stateRoot, "accounts", owner, "codex-home"),
+      join(stateRoot, "accounts", owner, "sqlite-home"),
+    )) return { ok: false, reason: "history_adoption_artifact_mismatch" };
     for (const account of config.accounts) {
       if (!account.included) continue;
       for (const directory of [
@@ -100,27 +175,107 @@ export function preflightRouterHomes(config: RouterConfig, stateRoot: string): b
         join(stateRoot, "accounts", account.opaqueAccountId, "codex-home"),
         join(stateRoot, "accounts", account.opaqueAccountId, "sqlite-home"),
       ]) {
-        if (!existsSync(directory)) return false;
+        if (!existsSync(directory)) return { ok: false, reason: "startup_selfcheck_failed" };
         ensurePrivateDirectory(directory);
       }
+      if (!validateIsolatedAccountHome(account.opaqueAccountId, stateRoot, secret)) return { ok: false, reason: "startup_selfcheck_failed" };
     }
-    return Boolean(readControlSecret(stateRoot));
+    return { ok: true };
   } catch {
-    return false;
+    return { ok: false, reason: "startup_selfcheck_failed" };
+  } finally {
+    intentBytes?.fill(0);
+    receiptBytes?.fill(0);
+    ownersBytes?.fill(0);
+    secret.fill(0);
   }
 }
 
+/**
+ * Stage-time hardening is rechecked immediately before the parent chooses the
+ * mux. No source auth, symlink, custom config, or post-stage swap is trusted.
+ */
+function validateIsolatedAccountHome(account: OpaqueAccountId, stateRoot: string, secret: Buffer): boolean {
+  const codexHome = join(stateRoot, "accounts", account, "codex-home");
+  const authBytes = readOwnerPrivateRegularFile(join(codexHome, "auth.json"), MAX_AUTH_BYTES, false);
+  const configBytes = readOwnerPrivateRegularFile(join(codexHome, "config.toml"), MAX_CHILD_CONFIG_BYTES, true);
+  try {
+    if (!authBytes || !configBytes || configBytes.byteLength !== 0) return false;
+    const parsed = JSON.parse(authBytes.toString("utf8")) as unknown;
+    const rawAccountId = authAccountId(parsed);
+    if (!rawAccountId) return false;
+    const expected = `ar_${createHmac("sha256", secret).update(`account-router:v1:${rawAccountId}`, "utf8").digest("base64url")}`;
+    return expected.length === account.length
+      && timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(account, "utf8"));
+  } catch {
+    return false;
+  } finally {
+    authBytes?.fill(0);
+    configBytes?.fill(0);
+  }
+}
+
+/** Read a bounded, owner-private, single-link regular file without following symlinks. */
+function readOwnerPrivateRegularFile(path: string, maxBytes: number, allowEmpty: boolean): Buffer | null {
+  let descriptor: number | undefined;
+  let bytes: Buffer | null = null;
+  let succeeded = false;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const before = fstatSync(descriptor);
+    if (!before.isFile() || before.nlink !== 1 || before.uid !== process.getuid?.()
+      || (before.mode & 0o077) !== 0 || before.size > maxBytes || (!allowEmpty && before.size <= 0)) return null;
+    bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(descriptor, bytes, offset, bytes.byteLength - offset, offset);
+      if (!count) return null;
+      offset += count;
+    }
+    const after = fstatSync(descriptor);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs) return null;
+    succeeded = true;
+    return bytes;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    // Ownership transfers only after every validation succeeds. Callers clear
+    // the returned byte buffer promptly; failed reads never retain auth data.
+    if (bytes && !succeeded) bytes.fill(0);
+  }
+}
+
+function authAccountId(value: unknown): string | null {
+  if (!isPlainRecord(value) || !isPlainRecord(value.tokens)) return null;
+  const accountId = value.tokens.account_id;
+  return typeof accountId === "string" && accountId.length > 0 && accountId.length <= 1_024 ? accountId : null;
+}
+
 /** A staged disable or uncertain dispatch is never reopened by a restart. */
-function stateAllowsBalancedStartup(stateRoot: string): boolean {
+function stateAllowsBalancedStartup(config: RouterConfigV2, stateRoot: string): RouterState | null {
   const stateFile = join(stateRoot, "router-state.json");
-  if (!existsSync(stateFile)) return true;
+  // A receipt proves a particular imported owner subset. A missing state
+  // cannot prove that subset, so v2 falls back before any child process exists.
+  if (!existsSync(stateFile)) return null;
   try {
     assertPrivateRegularFile(stateFile, 2 * 1024 * 1024);
     const state = JSON.parse(readFileSync(stateFile, "utf8")) as unknown;
-    if (!isPlainRecord(state) || state.stagedDisable !== null || !Array.isArray(state.correlations) || !isPlainRecord(state.pendingThreadOwners)) return false;
-    return state.correlations.length === 0 && Object.keys(state.pendingThreadOwners).length === 0;
+    // The store constructor is intentionally strict about configured accounts
+    // and ledger weights. Check the entire candidate here so the signed parent
+    // retains its direct app-server fallback instead of selecting a mux that
+    // will fail moments later on a v1-to-v2 (or pair/order/weight) mismatch.
+    if (!validateRouterState(state, config)) return null;
+    return state.stagedDisable === null
+      && state.correlations.length === 0
+      && Object.keys(state.pendingThreadOwners).length === 0
+      // A persisted reservation is ambiguous after a process crash: without
+      // an atomic reservation-to-thread recovery proof, start direct/manual.
+      && state.reservations.every((reservation) => reservation.state !== "reserved" && reservation.state !== "stranded_ambiguous")
+      ? state
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
 

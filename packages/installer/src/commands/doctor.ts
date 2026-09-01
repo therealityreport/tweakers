@@ -242,29 +242,111 @@ function environmentModeCacheDoctorStatus(
 
 /** Operator checks distinguish recorded source, packaged candidate, installed runtime, and live mux facts. */
 export function accountRouterDoctorChecks(evidence: AccountRouterEvidence): Check[] {
-  if (evidence.configuration.state === "not_staged" || evidence.configuration.state === "manual") return [];
+  const checks: Check[] = [];
   if (evidence.configuration.state === "invalid" || evidence.configuration.state === "unsafe") {
-    return [{
+    checks.push({
       name: "account router configuration",
       ok: false,
       detail: `staged configuration is ${evidence.configuration.state}; manual/direct fallback is required`,
-    }];
+    });
+  } else if (evidence.configuration.pending) {
+    const pending = evidence.configuration.pending;
+    const active = evidence.live.state === "active" && evidence.live.status ? evidence.live.status.active : null;
+    const matchesActive = active !== null
+      && active.generation === pending.generation
+      && active.fingerprint === pending.fingerprint
+      && active.mode === pending.mode
+      && active.policy === pending.policy;
+    checks.push({
+      name: "account router pending configuration",
+      ok: matchesActive || (pending.mode === "manual" && active === null) ? true : "warn",
+      detail: matchesActive
+        ? `pending ${describePending(pending)} matches authenticated active runtime`
+        : active
+          ? `pending ${describePending(pending)}; authenticated active ${describeActive(active)}; restart required`
+          : `pending ${describePending(pending)}; no authenticated mux is running`,
+    });
   }
+
+  const v2MuxBacked = evidence.configuration.pending?.schemaVersion === 2;
+  if (evidence.configuration.state === "not_staged" || (evidence.configuration.state === "manual" && !v2MuxBacked)) {
+    return appendAccountRouterLiveCheck(checks, evidence, false);
+  }
+
+  if (v2MuxBacked) {
+    checks.push({
+      name: "account history adoption",
+      ok: evidence.historyAdoption.state === "adopted" ? true : false,
+      detail: evidence.historyAdoption.state === "adopted"
+        ? evidence.configuration.pending?.mode === "manual"
+          ? "adopted offline history evidence is valid; v2 Manual remains mux-backed for history and assigns new threads to the primary account"
+          : "adopted offline history evidence is valid"
+        : `v2 mux candidate is blocked: history adoption is ${evidence.historyAdoption.state.replaceAll("_", " ")}`,
+    });
+  }
+
   const source = artifactCheck("account router source", evidence.source, null);
   const candidate = artifactCheck("account router candidate", evidence.candidate, evidence.source.version);
   const installed = artifactCheck("account router installed", evidence.installed, evidence.candidate.version);
+  checks.push(source, candidate, installed);
+  return appendAccountRouterLiveCheck(checks, evidence, true, evidence.configuration.pending?.mode === "manual");
+}
+
+function appendAccountRouterLiveCheck(
+  checks: Check[],
+  evidence: AccountRouterEvidence,
+  expected: boolean,
+  manualIsExpected = false,
+): Check[] {
+  if (!expected && evidence.live.state === "not_running") return checks;
   const live: Check = evidence.live.state === "active" && evidence.live.status
-    ? {
-      name: "account router live",
-      ok: true,
-      detail: `${evidence.live.status.mode}; ${evidence.live.status.fairnessPrecision}`,
-    }
+    ? describeLiveHealth(evidence.live.status, manualIsExpected)
     : {
       name: "account router live",
-      ok: evidence.live.state === "unavailable" ? false : "warn",
-      detail: evidence.live.state.replaceAll("_", " "),
+      ok: evidence.live.state === "unavailable" ? expected ? false : "warn" : expected ? "warn" : true,
+      detail: expected
+        ? evidence.live.state.replaceAll("_", " ")
+        : `${evidence.live.state.replaceAll("_", " ")}; direct/manual has no mux`,
     };
-  return [source, candidate, installed, live];
+  checks.push(live);
+  return checks;
+}
+
+function describeLiveHealth(
+  status: NonNullable<AccountRouterEvidence["live"]["status"]>,
+  manualIsExpected: boolean,
+): Check {
+  const concerns: string[] = [];
+  let ok: Check["ok"] = true;
+  if (status.protocolState !== "supported") {
+    ok = false;
+    concerns.push(`protocol ${status.protocolState}; routing paused`);
+  }
+  if (status.degradedReason) {
+    ok = false;
+    concerns.push(`degraded ${status.degradedReason.replaceAll("_", " ")}; routing paused`);
+  }
+  if ((status.active.mode === "manual" && !manualIsExpected) || status.active.mode === "direct_fallback") {
+    if (ok === true) ok = "warn";
+    concerns.push(`${status.active.mode.replaceAll("_", " ")} is active; quota-aware routing is paused`);
+  }
+  if (status.restartRequired) {
+    if (ok === true) ok = "warn";
+    concerns.push("restart required before pending intent can apply");
+  }
+  return {
+    name: "account router live",
+    ok,
+    detail: `authenticated ${describeActive(status.active)}${concerns.length ? `; ${concerns.join("; ")}` : ""}`,
+  };
+}
+
+function describePending(pending: NonNullable<AccountRouterEvidence["configuration"]["pending"]>): string {
+  return `${pending.mode.replaceAll("_", " ")}${pending.policy ? ` (${pending.policy})` : ""}; ${pending.generation === null ? "legacy v1" : `generation ${pending.generation}; ${pending.fingerprint?.slice(0, 15)}…`}`;
+}
+
+function describeActive(active: NonNullable<AccountRouterEvidence["live"]["status"]>["active"]): string {
+  return `${active.mode.replaceAll("_", " ")}${active.policy ? ` (${active.policy})` : ""}; ${active.generation === null ? active.fairnessPrecision ?? "legacy v1" : `generation ${active.generation}; ${active.fingerprint?.slice(0, 15)}…`}`;
 }
 
 function artifactCheck(

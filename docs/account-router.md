@@ -1,41 +1,58 @@
 # Account Router
 
-`co.tweakers.account-switcher` 0.3.0 retains its existing Manual account-switching behavior and can stage a two-account Balanced mode for a later, separately authorized restart. It is an unsupported local integration, not an OpenAI-approved feature. It never creates accounts, changes provider limits, shares credentials, retries uncertain requests on a second account, or makes an ineligible account eligible.
+`co.tweakers.account-switcher` retains its Manual account-switching behavior. Its v2 `quota_aware_v1` policy can stage exactly two local accounts for quota-aware **new-thread** routing after a separately authorized restart. This is an unsupported local integration, not an OpenAI-approved feature. It does not create accounts, alter provider limits, make an unavailable account eligible, migrate a thread, or retry an uncertain request on another account.
 
-Balanced mode remains deliberately inactive until its separately authorized restart and later acceptance gates. Staging it does not restart the app, use a provider account, or publish any configuration outside the local owner-private data directory.
+## Routing and availability contract
 
-## Operating model
-
-- Manual mode is the default and the direct official app-server path remains the fallback for missing, invalid, unsupported, or unsafe router configuration.
-- Balanced mode has exactly two enrolled local snapshots. Each official app-server child receives its own isolated `CODEX_HOME` and SQLite home, and a thread stays with its first selected account.
-- New threads use the locally recorded weighted least-spent estimate. A status is marked projected while work is reserved and estimated when exact terminal usage is unavailable; it is not a claim of provider-side equality.
-- The router writes only opaque local account identifiers, redacted state, and owner-private configuration. Raw provider IDs, account emails, auth payloads, refresh tokens, file paths, request contents, and the control capability are never rendered or included in operator output.
-- A failure after the mux has accepted work stages disable and returns a bounded error. It never swaps an already-open stdio session back to the direct child; a later separately authorized restart returns to Manual/direct mode.
+- V2 has exactly two enrolled, included local accounts. A new thread is assigned using the redacted per-account quota projection. Once assigned, the thread remains with that account for every follow-up, resume, fork, interruption, and turn.
+- The router does not fail over or migrate an existing thread. If either account is unavailable, stale in a way that cannot establish eligibility, reauthentication-blocked, depleted, or protocol-blocked, it pauses new-thread assignment rather than silently sending all work to the other account.
+- A configuration change is staged disk intent. It applies only to the next qualified app-server start. It cannot switch an existing stdio session or prove a runtime was activated.
+- Staging Manual is a rollback request for the next restart. Until that restart, an already-running quota-aware mux can remain active. Likewise, staging quota-aware mode does not turn it on.
 
 ## Operator evidence
 
-`tweaker status` and `tweaker doctor` report four different observations instead of treating one as proof of another:
+`tweaker status` and `tweaker doctor` keep five facts separate:
 
 | Layer | Meaning | Does not prove |
 | --- | --- | --- |
-| Source | The Account Switcher manifest in the one development checkout registered in Tweakers configuration. An absent or stale registration is reported explicitly. | Candidate, installed, or live bytes. |
-| Candidate | The runtime bundled with the currently running installer package. | That user-dir runtime assets have been promoted. |
-| Installed | The runtime files currently staged in the user directory. | That the desktop app has been restarted into them. |
-| Live | A successful authenticated read from the currently running mux. | Provider identity, quota, token-refresh, cancellation, delivery, or any authenticated acceptance gate. |
+| Source | Accounts tweak manifest in the registered development checkout. | Candidate, installed, pending, or live bytes. |
+| Candidate | Runtime bundled with this installer package. | That it was promoted to the user directory. |
+| Installed | Runtime artifacts in the user directory. | That the desktop restarted into them. |
+| Pending | Validated owner-private disk configuration: v2 mode, policy, generation, and fingerprint; legacy v1 is labelled as such. | The active app-server mode or generation. |
+| Live | Authenticated read from the discoverable owner-private mux socket: active mode, policy, generation, fingerprint, and any runtime-pending generation. | Provider authorization, policy approval, a delivered request, or live activation of a newly staged configuration. |
 
-The command also labels the staged configuration (`not staged`, `manual`, `balanced`, `invalid`, or `unsafe`). A `not running` live result is expected before the separately authorized restart; it is not evidence that a router process was launched.
+The CLI probes a safely discoverable socket even when disk intent is Manual or invalid. This prevents a staged rollback from falsely presenting direct/manual as already active. `not running` means no authenticated mux was found; it is not proof that direct mode was restarted. `unavailable` means the socket could not be safely authenticated or parsed.
+
+V1 config and socket responses remain readable. A v1 `balanced` projection is legacy local-token evidence, not provider quota. V2 output labels the pending and active generations and fingerprints independently; if they differ, the change is pending a restart.
+
+## Redacted quota projection
+
+For each account, v2 output accepts only a safe local label, eligibility, a safe plan label, a masked identifier, weekly remaining percentage/reset/freshness, short-window pressure, and assigned-thread count. The pool display is the sum of the two weekly remaining percentages and is explicitly `0–200%`, not a provider guarantee or a single-account percentage.
+
+The status reader rejects unexpected fields and never reports raw account or provider IDs, email addresses, auth payloads, tokens, local paths, thread IDs, request content, control capabilities, or provider error bodies. Missing or stale quota is shown as unavailable/unknown rather than zero.
 
 ## Local control status
 
-While Balanced mode is actually running, the mux exposes one read-only status request over a deterministic owner-private Unix socket. The endpoint is placed in a short, owner-private `/tmp` directory only because macOS AF_UNIX pathname limits can be shorter than the normal data-root path. Its location is derived from the local Account Switcher router-data root; it does not encode an account identity.
+An actually running mux exposes a read-only status request through a deterministic owner-private Unix socket. The endpoint uses a short owner-private `/tmp` directory because macOS AF_UNIX pathname limits can be shorter than the normal data-root path. Its location derives from the local Accounts router-data root and contains no account identity.
 
-The endpoint accepts one bounded JSONL `status` request per connection. It requires the 256-bit `control-secret.v1` capability stored in the owner-private router directory and compares it in constant time. Invalid, malformed, oversized, or pipelined requests receive no diagnostic payload. Successful responses contain only the redacted status projection. The socket closes on orderly, fatal, and startup-failure cleanup.
+Each bounded JSONL request requires the owner-private 256-bit `control-secret.v1` capability. Invalid, malformed, oversized, or pipelined requests receive no diagnostic payload. The renderer never connects to this socket; it receives a separately redacted IPC projection. The installer uses the socket only for local status and doctor evidence.
 
-The renderer does not connect to this socket. It continues to use the Account Switcher’s scoped IPC and receives only a redacted projection. The installer client uses the same deterministic endpoint only for its local, read-only status/doctor evidence.
+## Offline history adoption
 
-## Safety and authority boundaries
+Staging quota-aware mode creates only a signed adoption intent; it does not copy history, start a mux, or restart the app. Before a quota-aware candidate can be healthy, inspect its redacted history state with `tweaker status` or `tweaker doctor`:
 
-- Do not treat source, candidate, installed, or live status as permission to activate Balanced mode.
-- Do not use status output to infer account ownership, plan eligibility, administrator approval, provider policy, provider quota, or whether a request was delivered.
-- Any provider warning, administrator prohibition, credential ownership mismatch, unsupported protocol, invalid private-file mode, or cross-account mismatch is a fail-closed condition.
-- Restart, live activation, authenticated canary work, dev-sync, commit, push, tag, and publication all require their own explicit authority.
+- `required` means no signed intent or adoption proof is present.
+- `pending offline adoption` means a signed intent matches the staged configuration, but the offline import has not run.
+- `adopted` means the matching signed intent, receipt, and immutable owner proof all verify locally.
+- `invalid` means an artifact is missing, unsafe, malformed, or cannot be verified.
+- `mismatch` means valid signed proof is bound to a different staged configuration or adoption set.
+
+Run `tweaker adopt-account-history` first. It is a dry run by default. Use `tweaker adopt-account-history --apply` only after the app is fully quit; apply retains the source and creates a retained pre-adoption backup before promoting the adopted owner. Adoption does not open or restart the app. A later runtime activation/restart remains a separate, explicitly confirmed step.
+
+After that separate activation, routing is quota-aware only for new threads. Ownership stays sticky for existing threads and this is not a guarantee of exact 50/50 provider consumption.
+
+## Authority boundary
+
+- Do not treat source, candidate, installed, pending, or live status as authorization to activate quota-aware routing.
+- Restart, live activation, authenticated canary work, dev-sync, commit, push, tag, and publication each need their own explicit authority.
+- A rollback preserves local accounts, ownership records, and receipts. It stages Manual for a later restart; it does not hot-switch a running mux or delete local data.

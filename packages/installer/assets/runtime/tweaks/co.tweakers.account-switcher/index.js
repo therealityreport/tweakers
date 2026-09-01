@@ -11,23 +11,40 @@ const PLUGIN_PROFILE_SCHEMA_VERSION = 1;
 const PLUGIN_RECEIPT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 const PLUGIN_PROBE_TIMEOUT_MS = 8_000;
 const PLUGIN_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
-const ACCOUNT_ROUTER_SCHEMA_VERSION = 1;
+const ACCOUNT_ROUTER_SCHEMA_VERSION = 2;
+const ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION = 1;
+const ACCOUNT_ROUTER_QUOTA_POLICY = "quota_aware_v1";
 const ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT = "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10";
 const ACCOUNT_ROUTER_CONFIG_NAME = "account-router-config.json";
 const ACCOUNT_ROUTER_STATE_NAME = "router-state.json";
 const ACCOUNT_ROUTER_CONTROL_SECRET_NAME = "control-secret.v1";
 const ACCOUNT_ROUTER_RECEIPTS_NAME = "migration-receipts.v1.json";
+const ACCOUNT_ROUTER_HISTORY_ADOPTION_INTENT_NAME = "history-adoption-intent.v1.json";
+const ACCOUNT_ROUTER_HISTORY_ADOPTION_RECEIPT_NAME = "history-adoption-receipt.v1.json";
+const ACCOUNT_ROUTER_HISTORY_ADOPTION_OWNERS_NAME = "history-adoption-owners.v1.json";
 const ACCOUNT_ROUTER_CONTROL_SOCKET_NAME = "router-control.v1.sock";
-const MAX_ROUTER_STATE_BYTES = 512 * 1024;
+const MAX_ROUTER_STATE_BYTES = 2 * 1024 * 1024;
+const MAX_HISTORY_ADOPTION_BYTES = 64 * 1024;
+const MAX_HISTORY_ADOPTION_OWNERS_BYTES = 2 * 1024 * 1024;
 const ROUTER_CONTROL_FRAME_LIMIT = 4 * 1024;
 const ROUTER_CONTROL_TIMEOUT_MS = 2_000;
+const ROUTER_TERMINAL_RESERVATION_STATES = new Set(["released_pre_dispatch", "reconciled"]);
 const ROUTER_PUBLIC_ERROR_CODES = new Set([
   "invalid-router-mode",
   "untrusted-router-directory",
   "router-requires-exactly-two-accounts",
   "invalid-router-weight",
   "router-requires-distinct-accounts",
+  "router-history-owner-required",
+  "router-history-owner-not-selected",
+  "router-history-adoption-invalid",
+  "router-history-adoption-mismatch",
+  "router-state-mismatch-requires-reset",
   "router-not-idle",
+  "router-recovery-router-running",
+  "router-recovery-router-status-unavailable",
+  "router-recovery-account-mismatch",
+  "router-recovery-not-needed",
   "router-operation-failed",
 ]);
 const ROUTER_PUBLIC_ELIGIBILITY = new Set([
@@ -36,7 +53,8 @@ const ROUTER_PUBLIC_ELIGIBILITY = new Set([
 ]);
 const ROUTER_PUBLIC_DEGRADED_REASONS = new Set([
   "invalid_config", "unsupported_protocol", "startup_selfcheck_failed", "pool_depleted",
-  "capability_mismatch", "policy_stop", "post_start_failure",
+  "capability_mismatch", "policy_stop", "post_start_failure", "account_unauthenticated",
+  "account_disabled", "account_unhealthy", "quota_depleted", "quota_stale", "quota_unknown",
 ]);
 const ROUTER_CONTROL_FAILURE_MESSAGES = Object.freeze({
   "invalid-router-mode": "The requested router mode is unavailable.",
@@ -44,7 +62,16 @@ const ROUTER_CONTROL_FAILURE_MESSAGES = Object.freeze({
   "router-requires-exactly-two-accounts": "Choose exactly two saved accounts before staging balanced mode.",
   "invalid-router-weight": "Each selected account needs a routing weight from 1 to 100.",
   "router-requires-distinct-accounts": "Choose two different saved accounts before staging balanced mode.",
+  "router-history-owner-required": "Choose which selected account should keep your existing history before staging.",
+  "router-history-owner-not-selected": "The history owner must be one of the two selected saved accounts.",
+  "router-history-adoption-invalid": "The saved offline history-adoption record could not be verified safely.",
+  "router-history-adoption-mismatch": "Existing adopted history belongs to a different selected account pool or owner.",
+  "router-state-mismatch-requires-reset": "Existing router history does not match this account pool or weights. Restore its original pool, or keep Manual pending until explicit recovery is available.",
   "router-not-idle": "Balance reset requires an idle router.",
+  "router-recovery-router-running": "Recovery is blocked while the router is running. Stop it first, then retry recovery.",
+  "router-recovery-router-status-unavailable": "Recovery needs a confirmed stopped router, but its status could not be verified.",
+  "router-recovery-account-mismatch": "The current sign-in does not match the saved account selected for recovery.",
+  "router-recovery-not-needed": "The isolated account home already matches the current saved authentication.",
   "router-operation-failed": "The router action could not be completed safely.",
 });
 // These are stable remote package identifiers returned by Codex's experimental
@@ -117,8 +144,9 @@ module.exports = {
     if (typeof window === "undefined") {
       const service = globalThis[SERVICE_KEY];
       // Disabling this tweak is a staged rollback: retain diagnostic state and
-      // isolated homes, but make the next authorized startup take the direct
-      // manual path. It never interrupts an already-open stdio session.
+      // isolated homes, but make the next authorized startup keep the adopted
+      // history mux while assigning new threads to the primary account only.
+      // It never interrupts an already-open stdio session.
       try { service?.disableRouter?.(); } catch {}
       service?.dispose?.();
       if (globalThis[SERVICE_KEY] === service) globalThis[SERVICE_KEY] = null;
@@ -133,14 +161,19 @@ module.exports = {
   },
   _test: {
     validateReferenceName, validateAuthObject, redact, createAccountService,
-    stableRef, authPaths, displayLabelFromAuth, syncActiveSnapshot,
+    stableRef, authPaths, displayLabelFromAuth, safeSnapshotLabel, syncActiveSnapshot,
     cleanupLegacyAnalytics, accountMenuTargetFromCandidates, startRenderer, disposeRenderer,
     defaultPluginProfile, normalizePluginProfile, profileHash, evaluatePluginReceipt,
     makePluginReceipt, inventoryPlugins, validateOfficialInventory, runtimeCodexBinding, readOfficialPluginInventory,
-    accountRouterPaths, opaqueAccountId, validateRouterConfig, routerPublicStatus,
-    stageBalancedRouterConfig, stageManualRouterConfig, resetRouterBalanceEpoch,
+    accountRouterPaths, opaqueAccountId, validateRouterConfig, routerConfigFingerprint, routerPublicStatus,
+    historyPoolFingerprint, historyAdoptionIntentFingerprint, historyAdoptionThreadOwnersFingerprint,
+    signHistoryAdoptionIntent, signHistoryAdoptionOwners, signHistoryAdoptionReceipt,
+    validateHistoryAdoptionIntent, validateHistoryAdoptionOwners, validateHistoryAdoptionReceipt,
+    readHistoryAdoptionRecords, historyAdoptionProjection,
+    stageBalancedRouterConfig, stageManualRouterConfig, recoverRouterAccount, resetRouterBalanceEpoch,
     readRouterConfig, readRouterState, routerControlFailure, routerPresentation,
     authenticatedRouterStatus, routerControlSocketPath, parseAuthenticatedRouterStatus, routerControlCard,
+    quotaPoolRemainingPercent, accountDetailsFor, accountMenuRows, advancedAccountsCard, accountRecoveryCard, maskIdentifier, safeAccountLabel,
   },
 };
 
@@ -200,6 +233,7 @@ function createAccountService(api, options = {}) {
       if (message?.action === "save") return service.save(message.intent);
       if (message?.action === "router-status") return service.routerStatus();
       if (message?.action === "router-configure") return service.configureRouter(message);
+      if (message?.action === "router-recover") return service.recoverRouterAccount(message);
       if (message?.action === "router-reset-balance-epoch") return service.resetRouterBalanceEpoch();
       return Promise.resolve(safeFailure("invalid-request"));
     },
@@ -219,6 +253,7 @@ function createAccountService(api, options = {}) {
     save(intent) { return enqueueIntent({ action: "save", intent }); },
     routerStatus() { return routerStatus(api, deps, paths); },
     configureRouter(message) { return enqueue(() => configureRouter(api, deps, paths, refs, message)); },
+    recoverRouterAccount(message) { return enqueue(() => recoverRouterAccount(api, deps, paths, refs, message)); },
     resetRouterBalanceEpoch() { return enqueue(() => resetRouterBalanceEpoch(deps, accountRouterPaths(deps, paths))); },
     disableRouter() { return stageManualRouterConfig(deps, paths); },
     dispose() { disposed = true; stopSnapshotSync(); intents.clear(); refs.clear(); },
@@ -481,8 +516,11 @@ function listAccounts(deps, paths, refs, protection = null) {
     } catch {}
     const accounts = [];
     if (accountsDirectoryExists) {
-      for (const entry of deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const entries = deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .sort((left, right) => left.name.localeCompare(right.name));
+      const labels = savedSnapshotLabels(entries);
+      for (const entry of entries) {
         const name = entry.name.slice(0, -5);
         try {
           validateReferenceName(name);
@@ -493,7 +531,11 @@ function listAccounts(deps, paths, refs, protection = null) {
           const opaque = stableRef(entry.name);
           const account = withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, entry.name), (auth) => ({
             ref: opaque,
-            label: displayLabelFromAuth(auth.value, name),
+            // This is the renderer boundary. `displayLabelFromAuth` deliberately
+            // excludes emails and provider fields; only a safe local label and a
+            // fixed permanent mask may cross into renderer-facing account rows.
+            label: labels.get(entry.name) || safeSnapshotLabel(auth.value, entry.name, 1),
+            identifierMasked: maskIdentifier(),
             active: current.value === entry.name
               && Boolean(liveAccountId)
               && authAccountId(auth.value) === liveAccountId,
@@ -1284,6 +1326,9 @@ function accountRouterPaths(deps, paths) {
     stateFile: deps.path.join(routerDir, ACCOUNT_ROUTER_STATE_NAME),
     controlSecretFile: deps.path.join(routerDir, ACCOUNT_ROUTER_CONTROL_SECRET_NAME),
     receiptsFile: deps.path.join(routerDir, ACCOUNT_ROUTER_RECEIPTS_NAME),
+    historyAdoptionIntentFile: deps.path.join(routerDir, ACCOUNT_ROUTER_HISTORY_ADOPTION_INTENT_NAME),
+    historyAdoptionReceiptFile: deps.path.join(routerDir, ACCOUNT_ROUTER_HISTORY_ADOPTION_RECEIPT_NAME),
+    historyAdoptionOwnersFile: deps.path.join(routerDir, ACCOUNT_ROUTER_HISTORY_ADOPTION_OWNERS_NAME),
   };
 }
 
@@ -1399,20 +1444,410 @@ function opaqueAccountId(secret, rawAccountId) {
 
 function isOpaqueAccountId(value) { return typeof value === "string" && /^ar_[A-Za-z0-9_-]{43}$/.test(value); }
 function isFingerprint(value) { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value); }
+// Legacy v1 intent accepted optional fractional seconds. Keep that read-only
+// compatibility while making every new v2 generation match Date#toISOString.
+function isUtcIsoTimestamp(value) { return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value); }
+function isCanonicalUtcIsoTimestamp(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
 function isoNow(deps) { return new Date(deps.now()).toISOString(); }
+function safeAccountLabel(value, fallback = "Saved account") {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().replace(/\s+/g, " ").slice(0, 80);
+  // Account labels are renderer-visible. Do not let a snapshot filename or a
+  // provider identifier turn into a display identifier by accident.
+  if (!normalized || /[@/\\\\]/.test(normalized) || !validLabel(normalized)) return fallback;
+  return normalized;
+}
+function maskIdentifier(_value) { return "••••••••"; }
+function canonicalRouterIntent(value) {
+  return {
+    schemaVersion: value.schemaVersion,
+    mode: value.mode,
+    policy: value.policy,
+    generation: value.generation,
+    protocolFingerprint: value.protocolFingerprint,
+    primaryOpaqueAccountId: value.primaryOpaqueAccountId,
+    accounts: value.accounts.map((account) => ({
+      opaqueAccountId: account.opaqueAccountId,
+      included: account.included,
+      weight: account.weight,
+      capabilityFingerprint: account.capabilityFingerprint,
+      ...(account.label ? { label: account.label } : {}),
+    })),
+  };
+}
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!isRecord(value)) return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+function routerConfigFingerprint(value) {
+  const { createHash } = require("node:crypto");
+  return `sha256:${createHash("sha256").update(canonicalJson(canonicalRouterIntent(value)), "utf8").digest("hex")}`;
+}
+
+function canonicalFingerprint(value) {
+  const { createHash } = require("node:crypto");
+  return `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
+}
+
+function historyPoolFingerprint(protocolFingerprint, opaqueAccountIds) {
+  if (protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !Array.isArray(opaqueAccountIds) || opaqueAccountIds.length !== 2
+    || opaqueAccountIds.some((opaqueId) => !isOpaqueAccountId(opaqueId))
+    || new Set(opaqueAccountIds).size !== 2) throw coded("invalid-history-adoption-intent");
+  return canonicalFingerprint({
+    protocolFingerprint,
+    accountOpaqueIds: [...opaqueAccountIds].sort(),
+  });
+}
+
+function historyUnsigned(value) {
+  if (!isRecord(value)) return null;
+  const { hmac, ...unsigned } = value;
+  return unsigned;
+}
+
+function historyHmac(secret, value) {
+  if (!Buffer.isBuffer(secret) || secret.length !== 32 || !isRecord(value)) throw coded("invalid-history-adoption-intent");
+  const { createHmac } = require("node:crypto");
+  return `hmac-sha256:${createHmac("sha256", secret).update(canonicalJson(historyUnsigned(value)), "utf8").digest("hex")}`;
+}
+
+function matchesHistoryHmac(secret, value) {
+  if (typeof value?.hmac !== "string" || !/^hmac-sha256:[a-f0-9]{64}$/.test(value.hmac)) return false;
+  const expected = historyHmac(secret, value);
+  const { timingSafeEqual } = require("node:crypto");
+  return timingSafeEqual(Buffer.from(value.hmac, "utf8"), Buffer.from(expected, "utf8"));
+}
+
+function hasExactKeys(value, keys) {
+  return isRecord(value) && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function signHistoryAdoptionIntent(secret, value) {
+  const unsigned = historyUnsigned(value);
+  if (!unsigned) throw coded("invalid-history-adoption-intent");
+  return { ...unsigned, hmac: historyHmac(secret, unsigned) };
+}
+
+function historyAdoptionIntentFingerprint(value) {
+  const unsigned = historyUnsigned(value);
+  if (!unsigned) throw coded("invalid-history-adoption-intent");
+  return canonicalFingerprint(unsigned);
+}
+
+function canonicalHistoryThreadIds(value) {
+  if (!Array.isArray(value)
+    || value.some((threadId) => typeof threadId !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(threadId))) {
+    throw coded("invalid-history-adoption-owners");
+  }
+  const sorted = [...value].sort();
+  if (sorted.some((threadId, index) => index > 0 && sorted[index - 1] === threadId)) {
+    throw coded("invalid-history-adoption-owners");
+  }
+  return sorted;
+}
+
+function historyAdoptionThreadOwnersFingerprint(threadIds, legacyOwnerOpaqueAccountId) {
+  if (!isOpaqueAccountId(legacyOwnerOpaqueAccountId)) throw coded("invalid-history-adoption-owners");
+  return canonicalFingerprint(canonicalHistoryThreadIds(threadIds)
+    .map((threadId) => ({ threadId, opaqueAccountId: legacyOwnerOpaqueAccountId })));
+}
+
+function validateHistoryAdoptionIntent(value, secret) {
+  const keys = ["schemaVersion", "kind", "protocolFingerprint", "poolFingerprint", "configGeneration", "configFingerprint", "legacyOwnerOpaqueAccountId", "createdAt", "hmac"];
+  if (!hasExactKeys(value, keys)
+    || value.schemaVersion !== 1 || value.kind !== "account-router-history-adoption-intent"
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !isFingerprint(value.poolFingerprint) || !Number.isInteger(value.configGeneration) || value.configGeneration < 1
+    || !isFingerprint(value.configFingerprint) || !isOpaqueAccountId(value.legacyOwnerOpaqueAccountId)
+    || !isCanonicalUtcIsoTimestamp(value.createdAt) || !matchesHistoryHmac(secret, value)) throw coded("invalid-history-adoption-intent");
+  return value;
+}
+
+function signHistoryAdoptionOwners(secret, value) {
+  const unsigned = historyUnsigned(value);
+  if (!unsigned) throw coded("invalid-history-adoption-owners");
+  return { ...unsigned, hmac: historyHmac(secret, unsigned) };
+}
+
+function validateHistoryAdoptionOwners(value, secret) {
+  const keys = ["schemaVersion", "kind", "protocolFingerprint", "poolFingerprint", "legacyOwnerOpaqueAccountId", "threadIds", "threadOwnersFingerprint", "adoptedAt", "hmac"];
+  if (!hasExactKeys(value, keys)
+    || value.schemaVersion !== 1 || value.kind !== "account-router-history-adoption-owners"
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !isFingerprint(value.poolFingerprint) || !isOpaqueAccountId(value.legacyOwnerOpaqueAccountId)
+    || !Array.isArray(value.threadIds) || !isFingerprint(value.threadOwnersFingerprint)
+    || !isCanonicalUtcIsoTimestamp(value.adoptedAt) || !matchesHistoryHmac(secret, value)) {
+    throw coded("invalid-history-adoption-owners");
+  }
+  const threadIds = canonicalHistoryThreadIds(value.threadIds);
+  if (canonicalJson(threadIds) !== canonicalJson(value.threadIds)
+    || value.threadOwnersFingerprint !== historyAdoptionThreadOwnersFingerprint(threadIds, value.legacyOwnerOpaqueAccountId)) {
+    throw coded("invalid-history-adoption-owners");
+  }
+  return { ...value, threadIds };
+}
+
+const HISTORY_ADOPTION_DATABASE_NAMES = Object.freeze([
+  "goals_1.sqlite", "logs_2.sqlite", "memories_1.sqlite", "queue_1.sqlite", "state_5.sqlite", "thread_history_1.sqlite",
+]);
+const HISTORY_ADOPTION_HISTORY_NAMES = Object.freeze(["archived_sessions", "session_index.jsonl", "sessions"]);
+
+function validateHistoryAdoptionDatabases(value) {
+  return Array.isArray(value) && value.length === HISTORY_ADOPTION_DATABASE_NAMES.length
+    && value.every((entry, index) => hasExactKeys(entry, ["name", "present", "sha256", "bytes", "integrity"])
+      && entry.name === HISTORY_ADOPTION_DATABASE_NAMES[index] && typeof entry.present === "boolean"
+      && Number.isInteger(entry.bytes) && entry.bytes >= 0
+      && (entry.present
+        ? isFingerprint(entry.sha256) && entry.integrity === "ok"
+        : entry.sha256 === null && entry.bytes === 0 && entry.integrity === null));
+}
+
+function validateHistoryAdoptionHistories(value) {
+  return Array.isArray(value) && value.length === HISTORY_ADOPTION_HISTORY_NAMES.length
+    && value.every((entry, index) => hasExactKeys(entry, ["name", "present", "sha256", "bytes", "fileCount"])
+      && entry.name === HISTORY_ADOPTION_HISTORY_NAMES[index] && typeof entry.present === "boolean"
+      && Number.isInteger(entry.bytes) && entry.bytes >= 0 && Number.isInteger(entry.fileCount) && entry.fileCount >= 0
+      && (entry.present
+        ? isFingerprint(entry.sha256)
+        : entry.sha256 === null && entry.bytes === 0 && entry.fileCount === 0));
+}
+
+function signHistoryAdoptionReceipt(secret, value) {
+  const unsigned = historyUnsigned(value);
+  if (!unsigned) throw coded("invalid-history-adoption-receipt");
+  return { ...unsigned, hmac: historyHmac(secret, unsigned) };
+}
+
+function validateHistoryAdoptionReceipt(value, secret) {
+  const keys = ["schemaVersion", "kind", "protocolFingerprint", "poolFingerprint", "intentFingerprint", "legacyOwnerOpaqueAccountId", "sourceFingerprint", "destinationFingerprint", "databases", "histories", "importedThreadCount", "threadOwnersFingerprint", "backupFingerprint", "adoptedAt", "hmac"];
+  if (!hasExactKeys(value, keys)
+    || value.schemaVersion !== 1 || value.kind !== "account-router-history-adoption-receipt"
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !isFingerprint(value.poolFingerprint) || !isFingerprint(value.intentFingerprint)
+    || !isOpaqueAccountId(value.legacyOwnerOpaqueAccountId)
+    || !isFingerprint(value.sourceFingerprint) || !isFingerprint(value.destinationFingerprint)
+    || !validateHistoryAdoptionDatabases(value.databases) || !validateHistoryAdoptionHistories(value.histories)
+    || !Number.isInteger(value.importedThreadCount) || value.importedThreadCount < 0
+    || !isFingerprint(value.threadOwnersFingerprint) || !isFingerprint(value.backupFingerprint)
+    || !isCanonicalUtcIsoTimestamp(value.adoptedAt) || !matchesHistoryHmac(secret, value)) throw coded("invalid-history-adoption-receipt");
+  return value;
+}
+
+function historyAdoptionFilePresent(deps, file) {
+  return Boolean(routerPathStatOrNull(deps.fs, file));
+}
+
+function readHistoryAdoptionRecords(deps, routerPaths, suppliedSecret = null) {
+  let intentPresent;
+  let receiptPresent;
+  let ownersPresent;
+  try {
+    intentPresent = historyAdoptionFilePresent(deps, routerPaths.historyAdoptionIntentFile);
+    receiptPresent = historyAdoptionFilePresent(deps, routerPaths.historyAdoptionReceiptFile);
+    ownersPresent = historyAdoptionFilePresent(deps, routerPaths.historyAdoptionOwnersFile);
+  } catch {
+    return { intent: null, receipt: null, owners: null, intentInvalid: true, receiptInvalid: true, ownersInvalid: true };
+  }
+  if (!intentPresent && !receiptPresent && !ownersPresent) {
+    return { intent: null, receipt: null, owners: null, intentInvalid: false, receiptInvalid: false, ownersInvalid: false };
+  }
+  let secret = suppliedSecret;
+  let ownsSecret = false;
+  try {
+    if (!secret) { secret = existingRouterSecret(deps, routerPaths); ownsSecret = true; }
+    let intent = null;
+    let receipt = null;
+    let owners = null;
+    let intentInvalid = false;
+    let receiptInvalid = false;
+    let ownersInvalid = false;
+    if (intentPresent) {
+      try { intent = validateHistoryAdoptionIntent(readPrivateJson(deps, routerPaths.historyAdoptionIntentFile, MAX_HISTORY_ADOPTION_BYTES, "invalid-history-adoption-intent"), secret); }
+      catch { intentInvalid = true; }
+    }
+    if (receiptPresent) {
+      try { receipt = validateHistoryAdoptionReceipt(readPrivateJson(deps, routerPaths.historyAdoptionReceiptFile, MAX_HISTORY_ADOPTION_BYTES, "invalid-history-adoption-receipt"), secret); }
+      catch { receiptInvalid = true; }
+    }
+    if (ownersPresent) {
+      try { owners = validateHistoryAdoptionOwners(readPrivateJson(deps, routerPaths.historyAdoptionOwnersFile, MAX_HISTORY_ADOPTION_OWNERS_BYTES, "invalid-history-adoption-owners"), secret); }
+      catch { ownersInvalid = true; }
+    }
+    return { intent, receipt, owners, intentInvalid, receiptInvalid, ownersInvalid };
+  } catch {
+    return {
+      intent: null,
+      receipt: null,
+      owners: null,
+      intentInvalid: intentPresent,
+      receiptInvalid: receiptPresent,
+      ownersInvalid: ownersPresent,
+    };
+  } finally {
+    if (ownsSecret) clearSecretBuffer(secret);
+  }
+}
+
+function historyOwnerLabel(config, opaqueId) {
+  const index = config?.accounts?.findIndex((account) => account.opaqueAccountId === opaqueId);
+  return index >= 0 ? safeAccountLabel(config.accounts[index].label, `Account ${index + 1}`) : null;
+}
+
+function historyAdoptionReceiptMatchesIntent(records) {
+  return Boolean(records?.intent) && !records.intentInvalid && !records.receiptInvalid
+    && records.receipt?.intentFingerprint === historyAdoptionIntentFingerprint(records.intent)
+    && records.receipt.protocolFingerprint === records.intent.protocolFingerprint
+    && records.receipt.poolFingerprint === records.intent.poolFingerprint
+    && records.receipt.legacyOwnerOpaqueAccountId === records.intent.legacyOwnerOpaqueAccountId;
+}
+
+function completedHistoryAdoptionState(config, state, records) {
+  if (records?.intentInvalid || records?.receiptInvalid || records?.ownersInvalid) return "invalid";
+  if (!records?.receipt && !records?.owners) return null;
+  if (!records.intent || !records.receipt || !records.owners || !historyAdoptionReceiptMatchesIntent(records)) return "invalid";
+  const usableConfig = config?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION
+    && Array.isArray(config.accounts) && config.accounts.length === 2;
+  if (!usableConfig) return "mismatch";
+  const poolFingerprint = historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId));
+  const owner = records.intent.legacyOwnerOpaqueAccountId;
+  if (records.intent.poolFingerprint !== poolFingerprint || !config.accounts.some((account) => account.opaqueAccountId === owner)) {
+    return "mismatch";
+  }
+  if (records.receipt.protocolFingerprint !== config.protocolFingerprint
+    || records.receipt.poolFingerprint !== poolFingerprint
+    || records.receipt.legacyOwnerOpaqueAccountId !== owner
+    || records.owners.protocolFingerprint !== config.protocolFingerprint
+    || records.owners.poolFingerprint !== poolFingerprint
+    || records.owners.legacyOwnerOpaqueAccountId !== owner
+    || records.receipt.adoptedAt !== records.owners.adoptedAt
+    || records.receipt.importedThreadCount !== records.owners.threadIds.length
+    || records.receipt.threadOwnersFingerprint !== records.owners.threadOwnersFingerprint) return "invalid";
+  if (!state || !isRecord(state.threadOwners) || !isRecord(state.pendingThreadOwners)) return "invalid";
+  for (const threadId of records.owners.threadIds) {
+    if (state.threadOwners[threadId] !== owner) return "invalid";
+    const pending = state.pendingThreadOwners[threadId];
+    if (pending !== undefined && pending !== owner) return "invalid";
+  }
+  return "adopted";
+}
+
+function historyAdoptionProjection(config, records = null, state = null) {
+  const required = { state: "required", ownerLabel: null, importedThreadCount: 0, databaseCount: 0, historyCount: 0 };
+  const source = records || {
+    intent: null, receipt: null, owners: null, intentInvalid: false, receiptInvalid: false, ownersInvalid: false,
+  };
+  const completed = completedHistoryAdoptionState(config, state, source);
+  if (completed === "invalid" || completed === "mismatch") return { ...required, state: completed };
+  const usableConfig = config?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && Array.isArray(config.accounts) && config.accounts.length === 2;
+  if (completed === "adopted") {
+    const ownerLabel = historyOwnerLabel(config, source.receipt.legacyOwnerOpaqueAccountId);
+    if (!ownerLabel) return { ...required, state: "mismatch" };
+    return {
+      state: "adopted",
+      ownerLabel,
+      importedThreadCount: source.receipt.importedThreadCount,
+      databaseCount: source.receipt.databases.filter((entry) => entry.present).length,
+      historyCount: source.receipt.histories.filter((entry) => entry.present).length,
+    };
+  }
+  if (source.intentInvalid) return { ...required, state: "invalid" };
+  if (!source.intent) return required;
+  if (!usableConfig) return { ...required, state: "mismatch" };
+  const poolFingerprint = historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId));
+  const ownerLabel = historyOwnerLabel(config, source.intent.legacyOwnerOpaqueAccountId);
+  if (source.intent.poolFingerprint !== poolFingerprint || source.intent.configGeneration !== config.generation
+    || source.intent.configFingerprint !== config.fingerprint || !ownerLabel) return { ...required, state: "mismatch" };
+  return { ...required, state: "pending_offline_adoption", ownerLabel };
+}
+
+function createHistoryAdoptionIntent(deps, config, legacyOwnerOpaqueAccountId, secret) {
+  const poolFingerprint = historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId));
+  return signHistoryAdoptionIntent(secret, {
+    schemaVersion: 1,
+    kind: "account-router-history-adoption-intent",
+    protocolFingerprint: config.protocolFingerprint,
+    poolFingerprint,
+    configGeneration: config.generation,
+    configFingerprint: config.fingerprint,
+    legacyOwnerOpaqueAccountId,
+    createdAt: isoNow(deps),
+  });
+}
+
+function writeHistoryAdoptionIntent(deps, routerPaths, intent) {
+  const bytes = Buffer.from(JSON.stringify(intent), "utf8");
+  try {
+    if (bytes.length > MAX_HISTORY_ADOPTION_BYTES) throw coded("invalid-history-adoption-intent");
+    atomicWrite(deps, routerPaths.routerDir, routerPaths.historyAdoptionIntentFile, bytes);
+  } finally { clearSecretBuffer(bytes); }
+}
+
+function assertHistoryAdoptionMayStage(config, records, legacyOwnerOpaqueAccountId, state = null) {
+  if (records.intentInvalid || records.receiptInvalid || records.ownersInvalid) throw coded("router-history-adoption-invalid");
+  if (!records.receipt && !records.owners) {
+    // A valid pre-adoption intent is deliberately replaceable by this explicit
+    // staging action. A tampered one is not silently overwritten.
+    return;
+  }
+  const evidenceState = completedHistoryAdoptionState(config, state, records);
+  if (evidenceState === "mismatch") throw coded("router-history-adoption-mismatch");
+  if (evidenceState !== "adopted") throw coded("router-history-adoption-invalid");
+  if (legacyOwnerOpaqueAccountId !== null && legacyOwnerOpaqueAccountId !== undefined
+    && records.intent.legacyOwnerOpaqueAccountId !== legacyOwnerOpaqueAccountId) throw coded("router-history-adoption-mismatch");
+}
+
+function routerConfigGeneration(existing) {
+  return existing?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && Number.isInteger(existing.generation)
+    ? existing.generation + 1
+    : 1;
+}
 function pendingCapabilityFingerprint(opaqueId) {
   const { createHash } = require("node:crypto");
   return `sha256:${createHash("sha256").update(`account-router:v1:pending-capability:${opaqueId}`).digest("hex")}`;
 }
 
 function validateRouterConfig(value) {
-  if (!isRecord(value) || Object.keys(value).length !== 6
-    || value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+  if (!isRecord(value)) throw coded("invalid-router-config");
+  if (value.schemaVersion === ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION) return validateLegacyRouterConfig(value);
+  if (value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    || Object.keys(value).length !== 9
+    || !["manual", "quota_aware"].includes(value.mode)
+    || (value.mode === "quota_aware" ? value.policy !== ACCOUNT_ROUTER_QUOTA_POLICY : value.policy !== null)
+    || !Number.isInteger(value.generation) || value.generation < 1
+    || !isFingerprint(value.fingerprint)
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !isOpaqueAccountId(value.primaryOpaqueAccountId)
+    || !Array.isArray(value.accounts) || value.accounts.length !== 2
+    || !isCanonicalUtcIsoTimestamp(value.updatedAt)) throw coded("invalid-router-config");
+  const seen = new Set();
+  for (const account of value.accounts) {
+    if (!isRecord(account) || Object.keys(account).length !== 5
+      || !isOpaqueAccountId(account.opaqueAccountId) || typeof account.included !== "boolean"
+      || !Number.isInteger(account.weight) || account.weight < 1 || account.weight > 100
+      || !isFingerprint(account.capabilityFingerprint)
+      || safeAccountLabel(account.label, "") !== account.label
+      || seen.has(account.opaqueAccountId)) throw coded("invalid-router-config");
+    seen.add(account.opaqueAccountId);
+  }
+  if (!seen.has(value.primaryOpaqueAccountId) || value.accounts.some((account) => account.included !== true)
+    || routerConfigFingerprint(value) !== value.fingerprint) throw coded("invalid-router-config");
+  return value;
+}
+
+function validateLegacyRouterConfig(value) {
+  if (Object.keys(value).length !== 6
     || !["manual", "balanced"].includes(value.mode)
     || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
     || !isOpaqueAccountId(value.primaryOpaqueAccountId)
     || !Array.isArray(value.accounts) || value.accounts.length !== 2
-    || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) throw coded("invalid-router-config");
+    || !isUtcIsoTimestamp(value.updatedAt)) throw coded("invalid-router-config");
   const seen = new Set();
   for (const account of value.accounts) {
     if (!isRecord(account) || Object.keys(account).length !== 4
@@ -1439,7 +1874,7 @@ function readRouterConfig(deps, routerPaths) {
 }
 
 function validateRouterState(value) {
-  if (!isRecord(value) || value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+  if (!isRecord(value) || value.schemaVersion !== ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION
     || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
     || !Number.isInteger(value.epoch) || value.epoch < 1
     || !isRecord(value.ledger) || !isRecord(value.accountEligibility)
@@ -1454,16 +1889,56 @@ function readRouterState(deps, routerPaths) {
   return value === null ? null : validateRouterState(value);
 }
 
+function accountKeysMatch(value, accounts) {
+  const expected = new Set(accounts.map((account) => account.opaqueAccountId));
+  const actual = Object.keys(value);
+  return actual.length === expected.size && actual.every((opaqueId) => expected.has(opaqueId));
+}
+
+function routerStateMatchesPendingIntent(state, config) {
+  if (!routerStateIsTerminalAndIdle(state)
+    || !accountKeysMatch(state.ledger, config.accounts)
+    || !accountKeysMatch(state.accountEligibility, config.accounts)) return false;
+  const configured = new Set(config.accounts.map((account) => account.opaqueAccountId));
+  if (!Object.values(state.threadOwners).every((owner) => configured.has(owner))
+    || !Object.values(state.pendingThreadOwners).every((owner) => configured.has(owner))) return false;
+  return config.accounts.every((account) => {
+    const ledger = state.ledger[account.opaqueAccountId];
+    return isRecord(ledger) && ledger.weight === account.weight
+      && typeof state.accountEligibility[account.opaqueAccountId] === "string";
+  });
+}
+
+function assertRouterStateMatchesPendingIntent(deps, routerPaths, config) {
+  const state = readRouterState(deps, routerPaths);
+  if (state && !routerStateMatchesPendingIntent(state, config)) throw coded("router-state-mismatch-requires-reset");
+}
+
 function writePrivateJson(deps, directory, file, value) {
   const bytes = Buffer.from(JSON.stringify(value), "utf8");
   try { atomicWrite(deps, directory, file, bytes); } finally { clearSecretBuffer(bytes); }
 }
 
-function safeRouterReceipt(deps, routerPaths, entry) {
+function nextRouterReceipts(deps, routerPaths, entries) {
   const existing = readPrivateJson(deps, routerPaths.receiptsFile, MAX_ROUTER_STATE_BYTES, "invalid-router-receipts") || [];
   if (!Array.isArray(existing) || existing.some((item) => !isRecord(item))) throw coded("invalid-router-receipts");
-  existing.push(entry);
-  writePrivateJson(deps, routerPaths.routerDir, routerPaths.receiptsFile, existing.slice(-32));
+  if (!Array.isArray(entries) || entries.some((item) => !isRecord(item))) throw coded("invalid-router-receipts");
+  return [...existing, ...entries].slice(-32);
+}
+
+function migrationReceiptEntries(deps, config, migrations) {
+  return migrations.map(({ account, result }) => ({
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+    opaqueAccountId: account.opaqueAccountId,
+    snapshotHash: `sha256:${result.hash}`,
+    protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+    // A receipt records a prepared private home, not a claim that this pending
+    // config has become live. Config publication is the final operation below.
+    result: result.refreshed ? "refreshed" : result.reused ? "reused" : "prepared",
+    generation: config.generation,
+    intentFingerprint: config.fingerprint,
+    stagedAt: isoNow(deps),
+  }));
 }
 
 function exactRouterChild(deps, routerPaths, opaqueId) {
@@ -1496,13 +1971,30 @@ function stageRouterHome(deps, paths, routerPaths, filename, opaqueId, secret) {
     const target = exactRouterChild(deps, routerPaths, opaqueId);
     if (routerPathStatOrNull(deps.fs, target)) {
       const authFile = deps.path.join(target, "codex-home", "auth.json");
+      const configFile = deps.path.join(target, "codex-home", "config.toml");
       hardenRouterChild(deps, routerPaths.accountsDir, target, false);
       hardenRouterChild(deps, target, deps.path.join(target, "codex-home"), false);
       hardenRouterChild(deps, target, deps.path.join(target, "sqlite-home"), false);
-      withSecureAuth(deps.fs, authFile, (existing) => {
-        if (existing.hash !== sourceSnapshot.hash) throw coded("router-home-conflict");
+      const hasExpectedConfig = () => withOptionalSecureBytes(deps.fs, configFile, 4 * 1024,
+        (bytes) => Buffer.isBuffer(bytes) && bytes.length === 0);
+      if (!hasExpectedConfig()) throw coded("router-home-conflict");
+      const existing = withSecureAuth(deps.fs, authFile, (snapshot) => {
+        if (opaqueAccountId(secret, authAccountId(snapshot.value)) !== opaqueId) throw coded("router-home-conflict");
+        return { hash: snapshot.hash, identity: snapshot.identity };
       });
-      return { reused: true, hash: sourceSnapshot.hash };
+      // A saved source can legitimately lag behind an isolated home after the
+      // router refreshes its own token. Revalidate both identities, but never
+      // replace that hardened home during ordinary restaging.
+      withSecureAuth(deps.fs, source, (revalidated) => {
+        if (revalidated.identity !== sourceSnapshot.identity || revalidated.hash !== sourceSnapshot.hash
+          || opaqueAccountId(secret, authAccountId(revalidated.value)) !== opaqueId) throw coded("router-source-changed");
+      });
+      withSecureAuth(deps.fs, authFile, (revalidated) => {
+        if (revalidated.identity !== existing.identity || revalidated.hash !== existing.hash
+          || opaqueAccountId(secret, authAccountId(revalidated.value)) !== opaqueId) throw coded("router-home-conflict");
+      });
+      if (!hasExpectedConfig()) throw coded("router-home-conflict");
+      return { reused: true, hash: existing.hash };
     }
     staging = deps.path.join(routerPaths.accountsDir, `.staging-${deps.randomUUID()}`);
     hardenRouterChild(deps, routerPaths.accountsDir, staging, true);
@@ -1533,10 +2025,18 @@ function stageRouterHome(deps, paths, routerPaths, filename, opaqueId, secret) {
 
 function stageBalancedRouterConfig(deps, paths, refs, message) {
   const routerPaths = ensureRouterRoot(deps, paths);
+  // Validate the prior pending intent before preparing any new isolated home.
+  // A malformed prior config must fail before it can leave a partial retry
+  // footprint alongside a new intended generation.
+  const existing = readRouterConfig(deps, routerPaths);
   const refsInput = Array.isArray(message?.refs) ? message.refs : [];
   if (refsInput.length !== 2 || new Set(refsInput).size !== 2) throw coded("router-requires-exactly-two-accounts");
+  const legacyOwnerRef = typeof message?.legacyOwnerRef === "string" ? message.legacyOwnerRef : null;
+  if (!legacyOwnerRef) throw coded("router-history-owner-required");
+  if (!refsInput.includes(legacyOwnerRef)) throw coded("router-history-owner-not-selected");
   const filenames = refsInput.map((ref) => refs.get(ref));
   if (filenames.some((filename) => typeof filename !== "string")) throw coded("unknown-reference");
+  const labels = savedSnapshotLabels(deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true }));
   const weights = Array.isArray(message?.weights) ? message.weights : [1, 1];
   if (weights.length !== 2 || weights.some((weight) => !Number.isInteger(weight) || weight < 1 || weight > 100)) throw coded("invalid-router-weight");
   const secret = routerSecret(deps, routerPaths);
@@ -1544,18 +2044,65 @@ function stageBalancedRouterConfig(deps, paths, refs, message) {
     const accounts = filenames.map((filename, index) => withSecureAuth(deps.fs, sourceFilePath(deps.path, paths.accountsDir, filename), (snapshot) => {
       const rawId = authAccountId(snapshot.value);
       if (!rawId) throw coded("invalid-account-identity");
-      return { filename, opaqueAccountId: opaqueAccountId(secret, rawId), included: true, weight: weights[index], capabilityFingerprint: pendingCapabilityFingerprint(opaqueAccountId(secret, rawId)) };
+      const opaqueId = opaqueAccountId(secret, rawId);
+      return {
+        filename,
+        opaqueAccountId: opaqueId,
+        included: true,
+        // Kept for v1 compatibility; quota_aware_v1 does not expose weights in
+        // normal UI and the runtime owns any future allocation policy changes.
+        weight: weights[index],
+        capabilityFingerprint: pendingCapabilityFingerprint(opaqueId),
+        label: labels.get(filename) || safeSnapshotLabel(snapshot.value, filename, index + 1),
+      };
     }));
     if (new Set(accounts.map((account) => account.opaqueAccountId)).size !== 2) throw coded("router-requires-distinct-accounts");
+    const legacyOwnerOpaqueAccountId = accounts[refsInput.indexOf(legacyOwnerRef)].opaqueAccountId;
     const primaryRef = typeof message?.primaryRef === "string" ? message.primaryRef : refsInput[0];
     const primaryIndex = refsInput.indexOf(primaryRef);
     if (primaryIndex < 0) throw coded("invalid-router-primary");
+    const candidateAccounts = accounts.map(({ filename, ...account }) => account);
+    const draft = {
+      schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+      mode: "quota_aware",
+      policy: ACCOUNT_ROUTER_QUOTA_POLICY,
+      generation: routerConfigGeneration(existing),
+      protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+      primaryOpaqueAccountId: candidateAccounts[primaryIndex].opaqueAccountId,
+      accounts: candidateAccounts,
+      updatedAt: isoNow(deps),
+    };
+    const config = validateRouterConfig({ ...draft, fingerprint: routerConfigFingerprint(draft) });
+    // Router state is private runtime history. A new pair or per-account weight
+    // must never be published beside incompatible history: the runtime would
+    // fail closed at startup, so fail before preparing homes or receipts here.
+    const routerState = readRouterState(deps, routerPaths);
+    const historyRecords = readHistoryAdoptionRecords(deps, routerPaths, secret);
+    assertHistoryAdoptionMayStage(config, historyRecords, legacyOwnerOpaqueAccountId, routerState);
+    assertRouterStateMatchesPendingIntent(deps, routerPaths, config);
+    // Each source is read and identity-bound before its isolated home is
+    // promoted. A failure never changes a source snapshot or publishes a
+    // router config; a subsequent run reuses only an identity-matching,
+    // hardened home and preserves its independently rotated token bytes.
+    const migrations = [];
     for (const account of accounts) {
       const result = stageRouterHome(deps, paths, routerPaths, account.filename, account.opaqueAccountId, secret);
-      safeRouterReceipt(deps, routerPaths, { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, opaqueAccountId: account.opaqueAccountId, snapshotHash: `sha256:${result.hash}`, protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, result: result.reused ? "reused" : "staged", stagedAt: isoNow(deps) });
+      migrations.push({ account, result });
       delete account.filename;
     }
-    const config = validateRouterConfig({ schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "balanced", protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, primaryOpaqueAccountId: accounts[primaryIndex].opaqueAccountId, accounts, updatedAt: isoNow(deps) });
+    // Prepare the ordinary home-migration receipts, then publish the signed
+    // offline-adoption intent before the config's final commit. If a later
+    // write fails, that intent is only stale pre-adoption evidence and a new
+    // deliberate stage may replace it; it never claims live routing changed.
+    const receiptBatch = nextRouterReceipts(deps, routerPaths, migrationReceiptEntries(deps, config, migrations));
+    // Before adoption, a deliberate restage replaces stale intent. After a
+    // valid receipt, preserve the original signed intent byte-for-byte: that
+    // receipt/owners chain is independent from later v2 config generations.
+    if (!historyRecords.receipt) {
+      const historyIntent = createHistoryAdoptionIntent(deps, config, legacyOwnerOpaqueAccountId, secret);
+      writeHistoryAdoptionIntent(deps, routerPaths, historyIntent);
+    }
+    writePrivateJson(deps, routerPaths.routerDir, routerPaths.receiptsFile, receiptBatch);
     writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
     return config;
   } finally {
@@ -1571,10 +2118,213 @@ function stageManualRouterConfig(deps, paths) {
   hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
   const existing = readRouterConfig(deps, routerPaths);
   if (!existing) return null;
-  if (existing.mode === "manual") return existing;
-  const config = { ...existing, mode: "manual", updatedAt: isoNow(deps) };
+  const accounts = existing.accounts.map((account, index) => ({
+    opaqueAccountId: account.opaqueAccountId,
+    included: true,
+    weight: account.weight,
+    capabilityFingerprint: account.capabilityFingerprint,
+    label: safeAccountLabel(account.label, `Account ${index + 1}`),
+  }));
+  const draft = {
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+    mode: "manual",
+    policy: null,
+    generation: routerConfigGeneration(existing),
+    protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+    primaryOpaqueAccountId: existing.primaryOpaqueAccountId,
+    accounts,
+    updatedAt: isoNow(deps),
+  };
+  const config = validateRouterConfig({ ...draft, fingerprint: routerConfigFingerprint(draft) });
+  const state = readRouterState(deps, routerPaths);
+  const historyRecords = readHistoryAdoptionRecords(deps, routerPaths);
+  if (historyRecords.receipt || historyRecords.owners || historyRecords.receiptInvalid || historyRecords.ownersInvalid) {
+    assertHistoryAdoptionMayStage(config, historyRecords, null, state);
+  }
   writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
   return config;
+}
+
+function existingRouterSecret(deps, routerPaths) {
+  hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
+  return withOptionalSecureBytes(deps.fs, routerPaths.controlSecretFile, 64, (bytes) => {
+    if (!bytes || bytes.length !== 32) throw coded("invalid-router-control-secret");
+    return Buffer.from(bytes);
+  });
+}
+
+function recoveryCandidate(deps, paths, routerPaths, filename, opaqueId, secret) {
+  const sourceFile = sourceFilePath(deps.path, paths.accountsDir, filename);
+  const target = exactRouterChild(deps, routerPaths, opaqueId);
+  const homeDir = deps.path.join(target, "codex-home");
+  const homeAuthFile = deps.path.join(homeDir, "auth.json");
+  let source;
+  let current;
+  let home;
+  try {
+    hardenRouterChild(deps, routerPaths.accountsDir, target, false);
+    hardenRouterChild(deps, target, homeDir, false);
+    source = readSecureAuth(deps.fs, sourceFile);
+    current = readSecureAuth(deps.fs, paths.authFile);
+    home = readSecureAuth(deps.fs, homeAuthFile);
+    const sameOpaqueIdentity = (snapshot) => {
+      const accountId = authAccountId(snapshot.value);
+      return accountId && opaqueAccountId(secret, accountId) === opaqueId;
+    };
+    if (![source, current, home].every(sameOpaqueIdentity)) throw coded("router-recovery-account-mismatch");
+    return {
+      sourceFile,
+      homeDir,
+      homeAuthFile,
+      sourceIdentity: source.identity,
+      sourceHash: source.hash,
+      currentIdentity: current.identity,
+      currentHash: current.hash,
+      homeIdentity: home.identity,
+      homeHash: home.hash,
+      sourceBytes: Buffer.from(source.bytes),
+      currentBytes: Buffer.from(current.bytes),
+      homeBytes: Buffer.from(home.bytes),
+    };
+  } finally {
+    clearSecretBuffer(source?.bytes);
+    clearSecretBuffer(current?.bytes);
+    clearSecretBuffer(home?.bytes);
+  }
+}
+
+function sameRecoveryCandidate(left, right) {
+  return left?.sourceIdentity === right?.sourceIdentity && left?.sourceHash === right?.sourceHash
+    && left?.currentIdentity === right?.currentIdentity && left?.currentHash === right?.currentHash
+    && left?.homeIdentity === right?.homeIdentity && left?.homeHash === right?.homeHash;
+}
+
+function recoveryConfig(existing, refreshedOpaqueId, refreshedLabel, deps) {
+  if (existing?.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION) throw coded("router-operation-failed");
+  const accounts = existing.accounts.map((account, index) => ({
+    opaqueAccountId: account.opaqueAccountId,
+    included: true,
+    weight: account.weight,
+    capabilityFingerprint: account.capabilityFingerprint,
+    label: account.opaqueAccountId === refreshedOpaqueId
+      ? safeAccountLabel(refreshedLabel, `Account ${index + 1}`)
+      : safeAccountLabel(account.label, `Account ${index + 1}`),
+  }));
+  const draft = {
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+    mode: existing.mode,
+    policy: existing.policy,
+    generation: routerConfigGeneration(existing),
+    protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+    primaryOpaqueAccountId: existing.primaryOpaqueAccountId,
+    accounts,
+    updatedAt: isoNow(deps),
+  };
+  return validateRouterConfig({ ...draft, fingerprint: routerConfigFingerprint(draft) });
+}
+
+async function recoverRouterAccount(_api, deps, paths, refs, message) {
+  let secret;
+  let before;
+  let current;
+  let priorConfigBytes;
+  let receiptBatch;
+  let sourceWritten = false;
+  let homeWritten = false;
+  let receiptPublished = false;
+  let configPublicationStarted = false;
+  let configPublished = false;
+  try {
+    const ref = typeof message?.ref === "string" ? message.ref : null;
+    const filename = ref ? refs.get(ref) : null;
+    if (!filename) throw coded("unknown-reference");
+    const routerPaths = accountRouterPaths(deps, paths);
+    hardenRouterChild(deps, deps.path.dirname(routerPaths.routerDir), routerPaths.routerDir, false);
+    hardenRouterChild(deps, routerPaths.routerDir, routerPaths.accountsDir, false);
+    const existing = readRouterConfig(deps, routerPaths);
+    if (!existing || existing.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION) throw coded("router-operation-failed");
+    priorConfigBytes = withOptionalSecureBytes(deps.fs, routerPaths.configFile, 32 * 1024,
+      (bytes) => bytes ? Buffer.from(bytes) : null);
+    if (!priorConfigBytes) throw coded("router-operation-failed");
+    secret = existingRouterSecret(deps, routerPaths);
+    const source = sourceFilePath(deps.path, paths.accountsDir, filename);
+    const sourceAccountId = withSecureAuth(deps.fs, source, (snapshot) => authAccountId(snapshot.value));
+    const opaqueId = sourceAccountId ? opaqueAccountId(secret, sourceAccountId) : null;
+    const configured = opaqueId && existing.accounts.find((account) => account.opaqueAccountId === opaqueId);
+    if (!configured) throw coded("router-recovery-account-mismatch");
+    before = recoveryCandidate(deps, paths, routerPaths, filename, opaqueId, secret);
+    if (before.sourceHash === before.currentHash && before.homeHash === before.currentHash) throw coded("router-recovery-not-needed");
+
+    // A missing/refused socket proves this generation is not running. Any live
+    // response or unverifiable control path fails closed before a home changes.
+    const live = await authenticatedRouterStatus(deps, routerPaths);
+    if (live.state === "active") throw coded("router-recovery-router-running");
+    if (live.state !== "not_running") throw coded("router-recovery-router-status-unavailable");
+
+    current = recoveryCandidate(deps, paths, routerPaths, filename, opaqueId, secret);
+    if (!sameRecoveryCandidate(before, current)) throw coded("router-source-changed");
+    const recheckedConfig = readRouterConfig(deps, routerPaths);
+    if (recheckedConfig?.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+      || recheckedConfig.generation !== existing.generation
+      || recheckedConfig.fingerprint !== existing.fingerprint) throw coded("router-operation-failed");
+
+    // Refresh the existing source and its isolated copy as one recoverable
+    // pre-publication change. Neither snapshot is deleted or renamed, and the
+    // source remains the same named account rather than becoming a third entry.
+    atomicWrite(deps, paths.accountsDir, current.sourceFile, current.currentBytes);
+    sourceWritten = true;
+    atomicWrite(deps, current.homeDir, current.homeAuthFile, current.currentBytes);
+    homeWritten = true;
+    const labels = savedSnapshotLabels(deps.fs.readdirSync(paths.accountsDir, { withFileTypes: true }));
+    const config = recoveryConfig(existing, opaqueId, labels.get(filename), deps);
+    receiptBatch = nextRouterReceipts(deps, routerPaths, migrationReceiptEntries(deps, config, [{
+      account: config.accounts.find((account) => account.opaqueAccountId === opaqueId),
+      result: { hash: current.currentHash, refreshed: true },
+    }]));
+    // Receipt commit is deliberately before the config final commit. A receipt
+    // write failure therefore rolls back both refreshed auth files without
+    // publishing a pending generation.
+    writePrivateJson(deps, routerPaths.routerDir, routerPaths.receiptsFile, receiptBatch);
+    receiptPublished = true;
+    configPublicationStarted = true;
+    writePrivateJson(deps, routerPaths.routerDir, routerPaths.configFile, config);
+    configPublished = true;
+    const state = readRouterState(deps, routerPaths);
+    const historyRecords = readHistoryAdoptionRecords(deps, routerPaths);
+    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords), live: { state: "not_running", status: null } };
+  } catch (error) {
+    if (!configPublished) {
+      try {
+        // `atomicWrite` can only fail after its rename on a later metadata
+        // operation. Restore the prior valid config before restoring auth so an
+        // IPC failure never leaves a new router generation claiming recovery.
+        if (configPublicationStarted && priorConfigBytes) {
+          const routerPaths = accountRouterPaths(deps, paths);
+          atomicWrite(deps, routerPaths.routerDir, routerPaths.configFile, priorConfigBytes);
+        }
+        if (homeWritten && current) atomicWrite(deps, current.homeDir, current.homeAuthFile, current.homeBytes);
+        if (sourceWritten && current) atomicWrite(deps, paths.accountsDir, current.sourceFile, current.sourceBytes);
+        // The receipt file is only diagnostic. If a final config write throws,
+        // retain an explicit aborted record rather than a false claim that this
+        // new generation was published or silently deleting private evidence.
+        if (receiptPublished && receiptBatch) {
+          const aborted = receiptBatch.map((entry) => entry?.intentFingerprint
+            ? { ...entry, result: "aborted", abortedAt: isoNow(deps) } : entry);
+          const routerPaths = accountRouterPaths(deps, paths);
+          writePrivateJson(deps, routerPaths.routerDir, routerPaths.receiptsFile, aborted);
+        }
+      } catch { return safeRouterFailure(coded("router-operation-failed")); }
+    }
+    return safeRouterFailure(error);
+  } finally {
+    clearSecretBuffer(secret);
+    clearSecretBuffer(priorConfigBytes);
+    for (const candidate of [before, current]) {
+      clearSecretBuffer(candidate?.sourceBytes);
+      clearSecretBuffer(candidate?.currentBytes);
+      clearSecretBuffer(candidate?.homeBytes);
+    }
+  }
 }
 
 function routerDegradedReason(state) {
@@ -1582,8 +2332,47 @@ function routerDegradedReason(state) {
   return ({ protocol_drift: "unsupported_protocol", isolation_failure: "capability_mismatch", policy_stop: "policy_stop", post_start_failure: "post_start_failure" })[code] || null;
 }
 
-function routerPublicStatus(deps, config, state) {
-  if (!config) return { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "manual", protocolState: "supported", fairnessPrecision: "exact_completed_spend", accounts: [], restartRequired: false, degradedReason: null };
+function routerPublicStatus(deps, config, state, historyRecords = null) {
+  if (!config) return {
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+    mode: "manual",
+    policy: null,
+    active: null,
+    pending: null,
+    protocolState: "supported",
+    accounts: [],
+    restartRequired: false,
+    degradedReason: null,
+    historyAdoption: historyAdoptionProjection(null, historyRecords, state),
+  };
+  if (config.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) {
+    const invalid = config.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT;
+    const degradedReason = invalid ? "invalid_config" : routerDegradedReason(state);
+    return redact({
+      schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+      mode: config.mode,
+      policy: config.policy,
+      // This is a disk projection only. `active` is intentionally null: only
+      // the authenticated mux socket is allowed to claim current live truth.
+      active: null,
+      pending: {
+        mode: config.mode,
+        policy: config.policy,
+        generation: config.generation,
+        fingerprint: config.fingerprint,
+      },
+      protocolState: invalid ? "unknown" : "supported",
+      accounts: config.accounts.map((account, index) => ({
+        label: safeAccountLabel(account.label, `Account ${index + 1}`),
+        eligibility: state?.accountEligibility?.[account.opaqueAccountId] || "validating",
+        assignedThreadCount: Number.isInteger(state?.ledger?.[account.opaqueAccountId]?.assignedThreadCount)
+          ? state.ledger[account.opaqueAccountId].assignedThreadCount : 0,
+      })),
+      restartRequired: true,
+      degradedReason,
+      historyAdoption: historyAdoptionProjection(config, historyRecords, state),
+    });
+  }
   const invalid = config.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT;
   const degradedReason = invalid ? "invalid_config" : routerDegradedReason(state);
   const mode = degradedReason ? "direct_fallback" : config.mode;
@@ -1593,7 +2382,6 @@ function routerPublicStatus(deps, config, state) {
     const output = Number.isInteger(ledger?.completedOutputTokens) ? ledger.completedOutputTokens : 0;
     const reserved = Number.isInteger(ledger?.reservedRequestCost) ? ledger.reservedRequestCost : 0;
     return {
-      opaqueAccountId: account.opaqueAccountId,
       label: index === 0 ? "Account A" : "Account B",
       eligibility: state?.accountEligibility?.[account.opaqueAccountId] || "validating",
       normalizedSpend: (completed + output + reserved) / account.weight,
@@ -1601,28 +2389,45 @@ function routerPublicStatus(deps, config, state) {
     };
   });
   const inFlight = Boolean(state?.reservations?.length || state?.correlations?.length || accounts.some((account) => ["validating", "reserved", "active"].includes(account.eligibility)));
-  return redact({ schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode, protocolState: invalid ? "unknown" : "supported", fairnessPrecision: inFlight ? "projected" : "exact_completed_spend", accounts, restartRequired: mode === "balanced" || mode === "direct_fallback", degradedReason });
+  return redact({ schemaVersion: ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION, mode, protocolState: invalid ? "unknown" : "supported", fairnessPrecision: inFlight ? "projected" : "exact_completed_spend", accounts, restartRequired: mode === "balanced" || mode === "direct_fallback", degradedReason, historyAdoption: historyAdoptionProjection(config, historyRecords, state) });
 }
 
 async function routerStatus(_api, deps, paths) {
   const routerPaths = accountRouterPaths(deps, paths);
+  // The socket is the only active-truth authority. Query it first so a later
+  // bad pending config or state record cannot erase an authenticated running
+  // generation from the renderer's view.
+  let live;
+  try { live = await authenticatedRouterStatus(deps, routerPaths); }
+  catch { live = { state: "unavailable", status: null }; }
   try {
     const config = readRouterConfig(deps, routerPaths);
     const state = readRouterState(deps, routerPaths);
-    const router = routerPublicStatus(deps, config, state);
-    // The staged config and its local state are not runtime evidence. Only an
-    // authenticated mux response may carry a live account/thread projection.
-    const live = config?.mode === "balanced"
-      ? await authenticatedRouterStatus(deps, routerPaths)
-      : { state: "not_applicable", status: null };
+    const historyRecords = readHistoryAdoptionRecords(deps, routerPaths);
+    const router = routerPublicStatus(deps, config, state, historyRecords);
     return { ok: true, router, live };
   } catch {
     // A malformed/stale persisted control record never blocks manual behavior.
-    // The runtime will select direct mode; the renderer receives only its code.
+    // It is a pending-disk failure, not a claim about an independently
+    // authenticated running mux, which remains available in `live`.
     return {
       ok: true,
-      router: { schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION, mode: "direct_fallback", protocolState: "unknown", fairnessPrecision: "estimated", accounts: [], restartRequired: true, degradedReason: "invalid_config" },
-      live: { state: "unavailable", status: null },
+      router: {
+        schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+        mode: "manual",
+        policy: null,
+        active: null,
+        pending: null,
+        protocolState: "unknown",
+        accounts: [],
+        restartRequired: false,
+        degradedReason: "invalid_config",
+        // A corrupt persisted config/state cannot identify a safe history
+        // owner or pool. Report that offline record as invalid instead of
+        // falling back to a misleading "required" choice.
+        historyAdoption: { state: "invalid", ownerLabel: null, importedThreadCount: 0, databaseCount: 0, historyCount: 0 },
+      },
+      live,
     };
   }
 }
@@ -1688,8 +2493,15 @@ function parseAuthenticatedRouterStatus(bytes, requestId) {
     if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["requestId", "status", "version"].join("\0")
       || value.version !== 1 || value.requestId !== requestId || !isRecord(value.status)) return null;
     const status = value.status;
+    if (status.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) return parseQuotaAwareRouterStatus(status);
+    return parseLegacyRouterStatus(status);
+  } catch { return null; }
+}
+
+function parseLegacyRouterStatus(status) {
+  try {
     const allowed = ["accounts", "degradedReason", "fairnessPrecision", "mode", "protocolState", "restartRequired", "schemaVersion"];
-    if (Object.keys(status).some((key) => !allowed.includes(key)) || status.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    if (Object.keys(status).some((key) => !allowed.includes(key)) || status.schemaVersion !== ACCOUNT_ROUTER_LEGACY_SCHEMA_VERSION
       || !["manual", "balanced", "direct_fallback"].includes(status.mode)
       || !["supported", "unsupported", "drifted", "unknown"].includes(status.protocolState)
       || !["projected", "exact_completed_spend", "estimated"].includes(status.fairnessPrecision)
@@ -1707,18 +2519,98 @@ function parseAuthenticatedRouterStatus(bytes, requestId) {
   } catch { return null; }
 }
 
+function parseQuotaAwareRouterIntent(value) {
+  if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["fingerprint", "generation", "mode", "policy"].join("\0")
+    || !["manual", "quota_aware"].includes(value.mode)
+    || (value.mode === "quota_aware" ? value.policy !== ACCOUNT_ROUTER_QUOTA_POLICY : value.policy !== null)
+    || !Number.isInteger(value.generation) || value.generation < 1 || !isFingerprint(value.fingerprint)) return null;
+  return { mode: value.mode, policy: value.policy, generation: value.generation, fingerprint: value.fingerprint };
+}
+
+function parseQuotaAwareWeekly(value) {
+  if (!isRecord(value) || Object.keys(value).sort().join("\0") !== ["freshness", "remainingPercent", "resetAt"].join("\0")
+    || !(value.remainingPercent === null || (Number.isFinite(value.remainingPercent) && value.remainingPercent >= 0 && value.remainingPercent <= 100))
+    || !["fresh", "stale", "unknown"].includes(value.freshness)
+    || !(value.resetAt === null || (typeof value.resetAt === "string" && Number.isFinite(Date.parse(value.resetAt))))) return null;
+  return { remainingPercent: value.remainingPercent === null ? null : Math.round(value.remainingPercent), resetAt: value.resetAt, freshness: value.freshness };
+}
+
+function parseQuotaAwarePressure(value) {
+  if (value === null) return null;
+  return Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value) : undefined;
+}
+
+function parseQuotaAwareRouterAccount(value) {
+  const allowed = ["assignedThreadCount", "eligibility", "identifierMasked", "label", "opaqueAccountId", "plan", "shortWindowPressure", "weekly"];
+  if (!isRecord(value) || Object.keys(value).sort().join("\0") !== allowed.join("\0")
+    || !isOpaqueAccountId(value.opaqueAccountId) || !ROUTER_PUBLIC_ELIGIBILITY.has(value.eligibility)
+    || !Number.isInteger(value.assignedThreadCount) || value.assignedThreadCount < 0
+    || safeAccountLabel(value.label, "") !== value.label || !(value.plan === null || safeAccountLabel(value.plan, "") === value.plan)
+    || typeof value.identifierMasked !== "string" || !/^[•*]{4,80}$/.test(value.identifierMasked)) return null;
+  const weekly = parseQuotaAwareWeekly(value.weekly);
+  const shortWindowPressure = parseQuotaAwarePressure(value.shortWindowPressure);
+  if (!weekly || shortWindowPressure === undefined) return null;
+  return {
+    label: value.label,
+    eligibility: value.eligibility,
+    plan: value.plan,
+    identifierMasked: value.identifierMasked,
+    weekly,
+    shortWindowPressure,
+    assignedThreadCount: value.assignedThreadCount,
+  };
+}
+
+function parseQuotaAwareRouterStatus(status) {
+  const allowed = ["accounts", "active", "degradedReason", "pending", "poolRemainingPercent", "protocolState", "restartRequired", "schemaVersion"];
+  const active = parseQuotaAwareRouterIntent(status.active);
+  const pending = status.pending === null ? null : parseQuotaAwareRouterIntent(status.pending);
+  if (Object.keys(status).sort().join("\0") !== allowed.join("\0")
+    || status.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    || !["supported", "unsupported", "drifted", "unknown"].includes(status.protocolState)
+    || typeof status.restartRequired !== "boolean"
+    || !(status.degradedReason === null || ROUTER_PUBLIC_DEGRADED_REASONS.has(status.degradedReason))
+    || !(status.poolRemainingPercent === null || (Number.isFinite(status.poolRemainingPercent) && status.poolRemainingPercent >= 0 && status.poolRemainingPercent <= 200))
+    || !active || (status.pending !== null && !pending)
+    || !Array.isArray(status.accounts) || status.accounts.length !== 2) return null;
+  const accounts = status.accounts.map(parseQuotaAwareRouterAccount);
+  if (accounts.some((account) => account === null)) return null;
+  return redact({
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION,
+    active,
+    pending,
+    protocolState: status.protocolState,
+    restartRequired: status.restartRequired,
+    accounts,
+    // Do not use the transport-provided pool for presentation. The renderer
+    // recomputes the visible 0–200% value from the two redacted weekly rows.
+    poolRemainingPercent: status.poolRemainingPercent === null ? null : Math.round(status.poolRemainingPercent),
+    degradedReason: status.degradedReason,
+  });
+}
+
 async function configureRouter(_api, deps, paths, refs, message) {
   try {
-    const config = message?.mode === "balanced"
+    const config = ["quota_aware", "balanced"].includes(message?.mode)
       ? stageBalancedRouterConfig(deps, paths, refs, message)
       : message?.mode === "manual" ? stageManualRouterConfig(deps, paths) : (() => { throw coded("invalid-router-mode"); })();
-    return { ok: true, router: routerPublicStatus(deps, config, null) };
+    const routerPaths = config ? accountRouterPaths(deps, paths) : null;
+    const historyRecords = routerPaths ? readHistoryAdoptionRecords(deps, routerPaths) : null;
+    const state = routerPaths ? readRouterState(deps, routerPaths) : null;
+    return { ok: true, router: routerPublicStatus(deps, config, state, historyRecords) };
   } catch (error) { return safeRouterFailure(error); }
 }
 
 function routerIsIdle(state) {
-  return state.reservations.length === 0 && state.correlations.length === 0
+  return state.reservations.every((reservation) => isRecord(reservation)
+      && ROUTER_TERMINAL_RESERVATION_STATES.has(reservation.state))
+    && state.correlations.length === 0
     && !Object.values(state.accountEligibility).some((value) => ["validating", "reserved", "active"].includes(value));
+}
+
+function routerStateIsTerminalAndIdle(state) {
+  return routerIsIdle(state) && state.stagedDisable === null
+    && Object.keys(state.pendingThreadOwners).length === 0;
 }
 
 function resetRouterBalanceEpoch(deps, routerPaths) {
@@ -1831,158 +2723,274 @@ function startRenderer(api) {
 function renderAccountsPage(state, root) {
   let disposed = false;
   root.textContent = "Loading accounts…";
-  state.api.ipc.invoke(IPC, { action: "list" }).then((response) => {
+  Promise.all([
+    state.api.ipc.invoke(IPC, { action: "list" }),
+    state.api.ipc.invoke(IPC, { action: "router-status" }).catch(() => null),
+  ]).then(([response, routerStatus]) => {
     if (disposed) return;
     root.replaceChildren();
     if (!response?.ok) { root.textContent = "Accounts are unavailable."; return; }
     state.pluginProtectionMode = response.pluginProtection?.mode || "observation";
-    const card = document.createElement("div");
-    card.className = "border-token-border divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border";
-    for (const account of response.accounts) {
-      const row = document.createElement("div");
-      row.className = "flex items-center justify-between gap-4 p-3";
-      const copy = document.createElement("div");
-      copy.className = "min-w-0";
-      copy.innerHTML = `<div class="truncate text-sm text-token-text-primary"></div><div class="text-sm text-token-text-secondary">${account.active ? "Current account" : "Saved account"}${account.pluginProtection ? ` · Plugin receipt: ${pluginStatusLabel(account.pluginProtection)}` : ""}</div>`;
-      copy.firstElementChild.textContent = account.label;
-      row.append(copy, accountButton(state, account));
-      card.append(row);
-    }
-    if (!response.accounts.length) card.textContent = "No saved accounts yet.";
+    const savedAccounts = Array.isArray(response.accounts) ? response.accounts : [];
+    // Routing is a fixed two-account pool. Manual access remains independent
+    // so a one- or three-plus-snapshot inventory never disappears from UI.
+    const accounts = savedAccounts.length === 2 ? savedAccounts : [];
+    const liveStatus = routerStatus?.live?.state === "active" && isRecord(routerStatus.live.status)
+      ? routerStatus.live.status : null;
     const status = document.createElement("div");
-    status.className = "rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
-    status.textContent = response.accounts.some((account) => account.active) ? "Ready. The current account is marked below." : "No saved account matches the current session.";
+    status.className = "text-token-text-secondary text-sm";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    applyRouterPresentation(status, routerStatus?.router, routerStatus?.live, savedAccounts.length);
     state.statusElement = status;
-    const protection = pluginProtectionCard(state, response.pluginProtection);
-    const router = routerControlCard(state, response.accounts);
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "self-start rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
-    save.textContent = "Save Current";
-    save.addEventListener("click", async () => {
-      status.textContent = "Saving current account…";
-      const saved = await saveCurrentFromMenu(state);
-      if (!disposed) status.textContent = saved ? "Current account saved. Reopen this page to refresh the list." : "Save cancelled or unavailable; no success was recorded.";
-    });
-    root.append(router, protection);
-    root.append(status, save, card);
+    const page = document.createElement("div");
+    page.className = "flex flex-col gap-6";
+    page.append(usageSummaryCard(accounts, liveStatus));
+    page.append(accountCards(accounts, liveStatus));
+    page.append(routerControlCard(state, accounts, routerStatus));
+    page.append(historyAdoptionCard(routerStatus?.router?.historyAdoption));
+    page.append(accountRecoveryCard(state, accounts, savedAccounts.length, liveStatus, status));
+    page.append(advancedAccountsCard(state, savedAccounts, response.pluginProtection, status));
+    page.append(status);
+    root.append(page);
   }).catch(() => { if (!disposed) root.textContent = "Accounts are unavailable."; });
   return () => { disposed = true; root.replaceChildren(); };
 }
 
-function routerControlCard(state, accounts) {
+function settingsCard() {
   const card = document.createElement("div");
-  card.className = "border-token-border mb-3 flex flex-col divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border";
+  card.className = "border-token-border flex flex-col divide-y-[0.5px] divide-token-border rounded-lg border";
+  if (card.style) card.style.backgroundColor = "var(--color-background-panel, var(--color-token-bg-fog))";
+  return card;
+}
+
+function quotaPoolRemainingPercent(accounts) {
+  if (!Array.isArray(accounts) || accounts.length !== 2) return null;
+  const weekly = accounts.map((account) => account?.weekly);
+  if (weekly.some((value) => value?.freshness !== "fresh" || !Number.isFinite(value.remainingPercent))) return null;
+  const remaining = weekly.map((value) => value.remainingPercent);
+  return remaining.reduce((total, value) => total + Math.max(0, Math.min(100, Math.round(value))), 0);
+}
+
+function accountDetailsFor(account, liveStatus) {
+  if (liveStatus?.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION || !Array.isArray(liveStatus.accounts)) return null;
+  // The safe local label is the only renderer-visible join key. Opaque account
+  // ids stay inside the router boundary and are never rendered or persisted by
+  // this UI layer.
+  const candidates = liveStatus.accounts.filter((candidate) => candidate?.label === account.label);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function initials(label) {
+  const parts = safeAccountLabel(label, "Account").split(/\s+/).filter(Boolean);
+  return parts.slice(0, 2).map((part) => part.slice(0, 1).toUpperCase()).join("") || "A";
+}
+
+function accountAvatar(label) {
+  const avatar = document.createElement("div");
+  avatar.className = "bg-token-foreground/10 text-token-text-secondary flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-medium";
+  avatar.setAttribute("aria-hidden", "true");
+  avatar.textContent = initials(label);
+  return avatar;
+}
+
+function quotaSummaryText(liveStatus) {
+  const pool = quotaPoolRemainingPercent(liveStatus?.accounts);
+  return pool === null ? "Usage unavailable" : `${pool}% left`;
+}
+
+function usageSummaryCard(accounts, liveStatus) {
+  const card = settingsCard();
+  const row = document.createElement("div");
+  row.className = "flex items-center justify-between gap-4 p-3";
+  const copy = document.createElement("div");
+  copy.className = "flex min-w-0 flex-col gap-1";
+  const title = document.createElement("div");
+  title.className = "min-w-0 text-sm text-token-text-primary";
+  title.textContent = "Usage remaining";
+  const detail = document.createElement("div");
+  detail.className = "text-token-text-secondary min-w-0 text-sm";
+  detail.textContent = accounts.length === 2 ? "2 connected subscriptions" : "Set up exactly two saved subscriptions";
+  copy.append(title, detail);
+  const value = document.createElement("div");
+  value.className = "shrink-0 text-sm text-token-text-secondary";
+  value.textContent = quotaSummaryText(liveStatus);
+  row.append(copy, value);
+  card.append(row);
+  return card;
+}
+
+function accountCards(accounts, liveStatus) {
+  const card = settingsCard();
+  if (accounts.length !== 2) {
+    const row = document.createElement("div");
+    row.className = "p-3 text-sm text-token-text-secondary";
+    row.textContent = "Quota-aware routing uses exactly two saved subscriptions. Manual switching remains available in Advanced for every saved account.";
+    card.append(row);
+    return card;
+  }
+  for (const account of accounts) {
+    const detail = accountDetailsFor(account, liveStatus);
+    const row = document.createElement("div");
+    row.className = "flex items-center justify-between gap-4 p-3";
+    const identity = document.createElement("div");
+    identity.className = "flex min-w-0 items-center gap-3";
+    const copy = document.createElement("div");
+    copy.className = "flex min-w-0 flex-col gap-1";
+    const title = document.createElement("div");
+    title.className = "truncate text-sm text-token-text-primary";
+    title.textContent = account.label;
+    const meta = document.createElement("div");
+    meta.className = "text-token-text-secondary truncate text-sm";
+    const plan = detail?.plan || "Plan unavailable";
+    const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly remaining` : "Weekly usage unavailable";
+    meta.textContent = `${plan} · ${maskIdentifier(detail?.identifierMasked)} · ${weekly}`;
+    copy.append(title, meta);
+    identity.append(accountAvatar(account.label), copy);
+    const state = document.createElement("div");
+    state.className = "text-token-text-secondary shrink-0 text-right text-sm";
+    const freshness = detail?.weekly?.freshness || "unknown";
+    const reset = detail?.weekly?.resetAt ? ` · resets ${formatResetAt(detail.weekly.resetAt)}` : "";
+    const threads = Number.isInteger(detail?.assignedThreadCount) ? ` · ${detail.assignedThreadCount} assigned ${detail.assignedThreadCount === 1 ? "thread" : "threads"}` : "";
+    const pressure = detail?.shortWindowPressure === null || detail?.shortWindowPressure === undefined
+      ? "" : ` · short window ${String(detail.shortWindowPressure)}`;
+    state.textContent = `${routerEligibilityLabel(detail?.eligibility)} · ${freshness}${reset}${threads}${pressure}`;
+    row.append(identity, state);
+    card.append(row);
+  }
+  return card;
+}
+
+function formatResetAt(value) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "later";
+}
+
+function routerEligibilityLabel(value) {
+  if (value === "reauth_required") return "Reauthentication needed";
+  if (value === "quota_depleted") return "Weekly quota used";
+  if (value === "active") return "Active";
+  if (value === "eligible") return "Ready";
+  if (value === "validating") return "Checking";
+  if (value === "plugin_blocked") return "Plugin protection blocked";
+  return "Status unavailable";
+}
+
+function routerControlCard(state, accounts, initialStatus = null) {
+  const card = settingsCard();
   const summary = document.createElement("div");
   summary.className = "flex flex-col gap-1 p-3";
   const title = document.createElement("div");
   title.className = "text-sm text-token-text-primary";
-  title.textContent = "Account routing";
+  title.textContent = "Quota-aware routing";
   const description = document.createElement("div");
   description.className = "text-sm text-token-text-secondary";
-  description.textContent = "Manual switching remains the default. Two active ChatGPT sessions are not saved router snapshots. Balanced routing is staged only after you explicitly choose exactly two saved snapshots, and this page never restarts ChatGPT.";
+  description.textContent = "New work can use the two enrolled accounts according to their available weekly quota. Staging a change never restarts ChatGPT.";
   summary.append(title, description);
   const body = document.createElement("div");
-  body.className = "flex flex-col gap-3 p-3";
+  body.className = "flex flex-wrap items-center justify-between gap-3 p-3";
   const status = document.createElement("div");
-  status.className = "text-sm text-token-text-secondary";
+  status.className = "text-token-text-secondary min-w-0 text-sm";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  status.textContent = "Checking staged router status…";
-  const selected = new Set();
-  const weights = new Map(accounts.map((account) => [account.ref, 1]));
-  const selectionNote = document.createElement("div");
-  selectionNote.className = "text-sm text-token-text-secondary";
-  const choices = document.createElement("div");
-  choices.className = "flex flex-col gap-2";
+  applyRouterPresentation(status, initialStatus?.router, initialStatus?.live, accounts.length);
   const controls = document.createElement("div");
   controls.className = "flex flex-wrap items-center gap-2";
-  const balanced = document.createElement("button");
-  balanced.type = "button";
-  balanced.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary disabled:cursor-not-allowed disabled:opacity-60";
-  balanced.textContent = "Stage Balanced Mode";
-  balanced.setAttribute("aria-describedby", "account-router-selection-readiness");
-  const refreshStageAvailability = () => {
-    const selectedRefs = [...selected];
-    const validWeights = selectedRefs.length === 2 && selectedRefs.every((ref) => Number.isInteger(weights.get(ref)) && weights.get(ref) >= 1 && weights.get(ref) <= 100);
-    balanced.disabled = !validWeights;
-    selectionNote.id = "account-router-selection-readiness";
-    selectionNote.textContent = accounts.length === 0
-      ? "Not configured: save two account snapshots before Balanced mode can be staged."
-      : accounts.length === 1
-        ? "Save two accounts: one saved snapshot is available."
-        : `Saved snapshots: ${accounts.length}. Select exactly two distinct snapshots and give each a weight from 1 to 100.`;
-  };
-  for (const [index, account] of accounts.entries()) {
-    const row = document.createElement("label");
-    row.className = "flex items-center justify-between gap-3 text-sm text-token-text-primary";
-    const inclusion = document.createElement("input");
-    inclusion.type = "checkbox";
-    inclusion.checked = selected.has(account.ref);
-    const label = document.createElement("span");
-    label.className = "min-w-0 flex-1 truncate";
-    label.textContent = `Saved snapshot ${index + 1}`;
-    const weight = document.createElement("input");
-    weight.type = "number"; weight.min = "1"; weight.max = "100"; weight.value = "1";
-    weight.setAttribute("aria-label", `Weight for saved snapshot ${index + 1}`);
-    weight.className = "border-token-border bg-token-foreground/5 w-16 rounded-md border px-2 py-1 text-sm text-token-text-primary";
-    inclusion.addEventListener("change", () => {
-      if (inclusion.checked && selected.size >= 2) { inclusion.checked = false; return; }
-      if (inclusion.checked) selected.add(account.ref); else selected.delete(account.ref);
-      refreshStageAvailability();
-    });
-    weight.addEventListener("input", () => { weights.set(account.ref, Number(weight.value)); refreshStageAvailability(); });
-    row.append(inclusion, label, weight);
-    choices.append(row);
+  const historyOwner = document.createElement("select");
+  historyOwner.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer max-w-[240px] rounded-md border px-3 text-sm text-token-text-primary";
+  historyOwner.setAttribute("aria-label", "Keep my existing history with");
+  const historyPrompt = document.createElement("option");
+  historyPrompt.value = "";
+  historyPrompt.textContent = "Keep my existing history with…";
+  historyPrompt.disabled = true;
+  historyPrompt.selected = true;
+  historyOwner.append(historyPrompt);
+  for (const account of accounts) {
+    const option = document.createElement("option");
+    option.value = account.ref;
+    option.textContent = account.label;
+    historyOwner.append(option);
   }
-  balanced.addEventListener("click", async () => {
-    const refs = [...selected];
-    if (refs.length !== 2) { reportRouterControlFailure(state, status, "router-requires-exactly-two-accounts"); return; }
-    status.textContent = "Staging isolated account homes…";
+  let legacyOwnerRef = null;
+  const stage = document.createElement("button");
+  stage.type = "button";
+  stage.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary disabled:cursor-not-allowed disabled:opacity-60";
+  stage.textContent = "Stage quota-aware routing";
+  const updateStageAvailability = () => { stage.disabled = accounts.length !== 2 || legacyOwnerRef === null; };
+  updateStageAvailability();
+  historyOwner.addEventListener("change", () => {
+    legacyOwnerRef = accounts.some((account) => account.ref === historyOwner.value) ? historyOwner.value : null;
+    updateStageAvailability();
+  });
+  stage.addEventListener("click", async () => {
+    if (accounts.length !== 2) { reportRouterControlFailure(state, status, "router-requires-exactly-two-accounts"); return; }
+    if (!legacyOwnerRef) { reportRouterControlFailure(state, status, "router-history-owner-required"); return; }
+    status.textContent = "Staging selected account homes and offline history adoption intent…";
     try {
-      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "balanced", refs, primaryRef: refs[0], weights: refs.map((ref) => weights.get(ref)) });
+      const primary = accounts.find((account) => account.active) || accounts[0];
+      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "quota_aware", refs: accounts.map((account) => account.ref), primaryRef: primary.ref, legacyOwnerRef, weights: [1, 1] });
       if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts.length);
       else reportRouterControlFailure(state, status, result?.error?.code);
     } catch { reportRouterControlFailure(state, status); }
   });
-  const manual = document.createElement("button");
-  manual.type = "button";
-  manual.className = "rounded-md border border-token-border bg-token-foreground/5 px-3 py-2 text-sm text-token-text-primary";
-  manual.textContent = "Use Manual Mode";
-  manual.addEventListener("click", async () => {
-    try {
-      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
-      if (result?.ok) applyRouterPresentation(status, result.router, result.live, accounts.length);
-      else reportRouterControlFailure(state, status, result?.error?.code);
-    } catch { reportRouterControlFailure(state, status); }
-  });
-  const reset = document.createElement("button");
-  reset.type = "button";
-  reset.className = "rounded-full px-2 py-0.5 text-sm bg-token-charts-red/10 text-token-charts-red hover:bg-token-charts-red/20";
-  reset.textContent = "Reset balance";
-  reset.addEventListener("click", async () => {
-    try {
-      const result = await state.api.ipc.invoke(IPC, { action: "router-reset-balance-epoch" });
-      if (result?.ok) status.textContent = "Balance epoch reset while idle.";
-      else reportRouterControlFailure(state, status, result?.error?.code);
-    } catch { reportRouterControlFailure(state, status); }
-  });
-  controls.append(balanced, manual, reset);
-  refreshStageAvailability();
-  body.append(status, selectionNote, choices, controls);
+  controls.append(historyOwner, stage);
+  body.append(status, controls);
   card.append(summary, body);
-  void state.api.ipc.invoke(IPC, { action: "router-status" }).then((result) => {
-    if (!result?.ok) { status.textContent = "Router status is unavailable; manual switching remains available."; return; }
-    applyRouterPresentation(status, result.router, result.live, accounts.length);
-  }).catch(() => { status.textContent = "Router status is unavailable; manual switching remains available."; });
+  return card;
+}
+
+function historyAdoptionCard(projection) {
+  const history = projection && ["required", "pending_offline_adoption", "adopted", "invalid", "mismatch"].includes(projection.state)
+    ? projection : { state: "required", ownerLabel: null, importedThreadCount: 0, databaseCount: 0, historyCount: 0 };
+  const card = settingsCard();
+  const row = document.createElement("div");
+  row.className = "flex min-w-0 flex-col gap-1 p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Existing history";
+  const detail = document.createElement("div");
+  detail.className = "text-token-text-secondary text-sm";
+  if (history.state === "pending_offline_adoption") {
+    detail.textContent = `${history.ownerLabel || "The selected account"} is selected for an offline history-adoption step later. No live routing or history has changed.`;
+  } else if (history.state === "adopted") {
+    detail.textContent = `${history.ownerLabel || "The selected account"} has adopted existing history offline: ${history.importedThreadCount} threads across ${history.databaseCount} data stores and ${history.historyCount} history groups. Live routing remains separately reported.`;
+  } else if (history.state === "invalid") {
+    detail.textContent = "The saved offline history-adoption record could not be verified. No live routing or history change is being claimed.";
+  } else if (history.state === "mismatch") {
+    detail.textContent = "The saved history-adoption record belongs to a different account pool or selected owner. No live routing or history change is being claimed.";
+  } else {
+    detail.textContent = "Choose one of the two selected saved accounts before staging. History adoption is an offline step later; no live routing or history changes now.";
+  }
+  row.append(title, detail);
+  card.append(row);
   return card;
 }
 
 function routerPresentation(router, live, savedSnapshotCount) {
   const savedCount = Number.isInteger(savedSnapshotCount) && savedSnapshotCount >= 0 ? savedSnapshotCount : 0;
   const liveStatus = live?.state === "active" && isRecord(live.status) ? live.status : null;
-  const degraded = liveStatus?.degradedReason || router?.degradedReason;
-  if (degraded) return { label: "Degraded", message: `Direct fallback is active because ${String(degraded).replace(/_/g, " ")}.`, accounts: [] };
+  if (liveStatus?.degradedReason) return { label: "Router needs attention", message: `The router reported ${String(liveStatus.degradedReason).replace(/_/g, " ")}. No live fallback state is being claimed here.`, accounts: [] };
+  if (liveStatus?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) {
+    const active = liveStatus.active;
+    const pending = liveStatus.pending;
+    const diskNotice = router?.degradedReason
+      ? " The staged local record needs attention, but it does not replace authenticated live status."
+      : "";
+    if (active?.mode === "quota_aware") return {
+      label: "Quota-aware routing is active",
+      message: pending
+        ? `Active ${routerIntentSummary(active)}. Pending ${routerIntentSummary(pending)} will apply only after a separately confirmed restart.${diskNotice}`
+        : `Active ${routerIntentSummary(active)} from the authenticated local router.${diskNotice}`,
+      accounts: Array.isArray(liveStatus.accounts) ? liveStatus.accounts : [],
+    };
+    if (pending) return {
+      label: "Routing change staged",
+      message: `Pending ${routerIntentSummary(pending)} will take effect only after a separately confirmed restart. Current live routing is unchanged.${diskNotice}`,
+      accounts: [],
+    };
+    if (active?.mode === "manual") return { label: "Manual routing is active", message: `Active ${routerIntentSummary(active)} from the authenticated local router.${diskNotice}`, accounts: [] };
+    return { label: "Router status unavailable", message: `No active router generation was provided by the authenticated local socket.${diskNotice}`, accounts: [] };
+  }
   if (liveStatus?.mode === "balanced") {
     return {
       label: "Running Balanced",
@@ -1990,12 +2998,29 @@ function routerPresentation(router, live, savedSnapshotCount) {
       accounts: Array.isArray(liveStatus.accounts) ? liveStatus.accounts : [],
     };
   }
-  if (router?.mode === "direct_fallback") return { label: "Direct fallback", message: "The direct app-server is active. No live Balanced routing claim is being shown.", accounts: [] };
+  if (router?.degradedReason) return { label: "Router needs attention", message: `The staged router record reported ${String(router.degradedReason).replace(/_/g, " ")}. No live fallback state is being claimed here.`, accounts: [] };
+  if (router?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && router?.pending?.mode === "manual"
+    && router?.historyAdoption?.state === "adopted") return {
+    label: "Manual new-thread assignment pending",
+    message: "Manual routing is staged only for new-thread assignment after a separately confirmed restart. Existing adopted history is not globally restored or reassigned.",
+    accounts: [],
+  };
+  if (router?.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION && router?.pending) return {
+    label: "Routing change staged",
+    message: "The saved policy is pending. It does not claim that live routing has changed.",
+    accounts: [],
+  };
+  if (router?.mode === "direct_fallback") return { label: "Fallback staged", message: "A direct fallback is staged. Live state could not be verified from the authenticated local router.", accounts: [] };
   if (router?.mode === "balanced" || router?.restartRequired) return { label: "Balanced staged - restart required", message: "Balanced mode is staged but not running yet. A later separately authorized restart is required.", accounts: [] };
-  if (savedCount === 0) return { label: "Not configured", message: "Manual switching is active. Save two account snapshots before Balanced mode can be staged.", accounts: [] };
-  if (savedCount === 1) return { label: "Save two accounts", message: "Manual switching is active. One more saved snapshot is needed before Balanced mode can be staged.", accounts: [] };
-  if (savedCount === 2) return { label: "Ready to stage", message: "Manual switching is active. Select the two saved snapshots and explicitly stage Balanced mode when ready.", accounts: [] };
-  return { label: "Manual", message: "Manual switching is active. Choose exactly two saved snapshots if you want to stage Balanced mode.", accounts: [] };
+  if (savedCount === 0) return { label: "Not configured", message: "Manual switching is active. Save two account snapshots before quota-aware routing can be staged.", accounts: [] };
+  if (savedCount === 1) return { label: "Save two accounts", message: "Manual switching is active. One more saved snapshot is needed before quota-aware routing can be staged.", accounts: [] };
+  if (savedCount === 2) return { label: "Ready to stage", message: "Manual switching is active. Explicitly stage quota-aware routing when ready.", accounts: [] };
+  return { label: "Manual", message: "Manual switching is active. Quota-aware routing is available only while exactly two snapshots are saved.", accounts: [] };
+}
+
+function routerIntentSummary(intent) {
+  const fingerprint = typeof intent?.fingerprint === "string" ? intent.fingerprint.slice(7, 19) : "unknown";
+  return `generation ${intent?.generation ?? "unknown"} (${fingerprint})`;
 }
 
 function applyRouterPresentation(status, router, live, savedCount) {
@@ -2017,6 +3042,87 @@ function applyRouterPresentation(status, router, live, savedCount) {
     }
     status.append(list);
   }
+}
+
+function accountRecoveryCard(state, accounts, savedSnapshotCount, liveStatus, status) {
+  const card = settingsCard();
+  const row = document.createElement("div");
+  row.className = "flex items-center justify-between gap-4 p-3";
+  const copy = document.createElement("div");
+  copy.className = "flex min-w-0 flex-col gap-1";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Set up and recover";
+  const note = document.createElement("div");
+  note.className = "text-token-text-secondary text-sm";
+  const stale = accounts.find((account) => accountDetailsFor(account, liveStatus)?.eligibility === "reauth_required");
+  note.textContent = stale
+    ? `${stale.label} needs reauthentication. Use its Manual switch row to sign in, then refresh this existing saved account while the router is stopped.`
+    : savedSnapshotCount === 2
+      ? "The two saved subscriptions are ready to review. Original snapshots stay unchanged during router setup."
+      : savedSnapshotCount > 2
+        ? "Quota-aware routing needs exactly two saved subscriptions. Manual switching remains available below for every saved account."
+        : "Save the current account until exactly two subscriptions are available.";
+  copy.append(title, note);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer shrink-0 rounded-md border px-3 text-sm text-token-text-primary";
+  save.textContent = stale ? "Refresh reauthenticated account" : "Save current account";
+  save.addEventListener("click", async () => {
+    if (stale) {
+      status.textContent = "Checking that the router is stopped before refreshing this account…";
+      try {
+        const refreshed = await state.api.ipc.invoke(IPC, { action: "router-recover", ref: stale.ref });
+        status.textContent = refreshed?.ok
+          ? "The existing saved account and isolated home were refreshed. The pending generation needs a separately confirmed restart; no live routing change is claimed."
+          : routerControlFailure(refreshed?.error?.code).message;
+      } catch { status.textContent = "The reauthenticated account could not be refreshed safely."; }
+      return;
+    }
+    status.textContent = "Saving the current account…";
+    const saved = await saveCurrentFromMenu(state);
+    status.textContent = saved ? "Current account saved. Reopen Accounts to refresh the two subscriptions." : "No account was saved.";
+  });
+  row.append(copy, save);
+  card.append(row);
+  return card;
+}
+
+function advancedAccountsCard(state, accounts, protection, status) {
+  const card = settingsCard();
+  const header = document.createElement("div");
+  header.className = "flex flex-col gap-1 p-3";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Advanced";
+  const note = document.createElement("div");
+  note.className = "text-token-text-secondary text-sm";
+  note.textContent = "Manual switching, staged rollback, and remote-plugin protection.";
+  header.append(title, note);
+  const manualRow = document.createElement("div");
+  manualRow.className = "flex flex-wrap items-center justify-between gap-3 p-3";
+  const manualCopy = document.createElement("div");
+  manualCopy.className = "text-token-text-secondary text-sm";
+  manualCopy.textContent = "Stage manual routing for the next confirmed restart. Existing isolated account homes are preserved.";
+  const manual = document.createElement("button");
+  manual.type = "button";
+  manual.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
+  manual.textContent = "Stage manual routing";
+  manual.disabled = false;
+  manual.addEventListener("click", async () => {
+    try {
+      const result = await state.api.ipc.invoke(IPC, { action: "router-configure", mode: "manual" });
+      status.textContent = result?.ok
+        ? "Manual routing is staged for the next confirmed restart; current live routing is unchanged."
+        : routerControlFailure(result?.error?.code).message;
+    } catch { status.textContent = "Manual routing could not be staged safely."; }
+  });
+  manualRow.append(manualCopy, manual);
+  const switches = document.createElement("div");
+  switches.className = "flex flex-col divide-y-[0.5px] divide-token-border";
+  for (const account of accounts) switches.append(accountButton(state, account));
+  card.append(header, manualRow, switches, pluginProtectionCard(state, protection));
+  return card;
 }
 
 function pluginProtectionCard(state, protection) {
@@ -2089,8 +3195,12 @@ async function injectAccountMenus(state) {
   // dedupe BEFORE the IPC so re-scans of an already-injected menu don't trigger
   // a filesystem list on every DOM mutation.
   let response;
+  let routerStatus;
   try {
-    response = await state.api.ipc.invoke(IPC, { action: "list" });
+    [response, routerStatus] = await Promise.all([
+      state.api.ipc.invoke(IPC, { action: "list" }),
+      state.api.ipc.invoke(IPC, { action: "router-status" }).catch(() => null),
+    ]);
   } catch { return; }
   if (!response?.ok || state.disposed) return;
   state.pluginProtectionMode = response.pluginProtection?.mode || "observation";
@@ -2101,29 +3211,81 @@ async function injectAccountMenus(state) {
   }
   cleanupAccountSwitcherPanels(targetMenu);
   if (hasDirectAccountSwitcherPanel(targetMenu)) return;
-  const panel = document.createElement("div");
+  const panel = accountMenuRows(state, response.accounts, routerStatus);
   panel.dataset.tweakersAccountSwitcher = "true";
-  panel.className = "border-token-border my-1 border-t px-2 py-2";
-  const title = document.createElement("div");
-  title.className = "px-2 pb-1 text-xs font-medium text-token-text-secondary";
-  title.textContent = "Switch ChatGPT account";
-  panel.append(title);
-  const openAccounts = document.createElement("button");
-  openAccounts.type = "button";
-  openAccounts.className = menuButtonClass();
-  openAccounts.textContent = "Open Accounts";
-  openAccounts.setAttribute("aria-label", "Open Accounts settings");
-  openAccounts.addEventListener("click", async () => {
-    const result = await state.api.settings?.openPage?.("accounts");
-    if (!result?.ok) state.api.log?.warn?.("Account settings page could not be opened", result?.reason || "unavailable");
-  });
-  panel.append(openAccounts);
-  for (const account of response.accounts) panel.append(accountButton(state, account));
-  const save = document.createElement("button");
-  save.type = "button"; save.className = menuButtonClass(); save.textContent = "Save current session…";
-  save.addEventListener("click", () => void saveCurrentFromMenu(state));
-  panel.append(save);
   targetMenu.append(panel);
+}
+
+function accountMenuRows(state, suppliedAccounts, routerStatus) {
+  const savedAccounts = Array.isArray(suppliedAccounts) ? suppliedAccounts : [];
+  const accounts = savedAccounts.length === 2 ? savedAccounts : [];
+  const liveStatus = routerStatus?.live?.state === "active" && isRecord(routerStatus.live.status)
+    ? routerStatus.live.status : null;
+  const panel = document.createElement("div");
+  panel.className = "border-token-border my-1 flex flex-col border-t px-2 py-1";
+  const usage = document.createElement("div");
+  usage.className = "flex items-center justify-between gap-3 px-2 py-1.5 text-sm text-token-text-primary";
+  const usageCopy = document.createElement("div");
+  usageCopy.className = "flex min-w-0 flex-col";
+  const usageTitle = document.createElement("span");
+  usageTitle.textContent = "Usage remaining";
+  const subscriptions = document.createElement("span");
+  subscriptions.className = "text-token-text-secondary text-xs";
+  subscriptions.textContent = accounts.length === 2 ? "2 connected subscriptions" : "Set up exactly two saved subscriptions";
+  usageCopy.append(usageTitle, subscriptions);
+  const pool = document.createElement("span");
+  pool.className = "text-token-text-secondary shrink-0";
+  pool.textContent = quotaSummaryText(liveStatus);
+  usage.append(usageCopy, pool);
+  panel.append(usage);
+
+  if (accounts.length === 2) {
+    for (const account of accounts) {
+      const detail = accountDetailsFor(account, liveStatus);
+      const row = document.createElement("div");
+      row.className = "hover:bg-token-foreground/5 flex w-full items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left text-sm text-token-text-primary";
+      const identity = document.createElement("div");
+      identity.className = "flex min-w-0 items-center gap-2";
+      const copy = document.createElement("div");
+      copy.className = "flex min-w-0 flex-col";
+      const label = document.createElement("span");
+      label.className = "truncate";
+      label.textContent = account.label;
+      const detailText = document.createElement("span");
+      detailText.className = "text-token-text-secondary truncate text-xs";
+      const plan = detail?.plan || "Plan unavailable";
+      const weekly = Number.isFinite(detail?.weekly?.remainingPercent) ? `${Math.round(detail.weekly.remainingPercent)}% weekly` : "Weekly usage unavailable";
+      detailText.textContent = `${plan} · ${maskIdentifier(detail?.identifierMasked)} · ${weekly}`;
+      copy.append(label, detailText);
+      identity.append(accountAvatar(account.label), copy);
+      row.append(identity);
+      panel.append(row);
+    }
+  } else {
+    const setup = document.createElement("div");
+    setup.className = "px-2 py-1.5 text-sm text-token-text-secondary";
+    setup.textContent = "Set up exactly two saved subscriptions in Accounts.";
+    panel.append(setup);
+    if (savedAccounts.length > 0) {
+      const manualTitle = document.createElement("div");
+      manualTitle.className = "px-2 pt-2 text-xs text-token-text-secondary";
+      manualTitle.textContent = "Manual switching";
+      panel.append(manualTitle);
+      for (const account of savedAccounts) panel.append(accountButton(state, account));
+    }
+  }
+
+  const manage = document.createElement("button");
+  manage.type = "button";
+  manage.className = menuButtonClass();
+  manage.textContent = "Manage Accounts";
+  manage.setAttribute("aria-label", "Manage Accounts settings");
+  manage.addEventListener("click", async () => {
+    const result = await state.api.settings?.openPage?.("accounts");
+    if (!result?.ok) state.api.log?.warn?.("Accounts settings page could not be opened", result?.reason || "unavailable");
+  });
+  panel.append(manage);
+  return panel;
 }
 
 function accountButton(state, account) {
@@ -2241,31 +3403,59 @@ function hasDirectAccountSwitcherPanel(menu) {
 }
 function uniqueElements(elements) { return [...new Set(elements)].filter(Boolean); }
 function displayLabelFromAuth(value, fallback) {
-  const directEmail = [value?.user?.email, value?.account?.email, value?.email]
-    .find((item) => typeof item === "string" && item.trim());
-  if (directEmail) {
-    const label = directEmail.trim().slice(0, 120);
-    if (validLabel(label)) return label;
-  }
   const directName = [value?.user?.name, value?.account?.name, value?.name]
-    .find((item) => typeof item === "string" && item.trim());
+    .find((item) => typeof item === "string" && item.trim() && !/@/.test(item));
   const token = value?.tokens?.id_token;
   if (typeof token === "string") {
     try {
       const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-      const claim = [claims.email, claims.preferred_username, claims.name].find((item) => typeof item === "string" && item.trim());
+      const claim = [claims.name, claims.preferred_username].find((item) => typeof item === "string" && item.trim() && !/@/.test(item));
       if (claim) {
-        const label = claim.trim().slice(0, 120);
-        if (validLabel(label)) return label;
+        const label = safeAccountLabel(claim, "");
+        if (label) return label;
       }
     } catch {}
   }
   if (directName) {
-    const label = directName.trim().slice(0, 120);
-    if (validLabel(label)) return label;
+    const label = safeAccountLabel(directName, "");
+    if (label) return label;
   }
-  const fallbackLabel = String(fallback || "Saved account").slice(0, 120);
-  return validLabel(fallbackLabel) ? fallbackLabel : "Saved account";
+  return safeAccountLabel(typeof fallback === "string" ? fallback : "", "");
+}
+function safeSnapshotLabel(value, filename, ordinal = 1) {
+  const filenameLabel = typeof filename === "string" ? filename.replace(/\.json$/i, "") : "";
+  const fromSnapshot = safeAccountLabel(filenameLabel, "");
+  if (fromSnapshot) return fromSnapshot;
+  const fromProfile = displayLabelFromAuth(value, "");
+  return fromProfile || `Account ${Math.max(1, Number.isInteger(ordinal) ? ordinal : 1)}`;
+}
+function savedSnapshotLabels(entries) {
+  const records = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.isFile?.() && typeof entry.name === "string" && entry.name.endsWith(".json"))
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((entry, index) => {
+      try {
+        validateReferenceName(entry.name.slice(0, -5));
+        return [{ filename: entry.name, base: safeSnapshotLabel(null, entry.name, index + 1) }];
+      } catch { return []; }
+    });
+  const counts = new Map();
+  for (const record of records) {
+    const key = record.base.toLocaleLowerCase();
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const next = new Map();
+  const ordinals = new Map();
+  for (const record of records) {
+    const key = record.base.toLocaleLowerCase();
+    const ordinal = (ordinals.get(key) || 0) + 1;
+    ordinals.set(key, ordinal);
+    const label = counts.get(key) > 1
+      ? safeAccountLabel(`${record.base.slice(0, 76)} ${ordinal}`, `Account ${ordinal}`)
+      : record.base;
+    next.set(record.filename, label);
+  }
+  return next;
 }
 function safeFailure(code) { return { ok: false, error: { code, message: "The account request could not be completed safely." } }; }
 function routerPublicErrorCode(code) {

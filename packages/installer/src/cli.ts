@@ -32,6 +32,10 @@ import {
   type EnvironmentCommandOptions,
 } from "./commands/environment.js";
 import { codexSource, type CodexSourceOptions } from "./commands/codex-source.js";
+import {
+  adoptAccountHistoryCommand,
+  type AdoptAccountHistoryCliOptions,
+} from "./commands/adopt-account-history.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -465,6 +469,18 @@ prog.command("migrate")
   .option("--legacy-root", "Explicit legacy root (otherwise known roots are detected)")
   .option("--target-root", "Tweakers user root (defaults to the active user root)")
   .action(wrap(migrate));
+prog
+  .command("adopt-account-history")
+  .describe("Dry-run the signed legacy Codex history adoption; --apply never restarts the app")
+  .option("--apply", "Apply the already signed adoption intent after two idle censuses")
+  .option("--dry-run", "Force a read-only adoption preview (the default)")
+  .option("--source-codex-root", "Exact legacy CODEX_HOME root")
+  .option("--source-sqlite-root", "Exact legacy CODEX_SQLITE_HOME root")
+  .option("--router-root", "Exact private Account Router data root")
+  .option("--app", "Exact desktop app path used only for the idle census")
+  .action(wrap((options: AdoptAccountHistoryCliOptions) => {
+    adoptAccountHistoryCommand(options);
+  }));
 prog.command("watcher-run").describe("Run one internal watcher cycle").action(wrap(() =>
   runWatcherCycle({ userRoot: ensureUserPaths().root }).then(() => undefined)
 ));

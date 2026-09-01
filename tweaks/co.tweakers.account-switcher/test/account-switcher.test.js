@@ -119,6 +119,41 @@ test("list is redacted, side-effect-free, and reports a dangling marker", async 
   assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "missing.json\n", "listing must not reconcile a marker");
 });
 
+test("list projection never exposes an email or provider account id", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  const snapshot = JSON.parse(auth("work", "provider-account-id-should-not-render"));
+  snapshot.user = { email: "private@example.test" };
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "work.json"), JSON.stringify(snapshot), { mode: 0o600 });
+
+  const listed = await setup.service.handle({ action: "list" });
+  assert.equal(listed.ok, true);
+  assert.equal(JSON.stringify(listed).includes("private@example.test"), false);
+  assert.equal(JSON.stringify(listed).includes("provider-account-id-should-not-render"), false);
+  assert.equal(listed.accounts[0].identifierMasked, "••••••••");
+  assert.equal(listed.accounts[0].label, "work");
+});
+
+test("duplicate safe profile names use distinct stable snapshot labels shared by staged config", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  fs.renameSync(path.join(setup.paths.accountsDir, "work.json"), path.join(setup.paths.accountsDir, "alpha.json"));
+  const alpha = JSON.parse(auth("alpha", "provider-alpha"));
+  alpha.user = { name: "Taylor", email: "alpha@example.test" };
+  const beta = JSON.parse(auth("beta", "provider-beta"));
+  beta.user = { name: "Taylor", email: "beta@example.test" };
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "alpha.json"), JSON.stringify(alpha), { mode: 0o600 });
+  fs.writeFileSync(path.join(setup.paths.accountsDir, "beta.json"), JSON.stringify(beta), { mode: 0o600 });
+
+  const listed = await setup.service.handle({ action: "list" });
+  assert.deepEqual(listed.accounts.map((account) => account.label), ["alpha", "beta"]);
+  assert.equal(JSON.stringify(listed).includes("@example.test"), false);
+  const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(staged.ok, true);
+  const config = JSON.parse(fs.readFileSync(_test.accountRouterPaths(setup.deps, setup.paths).configFile, "utf8"));
+  assert.deepEqual(config.accounts.map((account) => account.label), ["alpha", "beta"]);
+});
+
 test("first use lists an absent snapshot directory as empty and saves safely", async (t) => {
   const setup = fixture({ withoutAccountsDirectory: true });
   disposeFixture(t, setup);
@@ -139,7 +174,7 @@ test("first use lists an absent snapshot directory as empty and saves safely", a
   assert.equal(fs.statSync(target).mode & 0o777, 0o600);
 
   const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
-  assert.match(source, /root\.append\(status, save, card\)/);
+  assert.match(source, /page\.append\(usageSummaryCard/);
 });
 
 test("switch uses opaque intent, 0600 writes, and preserves LKG", async (t) => {
@@ -312,18 +347,18 @@ test("authPaths honors CODEX_HOME and does not expose analytics paths", () => {
   assert.equal(fallback.codexDir, path.join("/home/whoever", ".codex"));
 });
 
-test("account labels use the saved ChatGPT identity without exposing tokens", () => {
+test("account labels use a safe saved name and never use an email identity", () => {
   const token = "x." + Buffer.from(JSON.stringify({ name: "Tweakers", email: "tweakers@example.com" })).toString("base64url") + ".x";
-  assert.equal(_test.displayLabelFromAuth({ auth_mode: "chatgpt", tokens: { id_token: token } }, "fallback"), "tweakers@example.com");
+  assert.equal(_test.displayLabelFromAuth({ auth_mode: "chatgpt", tokens: { id_token: token } }, "fallback"), "Tweakers");
   assert.equal(_test.displayLabelFromAuth({
     user: { name: "Codex", email: "codex@thereality.report" },
-  }, "fallback"), "codex@thereality.report");
+  }, "fallback"), "Codex");
   assert.equal(_test.displayLabelFromAuth({
     user: { name: "Safe Account", email: "sk-proj-SECRET_CANARY" },
   }, "fallback"), "Safe Account");
   assert.equal(_test.displayLabelFromAuth({
     user: { email: "Bearer SECRET_CANARY" },
-  }, "sk-proj-SECRET_CANARY"), "Saved account");
+  }, "sk-proj-SECRET_CANARY"), "");
   assert.equal(_test.displayLabelFromAuth({}, "Work Account"), "Work Account");
 });
 
@@ -471,28 +506,33 @@ test("account metadata declares the settings surface and has a synchronized mino
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.3.0");
+  assert.equal(manifest.name, "Accounts");
+  assert.equal(manifest.version, "0.4.0");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
 });
 
-test("router presentation distinguishes setup, staged, live, fallback, and degraded state without account identities", () => {
+test("router presentation separates active v2 truth from a pending generation", () => {
   const manual = { mode: "manual", restartRequired: false, degradedReason: null };
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 0).label, "Not configured");
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 1).label, "Save two accounts");
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 2).label, "Ready to stage");
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Manual");
-  assert.equal(_test.routerPresentation({ mode: "balanced", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Balanced staged - restart required");
+  const active = { mode: "quota_aware", policy: "quota_aware_v1", generation: 4, fingerprint: "sha256:" + "a".repeat(64) };
+  const pending = { mode: "manual", policy: null, generation: 5, fingerprint: "sha256:" + "b".repeat(64) };
   const running = _test.routerPresentation(
-    { mode: "balanced", restartRequired: true, degradedReason: null },
-    { state: "active", status: { mode: "balanced", degradedReason: null, accounts: [{ label: "Account A", eligibility: "active", assignedThreadCount: 2 }] } },
+    { schemaVersion: 2, pending, degradedReason: null },
+    { state: "active", status: { schemaVersion: 2, active, pending, degradedReason: null, accounts: [{ label: "Taylor", eligibility: "active", assignedThreadCount: 2 }] } },
     2,
   );
-  assert.equal(running.label, "Running Balanced");
-  assert.deepEqual(running.accounts, [{ label: "Account A", eligibility: "active", assignedThreadCount: 2 }]);
-  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Direct fallback");
-  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: "post_start_failure" }, { state: "not_running", status: null }, 2).label, "Degraded");
+  assert.equal(running.label, "Quota-aware routing is active");
+  assert.match(running.message, /Active generation 4/);
+  assert.match(running.message, /Pending generation 5/);
+  assert.deepEqual(running.accounts, [{ label: "Taylor", eligibility: "active", assignedThreadCount: 2 }]);
+  assert.equal(_test.routerPresentation({ schemaVersion: 2, pending, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Routing change staged");
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: null }, { state: "not_running", status: null }, 2).label, "Fallback staged");
+  assert.equal(_test.routerPresentation({ mode: "direct_fallback", restartRequired: true, degradedReason: "post_start_failure" }, { state: "not_running", status: null }, 2).label, "Router needs attention");
 });
 
 test("authenticated router status accepts only the redacted mux projection", () => {
@@ -514,6 +554,197 @@ test("authenticated router status accepts only the redacted mux projection", () 
   assert.deepEqual(parsed.accounts, [{ label: "Account A", eligibility: "active", normalizedSpend: 1, assignedThreadCount: 2 }]);
   assert.equal(JSON.stringify(parsed).includes(opaque), false);
   assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: { secret: "no" } })), requestId), null);
+});
+
+test("quota-aware v2 status accepts nullable quota fields but never exposes opaque ids", () => {
+  const requestId = "quota-router-test";
+  const active = { mode: "quota_aware", policy: "quota_aware_v1", generation: 3, fingerprint: "sha256:" + "a".repeat(64) };
+  const status = {
+    schemaVersion: 2,
+    active,
+    pending: { mode: "manual", policy: null, generation: 4, fingerprint: "sha256:" + "b".repeat(64) },
+    protocolState: "supported",
+    accounts: [
+      { opaqueAccountId: "ar_" + "c".repeat(43), label: "Taylor", eligibility: "active", plan: "Pro", identifierMasked: "••••••••", weekly: { remainingPercent: 90, resetAt: "2026-09-07T00:00:00.000Z", freshness: "fresh" }, shortWindowPressure: 18, assignedThreadCount: 2 },
+      { opaqueAccountId: "ar_" + "d".repeat(43), label: "Taylor", eligibility: "reauth_required", plan: null, identifierMasked: "••••••••", weekly: { remainingPercent: null, resetAt: null, freshness: "unknown" }, shortWindowPressure: null, assignedThreadCount: 0 },
+    ],
+    poolRemainingPercent: null,
+    restartRequired: true,
+    degradedReason: "quota_unknown",
+  };
+  const parsed = _test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status })), requestId);
+  assert.equal(parsed.active.generation, 3);
+  assert.equal(parsed.pending.generation, 4);
+  assert.equal(parsed.accounts[1].weekly.remainingPercent, null);
+  assert.equal(parsed.poolRemainingPercent, null);
+  assert.equal(JSON.stringify(parsed).includes("ar_"), false);
+  const unsafe = structuredClone(status);
+  unsafe.accounts[0].plan = "private@example.test";
+  assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: unsafe })), requestId), null);
+  const missingActive = structuredClone(status);
+  missingActive.active = null;
+  assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: missingActive })), requestId), null);
+  const invalidPressure = structuredClone(status);
+  invalidPressure.accounts[0].shortWindowPressure = "unknown";
+  assert.equal(_test.parseAuthenticatedRouterStatus(Buffer.from(JSON.stringify({ version: 1, requestId, status: invalidPressure })), requestId), null);
+});
+
+test("quota pool has a bounded 0–200 calculation and unknown never becomes capacity", () => {
+  assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 95, freshness: "fresh" } }, { weekly: { remainingPercent: 85, freshness: "fresh" } }]), 180);
+  assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 120, freshness: "fresh" } }, { weekly: { remainingPercent: -10, freshness: "fresh" } }]), 100);
+  assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: 100, freshness: "fresh" } }]), 200);
+  assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: 50, freshness: "stale" } }]), null);
+  assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: null, freshness: "unknown" } }]), null);
+});
+
+test("v2 config fingerprint uses a stable fixed canonical vector", () => {
+  const value = {
+    schemaVersion: 2,
+    mode: "quota_aware",
+    policy: "quota_aware_v1",
+    generation: 7,
+    protocolFingerprint: "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10",
+    primaryOpaqueAccountId: "ar_" + "a".repeat(43),
+    accounts: [
+      { opaqueAccountId: "ar_" + "a".repeat(43), included: true, weight: 1, capabilityFingerprint: "sha256:" + "b".repeat(64), label: "Alpha" },
+      { opaqueAccountId: "ar_" + "c".repeat(43), included: true, weight: 1, capabilityFingerprint: "sha256:" + "d".repeat(64), label: "Beta" },
+    ],
+    updatedAt: "2026-08-31T18:00:00.000Z",
+  };
+  assert.equal(_test.routerConfigFingerprint(value), "sha256:b26118045c98f42a6dcd1e53ba871d63b1a4b23b4aaf8f35969645bf719826b7");
+  assert.equal(_test.routerConfigFingerprint({ ...value, updatedAt: "2026-09-01T18:00:00.000Z" }), _test.routerConfigFingerprint(value));
+});
+
+test("legacy v1 config remains readable and manual rollback writes a v2 pending intent", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const v2 = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
+  const v1 = {
+    schemaVersion: 1,
+    mode: "balanced",
+    protocolFingerprint: v2.protocolFingerprint,
+    primaryOpaqueAccountId: v2.primaryOpaqueAccountId,
+    accounts: v2.accounts.map(({ opaqueAccountId, included, weight, capabilityFingerprint }) => ({ opaqueAccountId, included, weight, capabilityFingerprint })),
+    updatedAt: v2.updatedAt,
+  };
+  fs.writeFileSync(routerPaths.configFile, JSON.stringify(v1), { mode: 0o600 });
+  assert.equal(_test.readRouterConfig(setup.deps, routerPaths).schemaVersion, 1);
+  const legacyProjection = _test.routerPublicStatus(setup.deps, v1, null);
+  assert.equal(legacyProjection.schemaVersion, 1);
+  assert.equal(legacyProjection.mode, "balanced");
+  assert.equal(JSON.stringify(legacyProjection.accounts).includes("opaqueAccountId"), false);
+  const rollback = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(rollback.ok, true);
+  const manual = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
+  assert.equal(manual.schemaVersion, 2);
+  assert.equal(manual.mode, "manual");
+  assert.equal(manual.policy, null);
+  assert.equal(manual.accounts.length, 2);
+  assert.equal(manual.fingerprint, _test.routerConfigFingerprint(manual));
+});
+
+test("profile menu uses native rows for two masked accounts and a manage navigation", (t) => {
+  const previousDocument = global.document;
+  const nodes = [];
+  const element = (tagName) => {
+    const node = {
+      tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", type: "",
+      append(...children) { this.children.push(...children); },
+      setAttribute(key, value) { this.attrs[key] = value; },
+      addEventListener(name, listener) { this[`on_${name}`] = listener; },
+    };
+    nodes.push(node);
+    return node;
+  };
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const status = {
+    schemaVersion: 2,
+    active: { mode: "quota_aware", policy: "quota_aware_v1", generation: 1, fingerprint: "sha256:" + "a".repeat(64) },
+    pending: null,
+    accounts: [
+      { label: "Taylor", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 75, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+      { label: "Morgan", plan: "Plus", identifierMasked: "••••••••", eligibility: "reauth_required", weekly: { remainingPercent: 65, resetAt: null, freshness: "stale" }, shortWindowPressure: null, assignedThreadCount: 0 },
+    ],
+  };
+  const panel = _test.accountMenuRows({ api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } }, [{ label: "Taylor" }, { label: "Morgan" }], { live: { state: "active", status } });
+  const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
+  const text = flatten(panel);
+  assert.match(text, /Usage remaining/);
+  assert.match(text, /2 connected subscriptions/);
+  assert.match(text, /Usage unavailable/);
+  assert.match(text, /Manage Accounts/);
+  assert.equal(text.includes("Switch ChatGPT account"), false);
+  assert.equal(text.includes("Saved snapshot"), false);
+  assert.equal(text.includes("private@example.test"), false);
+  assert.equal(nodes.filter((node) => node.className.includes("hover:bg-token-foreground\/5") && node.children.length > 0).length, 2);
+});
+
+test("profile menu leaves quota details unknown when safe labels drift or are ambiguous", (t) => {
+  const previousDocument = global.document;
+  const element = (tagName) => ({
+    tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", type: "",
+    append(...children) { this.children.push(...children); },
+    setAttribute(key, value) { this.attrs[key] = value; },
+    addEventListener(name, listener) { this[`on_${name}`] = listener; },
+  });
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const status = {
+    schemaVersion: 2,
+    accounts: [
+      { label: "Taylor", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 99, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+      { label: "Taylor", plan: "Enterprise", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 20, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+    ],
+  };
+  assert.equal(_test.accountDetailsFor({ label: "Taylor" }, status), null, "duplicate safe labels are not a join key");
+  assert.equal(_test.accountDetailsFor({ label: "Renamed locally" }, status), null, "label drift is not positionally joined");
+  const panel = _test.accountMenuRows(
+    { api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } },
+    [{ label: "Taylor" }, { label: "Renamed locally" }],
+    { live: { state: "active", status } },
+  );
+  const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
+  const text = flatten(panel);
+  assert.equal(text.includes("Pro"), false);
+  assert.equal(text.includes("Enterprise"), false);
+  assert.equal(text.includes("99% weekly"), false);
+  assert.equal(text.includes("20% weekly"), false);
+  assert.equal((text.match(/Plan unavailable/g) || []).length, 2);
+  assert.equal((text.match(/Weekly usage unavailable/g) || []).length, 2);
+});
+
+test("profile menu keeps every manual switch visible outside the exact two-account routing pool", (t) => {
+  const previousDocument = global.document;
+  const element = (tagName) => ({
+    tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", type: "", disabled: false,
+    append(...children) { this.children.push(...children); },
+    setAttribute(key, value) { this.attrs[key] = value; },
+    addEventListener(name, listener) { this[`on_${name}`] = listener; },
+  });
+  global.document = { createElement: element };
+  t.after(() => { global.document = previousDocument; });
+  const state = { api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } }, pluginProtectionMode: "observation" };
+  const labels = (panel) => panel.children.filter((node) => node.type === "button").map((node) => node.textContent);
+  const one = _test.accountMenuRows(state, [{ label: "One", ref: "one" }], null);
+  const three = _test.accountMenuRows(state, [
+    { label: "One", ref: "one" }, { label: "Two", ref: "two" }, { label: "Three", ref: "three" },
+  ], null);
+  assert.deepEqual(labels(one), ["One", "Manage Accounts"]);
+  assert.deepEqual(labels(three), ["One", "Two", "Three", "Manage Accounts"]);
+  const buttons = (node) => [
+    ...(node.type === "button" ? [node.textContent] : []),
+    ...node.children.flatMap(buttons),
+  ];
+  const status = { textContent: "" };
+  assert.deepEqual(buttons(_test.advancedAccountsCard(state, [{ label: "One", ref: "one" }], null, status)).filter((label) => label === "One"), ["One"]);
+  assert.deepEqual(buttons(_test.advancedAccountsCard(state, [
+    { label: "One", ref: "one" }, { label: "Two", ref: "two" }, { label: "Three", ref: "three" },
+  ], null, status)).filter((label) => ["One", "Two", "Three"].includes(label)), ["One", "Two", "Three"]);
 });
 
 test("authenticated router status rejects unsafe and unknown public enum strings before presentation", () => {
@@ -552,7 +783,7 @@ test("authenticated router status rejects unsafe and unknown public enum strings
   }
 });
 
-test("router controls use an accessible live status and require an explicit two-snapshot selection", async (t) => {
+test("router controls require an explicit history owner before staging quota-aware routing", async (t) => {
   const previousDocument = global.document;
   const nodes = [];
   const element = (tagName) => {
@@ -582,26 +813,23 @@ test("router controls use an accessible live status and require an explicit two-
       ipc: {
         async invoke(_channel, request) {
           calls.push(request);
-          if (request.action === "router-status") return { ok: true, router: { mode: "manual", restartRequired: false, degradedReason: null }, live: { state: "not_applicable", status: null } };
-          return { ok: true, router: { mode: "balanced", restartRequired: true, degradedReason: null } };
+          return { ok: true, router: { schemaVersion: 2, mode: "quota_aware", policy: "quota_aware_v1", pending: { mode: "quota_aware", policy: "quota_aware_v1", generation: 1, fingerprint: "sha256:" + "a".repeat(64) }, restartRequired: true, degradedReason: null }, live: { state: "not_running", status: null } };
         },
       },
       log: { warn() {} },
     },
-  }, [{ ref: "one", label: "hidden-one" }, { ref: "two", label: "hidden-two" }]);
-  await Promise.resolve();
-  await Promise.resolve();
+  }, [{ ref: "one", label: "Account One" }, { ref: "two", label: "Account Two" }]);
   const status = nodes.find((node) => node.attrs.role === "status");
-  const balanced = nodes.find((node) => node.textContent === "Stage Balanced Mode");
-  const checks = nodes.filter((node) => node.type === "checkbox");
+  const historyOwner = nodes.find((node) => node.attrs["aria-label"] === "Keep my existing history with");
+  const stage = nodes.find((node) => node.textContent === "Stage quota-aware routing");
   assert.equal(status.attrs["aria-live"], "polite");
-  assert.equal(balanced.disabled, true);
-  assert.deepEqual(calls, [{ action: "router-status" }]);
-  checks[0].checked = true; checks[0].on_change();
-  assert.equal(balanced.disabled, true);
-  checks[1].checked = true; checks[1].on_change();
-  assert.equal(balanced.disabled, false);
-  assert.equal(nodes.some((node) => node.textContent === "hidden-one" || node.textContent === "hidden-two"), false);
+  assert.equal(historyOwner.value, "");
+  assert.equal(stage.disabled, true, "there is no default history owner");
+  historyOwner.value = "two";
+  historyOwner.on_change();
+  assert.equal(stage.disabled, false);
+  await stage.on_click();
+  assert.deepEqual(calls, [{ action: "router-configure", mode: "quota_aware", refs: ["one", "two"], primaryRef: "one", legacyOwnerRef: "two", weights: [1, 1] }]);
 });
 
 function addSavedAccount(setup, name, token, accountId) {
@@ -631,7 +859,257 @@ function validRouterState(config, overrides = {}) {
   };
 }
 
-test("balanced mode stages exactly two isolated snapshot homes and an opaque atomic config", async (t) => {
+function installActiveRouterSocket(t, setup, routerPaths, status) {
+  const socketPath = _test.routerControlSocketPath(setup.deps, routerPaths);
+  const originalFs = setup.deps.fs;
+  const originalNet = setup.deps.net;
+  const wrapped = Object.create(fs);
+  wrapped.lstatSync = (target) => {
+    if (target === socketPath) return { isSocket: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600 };
+    if (target === path.dirname(socketPath)) return { isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o700 };
+    return originalFs.lstatSync(target);
+  };
+  setup.deps.fs = wrapped;
+  setup.deps.net = {
+    createConnection() {
+      const { EventEmitter } = require("node:events");
+      const socket = new EventEmitter();
+      socket.setTimeout = () => {};
+      socket.destroy = () => {};
+      socket.end = (request) => {
+        const requestId = JSON.parse(request.toString("utf8")).requestId;
+        queueMicrotask(() => {
+          socket.emit("data", Buffer.from(JSON.stringify({ version: 1, requestId, status })));
+          socket.emit("end");
+        });
+      };
+      queueMicrotask(() => socket.emit("connect"));
+      return socket;
+    },
+  };
+  t.after(() => { setup.deps.fs = originalFs; setup.deps.net = originalNet; });
+}
+
+function activeQuotaStatus(config) {
+  return {
+    schemaVersion: 2,
+    active: { mode: "quota_aware", policy: "quota_aware_v1", generation: config.generation, fingerprint: config.fingerprint },
+    pending: null,
+    protocolState: "supported",
+    restartRequired: false,
+    accounts: config.accounts.map((account) => ({
+      opaqueAccountId: account.opaqueAccountId,
+      label: account.label,
+      eligibility: "active",
+      plan: "Pro",
+      identifierMasked: "••••••••",
+      weekly: { remainingPercent: 80, resetAt: null, freshness: "fresh" },
+      shortWindowPressure: 0,
+      assignedThreadCount: 1,
+    })),
+    poolRemainingPercent: 160,
+    degradedReason: null,
+  };
+}
+
+const HISTORY_DATABASE_NAMES = ["goals_1.sqlite", "logs_2.sqlite", "memories_1.sqlite", "queue_1.sqlite", "state_5.sqlite", "thread_history_1.sqlite"];
+const HISTORY_ENTRY_NAMES = ["archived_sessions", "session_index.jsonl", "sessions"];
+const fingerprint = (hex) => `sha256:${hex.repeat(64).slice(0, 64)}`;
+
+function historyOwnersFor(config, intent, secret, threadIds = [], overrides = {}) {
+  const owner = overrides.legacyOwnerOpaqueAccountId || intent.legacyOwnerOpaqueAccountId;
+  const sortedThreadIds = [...threadIds].sort();
+  const base = {
+    schemaVersion: 1,
+    kind: "account-router-history-adoption-owners",
+    protocolFingerprint: config.protocolFingerprint,
+    poolFingerprint: _test.historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId)),
+    legacyOwnerOpaqueAccountId: owner,
+    threadIds: sortedThreadIds,
+    threadOwnersFingerprint: _test.historyAdoptionThreadOwnersFingerprint(sortedThreadIds, owner),
+    adoptedAt: "2026-08-31T18:00:00.000Z",
+    ...overrides,
+  };
+  return _test.signHistoryAdoptionOwners(secret, base);
+}
+
+function historyReceiptFor(config, intent, secret, overrides = {}) {
+  const owner = overrides.legacyOwnerOpaqueAccountId || intent.legacyOwnerOpaqueAccountId;
+  const base = {
+    schemaVersion: 1,
+    kind: "account-router-history-adoption-receipt",
+    protocolFingerprint: config.protocolFingerprint,
+    poolFingerprint: _test.historyPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId)),
+    intentFingerprint: _test.historyAdoptionIntentFingerprint(intent),
+    legacyOwnerOpaqueAccountId: owner,
+    sourceFingerprint: fingerprint("a"),
+    destinationFingerprint: fingerprint("b"),
+    databases: HISTORY_DATABASE_NAMES.map((name) => ({ name, present: false, sha256: null, bytes: 0, integrity: null })),
+    histories: HISTORY_ENTRY_NAMES.map((name) => ({ name, present: false, sha256: null, bytes: 0, fileCount: 0 })),
+    importedThreadCount: 0,
+    threadOwnersFingerprint: _test.historyAdoptionThreadOwnersFingerprint([], owner),
+    backupFingerprint: fingerprint("d"),
+    adoptedAt: "2026-08-31T18:00:00.000Z",
+    ...overrides,
+  };
+  return _test.signHistoryAdoptionReceipt(secret, base);
+}
+
+test("history-adoption intent uses sorted canonical pool and a fixed HMAC vector", () => {
+  const secret = Buffer.from("01".repeat(32), "hex");
+  const first = `ar_${"a".repeat(43)}`;
+  const second = `ar_${"b".repeat(43)}`;
+  const protocolFingerprint = "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10";
+  const unsigned = {
+    schemaVersion: 1,
+    kind: "account-router-history-adoption-intent",
+    protocolFingerprint,
+    poolFingerprint: _test.historyPoolFingerprint(protocolFingerprint, [second, first]),
+    configGeneration: 7,
+    configFingerprint: fingerprint("c"),
+    legacyOwnerOpaqueAccountId: first,
+    createdAt: "2026-08-31T18:00:00.000Z",
+  };
+  const signed = _test.signHistoryAdoptionIntent(secret, unsigned);
+  assert.equal(unsigned.poolFingerprint, "sha256:ad24190f3fab23eff12e4111699334bb510d2450a7d1d5cc033803bf6527b9b8");
+  assert.equal(_test.historyAdoptionIntentFingerprint(signed), "sha256:944c8d0828251af540c85441f2e3bff5b60aef96efe6cb61547cdbed54d80fe9");
+  assert.equal(signed.hmac, "hmac-sha256:b4a9a63e06a34938183f57e0b38807be7b54b849f4dbd91ad96b12937729c693");
+  assert.equal(_test.historyPoolFingerprint(protocolFingerprint, [first, second]), unsigned.poolFingerprint);
+  assert.doesNotThrow(() => _test.validateHistoryAdoptionIntent(signed, secret));
+  assert.throws(() => _test.validateHistoryAdoptionIntent({ ...signed, configGeneration: 8 }, secret), /invalid-history-adoption-intent/);
+  assert.throws(() => _test.validateHistoryAdoptionIntent({ ...signed, extra: true }, secret), /invalid-history-adoption-intent/);
+  secret.fill(0);
+});
+
+test("history adoption requires a selected owner before any isolated home or config publication", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const base = { action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] };
+
+  const missing = await setup.service.handle(base);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error.code, "router-history-owner-required");
+  const foreign = await setup.service.handle({ ...base, legacyOwnerRef: "foreign-ref" });
+  assert.equal(foreign.ok, false);
+  assert.equal(foreign.error.code, "router-history-owner-not-selected");
+  assert.equal(fs.existsSync(routerPaths.configFile), false);
+  assert.equal(fs.existsSync(routerPaths.historyAdoptionIntentFile), false);
+  assert.equal(fs.existsSync(routerPaths.controlSecretFile), false);
+  assert.equal(fs.readdirSync(routerPaths.accountsDir).length, 0, "no isolated home is published without an explicit selected owner");
+});
+
+test("history-adoption receipts are strict, signed, and bind future staging to the stable pool and owner", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  addSavedAccount(setup, "third", "third", "account-third");
+  const listed = await setup.service.handle({ action: "list" });
+  const selected = listed.accounts.slice(0, 2);
+  const initial = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: selected.map((account) => account.ref), legacyOwnerRef: selected[0].ref, weights: [1, 1] });
+  assert.equal(initial.ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  const intent = JSON.parse(fs.readFileSync(routerPaths.historyAdoptionIntentFile, "utf8"));
+  const originalIntentBytes = fs.readFileSync(routerPaths.historyAdoptionIntentFile);
+  const secret = fs.readFileSync(routerPaths.controlSecretFile);
+  const receipt = historyReceiptFor(config, intent, secret);
+  const owners = historyOwnersFor(config, intent, secret);
+  assert.doesNotThrow(() => _test.validateHistoryAdoptionReceipt(receipt, secret));
+  assert.doesNotThrow(() => _test.validateHistoryAdoptionOwners(owners, secret));
+  assert.throws(() => _test.validateHistoryAdoptionReceipt(_test.signHistoryAdoptionReceipt(secret, { ...receipt, databases: receipt.databases.slice().reverse() }), secret), /invalid-history-adoption-receipt/);
+  assert.throws(() => _test.validateHistoryAdoptionReceipt({ ...receipt, hmac: "hmac-sha256:" + "0".repeat(64) }, secret), /invalid-history-adoption-receipt/);
+  assert.throws(() => _test.validateHistoryAdoptionOwners({ ...owners, hmac: "hmac-sha256:" + "0".repeat(64) }, secret), /invalid-history-adoption-owners/);
+  fs.writeFileSync(routerPaths.historyAdoptionReceiptFile, JSON.stringify(receipt), { mode: 0o600 });
+
+  const missingOwners = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(missingOwners.ok, false);
+  assert.equal(missingOwners.error.code, "router-history-adoption-invalid");
+  fs.writeFileSync(routerPaths.historyAdoptionOwnersFile, JSON.stringify(owners), { mode: 0o600 });
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config)), { mode: 0o600 });
+
+  const manual = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(manual.ok, true);
+  const sameOwner = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: selected.map((account) => account.ref), legacyOwnerRef: selected[0].ref, weights: [1, 1] });
+  assert.equal(sameOwner.ok, true, "a valid receipt remains usable across same-pool generations");
+  assert.deepEqual(fs.readFileSync(routerPaths.historyAdoptionIntentFile), originalIntentBytes,
+    "post-adoption staging preserves the original signed intent named by the receipt");
+  const restaged = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.notEqual(restaged.generation, config.generation);
+  assert.notEqual(restaged.fingerprint, config.fingerprint);
+  const configBeforeMismatch = fs.readFileSync(routerPaths.configFile);
+  const ownerMismatch = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: selected.map((account) => account.ref), legacyOwnerRef: selected[1].ref, weights: [1, 1] });
+  assert.equal(ownerMismatch.ok, false);
+  assert.equal(ownerMismatch.error.code, "router-history-adoption-mismatch");
+  const poolMismatch = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: [selected[0].ref, listed.accounts[2].ref], legacyOwnerRef: selected[0].ref, weights: [1, 1] });
+  assert.equal(poolMismatch.ok, false);
+  assert.equal(poolMismatch.error.code, "router-history-adoption-mismatch");
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBeforeMismatch);
+  const status = await setup.service.handle({ action: "router-status" });
+  assert.equal(status.router.historyAdoption.state, "adopted");
+  assert.equal(status.router.historyAdoption.ownerLabel, selected[0].label);
+  assert.equal(JSON.stringify(status).includes(intent.legacyOwnerOpaqueAccountId), false);
+  assert.equal(JSON.stringify(status).includes(secret.toString("hex")), false);
+  const importedThreadId = "019d0000-0000-7000-8000-000000000001";
+  const threadedOwners = historyOwnersFor(restaged, intent, secret, [importedThreadId]);
+  const threadedReceipt = historyReceiptFor(restaged, intent, secret, {
+    importedThreadCount: 1,
+    threadOwnersFingerprint: threadedOwners.threadOwnersFingerprint,
+    adoptedAt: threadedOwners.adoptedAt,
+  });
+  const threadedRecords = {
+    intent,
+    receipt: threadedReceipt,
+    owners: threadedOwners,
+    intentInvalid: false,
+    receiptInvalid: false,
+    ownersInvalid: false,
+  };
+  assert.equal(_test.historyAdoptionProjection(restaged, threadedRecords, validRouterState(restaged)).state, "invalid",
+    "a signed owners manifest cannot claim adopted until durable owner state contains its imported threads");
+  assert.equal(_test.historyAdoptionProjection(restaged, threadedRecords, validRouterState(restaged, {
+    threadOwners: { [importedThreadId]: intent.legacyOwnerOpaqueAccountId },
+  })).state, "adopted");
+  assert.equal(_test.historyAdoptionProjection(_test.readRouterConfig(setup.deps, routerPaths), {
+    intent: null, receipt: null, owners: null, intentInvalid: false, receiptInvalid: false, ownersInvalid: false,
+  }).state, "required");
+  assert.equal(_test.historyAdoptionProjection(_test.readRouterConfig(setup.deps, routerPaths), {
+    intent: null, receipt: null, owners: null, intentInvalid: false, receiptInvalid: true, ownersInvalid: false,
+  }).state, "invalid");
+  assert.equal(_test.historyAdoptionProjection(_test.readRouterConfig(setup.deps, routerPaths), {
+    intent: null, receipt: { ...receipt, poolFingerprint: fingerprint("e") }, owners: null,
+    intentInvalid: false, receiptInvalid: false, ownersInvalid: false,
+  }).state, "invalid");
+  secret.fill(0);
+});
+
+test("a deliberate pre-adoption restage replaces stale intent and projects only safe offline history state", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const first = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(first.ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const before = JSON.parse(fs.readFileSync(routerPaths.historyAdoptionIntentFile, "utf8"));
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "manual" })).ok, true);
+  const restaged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[1].ref, weights: [1, 1] });
+  assert.equal(restaged.ok, true);
+  const after = JSON.parse(fs.readFileSync(routerPaths.historyAdoptionIntentFile, "utf8"));
+  assert.notEqual(after.legacyOwnerOpaqueAccountId, before.legacyOwnerOpaqueAccountId);
+  const status = await setup.service.handle({ action: "router-status" });
+  assert.equal(status.router.historyAdoption.state, "pending_offline_adoption");
+  assert.equal(status.router.historyAdoption.ownerLabel, listed.accounts[1].label);
+  assert.equal(JSON.stringify(status.router.historyAdoption).includes(after.legacyOwnerOpaqueAccountId), false);
+  assert.equal(JSON.stringify(status.router.historyAdoption).includes("access_token"), false);
+  const manualPresentation = _test.routerPresentation({ schemaVersion: 2, pending: { mode: "manual", policy: null }, historyAdoption: { state: "adopted" } }, { state: "not_running", status: null }, 2);
+  assert.equal(manualPresentation.label, "Manual new-thread assignment pending");
+  assert.match(manualPresentation.message, /not globally restored or reassigned/);
+});
+
+test("quota-aware v2 stages exactly two isolated snapshot homes and immutable pending intent", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
@@ -641,11 +1119,12 @@ test("balanced mode stages exactly two isolated snapshot homes and an opaque ato
     action: "router-configure", mode: "balanced",
     refs: listed.accounts.map((account) => account.ref),
     primaryRef: listed.accounts[0].ref,
+    legacyOwnerRef: listed.accounts[0].ref,
     weights: [1, 3],
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.router.mode, "balanced");
+  assert.equal(result.router.mode, "quota_aware");
   assert.equal(result.router.accounts.length, 2);
   assert.equal(JSON.stringify(result).includes("account-work"), false);
   assert.equal(JSON.stringify(result).includes("access_token"), false);
@@ -654,7 +1133,11 @@ test("balanced mode stages exactly two isolated snapshot homes and an opaque ato
 
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const config = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
-  assert.equal(config.mode, "balanced");
+  assert.equal(config.schemaVersion, 2);
+  assert.equal(config.mode, "quota_aware");
+  assert.equal(config.policy, "quota_aware_v1");
+  assert.equal(config.generation, 1);
+  assert.equal(config.fingerprint, _test.routerConfigFingerprint(config));
   assert.equal(config.accounts.length, 2);
   assert.equal(config.accounts.every((account) => /^ar_[A-Za-z0-9_-]{43}$/.test(account.opaqueAccountId)), true);
   assert.equal(JSON.stringify(config).includes("account-work"), false);
@@ -668,6 +1151,321 @@ test("balanced mode stages exactly two isolated snapshot homes and an opaque ato
     assert.equal(fs.statSync(path.join(home, "auth.json")).mode & 0o777, 0o600);
     assert.equal(fs.readFileSync(path.join(home, "config.toml"), "utf8"), "", "v1 does not copy existing config or environment");
   }
+});
+
+test("quota-aware restaging preserves same-account rotated isolated auth and receipts its home hash", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] })).ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const initial = _test.readRouterConfig(setup.deps, routerPaths);
+  const work = initial.accounts.find((account) => account.label === "work");
+  const homeAuth = path.join(routerPaths.accountsDir, work.opaqueAccountId, "codex-home", "auth.json");
+  const rotatedHome = Buffer.from(auth("work-home-rotated", "account-work"));
+  fs.writeFileSync(homeAuth, rotatedHome, { mode: 0o600 });
+
+  const manual = await setup.service.handle({ action: "router-configure", mode: "manual" });
+  assert.equal(manual.ok, true);
+  const pendingManual = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.equal(pendingManual.mode, "manual");
+  const restaged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(restaged.ok, true);
+  const next = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.equal(next.mode, "quota_aware");
+  assert.equal(next.generation, pendingManual.generation + 1);
+  assert.deepEqual(fs.readFileSync(homeAuth), rotatedHome, "ordinary restaging must not overwrite a rotated isolated token");
+  const rotatedHash = crypto.createHash("sha256").update(rotatedHome).digest("hex");
+  const receipt = JSON.parse(fs.readFileSync(routerPaths.receiptsFile, "utf8"))
+    .find((entry) => entry.generation === next.generation && entry.opaqueAccountId === work.opaqueAccountId);
+  assert.equal(receipt.snapshotHash, `sha256:${rotatedHash}`);
+});
+
+test("quota-aware restaging rejects an existing isolated home for a different account", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] })).ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  const work = config.accounts.find((account) => account.label === "work");
+  const homeAuth = path.join(routerPaths.accountsDir, work.opaqueAccountId, "codex-home", "auth.json");
+  fs.writeFileSync(homeAuth, auth("wrong-home", "account-second"), { mode: 0o600 });
+  const configBefore = fs.readFileSync(routerPaths.configFile);
+  const receiptsBefore = fs.readFileSync(routerPaths.receiptsFile);
+  const wrongHome = fs.readFileSync(homeAuth);
+
+  const result = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.receiptsFile), receiptsBefore);
+  assert.deepEqual(fs.readFileSync(homeAuth), wrongHome);
+});
+
+test("quota-aware restaging rejects a changed isolated-home config before publication", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] })).ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  const work = config.accounts.find((account) => account.label === "work");
+  const homeConfig = path.join(routerPaths.accountsDir, work.opaqueAccountId, "codex-home", "config.toml");
+  fs.writeFileSync(homeConfig, "[unsafe]\n", { mode: 0o600 });
+  const configBefore = fs.readFileSync(routerPaths.configFile);
+  const receiptsBefore = fs.readFileSync(routerPaths.receiptsFile);
+
+  const result = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.receiptsFile), receiptsBefore);
+  assert.equal(fs.readFileSync(homeConfig, "utf8"), "[unsafe]\n");
+});
+
+test("v2 staging rejects incompatible private pair or per-account weights before publication", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  addSavedAccount(setup, "third", "third", "account-third");
+  const listed = await setup.service.handle({ action: "list" });
+  const selected = listed.accounts.slice(0, 2);
+  const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: selected.map((account) => account.ref), legacyOwnerRef: selected[0].ref, weights: [2, 3] });
+  assert.equal(staged.ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const initial = _test.readRouterConfig(setup.deps, routerPaths);
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(initial)), { mode: 0o600 });
+  const configBefore = fs.readFileSync(routerPaths.configFile);
+  const receiptsBefore = fs.readFileSync(routerPaths.receiptsFile);
+  const stateBefore = fs.readFileSync(routerPaths.stateFile);
+  const homesBefore = fs.readdirSync(routerPaths.accountsDir).sort();
+
+  const mismatchedWeights = await setup.service.handle({
+    action: "router-configure", mode: "quota_aware", refs: selected.map((account) => account.ref), legacyOwnerRef: selected[0].ref, weights: [3, 2],
+  });
+  assert.equal(mismatchedWeights.ok, false);
+  assert.equal(mismatchedWeights.error.code, "router-state-mismatch-requires-reset");
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.receiptsFile), receiptsBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.stateFile), stateBefore);
+  assert.deepEqual(fs.readdirSync(routerPaths.accountsDir).sort(), homesBefore);
+
+  const reversed = await setup.service.handle({
+    action: "router-configure", mode: "quota_aware", refs: selected.slice().reverse().map((account) => account.ref), legacyOwnerRef: selected[0].ref, weights: [3, 2],
+  });
+  assert.equal(reversed.ok, true, "state keys are a set; only each account's own weight must match");
+  const reversedConfig = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.deepEqual(reversedConfig.accounts.map((account) => account.opaqueAccountId), initial.accounts.map((account) => account.opaqueAccountId).reverse());
+  assert.deepEqual(fs.readFileSync(routerPaths.stateFile), stateBefore);
+
+  const configAfterReverse = fs.readFileSync(routerPaths.configFile);
+  const receiptsAfterReverse = fs.readFileSync(routerPaths.receiptsFile);
+  const mismatchedPair = await setup.service.handle({
+    action: "router-configure", mode: "quota_aware", refs: [selected[0].ref, listed.accounts[2].ref], legacyOwnerRef: selected[0].ref, weights: [2, 3],
+  });
+  assert.equal(mismatchedPair.ok, false);
+  assert.equal(mismatchedPair.error.code, "router-state-mismatch-requires-reset");
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configAfterReverse);
+  assert.deepEqual(fs.readFileSync(routerPaths.receiptsFile), receiptsAfterReverse);
+  assert.deepEqual(fs.readFileSync(routerPaths.stateFile), stateBefore);
+  assert.deepEqual(fs.readdirSync(routerPaths.accountsDir).sort(), homesBefore);
+});
+
+test("v2 staging permits an exact idle private state without mutating it", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const first = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [2, 3] });
+  assert.equal(first.ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const initial = _test.readRouterConfig(setup.deps, routerPaths);
+  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(initial)), { mode: 0o600 });
+  const stateBefore = fs.readFileSync(routerPaths.stateFile);
+
+  const repeated = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [2, 3] });
+  assert.equal(repeated.ok, true);
+  const next = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.equal(next.generation, initial.generation + 1);
+  assert.deepEqual(fs.readFileSync(routerPaths.stateFile), stateBefore);
+});
+
+test("receipt publication failure never publishes a runnable pending config", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const originalRename = fs.renameSync;
+  const wrapped = Object.create(fs);
+  wrapped.renameSync = (from, to) => {
+    if (to === routerPaths.receiptsFile) throw Object.assign(new Error("receipt write injected"), { code: "EIO" });
+    return originalRename(from, to);
+  };
+  setup.deps.fs = wrapped;
+  t.after(() => { setup.deps.fs = fs; });
+
+  const failed = await setup.service.handle({
+    action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1],
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(fs.existsSync(routerPaths.configFile), false, "receipt failure must happen before config publication");
+});
+
+test("v2 config timestamps use the runtime's strict UTC ISO form", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  const config = _test.readRouterConfig(setup.deps, _test.accountRouterPaths(setup.deps, setup.paths));
+  assert.doesNotThrow(() => _test.validateRouterConfig({ ...config, updatedAt: "2026-08-31T18:00:00.123Z" }));
+  assert.throws(() => _test.validateRouterConfig({ ...config, updatedAt: "2026-08-31T18:00:00.123456Z" }), /invalid-router-config/);
+  assert.throws(() => _test.validateRouterConfig({ ...config, updatedAt: "2026-02-30T18:00:00.123Z" }), /invalid-router-config/);
+  assert.throws(() => _test.validateRouterConfig({ ...config, updatedAt: "2026-08-31T18:00:00+00:00" }), /invalid-router-config/);
+});
+
+test("targeted reauthentication refreshes the same saved source and stopped isolated home before staging", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  assert.equal(staged.ok, true);
+  const work = listed.accounts.find((account) => account.label === "work");
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const before = _test.readRouterConfig(setup.deps, routerPaths);
+  const workConfig = before.accounts.find((account) => account.label === "work");
+  const homeAuth = path.join(routerPaths.accountsDir, workConfig.opaqueAccountId, "codex-home", "auth.json");
+  const secondBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "second.json"));
+  fs.writeFileSync(setup.paths.authFile, auth("work-reauthenticated", "account-work"), { mode: 0o600 });
+  // A present net implementation plus an absent private control socket is the
+  // bounded proof that this local router generation is not running.
+  setup.deps.net = { createConnection() { throw new Error("must not connect without a socket"); } };
+
+  const refreshed = await setup.service.handle({ action: "router-recover", ref: work.ref });
+  assert.equal(refreshed.ok, true);
+  assert.equal(refreshed.router.restartRequired, true);
+  assert.equal(refreshed.live.state, "not_running");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"))).tokens.access_token, "work-reauthenticated");
+  assert.equal(JSON.parse(fs.readFileSync(homeAuth)).tokens.access_token, "work-reauthenticated");
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "second.json")), secondBefore);
+  assert.deepEqual(fs.readdirSync(setup.paths.accountsDir).filter((name) => name.endsWith(".json")).sort(), ["second.json", "work.json"]);
+  const after = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.equal(after.generation, before.generation + 1);
+  assert.equal(after.fingerprint, _test.routerConfigFingerprint(after));
+});
+
+test("targeted reauthentication refuses an unverified or running router without changing saved or isolated auth", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  const work = listed.accounts.find((account) => account.label === "work");
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  const workConfig = config.accounts.find((account) => account.label === "work");
+  const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  const homeAuth = path.join(routerPaths.accountsDir, workConfig.opaqueAccountId, "codex-home", "auth.json");
+  const homeBefore = fs.readFileSync(homeAuth);
+  const configBefore = fs.readFileSync(routerPaths.configFile);
+  fs.writeFileSync(setup.paths.authFile, auth("work-reauthenticated", "account-work"), { mode: 0o600 });
+
+  const unverified = await setup.service.handle({ action: "router-recover", ref: work.ref });
+  assert.equal(unverified.ok, false);
+  assert.equal(unverified.error.code, "router-recovery-router-status-unavailable");
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
+  assert.deepEqual(fs.readFileSync(homeAuth), homeBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
+
+  const socketPath = _test.routerControlSocketPath(setup.deps, routerPaths);
+  const originalFs = setup.deps.fs;
+  const wrapped = Object.create(fs);
+  wrapped.lstatSync = (target) => {
+    if (target === socketPath) return { isSocket: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600 };
+    if (target === path.dirname(socketPath)) return { isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o700 };
+    return originalFs.lstatSync(target);
+  };
+  setup.deps.fs = wrapped;
+  const activeStatus = {
+    schemaVersion: 2,
+    active: { mode: "quota_aware", policy: "quota_aware_v1", generation: config.generation, fingerprint: config.fingerprint },
+    pending: null,
+    protocolState: "supported",
+    restartRequired: false,
+    accounts: config.accounts.map((account) => ({
+      opaqueAccountId: account.opaqueAccountId,
+      label: account.label,
+      eligibility: "active",
+      plan: null,
+      identifierMasked: "••••••••",
+      weekly: { remainingPercent: null, resetAt: null, freshness: "unknown" },
+      shortWindowPressure: null,
+      assignedThreadCount: 0,
+    })),
+    poolRemainingPercent: null,
+    degradedReason: null,
+  };
+  setup.deps.net = {
+    createConnection() {
+      const { EventEmitter } = require("node:events");
+      const socket = new EventEmitter();
+      socket.setTimeout = () => {};
+      socket.destroy = () => {};
+      socket.end = (request) => {
+        const requestId = JSON.parse(request.toString("utf8")).requestId;
+        queueMicrotask(() => {
+          socket.emit("data", Buffer.from(JSON.stringify({ version: 1, requestId, status: activeStatus })));
+          socket.emit("end");
+        });
+      };
+      queueMicrotask(() => socket.emit("connect"));
+      return socket;
+    },
+  };
+  t.after(() => { setup.deps.fs = originalFs; });
+
+  const running = await setup.service.handle({ action: "router-recover", ref: work.ref });
+  assert.equal(running.ok, false);
+  assert.equal(running.error.code, "router-recovery-router-running");
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
+  assert.deepEqual(fs.readFileSync(homeAuth), homeBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
+});
+
+test("targeted reauthentication rolls back source and isolated auth when receipt publication fails", async (t) => {
+  const setup = fixture();
+  disposeFixture(t, setup);
+  addSavedAccount(setup, "second", "second", "account-second");
+  const listed = await setup.service.handle({ action: "list" });
+  await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+  const work = listed.accounts.find((account) => account.label === "work");
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const config = _test.readRouterConfig(setup.deps, routerPaths);
+  const workConfig = config.accounts.find((account) => account.label === "work");
+  const homeAuth = path.join(routerPaths.accountsDir, workConfig.opaqueAccountId, "codex-home", "auth.json");
+  const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+  const homeBefore = fs.readFileSync(homeAuth);
+  const configBefore = fs.readFileSync(routerPaths.configFile);
+  fs.writeFileSync(setup.paths.authFile, auth("work-reauthenticated", "account-work"), { mode: 0o600 });
+  setup.deps.net = { createConnection() { throw new Error("must not connect without a socket"); } };
+  const originalFs = setup.deps.fs;
+  const wrapped = Object.create(fs);
+  wrapped.renameSync = (from, to) => {
+    if (to === routerPaths.receiptsFile) throw Object.assign(new Error("receipt write injected"), { code: "EIO" });
+    return originalFs.renameSync(from, to);
+  };
+  setup.deps.fs = wrapped;
+  t.after(() => { setup.deps.fs = originalFs; });
+
+  const failed = await setup.service.handle({ action: "router-recover", ref: work.ref });
+  assert.equal(failed.ok, false);
+  assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
+  assert.deepEqual(fs.readFileSync(homeAuth), homeBefore);
+  assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
 });
 
 test("balanced configuration rejects a third account, invalid weights, and duplicate identity before mutating config", async (t) => {
@@ -698,7 +1496,7 @@ test("router hardens only owner-owned 0755 children and leaves its shared parent
   const parentMode = fs.statSync(sharedParent).mode & 0o777;
   const listed = await setup.service.handle({ action: "list" });
   const result = await setup.service.handle({
-    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1],
   });
 
   assert.equal(result.ok, true);
@@ -805,7 +1603,7 @@ test("router IPC maps injected details to a finite safe error code", async (t) =
   };
   setup.deps.fs = wrapped;
   const result = await setup.service.handle({
-    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1],
+    action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1],
   });
 
   assert.equal(result.ok, false);
@@ -828,19 +1626,19 @@ test("failed isolated-home promotion removes only its staging home and never alt
     return originalRename(from, to);
   };
   t.after(() => { setup.deps.fs.renameSync = originalRename; });
-  const failed = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] });
+  const failed = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
   assert.equal(failed.ok, false);
   assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
   const routerAccounts = path.join(setup.root, "tweak-data", "co.tweakers.account-switcher", "accounts");
   assert.equal(fs.readdirSync(routerAccounts).some((name) => name.startsWith(".staging-")), false);
 });
 
-test("manual mode and lifecycle disable preserve staged homes while disabling balanced startup on the next restart", async (t) => {
+test("manual rollback stages a new pending generation while preserving isolated homes", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
   const listed = await setup.service.handle({ action: "list" });
-  assert.equal((await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] })).ok, true);
+  assert.equal((await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] })).ok, true);
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const homesBefore = fs.readdirSync(routerPaths.accountsDir).sort();
   const sourceBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
@@ -854,15 +1652,17 @@ test("manual mode and lifecycle disable preserve staged homes while disabling ba
   assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), sourceBefore);
   assert.deepEqual(fs.readFileSync(setup.paths.authFile), authBefore);
   assert.deepEqual(fs.readFileSync(setup.paths.currentMarker), markerBefore);
-  const manualBytes = fs.readFileSync(routerPaths.configFile);
-  const manualMtimeMs = fs.statSync(routerPaths.configFile).mtimeMs;
+  const firstManual = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
   const repeated = await setup.service.handle({ action: "router-configure", mode: "manual" });
   assert.equal(repeated.ok, true);
-  assert.deepEqual(fs.readFileSync(routerPaths.configFile), manualBytes, "manual mode remains byte-for-byte idempotent");
-  assert.equal(fs.statSync(routerPaths.configFile).mtimeMs, manualMtimeMs, "manual mode does not rewrite config");
-  fs.writeFileSync(routerPaths.configFile, JSON.stringify({ ..._test.readRouterConfig(setup.deps, routerPaths), mode: "balanced" }), { mode: 0o600 });
+  const secondManual = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
+  assert.equal(secondManual.mode, "manual");
+  assert.equal(secondManual.generation, firstManual.generation + 1);
+  assert.equal(secondManual.fingerprint, _test.routerConfigFingerprint(secondManual));
   setup.service.disableRouter();
-  assert.equal(JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8")).mode, "manual");
+  const disabled = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
+  assert.equal(disabled.mode, "manual");
+  assert.equal(disabled.generation, secondManual.generation + 1);
 });
 
 test("balance epoch reset is durably allowed only while the router is idle", async (t) => {
@@ -870,7 +1670,7 @@ test("balance epoch reset is durably allowed only while the router is idle", asy
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
   const listed = await setup.service.handle({ action: "list" });
-  await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [2, 3] });
+  await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [2, 3] });
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const config = _test.readRouterConfig(setup.deps, routerPaths);
   fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config)), { mode: 0o600 });
@@ -880,32 +1680,49 @@ test("balance epoch reset is durably allowed only while the router is idle", asy
   assert.equal(after.epoch, 2);
   assert.equal(Object.values(after.ledger).every((ledger) => ledger.completedInputTokens === 0 && ledger.assignedThreadCount === 0), true);
 
-  fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { reservations: [{ pending: true }] })), { mode: 0o600 });
-  const blocked = await setup.service.handle({ action: "router-reset-balance-epoch" });
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.error.code, "router-not-idle");
+  const reservation = (state) => ({
+    reservationId: "rs_1234567890abcdef",
+    opaqueAccountId: config.accounts[0].opaqueAccountId,
+    estimatedCost: 1,
+    state,
+    epoch: 1,
+  });
+  for (const state of ["released_pre_dispatch", "reconciled"]) {
+    fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { reservations: [reservation(state)] })), { mode: 0o600 });
+    const terminalReset = await setup.service.handle({ action: "router-reset-balance-epoch" });
+    assert.deepEqual(terminalReset, { ok: true, epoch: 2 }, state);
+  }
+  for (const state of ["reserved", "stranded_ambiguous"]) {
+    fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { reservations: [reservation(state)] })), { mode: 0o600 });
+    const blocked = await setup.service.handle({ action: "router-reset-balance-epoch" });
+    assert.equal(blocked.ok, false, state);
+    assert.equal(blocked.error.code, "router-not-idle", state);
+  }
 });
 
-test("router status is a redacted ownership and degraded-state projection", async (t) => {
+test("router status keeps a v2 disk intent pending and projects only redacted state", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
   const listed = await setup.service.handle({ action: "list" });
-  await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1] });
+  await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const config = _test.readRouterConfig(setup.deps, routerPaths);
   fs.writeFileSync(routerPaths.stateFile, JSON.stringify(validRouterState(config, { stagedDisable: { reasonCode: "post_start_failure", stagedAt: new Date().toISOString() } })), { mode: 0o600 });
   const status = await setup.service.handle({ action: "router-status" });
   assert.equal(status.ok, true);
-  assert.equal(status.router.mode, "direct_fallback");
+  assert.equal(status.router.mode, "quota_aware");
+  assert.equal(status.router.pending.mode, "quota_aware");
+  assert.equal(status.router.active, null);
   assert.equal(status.router.degradedReason, "post_start_failure");
-  assert.deepEqual(status.router.accounts.map((account) => account.label), ["Account A", "Account B"]);
+  assert.equal(status.router.accounts.length, 2);
+  assert.equal(JSON.stringify(status.router.accounts).includes("opaqueAccountId"), false);
   assert.equal(JSON.stringify(status).includes("account-work"), false);
   assert.equal(JSON.stringify(status).includes("access_token"), false);
   assert.equal(JSON.stringify(status).includes(setup.paths.codexDir), false);
 });
 
-test("router status defaults to manual and fails closed to a redacted direct fallback for corrupt state", async (t) => {
+test("router status defaults to manual and fails closed to a redacted invalid-config state", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   const defaultStatus = await setup.service.handle({ action: "router-status" });
@@ -918,9 +1735,36 @@ test("router status defaults to manual and fails closed to a redacted direct fal
   fs.writeFileSync(routerPaths.configFile, "{", { mode: 0o600 });
   const corrupt = await setup.service.handle({ action: "router-status" });
   assert.equal(corrupt.ok, true);
-  assert.equal(corrupt.router.mode, "direct_fallback");
+  assert.equal(corrupt.router.mode, "manual");
   assert.equal(corrupt.router.degradedReason, "invalid_config");
+  assert.equal(corrupt.router.historyAdoption.state, "invalid");
   assert.equal(JSON.stringify(corrupt).includes(setup.paths.codexDir), false);
+});
+
+test("router status preserves authenticated v2 active truth when later pending disk records are corrupt", async (t) => {
+  for (const corruptTarget of ["config", "state"]) {
+    const setup = fixture();
+    disposeFixture(t, setup);
+    addSavedAccount(setup, "second", "second", "account-second");
+    const listed = await setup.service.handle({ action: "list" });
+    const staged = await setup.service.handle({ action: "router-configure", mode: "quota_aware", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1] });
+    assert.equal(staged.ok, true, corruptTarget);
+    const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+    const config = _test.readRouterConfig(setup.deps, routerPaths);
+    installActiveRouterSocket(t, setup, routerPaths, activeQuotaStatus(config));
+    const target = corruptTarget === "config" ? routerPaths.configFile : routerPaths.stateFile;
+    fs.writeFileSync(target, "{", { mode: 0o600 });
+
+    const result = await setup.service.handle({ action: "router-status" });
+    assert.equal(result.ok, true, corruptTarget);
+    assert.equal(result.router.pending, null, corruptTarget);
+    assert.equal(result.router.degradedReason, "invalid_config", corruptTarget);
+    assert.equal(result.live.state, "active", corruptTarget);
+    assert.equal(result.live.status.schemaVersion, 2, corruptTarget);
+    assert.equal(result.live.status.active.generation, config.generation, corruptTarget);
+    assert.equal(_test.routerPresentation(result.router, result.live, 2).label, "Quota-aware routing is active", corruptTarget);
+    assert.match(_test.routerPresentation(result.router, result.live, 2).message, /staged local record needs attention/, corruptTarget);
+  }
 });
 
 test("experimental inventory maps package IDs and excludes created-by-me plugins", () => {
@@ -1403,6 +2247,7 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
     ipc: {
       async invoke(channel, request) {
         assert.equal(channel, "accounts");
+        if (request.action === "router-status") return { ok: true, router: { schemaVersion: 2, mode: "manual", policy: null, pending: null, restartRequired: false, degradedReason: null }, live: { state: "not_applicable", status: null } };
         assert.deepEqual(request, { action: "list" });
         listCalls += 1;
         if (deferNextList) {
@@ -1443,9 +2288,9 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
   assert.equal(menu.children.filter((child) => child.dataset.tweakersAccountSwitcher === "true").length, 1);
   assert.equal(listCalls, 1);
   const panel = menu.children.find((child) => child.dataset.tweakersAccountSwitcher === "true");
-  const openAccounts = panel.children.find((child) => child.textContent === "Open Accounts");
-  assert.equal(openAccounts.attrs["aria-label"], "Open Accounts settings");
-  await openAccounts.listeners.get("click")();
+  const manageAccounts = panel.children.find((child) => child.textContent === "Manage Accounts");
+  assert.equal(manageAccounts.attrs["aria-label"], "Manage Accounts settings");
+  await manageAccounts.listeners.get("click")();
   assert.equal(openPageCalls, 1);
 
   hostListener([{

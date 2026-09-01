@@ -1,75 +1,74 @@
-# Easy Account Switcher
+# Accounts
 
-`co.tweakers.account-switcher` keeps the existing manual saved-session switcher
-and optional remote-plugin receipt protection. Version 0.3 adds a visible,
-truthful routing control plane to the existing Accounts page.
+`co.tweakers.account-switcher` keeps the existing manual saved-session controls
+and optional remote-plugin receipt protection. Version 0.4 makes the native
+Accounts page and profile menu a two-account, quota-aware experience.
 
-## Modes
+## What it shows
 
-- **Manual** is the default and remains the rollback path. Existing saved
-  snapshots, the current-account marker, and last-known-good snapshot remain
-  compatible.
-- **Balanced** accepts exactly two distinct saved sessions and integer weights
-  from 1 through 100. It creates isolated, owner-private account homes and
-  stages a versioned router configuration for a later separately authorized
-  restart. Staging does not restart ChatGPT or change the global `auth.json`.
+- A native-style profile-menu summary with **Usage remaining**, **2 connected
+  subscriptions**, a 0–200% pool calculated from the two weekly values, two
+  account rows, and **Manage Accounts**.
+- Safe local labels, plan names, fixed permanent masks, weekly remaining
+  values, reset/freshness state, assigned-thread counts, and router eligibility.
+  It never renders emails, provider IDs, tokens, paths, opaque account ids, or
+  private configuration.
+- A Settings > Accounts page with account cards, setup/recovery guidance, and
+  manual switching plus remote-plugin protection under Advanced.
 
-## Privacy and safety
+## Routing states
 
-- The router config, migration receipts, state, and control secret are written
-  atomically in the owner-private Account Switcher data namespace. The config contains only
-  opaque HMAC-derived account keys, inclusion, weights, and fingerprints.
-- Each staged home has its own `auth.json`, SQLite home, and empty strict
-  `config.toml`; credentials, environment values, MCP secrets, plugin OAuth
-  state, and private plugins are not copied.
-- A failed pre-promotion import removes only its exact new staging directory.
-  It never deletes or overwrites a compatible manual snapshot, marker, LKG,
-  global auth file, or another account home.
-- The settings page exposes only redacted labels, opaque keys, eligibility,
-  normalized local spend, assignment counts, and degraded codes. It never
-  displays tokens, raw provider IDs, emails, paths, secret config, or thread
-  IDs.
+- **Manual** is the default and remains the rollback path.
+- **Quota-aware** stages exactly two distinct saved accounts in owner-private
+  isolated homes. It uses policy `quota_aware_v1`; compatibility weights remain
+  in the config but are not user controls.
+- A v2 on-disk config is a pending intent only. It records a monotonically
+  increasing generation and an immutable SHA-256 fingerprint over the routing
+  intent. Its timestamp uses the runtime's strict UTC ISO form; a timestamp-only
+  change cannot alter the fingerprint.
+- Before quota-aware routing can be staged, choose exactly one of the two
+  selected saved accounts in **Keep my existing history with**. There is no
+  default and the choice is never inferred from the current sign-in, primary
+  account, order, label, or account metadata. Staging records a signed,
+  private offline-adoption intent; it does not move history or change live
+  routing.
+- The authenticated local router socket is the only source allowed to claim an
+  active generation. A pending manual or quota-aware policy never overwrites
+  that live truth in the UI.
 
-## Balance state
+## Safety and recovery
 
-The balance epoch may be reset only when the local router reports no
-reservations, correlations, child validation, active work, or refresh/migration
-activity. A reset is durable and preserves manual snapshots and isolated homes.
-Existing plugin-protection receipts keep their existing observation and
-enforcement behavior; no plugin installation, deletion, reconciliation, or
-credential copying is performed while staging routing.
-
-Balanced mode is source-stage functionality only until the runtime candidate,
-independent evidence, explicit live-account bindings, and separately authorized
-restart have all been completed.
-
-## 0.3.0 Accounts-page state
-
-- The Account Switcher row opens the stable `Accounts` settings page. Its routing
-  card is always present and names one state: `Not configured`, `Save two
-  accounts`, `Ready to stage`, `Manual`, `Balanced staged - restart required`,
-  `Running Balanced`, `Direct fallback`, or `Degraded`.
-- Two ordinary signed-in sessions are not router snapshots. The page shows only
-  a saved-snapshot count for setup, and Balanced mode stays disabled until the
-  user explicitly selects exactly two distinct snapshots with valid weights.
-- Staging is an explicit button click. It does not save an account, switch an
-  account, or restart ChatGPT/Codex.
-- `Running Balanced` and its Account A/B assigned-thread counts are displayed
-  only after the owner-private mux control socket returns an authenticated,
-  redacted status. A staged configuration or local state file never creates a
-  live routing badge.
-
-## 0.2.1 routing repair
-
-- Router-owned directories created with the normal owner-readable `0755` mode
-  are verified through open descriptors and tightened to `0700`; unsafe,
-  symlinked, replaced, or foreign-owned paths are rejected without changing the
-  shared parent directory.
-- Selecting Manual while no router configuration exists is a successful no-op,
-  and an already-manual configuration is not rewritten.
-- Snapshot synchronization can repair a stale current-account marker only when
-  one secure saved snapshot uniquely matches the live account. A failed marker
-  write restores the previous marker.
-- Router controls expose only a finite set of safe error codes and fixed user
-  messages; lower-level paths and error details stay out of the settings UI and
-  logs.
+- Saved snapshots keep their names and remain the source of the two enrolled
+  identities. Each staged home has its own
+  private `auth.json`, SQLite home, and empty strict `config.toml`; global
+  configuration, environment values, plugin OAuth state, and private plugins
+  are not copied.
+- Each source is identity-bound and rechecked before promotion. A failed stage
+  writes its bounded receipt batch before the config's final publication. A
+  receipt failure leaves no pending config. A retry may reuse only a hardened
+  isolated home for the same opaque account identity, preserving any normal
+  token rotation already written by that account's official child process.
+- A stale account is marked for targeted reauthentication. Manually switch to
+  that exact saved account, sign in, then refresh it from Accounts. Recovery
+  requires confirmed stopped router control, rechecks the same opaque identity,
+  refreshes only that existing saved source and isolated home, and rolls both
+  back if it cannot publish the new pending generation. It never creates a
+  third snapshot; the other account remains preserved.
+- A later offline adoption creates a separately signed private receipt with
+  aggregate file and thread counts only. The Accounts page shows only the safe
+  selected label and those aggregate counts—never account identifiers, paths,
+  session content, source fingerprints, or control secrets. Once history is
+  adopted, restaging is allowed only for the same two-account pool and chosen
+  owner; generation, mode, label, and compatibility-weight changes do not
+  rewrite that ownership.
+- When there are one or three-or-more saved snapshots, quota-aware routing is
+  unavailable but every saved account remains available for manual switching in
+  Advanced and the profile menu.
+- Staging, recovery guidance, and rollback staging never restart ChatGPT. A
+  separately confirmed restart is required for a pending policy to become
+  active.
+- After history adoption, a Manual pending state applies only to new-thread
+  assignment after that separately confirmed restart. It does not globally
+  restore or reassign existing adopted history.
+- v1 router configuration/status remains readable for compatibility, but new
+  staging writes only v2 `quota_aware_v1` or v2 manual intent.

@@ -181,7 +181,16 @@ function printAccountRouterStatus(evidence: AccountRouterEvidence): void {
   for (const line of formatAccountRouterEvidence(evidence)) console.log(line);
   if (evidence.live.state !== "active" || !evidence.live.status) return;
   for (const account of evidence.live.status.accounts) {
-    console.log(`  ${account.label}:    ${account.eligibility}; spend ${account.normalizedSpend}; assigned ${account.assignedThreadCount}`);
+    const quota = account.weekly
+      ? `weekly ${account.weekly.remainingPercent ?? "unknown"}%; ${account.weekly.freshness}${account.weekly.resetAt ? `; resets ${account.weekly.resetAt}` : ""}`
+      : `legacy spend ${account.normalizedSpend}`;
+    console.log(`  ${account.label}:    ${account.eligibility}; ${account.plan ?? "plan unknown"}${account.identifierMasked ? `; ${account.identifierMasked}` : ""}; ${quota}; short window ${account.shortWindowPressure ?? "unknown"}%; assigned ${account.assignedThreadCount}`);
+  }
+  if (evidence.live.status.schemaVersion === 2) {
+    console.log(`  pool remaining: ${evidence.live.status.poolRemainingPercent ?? "unknown"}% of 200% across two accounts`);
+    if (evidence.live.status.pending) {
+      console.log(`  runtime pending: ${evidence.live.status.pending.mode.replaceAll("_", " ")}${evidence.live.status.pending.policy ? ` (${evidence.live.status.pending.policy})` : ""}; generation ${evidence.live.status.pending.generation}; ${evidence.live.status.pending.fingerprint.slice(0, 15)}…`);
+    }
   }
   if (evidence.live.status.degradedReason) {
     console.log(`  degraded:     ${evidence.live.status.degradedReason.replaceAll("_", " ")}`);

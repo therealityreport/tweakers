@@ -1,11 +1,13 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ELIGIBILITY_STATES = exports.ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT = exports.ACCOUNT_ROUTER_CONTRACT_FINGERPRINT = exports.ACCOUNT_ROUTER_SCHEMA_VERSION = void 0;
+exports.ELIGIBILITY_STATES = exports.ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT = exports.ACCOUNT_ROUTER_CONTRACT_FINGERPRINT = exports.ACCOUNT_ROUTER_SCHEMA_VERSION_V2 = exports.ACCOUNT_ROUTER_SCHEMA_VERSION = void 0;
 exports.isOpaqueAccountId = isOpaqueAccountId;
 exports.isFingerprint = isFingerprint;
 exports.isJsonRpcId = isJsonRpcId;
 exports.isPlainRecord = isPlainRecord;
+/** The legacy on-disk/state contract. Keep this export for v1 consumers. */
 exports.ACCOUNT_ROUTER_SCHEMA_VERSION = 1;
+exports.ACCOUNT_ROUTER_SCHEMA_VERSION_V2 = 2;
 exports.ACCOUNT_ROUTER_CONTRACT_FINGERPRINT = "sha256:6f9d6889bd23ff1122a89b417348b7346cdaa76ced1173eae8c7f8d0608113c2";
 exports.ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT = "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10";
 exports.ELIGIBILITY_STATES = new Set([

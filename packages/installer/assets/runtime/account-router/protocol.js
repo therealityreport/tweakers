@@ -71,7 +71,16 @@ const SERVER_NOTIFICATION_METHODS = new Set([
 const ACCOUNT_AUTH_MUTATIONS = new Set(["account/login/start", "account/login/cancel", "account/logout"]);
 const ACCOUNT_PROBES = new Set(["account/read", "account/rateLimits/read", "account/usage/read", "account/workspaceMessages/read"]);
 const AGGREGATE_READS = new Set(["thread/list", "thread/search", "thread/loaded/list"]);
-const CAPABILITY_MUTATIONS = /^(?:config\/|skills\/|plugin\/|marketplace\/)/;
+// Reads in these namespaces are safe to route to the primary home. Only these
+// explicitly enumerated writes can change an effective capability surface; an
+// active two-home mux has no atomic oracle for proving the two homes still
+// agree afterwards, so it refuses them and requires a fresh direct startup.
+const CAPABILITY_MUTATIONS = new Set([
+    "config/batchWrite", "config/mcpServer/reload", "config/value/write",
+    "experimentalFeature/enablement/set", "skills/config/write", "skills/extraRoots/set",
+    "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/remove", "marketplace/upgrade",
+    "mcpServer/oauth/login",
+]);
 const PRIMARY_HOST = /^(?:fs\/|command\/|process\/|fuzzyFileSearch)/;
 const THREAD_PREFIX = /^(?:thread\/|turn\/)/;
 function classifyClientMethod(method, params) {
@@ -81,12 +90,14 @@ function classifyClientMethod(method, params) {
         return "fanout_initialize_intersection";
     if (method === "thread/start")
         return "balance_new_thread";
+    // Section writes remain manual-only; section reads are namespaced inside
+    // the mux and never expose a child-home identifier to the desktop.
+    if (method === "threadSection/list")
+        return "fanout_sections_read";
+    if (method === "thread/section/move" || method === "threadSection/create" || method === "threadSection/update" || method === "threadSection/delete")
+        return "reject_sections_read_only";
     if (AGGREGATE_READS.has(method))
         return "fanout_aggregate_read_with_router_cursor";
-    if (method === "threadSection/list")
-        return "fanout_aggregate_namespaced_sections";
-    if (method.startsWith("threadSection/"))
-        return "primary_only_section_mutation";
     if (THREAD_PREFIX.test(method) && (hasThreadId(params) || method === "review/start" || method.startsWith("turn/"))) {
         return "persisted_thread_owner";
     }
@@ -98,8 +109,8 @@ function classifyClientMethod(method, params) {
         return "primary_to_desktop_internal_per_home_probe";
     if (method.startsWith("account/"))
         return "primary_only_explicit_account_action";
-    if (CAPABILITY_MUTATIONS.test(method))
-        return "primary_only_then_invalidate_capability_fingerprints";
+    if (CAPABILITY_MUTATIONS.has(method))
+        return "reject_capability_mutation_restart_required";
     if (method.startsWith("app/"))
         return "primary_to_desktop_internal_per_home_probe";
     if (method.startsWith("mcpServer"))

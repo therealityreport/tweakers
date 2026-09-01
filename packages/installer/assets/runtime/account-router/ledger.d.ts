@@ -1,5 +1,6 @@
 import type { EligibilityState, OpaqueAccountId, Reservation, RouterConfig, RouterState } from "./types";
 import type { RouterStateStore } from "./state-store";
+import { type AccountQuotaObservation } from "./quota";
 export interface TokenUsage {
     inputTokens: number;
     outputTokens: number;
@@ -8,6 +9,10 @@ export type FairnessPrecision = "projected" | "exact_completed_spend" | "estimat
 export interface AccountSelection {
     opaqueAccountId: OpaqueAccountId;
     normalizedSpend: number;
+}
+export interface KnownThreadBinding {
+    threadId: string;
+    owner: OpaqueAccountId;
 }
 /**
  * The ledger is deliberately local: it allocates request work fairly without
@@ -26,6 +31,12 @@ export declare class AccountLedger {
     get precision(): FairnessPrecision;
     estimateRequestCost(params: unknown, model?: string): number;
     select(requirement?: (account: OpaqueAccountId) => boolean): AccountSelection | null;
+    /**
+     * The v2 policy is intentionally stricter than v1 fair balancing: either
+     * enrolled account lacking fresh, authenticated weekly capacity pauses new
+     * assignments. Existing owned threads do not use this selector.
+     */
+    selectQuotaAware(observations: ReadonlyMap<OpaqueAccountId, AccountQuotaObservation>): AccountSelection | null;
     reserve(opaqueAccountId: OpaqueAccountId, estimatedCost: number): Reservation;
     releasePreDispatch(reservationId: string): void;
     strandAmbiguous(reservationId: string): void;
@@ -34,6 +45,12 @@ export declare class AccountLedger {
     /** Bind a child-observed thread event before forwarding it to the desktop. */
     bindObservedThread(threadId: string, owner: OpaqueAccountId): boolean;
     bindKnownThread(threadId: string, owner: OpaqueAccountId): void;
+    /**
+     * Commit a fully validated fanout page in one state update. Any collision or
+     * malformed duplicate throws before the cloned durable state is persisted,
+     * so a later child page can never leave half of a list owner-bound.
+     */
+    bindKnownThreads(bindings: readonly KnownThreadBinding[]): void;
     reservePendingOwner(pendingKey: string, owner: OpaqueAccountId): void;
     clearPendingOwner(pendingKey: string, owner: OpaqueAccountId): void;
     ownerFor(threadId: string): OpaqueAccountId | null;
