@@ -176,7 +176,7 @@ module.exports = {
     readRouterConfig, readRouterState, routerControlFailure, routerPresentation,
     authenticatedRouterStatus, routerControlSocketPath, parseAuthenticatedRouterStatus, routerControlCard,
     quotaPoolRemainingPercent, accountDetailsFor, accountDisplayLabel, accountIdentitySummary,
-    accountChoiceLabel, accountUsingNow, accountCards, accountMenuRows, advancedAccountsCard,
+    accountChoiceLabel, accountUsingNow, accountRowStatus, accountCards, accountMenuRows, advancedAccountsCard,
     accountRecoveryCard, historyAdoptionCard, maskIdentifier, safeAccountLabel,
   },
 };
@@ -3007,6 +3007,27 @@ function accountUsingNow(account, live) {
   return account?.active === true && live?.state === "not_running";
 }
 
+function accountRowStatus(account, detail, live) {
+  if (live?.state === "not_running") {
+    return accountUsingNow(account, live) ? "Using now" : "Saved — automatic routing is not running yet";
+  }
+  if (live?.state === "active") {
+    if (!detail) return "Status unavailable";
+    const mode = live?.status?.active?.mode ?? live?.status?.mode;
+    if (mode === "manual") {
+      return ["eligible", "reserved", "active"].includes(detail.eligibility)
+        ? "Saved account"
+        : routerEligibilityLabel(detail.eligibility);
+    }
+    if (mode === "quota_aware" || mode === "balanced") {
+      return ["eligible", "reserved", "active"].includes(detail.eligibility)
+        ? "Automatic routing is on"
+        : routerEligibilityLabel(detail.eligibility);
+    }
+  }
+  return "Status unavailable";
+}
+
 function accountChoiceLabel(account, usingNow = false) {
   const identity = accountIdentitySummary(account);
   const parts = [accountDisplayLabel(account)];
@@ -3044,7 +3065,7 @@ function usageSummaryCard(accounts, liveStatus) {
   title.textContent = "Weekly usage left";
   const detail = document.createElement("div");
   detail.className = "text-token-text-secondary min-w-0 text-sm";
-  detail.textContent = accounts.length === 2 ? "2 connected accounts" : "Save exactly two accounts";
+  detail.textContent = accounts.length === 2 ? "2 saved accounts" : "Save exactly two accounts";
   copy.append(title, detail);
   const value = document.createElement("div");
   value.className = "shrink-0 text-sm text-token-text-secondary";
@@ -3135,9 +3156,9 @@ function accountCards(state, accounts, liveStatus, live) {
     const freshness = detail?.weekly?.freshness === "fresh" ? "Usage is current" : "Usage not checked";
     const reset = detail?.weekly?.resetAt ? ` · resets ${formatResetAt(detail.weekly.resetAt)}` : "";
     const threads = Number.isInteger(detail?.assignedThreadCount) ? ` · ${detail.assignedThreadCount} assigned ${detail.assignedThreadCount === 1 ? "thread" : "threads"}` : "";
-    const usingNow = accountUsingNow(account, live);
-    statusNode.textContent = `${usingNow ? "Using now" : routerEligibilityLabel(detail?.eligibility)} · ${freshness}${reset}${threads}`;
-    statusNode.setAttribute("aria-label", usingNow ? `${accountDisplayLabel(account)} is the account in use now` : `${accountDisplayLabel(account)} account status`);
+    const rowStatus = accountRowStatus(account, detail, live);
+    statusNode.textContent = `${rowStatus} · ${freshness}${reset}${threads}`;
+    statusNode.setAttribute("aria-label", `${accountDisplayLabel(account)}: ${rowStatus}`);
     row.append(identity, statusNode);
     card.append(row);
   }
@@ -3154,8 +3175,13 @@ function routerEligibilityLabel(value) {
   if (value === "quota_depleted") return "Weekly usage used up";
   if (value === "active") return "Ready for new conversations";
   if (value === "eligible") return "Ready for new conversations";
+  if (value === "reserved") return "Ready for new conversations";
   if (value === "validating") return "Checking account";
+  if (value === "cooldown") return "Waiting before next use";
   if (value === "plugin_blocked") return "Plugin check is blocking this account";
+  if (value === "protocol_blocked") return "Routing update required";
+  if (value === "disabled") return "Not enabled for routing";
+  if (value === "unhealthy") return "This account needs attention";
   return "Status not available yet";
 }
 
@@ -3526,7 +3552,7 @@ function accountMenuRows(state, suppliedAccounts, routerStatus) {
   usageTitle.textContent = "Weekly usage left";
   const subscriptions = document.createElement("span");
   subscriptions.className = "text-token-text-secondary text-xs";
-  subscriptions.textContent = accounts.length === 2 ? "2 connected accounts" : "Save exactly two accounts";
+  subscriptions.textContent = accounts.length === 2 ? "2 saved accounts" : "Save exactly two accounts";
   usageCopy.append(usageTitle, subscriptions);
   const pool = document.createElement("span");
   pool.className = "text-token-text-secondary shrink-0";
@@ -3557,13 +3583,11 @@ function accountMenuRows(state, suppliedAccounts, routerStatus) {
       copy.append(label, identityText, detailText);
       identity.append(accountAvatar(accountDisplayLabel(account)), copy);
       row.append(identity);
-      if (accountUsingNow(account, routerStatus?.live)) {
-        const usingNow = document.createElement("span");
-        usingNow.className = "text-token-text-primary shrink-0 text-xs font-medium";
-        usingNow.textContent = "Using now";
-        usingNow.setAttribute("aria-label", `${accountDisplayLabel(account)} is the account in use now`);
-        row.append(usingNow);
-      }
+      const rowStatus = document.createElement("span");
+      rowStatus.className = "text-token-text-secondary shrink-0 text-xs";
+      rowStatus.textContent = accountRowStatus(account, detail, routerStatus?.live);
+      rowStatus.setAttribute("aria-label", `${accountDisplayLabel(account)}: ${rowStatus.textContent}`);
+      row.append(rowStatus);
       panel.append(row);
     }
   } else {

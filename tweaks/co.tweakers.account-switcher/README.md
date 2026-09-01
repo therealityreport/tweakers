@@ -2,15 +2,19 @@
 
 `co.tweakers.account-switcher` is the stable internal ID for the user-facing
 **Accounts** feature. Keeping that ID preserves saved accounts, settings, and
-receipts. Version 0.4.3 makes the two saved identities recognizable with a
+receipts. Version 0.4.4 makes the two saved identities recognizable with a
 profile name, account email, and optional local username. When no authenticated
 account router is running, it also marks the one uniquely matched saved account
-that Codex is using now. Routine hot reloads still never change the saved
+that Codex is using now, and explains that automatic routing has not started
+for the other saved account. When automatic routing is running, each safely
+matched row shows whether it can receive new work or needs attention. Manual
+mode keeps the rows labeled as saved accounts because it does not expose a safe
+per-row primary marker. Routine hot reloads still never change the saved
 routing mode.
 
 ## What it shows
 
-- A native-style profile-menu summary with **Weekly usage left**, **2 connected
+- A native-style profile-menu summary with **Weekly usage left**, **2 saved
   accounts**, a combined 0–200% total when both weekly values are current, two
   account rows, and **Manage accounts**.
 - Friendly profile names and account emails for generic saved
@@ -24,11 +28,11 @@ routing mode.
   It never renders provider IDs, tokens, paths, opaque account IDs, or private
   configuration. Email and optional username are presentation only; they never
   become routing, history, quota, plugin, or recovery join keys.
-- **Using now** appears only when no authenticated router is running and the
-  live direct sign-in, saved marker, and exactly one saved account all match.
-  A running router deliberately has no single global **Using now** account:
-  automatic routing can start new conversations on either account, and adopted
-  existing conversations remain pinned to their assigned account.
+- Each account row says whether it is **Using now**, **Saved — automatic routing
+  is not running yet**, **Automatic routing is on**, **Saved account**, or needs
+  attention. Those labels are shown only from the live router state and a
+  private account reference match; visible names, emails, and usernames never
+  establish a connection. An uncertain state is shown as **Status unavailable**.
 - A Settings > Accounts page with **Automatic routing for new conversations**,
   **Your current conversations**, **Connect or repair accounts**, manual
   switching, and a plain-language plugin check.

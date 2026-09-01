@@ -614,7 +614,7 @@ test("account metadata declares the settings surface and has a synchronized mino
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
   assert.equal(manifest.name, "Accounts");
-  assert.equal(manifest.version, "0.4.3");
+  assert.equal(manifest.version, "0.4.4");
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
@@ -796,25 +796,27 @@ test("profile menu shows account identity but no global current account while au
     active: { mode: "quota_aware", policy: "quota_aware_v1", generation: 1, fingerprint: "sha256:" + "a".repeat(64) },
     pending: null,
     accounts: [
-      { label: "Taylor", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 75, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
-      { label: "Morgan", plan: "Plus", identifierMasked: "••••••••", eligibility: "reauth_required", weekly: { remainingPercent: 65, resetAt: null, freshness: "stale" }, shortWindowPressure: null, assignedThreadCount: 0 },
+      { ref: "taylor", label: "Taylor", plan: "Pro", identifierMasked: "••••••••", eligibility: "active", weekly: { remainingPercent: 75, resetAt: null, freshness: "fresh" }, shortWindowPressure: 0, assignedThreadCount: 1 },
+      { ref: "morgan", label: "Morgan", plan: "Plus", identifierMasked: "••••••••", eligibility: "reauth_required", weekly: { remainingPercent: 65, resetAt: null, freshness: "stale" }, shortWindowPressure: null, assignedThreadCount: 0 },
     ],
   };
   const accounts = [
-    { label: "Taylor", displayLabel: "Taylor", email: "taylor@example.test", username: "taylorh", active: true },
-    { label: "Morgan", displayLabel: "Morgan", email: "morgan@example.test", username: null, active: false },
+    { ref: "taylor", label: "Taylor", displayLabel: "Taylor", email: "taylor@example.test", username: "taylorh", active: true },
+    { ref: "morgan", label: "Morgan", displayLabel: "Morgan", email: "morgan@example.test", username: null, active: false },
   ];
   const panel = _test.accountMenuRows({ api: { settings: { async openPage() { return { ok: true }; } }, log: { warn() {} } } }, accounts, { live: { state: "active", status } });
   const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
   const text = flatten(panel);
   assert.match(text, /Weekly usage left/);
-  assert.match(text, /2 connected accounts/);
+  assert.match(text, /2 saved accounts/);
   assert.match(text, /Cannot check right now/);
   assert.match(text, /Manage accounts/);
   assert.match(text, /@taylorh/);
   assert.match(text, /taylor@example\.test/);
   assert.match(text, /morgan@example\.test/);
   assert.equal(text.includes("Using now"), false, "automatic routing has no single global current account");
+  assert.equal((text.match(/Automatic routing is on/g) || []).length, 1);
+  assert.match(text, /Sign in again/);
   assert.equal(text.includes("Switch ChatGPT account"), false);
   assert.equal(text.includes("Saved snapshot"), false);
   assert.equal(text.includes("provider-account-id-should-not-render"), false);
@@ -842,10 +844,24 @@ test("profile menu marks exactly one directly signed-in saved account as Using n
   const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
   const text = flatten(panel);
   assert.equal((text.match(/Using now/g) || []).length, 1);
+  assert.match(text, /Saved — automatic routing is not running yet/);
   assert.match(text, /Thomas Hulihan/);
   assert.match(text, /@thommyhuli/);
   assert.equal(_test.accountUsingNow({ active: true }, { state: "active" }), false);
   assert.equal(_test.accountUsingNow({ active: true }, { state: "not_running" }), true);
+  assert.equal(_test.accountRowStatus({ active: true }, null, { state: "not_running" }), "Using now");
+  assert.equal(_test.accountRowStatus({ active: false }, null, { state: "not_running" }), "Saved — automatic routing is not running yet");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "active" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "Automatic routing is on");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "reauth_required" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "Sign in again");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "active" }, { state: "active", status: { active: { mode: "manual" } } }), "Saved account");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "reauth_required" }, { state: "active", status: { active: { mode: "manual" } } }), "Sign in again");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "quota_depleted" }, { state: "active", status: { active: { mode: "manual" } } }), "Weekly usage used up");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "cooldown" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "Waiting before next use");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "protocol_blocked" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "Routing update required");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "disabled" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "Not enabled for routing");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, { ref: "one", eligibility: "unhealthy" }, { state: "active", status: { active: { mode: "quota_aware" } } }), "This account needs attention");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, null, { state: "active", status: { active: { mode: "quota_aware" } } }), "Status unavailable");
+  assert.equal(_test.accountRowStatus({ ref: "one" }, null, { state: "unavailable" }), "Status unavailable");
 });
 
 test("conversation ownership never falls back to an internal generic snapshot label", (t) => {
