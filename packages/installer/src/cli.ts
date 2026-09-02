@@ -36,6 +36,10 @@ import {
   adoptAccountHistoryCommand,
   type AdoptAccountHistoryCliOptions,
 } from "./commands/adopt-account-history.js";
+import {
+  prepareAccountHistoryCommand,
+  type PrepareAccountHistoryCliOptions,
+} from "./commands/prepare-account-history.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -469,6 +473,17 @@ prog.command("migrate")
   .option("--legacy-root", "Explicit legacy root (otherwise known roots are detected)")
   .option("--target-root", "Tweakers user root (defaults to the active user root)")
   .action(wrap(migrate));
+prog
+  .command("prepare-account-history")
+  .describe("Prepare a private verified history copy; originals are never changed")
+  .option("--apply", "Create the verified private copy after repeated idle checks")
+  .option("--dry-run", "Inspect and report the copy plan without writing (the default)")
+  .option("--source-codex-root", "Exact legacy CODEX_HOME root")
+  .option("--source-sqlite-root", "Exact legacy CODEX_SQLITE_HOME root")
+  .option("--allowed-link-root", "Exact approved archive root for linked conversations")
+  .action(wrap((options: PrepareAccountHistoryCliOptions) => {
+    prepareAccountHistoryCommand(options);
+  }));
 prog
   .command("adopt-account-history")
   .describe("Dry-run the signed legacy Codex history adoption; --apply never restarts the app")
