@@ -33,6 +33,7 @@
     "prepare": "npm run build"
   },
   "devDependencies": {
+    "@openai/codex": "0.153.4",
     "@types/node": "^22.0.0",
     "@typescript-eslint/eslint-plugin": "^8.64.0",
     "@typescript-eslint/parser": "^8.64.0",

@@ -14,7 +14,7 @@ import { connectAccountsBrokerForStartup } from "../../src/account-router/broker
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES, ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE, createBrokerStartupDiagnostics, AccountsBrokerOwnerV1, BrokerProcessChild, credentialStoreArgs, connectAccountsBrokerAppServerClient, type EnrollmentMaterializationFaultPointV1 } from "../../src/account-router/broker-host";
 import { createOpaqueAppToolsRef, createOpaqueRendererRef, type BrokerDesktopIdentityBindingV1 } from "../../src/account-router/broker";
@@ -985,9 +985,15 @@ function assertGeneratedSchema(name: string, value: unknown): void {
     const isolatedHome = join(root, "home");
     mkdirSync(isolatedHome, { mode: 0o700 });
     const schemaRoot = join(root, "schema");
-    const binary = process.env.TWEAKERS_TEST_CODEX_BINARY ?? "/Applications/Tweakers.app/Contents/Resources/codex";
+    const binary = process.env.TWEAKERS_TEST_CODEX_BINARY
+      ?? join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "codex.cmd" : "codex");
     const generated = spawnSync(binary, ["app-server", "generate-json-schema", "--experimental", "--out", schemaRoot], {
-      env: { PATH: "/usr/bin:/bin", HOME: isolatedHome, CODEX_HOME: isolatedHome, CODEX_SQLITE_HOME: isolatedHome },
+      env: {
+        PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
+        HOME: isolatedHome,
+        CODEX_HOME: isolatedHome,
+        CODEX_SQLITE_HOME: isolatedHome,
+      },
       encoding: "utf8", timeout: 30_000,
     });
     assert.equal(generated.status, 0, `isolated app-server schema generation failed: ${generated.error?.message ?? generated.stderr}`);
