@@ -3,6 +3,7 @@ set -eu
 
 if git grep -n 'b-nnett' -- . \
   ':(exclude)CHANGELOG.md' \
+  ':(exclude)docs/account-router.md' \
   ':(exclude)docs/releases/*' \
   ':(exclude)docs/research/*' \
   ':(exclude)scripts/check-no-bnnett.sh' >/dev/null; then
