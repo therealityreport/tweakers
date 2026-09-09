@@ -25,7 +25,7 @@ jobs:
       - run: npm run check:public-history
       - run: npm test
       - run: npm run build
-      - name: Verify committed manager artifacts without signing
+      - name: Verify committed fixed-action manager artifacts without signing
         run: node scripts/verify-release.mjs --manager-artifacts
       - name: Verify generated files are committed
         run: |

@@ -69,10 +69,10 @@ export function verifyManagerReleaseArtifacts(root) {
   const name = policy.executableName;
   const canonicalLauncher = resolve(root, "packages/native-host/assets", name);
   const installerLauncher = resolve(root, "packages/installer/assets/manager-launcher", name);
-  const statusBundle = resolve(root, "packages/installer/assets/manager-launcher/manager.mjs");
+  const managerBundle = resolve(root, "packages/installer/assets/manager-launcher/manager.mjs");
   const packagedPolicy = resolve(root, "packages/installer/assets/manager-launcher/signing-policy.json");
   const canonicalPolicy = resolve(root, "packages/native-host/manager-signing-policy.json");
-  for (const path of [canonicalLauncher, installerLauncher, statusBundle, packagedPolicy]) {
+  for (const path of [canonicalLauncher, installerLauncher, managerBundle, packagedPolicy]) {
     if (!existsSync(path)) throw new Error(`missing committed manager release artifact: ${path}`);
   }
   if (sha256File(canonicalPolicy) !== sha256File(packagedPolicy)) {
@@ -106,11 +106,14 @@ export function verifyManagerReleaseArtifacts(root) {
   if (canonicalSha256 !== installerSha256) {
     throw new Error("installer manager launcher bytes differ from the committed canonical launcher");
   }
-  const bundle = readFileSync(statusBundle, "utf8");
-  for (const forbidden of ["environment.cancel", "desktop-update.resume", "createSealedTweakersManagerActionAdapter"]) {
-    if (bundle.includes(forbidden)) throw new Error(`status-only manager bundle contains dormant action marker: ${forbidden}`);
+  const bundle = readFileSync(managerBundle, "utf8");
+  for (const required of ["environment.cancel", "refresh.injected", "refresh.independent", "official-source.register", "createSealedTweakersManagerActionAdapter"]) {
+    if (!bundle.includes(required)) throw new Error(`fixed-action manager bundle is missing sealed action marker: ${required}`);
   }
-  return { canonicalLauncher, statusBundle, launcherSha256: canonicalSha256 };
+  if (bundle.includes("refresh.full")) {
+    throw new Error("fixed-action manager bundle contains the retired generic refresh action");
+  }
+  return { canonicalLauncher, managerBundle, launcherSha256: canonicalSha256 };
 }
 
 function parseSha256Sums(sums, tarball) {

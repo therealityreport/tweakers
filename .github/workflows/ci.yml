@@ -31,7 +31,7 @@ jobs:
       # calls the separate --release-manager-launcher private-signer path.
       - name: Build without a private manager signer
         run: npm run build
-      - name: Verify canonical signed launcher and status-only manager bundle
+      - name: Verify canonical signed launcher and fixed-action manager bundle
         run: node scripts/verify-release.mjs --manager-artifacts
       - name: Verify deterministic generated files are committed
         run: |
