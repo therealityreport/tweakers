@@ -440,6 +440,102 @@ test("a real official version change returns to Tweakers, refreshes the chosen s
   });
 });
 
+test("the official ChatGPT lane uses its own receipt and cannot enter Tweakers refresh paths", async () => {
+  await withFixture(async (fixture) => {
+    let officialInspection = 0;
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: () => {
+        officialInspection += 1;
+        return officialInspection === 1
+          ? { version: { marketingVersion: "1.0.0", build: "100" }, mainPid: 101 }
+          : { version: { marketingVersion: "1.1.0", build: "110" }, mainPid: 102 };
+      },
+      verifyFinal: async () => { throw new Error("legacy selected-environment verification must not run"); },
+    });
+    const transaction = createDesktopUpdateTransaction({ root: fixture.root, officialOnly: true }, deps);
+
+    const receipt = await transaction.start();
+
+    assert.equal(receipt.phase, "completed");
+    assert.deepEqual(receipt.observed, { marketingVersion: "1.1.0", build: "110" });
+    assert.equal(receipt.refreshSource, null);
+    assert.equal(calls.includes("prepare:chatgpt"), false);
+    assert.equal(calls.includes("commit:chatgpt"), false);
+    assert.equal(calls.includes("prepare:tweakers"), false);
+    assert.equal(calls.includes("commit:tweakers"), false);
+    assert.equal(calls.some((call) => call.startsWith("refresh:")), false);
+    assert.equal(calls.filter((call) => call === "refresh-environment-truth").length, 1);
+    assert.equal(officialInspection, 2);
+    assert.equal(existsSync(join(fixture.root, "transactions", "chatgpt-app-update.json")), true);
+    assert.equal(existsSync(fixture.stateFile), false);
+  });
+});
+
+test("the official ChatGPT lane does not report completion when refreshed manager metadata cannot be verified", async () => {
+  await withFixture(async (fixture) => {
+    let officialInspection = 0;
+    const { deps } = dependencies({
+      inspectLiveOfficialDesktop: () => {
+        officialInspection += 1;
+        return officialInspection === 1
+          ? { version: { marketingVersion: "1.0.0", build: "100" }, mainPid: 101 }
+          : { version: { marketingVersion: "1.1.0", build: "110" }, mainPid: 102 };
+      },
+      refreshEnvironmentTruth: async () => {
+        throw new Error("stored manager build does not match live ChatGPT");
+      },
+    });
+
+    const receipt = await createDesktopUpdateTransaction({ root: fixture.root, officialOnly: true }, deps).start();
+
+    assert.equal(receipt.phase, "failed");
+    assert.equal(receipt.safeOfficialMode, true);
+    assert.equal(receipt.resumable, true);
+    assert.match(receipt.error ?? "", /stored manager build does not match live ChatGPT/);
+  });
+});
+
+test("the official ChatGPT lane resumes verification without entering Tweakers refresh paths", async () => {
+  await withFixture(async (fixture) => {
+    let officialInspection = 0;
+    let refreshAttempts = 0;
+    const official = selection("chatgpt");
+    const { calls, deps } = dependencies({
+      inspectLiveOfficialDesktop: () => {
+        officialInspection += 1;
+        return officialInspection === 1
+          ? { version: { marketingVersion: "1.0.0", build: "100" }, mainPid: 101 }
+          : { version: { marketingVersion: "1.1.0", build: "110" }, mainPid: 102 };
+      },
+      refreshEnvironmentTruth: async () => {
+        refreshAttempts += 1;
+        if (refreshAttempts === 1) {
+          throw new Error("stored manager build does not match live ChatGPT");
+        }
+        calls.push("refresh-environment-truth");
+        return official;
+      },
+      verifyFinal: async () => { throw new Error("legacy selected-environment verification must not run"); },
+    });
+    const transaction = createDesktopUpdateTransaction({ root: fixture.root, officialOnly: true }, deps);
+
+    const failed = await transaction.start();
+    assert.equal(failed.phase, "failed");
+    assert.equal(failed.resumable, true);
+
+    const resumed = await transaction.resume();
+
+    assert.equal(resumed.phase, "completed");
+    assert.equal(resumed.officialMainPid, 102);
+    assert.deepEqual(resumed.observed, { marketingVersion: "1.1.0", build: "110" });
+    assert.equal(calls.includes("prepare:chatgpt"), false);
+    assert.equal(calls.includes("commit:chatgpt"), false);
+    assert.equal(calls.includes("prepare:tweakers"), false);
+    assert.equal(calls.includes("commit:tweakers"), false);
+    assert.equal(calls.some((call) => call.startsWith("refresh:")), false);
+  });
+});
+
 test("mode-cache v2 desktop update uses the current sealed pair and rebuilds a fresh updated pair", async () => {
   await withFixture(async (fixture) => {
     const baseline = { marketingVersion: "26.814.41407", build: "6720" };

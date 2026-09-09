@@ -30,11 +30,23 @@ export const ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION = 1 as const;
 export const ACCOUNT_HISTORY_ADOPTION_INTENT_FILE = "history-adoption-intent.v1.json" as const;
 export const ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE = "history-adoption-receipt.v1.json" as const;
 export const ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE = "history-adoption-owners.v1.json" as const;
+/**
+ * A durable, HMAC-bound preparation record used only when an old v2 router
+ * predates the history-adoption state files.  It lets the offline migration
+ * resume an interrupted preparation without inventing an owner, state, or
+ * receipt from stale process memory.
+ */
+export const ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_FILE = "history-adoption-initialization.v1.json" as const;
+/** Optional proof emitted only by a real, verified offline copy transaction. */
+export const ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE = "account-router-history-aliases.v1.json" as const;
 export const ACCOUNT_HISTORY_ADOPTION_INTENT_KIND = "account-router-history-adoption-intent" as const;
 export const ACCOUNT_HISTORY_ADOPTION_RECEIPT_KIND = "account-router-history-adoption-receipt" as const;
 export const ACCOUNT_HISTORY_ADOPTION_OWNERS_KIND = "account-router-history-adoption-owners" as const;
+export const ACCOUNT_HISTORY_ADOPTION_ALIASES_KIND = "account-router-history-aliases" as const;
+export const ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_KIND = "account-router-history-adoption-initialization" as const;
 export const HISTORY_ADOPTION_MAX_ARTIFACT_BYTES = 64 * 1024;
 export const HISTORY_ADOPTION_MAX_OWNERS_BYTES = 2 * 1024 * 1024;
+export const HISTORY_ADOPTION_MAX_ALIASES_BYTES = 2 * 1024 * 1024;
 export const ACCOUNT_ROUTER_HISTORY_ADOPTION_PROTOCOL_FINGERPRINT =
   "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10" as const;
 
@@ -68,6 +80,7 @@ const PRIVATE_FILE_MODE = 0o600;
 const MAX_ROUTER_STATE_BYTES = HISTORY_ADOPTION_MAX_OWNERS_BYTES;
 const MAX_AUTH_BYTES = 256 * 1024;
 const MAX_CONFIG_BYTES = 4 * 1024;
+const MAX_HISTORY_ADOPTION_ALIASES = 2_048;
 
 export interface HistoryAdoptionIntentV1 {
   schemaVersion: typeof ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION;
@@ -132,6 +145,54 @@ export interface HistoryAdoptionOwnersV1 {
   hmac: HmacSha256;
 }
 
+/**
+ * A physical copy edge, never a heuristic. The operation ID must be minted
+ * by the offline transaction that created and verified this exact copy; this
+ * module intentionally has no generic ID generator or automatic writer.
+ */
+export interface HistoryAdoptionAliasRecordV1 {
+  copyOperationId: string;
+  sourceOpaqueAccountId: OpaqueAccountId;
+  sourceNativeThreadId: string;
+  sourceRolloutSha256: Sha256Fingerprint;
+  copyOpaqueAccountId: OpaqueAccountId;
+  copyNativeThreadId: string;
+  copyRolloutSha256: Sha256Fingerprint;
+  portableTranscriptDigest: Sha256Fingerprint;
+}
+
+export interface HistoryAdoptionAliasesV1 {
+  schemaVersion: typeof ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION;
+  kind: typeof ACCOUNT_HISTORY_ADOPTION_ALIASES_KIND;
+  protocolFingerprint: Sha256Fingerprint;
+  poolFingerprint: Sha256Fingerprint;
+  intentFingerprint: Sha256Fingerprint;
+  adoptionReceiptFingerprint: Sha256Fingerprint;
+  aliases: readonly HistoryAdoptionAliasRecordV1[];
+  createdAt: string;
+  hmac: HmacSha256;
+}
+
+/**
+ * The journal is deliberately immutable.  Its durable state is represented
+ * by the separately published intent and router-state files, so recovery can
+ * derive its next safe step from the committed filesystem rather than a
+ * mutable in-memory phase flag.
+ */
+export interface HistoryAdoptionInitializationJournalV1 {
+  schemaVersion: typeof ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION;
+  kind: typeof ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_KIND;
+  configBytesFingerprint: Sha256Fingerprint;
+  configGeneration: number;
+  configFingerprint: Sha256Fingerprint;
+  intent: HistoryAdoptionIntentV1;
+  intentFingerprint: Sha256Fingerprint;
+  routerState: RouterStateForAdoption;
+  routerStateFingerprint: Sha256Fingerprint;
+  createdAt: string;
+  hmac: HmacSha256;
+}
+
 export interface CreateHistoryAdoptionIntentInput {
   protocolFingerprint: Sha256Fingerprint;
   accountOpaqueIds: readonly OpaqueAccountId[];
@@ -163,6 +224,34 @@ export interface CreateHistoryAdoptionOwnersInput {
   threadIds: readonly string[];
   threadOwnersFingerprint: Sha256Fingerprint;
   adoptedAt: string;
+}
+
+/** In-memory producer input; callers must never use it to invent a copy edge. */
+export interface CreateHistoryAdoptionAliasesInput {
+  protocolFingerprint: Sha256Fingerprint;
+  poolFingerprint: Sha256Fingerprint;
+  intentFingerprint: Sha256Fingerprint;
+  adoptionReceiptFingerprint: Sha256Fingerprint;
+  aliases: readonly HistoryAdoptionAliasRecordV1[];
+  createdAt: string;
+}
+
+/**
+ * Read-only proof consumed by the separate global-history migration.  It
+ * deliberately omits the control secret, source paths, account labels, and
+ * all history content.  The proof establishes that the legacy transaction
+ * finished while its v2 configuration was still authoritative.
+ */
+export interface CompletedLegacyV2HistoryAdoptionProof {
+  configFingerprint: Sha256Fingerprint;
+  poolFingerprint: Sha256Fingerprint;
+  legacyOwnerOpaqueAccountId: OpaqueAccountId;
+  accountOpaqueIds: readonly OpaqueAccountId[];
+  intent: HistoryAdoptionIntentV1;
+  owners: HistoryAdoptionOwnersV1;
+  receipt: HistoryAdoptionReceiptV1;
+  /** Null is the only backward-compatible no-alias state. */
+  aliases: HistoryAdoptionAliasesV1 | null;
 }
 
 /** Stable JSON serializer shared with the runtime-facing contract. */
@@ -428,12 +517,106 @@ export function verifyHistoryAdoptionOwners(owners: HistoryAdoptionOwnersV1, con
   }
 }
 
+/**
+ * Receipt binding deliberately excludes the receipt HMAC itself: callers first
+ * verify that HMAC, then bind the complete signed receipt payload here.
+ */
+export function historyAdoptionReceiptFingerprint(receipt: HistoryAdoptionReceiptV1): Sha256Fingerprint {
+  const parsed = parseHistoryAdoptionReceipt(Buffer.from(JSON.stringify(receipt)));
+  return canonicalSha256Fingerprint(withoutHmac(parsed));
+}
+
+/**
+ * Build a strict, in-memory alias proof. This does not write an artifact and
+ * does not mint copyOperationId values; only a concrete offline copier may
+ * decide that such an edge exists and persist the returned proof.
+ */
+export function createHistoryAdoptionAliases(
+  input: CreateHistoryAdoptionAliasesInput,
+  controlSecret: Buffer,
+): HistoryAdoptionAliasesV1 {
+  assertControlSecret(controlSecret);
+  const payload = canonicalHistoryAdoptionAliasesPayload(input, false);
+  return { ...payload, hmac: hmacPayload(controlSecret, payload) };
+}
+
+export function parseHistoryAdoptionAliases(bytes: Buffer | string): HistoryAdoptionAliasesV1 {
+  const raw = boundedJson(bytes, "invalid-history-adoption-aliases", HISTORY_ADOPTION_MAX_ALIASES_BYTES);
+  if (!isRecord(raw) || !hasExactKeys(raw, [
+    "schemaVersion", "kind", "protocolFingerprint", "poolFingerprint", "intentFingerprint", "adoptionReceiptFingerprint",
+    "aliases", "createdAt", "hmac",
+  ]) || raw.schemaVersion !== ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION
+    || raw.kind !== ACCOUNT_HISTORY_ADOPTION_ALIASES_KIND
+    || !isHmacSha256(raw.hmac)) {
+    throw failure("invalid-history-adoption-aliases");
+  }
+  const payload = canonicalHistoryAdoptionAliasesPayload({
+    protocolFingerprint: raw.protocolFingerprint as Sha256Fingerprint,
+    poolFingerprint: raw.poolFingerprint as Sha256Fingerprint,
+    intentFingerprint: raw.intentFingerprint as Sha256Fingerprint,
+    adoptionReceiptFingerprint: raw.adoptionReceiptFingerprint as Sha256Fingerprint,
+    aliases: Array.isArray(raw.aliases) ? raw.aliases as HistoryAdoptionAliasRecordV1[] : [],
+    createdAt: raw.createdAt as string,
+  }, true);
+  return { ...payload, hmac: raw.hmac };
+}
+
+export function verifyHistoryAdoptionAliases(aliases: HistoryAdoptionAliasesV1, controlSecret: Buffer): boolean {
+  try {
+    assertControlSecret(controlSecret);
+    const parsed = parseHistoryAdoptionAliases(Buffer.from(JSON.stringify(aliases)));
+    return secureEqualHmac(parsed.hmac, hmacPayload(controlSecret, withoutHmac(parsed)));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify that a signed artifact belongs to this completed legacy adoption.
+ * The source member must be in the signed owners manifest. The copy member is
+ * authorized only by this separately HMAC-signed artifact and is constrained
+ * to the receipt-bound account pool; router state is intentionally not an
+ * alias authority.
+ */
+export function assertHistoryAdoptionAliasesBindCompletedProof(input: {
+  aliases: HistoryAdoptionAliasesV1;
+  intent: HistoryAdoptionIntentV1;
+  receipt: HistoryAdoptionReceiptV1;
+  owners: HistoryAdoptionOwnersV1;
+  accountOpaqueIds: readonly OpaqueAccountId[];
+}): void {
+  const { aliases, intent, receipt, owners, accountOpaqueIds } = input;
+  const configured = canonicalPoolIds(accountOpaqueIds);
+  if (aliases.protocolFingerprint !== intent.protocolFingerprint
+    || aliases.poolFingerprint !== intent.poolFingerprint
+    || aliases.intentFingerprint !== historyAdoptionIntentFingerprint(intent)
+    || aliases.adoptionReceiptFingerprint !== historyAdoptionReceiptFingerprint(receipt)
+    || owners.protocolFingerprint !== aliases.protocolFingerprint
+    || owners.poolFingerprint !== aliases.poolFingerprint) {
+    throw failure("history-adoption-aliases-proof-mismatch");
+  }
+  const signedSources = new Set(owners.threadIds);
+  for (const alias of aliases.aliases) {
+    if (alias.sourceOpaqueAccountId !== owners.legacyOwnerOpaqueAccountId
+      || !signedSources.has(alias.sourceNativeThreadId)
+      || !configured.includes(alias.copyOpaqueAccountId)) {
+      throw failure("history-adoption-aliases-member-unproven");
+    }
+  }
+}
+
 export interface HistoryAdoptionCensus {
   app: "idle" | "running" | "unknown";
   main: "idle" | "running" | "unknown";
   appServer: "idle" | "running" | "unknown";
   openFileCount: number;
   observedAt: string;
+}
+
+/** Exact roots observed by the read-only process/open-file census. */
+export interface HistoryAdoptionCensusInput {
+  appPath: string;
+  protectedPaths: readonly string[];
 }
 
 export interface HistoryAdoptionProcessCensus {
@@ -494,7 +677,7 @@ export type HistoryAdoptionPhase =
 
 export interface HistoryAdoptionDependencies {
   sqlite: HistoryAdoptionSqliteAdapter;
-  census(input: { appPath: string; protectedPaths: readonly string[] }): HistoryAdoptionCensus;
+  census(input: HistoryAdoptionCensusInput): HistoryAdoptionCensus;
   now(): string;
   randomId(): string;
   beforePhase?(phase: HistoryAdoptionPhase): void;
@@ -512,6 +695,12 @@ export interface AdoptAccountHistoryInput {
   appPath: string;
   /** Omitted/false is a read-only dry run. */
   apply?: boolean;
+  /**
+   * The global-history migration may only consume a completed legacy v2
+   * transaction.  Keeping this opt-in avoids changing the existing v2/v3
+   * adoption command's compatibility behavior.
+   */
+  requireLegacyV2?: boolean;
 }
 
 export interface HistoryAdoptionResult {
@@ -526,27 +715,47 @@ export interface HistoryAdoptionResult {
   nextAction: "review-and-apply" | "restart-remains-user-confirmed" | "none";
 }
 
+export type HistoryAdoptionInitializationPhase =
+  | "initialization-journal-prepared"
+  | "initialization-intent-published"
+  | "initialization-router-state-published"
+  | "initialization-complete";
+
+export interface HistoryAdoptionInitializationDependencies {
+  census(input: HistoryAdoptionCensusInput): HistoryAdoptionCensus;
+  now(): string;
+  beforePhase?(phase: HistoryAdoptionInitializationPhase): void;
+}
+
+export interface HistoryAdoptionInitializationResult {
+  /** Existing valid artifacts are left exactly as they were. */
+  status: "ready" | "initialization-required" | "initialized";
+  configFingerprint: Sha256Fingerprint;
+  intentFingerprint: Sha256Fingerprint | null;
+  nextAction: "apply-offline-initialization" | "continue-adoption" | "none";
+}
+
 interface RouterAccountConfig {
   opaqueAccountId: OpaqueAccountId;
-  included: true;
+  included: boolean;
   weight: number;
   capabilityFingerprint: Sha256Fingerprint;
   label: string;
 }
 
 interface RouterConfigForAdoption {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   mode: "manual" | "quota_aware";
-  policy: "quota_aware_v1" | null;
+  policy: "quota_aware_v1" | "quota_aware_v2" | null;
   generation: number;
   fingerprint: Sha256Fingerprint;
   protocolFingerprint: Sha256Fingerprint;
   primaryOpaqueAccountId: OpaqueAccountId;
-  accounts: readonly [RouterAccountConfig, RouterAccountConfig];
+  accounts: readonly RouterAccountConfig[];
   updatedAt: string;
 }
 
-interface RouterStateForAdoption {
+export interface RouterStateForAdoption {
   schemaVersion: 1;
   protocolFingerprint: Sha256Fingerprint;
   epoch: number;
@@ -610,6 +819,188 @@ interface ActiveTransaction {
 }
 
 /**
+ * Materialize only the two v2 prerequisites that older router layouts could
+ * legitimately lack: the signed adoption intent and an idle router state.
+ *
+ * This is intentionally separate from `adoptAccountHistory`.  It never
+ * copies history, moves an account home, writes a receipt, or starts routing.
+ * It is an explicit offline preparation step for the later receipt-backed
+ * adoption.  A journal is written first and remains as audit evidence, so a
+ * restart derives its recovery from the committed configuration and files on
+ * disk rather than a caller's original constructor state.
+ */
+export function initializeMissingLegacyV2HistoryAdoption(
+  input: AdoptAccountHistoryInput,
+  suppliedDependencies: Partial<HistoryAdoptionInitializationDependencies> = {},
+): HistoryAdoptionInitializationResult {
+  const dependencies: HistoryAdoptionInitializationDependencies = {
+    census: suppliedDependencies.census ?? observeHistoryAdoptionCensus,
+    now: suppliedDependencies.now ?? (() => new Date().toISOString()),
+    beforePhase: suppliedDependencies.beforePhase,
+  };
+  const apply = input.apply === true;
+  const paths = adoptionPaths(input);
+  let controlSecret: Buffer | null = null;
+  try {
+    assertExactDirectory(paths.routerRoot, "router-root", true);
+    assertExactDirectory(paths.accountsRoot, "accounts-root", true);
+    const committed = readRouterConfigSnapshot(paths.configFile);
+    const config = committed.config;
+    if (config.schemaVersion !== 2) throw failure("legacy-v2-config-required");
+    assertExactDirectory(join(paths.accountsRoot, config.primaryOpaqueAccountId), "legacy-owner-root", true);
+    controlSecret = readPrivateRegularFile(paths.controlSecretFile, 64, false, "control-secret");
+    if (controlSecret.byteLength !== 32) throw failure("invalid-control-secret");
+
+    const journalPath = join(paths.routerRoot, ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_FILE);
+    const artifacts = initializationArtifactPresence(paths, journalPath);
+    let journal: HistoryAdoptionInitializationJournalV1 | null = null;
+    let alreadyObservedIdle = false;
+    let intentOnlyInitialization = false;
+
+    if (artifacts.journal) {
+      journal = parseHistoryAdoptionInitializationJournal(
+        readPrivateRegularFile(journalPath, MAX_ARTIFACT_BYTES, false, "history-adoption-initialization"),
+        controlSecret,
+      );
+      assertInitializationJournalMatchesCommittedConfig(journal, committed, config, controlSecret);
+      const completed = readInitializedArtifacts(paths, config, controlSecret, journal);
+      if (completed) {
+        return initializationResult("ready", config.fingerprint, historyAdoptionIntentFingerprint(completed.intent), "none");
+      }
+      assertNoInitializationAdoptionEvidence(artifacts);
+      if (!apply) {
+        return initializationResult("initialization-required", config.fingerprint, journal.intentFingerprint, "apply-offline-initialization");
+      }
+    } else {
+      if (artifacts.intent && artifacts.routerState) {
+        const completed = readInitializedArtifacts(paths, config, controlSecret, null);
+        if (!completed) throw failure("history-adoption-initialization-incomplete-without-journal");
+        return initializationResult("ready", config.fingerprint, historyAdoptionIntentFingerprint(completed.intent), "none");
+      }
+      if (artifacts.routerState) {
+        // A state without an intent has no signed owner/pool authority.  It
+        // must never be retrofitted into an initialization journal.
+        throw failure("history-adoption-initialization-incomplete-without-journal");
+      }
+
+      if (artifacts.intent) {
+        // A signed v2 intent from before the initializer existed is the one
+        // narrow, recoverable partial layout.  It is still only preparatory:
+        // no receipt, owners, aliases, state, or prior journal may coexist.
+        assertIntentOnlyInitializationArtifacts(artifacts);
+        intentOnlyInitialization = true;
+        const initialIntent = readSignedHistoryAdoptionIntentSnapshot(paths.intentFile, config, controlSecret);
+        if (!apply) {
+          return initializationResult(
+            "initialization-required",
+            config.fingerprint,
+            historyAdoptionIntentFingerprint(initialIntent.intent),
+            "apply-offline-initialization",
+          );
+        }
+
+        assertInitializationLayoutIdle(input, dependencies);
+        alreadyObservedIdle = true;
+        // Both committed inputs must remain byte-for-byte identical after the
+        // two independent idle observations.  This prevents a writer from
+        // substituting a differently signed intent between preview and the
+        // first durable initialization boundary.
+        assertIntentOnlyInitializationArtifacts(initializationArtifactPresence(paths, journalPath));
+        const latest = readRouterConfigSnapshot(paths.configFile);
+        if (latest.config.schemaVersion !== 2 || latest.bytesFingerprint !== committed.bytesFingerprint
+          || latest.config.fingerprint !== config.fingerprint) {
+          throw failure("history-adoption-initialization-config-changed-before-journal");
+        }
+        const latestIntent = readSignedHistoryAdoptionIntentSnapshot(paths.intentFile, latest.config, controlSecret);
+        if (latestIntent.bytesFingerprint !== initialIntent.bytesFingerprint) {
+          throw failure("history-adoption-initialization-intent-changed-before-journal");
+        }
+        journal = createHistoryAdoptionInitializationJournal({
+          config: latest.config,
+          configBytesFingerprint: latest.bytesFingerprint,
+          createdAt: canonicalNow(dependencies.now()),
+          intent: latestIntent.intent,
+        }, controlSecret);
+        writePrivateJsonNew(journalPath, journal);
+        dependencies.beforePhase?.("initialization-journal-prepared");
+      } else {
+        if (artifacts.receipt || artifacts.owners || artifacts.aliases) {
+          throw failure("history-adoption-initialization-conflicts-with-adoption-evidence");
+        }
+        if (!apply) {
+          return initializationResult("initialization-required", config.fingerprint, null, "apply-offline-initialization");
+        }
+
+        assertInitializationLayoutIdle(input, dependencies);
+        alreadyObservedIdle = true;
+        // Re-read after the two independent censuses.  The journal must bind
+        // exactly the committed config bytes that remain at publication time.
+        const laterArtifacts = initializationArtifactPresence(paths, journalPath);
+        if (laterArtifacts.journal || laterArtifacts.intent || laterArtifacts.routerState
+          || laterArtifacts.receipt || laterArtifacts.owners || laterArtifacts.aliases) {
+          throw failure("history-adoption-initialization-layout-changed-before-journal");
+        }
+        const latest = readRouterConfigSnapshot(paths.configFile);
+        if (latest.config.schemaVersion !== 2 || latest.bytesFingerprint !== committed.bytesFingerprint
+          || latest.config.fingerprint !== config.fingerprint) {
+          throw failure("history-adoption-initialization-config-changed-before-journal");
+        }
+        journal = createHistoryAdoptionInitializationJournal({
+          config: latest.config,
+          configBytesFingerprint: latest.bytesFingerprint,
+          createdAt: canonicalNow(dependencies.now()),
+        }, controlSecret);
+        writePrivateJsonNew(journalPath, journal);
+        dependencies.beforePhase?.("initialization-journal-prepared");
+      }
+    }
+
+    if (!journal) throw failure("history-adoption-initialization-journal-missing");
+    const beforePublicationArtifacts = initializationArtifactPresence(paths, journalPath);
+    assertNoInitializationAdoptionEvidence(beforePublicationArtifacts);
+    if (intentOnlyInitialization && (beforePublicationArtifacts.journal !== true || !beforePublicationArtifacts.intent)) {
+      throw failure("history-adoption-initialization-conflicts-with-adoption-evidence");
+    }
+    if (!alreadyObservedIdle) assertInitializationLayoutIdle(input, dependencies);
+    const latest = readRouterConfigSnapshot(paths.configFile);
+    assertInitializationJournalMatchesCommittedConfig(journal, latest, latest.config, controlSecret);
+    if (latest.config.schemaVersion !== 2) throw failure("legacy-v2-config-required");
+
+    const intentPath = paths.intentFile;
+    const statePath = paths.routerStateFile;
+    if (existsSync(intentPath)) {
+      assertInitializedIntentMatchesJournal(intentPath, latest.config, controlSecret, journal);
+    } else {
+      writePrivateJsonNew(intentPath, journal.intent);
+      dependencies.beforePhase?.("initialization-intent-published");
+    }
+
+    // A process death immediately after the intent publication resumes here.
+    // The config is checked again before the second independently durable
+    // artifact is created; a changed config is never silently reinterpreted.
+    const beforeState = readRouterConfigSnapshot(paths.configFile);
+    assertInitializationJournalMatchesCommittedConfig(journal, beforeState, beforeState.config, controlSecret);
+    assertNoInitializationAdoptionEvidence(initializationArtifactPresence(paths, journalPath));
+    if (existsSync(statePath)) {
+      assertInitializedRouterStateMatchesJournal(statePath, beforeState.config, journal);
+    } else {
+      writePrivateJsonNew(statePath, journal.routerState);
+      dependencies.beforePhase?.("initialization-router-state-published");
+    }
+
+    const finalized = readRouterConfigSnapshot(paths.configFile);
+    assertInitializationJournalMatchesCommittedConfig(journal, finalized, finalized.config, controlSecret);
+    assertNoInitializationAdoptionEvidence(initializationArtifactPresence(paths, journalPath));
+    const completed = readInitializedArtifacts(paths, finalized.config, controlSecret, journal);
+    if (!completed) throw failure("history-adoption-initialization-incomplete-after-publication");
+    dependencies.beforePhase?.("initialization-complete");
+    return initializationResult("initialized", finalized.config.fingerprint, historyAdoptionIntentFingerprint(completed.intent), "continue-adoption");
+  } finally {
+    controlSecret?.fill(0);
+  }
+}
+
+/**
  * Read-only by default. The only mutation path is guarded by two independent
  * idle censuses before the candidate directory is created.
  */
@@ -631,6 +1022,9 @@ export function adoptAccountHistory(
     if (controlSecret.byteLength !== 32) throw failure("invalid-control-secret");
 
     const config = readRouterConfig(paths.configFile);
+    if (input.requireLegacyV2 === true && config.schemaVersion !== 2) {
+      throw failure("legacy-v2-config-required");
+    }
     const intent = parseHistoryAdoptionIntent(readPrivateRegularFile(paths.intentFile, MAX_ARTIFACT_BYTES, false, "history-adoption-intent"));
     if (!verifyHistoryAdoptionIntent(intent, controlSecret)) throw failure("history-adoption-intent-hmac-invalid");
     assertIntentMatchesConfig(intent, config);
@@ -675,9 +1069,9 @@ export function adoptAccountHistory(
       return resultFor("dry-run", sourceFingerprint, null, intent, sourceDatabases, sourceHistories, sourcePlan);
     }
 
-    assertIdleCensus(dependencies.census({ appPath: paths.appPath, protectedPaths: protectedPaths(paths) }));
+    assertIdleCensus(dependencies.census(historyAdoptionCensusInput(input)));
     dependencies.beforePhase?.("after-first-census");
-    assertIdleCensus(dependencies.census({ appPath: paths.appPath, protectedPaths: protectedPaths(paths) }));
+    assertIdleCensus(dependencies.census(historyAdoptionCensusInput(input)));
     dependencies.beforePhase?.("after-second-census");
 
     const candidateRoot = uniqueSibling(paths.accountsRoot, ".history-adoption-candidate", dependencies.randomId());
@@ -812,10 +1206,100 @@ export function adoptAccountHistory(
   }
 }
 
+/**
+ * Verify, without writing, the exact completed v2 adoption evidence that a
+ * later global migration is allowed to consume.  This is intentionally
+ * narrower than `adoptAccountHistory`: a v3 configuration, a pending intent,
+ * or any non-idle durable router state is rejected rather than reinterpreted.
+ */
+export function inspectCompletedLegacyV2HistoryAdoption(
+  routerRoot: string,
+): CompletedLegacyV2HistoryAdoptionProof {
+  const root = exactAbsoluteInput(routerRoot, "invalid-router-root");
+  const accountsRoot = join(root, "accounts");
+  const configFile = join(root, "account-router-config.json");
+  const controlSecretFile = join(root, "control-secret.v1");
+  const intentFile = join(root, ACCOUNT_HISTORY_ADOPTION_INTENT_FILE);
+  const receiptFile = join(root, ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE);
+  const ownersFile = join(root, ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE);
+  const aliasesFile = join(root, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE);
+  const stateFile = join(root, "router-state.json");
+  let controlSecret: Buffer | null = null;
+  try {
+    assertExactDirectory(root, "router-root", true);
+    assertExactDirectory(accountsRoot, "accounts-root", true);
+    controlSecret = readPrivateRegularFile(controlSecretFile, 64, false, "control-secret");
+    if (controlSecret.byteLength !== 32) throw failure("invalid-control-secret");
+
+    const config = readRouterConfig(configFile);
+    if (config.schemaVersion !== 2) throw failure("legacy-v2-config-required");
+    const intent = parseHistoryAdoptionIntent(readPrivateRegularFile(intentFile, MAX_ARTIFACT_BYTES, false, "history-adoption-intent"));
+    const owners = parseHistoryAdoptionOwners(readPrivateRegularFile(ownersFile, HISTORY_ADOPTION_MAX_OWNERS_BYTES, false, "history-adoption-owners"));
+    const receipt = parseHistoryAdoptionReceipt(readPrivateRegularFile(receiptFile, MAX_ARTIFACT_BYTES, false, "history-adoption-receipt"));
+    if (!verifyHistoryAdoptionIntent(intent, controlSecret)
+      || !verifyHistoryAdoptionOwners(owners, controlSecret)
+      || !verifyHistoryAdoptionReceipt(receipt, controlSecret)) {
+      throw failure("history-adoption-proof-hmac-invalid");
+    }
+    assertIntentMatchesConfig(intent, config);
+    if (owners.protocolFingerprint !== config.protocolFingerprint
+      || owners.poolFingerprint !== intent.poolFingerprint
+      || owners.legacyOwnerOpaqueAccountId !== intent.legacyOwnerOpaqueAccountId
+      || receipt.protocolFingerprint !== config.protocolFingerprint
+      || receipt.poolFingerprint !== intent.poolFingerprint
+      || receipt.intentFingerprint !== historyAdoptionIntentFingerprint(intent)
+      || receipt.legacyOwnerOpaqueAccountId !== intent.legacyOwnerOpaqueAccountId
+      || receipt.importedThreadCount !== owners.threadIds.length
+      || receipt.threadOwnersFingerprint !== owners.threadOwnersFingerprint
+      || receipt.adoptedAt !== owners.adoptedAt) {
+      throw failure("history-adoption-proof-mismatch");
+    }
+    const aliases = existsSync(aliasesFile)
+      ? parseHistoryAdoptionAliases(readPrivateRegularFile(
+        aliasesFile,
+        HISTORY_ADOPTION_MAX_ALIASES_BYTES,
+        false,
+        "history-adoption-aliases",
+      ))
+      : null;
+    if (aliases) {
+      if (!verifyHistoryAdoptionAliases(aliases, controlSecret)) {
+        throw failure("history-adoption-aliases-hmac-invalid");
+      }
+      assertHistoryAdoptionAliasesBindCompletedProof({
+        aliases,
+        intent,
+        receipt,
+        owners,
+        accountOpaqueIds: config.accounts.map((account) => account.opaqueAccountId),
+      });
+    }
+    const state = readRouterState(stateFile, config, true).value;
+    for (const threadId of owners.threadIds) {
+      if (state.threadOwners[threadId] !== intent.legacyOwnerOpaqueAccountId) {
+        throw failure("history-adoption-proof-owner-mismatch");
+      }
+    }
+    assertExactDirectory(join(accountsRoot, intent.legacyOwnerOpaqueAccountId), "legacy-owner-root", true);
+    return {
+      configFingerprint: config.fingerprint,
+      poolFingerprint: intent.poolFingerprint,
+      legacyOwnerOpaqueAccountId: intent.legacyOwnerOpaqueAccountId,
+      accountOpaqueIds: config.accounts.map((account) => account.opaqueAccountId),
+      intent,
+      owners,
+      receipt,
+      aliases,
+    };
+  } finally {
+    controlSecret?.fill(0);
+  }
+}
+
 function defaultDependencies(): HistoryAdoptionDependencies {
   return {
     sqlite: defaultSqliteAdapter(),
-    census: defaultCensus,
+    census: observeHistoryAdoptionCensus,
     now: () => new Date().toISOString(),
     randomId: () => randomUUID(),
   };
@@ -829,6 +1313,7 @@ function adoptionPaths(input: AdoptAccountHistoryInput): {
   intentFile: string;
   receiptFile: string;
   ownersFile: string;
+  aliasesFile: string;
   routerStateFile: string;
   sourceCodexRoot: string;
   sourceSqliteRoot: string;
@@ -845,6 +1330,7 @@ function adoptionPaths(input: AdoptAccountHistoryInput): {
     intentFile: join(routerRoot, ACCOUNT_HISTORY_ADOPTION_INTENT_FILE),
     receiptFile: join(routerRoot, ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE),
     ownersFile: join(routerRoot, ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE),
+    aliasesFile: join(routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE),
     routerStateFile: join(routerRoot, "router-state.json"),
     sourceCodexRoot,
     sourceSqliteRoot,
@@ -858,7 +1344,28 @@ function exactAbsoluteInput(value: string, code: string): string {
 }
 
 function readRouterConfig(path: string): RouterConfigForAdoption {
-  const raw = boundedJson(readPrivateRegularFile(path, MAX_ARTIFACT_BYTES, false, "router-config"), "invalid-router-config");
+  return readRouterConfigSnapshot(path).config;
+}
+
+interface RouterConfigSnapshot {
+  config: RouterConfigForAdoption;
+  /** Hashes the exact committed JSON bytes, including the recorded update time. */
+  bytesFingerprint: Sha256Fingerprint;
+}
+
+function readRouterConfigSnapshot(path: string): RouterConfigSnapshot {
+  const bytes = readPrivateRegularFile(path, MAX_ARTIFACT_BYTES, false, "router-config");
+  try {
+    return {
+      config: parseRouterConfig(boundedJson(bytes, "invalid-router-config")),
+      bytesFingerprint: sha256Fingerprint(bytes),
+    };
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function parseRouterConfig(raw: unknown): RouterConfigForAdoption {
   if (!isRecord(raw) || !hasExactKeys(raw, [
     "schemaVersion", "mode", "policy", "generation", "fingerprint", "protocolFingerprint", "primaryOpaqueAccountId", "accounts", "updatedAt",
   ])) throw failure("invalid-router-config");
@@ -869,24 +1376,24 @@ function readRouterConfig(path: string): RouterConfigForAdoption {
   const protocolFingerprint = raw.protocolFingerprint;
   const primaryOpaqueAccountId = raw.primaryOpaqueAccountId;
   const updatedAt = raw.updatedAt;
-  if (raw.schemaVersion !== 2
+  if ((raw.schemaVersion !== 2 && raw.schemaVersion !== 3)
     || (mode !== "manual" && mode !== "quota_aware")
-    || (mode === "quota_aware" ? policy !== "quota_aware_v1" : policy !== null)
+    || (mode === "quota_aware" ? policy !== (raw.schemaVersion === 3 ? "quota_aware_v2" : "quota_aware_v1") : policy !== null)
     || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
     || !isSha256Fingerprint(fingerprint)
     || protocolFingerprint !== ACCOUNT_ROUTER_HISTORY_ADOPTION_PROTOCOL_FINGERPRINT
     || !isOpaqueAccountId(primaryOpaqueAccountId)
-    || !Array.isArray(raw.accounts) || raw.accounts.length !== 2
+    || !Array.isArray(raw.accounts) || (raw.schemaVersion === 2 ? raw.accounts.length !== 2 : raw.accounts.length < 1)
     || !isCanonicalUtcTimestamp(updatedAt)) throw failure("invalid-router-config");
   const accounts = raw.accounts.map(parseRouterAccount);
   if (accounts.some((account) => account === null)) throw failure("invalid-router-config");
-  const parsedAccounts = accounts as [RouterAccountConfig, RouterAccountConfig];
-  if (parsedAccounts[0].opaqueAccountId === parsedAccounts[1].opaqueAccountId
-    || !parsedAccounts.some((account) => account.opaqueAccountId === primaryOpaqueAccountId)) throw failure("invalid-router-config");
+  const parsedAccounts = accounts as RouterAccountConfig[];
+  if (new Set(parsedAccounts.map((account) => account.opaqueAccountId)).size !== parsedAccounts.length
+    || !parsedAccounts.some((account) => account.opaqueAccountId === primaryOpaqueAccountId && account.included)) throw failure("invalid-router-config");
   const config: RouterConfigForAdoption = {
-    schemaVersion: 2,
+    schemaVersion: raw.schemaVersion,
     mode: mode as "manual" | "quota_aware",
-    policy: policy as "quota_aware_v1" | null,
+    policy: policy as "quota_aware_v1" | "quota_aware_v2" | null,
     generation: generation as number,
     fingerprint,
     protocolFingerprint,
@@ -904,13 +1411,13 @@ function parseRouterAccount(value: unknown): RouterAccountConfig | null {
   const weight = value.weight;
   const capabilityFingerprint = value.capabilityFingerprint;
   const label = value.label;
-  if (!isOpaqueAccountId(opaqueAccountId) || value.included !== true
+  if (!isOpaqueAccountId(opaqueAccountId) || typeof value.included !== "boolean"
     || typeof weight !== "number" || !Number.isSafeInteger(weight) || weight < 1 || weight > 100
     || !isSha256Fingerprint(capabilityFingerprint)
     || !isSafeAccountLabel(label)) return null;
   return {
     opaqueAccountId,
-    included: true,
+    included: value.included,
     weight: weight as number,
     capabilityFingerprint,
     label,
@@ -924,11 +1431,11 @@ function isSafeAccountLabel(value: unknown): value is string {
     && !/[@/\\]/.test(value) && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-/** Mirrors the v2 router config writer without importing runtime source. */
+/** Mirrors the v2/v3 router config writer without importing runtime source. */
 export function routerConfigFingerprint(config: Pick<RouterConfigForAdoption,
-  "mode" | "policy" | "generation" | "protocolFingerprint" | "primaryOpaqueAccountId" | "accounts">): Sha256Fingerprint {
+  "schemaVersion" | "mode" | "policy" | "generation" | "protocolFingerprint" | "primaryOpaqueAccountId" | "accounts">): Sha256Fingerprint {
   return canonicalSha256Fingerprint({
-    schemaVersion: 2,
+    schemaVersion: config.schemaVersion,
     mode: config.mode,
     policy: config.policy,
     generation: config.generation,
@@ -994,6 +1501,287 @@ function readRouterState(
     throw failure("router-state-not-idle");
   }
   return { value: state, bytes };
+}
+
+function initializationArtifactPresence(
+  paths: ReturnType<typeof adoptionPaths>,
+  journalPath: string,
+): {
+  journal: boolean;
+  intent: boolean;
+  routerState: boolean;
+  receipt: boolean;
+  owners: boolean;
+  aliases: boolean;
+} {
+  return {
+    journal: existsSync(journalPath),
+    intent: existsSync(paths.intentFile),
+    routerState: existsSync(paths.routerStateFile),
+    receipt: existsSync(paths.receiptFile),
+    owners: existsSync(paths.ownersFile),
+    aliases: existsSync(paths.aliasesFile),
+  };
+}
+
+function assertIntentOnlyInitializationArtifacts(
+  artifacts: ReturnType<typeof initializationArtifactPresence>,
+): void {
+  if (!artifacts.intent || artifacts.journal || artifacts.routerState
+    || artifacts.receipt || artifacts.owners || artifacts.aliases) {
+    throw failure("history-adoption-initialization-intent-only-layout-invalid");
+  }
+}
+
+function assertNoInitializationAdoptionEvidence(
+  artifacts: ReturnType<typeof initializationArtifactPresence>,
+): void {
+  if (artifacts.receipt || artifacts.owners || artifacts.aliases) {
+    throw failure("history-adoption-initialization-conflicts-with-adoption-evidence");
+  }
+}
+
+interface SignedHistoryAdoptionIntentSnapshot {
+  intent: HistoryAdoptionIntentV1;
+  /** Hashes the exact private JSON bytes, not merely the unsigned intent payload. */
+  bytesFingerprint: Sha256Fingerprint;
+}
+
+function readSignedHistoryAdoptionIntentSnapshot(
+  path: string,
+  config: RouterConfigForAdoption,
+  controlSecret: Buffer,
+): SignedHistoryAdoptionIntentSnapshot {
+  const bytes = readPrivateRegularFile(path, MAX_ARTIFACT_BYTES, false, "history-adoption-intent");
+  try {
+    const intent = parseHistoryAdoptionIntent(bytes);
+    if (!verifyHistoryAdoptionIntent(intent, controlSecret)) throw failure("history-adoption-intent-hmac-invalid");
+    assertIntentMatchesConfig(intent, config);
+    return { intent, bytesFingerprint: sha256Fingerprint(bytes) };
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function createInitialRouterStateForAdoption(config: RouterConfigForAdoption): RouterStateForAdoption {
+  const ledger: RouterStateForAdoption["ledger"] = {};
+  const accountEligibility: Record<string, string> = {};
+  for (const account of config.accounts) {
+    ledger[account.opaqueAccountId] = {
+      completedInputTokens: 0,
+      completedOutputTokens: 0,
+      reservedRequestCost: 0,
+      weight: account.weight,
+      assignedThreadCount: 0,
+    };
+    accountEligibility[account.opaqueAccountId] = account.included ? "validating" : "disabled";
+  }
+  return {
+    schemaVersion: 1,
+    protocolFingerprint: config.protocolFingerprint,
+    epoch: 1,
+    threadOwners: {},
+    pendingThreadOwners: {},
+    ledger,
+    reservations: [],
+    accountEligibility,
+    correlations: [],
+    stagedDisable: null,
+  };
+}
+
+function createHistoryAdoptionInitializationJournal(input: {
+  config: RouterConfigForAdoption;
+  configBytesFingerprint: Sha256Fingerprint;
+  createdAt: string;
+  /** A verified legacy intent is retained exactly; only absent layouts mint one. */
+  intent?: HistoryAdoptionIntentV1;
+}, controlSecret: Buffer): HistoryAdoptionInitializationJournalV1 {
+  assertControlSecret(controlSecret);
+  if (input.config.schemaVersion !== 2 || !isSha256Fingerprint(input.configBytesFingerprint)
+    || !isCanonicalUtcTimestamp(input.createdAt)) {
+    throw failure("invalid-history-adoption-initialization-journal");
+  }
+  const intent = input.intent ?? createHistoryAdoptionIntent({
+    protocolFingerprint: input.config.protocolFingerprint,
+    accountOpaqueIds: input.config.accounts.map((account) => account.opaqueAccountId),
+    configGeneration: input.config.generation,
+    configFingerprint: input.config.fingerprint,
+    legacyOwnerOpaqueAccountId: input.config.primaryOpaqueAccountId,
+    createdAt: input.createdAt,
+  }, controlSecret);
+  if (!verifyHistoryAdoptionIntent(intent, controlSecret)) throw failure("history-adoption-intent-hmac-invalid");
+  assertIntentMatchesConfig(intent, input.config);
+  const routerState = createInitialRouterStateForAdoption(input.config);
+  const unsigned: Omit<HistoryAdoptionInitializationJournalV1, "hmac"> = {
+    schemaVersion: ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION,
+    kind: ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_KIND,
+    configBytesFingerprint: input.configBytesFingerprint,
+    configGeneration: input.config.generation,
+    configFingerprint: input.config.fingerprint,
+    intent,
+    intentFingerprint: historyAdoptionIntentFingerprint(intent),
+    routerState,
+    routerStateFingerprint: canonicalSha256Fingerprint(routerState),
+    createdAt: input.createdAt,
+  };
+  return { ...unsigned, hmac: hmacInitializationJournal(controlSecret, unsigned) };
+}
+
+function parseHistoryAdoptionInitializationJournal(
+  bytes: Buffer | string,
+  controlSecret: Buffer,
+): HistoryAdoptionInitializationJournalV1 {
+  const raw = boundedJson(bytes, "invalid-history-adoption-initialization-journal", MAX_ARTIFACT_BYTES);
+  if (!isRecord(raw) || !hasExactKeys(raw, [
+    "schemaVersion", "kind", "configBytesFingerprint", "configGeneration", "configFingerprint", "intent", "intentFingerprint",
+    "routerState", "routerStateFingerprint", "createdAt", "hmac",
+  ]) || raw.schemaVersion !== ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION
+    || raw.kind !== ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_KIND
+    || !isSha256Fingerprint(raw.configBytesFingerprint)
+    || typeof raw.configGeneration !== "number" || !Number.isSafeInteger(raw.configGeneration) || raw.configGeneration < 1
+    || !isSha256Fingerprint(raw.configFingerprint)
+    || !isSha256Fingerprint(raw.intentFingerprint)
+    || !isRecord(raw.routerState)
+    || !isSha256Fingerprint(raw.routerStateFingerprint)
+    || !isCanonicalUtcTimestamp(raw.createdAt)
+    || !isHmacSha256(raw.hmac)) {
+    throw failure("invalid-history-adoption-initialization-journal");
+  }
+  const intent = parseHistoryAdoptionIntent(Buffer.from(canonicalJson(raw.intent), "utf8"));
+  // The journal's HMAC and the committed-config comparison below provide the
+  // runtime shape authority; keep the JSON boundary explicit for TypeScript.
+  const routerState = structuredClone(raw.routerState) as unknown as RouterStateForAdoption;
+  const unsigned: Omit<HistoryAdoptionInitializationJournalV1, "hmac"> = {
+    schemaVersion: ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION,
+    kind: ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_KIND,
+    configBytesFingerprint: raw.configBytesFingerprint,
+    configGeneration: raw.configGeneration,
+    configFingerprint: raw.configFingerprint,
+    intent,
+    intentFingerprint: raw.intentFingerprint,
+    routerState,
+    routerStateFingerprint: raw.routerStateFingerprint,
+    createdAt: raw.createdAt,
+  };
+  if (historyAdoptionIntentFingerprint(intent) !== unsigned.intentFingerprint
+    || canonicalSha256Fingerprint(routerState) !== unsigned.routerStateFingerprint
+    || !secureEqualHmac(raw.hmac, hmacInitializationJournal(controlSecret, unsigned))) {
+    throw failure("history-adoption-initialization-journal-hmac-invalid");
+  }
+  return { ...unsigned, hmac: raw.hmac };
+}
+
+function hmacInitializationJournal(
+  controlSecret: Buffer,
+  payload: Omit<HistoryAdoptionInitializationJournalV1, "hmac">,
+): HmacSha256 {
+  assertControlSecret(controlSecret);
+  return `hmac-sha256:${createHmac("sha256", controlSecret)
+    .update("account-router-history-adoption-initialization:v1\\0", "utf8")
+    .update(canonicalJson(payload), "utf8")
+    .digest("hex")}` as HmacSha256;
+}
+
+function assertInitializationJournalMatchesCommittedConfig(
+  journal: HistoryAdoptionInitializationJournalV1,
+  committed: RouterConfigSnapshot,
+  config: RouterConfigForAdoption,
+  controlSecret: Buffer,
+): void {
+  if (config.schemaVersion !== 2
+    || journal.configBytesFingerprint !== committed.bytesFingerprint
+    || journal.configGeneration !== config.generation
+    || journal.configFingerprint !== config.fingerprint
+    || !verifyHistoryAdoptionIntent(journal.intent, controlSecret)
+    || historyAdoptionIntentFingerprint(journal.intent) !== journal.intentFingerprint
+    || journal.intent.legacyOwnerOpaqueAccountId !== config.primaryOpaqueAccountId) {
+    throw failure("history-adoption-initialization-config-mismatch");
+  }
+  assertIntentMatchesConfig(journal.intent, config);
+  const expectedState = createInitialRouterStateForAdoption(config);
+  if (canonicalJson(journal.routerState) !== canonicalJson(expectedState)
+    || canonicalSha256Fingerprint(journal.routerState) !== journal.routerStateFingerprint) {
+    throw failure("history-adoption-initialization-router-state-mismatch");
+  }
+}
+
+function assertInitializedIntentMatchesJournal(
+  path: string,
+  config: RouterConfigForAdoption,
+  controlSecret: Buffer,
+  journal: HistoryAdoptionInitializationJournalV1,
+): HistoryAdoptionIntentV1 {
+  const intent = parseHistoryAdoptionIntent(readPrivateRegularFile(path, MAX_ARTIFACT_BYTES, false, "history-adoption-intent"));
+  if (!verifyHistoryAdoptionIntent(intent, controlSecret)) throw failure("history-adoption-intent-hmac-invalid");
+  assertIntentMatchesConfig(intent, config);
+  if (canonicalJson(intent) !== canonicalJson(journal.intent)) {
+    throw failure("history-adoption-initialization-intent-mismatch");
+  }
+  return intent;
+}
+
+function assertInitializedRouterStateMatchesJournal(
+  path: string,
+  config: RouterConfigForAdoption,
+  journal: HistoryAdoptionInitializationJournalV1,
+): RouterStateForAdoption {
+  const state = readRouterState(path, config, true).value;
+  if (canonicalJson(state) !== canonicalJson(journal.routerState)) {
+    throw failure("history-adoption-initialization-router-state-mismatch");
+  }
+  return state;
+}
+
+function readInitializedArtifacts(
+  paths: ReturnType<typeof adoptionPaths>,
+  config: RouterConfigForAdoption,
+  controlSecret: Buffer,
+  journal: HistoryAdoptionInitializationJournalV1 | null,
+): { intent: HistoryAdoptionIntentV1; routerState: RouterStateForAdoption } | null {
+  const intentExists = existsSync(paths.intentFile);
+  const stateExists = existsSync(paths.routerStateFile);
+  if (!intentExists && !stateExists) return null;
+  if (journal) {
+    const intent = intentExists
+      ? assertInitializedIntentMatchesJournal(paths.intentFile, config, controlSecret, journal)
+      : null;
+    const routerState = stateExists
+      ? assertInitializedRouterStateMatchesJournal(paths.routerStateFile, config, journal)
+      : null;
+    return intent && routerState ? { intent, routerState } : null;
+  }
+  if (!intentExists || !stateExists) return null;
+  const intent = parseHistoryAdoptionIntent(readPrivateRegularFile(paths.intentFile, MAX_ARTIFACT_BYTES, false, "history-adoption-intent"));
+  if (!verifyHistoryAdoptionIntent(intent, controlSecret)) throw failure("history-adoption-intent-hmac-invalid");
+  assertIntentMatchesConfig(intent, config);
+  return { intent, routerState: readRouterState(paths.routerStateFile, config, true).value };
+}
+
+function assertInitializationLayoutIdle(
+  input: AdoptAccountHistoryInput,
+  dependencies: HistoryAdoptionInitializationDependencies,
+): void {
+  try {
+    if (!isHistoryAdoptionIdleCensus(dependencies.census(historyAdoptionCensusInput(input)))) {
+      throw failure("history-adoption-initialization-layout-not-idle");
+    }
+    if (!isHistoryAdoptionIdleCensus(dependencies.census(historyAdoptionCensusInput(input)))) {
+      throw failure("history-adoption-initialization-layout-not-idle");
+    }
+  } catch (error) {
+    if (error instanceof AdoptionFailure) throw error;
+    throw failure("history-adoption-initialization-layout-not-idle");
+  }
+}
+
+function initializationResult(
+  status: HistoryAdoptionInitializationResult["status"],
+  configFingerprint: Sha256Fingerprint,
+  intentFingerprint: Sha256Fingerprint | null,
+  nextAction: HistoryAdoptionInitializationResult["nextAction"],
+): HistoryAdoptionInitializationResult {
+  return { status, configFingerprint, intentFingerprint, nextAction };
 }
 
 function allValidThreadOwners(
@@ -1586,16 +2374,41 @@ function resultFor(
   };
 }
 
-function protectedPaths(paths: ReturnType<typeof adoptionPaths>): readonly string[] {
-  return [paths.sourceCodexRoot, paths.sourceSqliteRoot, paths.accountsRoot, paths.routerRoot];
+/**
+ * The exact legacy layout observed by every v2 adoption census. Other
+ * offline installers may reuse this projection only after independently
+ * validating these caller-supplied absolute roots.
+ */
+export function historyAdoptionCensusInput(input: Pick<
+  AdoptAccountHistoryInput,
+  "sourceCodexRoot" | "sourceSqliteRoot" | "routerRoot" | "appPath"
+>): HistoryAdoptionCensusInput {
+  const protectedPaths = [
+    input.sourceCodexRoot,
+    input.sourceSqliteRoot,
+    join(input.routerRoot, "accounts"),
+    input.routerRoot,
+  ];
+  return {
+    appPath: input.appPath,
+    // The same physical legacy root can validly host both histories and
+    // SQLite. Keep the observer's root set exact but avoid double-counting
+    // open files when callers supply that one canonical path twice.
+    protectedPaths: protectedPaths.filter((path, index) => protectedPaths.indexOf(path) === index),
+  };
 }
 
 function assertIdleCensus(census: HistoryAdoptionCensus): void {
-  if (!isRecord(census) || census.app !== "idle" || census.main !== "idle" || census.appServer !== "idle"
-    || !Number.isSafeInteger(census.openFileCount) || census.openFileCount !== 0
-    || !isCanonicalUtcTimestamp(census.observedAt)) {
+  if (!isHistoryAdoptionIdleCensus(census)) {
     throw failure("app-or-router-not-idle");
   }
+}
+
+/** Shared, fail-closed validation for an observation-only exact-root census. */
+export function isHistoryAdoptionIdleCensus(census: unknown): census is HistoryAdoptionCensus {
+  return isRecord(census) && census.app === "idle" && census.main === "idle" && census.appServer === "idle"
+    && Number.isSafeInteger(census.openFileCount) && census.openFileCount === 0
+    && isCanonicalUtcTimestamp(census.observedAt);
 }
 
 function defaultSqliteAdapter(): HistoryAdoptionSqliteAdapter {
@@ -1654,7 +2467,7 @@ function defaultSqliteAdapter(): HistoryAdoptionSqliteAdapter {
  * anything. If either census source is unavailable it reports unknown and the
  * caller fails closed before a candidate write.
  */
-function defaultCensus(input: { appPath: string; protectedPaths: readonly string[] }): HistoryAdoptionCensus {
+export function observeHistoryAdoptionCensus(input: HistoryAdoptionCensusInput): HistoryAdoptionCensus {
   const observedAt = new Date().toISOString();
   try {
     const ps = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
@@ -1922,6 +2735,111 @@ function assertReceiptPayload(input: CreateHistoryAdoptionReceiptInput): void {
   }
 }
 
+function canonicalHistoryAdoptionAliasesPayload(
+  input: CreateHistoryAdoptionAliasesInput,
+  requireCanonicalOrder: boolean,
+): Omit<HistoryAdoptionAliasesV1, "hmac"> {
+  assertProtocolFingerprint(input.protocolFingerprint);
+  for (const value of [
+    input.poolFingerprint,
+    input.intentFingerprint,
+    input.adoptionReceiptFingerprint,
+  ]) assertFingerprint(value, "invalid-history-adoption-aliases");
+  assertCanonicalTimestamp(input.createdAt, "invalid-history-adoption-aliases");
+  const aliases = canonicalHistoryAdoptionAliasRecords(input.aliases, requireCanonicalOrder);
+  const payload: Omit<HistoryAdoptionAliasesV1, "hmac"> = {
+    schemaVersion: ACCOUNT_HISTORY_ADOPTION_SCHEMA_VERSION,
+    kind: ACCOUNT_HISTORY_ADOPTION_ALIASES_KIND,
+    protocolFingerprint: input.protocolFingerprint,
+    poolFingerprint: input.poolFingerprint,
+    intentFingerprint: input.intentFingerprint,
+    adoptionReceiptFingerprint: input.adoptionReceiptFingerprint,
+    aliases,
+    createdAt: input.createdAt,
+  };
+  if (Buffer.byteLength(canonicalJson(payload), "utf8") > HISTORY_ADOPTION_MAX_ALIASES_BYTES) {
+    throw failure("history-adoption-aliases-capacity-exceeded");
+  }
+  return payload;
+}
+
+function canonicalHistoryAdoptionAliasRecords(
+  values: readonly HistoryAdoptionAliasRecordV1[],
+  requireCanonicalOrder: boolean,
+): HistoryAdoptionAliasRecordV1[] {
+  if (!Array.isArray(values) || values.length < 1 || values.length > MAX_HISTORY_ADOPTION_ALIASES) {
+    throw failure("invalid-history-adoption-aliases");
+  }
+  const aliases = values.map((value) => parseHistoryAdoptionAliasRecord(value));
+  const sorted = [...aliases].sort((left, right) => compareCodeUnits(aliasRecordKey(left), aliasRecordKey(right)));
+  if (requireCanonicalOrder && canonicalJson(aliases) !== canonicalJson(sorted)) {
+    throw failure("invalid-history-adoption-aliases");
+  }
+  const operationIds = new Set<string>();
+  const endpoints = new Set<string>();
+  const sources = new Set<string>();
+  const copies = new Set<string>();
+  for (const alias of sorted) {
+    const source = aliasMemberKey(alias.sourceOpaqueAccountId, alias.sourceNativeThreadId);
+    const copy = aliasMemberKey(alias.copyOpaqueAccountId, alias.copyNativeThreadId);
+    if (source === copy
+      || operationIds.has(alias.copyOperationId)
+      || endpoints.has(source)
+      || endpoints.has(copy)
+      || sources.has(source)
+      || copies.has(copy)) {
+      throw failure("invalid-history-adoption-aliases");
+    }
+    operationIds.add(alias.copyOperationId);
+    endpoints.add(source);
+    endpoints.add(copy);
+    sources.add(source);
+    copies.add(copy);
+  }
+  return sorted;
+}
+
+function parseHistoryAdoptionAliasRecord(value: unknown): HistoryAdoptionAliasRecordV1 {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "copyOperationId", "sourceOpaqueAccountId", "sourceNativeThreadId", "sourceRolloutSha256",
+    "copyOpaqueAccountId", "copyNativeThreadId", "copyRolloutSha256", "portableTranscriptDigest",
+  ])
+    || !isCopyOperationId(value.copyOperationId)
+    || !isOpaqueAccountId(value.sourceOpaqueAccountId)
+    || !isCanonicalThreadId(value.sourceNativeThreadId)
+    || !isSha256Fingerprint(value.sourceRolloutSha256)
+    || !isOpaqueAccountId(value.copyOpaqueAccountId)
+    || !isCanonicalThreadId(value.copyNativeThreadId)
+    || !isSha256Fingerprint(value.copyRolloutSha256)
+    || !isSha256Fingerprint(value.portableTranscriptDigest)) {
+    throw failure("invalid-history-adoption-aliases");
+  }
+  return {
+    copyOperationId: value.copyOperationId,
+    sourceOpaqueAccountId: value.sourceOpaqueAccountId,
+    sourceNativeThreadId: value.sourceNativeThreadId,
+    sourceRolloutSha256: value.sourceRolloutSha256,
+    copyOpaqueAccountId: value.copyOpaqueAccountId,
+    copyNativeThreadId: value.copyNativeThreadId,
+    copyRolloutSha256: value.copyRolloutSha256,
+    portableTranscriptDigest: value.portableTranscriptDigest,
+  };
+}
+
+function aliasRecordKey(value: HistoryAdoptionAliasRecordV1): string {
+  return canonicalJson(value);
+}
+
+function aliasMemberKey(account: OpaqueAccountId, nativeThreadId: string): string {
+  return `${account}\0${nativeThreadId}`;
+}
+
+function isCopyOperationId(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(value)
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function assertDatabaseEntries(entries: readonly HistoryAdoptionDatabaseEntry[]): void {
   if (!Array.isArray(entries) || entries.length !== OFFICIAL_CODEX_DATABASES.length) throw failure("invalid-history-adoption-databases");
   for (let index = 0; index < OFFICIAL_CODEX_DATABASES.length; index += 1) {
@@ -1989,6 +2907,10 @@ function canonicalThreadIds(ids: readonly string[]): string[] {
   const sorted = [...ids].sort();
   if (sorted.some((id, index) => index > 0 && sorted[index - 1] === id)) throw failure("duplicate-history-adoption-thread-id");
   return sorted;
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isCanonicalThreadId(value: unknown): value is string {

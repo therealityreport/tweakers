@@ -23,11 +23,20 @@ import {
 } from "../src/account-history-adoption";
 import {
   accountRouterDataRoot,
+  assertIndependentTweakersAccountsRegistration,
   formatAccountRouterEvidence,
+  inspectIndependentTweakersLiveHealth,
   inspectAccountRouter,
+  parseBrokerLiveResponse,
+  readIndependentTweakersBrokerAuthorityExpectation,
   readRegisteredDevelopmentSourceRoot,
   readLiveAccountRouterStatus,
 } from "../src/account-router-status";
+import {
+  REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS,
+  TWEAKERS_ORIGINAL_EXECUTABLE,
+  TWEAKERS_VARIANT_LAUNCHER_EXECUTABLE,
+} from "../src/macos-variant";
 
 const secret = Buffer.alloc(32, 17);
 const opaqueAccountId = `ar_${"a".repeat(43)}`;
@@ -655,3 +664,305 @@ test("installer rejects malformed or unredacted v2 socket projections", async ()
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+test("broker status keeps authenticated client, child, handoff, and browser evidence finite and identifier-free", () => {
+  const rendererA = `br_${"r".repeat(24)}`;
+  const rendererB = `br_${"s".repeat(24)}`;
+  const brokerFrame = {
+    version: 1,
+    requestId: "tweaker-cli-broker-status-v1",
+    status: {
+      version: 1,
+      state: "available",
+      registeredClients: [
+        { rendererRef: rendererA, clientKind: "chatgpt" },
+        { rendererRef: rendererB, clientKind: "tweakers" },
+      ],
+      pool: {
+        maxResidentChildren: 2,
+        residentChildren: 2,
+        heldWorkCount: 1,
+        accounts: [
+          { enabled: true, state: "active", childState: "active", activeRunCount: 1, assignedTaskCount: 3 },
+          { enabled: true, state: "ready", childState: "resident", activeRunCount: 0, assignedTaskCount: 1 },
+        ],
+      },
+      pendingHandoffs: { pendingCount: 1, ambiguousCount: 0 },
+      browserEvidence: { observed: true, observedAt: "2026-09-02T12:00:00.000Z" },
+    },
+  };
+  const parsed = parseBrokerLiveResponse(Buffer.from(JSON.stringify(brokerFrame)), "tweaker-cli-broker-status-v1");
+  assert.deepEqual(parsed, {
+    state: "available",
+    registeredClients: { total: 2, chatgpt: 1, tweakers: 1 },
+    residentChildren: 2,
+    maxResidentChildren: 2,
+    heldWorkCount: 1,
+    childStates: { absent: 0, resident: 1, active: 1, held: 0, evicted: 0 },
+    pendingHandoffs: { pendingCount: 1, ambiguousCount: 0 },
+    browserEvidence: { observed: true, observedAt: "2026-09-02T12:00:00.000Z" },
+  });
+  assert.doesNotMatch(JSON.stringify(parsed), new RegExp(`${rendererA}|${rendererB}|${opaqueAccountId}|${opaqueAccountIdB}`));
+
+  for (const invalid of [
+    { ...brokerFrame, status: { ...brokerFrame.status, secret: "must-not-pass" } },
+    { ...brokerFrame, status: { ...brokerFrame.status, registeredClients: [{ rendererRef: rendererA, clientKind: "chatgpt", path: "/private/path" }] } },
+    { ...brokerFrame, status: { ...brokerFrame.status, pool: { ...brokerFrame.status.pool, residentChildren: 3 } } },
+    { ...brokerFrame, status: { ...brokerFrame.status, pool: { ...brokerFrame.status.pool, accounts: [{ ...brokerFrame.status.pool.accounts[0], opaqueAccountId }] } } },
+    { ...brokerFrame, status: { ...brokerFrame.status, browserEvidence: { observed: true, observedAt: "not-a-timestamp" } } },
+  ]) {
+    assert.equal(parseBrokerLiveResponse(Buffer.from(JSON.stringify(invalid)), "tweaker-cli-broker-status-v1"), null);
+  }
+
+  const tooManyClients = {
+    ...brokerFrame,
+    status: {
+      ...brokerFrame.status,
+      registeredClients: Array.from({ length: 17 }, (_, index) => ({
+        rendererRef: `br_${String(index).padStart(24, "x")}`,
+        clientKind: index % 2 === 0 ? "chatgpt" : "tweakers",
+      })),
+    },
+  };
+  assert.equal(parseBrokerLiveResponse(Buffer.from(JSON.stringify(tooManyClients)), "tweaker-cli-broker-status-v1"), null);
+});
+
+test("independent runtime readiness binds only an absent broker root or an exact global-v3 config fingerprint", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-broker-authority-"));
+  try {
+    const brokerRoot = join(fixture, "global-broker");
+    assert.deepEqual(readIndependentTweakersBrokerAuthorityExpectation(brokerRoot), {
+      globalRootState: "absent",
+      configSha256: null,
+    });
+
+    mkdirSync(brokerRoot, { recursive: true, mode: 0o700 });
+    assert.throws(
+      () => readIndependentTweakersBrokerAuthorityExpectation(brokerRoot),
+      /exactly valid global-v3 config/,
+      "an existing root with no config is not absence",
+    );
+    writePrivate(join(brokerRoot, "account-router-config.json"), JSON.stringify({ schemaVersion: 3 }));
+    assert.throws(() => readIndependentTweakersBrokerAuthorityExpectation(brokerRoot), /exactly valid global-v3 config/);
+
+    const config = brokerV3Config();
+    const bytes = Buffer.from(`${JSON.stringify(config)}\n`);
+    writePrivate(join(brokerRoot, "account-router-config.json"), bytes);
+    assert.deepEqual(readIndependentTweakersBrokerAuthorityExpectation(brokerRoot), {
+      globalRootState: "valid-v3",
+      configSha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    chmodSync(brokerRoot, 0o755);
+    assert.throws(() => readIndependentTweakersBrokerAuthorityExpectation(brokerRoot), /owner-private real directory/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Accounts promotion requires a complete registration even when an absent root can be inspected", (t) => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-accounts-promotion-"));
+  t.after(() => rmSync(fixture, { recursive: true, force: true }));
+  const brokerRoot = join(fixture, "broker");
+  assert.throws(() => assertIndependentTweakersAccountsRegistration(brokerRoot), /setup is incomplete/);
+  mkdirSync(brokerRoot, { mode: 0o700 });
+  writePrivate(join(brokerRoot, "account-router-config.json"), JSON.stringify(brokerV3Config()));
+  assert.throws(() => assertIndependentTweakersAccountsRegistration(brokerRoot), /capability is missing/);
+  const secretPath = join(brokerRoot, "control-secret.v1");
+  writePrivate(secretPath, Buffer.alloc(8));
+  assert.throws(() => assertIndependentTweakersAccountsRegistration(brokerRoot), /capability is missing/);
+  writePrivate(secretPath, Buffer.alloc(32, 17));
+  assert.equal(assertIndependentTweakersAccountsRegistration(brokerRoot).globalRootState, "valid-v3");
+  chmodSync(secretPath, 0o644);
+  assert.throws(() => assertIndependentTweakersAccountsRegistration(brokerRoot), /capability is missing/);
+});
+
+test("independent live health rejects stale, exited, PID-reused, and malformed records", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-live-health-"));
+  try {
+    const now = Date.parse("2026-09-04T12:00:00.000Z");
+    const record = independentLiveHealth({ observedAt: "2026-09-04T11:59:00.000Z" });
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify(record));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=${record.appUserDataRoot}`,
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+      verifyCurrentIdentity: () => true,
+    }).state, "current");
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => "/Applications/Other.app/Contents/MacOS/Other",
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+      verifyCurrentIdentity: () => true,
+    }).state, "process_identity_mismatch");
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => `"/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE}" --user-data-dir=${record.appUserDataRoot}`,
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+      verifyCurrentIdentity: () => true,
+    }).state, "current");
+    for (const command of [
+      `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE}`,
+      `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=/Users/fixture/Other/app-data`,
+      `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=${record.appUserDataRoot} --user-data-dir=/Users/fixture/Other/app-data`,
+      `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=${record.appUserDataRoot} --started-from-launcher`,
+      `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_VARIANT_LAUNCHER_EXECUTABLE} --user-data-dir=${record.appUserDataRoot}`,
+    ]) {
+      assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+        nowMs: () => now,
+        processAlive: () => true,
+        readProcessStartToken: () => record.processStartToken,
+        readProcessCommand: () => command,
+        expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+        verifyCurrentIdentity: () => true,
+      }).state, "process_identity_mismatch", command);
+    }
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => "/Applications/Tweakers.app/Contents/Frameworks/Tweakers Helper.app/Contents/MacOS/Tweakers Helper --type=renderer",
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+      verifyCurrentIdentity: () => true,
+    }).state, "process_identity_mismatch");
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now + 2 * 60 * 1_000 + 1,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+    }).state, "stale");
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => false,
+      readProcessStartToken: () => record.processStartToken,
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+    }).state, "process_not_running");
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => "PID reused",
+      expectedAccountsBrokerRoot: record.accountsBrokerRoot,
+    }).state, "process_identity_mismatch");
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify({
+      ...record,
+      initializedTweakIds: record.initializedTweakIds.slice(0, -1),
+    }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture).state, "invalid");
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify({ ...record, appearance: { ...record.appearance, unexpected: true } }));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture).state, "invalid");
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("independent live health rejects current global-v3 broker config byte drift", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "tweakers-live-health-config-drift-"));
+  try {
+    const brokerRoot = join(fixture, "broker");
+    mkdirSync(brokerRoot, { recursive: true, mode: 0o700 });
+    const config = brokerV3Config();
+    const configBytes = Buffer.from(`${JSON.stringify(config)}\n`);
+    writePrivate(join(brokerRoot, "account-router-config.json"), configBytes);
+    const now = Date.parse("2026-09-04T12:00:00.000Z");
+    const record = {
+      ...independentLiveHealth({ observedAt: "2026-09-04T11:59:00.000Z" }),
+      accountsBrokerRoot: brokerRoot,
+      accountsBrokerConfigSha256: createHash("sha256").update(configBytes).digest("hex"),
+      sharedHistoryBrokerState: "connected" as const,
+    };
+    writePrivate(join(fixture, "independent-live-health.json"), JSON.stringify(record));
+    const currentProcess = {
+      nowMs: () => now,
+      processAlive: () => true,
+      readProcessStartToken: () => record.processStartToken,
+      readProcessCommand: () => `/Applications/Tweakers.app/Contents/MacOS/${TWEAKERS_ORIGINAL_EXECUTABLE} --user-data-dir=${record.appUserDataRoot}`,
+      expectedAccountsBrokerRoot: brokerRoot,
+      verifyCurrentIdentity: () => true,
+    };
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "current");
+    writePrivate(join(brokerRoot, "account-router-config.json"), Buffer.from(`\n${configBytes}`));
+    assert.equal(inspectIndependentTweakersLiveHealth(fixture, currentProcess).state, "invalid");
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("balanced token policy remains valid in installer authority and pending diagnostics", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-balanced-policy-"));
+  const brokerRoot = accountRouterDataRoot(root);
+  mkdirSync(brokerRoot, { recursive: true, mode: 0o700 });
+  const config = brokerV3Config("balanced_tokens_v1");
+  const bytes = Buffer.from(JSON.stringify(config));
+  writePrivate(join(brokerRoot, "account-router-config.json"), bytes);
+  assert.deepEqual(readIndependentTweakersBrokerAuthorityExpectation(brokerRoot), {
+    globalRootState: "valid-v3", configSha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+  const evidence = await inspectAccountRouter({ userRoot: root, brokerRoot });
+  assert.equal(evidence.configuration.state, "quota_aware");
+  assert.equal(evidence.configuration.pending?.policy, "balanced_tokens_v1");
+});
+
+function brokerV3Config(policy = "quota_aware_v2") {
+  const account = {
+    opaqueAccountId,
+    included: true,
+    weight: 1,
+    capabilityFingerprint: `sha256:${"b".repeat(64)}`,
+    label: "Alpha",
+  };
+  const canonical = {
+    schemaVersion: 3,
+    mode: "quota_aware",
+    policy,
+    generation: 1,
+    protocolFingerprint: "sha256:76eed5b646961d042d9037eb1d2c9df12a4edc71ef18580b8c99cd5176bd4f10",
+    primaryOpaqueAccountId: opaqueAccountId,
+    accounts: [account],
+  };
+  return {
+    ...canonical,
+    fingerprint: `sha256:${createHash("sha256").update(canonicalJson(canonical), "utf8").digest("hex")}`,
+    updatedAt: "2026-09-04T12:00:00.000Z",
+  };
+}
+
+function independentLiveHealth(input: { observedAt: string }) {
+  const metrics = {
+    electronZoomLevel: 0,
+    electronZoomFactor: 1,
+    cssWindowZoom: 1,
+    rootZoom: 1,
+    bodyZoom: 1,
+    rootFontSizePx: 16,
+    bodyFontSizePx: 16,
+    visualViewportScale: 1,
+    devicePixelRatio: 2,
+    displayScaleFactor: 2,
+    bounds: { x: 0, y: 0, width: 1200, height: 900 },
+  };
+  return {
+    schemaVersion: 1,
+    kind: "tweakers-independent-live-health",
+    pid: 1234,
+    processStartToken: "Thu Sep  4 12:00:00 2026",
+    appRoot: "/Applications/Tweakers.app",
+    bundleId: "com.therealityreport.tweakers",
+    appAsarHeaderHash: "a".repeat(64),
+    appSignatureSha256: "b".repeat(64),
+    runtimeFingerprint: "c".repeat(64),
+    appUserDataRoot: "/Users/fixture/Tweakers/app-data",
+    codexHomeRoot: "/Users/fixture/Tweakers/codex-home",
+    accountsBrokerRoot: "/Users/fixture/Tweakers/broker",
+    accountsBrokerConfigSha256: null,
+    sharedHistoryBrokerState: "blocked",
+    initializedTweakIds: [...REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS].sort(),
+    lifecycleFailures: [],
+    appearance: { status: "normal", normalized: true, windowId: 1, before: metrics, after: metrics },
+    observedAt: input.observedAt,
+  };
+}

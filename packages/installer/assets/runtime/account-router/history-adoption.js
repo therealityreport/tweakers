@@ -53,10 +53,10 @@ function canonicalJson(value) {
 function historyAdoptionPoolFingerprint(protocolFingerprint, accountOpaqueIds) {
     if (!(0, types_1.isFingerprint)(protocolFingerprint) || protocolFingerprint !== types_1.ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT)
         throw invalid();
-    if (accountOpaqueIds.length !== 2 || accountOpaqueIds.some((account) => !(0, types_1.isOpaqueAccountId)(account)))
+    if (accountOpaqueIds.length < 2 || accountOpaqueIds.some((account) => !(0, types_1.isOpaqueAccountId)(account)))
         throw invalid();
     const sorted = [...accountOpaqueIds].sort();
-    if (sorted[0] === sorted[1])
+    if (new Set(sorted).size !== sorted.length)
         throw invalid();
     return sha256(canonicalJson({ protocolFingerprint, accountOpaqueIds: sorted }));
 }
@@ -165,7 +165,9 @@ function validateHistoryAdoptionEvidence(config, state, secret, raw) {
         if (!verifyHistoryAdoptionIntent(intent, secret) || !verifyHistoryAdoptionOwners(owners, secret) || !verifyHistoryAdoptionReceipt(receipt, secret)) {
             return { ok: false, reason: "history_adoption_hmac_invalid" };
         }
-        const poolFingerprint = historyAdoptionPoolFingerprint(config.protocolFingerprint, config.accounts.map((account) => account.opaqueAccountId));
+        const poolFingerprint = matchingAdoptionPoolFingerprint(config, intent.poolFingerprint);
+        if (!poolFingerprint)
+            return { ok: false, reason: "history_adoption_config_mismatch" };
         // The signed intent remains an immutable description of the original
         // offline adoption. Once its receipt exists, later v2 pending intent may
         // change mode, primary, generation, or config fingerprint while retaining
@@ -195,6 +197,20 @@ function validateHistoryAdoptionEvidence(config, state, secret, raw) {
     catch (error) {
         return { ok: false, reason: error instanceof HistoryAdoptionError ? error.reason : "history_adoption_invalid" };
     }
+}
+function matchingAdoptionPoolFingerprint(config, expected) {
+    const ids = config.accounts.map((account) => account.opaqueAccountId);
+    const complete = historyAdoptionPoolFingerprint(config.protocolFingerprint, ids);
+    if (complete === expected)
+        return complete;
+    for (let left = 0; left < ids.length; left += 1) {
+        for (let right = left + 1; right < ids.length; right += 1) {
+            const candidate = historyAdoptionPoolFingerprint(config.protocolFingerprint, [ids[left], ids[right]]);
+            if (candidate === expected)
+                return candidate;
+        }
+    }
+    return null;
 }
 /**
  * Startup only checks artifact shape and private ownership; replaying hashes

@@ -86,6 +86,7 @@ export interface McpReconciler {
 }
 export declare const MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
 export declare const MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+export declare const MCP_DERIVED_VARIANT_ENV = "TWEAKERS_DERIVED_VARIANT";
 export interface ResolveMcpRuntimePathsOptions {
     /** Exact Tweakers user root selected by the loader for this runtime. */
     userRoot: string;
@@ -105,7 +106,9 @@ export interface McpRuntimePaths {
  * Ordinary launches intentionally retain the historical ~/.codex/config.toml
  * behavior, even when CODEX_HOME happens to be present. A disposable candidate
  * must explicitly opt in and supply an exact CODEX_HOME below its exact,
- * non-symlink Tweakers user root. Existing symlink components, the real
+ * non-symlink Tweakers user root. A derived variant also has to supply that
+ * isolated CODEX_HOME when its derived marker is active; unlike a candidate,
+ * its reconciler is disabled by main.ts. Existing symlink components, the real
  * ~/.codex tree, and paths outside the candidate root fail closed before a
  * watcher or reconciler can be created.
  */

@@ -338,6 +338,9 @@ export interface DesktopUpdateDependencies {
 
 export interface DesktopUpdateTransactionOptions {
   root?: string;
+  /** Official ChatGPT lane. It owns a separate receipt and never rebuilds or
+   * returns to Tweakers after the native updater completes. */
+  officialOnly?: boolean;
   stateFile?: string;
   receiptRoot?: string;
   lockFile?: string;
@@ -534,12 +537,14 @@ export function createDesktopUpdateTransaction(
 ): DesktopUpdateTransaction {
   const paths = userPaths();
   const root = options.root ?? paths.root;
-  const stateFile = options.stateFile ?? join(root, "transactions", "desktop-update.json");
-  const receiptRoot = options.receiptRoot ?? join(root, "transactions", "desktop-update");
-  const lockFile = options.lockFile ?? join(root, "transactions", "desktop-update.lock");
+  const officialOnly = options.officialOnly === true;
+  const transactionStem = officialOnly ? "chatgpt-app-update" : "desktop-update";
+  const stateFile = options.stateFile ?? join(root, "transactions", `${transactionStem}.json`);
+  const receiptRoot = options.receiptRoot ?? join(root, "transactions", transactionStem);
+  const lockFile = options.lockFile ?? join(root, "transactions", `${transactionStem}.lock`);
   const heartbeatFile = options.heartbeatFile
-    ?? join(root, "transactions", "desktop-update.heartbeat.json");
-  const logFile = options.logFile ?? join(root, "log", "desktop-update.log");
+    ?? join(root, "transactions", `${transactionStem}.heartbeat.json`);
+  const logFile = options.logFile ?? join(root, "log", `${transactionStem}.log`);
   const environmentRegistryFile = join(root, "environment-registry.json");
   const environmentSelectionFile = join(root, "environment-selection.json");
   const environmentTransactionFile = join(root, "transactions", "environment.json");
@@ -849,6 +854,13 @@ export function createDesktopUpdateTransaction(
     return token === null || token === receipt.ownerToken;
   };
 
+  const ownReceiptAllowance = (transactionId: string): {
+    desktopTransactionId?: string;
+    officialUpdateTransactionId?: string;
+  } => officialOnly
+    ? { officialUpdateTransactionId: transactionId }
+    : { desktopTransactionId: transactionId };
+
   async function start(): Promise<DesktopUpdateReceipt> {
     return withLifecycleLock(lifecycleLockFile, "desktop update", startUnlocked);
   }
@@ -868,23 +880,20 @@ export function createDesktopUpdateTransaction(
       }
       const source = await deps.readCurrentSelection();
       if (!source) throw new Error("No current environment selection is available");
-      await assertRequestedDesktopApp(options.appPath, source, deps.readDesktopBundleIdentifier);
-      const baseline = await deps.readDesktopVersion(source.selectedDesktopPath);
-      if (baseline.marketingVersion === null && baseline.build === null) {
-        throw new Error(
-          `Cannot start desktop update because both the ChatGPT version and build are unreadable at ${source.selectedDesktopPath}. No transaction was created.`,
-        );
-      }
       const profile = resolveEnvironmentProfile(defaultEnvironmentProfileRegistry(), source.releaseProfile);
       const official = createEnvironmentSelection({
-        profile: {
-          ...profile,
-          selectedDesktopPath: source.selectedDesktopPath,
-          selectedDesktopBundleId: source.selectedDesktopBundleId,
-        },
+        profile,
         appExperience: "chatgpt",
         requestedAt: deps.now(),
       });
+      const updateTarget = officialOnly ? official : source;
+      await assertRequestedDesktopApp(options.appPath, updateTarget, deps.readDesktopBundleIdentifier);
+      const baseline = await deps.readDesktopVersion(updateTarget.selectedDesktopPath);
+      if (baseline.marketingVersion === null && baseline.build === null) {
+        throw new Error(
+          `Cannot start desktop update because both the ChatGPT version and build are unreadable at ${updateTarget.selectedDesktopPath}. No transaction was created.`,
+        );
+      }
       const now = deps.now();
       const ownerToken = deps.readProcessStartToken(process.pid);
       if (!ownerToken) {
@@ -895,7 +904,7 @@ export function createDesktopUpdateTransaction(
       // whole update (two environment swaps + a native wait + a runtime
       // refresh) is a no-op and completes here in seconds. Every ambiguous or
       // failed probe falls open into the unchanged native updater flow.
-      const probe = await deps.probeAppcast!({ appPath: source.selectedDesktopPath, baseline });
+      const probe = await deps.probeAppcast!({ appPath: updateTarget.selectedDesktopPath, baseline });
       const created = persist({
         schemaVersion: DESKTOP_UPDATE_SCHEMA_VERSION,
         kind: "desktop-update",
@@ -936,7 +945,7 @@ export function createDesktopUpdateTransaction(
       if (probe.state === "current") {
         return update(created, {
           phase: "completed",
-          safeOfficialMode: created.source.appExperience === "chatgpt",
+          safeOfficialMode: officialOnly || created.source.appExperience === "chatgpt",
           resumable: false,
           error: null,
           completedAt: deps.now(),
@@ -945,7 +954,33 @@ export function createDesktopUpdateTransaction(
       return created;
     });
     if (receipt.phase === "completed") return receipt;
+    if (officialOnly) return startOfficialAppUpdate(receipt);
     return switchToOfficial(receipt);
+  }
+
+  /**
+   * The split official lane never swaps the selected Tweakers environment.
+   * It proves (or opens) the independent official app, then hands the update
+   * directly to that exact process.
+   */
+  async function startOfficialAppUpdate(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
+    try {
+      const live = await inspectOfficialWithRelaunch(initial.official);
+      const receipt = update(initial, {
+        phase: "awaiting_native_update",
+        safeOfficialMode: true,
+        resumable: true,
+        officialMainPid: live.mainPid,
+      });
+      return handoffAndAwaitNativeUpdate(receipt);
+    } catch (error) {
+      return update(initial, {
+        phase: "failed",
+        safeOfficialMode: false,
+        resumable: false,
+        error: `Could not prove the independent official ChatGPT app: ${errorMessage(error)}`,
+      }, true);
+    }
   }
 
   async function switchToOfficial(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
@@ -1407,7 +1442,7 @@ export function createDesktopUpdateTransaction(
       }
       return {
         receipt: update(latest, {
-          phase: latest.source.appExperience === "chatgpt" ? "verifying" : "returning_to_tweakers",
+          phase: officialOnly || latest.source.appExperience === "chatgpt" ? "verifying" : "returning_to_tweakers",
           observed,
           resumable: false,
           error: null,
@@ -1415,9 +1450,45 @@ export function createDesktopUpdateTransaction(
         shouldContinue: true,
       };
     });
-    return transitioned.shouldContinue
-      ? returnToRequestedEnvironment(transitioned.receipt)
-      : transitioned.receipt;
+    if (!transitioned.shouldContinue) return transitioned.receipt;
+    if (officialOnly) {
+      return verifyIndependentOfficialAndComplete(transitioned.receipt);
+    }
+    return returnToRequestedEnvironment(transitioned.receipt);
+  }
+
+  async function verifyIndependentOfficialAndComplete(receipt: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
+    try {
+      const live = await deps.inspectLiveOfficialDesktop(receipt.official);
+      if (!receipt.observed
+        || live.version.marketingVersion !== receipt.observed.marketingVersion
+        || live.version.build !== receipt.observed.build) {
+        throw new Error("the live official ChatGPT version does not match the installed update");
+      }
+      if (receipt.officialMainPid !== null && live.mainPid === receipt.officialMainPid) {
+        throw new Error(`the official ChatGPT update has not produced a new main PID (still ${live.mainPid})`);
+      }
+      const refreshedOfficial = (await deps.refreshEnvironmentTruth(receipt.official)) ?? receipt.official;
+      if (!sameEnvironmentSelection(refreshedOfficial, receipt.official)) {
+        throw new Error("the refreshed environment authority does not match the updated official ChatGPT app");
+      }
+      return update(receipt, {
+        phase: "completed",
+        official: refreshedOfficial,
+        officialMainPid: live.mainPid,
+        safeOfficialMode: false,
+        resumable: false,
+        error: null,
+        completedAt: deps.now(),
+      }, true);
+    } catch (error) {
+      return update(receipt, {
+        phase: "failed",
+        safeOfficialMode: true,
+        resumable: true,
+        error: `Could not verify the updated independent ChatGPT app: ${errorMessage(error)}`,
+      }, true);
+    }
   }
 
   async function returnToRequestedEnvironment(initial: DesktopUpdateReceipt): Promise<DesktopUpdateReceipt> {
@@ -1808,7 +1879,7 @@ export function createDesktopUpdateTransaction(
       if (!existing) throw new Error("No desktop update exists to resume");
       assertLifecycleReceiptsIdle(root, {
         contextOwned: false,
-        desktopTransactionId: existing.transactionId,
+        ...ownReceiptAllowance(existing.transactionId),
         environmentTransactionId: existing.environmentTransactionId ?? undefined,
       });
       if (!isTerminalDesktopUpdatePhase(existing.phase)
@@ -1932,10 +2003,13 @@ export function createDesktopUpdateTransaction(
 
       if (desktopVersionAdvanced(resumed.baseline, liveOfficial.version)) {
         return update(resumed, {
-          phase: "returning_to_tweakers",
+          phase: officialOnly ? "verifying" : "returning_to_tweakers",
           ownerPid: process.pid,
           observed: liveOfficial.version,
-          officialMainPid: liveOfficial.mainPid,
+          // The independent verifier needs the pre-update PID recorded by
+          // start in order to prove that the native updater relaunched the
+          // official app. Do not overwrite it with the resumed live PID.
+          ...(officialOnly ? {} : { officialMainPid: liveOfficial.mainPid }),
           resumable: false,
           error: null,
         });
@@ -1965,7 +2039,11 @@ export function createDesktopUpdateTransaction(
     // re-entering the return leg would clobber their diagnostic with a
     // lifecycle-gate error.
     if (receipt.phase === "failed") return receipt;
-    if (receipt.observed) return returnToRequestedEnvironment(receipt);
+    if (receipt.observed) {
+      return officialOnly
+        ? verifyIndependentOfficialAndComplete(receipt)
+        : returnToRequestedEnvironment(receipt);
+    }
     return handoffAndAwaitNativeUpdate(receipt);
   }
 
@@ -2018,7 +2096,7 @@ export function createDesktopUpdateTransaction(
       if (existing.phase !== "awaiting_native_update") return null;
       assertLifecycleReceiptsIdle(root, {
         contextOwned: false,
-        desktopTransactionId: existing.transactionId,
+        ...ownReceiptAllowance(existing.transactionId),
         environmentTransactionId: existing.environmentTransactionId ?? undefined,
       });
       return update(existing, {
@@ -2042,7 +2120,7 @@ export function createDesktopUpdateTransaction(
       }
       assertLifecycleReceiptsIdle(root, {
         contextOwned: false,
-        desktopTransactionId: existing.transactionId,
+        ...ownReceiptAllowance(existing.transactionId),
         environmentTransactionId: existing.environmentTransactionId ?? undefined,
       });
       if (existing.phase !== "awaiting_native_update"

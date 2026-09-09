@@ -23,6 +23,8 @@ export function isLifecycleLockHeld(userRoot: string): boolean {
 export interface LifecycleReceiptAllowance {
   environmentTransactionId?: string;
   desktopTransactionId?: string;
+  /** Exact independent official-app update allowed to resume or cancel itself. */
+  officialUpdateTransactionId?: string;
   /** Disable implicit ownership for preflight checks that run inside a new owner. */
   contextOwned?: boolean;
   /**
@@ -101,14 +103,19 @@ export function assertLifecycleReceiptsIdle(
     }
   }
 
-  const desktop = readDesktopUpdateReceipt(join(userRoot, "transactions", "desktop-update.json"));
-  if (desktop) {
+  const checkDesktopReceipt = (
+    desktop: ReturnType<typeof readDesktopUpdateReceipt>,
+    source: "Desktop update" | "Official ChatGPT update",
+    allowedTransactionId: string | undefined,
+    contextMayOwn: boolean,
+  ): void => {
+    if (!desktop) return;
     const detail = desktopReceiptBlocksLifecycle(desktop);
     const desktopRollbackFailed = desktop.phase === "failed"
       && /\brollback failed\b/i.test(desktop.error ?? "");
     const unsafeDesktopFailure = desktop.phase === "failed"
       && (desktop.safeOfficialMode !== true || desktopRollbackFailed);
-    const contextOwns = context?.startsWith("desktop update") === true;
+    const contextOwns = contextMayOwn && context?.startsWith("desktop update") === true;
     // Recovering the exact environment transaction that the blocking desktop
     // receipt itself recorded is a prerequisite of that receipt's own
     // continuation, not an unrelated mutation. Without this, `environment
@@ -126,15 +133,31 @@ export function assertLifecycleReceiptsIdle(
       && environment.transactionId === allowance.environmentTransactionId
       && environmentDetail !== null;
     if (detail !== null
-      && desktop.transactionId !== allowance.desktopTransactionId
+      && desktop.transactionId !== allowedTransactionId
       && !contextOwns
       && !ownsCoupledEnvironment) {
       const instruction = unsafeDesktopFailure
         ? "recover it explicitly before another lifecycle operation"
         : "resume or cancel it before another lifecycle operation";
       throw new Error(
-        `Desktop update ${desktop.transactionId} is ${detail}; ${instruction}`,
+        `${source} ${desktop.transactionId} is ${detail}; ${instruction}`,
       );
     }
-  }
+  };
+
+  checkDesktopReceipt(
+    readDesktopUpdateReceipt(join(userRoot, "transactions", "desktop-update.json")),
+    "Desktop update",
+    allowance.desktopTransactionId,
+    true,
+  );
+  // The independent official updater uses a separate durable receipt. It
+  // never owns a selected-environment desktop update merely because both
+  // operations share the lifecycle-lock label; only its exact id crosses.
+  checkDesktopReceipt(
+    readDesktopUpdateReceipt(join(userRoot, "transactions", "chatgpt-app-update.json")),
+    "Official ChatGPT update",
+    allowance.officialUpdateTransactionId,
+    false,
+  );
 }

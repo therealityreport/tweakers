@@ -3,12 +3,13 @@ import test from "node:test";
 import { readRouterLaunchSelection, routerConfigFingerprint, validateRouterConfig } from "../../src/account-router/config";
 import { CorrelationTable, classifyClientMethod, classifyServerNotification, parseJsonRpcLine } from "../../src/account-router/protocol";
 import { assertRedacted, redactedRouterError, serializeRedactedStatus } from "../../src/account-router/redaction";
-import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type RouterConfig, type RouterConfigV2 } from "../../src/account-router/types";
+import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type RouterConfig, type RouterConfigV2, type RouterConfigV3 } from "../../src/account-router/types";
 
 const accountA = `ar_${"A".repeat(43)}` as const;
 const accountB = `ar_${"B".repeat(43)}` as const;
 const sharedV2AccountA = `ar_${"a".repeat(43)}` as const;
 const sharedV2AccountB = `ar_${"c".repeat(43)}` as const;
+const sharedV3AccountC = `ar_${"e".repeat(43)}` as const;
 
 function config(): RouterConfig {
   return {
@@ -22,6 +23,24 @@ function config(): RouterConfig {
     ],
     updatedAt: "2026-08-19T12:00:00Z",
   };
+}
+
+function poolConfig(): RouterConfigV3 {
+  const draft: Omit<RouterConfigV3, "fingerprint"> = {
+    schemaVersion: 3,
+    mode: "quota_aware",
+    policy: "quota_aware_v2",
+    generation: 8,
+    protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+    primaryOpaqueAccountId: sharedV2AccountA,
+    accounts: [
+      { opaqueAccountId: sharedV2AccountA, included: true, weight: 1, capabilityFingerprint: `sha256:${"b".repeat(64)}`, label: "Alpha" },
+      { opaqueAccountId: sharedV2AccountB, included: false, weight: 1, capabilityFingerprint: `sha256:${"d".repeat(64)}`, label: "Beta" },
+      { opaqueAccountId: sharedV3AccountC, included: true, weight: 1, capabilityFingerprint: `sha256:${"e".repeat(64)}`, label: "Gamma" },
+    ],
+    updatedAt: "2026-09-01T12:00:00.000Z",
+  };
+  return { ...draft, fingerprint: routerConfigFingerprint(draft) };
 }
 
 function quotaConfig(): RouterConfigV2 {
@@ -72,6 +91,20 @@ test("v2 config fixes exactly two labelled accounts and has a stable cross-write
   const manual = { ...manualDraft, fingerprint: routerConfigFingerprint(manualDraft) };
   assert.deepEqual({ mode: readRouterLaunchSelection("/private/router.json", () => JSON.stringify(manual), () => true).mode,
     reason: readRouterLaunchSelection("/private/router.json", () => JSON.stringify(manual), () => true).reason }, { mode: "mux", reason: "manual" });
+});
+
+test("v3 config supports three or more accounts and preserves disabled enrollment", () => {
+  const pool = poolConfig();
+  assert.deepEqual(validateRouterConfig(pool), pool);
+  assert.deepEqual(
+    { mode: readRouterLaunchSelection("/private/router.json", () => JSON.stringify(pool), () => true).mode,
+      reason: readRouterLaunchSelection("/private/router.json", () => JSON.stringify(pool), () => true).reason },
+    { mode: "mux", reason: "quota_aware" },
+  );
+  const noneEnabledDraft = { ...pool, accounts: pool.accounts.map((account) => ({ ...account, included: false })) };
+  assert.equal(validateRouterConfig({ ...noneEnabledDraft, fingerprint: routerConfigFingerprint(noneEnabledDraft) }), null);
+  const disabledPrimaryDraft = { ...pool, accounts: pool.accounts.map((account, index) => ({ ...account, included: index !== 0 })) };
+  assert.equal(validateRouterConfig({ ...disabledPrimaryDraft, fingerprint: routerConfigFingerprint(disabledPrimaryDraft) }), null);
 });
 
 test("correlation ids preserve JSON id type, are single-use, and reject the wrong child", () => {

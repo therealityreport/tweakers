@@ -24,7 +24,9 @@ test("main contextual handler binds only an owned live BrowserWindow renderer", 
   assert.match(owned, /BrowserWindow\.getAllWindows\(\)/);
 
   const bridge = main.slice(main.indexOf("function makeMainIpc"), main.indexOf("function makeMainFs"));
-  assert.match(bridge, /sender: Object\.freeze\(\{ webContentsId: sender\.id \}\)/);
+  assert.match(bridge, /const senderContext = Object\.freeze\(\{ webContentsId: sender\.id \}\)/);
+  assert.match(bridge, /accountsBrokerInvocationContexts\.set\(senderContext, brokerInvocation\)/);
+  assert.match(bridge, /sender: senderContext/);
   assert.match(bridge, /return handler\(context, \.\.\.args\)/);
   assert.doesNotMatch(bridge, /handler\(event/);
 });

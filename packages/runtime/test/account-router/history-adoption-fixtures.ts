@@ -11,7 +11,7 @@ import {
   type HistoryAdoptionReceiptV1,
 } from "../../src/account-router/history-adoption";
 import { createInitialRouterState } from "../../src/account-router/state-store";
-import type { RouterConfigV2 } from "../../src/account-router/types";
+import type { RouterConfigV2, RouterConfigV3 } from "../../src/account-router/types";
 
 const DATABASES = [
   "goals_1.sqlite", "logs_2.sqlite", "memories_1.sqlite", "queue_1.sqlite", "state_5.sqlite", "thread_history_1.sqlite",
@@ -38,7 +38,7 @@ export function signHistoryDocument<T extends Record<string, unknown>>(payload: 
 
 export function publishHistoryAdoptionEvidence(input: {
   root: string;
-  config: RouterConfigV2;
+  config: RouterConfigV2 | RouterConfigV3;
   secret: Buffer;
   threadIds?: readonly string[];
   adoptedAt?: string;

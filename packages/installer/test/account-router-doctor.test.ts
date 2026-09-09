@@ -28,6 +28,7 @@ const balanced: AccountRouterEvidence = {
       degradedReason: null,
     },
   },
+  broker: { state: "not_running", status: null },
 };
 
 const quotaAware: AccountRouterEvidence = {
@@ -204,6 +205,48 @@ test("doctor treats adopted v2 Manual as a healthy mux-backed configuration", ()
   };
   const checks = accountRouterDoctorChecks(manual);
   assert.equal(checks.every((check) => check.ok === true), true);
-  assert.match(checks.find((check) => check.name === "account history adoption")!.detail, /valid; v2 Manual remains mux-backed for history and assigns new threads to the primary account/);
+  assert.match(checks.find((check) => check.name === "account history adoption")!.detail, /valid; Manual remains mux-backed for history and assigns new threads to the primary account/);
   assert.match(checks.at(-1)!.detail, /authenticated manual/);
+});
+
+test("doctor surfaces authenticated shared-broker clients, bounded children, handoffs, and browser evidence without opaque handles", () => {
+  const brokered: AccountRouterEvidence = {
+    ...quotaAware,
+    configuration: {
+      ...quotaAware.configuration,
+      pending: {
+        schemaVersion: 3,
+        mode: "quota_aware",
+        policy: "quota_aware_v2",
+        generation: 9,
+        fingerprint: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      },
+    },
+    broker: {
+      state: "active",
+      status: {
+        state: "available",
+        registeredClients: { total: 2, chatgpt: 1, tweakers: 1 },
+        residentChildren: 2,
+        maxResidentChildren: 2,
+        heldWorkCount: 0,
+        childStates: { absent: 0, resident: 1, active: 1, held: 0, evicted: 0 },
+        pendingHandoffs: { pendingCount: 0, ambiguousCount: 0 },
+        browserEvidence: { observed: true, observedAt: "2026-09-02T12:00:00.000Z" },
+      },
+    },
+  };
+  const health = accountRouterDoctorChecks(brokered).find((check) => check.name === "account broker live")!;
+  assert.equal(health.ok, true);
+  assert.match(health.detail, /2 registered desktop clients; 2\/2 resident children/);
+  assert.doesNotMatch(JSON.stringify(health), /br_[A-Za-z0-9_-]{16,128}|ar_[A-Za-z0-9_-]{43}|secret|token|cookie|\/Users\//i);
+
+  const ambiguous = {
+    ...brokered,
+    broker: {
+      ...brokered.broker,
+      status: { ...brokered.broker.status!, pendingHandoffs: { pendingCount: 0, ambiguousCount: 1 } },
+    },
+  };
+  assert.equal(accountRouterDoctorChecks(ambiguous).find((check) => check.name === "account broker live")!.ok, false);
 });

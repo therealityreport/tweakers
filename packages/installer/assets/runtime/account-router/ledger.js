@@ -75,14 +75,18 @@ class AccountLedger {
                 weeklyResetAt: observation.weeklyResetAt,
                 shortWindowPressure: observation.shortWindowPressure,
                 assignedThreadCount: ledger.assignedThreadCount,
+                resetCredits: observation.resetCredits,
                 configuredIndex,
             };
         });
-        // v2 always has two accounts, and both have to remain eligible. Do not
-        // quietly turn a two-account policy into a single-account fallback.
-        if (candidates.length !== 2 || candidates.some((candidate) => candidate === null))
+        // Preserve v2's exact-pair fail-closed behavior. V3 intentionally selects
+        // from the currently eligible subset of the enabled pool.
+        if (this.config.schemaVersion === 2 && (candidates.length !== 2 || candidates.some((candidate) => candidate === null)))
             return null;
-        const sorted = candidates.sort((left, right) => (0, quota_1.compareQuotaCandidates)(left, right, this.now()));
+        const eligible = candidates.filter((candidate) => candidate !== null);
+        if (eligible.length === 0)
+            return null;
+        const sorted = eligible.sort((left, right) => (0, quota_1.compareQuotaCandidates)(left, right, this.now()));
         const chosen = sorted[0];
         this.lastSelection.set(chosen.opaqueAccountId, this.now());
         return { opaqueAccountId: chosen.opaqueAccountId, normalizedSpend: normalizedSpend(state, chosen.opaqueAccountId) };

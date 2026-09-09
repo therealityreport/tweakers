@@ -10,6 +10,32 @@ const { spawnSync } = require("node:child_process");
 const tweak = require("../index.js");
 const { _test } = tweak;
 
+function brokerPublicId(prefix, seed) {
+  const encoded = String(seed).replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 43).padEnd(43, "A");
+  return `${prefix}_${encoded}`;
+}
+
+function brokerAccountId(seed) { return brokerPublicId("account", seed); }
+function brokerConnectionId(seed) { return brokerPublicId("connection", seed); }
+function brokerConversationId(seed) { return brokerPublicId("conversation", seed); }
+function brokerSegmentId(seed) { return brokerPublicId("segment", seed); }
+function brokerClientId(seed) { return brokerPublicId("client", seed); }
+function brokerTurnId(seed) { return brokerPublicId("turn", seed); }
+function brokerConfirmationId(seed) { return brokerPublicId("confirmation", seed); }
+
+test("legacy balance projections remain parse-only and reject forged parameters", () => {
+  const envelope = { version: 1, action: "broker", requestId: "balance", command: "balance.set", params: { enabled: true } };
+  assert.deepEqual(_test.normalizeAccountBrokerRequest(envelope), envelope);
+  assert.equal(_test.normalizeAccountBrokerRequest({ ...envelope, params: { enabled: true, token: "private" } }), null);
+  assert.equal(_test.normalizeAccountBrokerRequest({ ...envelope, params: { enabled: "true" } }), null);
+  const value = { policy: "balanced_tokens_v1", baselineAt: null, accounts: [{ accountId: brokerAccountId("a"),
+    completedTokens: 10, reservedTokens: 500, unreportedTokens: 0, sharePercent: null, precision: "unknown" }], degradedReason: "usage_unknown", nextAccountId: null };
+  assert.deepEqual(_test.projectAccountBrokerResult("balance.read", value), value);
+  assert.equal(_test.projectAccountBrokerResult("balance.read", null), null);
+  assert.equal(_test.projectAccountBrokerResult("balance.read", { ...value, accounts: [...value.accounts, ...value.accounts] }), null);
+  assert.equal(_test.projectAccountBrokerResult("balance.read", { ...value, accounts: [{ ...value.accounts[0], completedTokens: -1 }] }), null);
+});
+
 function auth(value, accountId = "account-" + value) {
   return JSON.stringify({
     auth_mode: "chatgpt",
@@ -68,9 +94,25 @@ function fixture(options = {}) {
     async flush() {},
   };
   const runtimeInfo = options.runtimeInfo || { codexVersion: "26.810.52044", buildFlavor: "prod", resourcesPath };
-  const api = { log, storage, codex: { runtime: { async getInfo() { return runtimeInfo; } } } };
-  const service = _test.createAccountService(api, { deps, paths, onSwitched: options.onSwitched, inventory: options.inventory });
-  return { root, paths, service, deps, log, store, storage, api };
+  // Every ordinary legacy fixture explicitly receives the mode that production
+  // main owns. Tests for blocked/global authority override it below.
+  const authorityMode = options.authorityMode ?? "legacy";
+  const api = {
+    log,
+    storage,
+    codex: {
+      runtime: { async getInfo() { return runtimeInfo; } },
+      accounts: { authorityMode: () => authorityMode },
+    },
+  };
+  const service = _test.createAccountService(api, {
+    deps,
+    paths,
+    authorityMode,
+    onSwitched: options.onSwitched,
+    inventory: options.inventory,
+  });
+  return { root, paths, service, deps, log, store, storage, api, authorityMode };
 }
 
 function disposeFixture(t, setup) {
@@ -117,6 +159,78 @@ test("list is redacted, side-effect-free, and reports a dangling marker", async 
   assert.deepEqual(fs.readFileSync(setup.paths.authFile), before);
   assert.equal(fs.existsSync(setup.paths.lkgFile), false);
   assert.equal(fs.readFileSync(setup.paths.currentMarker, "utf8"), "missing.json\n", "listing must not reconcile a marker");
+});
+
+test("global-v3 and blocked authority reject every legacy IPC action before local writes or watcher startup", async (t) => {
+  const actions = [
+    { action: "list", authorityMode: "legacy" },
+    { action: "plugin-protection-status" },
+    { action: "plugin-protection-verify-current" },
+    { action: "plugin-protection-configure", enforcement: true },
+    { action: "account-username-set", ref: "forged", username: "forged" },
+    { action: "account-profile-set", ref: "forged", label: "Forged" },
+    { action: "account-enroll-start" },
+    { action: "account-enroll-status", id: "forged" },
+    { action: "account-enroll-cancel", id: "forged" },
+    { action: "account-reset-consume", ref: "forged" },
+    { action: "prepare-switch", ref: "forged" },
+    { action: "prepare-switch-bypass", ref: "forged" },
+    { action: "prepare-save", name: "forged" },
+    { action: "switch", intent: "forged" },
+    { action: "save", intent: "forged" },
+    { action: "router-status" },
+    { action: "router-configure", mode: "manual" },
+    { action: "router-recover", ref: "forged" },
+    { action: "router-reset-balance-epoch" },
+  ];
+
+  for (const authorityMode of ["global-v3", "blocked"]) {
+    let watchStarts = 0;
+    let spawned = 0;
+    const guardedFs = Object.create(fs);
+    guardedFs.watch = () => {
+      watchStarts += 1;
+      return { close() {} };
+    };
+    const setup = fixture({ authorityMode, fs: guardedFs });
+    disposeFixture(t, setup);
+    setup.deps.spawn = () => { spawned += 1; throw new Error("legacy enrollment must not start"); };
+    const authBefore = fs.readFileSync(setup.paths.authFile);
+    const markerBefore = fs.readFileSync(setup.paths.currentMarker);
+    const accountBefore = fs.readFileSync(path.join(setup.paths.accountsDir, "work.json"));
+    assert.equal(fs.existsSync(setup.paths.routerDataDir), false, authorityMode);
+
+    const status = await setup.service.handle({ action: "authority-status", authorityMode: "legacy" });
+    assert.deepEqual(status, { ok: true, authorityMode }, authorityMode);
+    for (const action of actions) {
+      const result = await setup.service.handle(action);
+      assert.equal(result?.ok, false, `${authorityMode}:${action.action}`);
+      assert.equal(result?.error?.code, "account-authority-unavailable", `${authorityMode}:${action.action}`);
+    }
+
+    assert.equal(watchStarts, 0, `${authorityMode}: legacy snapshot watcher must not start`);
+    assert.equal(spawned, 0, `${authorityMode}: legacy enrollment helper must not start`);
+    assert.deepEqual(fs.readFileSync(setup.paths.authFile), authBefore, `${authorityMode}: auth`);
+    assert.deepEqual(fs.readFileSync(setup.paths.currentMarker), markerBefore, `${authorityMode}: marker`);
+    assert.deepEqual(fs.readFileSync(path.join(setup.paths.accountsDir, "work.json")), accountBefore, `${authorityMode}: snapshot`);
+    assert.equal(fs.existsSync(setup.paths.routerDataDir), false, `${authorityMode}: router namespace`);
+    assert.equal(setup.store.size, 0, `${authorityMode}: plugin state`);
+  }
+});
+
+test("only explicit legacy authority starts the local snapshot watcher and retains local account behavior", async (t) => {
+  let watchStarts = 0;
+  const guardedFs = Object.create(fs);
+  guardedFs.watch = () => {
+    watchStarts += 1;
+    return { close() {} };
+  };
+  const setup = fixture({ authorityMode: "legacy", fs: guardedFs });
+  disposeFixture(t, setup);
+
+  assert.deepEqual(await setup.service.handle({ action: "authority-status" }), { ok: true, authorityMode: "legacy" });
+  assert.equal((await setup.service.handle({ action: "list" })).ok, true);
+  assert.equal(watchStarts, 1);
 });
 
 test("list projection exposes an account email but never provider ids or auth secrets", async (t) => {
@@ -608,13 +722,13 @@ test("secure snapshot buffers are cleared after thrown reads and writes", async 
   assert.equal(thrownWriteBuffer.every((byte) => byte === 0), true);
 });
 
-test("account metadata declares the settings surface and has a synchronized minor version", () => {
+test("account metadata declares the settings surface and has a synchronized version", () => {
   const tweakRoot = path.join(__dirname, "..");
   const manifest = JSON.parse(fs.readFileSync(path.join(tweakRoot, "manifest.json"), "utf8"));
   const pkg = JSON.parse(fs.readFileSync(path.join(tweakRoot, "package.json"), "utf8"));
 
   assert.equal(manifest.name, "Accounts");
-  assert.equal(manifest.version, "0.4.4");
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
   assert.equal(pkg.version, manifest.version);
   assert.equal(manifest.permissions.includes("settings"), true);
   assert.match(fs.readFileSync(path.join(tweakRoot, "index.js"), "utf8"), /api\.settings\?\.registerPage/);
@@ -631,6 +745,9 @@ test("visible Accounts controls use plain language instead of router and receipt
     "Plugin check before switching",
     "Check plugins",
     "Block unchecked switches",
+    "Shared Skills and installed plugin packages are read-only.",
+    "Connection status is separate for each subscription.",
+    "Only MCP can be authorized here; Apps and Plugins are status-only.",
     "Old saved-account numbers can skip, so a missing number does not mean an account is missing.",
   ]) assert.equal(source.includes(phrase), true, phrase);
   for (const oldPhrase of [
@@ -640,6 +757,8 @@ test("visible Accounts controls use plain language instead of router and receipt
     "Stage quota-aware routing",
     "Keep my existing history with",
     "2 connected subscriptions",
+    "authorizes every connection",
+    "Authorization is separate for each subscription",
   ]) assert.equal(source.includes(oldPhrase), false, oldPhrase);
 });
 
@@ -648,7 +767,7 @@ test("router presentation separates active v2 truth from a pending generation", 
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 0).label, "Save two accounts");
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 1).label, "Save one more account");
   assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 2).label, "Ready to set up");
-  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Automatic routing unavailable");
+  assert.equal(_test.routerPresentation(manual, { state: "not_applicable", status: null }, 3).label, "Ready to set up");
   const active = { mode: "quota_aware", policy: "quota_aware_v1", generation: 4, fingerprint: "sha256:" + "a".repeat(64) };
   const pending = { mode: "manual", policy: null, generation: 5, fingerprint: "sha256:" + "b".repeat(64) };
   const running = _test.routerPresentation(
@@ -724,6 +843,136 @@ test("quota pool has a bounded 0–200 calculation and unknown never becomes cap
   assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: 100, freshness: "fresh" } }]), 200);
   assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: 50, freshness: "stale" } }]), null);
   assert.equal(_test.quotaPoolRemainingPercent([{ weekly: { remainingPercent: 100, freshness: "fresh" } }, { weekly: { remainingPercent: null, freshness: "unknown" } }]), null);
+  assert.equal(_test.freshWeeklyRemainingPercent({ remainingPercent: 47, freshness: "fresh" }), 47);
+  assert.equal(_test.freshWeeklyRemainingPercent({ remainingPercent: 47, freshness: "stale" }), null, "stale usage must not render as numeric capacity");
+  assert.equal(_test.freshWeeklyRemainingPercent({ remainingPercent: 47, freshness: "unknown" }), null, "unknown usage must not render as numeric capacity");
+});
+
+test("broker pool and selected-account copy use only fresh numeric quota", () => {
+  const stale = { enabled: true, assignedTaskCount: 0, quota: { remainingPercent: 80, freshness: "stale", resetAt: "2026-09-04T12:00:00.000Z", depleted: false } };
+  const fresh = { enabled: true, assignedTaskCount: 0, quota: { remainingPercent: 20, freshness: "fresh", resetAt: null, depleted: false } };
+  const unknown = { enabled: true, assignedTaskCount: 0, quota: { remainingPercent: 99, freshness: "unknown", resetAt: null, depleted: false } };
+  const stats = _test.brokerPoolStats([stale, fresh, unknown]);
+  assert.equal(stats.remainingPercent, null, "an incomplete pool must not look healthy from a subset of readings");
+  assert.equal(stats.allDepleted, false);
+  assert.equal(_test.freshBrokerQuotaRemainingPercent(stale.quota), null);
+  assert.equal(_test.freshBrokerQuotaRemainingPercent(fresh.quota), 20);
+  assert.equal(_test.brokerQuotaText(stale.quota), "Usage not available");
+  assert.equal(_test.brokerQuotaText(unknown.quota), "Usage not available");
+  assert.match(_test.brokerQuotaText(fresh.quota), /^20% usage left/);
+  assert.equal(_test.brokerUsageValueText(stale, stats), "Not available",
+    "a selected stale account must not fall back to another account's pooled capacity");
+  assert.equal(_test.brokerUsageValueText(null, stats), "Not available",
+    "the aggregate remains unavailable while any enabled reading is unknown");
+  assert.equal(_test.brokerPoolStats([fresh, { ...fresh, quota: { ...fresh.quota, remainingPercent: 80 } }]).remainingPercent, 100);
+  const pooled = _test.brokerPoolStats([
+    { ...fresh, quota: { ...fresh.quota, remainingPercent: 90 } },
+    { ...fresh, quota: { ...fresh.quota, remainingPercent: 100 } },
+  ]);
+  assert.equal(pooled.remainingPercent, 190, "pool copy sums capacity across subscriptions");
+  assert.equal(_test.nativePooledQuota({ profile: { accounts: [
+    { ...fresh, quota: { ...fresh.quota, remainingPercent: 90 } },
+    { ...fresh, quota: { ...fresh.quota, remainingPercent: 100 } },
+  ] } }).remainingPercent, 95, "the native usage bar remains bounded to a per-subscription average");
+});
+
+test("quota projections retain refresh state and accept partial all-account results", () => {
+  const primary = brokerAccountId("quota-primary");
+  const secondary = brokerAccountId("quota-secondary");
+  const quota = {
+    remainingPercent: 73,
+    freshness: "fresh",
+    resetAt: "2026-09-08T21:00:00.000Z",
+    resetCredits: 2,
+    refreshState: "error",
+    errorCode: "connection",
+    lastAttemptAt: "2026-09-08T20:59:00.000Z",
+  };
+  assert.deepEqual(_test.projectAccountBrokerResult("quota.read", {
+    accounts: [{ accountId: primary, quota }, { accountId: secondary, quota: { ...quota, remainingPercent: 25 } }],
+    partial: true,
+  }), {
+    accounts: [
+      { accountId: primary, quota: { ...quota, depleted: false } },
+      { accountId: secondary, quota: { ...quota, remainingPercent: 25, depleted: false } },
+    ],
+    partial: true,
+  });
+
+  const state = { profile: { accounts: [
+    { accountId: primary, quota: null },
+    { accountId: secondary, quota: null },
+  ] } };
+  assert.equal(_test.applyAllAccountQuotaResult(state, {
+    accounts: [{ accountId: primary, quota }, { accountId: secondary, quota: { ...quota, remainingPercent: 25 } }],
+    partial: true,
+  }), true);
+  assert.equal(state.profile.accounts[0].quota.refreshState, "error");
+  assert.equal(state.profile.accounts[1].quota.remainingPercent, 25);
+});
+
+test("native Usage projects the pooled remaining bar and hides single-account exhaustion warnings", () => {
+  const accounts = [90, 100].map((remainingPercent, index) => ({
+    accountId: brokerAccountId(`native-usage-${index}`),
+    enabled: true,
+    assignedTaskCount: 0,
+    quota: { remainingPercent, freshness: "fresh", resetAt: null, depleted: false },
+  }));
+  const native = {
+    rate_limit: {
+      allowed: false,
+      limit_reached: true,
+      primary_window: { remainingPercent: 10, usedPercent: 90, resetsAt: 1_800_000_000, windowMinutes: 300 },
+    },
+    sidebar_usage_warnings: { default: { remainingPercent: 10 }, by_model: {} },
+    model_picker_upsell: { blocked_model_slug: "gpt-example" },
+    rate_limit_warning: { banner_type: "rate_limit", rate_limit: { allowed: false, limit_reached: true } },
+  };
+  const projected = _test.projectNativeUsageStatus({ profile: { accounts } }, native);
+  assert.equal(projected.rate_limit.primary_window.remainingPercent, 95);
+  assert.equal(projected.rate_limit.primary_window.usedPercent, 5);
+  assert.equal(projected.rate_limit.allowed, true);
+  assert.equal(projected.rate_limit.limit_reached, false);
+  assert.equal(projected.sidebar_usage_warnings, null);
+  assert.equal(projected.model_picker_upsell, null);
+  assert.equal(projected.rate_limit_warning, null);
+
+  for (const unavailableQuota of [
+    { ...accounts[1].quota, freshness: "unknown", remainingPercent: null },
+    { ...accounts[1].quota, freshness: "stale", remainingPercent: 100 },
+  ]) {
+    const incomplete = { profile: { accounts: [
+      { ...accounts[0], quota: { ...accounts[0].quota, remainingPercent: 0, depleted: true } },
+      { ...accounts[1], quota: unavailableQuota },
+    ] } };
+    const incompleteProjection = _test.projectNativeUsageStatus(incomplete, native);
+    assert.notEqual(incompleteProjection, native);
+    assert.equal(incompleteProjection.sidebar_usage_warnings, null);
+    assert.equal(incompleteProjection.model_picker_upsell, null);
+    assert.equal(incompleteProjection.rate_limit_warning, null);
+    assert.equal(incompleteProjection.rate_limit.allowed, false, "incomplete quota never invents available capacity");
+    assert.equal(incompleteProjection.rate_limit.limit_reached, true, "the selected depleted subscription remains depleted");
+    assert.equal(incompleteProjection.rate_limit.primary_window.remainingPercent, 10,
+      "unknown pooled capacity never replaces the selected account's numeric window");
+    assert.match(
+      _test.projectAccountsNativeValue(incomplete, "usage", "depleted-message", "You have reached your limit."),
+      /Pooled usage is incomplete.*another enabled subscription/i,
+    );
+  }
+});
+
+test("native Usage selection defaults to the current subscription for credit operations", () => {
+  const accountId = brokerAccountId("native-credit-owner");
+  const selections = [];
+  _test.syncAccountsNativeSelections({
+    profile: { accounts: [{ accountId, enabled: true }] },
+    selectedAccountId: accountId,
+    usageSelectionId: null,
+    profileStatisticsSelection: "pooled",
+    nativeConnectionSelections: new Map(),
+    api: { accountsNative: { select(surface, selected) { selections.push([surface, selected]); } } },
+  });
+  assert.deepEqual(selections.find(([surface]) => surface === "usage"), ["usage", accountId]);
 });
 
 test("v2 config fingerprint uses a stable fixed canonical vector", () => {
@@ -769,7 +1018,7 @@ test("legacy v1 config remains readable and manual rollback writes a v2 pending 
   const rollback = await setup.service.handle({ action: "router-configure", mode: "manual" });
   assert.equal(rollback.ok, true);
   const manual = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
-  assert.equal(manual.schemaVersion, 2);
+  assert.equal(manual.schemaVersion, 3);
   assert.equal(manual.mode, "manual");
   assert.equal(manual.policy, null);
   assert.equal(manual.accounts.length, 2);
@@ -808,7 +1057,7 @@ test("profile menu shows account identity but no global current account while au
   const flatten = (node) => `${node.textContent || ""} ${node.children.map(flatten).join(" ")}`;
   const text = flatten(panel);
   assert.match(text, /Weekly usage left/);
-  assert.match(text, /2 saved accounts/);
+  assert.match(text, /2 saved subscriptions/);
   assert.match(text, /Cannot check right now/);
   assert.match(text, /Manage accounts/);
   assert.match(text, /@taylorh/);
@@ -1032,7 +1281,7 @@ test("router controls require an explicit history owner before staging quota-awa
   historyOwner.on_change();
   assert.equal(stage.disabled, false);
   await stage.on_click();
-  assert.deepEqual(calls, [{ action: "router-configure", mode: "quota_aware", refs: ["one", "two"], primaryRef: "one", legacyOwnerRef: "two", weights: [1, 1] }]);
+  assert.deepEqual(calls, [{ action: "router-configure", mode: "quota_aware", refs: ["one", "two"], enabledRefs: ["one", "two"], primaryRef: "one", legacyOwnerRef: "two", weights: [1, 1] }]);
 });
 
 function addSavedAccount(setup, name, token, accountId) {
@@ -1312,7 +1561,7 @@ test("a deliberate pre-adoption restage replaces stale intent and projects only 
   assert.match(manualPresentation.message, /Current conversations will stay with their assigned account/);
 });
 
-test("quota-aware v2 stages exactly two isolated snapshot homes and immutable pending intent", async (t) => {
+test("quota-aware v3 stages isolated snapshot homes and immutable pending intent", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
@@ -1336,9 +1585,9 @@ test("quota-aware v2 stages exactly two isolated snapshot homes and immutable pe
 
   const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
   const config = JSON.parse(fs.readFileSync(routerPaths.configFile, "utf8"));
-  assert.equal(config.schemaVersion, 2);
+  assert.equal(config.schemaVersion, 3);
   assert.equal(config.mode, "quota_aware");
-  assert.equal(config.policy, "quota_aware_v1");
+  assert.equal(config.policy, "quota_aware_v2");
   assert.equal(config.generation, 1);
   assert.equal(config.fingerprint, _test.routerConfigFingerprint(config));
   assert.equal(config.accounts.length, 2);
@@ -1671,19 +1920,23 @@ test("targeted reauthentication rolls back source and isolated auth when receipt
   assert.deepEqual(fs.readFileSync(routerPaths.configFile), configBefore);
 });
 
-test("balanced configuration rejects a third account, invalid weights, and duplicate identity before mutating config", async (t) => {
+test("quota-aware v3 accepts a third account and rejects invalid weights before publication", async (t) => {
   const setup = fixture();
   disposeFixture(t, setup);
   addSavedAccount(setup, "second", "second", "account-second");
   addSavedAccount(setup, "third", "third", "account-third");
   const listed = await setup.service.handle({ action: "list" });
   const before = fs.readFileSync(setup.paths.authFile);
-  const third = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), weights: [1, 1, 1] });
-  assert.equal(third.ok, false);
+  const third = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.map((account) => account.ref), legacyOwnerRef: listed.accounts[0].ref, weights: [1, 1, 1] });
+  assert.equal(third.ok, true);
+  const routerPaths = _test.accountRouterPaths(setup.deps, setup.paths);
+  const threeAccountConfig = _test.readRouterConfig(setup.deps, routerPaths);
+  assert.equal(threeAccountConfig.schemaVersion, 3);
+  assert.equal(threeAccountConfig.accounts.length, 3);
   const badWeight = await setup.service.handle({ action: "router-configure", mode: "balanced", refs: listed.accounts.slice(0, 2).map((account) => account.ref), weights: [0, 1] });
   assert.equal(badWeight.ok, false);
   assert.deepEqual(fs.readFileSync(setup.paths.authFile), before);
-  assert.equal(fs.existsSync(path.join(setup.root, "tweak-data", "co.tweakers.account-switcher", "account-router-config.json")), false);
+  assert.equal(_test.readRouterConfig(setup.deps, routerPaths).accounts.length, 3);
 });
 
 test("router hardens only owner-owned 0755 children and leaves its shared parent unchanged", async (t) => {
@@ -2358,6 +2611,40 @@ function fakeAccountMenu(name, options = {}) {
   return node;
 }
 
+test("account menu rerenders preserve the owned panel, viewport scroll, and keyboard focus", (t) => {
+  const previousDocument = global.document;
+  let focused = null;
+  const child = (key) => ({
+    dataset: { tweakersFocusKey: key },
+    parentElement: null,
+    focus() { focused = this; },
+  });
+  const panel = (button) => ({
+    dataset: {}, className: "panel", children: [button], parentElement: null, scrollTop: 0,
+    contains(node) { return this.children.includes(node); },
+    replaceChildren(...children) { this.children = children; for (const item of children) item.parentElement = this; },
+    querySelector(selector) { return this.children.find((item) => selector.includes(item.dataset.tweakersFocusKey)) || null; },
+  });
+  const firstButton = child("manage");
+  const first = panel(firstButton);
+  const target = {
+    children: [],
+    append(node) { node.parentElement = this; this.children.push(node); },
+  };
+  global.document = { activeElement: firstButton };
+  t.after(() => { global.document = previousDocument; });
+
+  assert.equal(_test.mountAccountSwitcherPanel(target, first), first);
+  first.scrollTop = 214;
+  const replacementButton = child("manage");
+  const replacement = panel(replacementButton);
+  const mounted = _test.mountAccountSwitcherPanel(target, replacement);
+  assert.equal(mounted, first, "the native trigger keeps the same directly owned panel through a geometry cycle");
+  assert.equal(target.children.length, 1);
+  assert.equal(mounted.scrollTop, 214);
+  assert.equal(focused, replacementButton);
+});
+
 test("account-menu targeting selects one nested host menu and fails closed on ambiguity", (t) => {
   const previousWindow = global.window;
   global.window = { innerWidth: 1000, innerHeight: 1000 };
@@ -2478,8 +2765,9 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
     const pending = [...timers.values()];
     timers.clear();
     for (const callback of pending) callback();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Broker-first rendering adds a bounded async turn before the read-only
+    // legacy fallback used by this compatibility fixture.
+    for (let turn = 0; turn < 6; turn += 1) await Promise.resolve();
   };
 
   global.window = fakeWindow;
@@ -2497,6 +2785,15 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
     ipc: {
       async invoke(channel, request) {
         assert.equal(channel, "accounts");
+        if (request.action === "broker") {
+          return {
+            version: 1,
+            requestId: request.requestId,
+            ok: false,
+            error: { code: "broker_unavailable", retryable: true },
+          };
+        }
+        if (request.action === "authority-status") return { ok: true, authorityMode: "legacy" };
         if (request.action === "router-status") return { ok: true, router: { schemaVersion: 2, mode: "manual", policy: null, pending: null, restartRequired: false, degradedReason: null }, live: { state: "not_applicable", status: null } };
         assert.deepEqual(request, { action: "list" });
         listCalls += 1;
@@ -2510,7 +2807,7 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
     react: {
       host: {
         observe(kinds, listener) {
-          assert.deepEqual(kinds, ["account-menu"]);
+          assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "plugins-settings", "mcp-settings"]);
           hostListener = listener;
           return () => { hostDisconnects += 1; };
         },
@@ -2580,4 +2877,1471 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
   tweak.stop();
   assert.equal(hostDisconnects, 1);
   assert.equal(unregisters, 1);
+});
+
+test("native account menus never fall back to local controls when main says global-v3 or blocked", async (t) => {
+  const previousWindow = global.window;
+  const previousDocument = global.document;
+  const nodes = new Set();
+  const element = (tagName, options = {}) => {
+    const node = {
+      tagName,
+      dataset: {},
+      attrs: { ...(options.attrs || {}) },
+      children: [],
+      parentElement: null,
+      textContent: options.text || "",
+      className: "",
+      type: "",
+      getAttribute(name) { return this.attrs[name] ?? null; },
+      setAttribute(name, value) { this.attrs[name] = String(value); },
+      append(...children) {
+        for (const child of children) {
+          child.remove?.();
+          child.parentElement = this;
+          this.children.push(child);
+        }
+      },
+      remove() {
+        if (!this.parentElement) return;
+        this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+        this.parentElement = null;
+      },
+      addEventListener() {},
+      contains(other) { return this === other || this.children.some((child) => child.contains(other)); },
+      getBoundingClientRect() { return { width: 430, height: 560, top: 120, left: 24, right: 454, bottom: 680 }; },
+    };
+    nodes.add(node);
+    return node;
+  };
+  global.window = { innerWidth: 1000, innerHeight: 1000 };
+  global.document = {
+    createElement: (tagName) => element(tagName),
+    querySelectorAll(selector) {
+      if (selector === "[data-tweakers-account-switcher]") {
+        return [...nodes].filter((node) => node.dataset.tweakersAccountSwitcher === "true" && node.parentElement);
+      }
+      return [];
+    },
+  };
+  t.after(() => {
+    global.window = previousWindow;
+    global.document = previousDocument;
+  });
+
+  const text = (node) => `${node.textContent || ""}${node.children.map(text).join("")}`;
+  for (const [authorityMode, code] of [["global-v3", "broker_unavailable"], ["blocked", "broker_unavailable"], ["blocked", "broker_setup_required"]]) {
+    const menu = element("div", {
+      text: "Usage remaining Settings Log out",
+      attrs: { role: "menu" },
+    });
+    const requests = [];
+    const state = {
+      accountMenus: [menu],
+      disposed: false,
+      brokerRequestNonce: 0,
+      api: {
+        ipc: {
+          async invoke(channel, request) {
+            assert.equal(channel, "accounts");
+            requests.push(request);
+            if (request.action === "broker") {
+              return {
+                version: 1,
+                requestId: request.requestId,
+                ok: false,
+                error: { code, retryable: code !== "broker_setup_required" },
+              };
+            }
+            if (request.action === "authority-status") return { ok: true, authorityMode };
+            assert.fail(`unexpected local fallback: ${request.action}`);
+          },
+        },
+        settings: { async openPage() { return { ok: true }; } },
+        log: { warn() {} },
+      },
+    };
+
+    await _test.injectAccountMenus(state);
+    assert.equal(requests.filter((request) => request.action === "broker").length, 1, authorityMode);
+    assert.equal(requests.filter((request) => request.action === "authority-status").length, 1, authorityMode);
+    assert.equal(requests.some((request) => request.action === "list" || request.action === "router-status"), false, authorityMode);
+    assert.equal(menu.children.length, 1, authorityMode);
+    if (code === "broker_setup_required") {
+      assert.match(text(menu.children[0]), /Account setup is incomplete/);
+      assert.match(text(menu.children[0]), /View setup steps/);
+    } else {
+      assert.match(text(menu.children[0]), /Accounts are unavailable right now/);
+    }
+    assert.doesNotMatch(text(menu.children[0]), /Choose an account yourself|Save at least two subscriptions/);
+  }
+});
+
+test("incomplete account setup explains the maintenance recovery and never offers an account mutation", (t) => {
+  const previousDocument = global.document;
+  const node = () => ({ children: [], textContent: "", attrs: {}, events: {},
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    addEventListener(name, callback) { this.events[name] = callback; },
+  });
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+  const root = node();
+  _test.renderBrokerUnavailable(root, "broker_setup_required");
+  const text = (element) => `${element.textContent} ${element.children.map(text).join(" ")}`;
+  assert.match(text(root), /Account setup is incomplete/);
+  assert.match(text(root), /prepare shared account activation/);
+  assert.match(text(root), /After those checks pass, approve the final maintenance restart/);
+  assert.match(text(root), /history stay in place/);
+  assert.doesNotMatch(text(root), /Try again|Save current account|Remove account/);
+  _test.renderBrokerUnavailable(root, "broker_unavailable");
+  assert.match(text(root), /Accounts are unavailable right now/);
+  assert.doesNotMatch(text(root), /setup is incomplete|maintenance restart/);
+});
+
+test("broker bridge binds the owned renderer, projects responses, and removes its event subscription", async () => {
+  const calls = [];
+  const forwarded = [];
+  let eventHandler = null;
+  let subscriptionCleanups = 0;
+  const account = {
+    accountId: brokerAccountId("bridge-primary"),
+    label: "Primary",
+    email: "private@example.test",
+    providerId: "provider-account-id-must-not-cross-ipc",
+    plan: "Pro",
+    enabled: true,
+    assignedTaskCount: 2,
+    status: "ready",
+    quota: { remainingPercent: 71, freshness: "fresh", resetAt: "2026-09-03T12:00:00.000Z", resetCredits: 1 },
+  };
+  const bridge = _test.createAccountBrokerBridge({
+    codex: { accounts: {
+      async invoke(context, request) {
+        calls.push({ context, request });
+        return {
+          version: 1,
+          requestId: request.requestId,
+          ok: true,
+          result: request.command === "profile.read"
+            ? { accounts: [account], selectedAccountId: account.accountId, access_token: "must-not-cross-ipc" }
+            : {},
+        };
+      },
+      subscribe(context, handler) {
+        assert.deepEqual(context, { webContentsId: 42 });
+        eventHandler = handler;
+        return () => { subscriptionCleanups += 1; };
+      },
+    } },
+    ipc: {
+      sendToRenderer(webContentsId, channel, event) {
+        forwarded.push({ webContentsId, channel, event });
+        return true;
+      },
+    },
+  });
+
+  const profile = await bridge.handle({ sender: { webContentsId: 42 } }, {
+    version: 1, action: "broker", requestId: "bridge-profile", command: "profile.read",
+  });
+  assert.equal(profile.ok, true);
+  assert.deepEqual(calls[0].context, { webContentsId: 42 });
+  assert.equal(profile.result.accounts[0].email, "p••••••@example.test");
+  assert.equal(JSON.stringify(profile).includes("private@example.test"), false);
+  assert.equal(JSON.stringify(profile).includes("provider-account-id-must-not-cross-ipc"), false);
+  assert.equal(JSON.stringify(profile).includes("access_token"), false);
+
+  const subscribed = await bridge.handle({ sender: { webContentsId: 42 } }, {
+    version: 1, action: "broker", requestId: "bridge-subscribe", command: "events.subscribe",
+  });
+  assert.equal(subscribed.ok, true);
+  assert.equal(typeof eventHandler, "function");
+  eventHandler({
+    version: 1,
+    sequence: 1,
+    type: "profile.updated",
+    payload: { accounts: [account], selectedAccountId: account.accountId, request: "do not render this" },
+  });
+  assert.equal(forwarded.length, 1);
+  assert.equal(forwarded[0].webContentsId, 42);
+  assert.equal(forwarded[0].channel, "accounts.events");
+  assert.equal(JSON.stringify(forwarded[0].event).includes("private@example.test"), false);
+  assert.equal(JSON.stringify(forwarded[0].event).includes("do not render this"), false);
+
+  const unsubscribed = await bridge.handle({ sender: { webContentsId: 42 } }, {
+    version: 1, action: "broker", requestId: "bridge-unsubscribe", command: "events.unsubscribe",
+  });
+  assert.equal(unsubscribed.ok, true);
+  assert.equal(subscriptionCleanups, 1);
+  const unavailable = await bridge.handle({ sender: {} }, {
+    version: 1, action: "broker", requestId: "bridge-no-sender", command: "profile.read",
+  });
+  assert.deepEqual(unavailable.error, { code: "broker_unavailable", retryable: false });
+  bridge.dispose();
+  assert.equal(subscriptionCleanups, 1);
+});
+
+test("broker envelopes reject unbounded params and continuation projection retains only opaque confirmation state", () => {
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "bad-params", command: "profile.read", params: { request: "hidden" },
+  }), null);
+  assert.deepEqual(_test.projectAccountBrokerResult("handoff.confirm", {
+    confirmationId: brokerPublicId("confirmation", "handoff"),
+    state: "pending",
+    actionLabel: "Delete the pending task",
+    request: "sensitive continuation request",
+    prompt: "another sensitive value",
+  }), {
+    continuation: { confirmationId: brokerPublicId("confirmation", "handoff"), state: "pending", expiresAt: null },
+  });
+  assert.equal(_test.projectAccountBrokerResult("profile.read", {
+    accounts: [
+      {
+        accountId: brokerAccountId("projection-primary"), label: "Primary", enabled: true, status: "ready",
+        quota: { remainingPercent: 50, freshness: "fresh", resetAt: null, resetCredits: 0 },
+      },
+      { accountId: "not an opaque handle", label: "Unsafe", quota: { remainingPercent: 10 } },
+    ],
+  }), null, "a malformed broker row fails the whole bounded projection rather than changing the pool silently");
+});
+
+test("shared history is redacted, preserves partial and ambiguous states, and exposes committed turn ownership", () => {
+  const primary = { accountId: brokerAccountId("history-primary"), label: "Primary" };
+  const secondary = { accountId: brokerAccountId("history-secondary"), label: "Secondary" };
+  const conversation = {
+    conversationId: brokerConversationId("history"),
+    availability: "partial",
+    segments: [
+      { segmentId: brokerSegmentId("one"), subscription: primary, state: "committed", committedAt: "2026-09-02T19:20:00.000Z", providerThreadId: "must-not-render" },
+      { segmentId: brokerSegmentId("two"), subscription: secondary, state: "ambiguous", nativeThreadId: "must-not-render" },
+    ],
+    activeClient: { clientId: brokerClientId("desktop"), label: "Codex on this Mac", subscription: secondary },
+    peerBusy: true,
+    updatedAt: "2026-09-02T19:21:00.000Z",
+    transcript: "must-not-render",
+  };
+  const projected = _test.projectAccountBrokerResult("history.read", {
+    conversation,
+    turns: [{ turnId: brokerTurnId("one"), subscription: primary, state: "committed", content: "must-not-render" }],
+  });
+
+  assert.deepEqual(projected, {
+    conversation: {
+      conversationId: conversation.conversationId,
+      availability: "partial",
+      segments: [
+        { segmentId: brokerSegmentId("one"), subscription: primary, state: "committed", committedAt: "2026-09-02T19:20:00.000Z" },
+        { segmentId: brokerSegmentId("two"), subscription: secondary, state: "ambiguous", committedAt: null },
+      ],
+      activeClient: { clientId: brokerClientId("desktop"), label: "Codex on this Mac", subscription: secondary },
+      peerBusy: true,
+      updatedAt: "2026-09-02T19:21:00.000Z",
+    },
+    turns: [{ turnId: brokerTurnId("one"), subscription: primary, state: "committed" }],
+  });
+  assert.match(_test.sharedHistoryAvailabilityText(projected.conversation), /ambiguous/i, "a known ambiguous segment outranks generic partial availability");
+  assert.match(_test.sharedHistoryAvailabilityText({ ...projected.conversation, historyWarning: null, activeClient: null }), /some earlier history is not available/i);
+  assert.match(_test.sharedHistoryAvailabilityText({ ...projected.conversation, availability: "ambiguous" }), /will not be replayed/i);
+  assert.equal(JSON.stringify(projected).includes("must-not-render"), false);
+
+  const empty = _test.projectAccountBrokerResult("history.read", { conversation: null, turns: [] });
+  assert.deepEqual(empty, { conversation: null, turns: [] }, "a successful empty canonical-history response is a current state, not a failed projection");
+  assert.equal(_test.projectAccountBrokerResult("history.read", { conversation: null, turns: projected.turns }), null,
+    "orphaned turns cannot survive an empty current-history response");
+
+  const event = _test.projectAccountBrokerEvent({ version: 1, sequence: 1, type: "turn.committed", payload: { turn: projected.turns[0] } });
+  assert.deepEqual(event.payload, {});
+  const continuation = _test.projectAccountBrokerResult("handoff.confirm", {
+    continuation: {
+      confirmationId: brokerConfirmationId("switch"), state: "pending", kind: "subscription_switch",
+      fromSubscription: primary, toSubscription: secondary, conversationId: conversation.conversationId,
+      expiresAt: "2026-09-02T19:25:00.000Z",
+    },
+  });
+  assert.equal(continuation.continuation.kind, "subscription_switch");
+  assert.equal(continuation.continuation.toSubscription.label, "Secondary");
+});
+
+test("current shared-history invalidations refetch once, render canonical turns, reject malformed events, and stop after cleanup", async (t) => {
+  const previousDocument = global.document;
+  const node = () => ({
+    children: [], attrs: {}, dataset: {}, textContent: "", className: "", isConnected: true,
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    remove() { this.removed = true; },
+  });
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+
+  const subscription = { accountId: brokerAccountId("event-primary"), label: "Primary" };
+  const history = _test.projectBrokerSharedHistory({
+    conversationId: brokerConversationId("event"), availability: "complete",
+    segments: [{ segmentId: brokerSegmentId("event"), subscription, state: "committed" }],
+    activeClient: null, peerBusy: false, updatedAt: "2026-09-02T20:30:00.000Z",
+  });
+  const turn = { turnId: brokerTurnId("event"), subscription, state: "committed" };
+  const statusRoot = node();
+  const composerRoot = node();
+  const turnRoot = node();
+  const requests = [];
+  const state = {
+    disposed: false, brokerSequence: 0, brokerRequestNonce: 0,
+    sharedHistory: null, sharedHistoryTurns: [], sharedHistoryRevision: 0, sharedHistoryRefreshPromise: null,
+    sharedHistoryAdapterCleanup: null, sharedHistoryAdapterRevision: 0, brokerRoots: new Set(),
+    api: {
+      ipc: { async invoke(_channel, request) {
+        requests.push(request);
+        return { version: 1, requestId: request.requestId, ok: true, result: { conversation: history, turns: [turn] } };
+      } },
+      react: { host: { async getSharedHistoryTarget() {
+        return { status: "available", target: {
+          kind: "shared-history-conversation", conversationId: history.conversationId,
+          statusRoot, composerRoot, assistantTurns: [{ turnId: turn.turnId, root: turnRoot }], isCurrent: () => true,
+        } };
+      } } },
+    },
+  };
+  const events = ["history.updated", "conversation.updated", "turn.committed"];
+  for (const [index, type] of events.entries()) {
+    const projected = _test.projectAccountBrokerEvent({
+      version: 1, sequence: index + 1, type, payload: { untrustedTranscript: "never render" },
+    });
+    assert.deepEqual(projected?.payload, {}, `${type} is a content-free invalidation`);
+  }
+  const paired = _test.handleAccountBrokerEvent(state, { version: 1, sequence: 1, type: "history.updated", payload: {} });
+  const duplicate = _test.handleAccountBrokerEvent(state, { version: 1, sequence: 2, type: "conversation.updated", payload: {} });
+  assert.equal(paired, duplicate, "paired invalidations share the first immediate history.read");
+  await paired;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.filter((request) => request.command === "history.read").length, 1);
+  assert.equal(state.sharedHistory.conversationId, history.conversationId);
+  assert.equal(statusRoot.children[0].textContent, "All committed conversation history is available.");
+  assert.equal(turnRoot.children[0].textContent, "Answered by Primary");
+  assert.equal(JSON.stringify(state.sharedHistory).includes("untrustedTranscript"), false);
+
+  state.api.ipc.invoke = async (_channel, request) => {
+    requests.push(request);
+    return { version: 1, requestId: request.requestId, ok: true, result: { conversation: null, turns: [] } };
+  };
+  await _test.handleAccountBrokerEvent(state, { version: 1, sequence: 3, type: "history.updated", payload: {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.sharedHistory, null, "a later successful empty response clears the prior conversation");
+  assert.deepEqual(state.sharedHistoryTurns, [], "a later successful empty response clears prior turns");
+  assert.equal(statusRoot.children[0].removed, true, "the old conversation adapter is removed after the current history becomes empty");
+  assert.equal(_test.projectAccountBrokerEvent({ version: 1, sequence: 4, type: "turn.committed", payload: "not-an-object" }), null);
+  assert.equal(_test.projectAccountBrokerEvent({ version: 1, sequence: 5, type: "turn", payload: {} }), null);
+
+  let resolveLate;
+  state.sharedHistoryRefreshPromise = null;
+  state.api.ipc.invoke = async (_channel, request) => {
+    requests.push(request);
+    return new Promise((resolve) => { resolveLate = () => resolve({ version: 1, requestId: request.requestId, ok: true, result: { conversation: history, turns: [turn] } }); });
+  };
+  const late = _test.handleAccountBrokerEvent(state, { version: 1, sequence: 6, type: "turn.committed", payload: {} });
+  state.disposed = true;
+  resolveLate();
+  await late;
+  assert.equal(statusRoot.children.length, 1, "cleanup prevents a late refetch from mounting another adapter");
+});
+
+test("subscription-switch confirmation selects only eligible destinations and sends its public account handle", async (t) => {
+  const previousDocument = global.document;
+  const nodes = [];
+  const node = (tagName) => {
+    const value = {
+      tagName, children: [], attrs: {}, dataset: {}, textContent: "", className: "", style: {}, value: "", disabled: false,
+      append(...children) { this.children.push(...children); },
+      setAttribute(name, content) { this.attrs[name] = String(content); },
+      addEventListener(name, listener) { (this.listeners ||= {})[name] = listener; },
+    };
+    nodes.push(value);
+    return value;
+  };
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+  const primary = { accountId: brokerAccountId("switch-primary"), label: "Primary" };
+  const secondary = { accountId: brokerAccountId("switch-secondary"), label: "Secondary" };
+  const unavailable = { accountId: brokerAccountId("switch-unavailable"), label: "Unavailable" };
+  const disabled = { accountId: brokerAccountId("switch-disabled"), label: "Disabled" };
+  const busy = { accountId: brokerAccountId("switch-busy"), label: "Busy" };
+  const stale = { accountId: brokerAccountId("switch-stale"), label: "Stale" };
+  const zero = { accountId: brokerAccountId("switch-zero"), label: "Zero" };
+  const continuation = {
+    confirmationId: brokerConfirmationId("switch-selector"), state: "pending", kind: "subscription_switch",
+    fromSubscription: primary, toSubscription: secondary, conversationId: brokerConversationId("switch-selector"),
+    expiresAt: "2026-09-02T20:31:00.000Z",
+  };
+  const requests = [];
+  const state = {
+    disposed: false, brokerRequestNonce: 0, pendingContinuation: continuation, brokerStatus: { textContent: "" },
+    refreshQueued: false, brokerRoots: new Set(), profile: { accounts: [
+      { ...primary, enabled: true, status: "active", quota: { freshness: "fresh", remainingPercent: 80 } },
+      { ...secondary, enabled: true, status: "ready", quota: { freshness: "fresh", remainingPercent: 20 } },
+      { ...unavailable, enabled: true, status: "unavailable", quota: { freshness: "fresh", remainingPercent: 80 } },
+      { ...disabled, enabled: false, status: "ready", quota: { freshness: "fresh", remainingPercent: 80 } },
+      { ...busy, enabled: true, status: "active", quota: { freshness: "fresh", remainingPercent: 80 } },
+      { ...stale, enabled: true, status: "ready", quota: { freshness: "stale", remainingPercent: 80 } },
+      { ...zero, enabled: true, status: "ready", quota: { freshness: "fresh", remainingPercent: 0 } },
+    ] },
+    api: { ipc: { async invoke(_channel, request) {
+      requests.push(request);
+      return { version: 1, requestId: request.requestId, ok: true, result: { continuation: { ...continuation, state: "confirmed" } } };
+    } }, react: { host: {} } },
+  };
+  assert.deepEqual(_test.eligibleContinuationDestinations(state, continuation).map((account) => account.accountId), [secondary.accountId]);
+  _test.brokerContinuationCard(state);
+  const selector = nodes.find((value) => value.tagName === "select");
+  const confirm = nodes.find((value) => value.tagName === "button" && value.textContent === "Continue");
+  assert.equal(selector.attrs["aria-label"], "Destination subscription");
+  assert.deepEqual(selector.children.map((option) => option.value), [secondary.accountId]);
+  assert.equal(confirm.disabled, false);
+  await confirm.listeners.click();
+  assert.deepEqual(requests[0].params, { confirmationId: continuation.confirmationId, accountId: secondary.accountId });
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "switch-destination", command: "handoff.confirm",
+    params: { confirmationId: continuation.confirmationId, accountId: secondary.accountId },
+  }).params, { confirmationId: continuation.confirmationId, accountId: secondary.accountId });
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "cancel-destination", command: "handoff.cancel",
+    params: { confirmationId: continuation.confirmationId, accountId: secondary.accountId },
+  }), null);
+  state.disposed = true;
+});
+
+test("shared history conversation adapter requires an exact host target and cleans up labels", (t) => {
+  const previousDocument = global.document;
+  const nodes = [];
+  const node = () => ({
+    children: [], attrs: {}, dataset: {}, textContent: "", className: "",
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    remove() { this.removed = true; },
+  });
+  global.document = { createElement() { const value = node(); nodes.push(value); return value; } };
+  t.after(() => { global.document = previousDocument; });
+  const subscription = { accountId: brokerAccountId("adapter"), label: "Primary" };
+  const history = _test.projectBrokerSharedHistory({
+    conversationId: brokerConversationId("adapter"), availability: "incomplete",
+    segments: [{ segmentId: brokerSegmentId("adapter"), subscription, state: "incomplete" }],
+    activeClient: { clientId: brokerClientId("live-peer"), label: "Other app", subscription }, peerBusy: true, historyWarning: "content_gap", updatedAt: "2026-09-02T19:20:00.000Z",
+  });
+  assert.equal(_test.projectBrokerSharedHistory({ ...history, activeClient: null }).peerBusy, false, "a missing live owner cannot be reported as a busy peer");
+  const turn = { turnId: brokerTurnId("adapter"), subscription, state: "committed" };
+  const statusRoot = node();
+  const composerRoot = node();
+  const turnRoot = node();
+  assert.equal(_test.renderSharedHistoryConversationAdapter({ kind: "conversation", conversationId: history.conversationId }, history, [turn]), null);
+  const mounted = _test.renderSharedHistoryConversationAdapter({
+    kind: "shared-history-conversation", conversationId: history.conversationId,
+    statusRoot, composerRoot, assistantTurns: [{ turnId: turn.turnId, root: turnRoot }],
+  }, history, [turn]);
+  assert.ok(mounted, "the parent bridge must supply every exact root; no selector fallback exists");
+  assert.equal(statusRoot.children[0].textContent, "A linked continuation could not safely include every item. Available conversation history is still shown. To continue, start a separate linked continuation with the intended subscription and restate or reattach the missing item there.");
+  assert.equal(composerRoot.children[0].textContent, "Another Codex app is working on this conversation.");
+  assert.equal(turnRoot.children[0].textContent, "Answered by Primary");
+  mounted.cleanup();
+  assert.equal(nodes.every((value) => value.removed === true), true);
+});
+
+test("linked-continuation failures are distinct and incomplete history preserves the safe next action", () => {
+  const required = _test.accountBrokerDisplayMessage("linked_continuation_required");
+  const unavailable = _test.accountBrokerDisplayMessage("handoff_unavailable");
+  assert.match(required, /not transferred between subscriptions/i);
+  assert.match(required, /restate or reattach/i);
+  assert.match(unavailable, /proposal is no longer available/i);
+  assert.notEqual(required, unavailable);
+  assert.equal(/provider|thread|path|native|attachment id/i.test(`${required} ${unavailable}`), false);
+  const incomplete = _test.sharedHistoryAvailabilityText({ availability: "incomplete", historyWarning: "content_gap" });
+  assert.match(incomplete, /Available conversation history is still shown/i);
+  assert.match(incomplete, /start a separate linked continuation/i);
+  assert.match(incomplete, /restate or reattach/i);
+  const active = { availability: "incomplete", historyWarning: null, activeClient: { label: "Tweakers" }, segments: [{ state: "active" }] };
+  assert.match(_test.sharedHistoryAvailabilityText(active), /response is in progress/i);
+  assert.doesNotMatch(_test.sharedHistoryAvailabilityText(active), /missing|reattach|could not safely/i);
+  assert.match(_test.sharedHistoryAvailabilityText({ ...active, historyWarning: "content_gap" }), /restate or reattach/i, "a real prior gap survives later activity");
+  assert.match(_test.sharedHistoryAvailabilityText({ ...active, historyWarning: "ambiguous" }), /ambiguous/i);
+  assert.doesNotMatch(_test.sharedHistoryAvailabilityText({ availability: "incomplete", segments: [{ state: "active" }] }), /restate|reattach|could not safely/i, "legacy activity alone is not missing-content evidence");
+});
+
+test("shared history host targets remount through public handles and release the replaced target", async (t) => {
+  const previousDocument = global.document;
+  const node = () => ({
+    children: [], attrs: {}, dataset: {}, textContent: "", className: "", isConnected: true,
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    remove() { this.removed = true; },
+  });
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+  const subscription = { accountId: brokerAccountId("remount"), label: "Primary" };
+  const history = _test.projectBrokerSharedHistory({
+    conversationId: brokerConversationId("remount"), availability: "complete",
+    segments: [{ segmentId: brokerSegmentId("remount"), subscription, state: "committed" }],
+    activeClient: null, peerBusy: false, updatedAt: "2026-09-02T19:20:00.000Z",
+  });
+  const turn = { turnId: brokerTurnId("remount"), subscription, state: "committed" };
+  const first = { statusRoot: node(), composerRoot: node(), turnRoot: node() };
+  const second = { statusRoot: node(), composerRoot: node(), turnRoot: node() };
+  let current = first;
+  const state = {
+    disposed: false, sharedHistory: history, sharedHistoryTurns: [turn],
+    sharedHistoryAdapterCleanup: null, sharedHistoryAdapterRevision: 0,
+    api: { react: { host: { async getSharedHistoryTarget() {
+      return {
+        status: "available",
+        target: {
+          kind: "shared-history-conversation", conversationId: history.conversationId,
+          statusRoot: current.statusRoot, composerRoot: current.composerRoot,
+          assistantTurns: [{ turnId: turn.turnId, root: current.turnRoot }], isCurrent: () => true,
+        },
+      };
+    } } } },
+  };
+  await _test.refreshSharedHistoryConversationAdapter(state);
+  const firstStatus = first.statusRoot.children[0];
+  assert.equal(firstStatus.textContent, "All committed conversation history is available.");
+  current = second;
+  await _test.refreshSharedHistoryConversationAdapter(state);
+  assert.equal(firstStatus.removed, true, "a remount releases the old exact host target before mounting its replacement");
+  assert.equal(second.turnRoot.children[0].textContent, "Answered by Primary");
+  _test.clearSharedHistoryConversationAdapter(state);
+  assert.equal(second.statusRoot.children[0].removed, true);
+});
+
+test("broker renderer accepts only HMAC-shaped public IDs and strips avatar URL capabilities", (t) => {
+  const accountId = brokerAccountId("avatar-owner");
+  const connectionId = brokerConnectionId("avatar-connection");
+  const profile = _test.projectAccountBrokerResult("profile.read", {
+    accounts: [{
+      accountId,
+      label: "account-2",
+      email: "p****@example.test",
+      continuityState: "deferred", continuityReason: "migration_pending",
+      avatarUrl: "https://avatars.example.test/profile.png?access_token=must-not-reach-dom#fragment",
+      enabled: true,
+      status: "ready",
+      quota: { remainingPercent: 42, freshness: "fresh", resetAt: null, resetCredits: 0 },
+    }],
+    selectedAccountId: accountId,
+  });
+  assert.equal(profile.accounts[0].avatarUrl, "https://avatars.example.test/profile.png");
+  assert.equal(profile.accounts[0].label, profile.accounts[0].email);
+  assert.notEqual(profile.accounts[0].label, "account-2");
+  assert.equal(profile.accounts[0].continuityReason, "migration_pending");
+  const previousDocument = global.document;
+  global.document = {
+    createElement(tagName) {
+      return {
+        tagName,
+        className: "",
+        style: {},
+        textContent: "",
+        setAttribute() {},
+        addEventListener() {},
+      };
+    },
+  };
+  t.after(() => { global.document = previousDocument; });
+  const image = _test.brokerAccountAvatar({
+    label: "Primary",
+    avatarUrl: "https://avatars.example.test/profile.png?access_token=must-not-reach-dom#fragment",
+  });
+  assert.equal(image.tagName, "img");
+  assert.equal(image.src, "https://avatars.example.test/profile.png");
+  assert.equal(image.referrerPolicy, "no-referrer");
+  assert.equal(_test.brokerAccountAvatar({ label: "Primary", avatarUrl: "data:image/svg+xml;base64,unsafe" }).tagName, "div");
+  assert.equal(_test.projectAccountBrokerResult("profile.read", {
+    accounts: [{
+      accountId: "chatgpt-provider-account-12345678",
+      label: "Unsafe provider identity",
+      enabled: true,
+      status: "ready",
+      quota: { remainingPercent: 42 },
+    }],
+  }), null);
+  assert.equal(_test.projectAccountBrokerResult("connection.status", {
+    accountId,
+    connection: { connectionId: "provider-connection-12345678", surface: "mcp", label: "Unsafe", status: "connected" },
+  }), null);
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1,
+    action: "broker",
+    requestId: "provider-id-request",
+    command: "connection.status",
+    params: { accountId: "chatgpt-provider-account-12345678", surface: "mcp", connectionId },
+  }), null);
+  assert.equal(_test.projectAccountBrokerResult("profile.read", {
+    accounts: [{
+      accountId,
+      label: "No remote avatar",
+      avatarUrl: "data:image/svg+xml;base64,unsafe",
+      enabled: true,
+      status: "ready",
+      quota: { remainingPercent: 42 },
+    }],
+    selectedAccountId: accountId,
+  }).accounts[0].avatarUrl, null);
+});
+
+test("a late broker subscription is explicitly released during renderer hot reload", async () => {
+  const commands = [];
+  let resolveSubscribe;
+  const state = {
+    disposed: false,
+    brokerSubscribed: false,
+    brokerRequestNonce: 0,
+    api: { ipc: {
+      invoke(_channel, request) {
+        commands.push(request);
+        if (request.command === "events.subscribe") {
+          return new Promise((resolve) => { resolveSubscribe = () => resolve({ version: 1, requestId: request.requestId, ok: true, result: {} }); });
+        }
+        return Promise.resolve({ version: 1, requestId: request.requestId, ok: true, result: {} });
+      },
+    } },
+  };
+  const pending = _test.subscribeToAccountBroker(state);
+  state.disposed = true;
+  resolveSubscribe();
+  await pending;
+  await Promise.resolve();
+  assert.deepEqual(commands.map((request) => request.command), ["events.subscribe", "events.unsubscribe"]);
+  assert.equal(state.brokerSubscribed, false);
+});
+
+test("broker projections retain an arbitrary bounded account pool and render every selector option without children", (t) => {
+  const previousDocument = global.document;
+  const nodes = [];
+  global.document = {
+    createElement(tagName) {
+      const node = {
+        tagName,
+        children: [],
+        attrs: {},
+        value: "",
+        textContent: "",
+        append(...children) { this.children.push(...children); },
+        setAttribute(name, value) { this.attrs[name] = String(value); },
+        addEventListener() {},
+      };
+      nodes.push(node);
+      return node;
+    },
+  };
+  t.after(() => { global.document = previousDocument; });
+
+  const accounts = Array.from({ length: 65 }, (_unused, index) => ({
+    accountId: brokerAccountId(String(index).padStart(16, "0")),
+    label: `Subscription ${index + 1}`,
+    enabled: true,
+    status: "ready",
+    quota: { remainingPercent: 100 - (index % 100), freshness: "fresh", resetAt: null, resetCredits: 0 },
+  }));
+  const profile = _test.projectAccountBrokerResult("profile.read", {
+    accounts,
+    selectedAccountId: accounts[64].accountId,
+  });
+
+  assert.equal(profile.accounts.length, 65);
+  assert.equal(_test.isSerializedValueWithinBound(profile), true);
+  const selector = _test.brokerAccountSelector(
+    { selectedAccountId: accounts[64].accountId },
+    profile.accounts,
+    "Profile subscription",
+    false,
+    () => assert.fail("rendering a selector must not trigger a lifecycle action"),
+  );
+  assert.equal(selector.children.length, 65);
+  assert.equal(selector.value, accounts[64].accountId);
+  assert.equal(nodes.some((node) => node.tagName === "option"), true);
+  const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  assert.equal(source.includes("ACCOUNT_BROKER_MAX_ACCOUNTS"), false);
+});
+
+test("device sign-in opens only the fixed external page in broker and legacy modes", async (t) => {
+  const opened = [];
+  for (const authorityMode of ["legacy", "global-v3"]) {
+    const f = fixture({ authorityMode });
+    disposeFixture(t, f);
+    f.deps.openExternal = async (url) => { opened.push(url); };
+    assert.deepEqual(await f.service.handle({ action: "open-device-sign-in" }), { ok: true });
+    assert.equal((await f.service.handle({ action: "open-device-sign-in", url: "https://example.test" })).ok, false);
+    f.deps.openExternal = async () => { throw new Error("opener failed"); };
+    assert.equal((await f.service.handle({ action: "open-device-sign-in" })).ok, false);
+  }
+  assert.deepEqual(opened, Array(2).fill("https://auth.openai.com/codex/device"));
+
+  const previousDocument = global.document;
+  const nodes = [];
+  global.document = { createElement(tagName) {
+    const node = { tagName, children: [], listeners: new Map(), append(...items) { this.children.push(...items); },
+      addEventListener(name, fn) { this.listeners.set(name, fn); } };
+    nodes.push(node); return node;
+  } };
+  t.after(() => { global.document = previousDocument; });
+  const requests = [];
+  const state = { activeEnrollment: { state: "waiting", userCode: "ABCD-1234", verificationUrl: opened[0] },
+    api: { ipc: { async invoke(channel, request) { requests.push(request); return { ok: true }; } } } };
+  _test.brokerEnrollmentStatusCard(state);
+  const button = nodes.find((node) => node.textContent === "Open sign-in in browser");
+  assert.equal(button.tagName, "button");
+  assert.equal(nodes.some((node) => node.tagName === "a"), false);
+  await button.listeners.get("click")();
+  assert.deepEqual(requests, [{ action: "open-device-sign-in" }]);
+  assert.equal(button.disabled, false);
+});
+
+test("device-login cancellation sends only the sealed provider login handle and never publishes it", () => {
+  const writes = [];
+  const kills = [];
+  const projected = _test.projectDeviceLogin({
+    loginId: "login-12345678",
+    userCode: "ABCD-1234",
+    verificationUrl: "https://auth.openai.com/device",
+    expiresIn: 900,
+  }, () => Date.parse("2026-09-02T12:00:00.000Z"));
+  assert.ok(projected);
+  const job = {
+    id: "enroll-12345678",
+    state: "waiting",
+    ...projected,
+    child: {
+      stdin: { write(line) { writes.push(line); } },
+      kill(signal) { kills.push(signal); },
+    },
+  };
+  const enrollments = new Map([[job.id, job]]);
+  const cancelled = _test.cancelAccountEnrollment(enrollments, { id: job.id });
+  assert.equal(cancelled.ok, true);
+  assert.equal(JSON.stringify(cancelled).includes("login-12345678"), false);
+  assert.deepEqual(JSON.parse(writes[0]), {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "account/login/cancel",
+    params: { loginId: "login-12345678" },
+  });
+  assert.deepEqual(kills, ["SIGTERM"]);
+
+  const missingLoginId = {
+    id: "enroll-87654321",
+    state: "waiting",
+    loginId: null,
+    userCode: "ABCD-1234",
+    verificationUrl: "https://auth.openai.com/device",
+    expiresAt: "2026-09-02T12:15:00.000Z",
+    child: job.child,
+  };
+  enrollments.set(missingLoginId.id, missingLoginId);
+  assert.equal(_test.cancelAccountEnrollment(enrollments, { id: missingLoginId.id }).ok, true);
+  assert.equal(writes.length, 1, "a missing sealed login handle must never fall back to params: {}");
+  assert.equal(writes.some((line) => line.includes('"params":{}')), false);
+});
+
+test("only MCP authorization is exposed while Apps and Plugins remain honest status views", () => {
+  const authorizationRequest = (surface) => _test.normalizeAccountBrokerRequest({
+    version: 1,
+    action: "broker",
+    requestId: `${surface}-authorize`,
+    command: "connection.authorize",
+    params: { accountId: brokerAccountId(surface), surface, connectionId: brokerConnectionId(surface) },
+  });
+  assert.equal(authorizationRequest("apps"), null);
+  assert.equal(authorizationRequest("plugins"), null);
+  assert.ok(authorizationRequest("mcp"));
+  const oauthResult = _test.projectAccountBrokerResult("connection.authorize", {
+    accountId: brokerAccountId("mcp-authorize"),
+    connections: [{
+      connectionId: brokerConnectionId("mcp-authorize"), surface: "mcp", label: "MCP connection",
+      status: "setup_required", authorizationAvailable: true,
+    }],
+    oauthUrl: "https://example.invalid/oauth?state=main-process-only",
+  });
+  assert.deepEqual(oauthResult, {
+    accountId: brokerAccountId("mcp-authorize"),
+    connections: [{
+      connectionId: brokerConnectionId("mcp-authorize"), surface: "mcp", label: "MCP connection",
+      status: "setup_required", authorizationAvailable: true,
+    }],
+  });
+  assert.doesNotMatch(JSON.stringify(oauthResult), /oauth|state=main-process-only/i, "the renderer projection never carries a provider OAuth URL");
+  assert.deepEqual(_test.projectBrokerConnection({
+    connectionId: brokerConnectionId("apps"),
+    surface: "apps",
+    label: "Shared Apps definition",
+    status: "connected",
+    authorizationAvailable: true,
+  }), {
+    connectionId: brokerConnectionId("apps"),
+    surface: "apps",
+    label: "Shared Apps definition",
+    status: "connected",
+    authorizationAvailable: false,
+  });
+  assert.deepEqual(_test.projectBrokerConnection({
+    connectionId: brokerConnectionId("plugins"),
+    surface: "plugins",
+    label: "Shared Plugin definition",
+    status: "setup_required",
+    authorizationAvailable: true,
+  }), {
+    connectionId: brokerConnectionId("plugins"),
+    surface: "plugins",
+    label: "Shared Plugin definition",
+    status: "setup_required",
+    authorizationAvailable: false,
+  });
+});
+
+test("plugin service failures use an explicit cache-preserving message", () => {
+  assert.match(_test.accountConnectionDisplayMessage("plugins", "broker_unavailable"), /Plugin service unavailable/);
+  assert.match(_test.accountConnectionDisplayMessage("plugins", "broker_unavailable"), /Cached plugins were not changed/);
+  assert.equal(
+    _test.accountConnectionDisplayMessage("apps", "broker_unavailable"),
+    _test.accountBrokerDisplayMessage("broker_unavailable"),
+  );
+});
+
+test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh events, and hot-reload cleanup", async (t) => {
+  const previousWindow = global.window;
+  const previousDocument = global.document;
+  const previousClearTimeout = global.clearTimeout;
+  const rendererKey = "__tweakersAccountRendererV1";
+  const hadRenderer = Object.hasOwn(globalThis, rendererKey);
+  const previousRenderer = globalThis[rendererKey];
+  const nodes = new Set();
+  const timers = new Map();
+  const hostListeners = [];
+  const commands = [];
+  let timerId = 0;
+  let hostDisconnects = 0;
+  let ipcCleanups = 0;
+  let pageUnregisters = 0;
+  let windowListenerRemovals = 0;
+  let ipcEventListener = null;
+  let pluginStatus = "setup_required";
+  let pluginListUnavailableOnce = false;
+  let mismatchNextPluginList = false;
+  let mismatchNextPluginStatus = false;
+  let deferNextMcpAuthorize = false;
+  let resolvePendingMcpAuthorize = null;
+  const windowListeners = new Map();
+  const connectionRequests = [];
+
+  function element(tagName, options = {}) {
+    const node = {
+      tagName,
+      dataset: {},
+      attrs: {},
+      children: [],
+      parentElement: null,
+      textContent: options.textContent || "",
+      className: "",
+      type: "",
+      value: "",
+      disabled: false,
+      listeners: new Map(),
+      get isConnected() { return options.root === true || this.parentElement?.isConnected === true; },
+      getAttribute(name) { return this.attrs[name] ?? null; },
+      querySelector(selector) {
+        return selector === '[data-tweakers-account-connection-rows="true"]'
+          ? find(this, (entry) => entry !== this && entry.dataset.tweakersAccountConnectionRows === "true") : null;
+      },
+      setAttribute(name, value) { this.attrs[name] = String(value); },
+      append(...children) {
+        for (const child of children) {
+          child.remove?.();
+          child.parentElement = this;
+          this.children.push(child);
+        }
+      },
+      replaceChildren(...children) {
+        for (const child of this.children) child.parentElement = null;
+        this.children = [];
+        this.textContent = "";
+        this.append(...children);
+      },
+      remove() {
+        if (!this.parentElement) return;
+        this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+        this.parentElement = null;
+      },
+      addEventListener(name, listener) { this.listeners.set(name, listener); },
+      contains(other) { return this === other || this.children.some((child) => child.contains(other)); },
+    };
+    nodes.add(node);
+    return node;
+  }
+
+  const appsRoot = element("section", { root: true });
+  const appsDuplicate = element("section", { root: true });
+  const pluginsRoot = element("section", { root: true });
+  const mcpRoot = element("section", { root: true });
+  const genericSettingsRoot = element("section", { root: true });
+  const fakeDocument = {
+    documentElement: element("html", { root: true }),
+    createElement: (tagName) => element(tagName),
+    querySelectorAll(selector) {
+      if (selector === "[data-tweakers-account-switcher]") {
+        return [...nodes].filter((node) => node.dataset.tweakersAccountSwitcher === "true" && node.parentElement);
+      }
+      if (selector === "[data-tweakers-account-connection-surface]") {
+        return [...nodes].filter((node) => node.attrs["data-tweakers-account-connection-surface"] && node.parentElement);
+      }
+      return [];
+    },
+  };
+  const fakeWindow = {
+    setTimeout(callback) {
+      timerId += 1;
+      timers.set(timerId, callback);
+      return timerId;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    addEventListener(name, listener) {
+      if (!windowListeners.has(name)) windowListeners.set(name, new Set());
+      windowListeners.get(name).add(listener);
+    },
+    removeEventListener(name, listener) {
+      windowListenerRemovals += 1;
+      windowListeners.get(name)?.delete(listener);
+    },
+    dispatchEvent() {},
+    alert() {},
+    confirm() { return false; },
+    prompt() { return null; },
+  };
+  const text = (node) => `${node.textContent || ""}${node.children.map(text).join("")}`;
+  const find = (node, predicate) => predicate(node) ? node : node.children.map((child) => find(child, predicate)).find(Boolean) || null;
+  const panelFor = (root, kind) => root.children.find((child) => child.dataset.tweakersAccountConnectionSurface === kind) || null;
+  const optionsFor = (panel) => find(panel, (node) => node.tagName === "select")?.children || [];
+  const buttonNamed = (panel, label) => Boolean(find(panel, (node) => node.tagName === "button" && node.textContent === label));
+  const flush = async () => {
+    for (let pass = 0; pass < 3; pass += 1) {
+      const pending = [...timers.values()];
+      timers.clear();
+      for (const callback of pending) callback();
+      for (let turn = 0; turn < 12; turn += 1) await Promise.resolve();
+    }
+  };
+  const accounts = [
+    {
+      accountId: brokerAccountId("native-primary"), label: "Primary", enabled: true, status: "ready", plan: "Pro",
+      quota: { remainingPercent: 71, freshness: "fresh", resetAt: "2026-09-03T12:00:00.000Z", resetCredits: 1 },
+    },
+    {
+      accountId: brokerAccountId("native-secondary"), label: "Secondary", enabled: true, status: "ready", plan: "Pro",
+      quota: { remainingPercent: 40, freshness: "fresh", resetAt: "2026-09-03T12:00:00.000Z", resetCredits: 0 },
+    },
+  ];
+  const connection = (surface, status, authorizationAvailable = true) => ({
+    connectionId: brokerConnectionId(surface),
+    surface,
+    label: `${surface} shared definition`,
+    status,
+    authorizationAvailable,
+  });
+  const brokerResponse = (request, result) => ({ version: 1, requestId: request.requestId, ok: true, result });
+  const snapshots = (appsMatches = [{ kind: "apps-settings", confidence: "high", element: appsRoot }]) => [
+    { kind: "account-menu", count: 0, matches: [] },
+    { kind: "apps-settings", count: appsMatches.length, matches: appsMatches },
+    { kind: "plugins-settings", count: 1, matches: [{ kind: "plugins-settings", confidence: "high", element: pluginsRoot }] },
+    { kind: "mcp-settings", count: 1, matches: [{ kind: "mcp-settings", confidence: "high", element: mcpRoot }] },
+    { kind: "settings-rows", count: 1, matches: [{ kind: "settings-rows", confidence: "high", element: genericSettingsRoot }] },
+  ];
+
+  global.window = fakeWindow;
+  global.document = fakeDocument;
+  global.clearTimeout = fakeWindow.clearTimeout;
+  t.after(() => {
+    try { tweak.stop(); } catch {}
+    if (hadRenderer) globalThis[rendererKey] = previousRenderer;
+    else delete globalThis[rendererKey];
+    global.window = previousWindow;
+    global.document = previousDocument;
+    global.clearTimeout = previousClearTimeout;
+  });
+
+  const api = {
+    ipc: {
+      on(channel, listener) {
+        assert.equal(channel, "accounts.events");
+        ipcEventListener = listener;
+        return () => { ipcCleanups += 1; };
+      },
+      async invoke(channel, request) {
+        assert.equal(channel, "accounts");
+        commands.push(request.command);
+        if (["events.subscribe", "events.unsubscribe"].includes(request.command)) return brokerResponse(request, {});
+        if (request.command === "profile.read") return brokerResponse(request, { accounts, selectedAccountId: accounts[0].accountId });
+        if (request.command === "quota.read") return brokerResponse(request, { accountId: request.params.accountId, quota: accounts[0].quota });
+        if (request.command === "connection.list") {
+          connectionRequests.push({ command: request.command, params: { ...request.params } });
+          if (request.params.surface === "plugins" && pluginListUnavailableOnce) {
+            pluginListUnavailableOnce = false;
+            return { version: 1, requestId: request.requestId, ok: false, error: { code: "broker_unavailable", retryable: true } };
+          }
+          const status = request.params.surface === "apps" ? "connected"
+            : request.params.surface === "plugins" ? pluginStatus : "setup_required";
+          const returnedAccountId = request.params.surface === "plugins" && mismatchNextPluginList
+            ? (mismatchNextPluginList = false, accounts[0].accountId)
+            : request.params.accountId;
+          return brokerResponse(request, {
+            accountId: returnedAccountId,
+            connections: [connection(request.params.surface, status, request.params.surface === "mcp")],
+          });
+        }
+        if (request.command === "connection.status") {
+          connectionRequests.push({ command: request.command, params: { ...request.params } });
+          const returnedAccountId = request.params.surface === "plugins" && mismatchNextPluginStatus
+            ? (mismatchNextPluginStatus = false, accounts[0].accountId)
+            : request.params.accountId;
+          return brokerResponse(request, {
+            accountId: returnedAccountId,
+            connections: [connection(request.params.surface, pluginStatus, request.params.surface === "mcp")],
+          });
+        }
+        if (request.command === "connection.authorize") {
+          connectionRequests.push({ command: request.command, params: { ...request.params } });
+          const result = {
+            accountId: request.params.accountId,
+            connections: [connection(request.params.surface, "setup_required", true)],
+          };
+          if (request.params.surface === "mcp" && deferNextMcpAuthorize) {
+            deferNextMcpAuthorize = false;
+            return new Promise((resolve) => { resolvePendingMcpAuthorize = () => resolve(brokerResponse(request, result)); });
+          }
+          return brokerResponse(request, result);
+        }
+        return brokerResponse(request, {});
+      },
+    },
+    react: { host: {
+      observe(kinds, listener) {
+        assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "plugins-settings", "mcp-settings"]);
+        hostListeners.push(listener);
+        return () => { hostDisconnects += 1; };
+      },
+    } },
+    settings: {
+      registerPage() { return { unregister() { pageUnregisters += 1; } }; },
+    },
+  };
+
+  _test.startRenderer(api);
+  hostListeners[0](snapshots());
+  await flush();
+  const appsPanel = panelFor(appsRoot, "apps-settings");
+  const pluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  const mcpPanel = panelFor(mcpRoot, "mcp-settings");
+  assert.ok(appsPanel);
+  assert.ok(pluginsPanel);
+  assert.ok(mcpPanel);
+  assert.equal(panelFor(genericSettingsRoot, "settings-rows"), null, "generic settings rows are never a compatibility target");
+  assert.equal(optionsFor(appsPanel).length, 2);
+  assert.equal(optionsFor(pluginsPanel).length, 2);
+  assert.equal(optionsFor(mcpPanel).length, 2);
+  assert.match(text(appsPanel), /Connected/);
+  assert.equal(buttonNamed(appsPanel, "Authorize"), false);
+  assert.equal(buttonNamed(pluginsPanel, "Authorize"), false);
+  assert.equal(buttonNamed(mcpPanel, "Authorize"), true);
+
+  const initialMcpSelector = find(mcpPanel, (node) => node.tagName === "select");
+  const initialMcpAuthorize = find(mcpPanel, (node) => node.tagName === "button" && node.textContent === "Authorize");
+  deferNextMcpAuthorize = true;
+  const pendingAuthorize = initialMcpAuthorize.listeners.get("click")();
+  await Promise.resolve();
+  const authorizeRequest = connectionRequests.filter((request) => request.command === "connection.authorize").slice(-1)[0];
+  assert.equal(authorizeRequest.params.accountId, accounts[0].accountId, "authorize captures the subscription that owned the rendered row");
+  assert.equal(typeof resolvePendingMcpAuthorize, "function");
+  initialMcpSelector.value = accounts[1].accountId;
+  initialMcpSelector.listeners.get("change")();
+  await flush();
+  const requestsBeforeStaleAuthorize = connectionRequests.length;
+  resolvePendingMcpAuthorize();
+  await pendingAuthorize;
+  await Promise.resolve();
+  assert.equal(connectionRequests.length, requestsBeforeStaleAuthorize, "a stale authorization response cannot refresh or mutate the newly selected subscription");
+  const selectedMcpPanel = panelFor(mcpRoot, "mcp-settings");
+  assert.equal(find(selectedMcpPanel, (node) => node.tagName === "select").value, accounts[1].accountId);
+
+  const initialPluginSelector = find(pluginsPanel, (node) => node.tagName === "select");
+  initialPluginSelector.value = accounts[1].accountId;
+  initialPluginSelector.listeners.get("change")();
+  await flush();
+  const selectedPluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  assert.equal(find(selectedPluginsPanel, (node) => node.tagName === "select").value, accounts[1].accountId);
+
+  mismatchNextPluginStatus = true;
+  const selectedPluginRefresh = find(selectedPluginsPanel, (node) => node.tagName === "button" && node.textContent === "Refresh status");
+  await selectedPluginRefresh.listeners.get("click")();
+  assert.match(text(selectedPluginsPanel), /Connection status is unavailable right now\./, "a status response for another account is discarded");
+
+  mismatchNextPluginList = true;
+  ipcEventListener({
+    version: 1,
+    sequence: 1,
+    type: "connection.updated",
+    payload: { accountId: accounts[1].accountId, connections: [connection("plugins", "setup_required", true)] },
+  });
+  await flush();
+  assert.match(text(panelFor(pluginsRoot, "plugins-settings")), /Connection status is unavailable right now\./, "a list response for another account is discarded");
+
+  hostListeners[0](snapshots([
+    { kind: "apps-settings", confidence: "high", element: appsRoot },
+    { kind: "apps-settings", confidence: "high", element: appsDuplicate },
+  ]));
+  await flush();
+  assert.equal(panelFor(appsRoot, "apps-settings"), null);
+  assert.equal(panelFor(appsDuplicate, "apps-settings"), null);
+  assert.ok(panelFor(pluginsRoot, "plugins-settings"));
+  assert.ok(panelFor(mcpRoot, "mcp-settings"));
+
+  hostListeners[0](snapshots());
+  await flush();
+  pluginStatus = "connected";
+  ipcEventListener({
+    version: 1,
+    sequence: 2,
+    type: "connection.updated",
+    payload: { accountId: accounts[0].accountId, connections: [connection("plugins", "connected", true)] },
+  });
+  await flush();
+  const refreshedPluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  assert.match(text(refreshedPluginsPanel), /Connected/);
+  assert.equal(buttonNamed(refreshedPluginsPanel, "Authorize"), false);
+
+  pluginListUnavailableOnce = true;
+  ipcEventListener({
+    version: 1,
+    sequence: 3,
+    type: "connection.updated",
+    payload: { accountId: accounts[0].accountId, connections: [connection("plugins", "unavailable", false)] },
+  });
+  await flush();
+  const unavailablePluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  assert.match(text(unavailablePluginsPanel), /Plugin service unavailable/);
+  assert.match(text(unavailablePluginsPanel), /Cached plugins were not changed/);
+  assert.equal(buttonNamed(unavailablePluginsPanel, "Retry"), true);
+  assert.ok(find(unavailablePluginsPanel, (node) => node.tagName === "a" && node.textContent === "Report issue"));
+  find(unavailablePluginsPanel, (node) => node.tagName === "button" && node.textContent === "Retry").listeners.get("click")();
+  await flush();
+  assert.match(text(panelFor(pluginsRoot, "plugins-settings")), /Connected/);
+
+  _test.startRenderer(api);
+  assert.equal(panelFor(appsRoot, "apps-settings"), null);
+  assert.equal(panelFor(pluginsRoot, "plugins-settings"), null);
+  assert.equal(panelFor(mcpRoot, "mcp-settings"), null);
+  assert.equal(hostDisconnects, 1);
+  assert.equal(ipcCleanups, 1);
+  assert.equal(pageUnregisters, 1);
+  assert.equal(windowListenerRemovals, 5);
+  assert.equal([...windowListeners.values()].every((listeners) => listeners.size === 1), true, "hot reload leaves only the replacement renderer listeners");
+  assert.equal(commands.includes("events.unsubscribe"), true);
+
+  hostListeners[1](snapshots());
+  await flush();
+  assert.equal(panelFor(appsRoot, "apps-settings") !== null, true);
+  assert.equal(panelFor(pluginsRoot, "plugins-settings") !== null, true);
+  assert.equal(panelFor(mcpRoot, "mcp-settings") !== null, true);
+  tweak.stop();
+  assert.equal(panelFor(appsRoot, "apps-settings"), null);
+  assert.equal(panelFor(pluginsRoot, "plugins-settings"), null);
+  assert.equal(panelFor(mcpRoot, "mcp-settings"), null);
+  assert.equal(hostDisconnects, 2);
+  assert.equal(ipcCleanups, 2);
+  assert.equal(pageUnregisters, 2);
+  assert.equal(windowListenerRemovals, 10);
+  assert.equal([...windowListeners.values()].every((listeners) => listeners.size === 0), true);
+  assert.equal(timers.size, 0);
+});
+
+test("fork-parity Accounts controls use strict account-scoped broker projections and never render token balancing", async (t) => {
+  const accountId = brokerAccountId("fork-ui");
+  const deviceId = brokerPublicId("device", "fork-ui-device");
+  const remote = (overrides = {}) => ({
+    accountId,
+    enabled: true,
+    state: "ready",
+    pairing: null,
+    devices: [{ deviceId, label: "Thomas’s MacBook" }],
+    ...overrides,
+  });
+  const preferences = { failoverMode: "automatic", unifiedCatalogEnabled: false };
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "pref-read", command: "preferences.read",
+  }), { version: 1, action: "broker", requestId: "pref-read", command: "preferences.read" });
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "pref-write", command: "preferences.update",
+    params: { failoverMode: "ask", unifiedCatalogEnabled: true },
+  }).params, { failoverMode: "ask", unifiedCatalogEnabled: true });
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "pref-private", command: "preferences.update",
+    params: { failoverMode: "ask", secret: "never" },
+  }), null);
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "remote-bad", command: "remote.devices.revoke",
+    params: { accountId, deviceId: "device_provider_id", extra: true },
+  }), null);
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "remote-revoke", command: "remote.devices.revoke",
+    params: { accountId, deviceId },
+  }).params, { accountId, deviceId });
+  assert.equal(_test.projectAccountBrokerResult("remote.status", { ...remote(), privateToken: "must reject" }), null);
+  assert.equal(_test.projectAccountBrokerResult("remote.status", remote({ devices: [{ deviceId: "device_provider_id", label: "Unsafe" }] })), null);
+  assert.equal(_test.projectAccountBrokerResult("remote.pairing.start", remote({
+    state: "pairing", pairing: { code: "unsafe code", expiresAt: "2026-09-05T12:00:00.000Z" },
+  })), null);
+  assert.equal(_test.projectAccountBrokerResult("profile.email", { accountId, email: "reader@example.test", token: "must reject" }), null);
+  assert.equal(_test.accountBrokerDisplayMessage("account_history_busy"),
+    "Account-history setup is still running. Wait for it to finish, close the conflicting app if it remains open, then Retry.");
+
+  const previousDocument = global.document;
+  const previousWindow = global.window;
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const nodes = [];
+  const timers = new Map();
+  let nextTimer = 0;
+  const node = (tagName) => {
+    const value = {
+      tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", value: "", checked: false, disabled: false, style: {},
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(name, content) { this.attrs[name] = String(content); },
+      addEventListener(name, listener) { (this.listeners ||= new Map()).set(name, listener); },
+      remove() { this.removed = true; },
+    };
+    nodes.push(value);
+    return value;
+  };
+  const text = (value) => `${value.textContent || ""}${value.children.map(text).join("")}`;
+  const find = (value, predicate) => predicate(value) ? value : value.children.map((child) => find(child, predicate)).find(Boolean) || null;
+  const buttonsNamed = (value, label) => find(value, (entry) => entry.tagName === "button" && entry.textContent === label);
+  const copied = [];
+  global.document = { createElement: node };
+  global.window = {
+    setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    prompt() { return null; },
+  };
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { async writeText(value) { copied.push(value); } } } });
+  t.after(() => {
+    global.document = previousDocument;
+    global.window = previousWindow;
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  });
+
+  const account = {
+    accountId, label: "Primary", email: "p••••@example.test", plan: "Pro", enabled: true, status: "ready", assignedTaskCount: 2,
+    quota: { remainingPercent: 71, freshness: "fresh", resetAt: null, resetCredits: 0 },
+  };
+  const requests = [];
+  const response = (request, result) => ({ version: 1, requestId: request.requestId, ok: true, result });
+  const state = {
+    disposed: false, brokerRequestNonce: 0, profile: { accounts: [account], selectedAccountId: accountId }, selectedAccountId: accountId,
+    preferences, brokerRoots: new Set(), accountMenus: [], remoteTimers: new Map(), remoteByAccountId: new Map(),
+    remotePairings: new Map(), remoteErrors: new Map(), remoteActions: new Set(), expandedBrokerAccountId: accountId,
+    menuExpandedBrokerAccountId: null, brokerStatus: { textContent: "" },
+    api: { ipc: { async invoke(_channel, request) {
+      requests.push(request);
+      if (request.command === "preferences.update") return response(request, { ...preferences, ...request.params });
+      if (request.command === "profile.email") return response(request, { accountId, email: "reader@example.test" });
+      if (request.command === "remote.status") return response(request, remote({ enabled: false, state: "disabled", devices: [] }));
+      if (request.command === "remote.enable") return response(request, remote({ devices: [] }));
+      if (request.command === "remote.pairing.start" || request.command === "remote.pairing.status") {
+        return response(request, remote({ state: "pairing", pairing: { code: "PAIR-2026", expiresAt: "2026-12-05T12:00:00.000Z" } }));
+      }
+      if (request.command === "remote.devices.revoke") return response(request, remote({ devices: [] }));
+      if (request.command === "connection.list") return response(request, { accountId, connections: [] });
+      if (request.command === "profile.read") return response(request, state.profile);
+      if (request.command === "quota.read") return response(request, { accountId, quota: account.quota });
+      if (request.command === "history.read") return response(request, { conversation: null, turns: [] });
+      if (["events.subscribe", "events.unsubscribe"].includes(request.command)) return response(request, {});
+      throw new Error(`unexpected command ${request.command}`);
+    } }, react: { host: {} } },
+  };
+
+  const preferenceCard = _test.brokerRoutingPreferencesCard(state);
+  const preferenceSelector = find(preferenceCard, (entry) => entry.tagName === "select");
+  preferenceSelector.value = "ask";
+  await preferenceSelector.listeners.get("change")();
+  assert.deepEqual(requests.find((request) => request.command === "preferences.update").params, { failoverMode: "ask" });
+
+  const disclosure = _test.brokerAccountDisclosure(state, account);
+  assert.doesNotMatch(text(disclosure), /existing settings while it is active/);
+  const deferred = { ...account, continuityState: "deferred" };
+  assert.match(text(_test.brokerAccountDisclosure(state, deferred)), /one-time migration.*later idle launch/);
+  assert.match(text(_test.brokerAccountDisclosure(state, { ...deferred, continuityReason: "account_in_use", continuityBlocker: "Chrome helper" })), /Chrome helper is using.*later idle launch/);
+  assert.match(text(_test.brokerAccountDisclosure(state, { ...deferred, continuityReason: "source_changed" })), /source changed during verification/);
+  assert.match(text(_test.brokerAccountDisclosure(state, { ...deferred, continuityReason: "recovery_required" })), /Recovery must finish/);
+  assert.match(text(_test.brokerAccountPoolCard(state, [deferred])), /Settings migration pending/);
+  const second = { ...account, accountId: brokerAccountId("second-subscription"), label: "s••••@example.test" };
+  assert.match(text(_test.brokerAccountPoolCard(state, [account, second])), /2 subscriptions/);
+  assert.doesNotMatch(text(_test.brokerAccountPoolCard(state, [account, second])), /3 subscriptions/);
+  assert.match(text(_test.brokerAccountPoolCard(state, [{ ...deferred, status: "reauth_required" }])), /Sign in again/);
+  assert.match(text(_test.brokerAccountPoolCard(state, [{ ...deferred, status: "depleted" }])), /Usage depleted/);
+  assert.doesNotMatch(text(disclosure), /reader@example\.test/, "a full email is absent until its explicit copy action returns");
+  await buttonsNamed(disclosure, "Copy email").listeners.get("click")();
+  assert.deepEqual(requests.find((request) => request.command === "profile.email").params, { accountId });
+  assert.deepEqual(copied, ["reader@example.test"]);
+  buttonsNamed(disclosure, "Pair device").listeners.get("click")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.filter((request) => request.command.startsWith("remote.")).map((request) => [request.command, request.params]), [
+    ["remote.status", { accountId }],
+    ["remote.enable", { accountId }],
+    ["remote.pairing.start", { accountId }],
+  ]);
+  assert.equal(timers.size, 1, "pairing polling starts only after an explicit pairing action");
+  const pairedControls = _test.brokerRemoteControls(state, account);
+  assert.match(text(pairedControls), /PAIR-2026/);
+  await buttonsNamed(pairedControls, "Copy pairing code").listeners.get("click")();
+  assert.deepEqual(copied, ["reader@example.test", "PAIR-2026"]);
+  await buttonsNamed(pairedControls, "Remove").listeners.get("click")();
+  assert.deepEqual(requests.find((request) => request.command === "remote.devices.revoke").params, { accountId, deviceId });
+  _test.clearRemotePairing(state, accountId);
+  assert.equal(timers.size, 0, "closing pairing state clears its bounded timer");
+
+  state.remoteByAccountId.set(accountId, remote({ enabled: false, state: "unavailable", devices: [] }));
+  const unavailableControls = _test.brokerRemoteControls(state, account);
+  assert.match(text(unavailableControls), /unavailable right now/i);
+  assert.match(text(unavailableControls), /required MFA in the native app, then Retry/i);
+  assert.equal(buttonsNamed(unavailableControls, "Pair device").disabled, true);
+
+  const root = node("div");
+  _test.renderBrokerAccountsContents(state, root);
+  assert.match(text(root), /Routing preferences/);
+  assert.doesNotMatch(text(root), /Balance evenly|measured tokens|even balancing/i);
+  assert.equal(requests.some((request) => request.command === "balance.read" || request.command === "balance.set"), false,
+    "the active Accounts renderer never requests retired token-balance controls");
+});
+
+test("profile activity keeps pooled and per-subscription statistics public, cached, and explicitly refreshed", async (t) => {
+  const primaryId = brokerAccountId("profile-primary");
+  const secondaryId = brokerAccountId("profile-secondary");
+  const privateHandle = "provider-private@example.test";
+  const safeStats = (overrides = {}) => ({
+    lifetimeTokens: 124_500,
+    peakDailyTokens: 18_000,
+    currentStreakDays: 7,
+    longestStreakDays: 30,
+    totalThreads: 84,
+    longestRunningTurnSec: 3671,
+    fastModeUsagePercentage: 42.5,
+    totalSkillsUsed: 19,
+    uniqueSkillsUsed: 8,
+    mostUsedReasoningEffort: "high",
+    mostUsedReasoningEffortPercentage: 56.25,
+    dailyUsageBuckets: [{ startDate: "2026-09-04", tokens: 1200 }],
+    cumulativeDailyUsageBuckets: [{ startDate: "2026-09-04", tokens: 124500 }],
+    weeklyUsageBuckets: [{ startDate: "2026-09-01", tokens: 6200 }],
+    topInvocations: [{ type: "skill", label: "Code review", usageCount: 5 }],
+    ...overrides,
+  });
+  const statsResult = (selection, stats = selection === secondaryId ? null : safeStats()) => ({
+    selection,
+    partial: true,
+    accounts: [
+      { accountId: primaryId, state: "ready", stats: safeStats() },
+      { accountId: secondaryId, state: "unavailable", stats: null },
+    ],
+    stats,
+    observedAt: 1_788_264_000_000,
+  });
+  const pooled = statsResult("pooled");
+
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "profile-stats", command: "profile.statistics", params: { selection: "pooled" },
+  }).params, { selection: "pooled" });
+  assert.deepEqual(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "profile-stats-account", command: "profile.statistics", params: { selection: primaryId },
+  }).params, { selection: primaryId });
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "profile-stats-private", command: "profile.statistics", params: { selection: privateHandle },
+  }), null);
+  assert.equal(_test.normalizeAccountBrokerRequest({
+    version: 1, action: "broker", requestId: "profile-stats-extra", command: "profile.statistics", params: { selection: "pooled", token: "never" },
+  }), null);
+  assert.equal(_test.projectAccountBrokerResult("profile.statistics", {
+    ...pooled, privateHandle,
+  }), null);
+  assert.equal(_test.projectAccountBrokerResult("profile.statistics", statsResult("pooled", safeStats({
+    topInvocations: [{ type: "skill", label: privateHandle, usageCount: 1 }],
+  }))), null, "an identifier-shaped invocation label never reaches the DOM");
+  assert.equal(_test.projectAccountBrokerResult("profile.statistics", {
+    ...pooled,
+    selection: brokerAccountId("unknown-profile"),
+  }), null, "an account-specific result must include the selected public account");
+  assert.deepEqual(_test.projectAccountBrokerResult("profile.statistics", pooled), pooled);
+
+  const previousDocument = global.document;
+  const nodes = [];
+  const node = (tagName) => {
+    const value = {
+      tagName, children: [], attrs: {}, dataset: {}, className: "", textContent: "", value: "", disabled: false,
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      setAttribute(name, content) { this.attrs[name] = String(content); },
+      addEventListener(name, listener) { (this.listeners ||= new Map()).set(name, listener); },
+    };
+    nodes.push(value);
+    return value;
+  };
+  const text = (value) => `${value.textContent || ""}${value.children.map(text).join("")}`;
+  const find = (value, predicate) => predicate(value) ? value : value.children.map((child) => find(child, predicate)).find(Boolean) || null;
+  const buttonNamed = (value, label) => find(value, (entry) => entry.tagName === "button" && entry.textContent === label);
+  global.document = { createElement: node };
+  t.after(() => { global.document = previousDocument; });
+
+  const accounts = [
+    { accountId: primaryId, label: "Primary", enabled: true },
+    { accountId: secondaryId, label: "Second workspace", enabled: true },
+  ];
+  const requests = [];
+  const response = (request, result) => ({ version: 1, requestId: request.requestId, ok: true, result });
+  const state = {
+    disposed: false,
+    brokerRequestNonce: 0,
+    profile: { accounts },
+    profileStatistics: new Map([["pooled", pooled]]),
+    profileStatisticsLoading: new Set(),
+    profileStatisticsErrors: new Map(),
+    profileStatisticsRevisions: new Map(),
+    profileStatisticsSelection: "pooled",
+    brokerRoots: new Set(),
+    accountMenus: [],
+    api: { ipc: { async invoke(_channel, request) {
+      requests.push(request);
+      if (request.command !== "profile.statistics") throw new Error(`unexpected command ${request.command}`);
+      return response(request, statsResult(request.params.selection));
+    } } },
+  };
+
+  const pooledCard = _test.brokerProfileActivityCard(state, accounts);
+  assert.match(text(pooledCard), /Profile activity/);
+  assert.match(text(pooledCard), /Lifetime tokens/);
+  assert.match(text(pooledCard), /124,500|124500/);
+  assert.match(text(pooledCard), /Some subscriptions are unavailable/);
+  assert.match(text(pooledCard), /Second workspace: activity unavailable/);
+  assert.doesNotMatch(text(pooledCard), new RegExp(privateHandle));
+  assert.doesNotMatch(text(pooledCard), new RegExp(primaryId));
+  const picker = find(pooledCard, (entry) => entry.tagName === "select" && entry.attrs["aria-label"] === "Profile activity subscription");
+  assert.equal(picker.value, "pooled");
+  picker.value = secondaryId;
+  picker.listeners.get("change")();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests[0].params, { selection: secondaryId }, "the displayed account selection is the exact authenticated broker read");
+  assert.equal(state.profileStatistics.get(secondaryId).selection, secondaryId);
+  const accountCard = _test.brokerProfileActivityCard(state, accounts, { menu: true });
+  assert.match(text(accountCard), /Profile activity/);
+  assert.match(text(accountCard), /Profile activity is unavailable for this selection/);
+  await buttonNamed(accountCard, "Refresh profile activity").listeners.get("click")();
+  assert.deepEqual(requests.at(-1).params, { selection: secondaryId }, "the visible refresh action reads only the displayed subscription");
+  const requestCount = requests.length;
+  picker.value = privateHandle;
+  picker.listeners.get("change")();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, requestCount, "forged private selections never reach the broker");
 });

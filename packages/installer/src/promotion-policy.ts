@@ -21,6 +21,12 @@ export interface PromotionPolicyReadDependencies {
   afterRead?: () => void;
 }
 
+export interface PromotionPolicyPathComparison {
+  preparedFingerprint: string;
+  liveFingerprint: string;
+  compatible: boolean;
+}
+
 export type PromotionPolicyFingerprintFailureReason =
   | "open_failed"
   | "unsafe_metadata"
@@ -49,6 +55,39 @@ export function trustedPromotionPolicyMode(mode: number): boolean {
 
 /** Semantic, bounded and no-follow policy proof used by installer expectations. */
 export function fingerprintPromotionPolicyPath(
+  path: string,
+  deps: PromotionPolicyReadDependencies = {},
+): string {
+  const canonical = readCanonicalPromotionPolicyPath(path, deps);
+  return createHash("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
+}
+
+/**
+ * Compare the prepared policy snapshot with the live state after the desktop
+ * has intentionally quit and flushed its atoms.
+ *
+ * Existing prepared task identities remain fail-closed: removal or any
+ * authorization change is incompatible. Codex may append a new task while a
+ * candidate is being checked, because that task did not exist in the prepared
+ * authorization surface. The desktop also persists the exact managed
+ * full-access selection from `{ id: ":danger-full-access", extends: null }`
+ * to `null` while retaining the durable approval and sandbox policies; those
+ * two representations are equivalent only for that exact selection.
+ */
+export function comparePromotionPolicyPaths(
+  preparedPath: string,
+  livePath: string,
+): PromotionPolicyPathComparison {
+  const preparedCanonical = readCanonicalPromotionPolicyPath(preparedPath);
+  const liveCanonical = readCanonicalPromotionPolicyPath(livePath);
+  return {
+    preparedFingerprint: promotionPolicyFingerprint(preparedCanonical),
+    liveFingerprint: promotionPolicyFingerprint(liveCanonical),
+    compatible: compatiblePromotionPolicyProjection(preparedCanonical, liveCanonical),
+  };
+}
+
+function readCanonicalPromotionPolicyPath(
   path: string,
   deps: PromotionPolicyReadDependencies = {},
 ): string {
@@ -132,10 +171,92 @@ export function fingerprintPromotionPolicyPath(
     } catch (error) {
       throw classifyCanonicalPolicyFailure(error);
     }
-    return createHash("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
+    return canonical;
   } finally {
     closeSync(fd);
   }
+}
+
+function promotionPolicyFingerprint(canonical: string): string {
+  return createHash("sha256").update(PROMOTION_POLICY_HASH_DOMAIN).update(canonical).digest("hex");
+}
+
+interface CanonicalPolicySlot<T> {
+  present: boolean;
+  value?: T;
+}
+
+interface CanonicalThreadPermissionRecord {
+  activePermissionProfile: CanonicalPolicySlot<unknown>;
+  approvalPolicy: CanonicalPolicySlot<unknown>;
+  sandboxPolicy: CanonicalPolicySlot<unknown>;
+  approvalsReviewer: CanonicalPolicySlot<unknown>;
+  runtimeWorkspaceRoots: CanonicalPolicySlot<unknown>;
+}
+
+interface CanonicalPromotionPolicyProjection {
+  schemaVersion: number;
+  mcpFormElicitationsEnabled: CanonicalPolicySlot<unknown>;
+  persistedAtoms: {
+    present: boolean;
+    agentModes: {
+      present: boolean;
+      local: CanonicalPolicySlot<unknown>;
+    };
+    threadPermissions: CanonicalPolicySlot<Array<[string, CanonicalThreadPermissionRecord]>>;
+  };
+}
+
+function compatiblePromotionPolicyProjection(preparedCanonical: string, liveCanonical: string): boolean {
+  const prepared = JSON.parse(preparedCanonical) as CanonicalPromotionPolicyProjection;
+  const live = JSON.parse(liveCanonical) as CanonicalPromotionPolicyProjection;
+  if (prepared.schemaVersion !== live.schemaVersion
+    || JSON.stringify(prepared.mcpFormElicitationsEnabled) !== JSON.stringify(live.mcpFormElicitationsEnabled)
+    || JSON.stringify(prepared.persistedAtoms.agentModes.local)
+      !== JSON.stringify(live.persistedAtoms.agentModes.local)) {
+    return false;
+  }
+
+  const preparedThreads = canonicalThreadPermissionMap(prepared.persistedAtoms.threadPermissions);
+  const liveThreads = canonicalThreadPermissionMap(live.persistedAtoms.threadPermissions);
+  for (const [threadId, preparedRecord] of preparedThreads) {
+    const liveRecord = liveThreads.get(threadId);
+    if (liveRecord === undefined
+      || JSON.stringify(normalizeManagedFullAccessSelection(preparedRecord))
+        !== JSON.stringify(normalizeManagedFullAccessSelection(liveRecord))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function canonicalThreadPermissionMap(
+  slot: CanonicalPolicySlot<Array<[string, CanonicalThreadPermissionRecord]>>,
+): Map<string, CanonicalThreadPermissionRecord> {
+  return new Map(slot.present ? slot.value ?? [] : []);
+}
+
+function normalizeManagedFullAccessSelection(
+  record: CanonicalThreadPermissionRecord,
+): CanonicalThreadPermissionRecord {
+  if (!isExactManagedFullAccessProfile(record.activePermissionProfile)) return record;
+  return {
+    ...record,
+    activePermissionProfile: { present: true, value: null },
+  };
+}
+
+function isExactManagedFullAccessProfile(slot: CanonicalPolicySlot<unknown>): boolean {
+  if (!slot.present || slot.value === null || typeof slot.value !== "object" || Array.isArray(slot.value)) {
+    return false;
+  }
+  const profile = slot.value as Record<string, unknown>;
+  const keys = Object.keys(profile).sort();
+  return keys.length === 2
+    && keys[0] === "extends"
+    && keys[1] === "id"
+    && profile.id === ":danger-full-access"
+    && profile.extends === null;
 }
 
 function policyFailure(

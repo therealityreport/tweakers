@@ -182,6 +182,38 @@ test("durable environment and resumable desktop receipts block other lifecycle o
   }
 });
 
+test("the independent official updater receipt blocks unrelated lifecycle work", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-lifecycle-official-update-"));
+  const transactions = join(root, "transactions");
+  mkdirSync(transactions, { recursive: true });
+  try {
+    writeFileSync(join(transactions, "chatgpt-app-update.json"), JSON.stringify(desktopReceipt({
+      transactionId: "official-update-1",
+      phase: "failed",
+      safeOfficialMode: true,
+      resumable: true,
+    })));
+
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, { contextOwned: false }),
+      /Official ChatGPT update official-update-1.*resume or cancel/i,
+    );
+    assert.throws(
+      () => assertLifecycleReceiptsIdle(root, {
+        contextOwned: false,
+        desktopTransactionId: "official-update-1",
+      }),
+      /Official ChatGPT update official-update-1/i,
+    );
+    assert.doesNotThrow(() => assertLifecycleReceiptsIdle(root, {
+      contextOwned: false,
+      officialUpdateTransactionId: "official-update-1",
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("an active desktop update context may nest its environment coordinator", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-lifecycle-desktop-nesting-"));
   const transactions = join(root, "transactions");

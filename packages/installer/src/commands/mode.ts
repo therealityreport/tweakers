@@ -97,6 +97,15 @@ import type {
 import type { EnvironmentWarmCommitReceipt } from "../environment-warm-commit.js";
 import { environmentModeCachePaths, observeEnvironmentModeCache, type EnvironmentModeCacheStatus } from "../environment-mode-cache.js";
 
+/**
+ * A deliberately short observation window after launchd takes commit
+ * ownership.  The helper remains the durable authority when the invoking
+ * process is stopped as part of the switch, so expiry is a submitted/in-flight
+ * outcome rather than a failed mode change.
+ */
+const MODE_TRANSACTION_POLL_ATTEMPTS = 12;
+const MODE_TRANSACTION_POLL_DELAY_MS = 250;
+
 export interface ModeCommandOptions {
   json?: boolean;
   yes?: boolean;
@@ -140,6 +149,8 @@ export interface ModeCommandDeps {
   legacyModeEngineForTests?: boolean;
   /** Test seam for the instant immediately following a deliberate confirmation. */
   now?: () => string;
+  /** Test seam for the bounded post-submission transaction observation delay. */
+  waitForEnvironmentTransaction?: (delayMs: number) => Promise<void>;
 }
 
 export async function mode(
@@ -306,40 +317,138 @@ async function switchEnvironmentExperience(
     detail: `Mode switch to ${target} approved via ${opts.yes === true ? "--yes flag" : "confirmation dialog"}`,
   });
 
-  const committed = await runEnvironment("commit", {
+  const submitted = await runEnvironment("submit", {
     transaction: receipt.transactionId,
     approvalAt,
     quiet: true,
   });
-  if (receipt.kind === "v2") {
-    if (!isEnvironmentWarmCommitReceipt(committed) || committed.phase !== "ready") {
-      const phase = isEnvironmentWarmCommitReceipt(committed) ? committed.phase : "invalid";
-      const detail = isEnvironmentWarmCommitReceipt(committed) && committed.error
-        ? `: ${committed.error}`
-        : "";
-      throw new Error(`Environment mode switch did not commit (phase ${phase})${detail}`);
-    }
-    console.log(kleur.green().bold(`✓ Switched to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
-    console.log(
-      kleur.dim(
-        `  Restart verified: PID ${committed.sourceMainPid ?? "unknown"} → ${committed.targetMainPid ?? "unknown"}; activated window at ${status.selected.selectedDesktopPath}`,
-      ),
-    );
+  requireSubmittedEnvironmentHelper(submitted, receipt, approvalAt);
+
+  // launchd owns the quit/reopen exchange. In particular, a Codex-hosted CLI
+  // can die while its own desktop source is stopped; that interruption is
+  // safe because the helper receipt and transaction record are already
+  // durable. When the caller remains alive, observe only this prepared ID.
+  const terminal = await pollSubmittedEnvironmentTransaction(
+    receipt,
+    runEnvironment,
+    deps.waitForEnvironmentTransaction ?? waitForEnvironmentTransaction,
+  );
+  if (terminal === null) {
+    console.log(kleur.yellow(
+      `Mode switch to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} was submitted and is still in progress.`,
+    ));
+    console.log(kleur.dim(`  Transaction: ${receipt.transactionId}; durable helper evidence will complete or record failure.`));
     return;
   }
-  if (!isEnvironmentTransactionReceipt(committed) || committed.phase !== "committed") {
-    const phase = isEnvironmentTransactionReceipt(committed) ? committed.phase : "invalid";
-    const detail = isEnvironmentTransactionReceipt(committed) && committed.error
-      ? `: ${committed.error}`
-      : "";
-    throw new Error(`Environment mode switch did not commit (phase ${phase})${detail}`);
+  reportCompletedEnvironmentSwitch(target, terminal, status.selected.selectedDesktopPath);
+}
+
+type PreparedEnvironmentTransaction = ReturnType<typeof requirePreparedEnvironmentReceipt>;
+
+function requireSubmittedEnvironmentHelper(
+  value: EnvironmentCommandResult,
+  prepared: PreparedEnvironmentTransaction,
+  approvalAt: string,
+): void {
+  const transactionId = prepared.transactionId;
+  if (!("kind" in value)
+    || value.kind !== "environment-commit-helper"
+    || !("transactionId" in value)
+    || value.transactionId !== transactionId
+    || !("phase" in value)
+    || value.phase !== "submitted") {
+    const phase = "phase" in value && typeof value.phase === "string" ? value.phase : "invalid";
+    throw new Error(`Environment mode switch helper did not submit transaction ${transactionId} (phase ${phase})`);
   }
+  // Schema-v2 makes the user-confirmation instant part of the helper's
+  // durable binding. Do not accept a helper that substituted or dropped it.
+  if (prepared.kind === "v2" && (!("approvalAt" in value) || value.approvalAt !== approvalAt)) {
+    throw new Error(`Environment mode switch helper did not preserve approval for transaction ${transactionId}`);
+  }
+}
+
+async function pollSubmittedEnvironmentTransaction(
+  prepared: PreparedEnvironmentTransaction,
+  runEnvironment: NonNullable<ModeCommandDeps["environmentCommand"]>,
+  wait: (delayMs: number) => Promise<void>,
+): Promise<EnvironmentCommandResult | null> {
+  for (let attempt = 0; attempt < MODE_TRANSACTION_POLL_ATTEMPTS; attempt += 1) {
+    const observed = await runEnvironment("transaction", { quiet: true });
+    const state = classifySubmittedEnvironmentTransaction(prepared, observed);
+    if (state === "success") return observed;
+    if (state === "failure") throw terminalEnvironmentTransactionError(prepared.transactionId, observed);
+    if (attempt + 1 < MODE_TRANSACTION_POLL_ATTEMPTS) {
+      await wait(MODE_TRANSACTION_POLL_DELAY_MS);
+    }
+  }
+  return null;
+}
+
+function classifySubmittedEnvironmentTransaction(
+  prepared: PreparedEnvironmentTransaction,
+  value: EnvironmentCommandResult,
+): "pending" | "success" | "failure" {
+  if (prepared.kind === "v1") {
+    if (!isEnvironmentTransactionReceipt(value)) {
+      // An idle projection is possible before the detached helper has begun.
+      if ("kind" in value && value.kind === "environment" && value.transactionId === null) return "pending";
+      throw new Error(`Environment transaction poll returned an invalid result for ${prepared.transactionId}`);
+    }
+    if (value.transactionId !== prepared.transactionId) {
+      throw new Error(`Environment transaction poll returned ${value.transactionId}, expected ${prepared.transactionId}`);
+    }
+    if (value.phase === "committed") return "success";
+    if (["rolled-back", "failed", "cancelled"].includes(value.phase)) return "failure";
+    return "pending";
+  }
+
+  if (!("kind" in value)
+    || value.kind !== "environment-mode-v2-transaction"
+    || !("transactionId" in value)) {
+    throw new Error(`Environment mode transaction poll returned an invalid result for ${prepared.transactionId}`);
+  }
+  if (value.transactionId === null) return "pending";
+  if (value.transactionId !== prepared.transactionId) {
+    throw new Error(`Environment mode transaction poll returned ${value.transactionId}, expected ${prepared.transactionId}`);
+  }
+  if (value.phase === "ready") return "success";
+  if (value.terminalAt !== null) return "failure";
+  return "pending";
+}
+
+function terminalEnvironmentTransactionError(transactionId: string, value: EnvironmentCommandResult): Error {
+  const phase = "phase" in value && typeof value.phase === "string" ? value.phase : "invalid";
+  const detail = "error" in value && typeof value.error === "string" && value.error.length > 0
+    ? `: ${value.error}`
+    : "";
+  return new Error(`Environment mode switch ${transactionId} ended in phase ${phase}${detail}`);
+}
+
+function reportCompletedEnvironmentSwitch(
+  target: "chatgpt" | "tweakers",
+  completed: EnvironmentCommandResult,
+  selectedDesktopPath: string,
+): void {
   console.log(kleur.green().bold(`✓ Switched to ${target === "chatgpt" ? "ChatGPT" : "Tweakers"} mode.`));
-  console.log(
-    kleur.dim(
-      `  Restart verified: PID ${committed.oldMainPid} → ${committed.newMainPid}; activated window at ${committed.requested.selectedDesktopPath}`,
-    ),
-  );
+  if (isEnvironmentWarmCommitReceipt(completed)) {
+    console.log(kleur.dim(
+      `  Restart verified: PID ${completed.sourceMainPid ?? "unknown"} → ${completed.targetMainPid ?? "unknown"}; activated window at ${selectedDesktopPath}`,
+    ));
+    return;
+  }
+  if (isEnvironmentTransactionReceipt(completed)) {
+    console.log(kleur.dim(
+      `  Restart verified: PID ${completed.oldMainPid} → ${completed.newMainPid}; activated window at ${completed.requested.selectedDesktopPath}`,
+    ));
+    return;
+  }
+  // The v2 transaction projection deliberately carries only durable status;
+  // process proof remains in its warm journal rather than this read model.
+  console.log(kleur.dim(`  Restart verified by durable transaction ${"transactionId" in completed ? completed.transactionId : "unknown"}.`));
+}
+
+function waitForEnvironmentTransaction(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function isEnvironmentStatusResult(value: EnvironmentCommandResult): value is EnvironmentStatusResult {

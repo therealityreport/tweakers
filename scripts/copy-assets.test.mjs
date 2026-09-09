@@ -13,10 +13,16 @@ function fixture() {
   mkdirSync(join(root, "packages", "installer", "assets", "runtime", "tweaks", "stale"), { recursive: true });
   mkdirSync(join(root, "packages", "installer", "dist"), { recursive: true });
   mkdirSync(join(root, "packages", "native-host", "assets"), { recursive: true });
+  mkdirSync(join(root, "packages", "native-host", "dist", "Tweakers Swap Helper.app", "Contents", "MacOS"), { recursive: true });
   mkdirSync(join(root, "tweaks", "alpha"), { recursive: true });
   mkdirSync(join(root, "store"), { recursive: true });
   writeFileSync(join(root, "packages", "loader", "loader.cjs"), "loader\n");
   writeFileSync(join(root, "packages", "installer", "assets", "loader.cjs"), "old loader\n");
+  writeFileSync(join(root, "packages", "installer", "assets", "protected-loader.cjs"), "protected loader\n");
+  writeFileSync(join(root, "packages", "installer", "assets", "tweakers.icns"), "icon\n");
+  writeFileSync(join(root, "packages", "installer", "assets", "tweakers.png"), "png\n");
+  writeFileSync(join(root, "packages", "native-host", "dist", "Tweakers App Launcher"), "app launcher\n");
+  writeFileSync(join(root, "packages", "native-host", "dist", "Tweakers Swap Helper.app", "Contents", "MacOS", "Tweakers Swap Helper"), "swap helper\n");
   chmodSync(join(root, "packages", "installer", "assets", "loader.cjs"), 0o710);
   writeFileSync(join(root, "packages", "runtime", "dist", "main.js"), "runtime\n");
   writeFileSync(

@@ -147,7 +147,12 @@ export function ensureUserPaths(): ResolvedUserPaths {
   return p;
 }
 
-function userRoot(): string {
+/**
+ * Explicit caller/test roots remain authoritative. This deliberately excludes
+ * the legacy on-disk fallback so sealed manager code can distinguish a caller
+ * binding from historical root discovery.
+ */
+export function explicitTweakersUserRoot(): string | null {
   // Installer-home overrides remain authoritative for explicit CLI/test
   // isolation. Runtime-spawned CLIs bind these aliases to the loader's exact
   // root, while the user-root aliases still support health/candidate launches
@@ -170,6 +175,13 @@ function userRoot(): string {
   ) {
     return process.env.TWEAKERS_TEST_FALLBACK_ROOT;
   }
+
+  return null;
+}
+
+function userRoot(): string {
+  const explicit = explicitTweakersUserRoot();
+  if (explicit !== null) return explicit;
 
   const home = targetUserHome();
   switch (platform()) {

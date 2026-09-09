@@ -8,6 +8,7 @@ import {
   collectOwlBridgeReport,
   tweakerPaths,
   detectRuntime,
+  getOpenReport,
   parsePsOutput,
   reportsMainProcessRunning,
   type DataPath,
@@ -94,6 +95,85 @@ test("reportsMainProcessRunning ignores helper-only states", () => {
     };
     assert.equal(reportsMainProcessRunning(report), expected, JSON.stringify(partial));
   }
+});
+
+test("open report recognizes the fixed legacy Tweakers Electron main process", () => {
+  const appRoot = "/Applications/Tweakers.app";
+  const codex: CodexInstall = {
+    appRoot,
+    resourcesDir: join(appRoot, "Contents", "Resources"),
+    asarPath: join(appRoot, "Contents", "Resources", "app.asar"),
+    metaPath: join(appRoot, "Contents", "Info.plist"),
+    electronBinary: join(appRoot, "Contents", "Frameworks", "Electron Framework.framework"),
+    executable: join(appRoot, "Contents", "MacOS", "ChatGPT"),
+    appName: "Tweakers",
+    bundleId: "com.therealityreport.tweakers",
+    channel: "stable",
+    platform: "darwin",
+  };
+  const report = getOpenReport(codex, [{
+    pid: 5687,
+    ppid: 1,
+    startedAt: "2026-09-03T05:04:42.000Z",
+    startedAtRaw: "Thu Sep  3 01:04:42 2026",
+    command: `${join(appRoot, "Contents", "MacOS", "Tweakers Electron")} --user-data-dir=/isolated`,
+  }]);
+
+  assert.equal(report.pid, 5687);
+  assert.equal(report.hasMainProcess, true);
+  assert.deepEqual(report.relatedPids, [5687]);
+});
+
+test("open report does not treat Tweakers Electron as an ordinary ChatGPT main process", () => {
+  const appRoot = "/Applications/ChatGPT.app";
+  const codex: CodexInstall = {
+    appRoot,
+    resourcesDir: join(appRoot, "Contents", "Resources"),
+    asarPath: join(appRoot, "Contents", "Resources", "app.asar"),
+    metaPath: join(appRoot, "Contents", "Info.plist"),
+    electronBinary: join(appRoot, "Contents", "Frameworks", "Electron Framework.framework"),
+    executable: join(appRoot, "Contents", "MacOS", "ChatGPT"),
+    appName: "ChatGPT",
+    bundleId: "com.openai.codex",
+    channel: "stable",
+    platform: "darwin",
+  };
+  const report = getOpenReport(codex, [{
+    pid: 9001,
+    ppid: 1,
+    startedAt: "2026-09-03T05:04:42.000Z",
+    startedAtRaw: "Thu Sep  3 01:04:42 2026",
+    command: `${join(appRoot, "Contents", "MacOS", "Tweakers Electron")} --user-data-dir=/unexpected`,
+  }]);
+
+  assert.equal(report.status, "background");
+  assert.equal(report.hasMainProcess, false);
+});
+
+test("open report keeps a Tweakers helper-only process in the background state", () => {
+  const appRoot = "/Applications/Tweakers.app";
+  const codex: CodexInstall = {
+    appRoot,
+    resourcesDir: join(appRoot, "Contents", "Resources"),
+    asarPath: join(appRoot, "Contents", "Resources", "app.asar"),
+    metaPath: join(appRoot, "Contents", "Info.plist"),
+    electronBinary: join(appRoot, "Contents", "Frameworks", "Electron Framework.framework"),
+    executable: join(appRoot, "Contents", "MacOS", "ChatGPT"),
+    appName: "Tweakers",
+    bundleId: "com.therealityreport.tweakers",
+    channel: "stable",
+    platform: "darwin",
+  };
+  const report = getOpenReport(codex, [{
+    pid: 5698,
+    ppid: 1,
+    startedAt: "2026-09-03T05:04:43.000Z",
+    startedAtRaw: "Thu Sep  3 01:04:43 2026",
+    command: join(appRoot, "Contents", "Frameworks", "Codex (Service).app", "Contents", "MacOS", "Codex (Service)"),
+  }]);
+
+  assert.equal(report.status, "background");
+  assert.equal(report.hasMainProcess, false);
 });
 
 test("tweakerPaths reports paths without creating them", () => {

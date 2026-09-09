@@ -23,6 +23,8 @@ test("switcher app bundle has the expected structure", { skip: process.platform 
   const info = readFileSync(infoPlistPath, "utf8");
   assert.match(info, /<key>CFBundleIdentifier<\/key>\s*<string>com\.therealityreport\.tweakers\.switcher<\/string>/);
   assert.match(info, /<key>CFBundleExecutable<\/key>\s*<string>Tweakers Switcher<\/string>/);
+  assert.match(info, /<key>CFBundleDisplayName<\/key>\s*<string>Tweakers<\/string>/);
+  assert.match(info, /<key>CFBundleName<\/key>\s*<string>Tweakers<\/string>/);
   // LSUIElement keeps the switcher out of the Dock — menu bar only.
   assert.match(info, /<key>LSUIElement<\/key>\s*<true\/>/);
 });

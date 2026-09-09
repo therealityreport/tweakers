@@ -3,7 +3,11 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { doctor } from "../src/commands/doctor";
+import {
+  codeSignatureDoctorDetail,
+  doctor,
+  independentTweakersLiveHealthDoctorChecks,
+} from "../src/commands/doctor";
 import {
   createEnvironmentSelection,
   defaultEnvironmentProfileRegistry,
@@ -35,6 +39,33 @@ async function doctorOutput(root: string, options: Parameters<typeof doctor>[0] 
   }
   return lines.join("\n");
 }
+
+test("doctor distinguishes local certificate signatures from ad-hoc signatures", () => {
+  assert.equal(codeSignatureDoctorDetail(
+    { ok: true, output: "" },
+    { ok: true, adHoc: false, teamIdentifier: null, authority: ["Tweakers Local Signing"], output: "" },
+  ), "valid (Tweakers Local Signing)");
+  assert.equal(codeSignatureDoctorDetail(
+    { ok: true, output: "" },
+    { ok: true, adHoc: true, teamIdentifier: null, authority: [], output: "Signature=adhoc" },
+  ), "valid (ad-hoc)");
+  assert.equal(codeSignatureDoctorDetail(
+    { ok: true, output: "" },
+    { ok: true, adHoc: false, teamIdentifier: "TEAM", authority: ["Developer ID Application: Example"], output: "" },
+  ), "valid (Developer ID Application: Example)");
+});
+
+test("doctor rejects stale independent Tweakers live-health evidence instead of treating it as current", () => {
+  const checks = independentTweakersLiveHealthDoctorChecks({
+    state: "stale",
+    health: {} as never,
+  });
+  assert.deepEqual(checks, [{
+    name: "independent Tweakers live health",
+    ok: false,
+    detail: "rejected stale evidence",
+  }]);
+});
 
 test("doctor fails the environment consistency check when the selection drifts from the registry", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-doctor-drift-"));

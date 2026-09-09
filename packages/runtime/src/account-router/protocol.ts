@@ -19,6 +19,7 @@ export type ClientRoute =
   | "fanout_aggregate_read_with_router_cursor"
   | "fanout_aggregate_namespaced_sections"
   | "fanout_sections_read"
+  | "fanout_feature_enablement"
   | "persisted_thread_owner"
   | "thread_owner_if_present_else_primary"
   | "reject_in_balanced_mode_use_manual_enrollment"
@@ -105,7 +106,7 @@ const AGGREGATE_READS = new Set(["thread/list", "thread/search", "thread/loaded/
 // agree afterwards, so it refuses them and requires a fresh direct startup.
 const CAPABILITY_MUTATIONS = new Set<string>([
   "config/batchWrite", "config/mcpServer/reload", "config/value/write",
-  "experimentalFeature/enablement/set", "skills/config/write", "skills/extraRoots/set",
+  "skills/config/write", "skills/extraRoots/set",
   "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/remove", "marketplace/upgrade",
   "mcpServer/oauth/login",
 ]);
@@ -116,6 +117,7 @@ export function classifyClientMethod(method: unknown, params?: unknown): ClientR
   if (typeof method !== "string" || !CLIENT_METHODS.has(method)) return "unknown";
   if (method === "initialize") return "fanout_initialize_intersection";
   if (method === "thread/start") return "balance_new_thread";
+  if (method === "experimentalFeature/enablement/set") return "fanout_feature_enablement";
   // Section writes remain manual-only; section reads are namespaced inside
   // the mux and never expose a child-home identifier to the desktop.
   if (method === "threadSection/list") return "fanout_sections_read";
@@ -149,12 +151,14 @@ export function isKnownServerRequest(method: unknown): boolean {
 }
 
 export function hasThreadId(params: unknown): boolean {
-  return isPlainRecord(params) && typeof params.threadId === "string" && params.threadId.length > 0;
+  return isPlainRecord(params) && ((typeof params.threadId === "string" && params.threadId.length > 0)
+    || (typeof params.thread_id === "string" && params.thread_id.length > 0));
 }
 
 export function threadIdFrom(params: unknown): string | null {
   if (!isPlainRecord(params)) return null;
   if (typeof params.threadId === "string" && params.threadId.length > 0) return params.threadId;
+  if (typeof params.thread_id === "string" && params.thread_id.length > 0) return params.thread_id;
   const thread = params.thread;
   return isPlainRecord(thread) && typeof thread.id === "string" && thread.id.length > 0 ? thread.id : null;
 }

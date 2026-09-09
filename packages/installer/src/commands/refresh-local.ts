@@ -15,6 +15,7 @@ import { acquireProcessLock, processAlive, readLockOwner, type ProcessLock } fro
 import { readState, resolveMode } from "../state.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
 import { assertInstallerUpdateQuarantineClear } from "../protected-update-quarantine.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "../accounts-transfer-compatibility.js";
 
 export type RefreshSource = "development" | "stable" | "current";
 export type RefreshPhase = "idle" | "preparing" | "quitting" | "promoting" | "complete" | "failed";
@@ -94,6 +95,17 @@ export function preferredDesktopRefreshSource(status: LocalRefreshStatus): "deve
   if (status.source === "development") return "development";
   if (status.source === "stable") return "stable";
   return status.developmentSourceRoot !== null ? "development" : "stable";
+}
+
+export function assertStableRefreshAccountsTransferCompatible(
+  stagedUserRoot: string,
+  userRoot: string,
+  appRoot: string,
+): void {
+  assertAccountsTransferRuntimeCompatible(
+    join(managedSourceRoot(stagedUserRoot), "packages", "installer", "assets", "runtime"),
+    accountsTransferBrokerRoots(userRoot, appRoot),
+  );
 }
 
 export function getLocalRefreshStatus(userRoot: string): LocalRefreshStatus {
@@ -231,6 +243,7 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
               + "Register a development checkout or rerun with --source development.",
             );
           }
+          assertStableRefreshAccountsTransferCompatible(stableStageRoot, paths.root, appRoot);
           runChecked(process.execPath, [stagedCli, "install", "--app", appRoot, "--candidate-only", "--coordinated-refresh", "--no-watcher"], process.cwd(), process.env);
         } else {
           await timed("preparing.build", () => runChecked(npmCommand(), ["run", "build"], sourceRoot, nodeAugmentedEnvironment()));
@@ -251,12 +264,13 @@ export async function refreshLocal(opts: RefreshLocalOptions = {}): Promise<void
       promote: async () => {
         if (selected === "stable") {
           if (!preparedStableSource) throw new Error("Stable refresh source was not prepared");
+          assertStableRefreshAccountsTransferCompatible(stableStageRoot, paths.root, appRoot);
           runChecked(process.execPath, [managedCliPath(stableStageRoot), "repair", "--app", appRoot, "--force", "--quiet"], process.cwd(), process.env);
-          installManagedRuntime(preparedStableSource, paths.root);
+          installManagedRuntime(preparedStableSource, paths.root, { appRoot });
         } else {
           await timed("promoting.repair", () => repair({ app: appRoot, force: true, quiet: true }));
           await timed("promoting.managedRuntime", () => {
-            const managed = installManagedRuntime(sourceRoot, paths.root);
+            const managed = installManagedRuntime(sourceRoot, paths.root, { appRoot });
             writeDevelopmentProvenanceHash(managed, hashTree(sourceRoot, false));
           });
           // Bind the freshly promoted state for the no-op gate. Never fail a

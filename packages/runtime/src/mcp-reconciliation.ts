@@ -141,6 +141,7 @@ export interface McpReconciler {
 
 export const MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
 export const MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+export const MCP_DERIVED_VARIANT_ENV = "TWEAKERS_DERIVED_VARIANT";
 
 export interface ResolveMcpRuntimePathsOptions {
   /** Exact Tweakers user root selected by the loader for this runtime. */
@@ -163,7 +164,9 @@ export interface McpRuntimePaths {
  * Ordinary launches intentionally retain the historical ~/.codex/config.toml
  * behavior, even when CODEX_HOME happens to be present. A disposable candidate
  * must explicitly opt in and supply an exact CODEX_HOME below its exact,
- * non-symlink Tweakers user root. Existing symlink components, the real
+ * non-symlink Tweakers user root. A derived variant also has to supply that
+ * isolated CODEX_HOME when its derived marker is active; unlike a candidate,
+ * its reconciler is disabled by main.ts. Existing symlink components, the real
  * ~/.codex tree, and paths outside the candidate root fail closed before a
  * watcher or reconciler can be created.
  */
@@ -175,6 +178,50 @@ export function resolveMcpRuntimePaths(
   const ordinaryCodexHome = join(options.homeDirectory, ".codex");
   const candidateOptIn = env[MCP_CANDIDATE_RECONCILIATION_ENV];
   if (candidateOptIn === undefined || candidateOptIn === "") {
+    if (env[MCP_DERIVED_VARIANT_ENV] === "1") {
+      const derivedCodexHome = env[MCP_CANDIDATE_CODEX_HOME_ENV];
+      if (!derivedCodexHome) {
+        throw new Error(
+          `${MCP_CANDIDATE_CODEX_HOME_ENV} is required for derived variant MCP isolation`,
+        );
+      }
+      assertExactAbsolutePath(options.userRoot, "Tweakers derived user root");
+      assertExactAbsolutePath(derivedCodexHome, "Derived CODEX_HOME");
+      assertExistingDirectoryWithoutSymlinks(options.userRoot, "Tweakers derived user root");
+      assertPathHasNoExistingSymlink(derivedCodexHome, "Derived CODEX_HOME");
+      if (!isStrictDescendant(options.userRoot, derivedCodexHome)) {
+        throw new Error("Derived CODEX_HOME must be contained under the Tweakers derived user root");
+      }
+
+      const resolvedDerivedHome = resolveThroughExistingAncestor(derivedCodexHome);
+      const resolvedOrdinaryHome = resolveThroughExistingAncestor(ordinaryCodexHome);
+      if (
+        resolvedDerivedHome === resolvedOrdinaryHome
+        || isStrictDescendant(resolvedOrdinaryHome, resolvedDerivedHome)
+        || isStrictDescendant(resolvedDerivedHome, resolvedOrdinaryHome)
+      ) {
+        throw new Error("Derived CODEX_HOME must not resolve to or contain the real ~/.codex directory");
+      }
+
+      if (existsSync(derivedCodexHome) && !lstatSync(derivedCodexHome).isDirectory()) {
+        throw new Error("Derived CODEX_HOME must be a directory when it already exists");
+      }
+      const configPath = join(derivedCodexHome, "config.toml");
+      assertPathHasNoExistingSymlink(configPath, "Derived Codex config");
+      assertPathHasNoExistingSymlink(statePath, "Derived MCP receipt");
+      assertRegularFileWhenPresent(configPath, "Derived Codex config");
+      assertRegularFileWhenPresent(statePath, "Derived MCP receipt");
+
+      return {
+        codexHome: derivedCodexHome,
+        configPath,
+        statePath,
+        // This flag remains a proof of the explicit disposable-candidate
+        // opt-in. A normal derived app uses isolated paths but must not satisfy
+        // the candidate health gate merely because both mode markers exist.
+        candidateIsolated: false,
+      };
+    }
     return {
       codexHome: ordinaryCodexHome,
       configPath: join(ordinaryCodexHome, "config.toml"),

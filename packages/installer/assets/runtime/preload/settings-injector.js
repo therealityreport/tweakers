@@ -68,6 +68,7 @@ const state = {
     settingsSurfaceVisible: false,
     settingsSurfaceHideTimer: null,
     sidebarProbeStatus: null,
+    runtimeReadyMountPublished: false,
     tweakStore: null,
     tweakStorePromise: null,
     tweakStoreError: null,
@@ -87,6 +88,12 @@ function safeStringify(v) {
     catch {
         return String(v);
     }
+}
+function publishRuntimeReadySettingsMount() {
+    if (state.runtimeReadyMountPublished)
+        return;
+    state.runtimeReadyMountPublished = true;
+    electron_1.ipcRenderer.send("tweaker:settings-mounted", { version: 1 });
 }
 // ───────────────────────────────────────────────────────────── public API ──
 function startSettingsInjector() {
@@ -534,6 +541,7 @@ function tryInject() {
         if (state.activePage !== null)
             syncCodexNativeNavActive(true);
         activatePendingRegisteredPageOpen();
+        publishRuntimeReadySettingsMount();
         return "found";
     }
     // Sidebar was either freshly mounted (Settings just opened) or re-mounted
@@ -562,6 +570,7 @@ function tryInject() {
         if (state.activePage !== null)
             syncCodexNativeNavActive(true);
         activatePendingRegisteredPageOpen();
+        publishRuntimeReadySettingsMount();
         return "found";
     }
     // ── Group container ───────────────────────────────────────────────────
@@ -593,6 +602,7 @@ function tryInject() {
     noteNavGroupInjection(outer);
     syncPagesGroup();
     activatePendingRegisteredPageOpen();
+    publishRuntimeReadySettingsMount();
     return "found";
 }
 function recordSidebarProbeTransition(outcome, detail) {
@@ -1315,8 +1325,107 @@ function rowCopy(title, detail) {
 function renderConfigPage(sectionsWrap, subtitle) {
     const cleanups = [];
     const cardUpdates = new environment_config_controller_1.ConfigCardUpdateCoordinator();
+    let disposed = false;
+    void electron_1.ipcRenderer.invoke("tweaker:get-independent-manager-status")
+        .then((value) => {
+        if (disposed || !sectionsWrap.isConnected)
+            return;
+        const projection = value;
+        if (projection?.deploymentKind === "independent") {
+            renderIndependentSettingsSurface(sectionsWrap, cardUpdates, projection, subtitle, cleanups);
+            return;
+        }
+        renderInjectedSettingsSurface(sectionsWrap, cardUpdates, subtitle, cleanups);
+    })
+        .catch(() => {
+        if (disposed || !sectionsWrap.isConnected)
+            return;
+        // Failure to establish the deployment authority is treated as an
+        // independent manager outage. Never reveal the legacy writer controls.
+        renderIndependentSettingsSurface(sectionsWrap, cardUpdates, {
+            deploymentKind: "independent",
+            manager: {
+                available: false,
+                reason: "The verified global Tweakers manager is unavailable. This app is read-only until manager authority is restored.",
+                actions: [],
+                status: null,
+            },
+        }, subtitle, cleanups);
+    });
+    return () => {
+        disposed = true;
+        for (const cleanup of cleanups.splice(0)) {
+            try {
+                cleanup();
+            }
+            catch { }
+        }
+    };
+}
+function renderIndependentSettingsSurface(sectionsWrap, cardUpdates, projection, subtitle, cleanups) {
+    if (subtitle) {
+        subtitle.textContent = projection.manager.available
+            ? "Independent Tweakers is managed by the global Tweakers manager."
+            : "Independent Tweakers is read-only because its global manager is unavailable.";
+    }
+    renderIndependentAppearanceHealthSection(sectionsWrap, cleanups);
+    renderIndependentManagerStatusSection(sectionsWrap, projection);
+    if (projection.manager.available) {
+        cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "independent", projection));
+    }
+    else {
+        renderIndependentRefreshUnavailableSection(sectionsWrap, projection.manager.reason);
+    }
+}
+function renderIndependentAppearanceHealthSection(sectionsWrap, cleanups) {
+    const section = document.createElement("section");
+    section.className = "flex flex-col gap-2";
+    section.appendChild(sectionTitle("Appearance"));
+    const card = roundedCard();
+    section.appendChild(card);
+    sectionsWrap.appendChild(section);
+    const render = (health) => {
+        if (!card.isConnected)
+            return;
+        const status = health?.appearance.status ?? "not_observed";
+        const presentation = status === "normal"
+            ? {
+                badge: "Normal",
+                tone: "ok",
+                detail: "The owned primary Tweakers window is at native Actual Size.",
+            }
+            : status === "needs_attention"
+                ? {
+                    badge: "Needs attention",
+                    tone: "warn",
+                    detail: "Native or CSS scaling still needs a later Actual Size validation.",
+                }
+                : {
+                    badge: "Not observed",
+                    tone: "warn",
+                    detail: "The current process has not yet observed an owned primary Tweakers window.",
+                };
+        card.textContent = "";
+        const row = actionRow("Window appearance", presentation.detail);
+        row.querySelector("[data-tweaker-row-actions]")?.appendChild(statusBadge(presentation.tone, presentation.badge));
+        card.appendChild(row);
+        if (health?.observedAt) {
+            card.appendChild(rowSimple("Last observed", new Date(health.observedAt).toLocaleString()));
+        }
+    };
+    render(null);
+    void electron_1.ipcRenderer.invoke("tweaker:get-independent-live-health")
+        .then((value) => render(value))
+        .catch(() => render(null));
+    const onChanged = (_event, value) => {
+        render(value);
+    };
+    electron_1.ipcRenderer.on("tweaker:independent-live-health-changed", onChanged);
+    cleanups.push(() => electron_1.ipcRenderer.removeListener("tweaker:independent-live-health-changed", onChanged));
+}
+function renderInjectedSettingsSurface(sectionsWrap, cardUpdates, subtitle, cleanups) {
     cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
-    cleanups.push(renderDesktopUpdateSection(sectionsWrap, cardUpdates));
+    cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "injected"));
     cleanups.push(renderTweaksHealthSection(sectionsWrap, cardUpdates));
     cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
     cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
@@ -1325,16 +1434,13 @@ function renderConfigPage(sectionsWrap, subtitle) {
     section.appendChild(sectionTitle("Tweakers Updates"));
     const card = roundedCard();
     card.dataset.tweakerConfigCard = "true";
-    const loading = rowSimple("Loading update settings", "Checking current Tweakers configuration.");
-    card.appendChild(loading);
+    card.appendChild(rowSimple("Loading update settings", "Checking current Tweakers configuration."));
     section.appendChild(card);
     sectionsWrap.appendChild(section);
-    void electron_1.ipcRenderer
-        .invoke("tweaker:get-config")
+    void electron_1.ipcRenderer.invoke("tweaker:get-config")
         .then((config) => {
-        if (subtitle) {
+        if (subtitle)
             subtitle.textContent = `You have Tweakers ${config.version} installed.`;
-        }
         card.textContent = "";
         renderTweakerConfig(card, config);
     })
@@ -1349,18 +1455,54 @@ function renderConfigPage(sectionsWrap, subtitle) {
     maintenance.className = "flex flex-col gap-2";
     maintenance.appendChild(sectionTitle("Maintenance"));
     const maintenanceCard = roundedCard();
-    maintenanceCard.appendChild(uninstallRow());
-    maintenanceCard.appendChild(reportBugRow());
+    maintenanceCard.append(uninstallRow(), reportBugRow());
     maintenance.appendChild(maintenanceCard);
     sectionsWrap.appendChild(maintenance);
-    return () => {
-        for (const cleanup of cleanups.splice(0)) {
-            try {
-                cleanup();
-            }
-            catch { }
+}
+function renderIndependentManagerStatusSection(sectionsWrap, projection) {
+    const section = document.createElement("section");
+    section.className = "flex flex-col gap-2";
+    section.appendChild(sectionTitle("Independent Tweakers"));
+    const card = roundedCard();
+    const manager = projection.manager;
+    const managerRow = actionRow("Global manager", manager.available
+        ? "Verified manager authority is providing this read-only environment and maintenance status."
+        : manager.reason ?? "The verified global Tweakers manager is unavailable. This app is read-only.");
+    managerRow.querySelector("[data-tweaker-row-actions]")?.appendChild(statusBadge(manager.available ? "ok" : "warn", manager.available ? "Available" : "Unavailable"));
+    card.appendChild(managerRow);
+    if (manager.available && manager.status) {
+        const environment = manager.status.environment;
+        const official = environment?.officialApp;
+        const officialDetail = official?.state === "valid"
+            ? `Verified ${official.bundleId === "com.openai.codex.beta" ? "OpenAI Alpha" : "ChatGPT"}${official.version ? ` v${official.version}` : ""}${official.build ? ` (${official.build})` : ""}.`
+            : official?.problem ?? "The manager has no verified official ChatGPT app.";
+        card.appendChild(rowSimple("Official ChatGPT", officialDetail));
+        const selection = environment?.selection;
+        if (selection?.experience || selection?.releaseProfile) {
+            card.appendChild(rowSimple("Environment", `${selection.experience ?? "Unknown app"} · ${selection.releaseProfile ?? "Unknown release"} (manager read-only).`));
         }
-    };
+        const patch = manager.status.tweakersPatch;
+        if (patch) {
+            card.appendChild(rowSimple("Tweakers reapplication", patch.state === "source-changes-available"
+                ? "A manager-verified Tweakers reapplication may be available after the official update."
+                : patch.problem ?? "No manager-verified Tweakers reapplication is currently needed."));
+        }
+        const coordinator = manager.status.coordinator;
+        if (coordinator?.state && coordinator.state !== "idle") {
+            card.appendChild(rowSimple("Manager coordination", coordinator.problem ?? `Manager state: ${coordinator.state}.`));
+        }
+    }
+    section.appendChild(card);
+    sectionsWrap.appendChild(section);
+}
+function renderIndependentRefreshUnavailableSection(sectionsWrap, reason) {
+    const section = document.createElement("section");
+    section.className = "flex flex-col gap-2";
+    section.appendChild(sectionTitle("Tweakers App Update"));
+    const card = roundedCard();
+    card.appendChild(rowSimple("Tweakers reapplication unavailable", reason ?? "The verified global Tweakers manager is unavailable. This surface is read-only; no Tweakers reapplication control is exposed."));
+    section.appendChild(card);
+    sectionsWrap.appendChild(section);
 }
 /**
  * Codex-native environment controls. App experience and release profile are
@@ -2255,299 +2397,73 @@ function openEnvironmentConfirmModal(requested, transaction) {
     confirm.focus();
     return decision;
 }
-function renderDesktopUpdateSection(sectionsWrap, cardUpdates) {
+function renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, deploymentKind, projection) {
     const section = document.createElement("section");
     section.className = "flex flex-col gap-2";
-    section.appendChild(sectionTitle("Desktop Update"));
+    section.appendChild(sectionTitle(deploymentKind === "independent" ? "Tweakers App Update" : "Tweaker Mode Runtime"));
     const card = roundedCard();
-    card.dataset.tweakerDesktopUpdateCard = "true";
-    card.appendChild(rowSimple("Loading desktop update", "Checking the signed Codex appcast."));
+    card.dataset.tweakerRuntimeRefreshCard = deploymentKind;
     section.appendChild(card);
     sectionsWrap.appendChild(section);
-    let current = null;
-    let transaction = null;
+    const actionId = deploymentKind === "independent" ? "refresh.independent" : "refresh.injected";
+    const managerAction = projection?.manager.actions.find((action) => action.actionId === actionId) ?? null;
     let busy = false;
-    let polling = null;
-    let transactionPollFailures = 0;
-    let awaitingTransactionReceiptUntil = 0;
-    let initialResultSuperseded = false;
-    let transactionFetchFailed = false;
-    const transactionIsNonTerminal = () => {
-        if (!transaction?.transactionId) {
-            return transaction?.phase === "preparing" && Date.now() < awaitingTransactionReceiptUntil;
-        }
-        return !["completed", "failed", "rolled_back"].includes(transaction.phase);
-    };
-    const scheduleTransactionPoll = (delayMs = 2_000) => {
-        if (polling)
-            clearTimeout(polling);
-        // A failed fetch must keep polling even with no known transaction: a
-        // stranded receipt would otherwise stay invisible until tab re-mount.
-        if (!card.isConnected
-            || (!transactionIsNonTerminal()
-                && transaction?.resumable !== true
-                && !transactionFetchFailed))
-            return;
-        polling = setTimeout(() => {
-            polling = null;
-            void loadTransaction();
-        }, delayMs);
-    };
-    const loadTransaction = async () => {
-        const update = cardUpdates.begin("desktop-update-transaction");
-        try {
-            const value = await electron_1.ipcRenderer.invoke("tweaker:get-codex-desktop-update-transaction");
-            if (!cardUpdates.isCurrent(update) || !card.isConnected)
-                return;
-            transactionFetchFailed = false;
-            const observed = normalizeDesktopUpdateTransaction(value);
-            if (observed?.phase === "idle"
-                && observed.transactionId === null
-                && transaction?.phase === "preparing"
-                && transaction.transactionId === null) {
-                if (Date.now() >= awaitingTransactionReceiptUntil) {
-                    transaction = {
-                        transactionId: null,
-                        phase: "failed",
-                        error: "The desktop updater did not create a transaction receipt.",
-                    };
-                }
-            }
-            else {
-                const idleWithoutReceipt = observed?.phase === "idle" && observed.transactionId === null;
-                transaction = idleWithoutReceipt ? null : observed;
-                if (transaction?.transactionId)
-                    awaitingTransactionReceiptUntil = 0;
-            }
-            transactionPollFailures = 0;
-            draw();
-            scheduleTransactionPoll();
-        }
-        catch (error) {
-            if (!cardUpdates.isCurrent(update) || !card.isConnected)
-                return;
-            transactionFetchFailed = true;
-            // With no known transaction, keep it null: fabricating a phantom
-            // "preparing" row both misinforms and used to satisfy no poll gate,
-            // permanently hiding any real stranded receipt on disk.
-            if (transaction) {
-                transaction = {
-                    ...transaction,
-                    error: safeUiError(error),
-                };
-            }
-            draw();
-            transactionPollFailures += 1;
-            const backoff = Math.min(30_000, 1_000 * (2 ** Math.min(transactionPollFailures - 1, 5)));
-            const jitter = Math.floor(backoff * 0.25 * Math.random());
-            scheduleTransactionPoll(backoff + jitter);
-        }
-    };
+    let detail = null;
     const draw = () => {
         card.textContent = "";
-        const result = current;
-        const installed = result?.installed?.marketingVersion ?? "Unavailable";
-        const latest = result?.latest?.marketingVersion ?? "Unavailable";
-        const status = (0, environment_config_controller_1.desktopUpdateStatusPresentation)(result?.status);
-        const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
-        const left = row.firstElementChild;
-        left?.prepend(statusBadge(status.tone, status.label));
+        const patch = projection?.manager.status?.tweakersPatch;
+        const independentlyAvailable = deploymentKind !== "independent" || managerAction?.available === true;
+        const summary = deploymentKind === "independent"
+            ? patch?.state === "source-changes-available"
+                ? "A verified source change is ready to rebuild only this independent Tweakers app."
+                : patch?.state === "current"
+                    ? "Reapply this independent Tweakers app from its manager-verified official source."
+                    : managerAction?.reason ?? patch?.problem ?? "A manager-verified official source is required before Tweakers can be rebuilt."
+            : "Refreshes the separately selected ChatGPT Tweaker mode from its manager-verified source.";
+        const row = actionRow(deploymentKind === "independent" ? "Independent Tweakers" : "ChatGPT Tweaker mode", detail ?? summary);
         const actions = row.querySelector("[data-tweaker-row-actions]");
-        const check = compactButton("Check for Updates…", () => {
+        const button = compactButton(deploymentKind === "independent" ? "Rebuild Tweakers App" : "Refresh Tweaker Mode", () => {
             if (busy)
                 return;
             busy = true;
-            check.disabled = true;
-            void electron_1.ipcRenderer.invoke("tweaker:check-codex-desktop-update")
+            detail = "The global Tweakers manager is preparing the selected refresh.";
+            draw();
+            const update = cardUpdates.begin(`tweakers-runtime-${deploymentKind}`);
+            void electron_1.ipcRenderer.invoke("tweaker:reapply-tweakers")
                 .then((value) => {
+                if (!cardUpdates.complete(update, value))
+                    return;
                 const result = value;
-                acceptDesktopUpdateResult(result);
-                if (result.updateAndReloadRequested) {
-                    awaitingTransactionReceiptUntil = Date.now() + 10_000;
-                    transaction = { transactionId: null, phase: "preparing" };
-                    void loadTransaction();
-                }
+                detail = typeof result.detail === "string"
+                    ? result.detail
+                    : typeof result.reason === "string"
+                        ? result.reason
+                        : result.blocked === true
+                            ? "The manager blocked this refresh until its exact prerequisite is complete."
+                            : "The global Tweakers manager accepted the refresh request.";
             })
-                .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
-                .finally(() => { busy = false; draw(); });
-        });
-        check.disabled = busy || !!result?.setupRequired;
-        actions?.appendChild(check);
-        const update = compactButton("Update and Reload", () => {
-            if (busy)
-                return;
-            busy = true;
-            update.disabled = true;
-            void electron_1.ipcRenderer.invoke("tweaker:start-codex-desktop-update")
-                .then(() => {
-                awaitingTransactionReceiptUntil = Date.now() + 10_000;
-                transaction = { transactionId: null, phase: "preparing" };
-                void loadTransaction();
+                .catch((error) => {
+                if (cardUpdates.complete(update, error))
+                    detail = safeUiError(error);
             })
-                .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
-                .finally(() => { busy = false; draw(); });
+                .finally(() => {
+                busy = false;
+                draw();
+            });
         });
-        // Gate on non-terminal (not "active"): a stranded dead-owner receipt still
-        // blocks start() on disk, so the button must stay disabled until recovery.
-        update.disabled = busy
-            || result?.status !== "update-available"
-            || transactionIsNonTerminal()
-            || transaction?.resumable === true;
-        actions?.appendChild(update);
+        button.disabled = busy || !independentlyAvailable;
+        actions?.appendChild(button);
+        row.querySelector("[data-tweaker-row-actions]")?.prepend(statusBadge(independentlyAvailable ? "ok" : "warn", independentlyAvailable ? "Manager ready" : "Blocked"));
         card.appendChild(row);
-        if (result?.setupRequired) {
-            const setupLabel = result.setupRequired === "register-beta"
-                ? "Register OpenAI Beta"
-                : "Launch OpenAI Beta once";
-            card.appendChild(rowSimple(`Alpha update setup · ${setupLabel}`, result.reason ?? "Alpha update checks stay disabled until Tweakers captures the registered Beta app's own feed."));
+        card.appendChild(rowSimple("ChatGPT updater", "ChatGPT remains on its own native updater. This control only refreshes Tweakers or the separately selected Tweaker mode."));
+        if (patch?.installedVersion || patch?.officialVersion) {
+            card.appendChild(rowSimple("Source comparison", `Tweakers ${patch.installedVersion ?? "unknown"} · Official ChatGPT ${patch.officialVersion ?? "unknown"}.`));
         }
-        if (result?.checkedAt)
-            card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
-        if (transaction)
-            card.appendChild(desktopUpdateTransactionRow(transaction, {
-                busy,
-                onResume: () => {
-                    if (busy)
-                        return;
-                    busy = true;
-                    draw();
-                    void electron_1.ipcRenderer.invoke("tweaker:resume-codex-desktop-update")
-                        .then(() => {
-                        transaction = transaction ? { ...transaction, phase: "awaiting_native_update", resumable: false } : transaction;
-                        scheduleTransactionPoll();
-                    })
-                        .catch((error) => {
-                        if (transaction)
-                            transaction = { ...transaction, error: safeUiError(error) };
-                    })
-                        .finally(() => { busy = false; draw(); });
-                },
-                onCancel: () => {
-                    if (busy)
-                        return;
-                    busy = true;
-                    draw();
-                    void electron_1.ipcRenderer.invoke("tweaker:cancel-codex-desktop-update")
-                        .then((value) => { transaction = normalizeDesktopUpdateTransaction(value) ?? transaction; })
-                        .catch((error) => {
-                        if (transaction)
-                            transaction = { ...transaction, error: safeUiError(error) };
-                    })
-                        .finally(() => { busy = false; draw(); });
-                },
-            }));
     };
     draw();
-    const acceptDesktopUpdateResult = (value) => {
-        const currentTime = current?.checkedAt ? Date.parse(current.checkedAt) : Number.NaN;
-        const nextTime = value.checkedAt ? Date.parse(value.checkedAt) : Number.NaN;
-        if (Number.isFinite(currentTime) && (!Number.isFinite(nextTime) || nextTime < currentTime))
-            return;
-        current = value;
-        draw();
-    };
-    const onDesktopUpdateChanged = (_event, value) => {
-        if (!card.isConnected) {
-            electron_1.ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-            return;
-        }
-        initialResultSuperseded = true;
-        acceptDesktopUpdateResult(value);
-    };
-    electron_1.ipcRenderer.on("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-    const currentUpdate = cardUpdates.begin("desktop-update-result");
-    void electron_1.ipcRenderer.invoke("tweaker:get-codex-desktop-update")
-        .then((value) => {
-        if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected || initialResultSuperseded)
-            return;
-        if (value && typeof value === "object") {
-            acceptDesktopUpdateResult(value);
-        }
-        else {
-            current = { status: "unavailable", reason: "Update status has not been checked yet." };
-            draw();
-        }
-    })
-        .catch((error) => {
-        if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected)
-            return;
-        current = { status: "error", reason: safeUiError(error) };
-        draw();
-    });
-    void loadTransaction();
     return () => {
-        cardUpdates.invalidate("desktop-update-result");
-        cardUpdates.invalidate("desktop-update-transaction");
-        electron_1.ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-        if (polling)
-            clearTimeout(polling);
-        polling = null;
+        cardUpdates.invalidate(`tweakers-runtime-${deploymentKind}`);
     };
-}
-function normalizeDesktopUpdateTransaction(value) {
-    if (!value || typeof value !== "object")
-        return null;
-    const candidate = value;
-    if (candidate.transactionId !== null && typeof candidate.transactionId !== "string")
-        return null;
-    if (typeof candidate.phase !== "string")
-        return null;
-    return {
-        ...candidate,
-        transactionId: candidate.transactionId ?? null,
-        phase: candidate.phase,
-    };
-}
-function desktopUpdateTransactionRow(transaction, actions) {
-    const phase = humanizeCodexPhase(transaction.phase);
-    const nonTerminal = !["completed", "failed", "rolled_back"].includes(transaction.phase);
-    // ownerAlive === false on a non-terminal receipt means the coordinator died
-    // mid-flight: the receipt is stranded, not progressing.
-    const ownerExited = nonTerminal && transaction.ownerAlive === false;
-    const detail = [
-        ownerExited ? "Owner process exited — recovery required." : null,
-        transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
-        transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
-        transaction.refreshSource ? `${transaction.refreshSource} Tweakers refresh` : null,
-        typeof transaction.terminalAt === "string"
-            ? `Terminal at ${new Date(transaction.terminalAt).toLocaleString()}`
-            : transaction.updatedAt
-                ? `Last update at ${new Date(transaction.updatedAt).toLocaleString()}`
-                : null,
-        transaction.error ?? null,
-    ].filter(Boolean).join(" · ") || "Waiting for the durable updater receipt.";
-    const row = actionRow("Update and Reload", detail);
-    row.setAttribute("role", "status");
-    row.setAttribute("aria-live", "polite");
-    const left = row.firstElementChild;
-    const tone = transaction.phase === "completed"
-        ? "ok"
-        : ownerExited || (transaction.phase === "failed" && !transaction.resumable)
-            ? "error"
-            : "warn";
-    left?.prepend(statusBadge(tone, phase));
-    const controls = row.querySelector("[data-tweaker-row-actions]");
-    const canResume = transaction.resumable === true
-        && (transaction.phase === "failed" || transaction.phase === "rolled_back");
-    // cancelUnlocked handles exited owners for these stranded phases via
-    // recoverExitedOwner, so a dead-owner receipt gets a safe-recovery Cancel.
-    const deadOwnerRecoverable = ownerExited
-        && ["switching_to_chatgpt", "returning_to_tweakers", "refreshing_runtime", "verifying", "preparing"]
-            .includes(transaction.phase);
-    const canCancel = transaction.phase === "awaiting_native_update"
-        || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase))
-        || deadOwnerRecoverable;
-    if (canResume) {
-        const resume = compactButton("Resume", actions.onResume);
-        resume.disabled = actions.busy;
-        controls?.appendChild(resume);
-    }
-    if (canCancel) {
-        const cancel = compactButton("Cancel", actions.onCancel);
-        cancel.disabled = actions.busy;
-        controls?.appendChild(cancel);
-    }
-    return row;
 }
 function renderTweaksHealthSection(sectionsWrap, cardUpdates) {
     const section = document.createElement("section");

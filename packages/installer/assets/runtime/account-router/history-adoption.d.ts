@@ -1,4 +1,4 @@
-import { type OpaqueAccountId, type RouterConfigV2, type RouterState } from "./types";
+import { type OpaqueAccountId, type RouterConfigV2, type RouterConfigV3, type RouterState } from "./types";
 /** Offline-published evidence names. The runtime only verifies them. */
 export declare const ACCOUNT_HISTORY_ADOPTION_INTENT_FILE: "history-adoption-intent.v1.json";
 export declare const ACCOUNT_HISTORY_ADOPTION_RECEIPT_FILE: "history-adoption-receipt.v1.json";
@@ -92,7 +92,7 @@ export declare function verifyHistoryAdoptionReceipt(receipt: HistoryAdoptionRec
  * strict durable owner state. It deliberately accepts later non-historical
  * thread owner growth; only the signed manifest subset is required here.
  */
-export declare function validateHistoryAdoptionEvidence(config: RouterConfigV2, state: RouterState, secret: Buffer, raw: {
+export declare function validateHistoryAdoptionEvidence(config: RouterConfigV2 | RouterConfigV3, state: RouterState, secret: Buffer, raw: {
     intent: Buffer;
     owners: Buffer;
     receipt: Buffer;

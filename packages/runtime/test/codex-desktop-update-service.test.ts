@@ -31,7 +31,7 @@ test("concurrent menu and Config checks join one metadata request and one native
     resolveTarget: async () => stableTarget,
     refreshMetadata: async () => { refreshes += 1; return metadata; },
     showDialog: async (dialog) => { dialogs.push(dialog); return { response: 0 }; },
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
   });
 
   const menu = service.checkAndPresent();
@@ -59,7 +59,7 @@ test("silent checks refresh metadata without ever opening a native dialog", asyn
       return { ...currentMetadata, updateAvailable: true };
     },
     showDialog: async () => { dialogs += 1; return { response: 0 }; },
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
   });
 
   const result = await service.checkSilently();
@@ -80,7 +80,7 @@ test("completed checks are retained and published once without sharing mutable s
       updateAvailable: true,
     }),
     showDialog: async () => ({ response: 1 }),
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
     onResult: (result) => {
       published.push(result.latest);
       result.latest.marketingVersion = "mutated publisher copy";
@@ -105,7 +105,7 @@ test("a cached known update remains visible when its metadata refresh is stale",
       error: "OpenAI appcast metadata could not be refreshed.",
     }),
     showDialog: async () => ({ response: 1 }),
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
   });
 
   const result = await service.checkSilently();
@@ -123,7 +123,7 @@ test("a silent check and a manual check share metadata while only the manual che
     resolveTarget: async () => stableTarget,
     refreshMetadata: async () => { refreshes += 1; return metadata; },
     showDialog: async () => { dialogs += 1; return { response: 0 }; },
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
   });
 
   const silent = service.checkSilently();
@@ -138,7 +138,7 @@ test("a silent check and a manual check share metadata while only the manual che
   assert.equal(dialogs, 1);
 });
 
-test("an available update offers Update and Reload and starts the shared transaction once", async () => {
+test("an available update offers Update ChatGPT and starts the official transaction once", async () => {
   const dialogs: CodexDesktopUpdateDialog[] = [];
   let starts = 0;
   const service = createCodexDesktopUpdateService({
@@ -149,15 +149,16 @@ test("an available update offers Update and Reload and starts the shared transac
       updateAvailable: true,
     }),
     showDialog: async (dialog) => { dialogs.push(dialog); return { response: 0 }; },
-    startUpdateAndReload: async () => { starts += 1; },
+    startOfficialUpdate: async () => { starts += 1; },
   });
 
   const result = await service.checkAndPresent();
 
   assert.equal(result.status, "update-available");
   assert.equal(result.updateAndReloadRequested, true);
+  assert.equal(result.officialUpdateRequested, true);
   assert.equal(starts, 1);
-  assert.deepEqual(dialogs[0]?.buttons, ["Update and Reload", "Later"]);
+  assert.deepEqual(dialogs[0]?.buttons, ["Update ChatGPT", "Later"]);
   assert.match(dialogs[0]?.message ?? "", /1\.3\.0/);
   assert.match(dialogs[0]?.detail ?? "", /1\.2\.3/);
 });
@@ -168,7 +169,7 @@ test("Later leaves an available update actionable without starting a transaction
     resolveTarget: async () => stableTarget,
     refreshMetadata: async () => ({ ...currentMetadata, updateAvailable: true }),
     showDialog: async () => ({ response: 1 }),
-    startUpdateAndReload: async () => { starts += 1; },
+    startOfficialUpdate: async () => { starts += 1; },
   });
 
   const result = await service.checkAndPresent();
@@ -190,7 +191,7 @@ test("gated Alpha setup is returned inline without opening a dead-end retry dial
     }),
     refreshMetadata: async () => { refreshes += 1; return currentMetadata; },
     showDialog: async () => { dialogs += 1; return { response: 0 }; },
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
   });
 
   const result = await service.checkAndPresent();
@@ -212,7 +213,7 @@ test("a failed update transaction replaces the retained available state and pres
       dialogs.push(dialog);
       return { response: dialogs.length === 1 ? 0 : 1 };
     },
-    startUpdateAndReload: async () => { throw new Error("transaction launch failed"); },
+    startOfficialUpdate: async () => { throw new Error("transaction launch failed"); },
     onResult: (result) => { published.push(result.status); },
   });
 
@@ -261,7 +262,7 @@ test("current, stale, error, and unavailable targets have explicit native outcom
         resolveTarget: async () => scenario.target ?? stableTarget,
         refreshMetadata: async () => scenario.metadata ?? currentMetadata,
         showDialog: async (dialog) => { dialogs.push(dialog); return { response: scenario.buttons.length - 1 }; },
-        startUpdateAndReload: async () => {},
+        startOfficialUpdate: async () => {},
       });
 
       const result = await service.checkAndPresent();
@@ -286,7 +287,7 @@ test("Try Again schedules a fresh flight only after the failed flight is complet
       return { ...currentMetadata, error: "offline" };
     },
     showDialog: async () => ({ response: 0 }),
-    startUpdateAndReload: async () => {},
+    startOfficialUpdate: async () => {},
     scheduleRetry: (retry) => { scheduled.push(retry); },
   });
 

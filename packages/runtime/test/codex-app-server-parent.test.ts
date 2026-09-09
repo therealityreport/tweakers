@@ -10,9 +10,68 @@ import {
   CODEX_APP_SERVER_PARENT_SOURCE,
   installCodexAppServerParent,
   isCodexAppServerSpawn,
+  SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV,
+  secondaryVariantAppServerArgs,
   type MutableChildProcessModule,
   type SpawnFunction,
 } from "../src/codex-app-server-parent";
+
+test("secondary variant keeps only its per-window app-tools MCP projection", () => {
+  assert.deepEqual(secondaryVariantAppServerArgs([
+    "-c", "features.code_mode_host=true",
+    "app-server",
+    "--analytics-default-enabled",
+    "-c", "mcp_servers.codex_app={command=\"app-tools\"}",
+    "-c", "mcp_servers.context7={command=\"context7\"}",
+    "-c", "mcp_servers.node_repl.enabled=true",
+    "-c", "plugins.\"shadcn@local\".enabled=true",
+  ]), [
+    "-c", "features.code_mode_host=true",
+    "app-server",
+    "--analytics-default-enabled",
+    "-c", "mcp_servers.codex_app={command=\"app-tools\"}",
+  ]);
+});
+
+test("secondary variant filtering and remote-control suppression are applied before the signed parent spawn", () => {
+  const calls: Array<{ command: string; args: unknown; options: unknown }> = [];
+  const childProcess: MutableChildProcessModule = {
+    spawn: ((command, args, options) => {
+      calls.push({ command, args, options });
+      return {} as ChildProcess;
+    }) as SpawnFunction,
+  };
+  const installation = installCodexAppServerParent({
+    childProcess,
+    resourcesPath: "/present",
+    platform: "darwin",
+    pathExists: () => true,
+    secondaryVariant: true,
+  });
+  childProcess.spawn("/usr/local/bin/codex", [
+    "app-server",
+    "-c", "mcp_servers.codex_app={command=\"app-tools\"}",
+    "-c", "plugins.\"last30days@local\".enabled=true",
+  ], {
+    stdio: "pipe",
+    env: {
+      PATH: "/usr/bin",
+      [SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV]: "0",
+    },
+  });
+  assert.deepEqual(calls[0]?.args, buildCodexAppServerParentArgs("/usr/local/bin/codex", [
+    "app-server",
+    "-c", "mcp_servers.codex_app={command=\"app-tools\"}",
+  ]));
+  assert.deepEqual(calls[0]?.options, {
+    stdio: "pipe",
+    env: {
+      PATH: "/usr/bin",
+      [SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV]: "1",
+    },
+  });
+  installation.uninstall();
+});
 
 test("matches only a normal Codex app-server launch", () => {
   assert.equal(isCodexAppServerSpawn("/usr/local/bin/codex", ["app-server"]), true);

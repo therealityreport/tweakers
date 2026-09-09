@@ -18,19 +18,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_FILE,
+  ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE,
   ACCOUNT_HISTORY_ADOPTION_OWNERS_FILE,
   ACCOUNT_ROUTER_HISTORY_ADOPTION_PROTOCOL_FINGERPRINT,
   CODEX_HISTORY_ARTIFACTS,
   OFFICIAL_CODEX_DATABASES,
   adoptAccountHistory,
   canonicalJson,
+  createHistoryAdoptionAliases,
   createHistoryAdoptionIntent,
   createHistoryAdoptionOwners,
   createHistoryAdoptionReceipt,
+  historyAdoptionCensusInput,
   historyAdoptionPoolFingerprint,
+  historyAdoptionReceiptFingerprint,
+  historyAdoptionIntentFingerprint,
   historyAdoptionProcessCensus,
   historyAdoptionThreadOwnersFingerprint,
+  inspectCompletedLegacyV2HistoryAdoption,
+  initializeMissingLegacyV2HistoryAdoption,
   parseHistoryAdoptionIntent,
+  parseHistoryAdoptionAliases,
   parseHistoryAdoptionReceipt,
   routerConfigFingerprint,
   type HistoryAdoptionCensus,
@@ -38,6 +47,7 @@ import {
   type HistoryAdoptionSqliteAdapter,
   type HistoryAdoptionSqliteRow,
   verifyHistoryAdoptionIntent,
+  verifyHistoryAdoptionAliases,
   verifyHistoryAdoptionReceipt,
 } from "../src/account-history-adoption";
 
@@ -45,6 +55,8 @@ const OWNER = `ar_${"a".repeat(43)}` as const;
 const OTHER = `ar_${"b".repeat(43)}` as const;
 const THREAD_A = "01a05546-cf93-7383-96ed-dc76ce3d1b3c";
 const THREAD_B = "01a05547-cf93-7383-96ed-dc76ce3d1b3c";
+const THREAD_C = "01a05548-cf93-7383-96ed-dc76ce3d1b3c";
+const THREAD_D = "01a05549-cf93-7383-96ed-dc76ce3d1b3c";
 const FIXED_TIME = "2026-08-31T12:00:00.000Z";
 
 class SyntheticSqlite implements HistoryAdoptionSqliteAdapter {
@@ -167,6 +179,7 @@ class Fixture {
       { opaqueAccountId: OTHER, included: true as const, weight: 1, capabilityFingerprint: `sha256:${"d".repeat(64)}` as const, label: "Account B" },
     ] as const;
     const bare = {
+      schemaVersion: 2 as const,
       mode: "quota_aware" as const,
       policy: "quota_aware_v1" as const,
       generation: 1,
@@ -175,7 +188,6 @@ class Fixture {
       accounts,
     };
     return {
-      schemaVersion: 2 as const,
       ...bare,
       fingerprint: routerConfigFingerprint(bare),
       updatedAt: FIXED_TIME,
@@ -269,6 +281,229 @@ test("dry run performs zero writes and only returns redacted adoption evidence",
   assert.deepEqual(readdirSync(fixture.accountsRoot).sort(), [OWNER]);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(OWNER));
   assert.doesNotMatch(JSON.stringify(result), new RegExp(fixture.sourceCodexRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+}));
+
+test("a signed legacy intent-only layout previews without writes, then journals and publishes only deterministic state", () => withFixture((fixture) => {
+  rmSync(fixture.stateFile);
+  const originalIntent = JSON.parse(readFileSync(fixture.intentFile, "utf8"));
+  const beforePreview = fixture.snapshot();
+  let previewCensuses = 0;
+  const preview = initializeMissingLegacyV2HistoryAdoption({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceSqliteRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+  }, {
+    census: () => {
+      previewCensuses += 1;
+      return idleCensus();
+    },
+    now: () => FIXED_TIME,
+  });
+  assert.equal(preview.status, "initialization-required");
+  assert.equal(preview.intentFingerprint, historyAdoptionIntentFingerprint(originalIntent));
+  assert.equal(preview.nextAction, "apply-offline-initialization");
+  assert.equal(previewCensuses, 0);
+  assert.equal(fixture.snapshot(), beforePreview);
+
+  let applyCensuses = 0;
+  const phases: string[] = [];
+  const initialized = initializeMissingLegacyV2HistoryAdoption({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceSqliteRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+    apply: true,
+  }, {
+    census: () => {
+      applyCensuses += 1;
+      return idleCensus();
+    },
+    now: () => FIXED_TIME,
+    beforePhase: (phase) => phases.push(phase),
+  });
+  assert.equal(initialized.status, "initialized");
+  assert.equal(initialized.nextAction, "continue-adoption");
+  assert.equal(applyCensuses, 2);
+  assert.deepEqual(phases, ["initialization-journal-prepared", "initialization-router-state-published", "initialization-complete"]);
+  const journal = JSON.parse(readFileSync(join(fixture.routerRoot, "history-adoption-initialization.v1.json"), "utf8")) as { intent: unknown };
+  assert.deepEqual(journal.intent, originalIntent);
+  assert.equal(existsSync(fixture.stateFile), true);
+  assert.equal(fixture.run(true).status, "adopted");
+}));
+
+test("every durable initialization boundary recovers from the committed disk layout without duplicate mutation", () => {
+  const faultPhases = [
+    "initialization-journal-prepared",
+    "initialization-intent-published",
+    "initialization-router-state-published",
+    "initialization-complete",
+  ] as const;
+
+  for (const faultPhase of faultPhases) withFixture((fixture) => {
+    rmSync(fixture.intentFile);
+    rmSync(fixture.stateFile);
+    const configBefore = readFileSync(fixture.configFile);
+    const immutableBefore = fixture.snapshot(fixture.sourceCodexRoot, fixture.sourceSqliteRoot, fixture.ownerRoot);
+    const observed: string[] = [];
+
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption({
+      sourceCodexRoot: fixture.sourceCodexRoot,
+      sourceSqliteRoot: fixture.sourceSqliteRoot,
+      routerRoot: fixture.routerRoot,
+      appPath: "/synthetic/ChatGPT.app",
+      apply: true,
+    }, {
+      census: () => idleCensus(),
+      now: () => FIXED_TIME,
+      beforePhase: (phase) => {
+        observed.push(phase);
+        if (phase === faultPhase) throw new Error(`synthetic initialization crash ${faultPhase}`);
+      },
+    }), /synthetic initialization crash/);
+
+    assert.equal(observed.includes(faultPhase), true, faultPhase);
+    assert.equal(existsSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_FILE)), true, faultPhase);
+    assert.deepEqual(readFileSync(fixture.configFile), configBefore, faultPhase);
+    assert.equal(fixture.snapshot(fixture.sourceCodexRoot, fixture.sourceSqliteRoot, fixture.ownerRoot), immutableBefore, faultPhase);
+    assert.deepEqual(readdirSync(fixture.accountsRoot).sort(), [OWNER], faultPhase);
+
+    // A fresh call has no in-memory state from the interrupted initializer;
+    // it must rebuild solely from the journal and committed configuration.
+    const recovered = initializeMissingLegacyV2HistoryAdoption({
+      sourceCodexRoot: fixture.sourceCodexRoot,
+      sourceSqliteRoot: fixture.sourceSqliteRoot,
+      routerRoot: fixture.routerRoot,
+      appPath: "/synthetic/ChatGPT.app",
+      apply: true,
+    }, { census: () => idleCensus(), now: () => FIXED_TIME });
+    assert.equal(recovered.status === "initialized" || recovered.status === "ready", true, faultPhase);
+    assert.deepEqual(JSON.parse(readFileSync(fixture.stateFile, "utf8")), routerState(fixture.config()), faultPhase);
+    assert.equal(fixture.run(false).status, "dry-run", faultPhase);
+
+    const retry = initializeMissingLegacyV2HistoryAdoption({
+      sourceCodexRoot: fixture.sourceCodexRoot,
+      sourceSqliteRoot: fixture.sourceSqliteRoot,
+      routerRoot: fixture.routerRoot,
+      appPath: "/synthetic/ChatGPT.app",
+      apply: true,
+    }, { census: () => idleCensus(), now: () => FIXED_TIME });
+    assert.equal(retry.status, "ready", faultPhase);
+    assert.deepEqual(readFileSync(fixture.configFile), configBefore, faultPhase);
+    assert.equal(fixture.snapshot(fixture.sourceCodexRoot, fixture.sourceSqliteRoot, fixture.ownerRoot), immutableBefore, faultPhase);
+    assert.deepEqual(readdirSync(fixture.accountsRoot).sort(), [OWNER], faultPhase);
+  });
+});
+
+test("initialization restart rejects a journal when its committed config bytes have drifted", () => withFixture((fixture) => {
+  rmSync(fixture.intentFile);
+  rmSync(fixture.stateFile);
+  assert.throws(() => initializeMissingLegacyV2HistoryAdoption({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceSqliteRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+    apply: true,
+  }, {
+    census: () => idleCensus(),
+    now: () => FIXED_TIME,
+    beforePhase: (phase) => {
+      if (phase === "initialization-journal-prepared") throw new Error("synthetic initialization crash");
+    },
+  }), /synthetic initialization crash/);
+
+  const config = fixture.config();
+  writeFileSync(fixture.configFile, JSON.stringify({ ...config, updatedAt: "2026-08-31T12:00:01.000Z" }), { mode: 0o600 });
+  assert.throws(() => initializeMissingLegacyV2HistoryAdoption({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceSqliteRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+    apply: true,
+  }, { census: () => idleCensus(), now: () => FIXED_TIME }), /history-adoption-initialization-config-mismatch/);
+  assert.equal(existsSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_INITIALIZATION_JOURNAL_FILE)), true);
+  assert.equal(existsSync(fixture.intentFile), false);
+  assert.equal(existsSync(fixture.stateFile), false);
+}));
+
+test("intent-only initialization fails closed for incomplete, tampered, drifting, or newly evidenced layouts", () => {
+  const inputFor = (fixture: Fixture, apply = false) => ({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceSqliteRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+    apply,
+  });
+  const dependencies = { census: () => idleCensus(), now: () => FIXED_TIME };
+
+  withFixture((fixture) => {
+    rmSync(fixture.intentFile);
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption(inputFor(fixture), dependencies), /history-adoption-initialization-incomplete-without-journal/);
+  });
+  withFixture((fixture) => {
+    rmSync(fixture.stateFile);
+    const intent = JSON.parse(readFileSync(fixture.intentFile, "utf8")) as Record<string, unknown>;
+    writeFileSync(fixture.intentFile, JSON.stringify({ ...intent, hmac: `hmac-sha256:${"0".repeat(64)}` }), { mode: 0o600 });
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption(inputFor(fixture), dependencies), /history-adoption-intent-hmac-invalid/);
+  });
+  withFixture((fixture) => {
+    rmSync(fixture.stateFile);
+    let censuses = 0;
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption(inputFor(fixture, true), {
+      census: () => {
+        censuses += 1;
+        if (censuses === 2) {
+          const config = fixture.config();
+          writeFileSync(fixture.configFile, JSON.stringify({ ...config, updatedAt: "2026-08-31T12:00:01.000Z" }), { mode: 0o600 });
+        }
+        return idleCensus();
+      },
+      now: () => FIXED_TIME,
+    }), /history-adoption-initialization-config-changed-before-journal/);
+    assert.equal(existsSync(join(fixture.routerRoot, "history-adoption-initialization.v1.json")), false);
+  });
+  withFixture((fixture) => {
+    rmSync(fixture.stateFile);
+    let censuses = 0;
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption(inputFor(fixture, true), {
+      census: () => {
+        censuses += 1;
+        if (censuses === 2) {
+          const intent = JSON.parse(readFileSync(fixture.intentFile, "utf8"));
+          writeFileSync(fixture.intentFile, `${JSON.stringify(intent, null, 2)}\n`, { mode: 0o600 });
+        }
+        return idleCensus();
+      },
+      now: () => FIXED_TIME,
+    }), /history-adoption-initialization-intent-changed-before-journal/);
+    assert.equal(existsSync(join(fixture.routerRoot, "history-adoption-initialization.v1.json")), false);
+  });
+  withFixture((fixture) => {
+    rmSync(fixture.stateFile);
+    let censuses = 0;
+    assert.throws(() => initializeMissingLegacyV2HistoryAdoption(inputFor(fixture, true), {
+      census: () => {
+        censuses += 1;
+        if (censuses === 2) writeFileSync(fixture.ownersFile, "unexpected adoption evidence", { mode: 0o600 });
+        return idleCensus();
+      },
+      now: () => FIXED_TIME,
+    }), /history-adoption-initialization-intent-only-layout-invalid/);
+    assert.equal(existsSync(join(fixture.routerRoot, "history-adoption-initialization.v1.json")), false);
+  });
+});
+
+test("history adoption census roots retain order while deduplicating the exact shared source root", () => withFixture((fixture) => {
+  assert.deepEqual(historyAdoptionCensusInput({
+    sourceCodexRoot: fixture.sourceCodexRoot,
+    sourceSqliteRoot: fixture.sourceCodexRoot,
+    routerRoot: fixture.routerRoot,
+    appPath: "/synthetic/ChatGPT.app",
+  }).protectedPaths, [
+    fixture.sourceCodexRoot,
+    fixture.accountsRoot,
+    fixture.routerRoot,
+  ]);
 }));
 
 test("process census ignores exactly the installer PID while another matching PID still blocks", () => {
@@ -398,6 +633,141 @@ test("receipt is published last, retained backup/source remain unchanged, and ex
   const rerun = fixture.run(true);
   assert.equal(rerun.status, "already-adopted");
   assert.equal(fixture.snapshot(), afterFirst);
+}));
+
+test("completed v2 proof is HMAC-bound and refuses any non-v2 router configuration", () => withFixture((fixture) => {
+  const adopted = fixture.run(true);
+  assert.equal(adopted.status, "adopted");
+  const proof = inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot);
+  assert.equal(proof.legacyOwnerOpaqueAccountId, OWNER);
+  assert.deepEqual(proof.owners.threadIds, [THREAD_A]);
+  assert.equal(proof.receipt.importedThreadCount, 1);
+
+  const v2 = fixture.config();
+  const config = {
+    ...v2,
+    schemaVersion: 3 as const,
+    policy: "quota_aware_v2" as const,
+  };
+  config.fingerprint = routerConfigFingerprint(config);
+  writeFileSync(fixture.configFile, JSON.stringify(config), { mode: 0o600 });
+  assert.throws(() => inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot), /legacy-v2-config-required/);
+}));
+
+test("optional alias provenance is canonical, receipt-bound, and never inferred from a copy-like record", () => withFixture((fixture) => {
+  assert.equal(fixture.run(true).status, "adopted");
+  const completed = inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot);
+  assert.equal(completed.aliases, null);
+  const aliases = createHistoryAdoptionAliases({
+    protocolFingerprint: completed.intent.protocolFingerprint,
+    poolFingerprint: completed.intent.poolFingerprint,
+    intentFingerprint: historyAdoptionIntentFingerprint(completed.intent),
+    adoptionReceiptFingerprint: historyAdoptionReceiptFingerprint(completed.receipt),
+    createdAt: FIXED_TIME,
+    aliases: [{
+      copyOperationId: "offline-copy-fixture-0001",
+      sourceOpaqueAccountId: OWNER,
+      sourceNativeThreadId: THREAD_A,
+      sourceRolloutSha256: `sha256:${"1".repeat(64)}`,
+      copyOpaqueAccountId: OTHER,
+      copyNativeThreadId: THREAD_B,
+      copyRolloutSha256: `sha256:${"2".repeat(64)}`,
+      portableTranscriptDigest: `sha256:${"3".repeat(64)}`,
+    }],
+  }, fixture.secret);
+  assert.equal(verifyHistoryAdoptionAliases(parseHistoryAdoptionAliases(Buffer.from(JSON.stringify(aliases))), fixture.secret), true);
+  assert.equal(verifyHistoryAdoptionAliases({ ...aliases, adoptionReceiptFingerprint: `sha256:${"4".repeat(64)}` }, fixture.secret), false);
+  writeFileSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE), JSON.stringify(aliases), { mode: 0o600 });
+  assert.deepEqual(inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot).aliases, aliases);
+
+  const cyclic = [
+    aliases.aliases[0]!,
+    {
+      ...aliases.aliases[0]!,
+      copyOperationId: "offline-copy-fixture-0002",
+      sourceOpaqueAccountId: OTHER,
+      sourceNativeThreadId: THREAD_B,
+      sourceRolloutSha256: `sha256:${"4".repeat(64)}`,
+      copyOpaqueAccountId: OWNER,
+      copyNativeThreadId: THREAD_A,
+      copyRolloutSha256: `sha256:${"5".repeat(64)}`,
+    },
+  ];
+  assert.throws(() => createHistoryAdoptionAliases({
+    protocolFingerprint: completed.intent.protocolFingerprint,
+    poolFingerprint: completed.intent.poolFingerprint,
+    intentFingerprint: historyAdoptionIntentFingerprint(completed.intent),
+    adoptionReceiptFingerprint: historyAdoptionReceiptFingerprint(completed.receipt),
+    createdAt: FIXED_TIME,
+    aliases: cyclic,
+  }, fixture.secret), /invalid-history-adoption-aliases/);
+
+  writeFileSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE), JSON.stringify({
+    ...aliases,
+    hmac: `hmac-sha256:${"0".repeat(64)}`,
+  }), { mode: 0o600 });
+  assert.throws(() => inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot), /history-adoption-aliases-hmac-invalid/);
+}));
+
+test("alias records reject forged receipt or members plus malformed ordering and graph edges", () => withFixture((fixture) => {
+  assert.equal(fixture.run(true).status, "adopted");
+  const completed = inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot);
+  const baseRecord = {
+    copyOperationId: "offline-copy-fixture-0001",
+    sourceOpaqueAccountId: OWNER,
+    sourceNativeThreadId: THREAD_A,
+    sourceRolloutSha256: `sha256:${"1".repeat(64)}` as const,
+    copyOpaqueAccountId: OTHER,
+    copyNativeThreadId: THREAD_B,
+    copyRolloutSha256: `sha256:${"2".repeat(64)}` as const,
+    portableTranscriptDigest: `sha256:${"3".repeat(64)}` as const,
+  };
+  const create = (records: readonly typeof baseRecord[], receiptFingerprint = historyAdoptionReceiptFingerprint(completed.receipt)) =>
+    createHistoryAdoptionAliases({
+      protocolFingerprint: completed.intent.protocolFingerprint,
+      poolFingerprint: completed.intent.poolFingerprint,
+      intentFingerprint: historyAdoptionIntentFingerprint(completed.intent),
+      adoptionReceiptFingerprint: receiptFingerprint,
+      aliases: records,
+      createdAt: FIXED_TIME,
+    }, fixture.secret);
+
+  const valid = create([baseRecord]);
+  const forgedReceipt = create([baseRecord], `sha256:${"4".repeat(64)}` as const);
+  writeFileSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE), JSON.stringify(forgedReceipt), { mode: 0o600 });
+  assert.throws(() => inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot), /history-adoption-aliases-proof-mismatch/);
+
+  const forgedMember = create([{ ...baseRecord, sourceNativeThreadId: THREAD_B }]);
+  writeFileSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE), JSON.stringify(forgedMember), { mode: 0o600 });
+  assert.throws(() => inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot), /history-adoption-aliases-member-unproven/);
+
+  const second = {
+    ...baseRecord,
+    copyOperationId: "offline-copy-fixture-0002",
+    sourceNativeThreadId: THREAD_C,
+    sourceRolloutSha256: `sha256:${"4".repeat(64)}` as const,
+    copyNativeThreadId: THREAD_D,
+    copyRolloutSha256: `sha256:${"5".repeat(64)}` as const,
+    portableTranscriptDigest: `sha256:${"6".repeat(64)}` as const,
+  };
+  const ordered = create([baseRecord, second]);
+  assert.throws(() => parseHistoryAdoptionAliases(Buffer.from(JSON.stringify({
+    ...ordered,
+    aliases: [...ordered.aliases].reverse(),
+  }))), /invalid-history-adoption-aliases/);
+  assert.throws(() => create([{ ...baseRecord, copyOperationId: "too-short" }]), /invalid-history-adoption-aliases/);
+  assert.throws(() => create([baseRecord, { ...second, copyOperationId: baseRecord.copyOperationId }]), /invalid-history-adoption-aliases/);
+  assert.throws(() => create([baseRecord, { ...second, sourceNativeThreadId: THREAD_A }]), /invalid-history-adoption-aliases/);
+  assert.throws(() => create([baseRecord, {
+    ...second,
+    sourceOpaqueAccountId: OTHER,
+    sourceNativeThreadId: THREAD_B,
+    copyOpaqueAccountId: OWNER,
+    copyNativeThreadId: THREAD_A,
+  }]), /invalid-history-adoption-aliases/);
+
+  writeFileSync(join(fixture.routerRoot, ACCOUNT_HISTORY_ADOPTION_ALIASES_FILE), JSON.stringify(valid), { mode: 0o600 });
+  assert.deepEqual(inspectCompletedLegacyV2HistoryAdoption(fixture.routerRoot).aliases, valid);
 }));
 
 test("every publication-boundary failure restores owner/router state and retains failed candidates", () => {

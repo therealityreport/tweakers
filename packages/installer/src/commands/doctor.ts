@@ -4,7 +4,7 @@ import { userPaths } from "../paths.js";
 import { readState, resolveMode } from "../state.js";
 import { locateCodex } from "../platform.js";
 import { readHeaderHash } from "../asar.js";
-import { verifySignature } from "../codesign.js";
+import { signatureInfo, verifySignature, type SignatureInfo } from "../codesign.js";
 import { existsSync, accessSync, constants } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { inspectChromeBridge } from "../chrome-bridge-health.js";
@@ -13,6 +13,7 @@ import { describeChatgptModeAsar, describeRendererPatchCoverage, patchedPayloadA
 import { readRendererPatchRecord } from "../renderer-patch-outcome.js";
 import { parkedPayloadApp, payloadMetadataFile, readPayloadMetadata } from "../mode-transition.js";
 import { targetUserHome } from "../ownership.js";
+import { defaultTweakersAccountsBrokerRoot } from "../macos-variant.js";
 import {
   inspectMcpLifecycleHealth,
   type McpLifecycleHealthReport,
@@ -22,6 +23,8 @@ import { environmentModeCachePaths, observeEnvironmentModeCache } from "../envir
 import { readConfigFile } from "../config.js";
 import {
   inspectAccountRouter,
+  inspectIndependentTweakersLiveHealth,
+  canonicalIndependentTweakersVariantRoot,
   readRegisteredDevelopmentSourceRoot,
   type AccountRouterArtifactEvidence,
   type AccountRouterEvidence,
@@ -52,8 +55,13 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   });
   const accountRouter = await inspectAccountRouter({
     userRoot: paths.root,
+    brokerRoot: defaultTweakersAccountsBrokerRoot(targetUserHome()),
     registeredDevelopmentSourceRoot: readRegisteredDevelopmentSourceRoot(readConfigFile(paths.configFile)),
     installedRuntimeRoot: paths.runtime,
+  });
+  const independentVariantRoot = canonicalIndependentTweakersVariantRoot(targetUserHome());
+  const independentLiveHealth = inspectIndependentTweakersLiveHealth(independentVariantRoot, {
+    expectedAccountsBrokerRoot: defaultTweakersAccountsBrokerRoot(targetUserHome()),
   });
 
   checks.push({
@@ -67,6 +75,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
     detail: item.detail,
   })));
   checks.push(...accountRouterDoctorChecks(accountRouter));
+  checks.push(...independentTweakersLiveHealthDoctorChecks(independentLiveHealth));
 
   // This is a presentation-only read. In particular it must not create the
   // default-off cache directory while doctor is checking an ordinary install.
@@ -176,11 +185,12 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   }
 
   if (codex.platform === "darwin") {
-    const sig = verifySignature(codex.appRoot);
+    const verification = verifySignature(codex.appRoot);
+    const identity = signatureInfo(codex.appRoot);
     checks.push({
       name: "code signature",
-      ok: sig.ok,
-      detail: sig.ok ? "valid (ad-hoc)" : sig.output.split("\n")[0],
+      ok: verification.ok && identity.ok,
+      detail: codeSignatureDoctorDetail(verification, identity),
     });
 
     // A locally re-signed app no longer matches the ACL on the safeStorage
@@ -221,6 +231,17 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   print(checks, options, lifecycle, cacheV2);
 }
 
+export function codeSignatureDoctorDetail(
+  verification: Readonly<{ ok: boolean; output: string }>,
+  identity: SignatureInfo,
+): string {
+  if (!verification.ok) return verification.output.split("\n")[0] || "invalid signature";
+  if (!identity.ok) return identity.output.split("\n")[0] || "signature identity unreadable";
+  if (identity.adHoc) return "valid (ad-hoc)";
+  const authority = identity.authority[0];
+  return authority ? `valid (${authority})` : "valid (certificate identity unavailable)";
+}
+
 function describeEnvironmentModeCache(cache: ReturnType<typeof observeEnvironmentModeCache>): string {
   const generation = cache.generationId ? `generation ${cache.generationId}` : "no generation";
   const reason = cache.invalidationReasons[0];
@@ -238,6 +259,44 @@ function environmentModeCacheDoctorStatus(
     && cache.invalidationReasons.length === 1
     && cache.invalidationReasons[0] === "no environment mode cache has been published") return true;
   return "warn";
+}
+
+/**
+ * A current independent-app health record is useful only while its exact
+ * process is still alive.  Do not downgrade stale/PID-reused evidence to a
+ * warning: that would make an old good-looking receipt look live.
+ */
+export function independentTweakersLiveHealthDoctorChecks(
+  evidence: ReturnType<typeof inspectIndependentTweakersLiveHealth>,
+): Check[] {
+  if (evidence.state === "missing") return [];
+  if (evidence.state !== "current") {
+    return [{
+      name: "independent Tweakers live health",
+      ok: false,
+      detail: `rejected ${evidence.state.replaceAll("_", " ")} evidence`,
+    }];
+  }
+  const health = evidence.health;
+  const concerns: string[] = [];
+  if (health.lifecycleFailures.length > 0) {
+    concerns.push(`${health.lifecycleFailures.length} lifecycle failure${health.lifecycleFailures.length === 1 ? "" : "s"}`);
+  }
+  if (health.appearance.status !== "normal" || !health.appearance.normalized) {
+    concerns.push(`appearance ${health.appearance.status.replaceAll("_", " ")}${health.appearance.normalized ? "" : "; not normalized"}`);
+  }
+  if (concerns.length > 0) {
+    return [{
+      name: "independent Tweakers live health",
+      ok: false,
+      detail: `current PID ${health.pid} rejected: ${concerns.join("; ")}`,
+    }];
+  }
+  return [{
+    name: "independent Tweakers live health",
+    ok: true,
+    detail: `current PID ${health.pid}; ${health.initializedTweakIds.length} initialized tweaks; broker ${health.sharedHistoryBrokerState}; appearance normalized`,
+  }];
 }
 
 /** Operator checks distinguish recorded source, packaged candidate, installed runtime, and live mux facts. */
@@ -268,20 +327,21 @@ export function accountRouterDoctorChecks(evidence: AccountRouterEvidence): Chec
     });
   }
 
-  const v2MuxBacked = evidence.configuration.pending?.schemaVersion === 2;
-  if (evidence.configuration.state === "not_staged" || (evidence.configuration.state === "manual" && !v2MuxBacked)) {
-    return appendAccountRouterLiveCheck(checks, evidence, false);
+  const muxBacked = evidence.configuration.pending?.schemaVersion === 2 || evidence.configuration.pending?.schemaVersion === 3;
+  if (evidence.configuration.state === "not_staged" || (evidence.configuration.state === "manual" && !muxBacked)) {
+    appendAccountRouterLiveCheck(checks, evidence, false);
+    return appendAccountBrokerCheck(checks, evidence, false);
   }
 
-  if (v2MuxBacked) {
+  if (muxBacked) {
     checks.push({
       name: "account history adoption",
       ok: evidence.historyAdoption.state === "adopted" ? true : false,
       detail: evidence.historyAdoption.state === "adopted"
         ? evidence.configuration.pending?.mode === "manual"
-          ? "adopted offline history evidence is valid; v2 Manual remains mux-backed for history and assigns new threads to the primary account"
+          ? "adopted offline history evidence is valid; Manual remains mux-backed for history and assigns new threads to the primary account"
           : "adopted offline history evidence is valid"
-        : `v2 mux candidate is blocked: history adoption is ${evidence.historyAdoption.state.replaceAll("_", " ")}`,
+        : `mux candidate is blocked: history adoption is ${evidence.historyAdoption.state.replaceAll("_", " ")}`,
     });
   }
 
@@ -289,7 +349,8 @@ export function accountRouterDoctorChecks(evidence: AccountRouterEvidence): Chec
   const candidate = artifactCheck("account router candidate", evidence.candidate, evidence.source.version);
   const installed = artifactCheck("account router installed", evidence.installed, evidence.candidate.version);
   checks.push(source, candidate, installed);
-  return appendAccountRouterLiveCheck(checks, evidence, true, evidence.configuration.pending?.mode === "manual");
+  appendAccountRouterLiveCheck(checks, evidence, true, evidence.configuration.pending?.mode === "manual");
+  return appendAccountBrokerCheck(checks, evidence, evidence.configuration.pending?.schemaVersion === 3);
 }
 
 function appendAccountRouterLiveCheck(
@@ -309,6 +370,52 @@ function appendAccountRouterLiveCheck(
         : `${evidence.live.state.replaceAll("_", " ")}; direct/manual has no mux`,
     };
   checks.push(live);
+  return checks;
+}
+
+/**
+ * Broker evidence is independent of the legacy mux socket. Only a v3 staged
+ * configuration requires it; older staged formats retain their legacy doctor
+ * verdicts until they are explicitly migrated.
+ */
+function appendAccountBrokerCheck(
+  checks: Check[],
+  evidence: AccountRouterEvidence,
+  expected: boolean,
+): Check[] {
+  if (!expected && evidence.broker.state === "not_running") return checks;
+  if (evidence.broker.state !== "active" || !evidence.broker.status) {
+    checks.push({
+      name: "account broker live",
+      ok: expected ? (evidence.broker.state === "unavailable" ? false : "warn") : "warn",
+      detail: expected
+        ? `shared broker ${evidence.broker.state.replaceAll("_", " ")}`
+        : `${evidence.broker.state.replaceAll("_", " ")}; no v3 broker is staged`,
+    });
+    return checks;
+  }
+  const broker = evidence.broker.status;
+  const concerns: string[] = [];
+  let ok: Check["ok"] = true;
+  if (broker.state !== "available") {
+    ok = false;
+    concerns.push(`broker ${broker.state}`);
+  }
+  if (broker.pendingHandoffs.ambiguousCount > 0) {
+    ok = false;
+    concerns.push(`${broker.pendingHandoffs.ambiguousCount} ambiguous handoff${broker.pendingHandoffs.ambiguousCount === 1 ? "" : "s"}`);
+  }
+  if (broker.registeredClients.total === 0 || !broker.browserEvidence.observed || broker.pendingHandoffs.pendingCount > 0) {
+    if (ok === true) ok = "warn";
+    if (broker.registeredClients.total === 0) concerns.push("no registered desktop clients");
+    if (!broker.browserEvidence.observed) concerns.push("browser evidence not observed");
+    if (broker.pendingHandoffs.pendingCount > 0) concerns.push(`${broker.pendingHandoffs.pendingCount} pending handoff${broker.pendingHandoffs.pendingCount === 1 ? "" : "s"}`);
+  }
+  checks.push({
+    name: "account broker live",
+    ok,
+    detail: `authenticated shared broker; ${broker.registeredClients.total} registered desktop ${broker.registeredClients.total === 1 ? "client" : "clients"}; ${broker.residentChildren}/${broker.maxResidentChildren} resident children; held work ${broker.heldWorkCount}${concerns.length ? `; ${concerns.join("; ")}` : ""}`,
+  });
   return checks;
 }
 

@@ -16,7 +16,12 @@ export interface RateLimitObservation {
   weeklyRemainingPercent: number | null;
   weeklyResetAt: number | null;
   shortWindowPressure: number | null;
+  /** Present only when the provider supplied the exact five-hour reset. */
+  shortWindowResetAt?: number | null;
+  /** A non-null server-classified reached type makes the bucket ineligible. */
+  rateLimitReached?: boolean;
   observedAt: number | null;
+  resetCredits?: number | null;
 }
 
 export interface AccountQuotaObservation extends AccountReadObservation, RateLimitObservation {}
@@ -27,6 +32,7 @@ export interface QuotaSelectionCandidate {
   weeklyResetAt: number;
   shortWindowPressure: number | null;
   assignedThreadCount: number;
+  resetCredits?: number | null;
   configuredIndex: number;
 }
 
@@ -38,6 +44,9 @@ export function emptyQuotaObservation(): AccountQuotaObservation {
     weeklyRemainingPercent: null,
     weeklyResetAt: null,
     shortWindowPressure: null,
+    shortWindowResetAt: null,
+    rateLimitReached: false,
+    resetCredits: null,
   };
 }
 
@@ -68,21 +77,26 @@ export function parseAccountRead(result: unknown, now: number): AccountReadObser
  */
 export function parseRateLimitsRead(result: unknown, now: number): RateLimitObservation | null {
   if (!isPlainRecord(result)) return null;
-  const windows = collectWindows(result);
+  const bucket = codexRateLimitBucket(result);
+  if (!bucket) return null;
+  const windows = collectWindows(bucket.value);
   const weekly = windows
-    .filter((window) => window.weekly && window.durationMinutes === 10_080 && window.remainingPercent !== null && window.resetAt !== null)
+    .filter((window) => window.durationMinutes === 10_080 && window.remainingPercent !== null && window.resetAt !== null)
     .sort((left, right) => left.pathKey.localeCompare(right.pathKey))[0];
   if (!weekly) return null;
   // The five-hour (300-minute) window is the only supported short-pressure
   // tiebreaker. Monthly or arbitrary longer buckets must never affect it.
-  const shortPressures = windows
+  const short = windows
     .filter((window) => window.durationMinutes === 300 && window.remainingPercent !== null)
-    .map((window) => 100 - window.remainingPercent!);
+    .sort((left, right) => (left.remainingPercent! - right.remainingPercent!) || left.pathKey.localeCompare(right.pathKey))[0];
   return {
     weeklyRemainingPercent: weekly.remainingPercent,
     weeklyResetAt: weekly.resetAt,
-    shortWindowPressure: shortPressures.length ? Math.max(...shortPressures) : null,
+    shortWindowPressure: short ? 100 - short.remainingPercent! : null,
+    shortWindowResetAt: short?.resetAt ?? null,
+    rateLimitReached: bucket.rateLimitReached,
     observedAt: now,
+    resetCredits: resetCreditsFrom(result),
   };
 }
 
@@ -98,19 +112,93 @@ export function accountObservationEligible(observation: AccountQuotaObservation,
     && observation.weeklyRemainingPercent !== null
     && observation.weeklyRemainingPercent > 0
     && observation.weeklyResetAt !== null
-    && observation.weeklyResetAt > now;
+    && observation.weeklyResetAt > now
+    && observation.rateLimitReached !== true
+    // An exact zero in the currently-unreset five-hour window is not capacity.
+    // A missing reset never becomes an invented zero; it remains an unknown
+    // tiebreaker, preserving compatibility with older provider readings.
+    && !(observation.shortWindowPressure === 100
+      && (observation.shortWindowResetAt === null || observation.shortWindowResetAt === undefined || observation.shortWindowResetAt > now));
 }
 
-/** Higher weekly remaining percentage per remaining reset time wins. */
+// Ported from braindead-dev/codex-subscription-router a1d3e02,
+// internal/mux/accounts.go. See docs/accounts-upstream-LICENSE.txt.
+export const ROUTING_MINIMUM_WINDOW_MS = 60_000;
+export const ROUTING_FALLBACK_WINDOW_MS = 7 * 24 * 60 * 60_000;
+export const ROUTING_RESET_BONUS_PER_CREDIT = 0.15;
+export const ROUTING_RESET_BONUS_CREDIT_CAP = 3;
+
+export function quotaUrgencyScore(candidate: QuotaSelectionCandidate, now: number): number {
+  const remaining = Math.max(0, Math.min(100, candidate.weeklyRemainingPercent));
+  const untilReset = candidate.weeklyResetAt - now;
+  const horizon = Math.max(ROUTING_MINIMUM_WINDOW_MS, untilReset > 0 ? untilReset : ROUTING_FALLBACK_WINDOW_MS);
+  const credits = Math.min(ROUTING_RESET_BONUS_CREDIT_CAP, Math.max(0, candidate.resetCredits ?? 0));
+  return remaining / (horizon / 3_600_000) * (1 + credits * ROUTING_RESET_BONUS_PER_CREDIT);
+}
+
+/** Upstream urgency and stable tie-breaks, after fresh capacity eligibility. */
 export function compareQuotaCandidates(left: QuotaSelectionCandidate, right: QuotaSelectionCandidate, now: number): number {
-  const leftScore = left.weeklyRemainingPercent / Math.max(1, left.weeklyResetAt - now);
-  const rightScore = right.weeklyRemainingPercent / Math.max(1, right.weeklyResetAt - now);
-  if (leftScore !== rightScore) return rightScore - leftScore;
-  const leftPressure = left.shortWindowPressure ?? Number.POSITIVE_INFINITY;
-  const rightPressure = right.shortWindowPressure ?? Number.POSITIVE_INFINITY;
-  if (leftPressure !== rightPressure) return leftPressure - rightPressure;
+  const leftScore = quotaUrgencyScore(left, now);
+  const rightScore = quotaUrgencyScore(right, now);
+  if (Math.abs(leftScore - rightScore) > 0.000001) return rightScore - leftScore;
+  const leftPressure = left.shortWindowPressure ?? 1_000;
+  const rightPressure = right.shortWindowPressure ?? 1_000;
+  if (Math.abs(leftPressure - rightPressure) > 0.001) return leftPressure - rightPressure;
+  if (Math.abs(left.weeklyRemainingPercent - right.weeklyRemainingPercent) > 0.001) return right.weeklyRemainingPercent - left.weeklyRemainingPercent;
   if (left.assignedThreadCount !== right.assignedThreadCount) return left.assignedThreadCount - right.assignedThreadCount;
   return left.configuredIndex - right.configuredIndex;
+}
+
+function resetCreditsFrom(value: Record<string, unknown>): number | null {
+  if (isPlainRecord(value.rateLimitResetCredits)) {
+    const documented = value.rateLimitResetCredits.availableCount;
+    // The documented aggregate is authoritative; detail rows may be capped.
+    return isResetCreditCount(documented) ? documented : null;
+  }
+  const candidates = [
+    value.rateLimitResetCredits,
+    value.resetCredits,
+    isPlainRecord(value.credits) ? value.credits.available : null,
+    isPlainRecord(value.rateLimits) ? value.rateLimits.resetCredits : null,
+  ];
+  const found = candidates.find(isResetCreditCount);
+  return typeof found === "number" ? found : null;
+}
+
+function isResetCreditCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 10_000;
+}
+
+interface RateLimitBucket {
+  value: Record<string, unknown>;
+  rateLimitReached: boolean;
+}
+
+/**
+ * The multi-bucket response is keyed by the metered `limitId`. Select only the
+ * documented Codex bucket; other model/product buckets must not be combined
+ * with it. Older single-bucket fixtures without a limit identifier remain
+ * supported only when no multi-bucket response was supplied.
+ */
+function codexRateLimitBucket(result: Record<string, unknown>): RateLimitBucket | null {
+  const byLimitId = result.rateLimitsByLimitId;
+  if (isPlainRecord(byLimitId)) {
+    const codex = byLimitId.codex;
+    if (isPlainRecord(codex) && (codex.limitId === undefined || codex.limitId === "codex")) return bucket(codex);
+  }
+
+  const legacy = result.rateLimits;
+  if (!isPlainRecord(legacy)) return null;
+  if (legacy.limitId === "codex") return bucket(legacy);
+  if (legacy.limitId !== undefined || isPlainRecord(byLimitId)) return null;
+  return bucket(legacy);
+}
+
+function bucket(value: Record<string, unknown>): RateLimitBucket {
+  return {
+    value,
+    rateLimitReached: value.rateLimitReachedType !== null && value.rateLimitReachedType !== undefined,
+  };
 }
 
 interface ParsedWindow {
@@ -123,20 +211,17 @@ interface ParsedWindow {
 
 function collectWindows(value: unknown): ParsedWindow[] {
   const result: ParsedWindow[] = [];
-  const visit = (item: unknown, path: string[], depth: number): void => {
-    if (depth > 6 || result.length >= 64) return;
-    if (Array.isArray(item)) {
-      for (const child of item) visit(child, path, depth + 1);
-      return;
-    }
-    if (!isPlainRecord(item)) return;
-    const window = parseWindow(item, path);
+  if (!isPlainRecord(value)) return result;
+  const root = parseWindow(value, []);
+  if (root) result.push(root);
+  // App-server exposes primary and secondary directly on a selected bucket.
+  // Supporting other direct legacy window names keeps old fixtures working
+  // while intentionally refusing nested model/product bucket collections.
+  for (const [key, child] of Object.entries(value)) {
+    if (result.length >= 16 || !isPlainRecord(child)) continue;
+    const window = parseWindow(child, [key]);
     if (window) result.push(window);
-    for (const [key, child] of Object.entries(item)) {
-      if (typeof child === "object" && child !== null) visit(child, [...path, key], depth + 1);
-    }
-  };
-  visit(value, [], 0);
+  }
   return result;
 }
 
@@ -144,16 +229,10 @@ function parseWindow(value: Record<string, unknown>, path: string[]): ParsedWind
   const remainingPercent = percentFrom(value);
   const resetAt = resetAtFrom(value);
   if (remainingPercent === null && resetAt === null) return null;
-  const descriptive = [
-    ...path,
-    value.window, value.windowName, value.name, value.key, value.limitName, value.duration,
-  ].filter((item): item is string => typeof item === "string").join(" ").toLowerCase();
   const minutes = value.windowDurationMins ?? value.windowDurationMinutes ?? value.durationMinutes;
   const numericMinutes = typeof minutes === "number" && Number.isFinite(minutes) && minutes >= 0 ? minutes : null;
-  const weekly = /(?:week|7d|seven.day)/.test(descriptive)
-    || numericMinutes === 10_080;
-  const durationMinutes = numericMinutes ?? (weekly ? 10_080 : 0);
-  return { weekly, remainingPercent, resetAt, durationMinutes, pathKey: path.join("\u0000") };
+  const durationMinutes = numericMinutes ?? (path.some((segment) => /(?:week|7d|seven.day)/i.test(segment)) ? 10_080 : 0);
+  return { weekly: durationMinutes === 10_080, remainingPercent, resetAt, durationMinutes, pathKey: path.join("\u0000") };
 }
 
 function percentFrom(value: Record<string, unknown>): number | null {
@@ -191,4 +270,17 @@ function safePlan(...records: Record<string, unknown>[]): string | null {
     }
   }
   return null;
+}
+
+/** Missing/stale capacity is not evidence that an existing subscription is depleted. */
+export function hasConfirmedQuotaDepletion(quota: {
+  freshness: string; observedAt?: number | null; remainingPercent: number | null;
+  resetAt: string | null; shortWindowPressure: number | null; shortWindowResetAt?: number | null;
+  rateLimitReached?: boolean;
+} | undefined, now = Date.now()): boolean {
+  if (!quota || quota.freshness !== "fresh" || typeof quota.observedAt !== "number"
+    || !Number.isFinite(quota.observedAt) || quota.observedAt > now || now - quota.observedAt > QUOTA_STALE_AFTER_MS) return false;
+  return (quota.remainingPercent === 0 && quota.resetAt !== null && Date.parse(quota.resetAt) > now)
+    || (quota.shortWindowPressure === 100 && typeof quota.shortWindowResetAt === "number" && quota.shortWindowResetAt > now)
+    || (quota.rateLimitReached === true && quota.resetAt !== null && Date.parse(quota.resetAt) > now);
 }

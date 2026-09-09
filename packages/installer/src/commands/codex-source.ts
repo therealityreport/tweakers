@@ -119,6 +119,26 @@ const MINIMUM_BUILD_FREE_BYTES = 40n * 1024n * 1024n * 1024n;
  */
 export const CODEX_SOURCE_CARGO_JOBS = "2";
 
+export const CODEX_SOURCE_BUILD_COMMAND = [
+  "cargo",
+  "build",
+  "--locked",
+  "--release",
+  "--package",
+  "codex-cli",
+  "--bin",
+  "codex",
+] as const;
+
+export const CODEX_SOURCE_RUST_TEST_COMMAND = [
+  "cargo",
+  "test",
+  "--locked",
+  "--package",
+  "codex-mcp",
+  "--lib",
+] as const;
+
 export function codexSourceCargoEnvironment(
   inherited: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
@@ -1292,6 +1312,19 @@ export function createProductionCodexSourceBuildAdapter(
       }
       const patchSeriesDigest = digestFiles("patch series", patchFiles);
       const treeDigest = digestTrackedSource(sourceRoot);
+      const reviewedDiffDigest = digestText(
+        "reviewed applied diff",
+        runGit([
+          "diff",
+          "--cached",
+          "--binary",
+          "--full-index",
+          "--no-ext-diff",
+          "--no-color",
+          peeledCommit,
+          "--",
+        ], sourceRoot),
+      );
       const cargoRoot = join(sourceRoot, "codex-rs");
       const lockfile = exactExistingFile(join(cargoRoot, "Cargo.lock"), "Cargo.lock");
       const rustc = execFileSync("rustc", ["-vV"], { encoding: "utf8", timeout: 10_000 });
@@ -1303,7 +1336,7 @@ export function createProductionCodexSourceBuildAdapter(
         patchedTreeSha256: treeDigest.value,
         cargoLockSha256: sha256File(lockfile),
       });
-      execFileSync("cargo", ["build", "--locked", "--release", "--package", "codex-cli", "--bin", "codex"], {
+      execFileSync(CODEX_SOURCE_BUILD_COMMAND[0], [...CODEX_SOURCE_BUILD_COMMAND.slice(1)], {
         cwd: cargoRoot,
         env: codexSourceCargoEnvironment(),
         stdio: "inherit",
@@ -1355,6 +1388,8 @@ export function createProductionCodexSourceBuildAdapter(
           archiveDigest: null,
           treeDigest,
           patchSeriesDigest,
+          reviewedDiffDigest,
+          buildCommand: CODEX_SOURCE_BUILD_COMMAND,
           toolchainDigests: [digestText("rustc -vV", rustc), digestText("cargo -V", cargo)],
           lockfileDigests: [digestFile("Cargo.lock", lockfile)],
         },
@@ -1413,7 +1448,7 @@ function runRustLifecycleReceiptTests(input: {
   patchedTreeSha256: string;
   cargoLockSha256: string;
 }): Omit<CodexRustLifecycleTestEvidence, "candidateBinarySha256"> {
-  const args = ["test", "--locked", "--package", "codex-mcp", "--lib"] as const;
+  const args = CODEX_SOURCE_RUST_TEST_COMMAND.slice(1);
   const startedAt = new Date().toISOString();
   const result = spawnSync("cargo", [...args], {
     cwd: input.cargoRoot,
@@ -1448,7 +1483,7 @@ function runRustLifecycleReceiptTests(input: {
     sourceCommit: input.sourceCommit,
     patchedTreeSha256: input.patchedTreeSha256,
     cargoLockSha256: input.cargoLockSha256,
-    command: ["cargo", ...args],
+    command: CODEX_SOURCE_RUST_TEST_COMMAND,
     exitCode: 0,
     passedTests,
     stdoutFile,
@@ -1471,7 +1506,7 @@ function assertRustLifecycleTestEvidence(
     || evidence.sourceCommit !== candidate.evidence.source.checkoutCommit
     || evidence.patchedTreeSha256 !== candidate.evidence.source.treeDigest.value
     || evidence.cargoLockSha256 !== candidate.evidence.source.lockfileDigests.find((item) => item.scope === "Cargo.lock")?.value
-    || JSON.stringify(evidence.command) !== JSON.stringify(["cargo", "test", "--locked", "--package", "codex-mcp", "--lib"])
+    || JSON.stringify(evidence.command) !== JSON.stringify(CODEX_SOURCE_RUST_TEST_COMMAND)
     || evidence.exitCode !== 0
     || evidence.candidateBinarySha256 !== candidateBinarySha256
     || !validTimestamp(evidence.startedAt)

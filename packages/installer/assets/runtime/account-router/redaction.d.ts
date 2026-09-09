@@ -1,5 +1,5 @@
 import type { RedactedControlStatus } from "./types";
-export type RedactedErrorCode = "invalid_request" | "unknown_method" | "unknown_thread_owner" | "pool_depleted" | "balanced_mode_auth_mutation" | "protocol_drift" | "post_start_failure" | "ambiguous_dispatch" | "invalid_correlation" | "capability_mismatch" | "router_stopping";
+export type RedactedErrorCode = "invalid_request" | "unknown_method" | "unknown_thread_owner" | "pool_depleted" | "balanced_mode_auth_mutation" | "protocol_drift" | "post_start_failure" | "ambiguous_dispatch" | "provider_confirmation_required" | "invalid_correlation" | "account_history_busy" | "conversation_busy" | "handoff_unavailable" | "linked_continuation_required" | "capability_mismatch" | "router_stopping";
 export declare function redactedRouterError(id: string | number | null, code: RedactedErrorCode): {
     jsonrpc: "2.0";
     id: string | number | null;

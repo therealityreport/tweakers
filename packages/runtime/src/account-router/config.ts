@@ -5,9 +5,11 @@ import {
   ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
   ACCOUNT_ROUTER_SCHEMA_VERSION,
   ACCOUNT_ROUTER_SCHEMA_VERSION_V2,
+  ACCOUNT_ROUTER_SCHEMA_VERSION_V3,
   type RouterConfig,
   type RouterConfigV1,
   type RouterConfigV2,
+  type RouterConfigV3,
   isFingerprint,
   isOpaqueAccountId,
   isPlainRecord,
@@ -51,7 +53,9 @@ export function readRouterLaunchSelection(
     // Legacy v1 remains readable for UI/installer compatibility, but it has
     // no signed history-adoption contract and therefore can never select a
     // process mux. V2 manual is mux-backed after the preflight receipt gate.
-    if (config.schemaVersion !== 2) return { mode: "direct", reason: "history-adoption-required", config };
+    if (config.schemaVersion !== 2 && config.schemaVersion !== 3) {
+      return { mode: "direct", reason: "history-adoption-required", config };
+    }
     return { mode: "mux", reason: config.mode, config };
   } catch {
     return { mode: "direct", reason: "invalid-config", config: null };
@@ -63,7 +67,39 @@ export function validateRouterConfig(value: unknown): RouterConfig | null {
   if (!isPlainRecord(value)) return null;
   if (value.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION) return validateRouterConfigV1(value);
   if (value.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION_V2) return validateRouterConfigV2(value);
+  if (value.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION_V3) return validateRouterConfigV3(value);
   return null;
+}
+
+function validateRouterConfigV3(value: Record<string, unknown>): RouterConfigV3 | null {
+  const allowed = new Set([
+    "schemaVersion", "mode", "policy", "generation", "fingerprint", "protocolFingerprint", "primaryOpaqueAccountId", "accounts", "updatedAt",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) return null;
+  const mode = value.mode === "manual" || value.mode === "quota_aware" ? value.mode : null;
+  const policy = value.policy === "quota_aware_v2" || value.policy === "balanced_tokens_v1" ? value.policy : value.policy === null ? null : undefined;
+  if (!mode || policy === undefined || (mode === "quota_aware" && policy !== "quota_aware_v2" && policy !== "balanced_tokens_v1") || (mode === "manual" && policy !== null)) return null;
+  if (typeof value.generation !== "number" || !Number.isSafeInteger(value.generation) || value.generation < 1 || !isFingerprint(value.fingerprint)) return null;
+  if (!isFingerprint(value.protocolFingerprint) || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT || !isOpaqueAccountId(value.primaryOpaqueAccountId)) return null;
+  if (!isIsoTimestamp(value.updatedAt) || !Array.isArray(value.accounts) || value.accounts.length < 1) return null;
+  const accounts = value.accounts.map(validateAccountConfigV2);
+  if (accounts.some((account) => account === null)) return null;
+  const validAccounts = accounts as RouterConfigV3["accounts"];
+  if (new Set(validAccounts.map((account) => account.opaqueAccountId)).size !== validAccounts.length) return null;
+  const primary = validAccounts.find((account) => account.opaqueAccountId === value.primaryOpaqueAccountId);
+  if (!primary || !primary.included || (mode === "quota_aware" && !validAccounts.some((account) => account.included))) return null;
+  const config: RouterConfigV3 = {
+    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION_V3,
+    mode,
+    policy,
+    generation: value.generation,
+    fingerprint: value.fingerprint,
+    protocolFingerprint: value.protocolFingerprint,
+    primaryOpaqueAccountId: value.primaryOpaqueAccountId,
+    accounts: validAccounts,
+    updatedAt: value.updatedAt,
+  };
+  return routerConfigFingerprint(config) === config.fingerprint ? config : null;
 }
 
 /** Strict legacy validator: do not make a v1 file acquire v2 requirements. */
@@ -160,9 +196,11 @@ function validateAccountConfigV2(value: unknown): RouterConfigV2["accounts"][num
  * purposefully excludes `fingerprint` and `updatedAt`; timestamp-only writes
  * therefore cannot pretend to be a new routing generation.
  */
-export function routerConfigFingerprint(config: Omit<RouterConfigV2, "fingerprint"> | RouterConfigV2): `sha256:${string}` {
+export function routerConfigFingerprint(
+  config: Omit<RouterConfigV2, "fingerprint"> | RouterConfigV2 | Omit<RouterConfigV3, "fingerprint"> | RouterConfigV3,
+): `sha256:${string}` {
   const canonical = {
-    schemaVersion: ACCOUNT_ROUTER_SCHEMA_VERSION_V2,
+    schemaVersion: config.schemaVersion,
     mode: config.mode,
     policy: config.policy,
     generation: config.generation,
@@ -181,6 +219,14 @@ export function routerConfigFingerprint(config: Omit<RouterConfigV2, "fingerprin
 
 export function isRouterConfigV2(config: RouterConfig): config is RouterConfigV2 {
   return config.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION_V2;
+}
+
+export function isRouterConfigV3(config: RouterConfig): config is RouterConfigV3 {
+  return config.schemaVersion === ACCOUNT_ROUTER_SCHEMA_VERSION_V3;
+}
+
+export function isQuotaAwareRouterConfig(config: RouterConfig): config is RouterConfigV2 | RouterConfigV3 {
+  return isRouterConfigV2(config) || isRouterConfigV3(config);
 }
 
 function isIsoTimestamp(value: unknown): value is string {

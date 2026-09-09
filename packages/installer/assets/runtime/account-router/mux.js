@@ -94,7 +94,7 @@ class AccountRouterMux {
         this.correlations = new protocol_1.CorrelationTable(options.store.snapshot().correlations, (records) => {
             options.store.update((state) => { state.correlations = records; });
         });
-        if ((0, config_1.isRouterConfigV2)(options.config)) {
+        if ((0, config_1.isQuotaAwareRouterConfig)(options.config)) {
             for (const account of options.config.accounts)
                 this.quota.set(account.opaqueAccountId, (0, quota_1.emptyQuotaObservation)());
         }
@@ -161,7 +161,7 @@ class AccountRouterMux {
         this.routeDesktopRequest(message);
     }
     status() {
-        if ((0, config_1.isRouterConfigV2)(this.options.config))
+        if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config))
             return this.quotaAwareStatus();
         const state = this.options.store.snapshot();
         const protocolState = state.stagedDisable?.reasonCode === "protocol_drift" ? "drifted" : "supported";
@@ -267,6 +267,10 @@ class AccountRouterMux {
             this.dispatchNewThread(request);
             return;
         }
+        if (route === "fanout_feature_enablement") {
+            this.dispatchFeatureEnablement(request);
+            return;
+        }
         if (route === "fanout_sections_read") {
             this.dispatchSectionRead(request);
             return;
@@ -315,8 +319,19 @@ class AccountRouterMux {
             }
         }
     }
+    dispatchFeatureEnablement(request) {
+        const key = fanoutKey(request.id);
+        const fanout = { desktopId: request.id, expected: this.children.size, responses: [], failed: false, route: "fanout_feature_enablement" };
+        this.fanouts.set(key, fanout);
+        this.startFanoutTimeout(key, fanout);
+        let scope = 0;
+        for (const child of this.children.values()) {
+            if (!this.dispatchToChild(request, child, { fanoutKey: key, scope: `feature-${scope++}` }))
+                this.failFanout(fanout, key);
+        }
+    }
     dispatchNewThread(request) {
-        if ((0, config_1.isRouterConfigV2)(this.options.config) && this.options.config.mode === "manual") {
+        if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config) && this.options.config.mode === "manual") {
             // Manual v2 remains mux-backed for durable aggregate history, but new
             // work is an explicit primary-only route. Quota observations stay
             // visible truth and never select or fail over to the other account.
@@ -329,11 +344,11 @@ class AccountRouterMux {
             this.dispatchSelectedNewThread(request, primary);
             return;
         }
-        const first = (0, config_1.isRouterConfigV2)(this.options.config)
+        const first = (0, config_1.isQuotaAwareRouterConfig)(this.options.config)
             ? this.ledger.selectQuotaAware(this.quota)
             : this.ledger.select();
         if (!first) {
-            if ((0, config_1.isRouterConfigV2)(this.options.config) && this.quotaNeedsRefresh()) {
+            if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config) && this.quotaNeedsRefresh()) {
                 this.queueNewThreadForQuotaRefresh(request);
                 return;
             }
@@ -1126,7 +1141,7 @@ class AccountRouterMux {
                 }
             }
         }
-        if (issued.method === "thread/fork" && threadId) {
+        if (["thread/fork", "thread/resume", "thread/unarchive"].includes(issued.method) && threadId) {
             try {
                 this.ledger.bindKnownThread(threadId, childId);
             }
@@ -1243,7 +1258,7 @@ class AccountRouterMux {
             return;
         }
         if (fanout.route === "fanout_initialize_intersection") {
-            const initialized = this.options.config.accounts.map((account) => {
+            const initialized = this.options.config.accounts.filter((account) => account.included).map((account) => {
                 const response = fanout.responses.find((item) => item.childId === account.opaqueAccountId)?.response;
                 return response ? parseInitializeResult(response.result, account.opaqueAccountId) : null;
             });
@@ -1254,11 +1269,11 @@ class AccountRouterMux {
             }
             for (const child of this.children.values()) {
                 child.markInitialized?.();
-                if (!(0, config_1.isRouterConfigV2)(this.options.config))
+                if (!(0, config_1.isQuotaAwareRouterConfig)(this.options.config))
                     this.ledger.setEligibility(child.opaqueAccountId, "eligible");
             }
             this.initialized = true;
-            if ((0, config_1.isRouterConfigV2)(this.options.config))
+            if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config))
                 this.refreshAllQuota();
             // Child responses may arrive in either order. The configured primary is
             // the only isolated-home response the desktop is allowed to observe.
@@ -1266,6 +1281,15 @@ class AccountRouterMux {
             if (!primary) {
                 this.options.writeDesktop((0, redaction_1.redactedRouterError)(fanout.desktopId, "post_start_failure"));
                 this.postStartFailure("post_start_failure");
+                return;
+            }
+            this.options.writeDesktop({ ...primary, id: fanout.desktopId });
+            return;
+        }
+        if (fanout.route === "fanout_feature_enablement") {
+            const primary = fanout.responses.find((item) => item.childId === this.options.config.primaryOpaqueAccountId)?.response;
+            if (!primary) {
+                this.options.writeDesktop((0, redaction_1.redactedRouterError)(fanout.desktopId, "post_start_failure"));
                 return;
             }
             this.options.writeDesktop({ ...primary, id: fanout.desktopId });
@@ -1516,7 +1540,7 @@ class AccountRouterMux {
             this.protocolDrift();
             return;
         }
-        if ((0, config_1.isRouterConfigV2)(this.options.config) && notification.method === "account/rateLimits/updated")
+        if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config) && notification.method === "account/rateLimits/updated")
             this.refreshQuotaFor(childId);
         const threadId = (0, protocol_1.threadIdFrom)(notification.params);
         if (route === "verify_persisted_owner_then_forward") {
@@ -1563,7 +1587,7 @@ class AccountRouterMux {
     reconcileTerminal(threadId, notification, childId) {
         if (!(0, protocol_1.isNotification)(notification) || notification.method !== "turn/completed" || !(0, types_1.isPlainRecord)(notification.params))
             return;
-        if ((0, config_1.isRouterConfigV2)(this.options.config))
+        if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config))
             this.refreshQuotaFor(childId);
         const turnId = (0, types_1.isPlainRecord)(notification.params.turn) && typeof notification.params.turn.id === "string" ? notification.params.turn.id : "";
         const recordedUsage = turnId ? this.tokenUsage.get(`${threadId}:${turnId}`) ?? null : null;
@@ -1589,13 +1613,13 @@ class AccountRouterMux {
     }
     /** Issue one bounded pair of official app-server reads per enrolled child. */
     refreshAllQuota() {
-        if (!(0, config_1.isRouterConfigV2)(this.options.config))
+        if (!(0, config_1.isQuotaAwareRouterConfig)(this.options.config))
             return;
         for (const account of this.options.config.accounts)
             this.refreshQuotaFor(account.opaqueAccountId);
     }
     refreshQuotaFor(account) {
-        if (!(0, config_1.isRouterConfigV2)(this.options.config) || !this.initialized || !this.accepting)
+        if (!(0, config_1.isQuotaAwareRouterConfig)(this.options.config) || !this.initialized || !this.accepting)
             return;
         const child = this.children.get(account);
         if (!child) {
@@ -1656,12 +1680,18 @@ class AccountRouterMux {
                 observation.weeklyRemainingPercent = parsed.weeklyRemainingPercent;
                 observation.weeklyResetAt = parsed.weeklyResetAt;
                 observation.shortWindowPressure = parsed.shortWindowPressure;
+                observation.shortWindowResetAt = parsed.shortWindowResetAt ?? null;
+                observation.rateLimitReached = parsed.rateLimitReached ?? false;
+                observation.resetCredits = parsed.resetCredits ?? null;
                 observation.observedAt = observation.observedAt === null ? null : Math.min(observation.observedAt, parsed.observedAt ?? now);
             }
             else {
                 observation.weeklyRemainingPercent = null;
                 observation.weeklyResetAt = null;
                 observation.shortWindowPressure = null;
+                observation.shortWindowResetAt = null;
+                observation.rateLimitReached = false;
+                observation.resetCredits = null;
             }
         }
         this.quota.set(childId, observation);
@@ -1683,6 +1713,9 @@ class AccountRouterMux {
             observation.weeklyRemainingPercent = null;
             observation.weeklyResetAt = null;
             observation.shortWindowPressure = null;
+            observation.shortWindowResetAt = null;
+            observation.rateLimitReached = false;
+            observation.resetCredits = null;
         }
         this.quota.set(childId, observation);
         const inFlight = this.quotaProbesInFlight.get(childId);
@@ -1756,7 +1789,7 @@ class AccountRouterMux {
             // Manual's primary-only routing needs account health, not a quota
             // score. A missing/old rate-limit reply therefore remains honestly
             // nullable in status without silently selecting the secondary account.
-            if ((0, config_1.isRouterConfigV2)(this.options.config) && this.options.config.mode === "manual" && observation.health === "authenticated") {
+            if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config) && this.options.config.mode === "manual" && observation.health === "authenticated") {
                 this.ledger.setEligibility(account, "eligible");
             }
             else {
@@ -1764,12 +1797,11 @@ class AccountRouterMux {
             }
             return;
         }
-        if ((0, config_1.isRouterConfigV2)(this.options.config) && this.options.config.mode === "manual") {
+        if ((0, config_1.isQuotaAwareRouterConfig)(this.options.config) && this.options.config.mode === "manual") {
             this.ledger.setEligibility(account, "eligible");
             return;
         }
-        if (observation.weeklyRemainingPercent === null || observation.weeklyRemainingPercent <= 0
-            || observation.weeklyResetAt === null || observation.weeklyResetAt <= this.now()) {
+        if (!(0, quota_1.accountObservationEligible)(observation, this.now())) {
             this.ledger.setEligibility(account, "quota_depleted");
             return;
         }
@@ -1816,38 +1848,45 @@ class AccountRouterMux {
         this.queuedNewThread = null;
     }
     quotaNeedsRefresh() {
-        if (!(0, config_1.isRouterConfigV2)(this.options.config))
+        if (!(0, config_1.isQuotaAwareRouterConfig)(this.options.config))
             return false;
-        return this.options.config.accounts.some((account) => (0, quota_1.quotaFreshness)(this.quota.get(account.opaqueAccountId) ?? (0, quota_1.emptyQuotaObservation)(), this.now()) !== "fresh");
+        return this.options.config.accounts.some((account) => account.included && (0, quota_1.quotaFreshness)(this.quota.get(account.opaqueAccountId) ?? (0, quota_1.emptyQuotaObservation)(), this.now()) !== "fresh");
     }
     quotaAwareStatus() {
         const config = this.options.config;
-        if (!(0, config_1.isRouterConfigV2)(config))
-            throw new Error("quota status requires a v2 router config");
+        if (!(0, config_1.isQuotaAwareRouterConfig)(config))
+            throw new Error("quota status requires a quota-aware router config");
         const now = this.now();
         if (this.initialized && this.accepting) {
             for (const account of config.accounts) {
+                if (!account.included)
+                    continue;
                 const observation = this.quota.get(account.opaqueAccountId) ?? (0, quota_1.emptyQuotaObservation)();
                 if ((0, quota_1.quotaFreshness)(observation, now) !== "fresh")
                     this.refreshQuotaFor(account.opaqueAccountId);
             }
         }
         const state = this.options.store.snapshot();
-        const first = this.quotaStatusAccount(config.accounts[0], state, now);
-        const second = this.quotaStatusAccount(config.accounts[1], state, now);
-        const accounts = [first, second];
+        const accounts = config.accounts.map((account) => this.quotaStatusAccount(account, state, now));
         const pending = this.pendingQuotaIntent(config);
-        const allFresh = accounts.every((account) => account.weekly.freshness === "fresh" && account.weekly.remainingPercent !== null);
-        return {
-            schemaVersion: 2,
+        const enabledAccounts = accounts.filter((account) => account.eligibility !== "disabled");
+        const allFresh = enabledAccounts.length > 0
+            && enabledAccounts.every((account) => account.weekly.freshness === "fresh" && account.weekly.remainingPercent !== null);
+        const protocolState = state.stagedDisable?.reasonCode === "protocol_drift" ? "drifted" : "supported";
+        const common = {
             active: quotaIntent(config),
             pending,
-            protocolState: state.stagedDisable?.reasonCode === "protocol_drift" ? "drifted" : "supported",
-            accounts,
-            poolRemainingPercent: allFresh ? accounts[0].weekly.remainingPercent + accounts[1].weekly.remainingPercent : null,
+            protocolState,
+            poolRemainingPercent: allFresh
+                ? enabledAccounts.reduce((total, account) => total + account.weekly.remainingPercent, 0)
+                : null,
             restartRequired: state.stagedDisable !== null || pending !== null,
             degradedReason: quotaDegradedReason(state.stagedDisable?.reasonCode, accounts),
         };
+        if (config.schemaVersion === 2) {
+            return { ...common, schemaVersion: 2, accounts: [accounts[0], accounts[1]] };
+        }
+        return { ...common, schemaVersion: 3, accounts };
     }
     quotaStatusAccount(account, state, now) {
         const observation = this.quota.get(account.opaqueAccountId) ?? (0, quota_1.emptyQuotaObservation)();
@@ -1865,12 +1904,13 @@ class AccountRouterMux {
             },
             shortWindowPressure: observation.shortWindowPressure,
             assignedThreadCount: state.ledger[account.opaqueAccountId]?.assignedThreadCount ?? 0,
+            resetCredits: observation.resetCredits,
         };
     }
     pendingQuotaIntent(active) {
         try {
             const candidate = this.options.readPendingConfig?.() ?? null;
-            if (!candidate || !(0, config_1.isRouterConfigV2)(candidate))
+            if (!candidate || !(0, config_1.isQuotaAwareRouterConfig)(candidate) || candidate.schemaVersion !== active.schemaVersion)
                 return null;
             if (candidate.fingerprint === active.fingerprint && candidate.generation === active.generation
                 && candidate.mode === active.mode && candidate.policy === active.policy)
@@ -1972,13 +2012,13 @@ function parseInitializeResult(value, account) {
     return { userAgent, codexHome, platformFamily, platformOs };
 }
 function initializeResultsCompatible(results) {
-    if (results.length !== 2)
+    if (results.length < 1)
         return false;
-    const [first, second] = results;
-    return first.userAgent === second.userAgent
-        && first.platformFamily === second.platformFamily
-        && first.platformOs === second.platformOs
-        && first.codexHome !== second.codexHome;
+    const first = results[0];
+    return results.every((result) => result.userAgent === first.userAgent
+        && result.platformFamily === first.platformFamily
+        && result.platformOs === first.platformOs)
+        && new Set(results.map((result) => result.codexHome)).size === results.length;
 }
 function quotaDegradedReason(stagedReason, accounts) {
     if (stagedReason === "protocol_drift")

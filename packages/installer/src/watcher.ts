@@ -38,6 +38,80 @@ export interface WatcherPromotionSnapshot {
   capturedAt: string;
 }
 
+/** Raw configuration evidence used only inside a prepared environment receipt.
+ * Service loaded/enabled state remains owned by the promotion receipt. */
+export interface WatcherConfigurationSnapshot {
+  targetPath: string | null;
+  existed: boolean;
+  bytes: Buffer | null;
+  digest: string | null;
+}
+
+/** Read the exact current definition without loading, unloading, or writing it. */
+export function captureWatcherConfiguration(): WatcherConfigurationSnapshot {
+  const targetPath = watcherDefinitionPath();
+  if (targetPath === null || !existsSync(targetPath)) {
+    return { targetPath, existed: false, bytes: null, digest: null };
+  }
+  const bytes = readFileSync(targetPath);
+  return {
+    targetPath,
+    existed: true,
+    bytes,
+    digest: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+/** Construct, but never install, the exact watcher definition for a target. */
+export function createWatcherConfiguration(appRoot: string): WatcherConfigurationSnapshot {
+  switch (platform()) {
+    case "darwin": {
+      const targetPath = launchdPath();
+      const bytes = Buffer.from(launchdDefinitionXml(appRoot, launchdLogPath()), "utf8");
+      return {
+        targetPath,
+        existed: true,
+        bytes,
+        digest: createHash("sha256").update(bytes).digest("hex"),
+      };
+    }
+    case "linux": {
+      const targetPath = systemdWatcherPath();
+      const bytes = Buffer.from(systemdPathDefinition(appRoot), "utf8");
+      return {
+        targetPath,
+        existed: true,
+        bytes,
+        digest: createHash("sha256").update(bytes).digest("hex"),
+      };
+    }
+    default:
+      return { targetPath: null, existed: false, bytes: null, digest: null };
+  }
+}
+
+/** Apply one receipt-owned definition without starting its service. */
+export function writeWatcherConfiguration(snapshot: WatcherConfigurationSnapshot): void {
+  if (snapshot.targetPath === null || snapshot.bytes === null) {
+    throw new Error("Watcher configuration has no writable definition");
+  }
+  const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+  if (snapshot.digest !== digest) throw new Error("Watcher configuration digest changed before apply");
+  mkdirSync(dirname(snapshot.targetPath), { recursive: true });
+  writeFileSync(snapshot.targetPath, snapshot.bytes);
+  chownForTargetUser(snapshot.targetPath);
+}
+
+/** Restore exact receipt-owned bytes, or remove only an explicitly absent file. */
+export function restoreWatcherConfiguration(snapshot: WatcherConfigurationSnapshot): void {
+  if (snapshot.targetPath === null) return;
+  if (!snapshot.existed) {
+    rmSync(snapshot.targetPath, { force: true });
+    return;
+  }
+  writeWatcherConfiguration(snapshot);
+}
+
 /** Capture the service state before a promotion mutates any live app bytes. */
 export function captureWatcherPromotionSnapshot(): WatcherPromotionSnapshot {
   const capturedAt = new Date().toISOString();
@@ -228,6 +302,14 @@ function launchdPath(): string {
   return join(targetUserHome(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
 
+function watcherDefinitionPath(): string | null {
+  switch (platform()) {
+    case "darwin": return launchdPath();
+    case "linux": return systemdWatcherPath();
+    default: return null;
+  }
+}
+
 function launchdLogPath(): string {
   return join(targetUserHome(), "Library", "Logs", "tweaker-watcher.log");
 }
@@ -255,11 +337,19 @@ function writeLaunchdDefinition(appRoot: string): string {
   mkdirSync(dirname(plPath), { recursive: true });
   const logPath = launchdLogPath();
   mkdirSync(dirname(logPath), { recursive: true });
+  writeFileSync(plPath, launchdDefinitionXml(appRoot, logPath));
+  writeFileSync(logPath, "", { flag: "a" });
+  chownForTargetUser(plPath);
+  chownForTargetUser(logPath);
+  return plPath;
+}
+
+function launchdDefinitionXml(appRoot: string, logPath: string): string {
   // Trigger on login + when Codex.app's asar changes. Run this installed CLI
   // directly so auto-repair does not depend on npm availability. The CLI
   // throttles GitHub release checks, so this interval keeps app repair prompt.
   const repair = xmlEscape(watcherShellScript(logPath));
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -287,11 +377,6 @@ function writeLaunchdDefinition(appRoot: string): string {
   <string>${logPath}</string>
   </dict>
 </plist>`;
-  writeFileSync(plPath, xml);
-  writeFileSync(logPath, "", { flag: "a" });
-  chownForTargetUser(plPath);
-  chownForTargetUser(logPath);
-  return plPath;
 }
 
 export function isRunningFromWatcher(): boolean {
@@ -435,7 +520,12 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 `);
-  writeFileSync(join(dir, "tweaker-watcher.path"), `[Unit]
+  writeFileSync(join(dir, "tweaker-watcher.path"), systemdPathDefinition(appRoot));
+  return dir;
+}
+
+function systemdPathDefinition(appRoot: string): string {
+  return `[Unit]
 Description=tweaker app.asar watcher
 
 [Path]
@@ -443,8 +533,7 @@ PathChanged=${appRoot}/resources/app.asar
 
 [Install]
 WantedBy=default.target
-`);
-  return dir;
+`;
 }
 
 function systemdUnitActive(unit: string): boolean {

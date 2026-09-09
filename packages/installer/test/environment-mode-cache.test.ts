@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -11,6 +12,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -22,10 +24,15 @@ import {
   assertEnvironmentModeCacheRootIsReal,
   assertEnvironmentModeCacheSameDevice,
   assertEnvironmentModeCacheSteadyState,
+  acquireSealedInactiveEnvironmentModeSourceLease,
+  assertSealedInactiveEnvironmentModeSource,
   assertEnvironmentModePairContentsExchangeable,
   assertEnvironmentModeCacheLiveTreeSeal,
+  assertEnvironmentModeCacheProjectionStatSealAfterRename,
+  assertEnvironmentModeCacheProjectionStatSealOnly,
   assertEnvironmentModeCacheTreeSeal,
   assertEnvironmentModeCacheTreeStatSealAfterRename,
+  assertEnvironmentModeCacheTreeStatSealOnly,
   cancelStaleEnvironmentModePair,
   compareEnvironmentModeCacheInvalidation,
   environmentModeCacheGcEligibility,
@@ -33,6 +40,7 @@ import {
   environmentModeCachePaths,
   environmentModeCacheReachability,
   environmentModeCacheState,
+  ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
   environmentModePairReceiptDigest,
   environmentModePairStatSealDigest,
   finalizeEnvironmentModePairReceipt,
@@ -315,6 +323,56 @@ test("schema-v2 pair receipts bind opposite roles, exact generation paths, evide
   }
 });
 
+test("sealed inactive source requires a steady materialized ChatGPT role and a fresh full tree seal", () => {
+  const fixture = makePairFixture("inactive-chatgpt-source");
+  try {
+    fixture.receipt.roles.live.experience = "tweakers";
+    fixture.receipt.roles.inactive.experience = "chatgpt";
+    fixture.receipt = finalizeEnvironmentModePairReceipt(fixture.receipt);
+    publishEnvironmentModePair(fixture.paths, fixture.receipt, { now: () => NOW });
+
+    const source = assertSealedInactiveEnvironmentModeSource(fixture.paths);
+    assert.equal(source.roles.inactive.appPath, fixture.receipt.paths.inactiveAppPath);
+
+    writeFileSync(join(fixture.receipt.paths.inactiveAppPath, "nested", "leaf.txt"), "source-tampered");
+    assert.throws(
+      () => assertSealedInactiveEnvironmentModeSource(fixture.paths),
+      /tree (?:stat )?seal mismatch/,
+    );
+  } finally {
+    cleanup(fixture.root);
+  }
+});
+
+test("sealed inactive source lease excludes canonical writers through clone handoff and rejects source drift", () => {
+  const fixture = makePairFixture("inactive-source-lease");
+  try {
+    fixture.receipt.roles.live.experience = "tweakers";
+    fixture.receipt.roles.inactive.experience = "chatgpt";
+    fixture.receipt = finalizeEnvironmentModePairReceipt(fixture.receipt);
+    publishEnvironmentModePair(fixture.paths, fixture.receipt, { now: () => NOW });
+
+    const lease = acquireSealedInactiveEnvironmentModeSourceLease(fixture.paths);
+    try {
+      assert.equal(lease.receipt.roles.inactive.appPath, fixture.receipt.paths.inactiveAppPath);
+      assert.throws(
+        () => publishEnvironmentModePair(fixture.paths, fixture.receipt, { now: () => LATER }),
+        /mutex is already held/,
+      );
+    } finally {
+      lease.release();
+    }
+
+    writeFileSync(join(fixture.receipt.paths.inactiveAppPath, "nested", "leaf.txt"), "drifted-after-lease");
+    assert.throws(
+      () => acquireSealedInactiveEnvironmentModeSourceLease(fixture.paths),
+      /tree (?:stat )?seal mismatch/,
+    );
+  } finally {
+    cleanup(fixture.root);
+  }
+});
+
 test("schema-v2 derives the invalidation stat seal from canonical role seals and rejects any detached value", () => {
   const fixture = makePairFixture();
   try {
@@ -506,6 +564,141 @@ test("an activated projection accepts only the root ctime change caused by renam
     assert.throws(
       () => assertEnvironmentModeCacheTreeStatSealAfterRename(active, seal),
       /stat seal mismatch/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("projection metadata policy tolerates only regular .DS_Store lifecycle churn", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-mode-cache-finder-"));
+  try {
+    const projection = join(root, "projection");
+    const nested = join(projection, "nested");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "runtime.js"), "sealed-runtime\n");
+    const cleanSeal = sealEnvironmentModeCacheTree(projection);
+    const finderMetadata = join(nested, ".DS_Store");
+
+    writeFileSync(finderMetadata, "finder-created\n");
+    assert.throws(
+      () => assertEnvironmentModeCacheTreeStatSealOnly(projection, cleanSeal),
+      /tree stat seal mismatch/,
+    );
+    assert.doesNotThrow(() => assertEnvironmentModeCacheProjectionStatSealOnly(
+      projection,
+      cleanSeal,
+      ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+    ));
+
+    writeFileSync(finderMetadata, "finder-rewritten-with-different-bytes\n");
+    assert.doesNotThrow(() => assertEnvironmentModeCacheProjectionStatSealOnly(
+      projection,
+      cleanSeal,
+      ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+    ));
+
+    const sealWithFinderMetadata = sealEnvironmentModeCacheTree(projection);
+    unlinkSync(finderMetadata);
+    assert.doesNotThrow(() => assertEnvironmentModeCacheProjectionStatSealOnly(
+      projection,
+      sealWithFinderMetadata,
+      ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+    ));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("projection metadata policy remains strict for non-regular junk and non-junk drift", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-mode-cache-finder-strict-"));
+  const makeProjection = (name: string, withSymlink = false) => {
+    const projection = join(root, name);
+    const nested = join(projection, "nested");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "runtime.js"), "sealed-runtime\n");
+    if (withSymlink) {
+      writeFileSync(join(nested, "target-a"), "a\n");
+      writeFileSync(join(nested, "target-b"), "b\n");
+      symlinkSync("target-a", join(nested, "selected-target"));
+    }
+    return { projection, nested, seal: sealEnvironmentModeCacheTree(projection) };
+  };
+  const assertRejected = (projection: string, seal: ReturnType<typeof sealEnvironmentModeCacheTree>) => {
+    assert.throws(
+      () => assertEnvironmentModeCacheProjectionStatSealOnly(
+        projection,
+        seal,
+        ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+      ),
+      /projection stat seal mismatch/,
+    );
+  };
+
+  try {
+    const symlinkJunk = makeProjection("symlink-junk");
+    symlinkSync("runtime.js", join(symlinkJunk.nested, ".DS_Store"));
+    assertRejected(symlinkJunk.projection, symlinkJunk.seal);
+
+    const directoryJunk = makeProjection("directory-junk");
+    mkdirSync(join(directoryJunk.nested, ".DS_Store"));
+    assertRejected(directoryJunk.projection, directoryJunk.seal);
+
+    const nonJunkAddition = makeProjection("non-junk-addition");
+    writeFileSync(join(nonJunkAddition.nested, "extra.js"), "extra\n");
+    assertRejected(nonJunkAddition.projection, nonJunkAddition.seal);
+
+    const modeChange = makeProjection("mode-change");
+    chmodSync(join(modeChange.nested, "runtime.js"), 0o755);
+    assertRejected(modeChange.projection, modeChange.seal);
+
+    const payloadChange = makeProjection("payload-change");
+    const payload = join(payloadChange.nested, "runtime.js");
+    const before = statSync(payload);
+    writeFileSync(payload, "edited-runtime\n");
+    utimesSync(payload, before.atime, before.mtime);
+    assertRejected(payloadChange.projection, payloadChange.seal);
+
+    const symlinkTarget = makeProjection("symlink-target", true);
+    const selectedTarget = join(symlinkTarget.nested, "selected-target");
+    unlinkSync(selectedTarget);
+    symlinkSync("target-b", selectedTarget);
+    assertRejected(symlinkTarget.projection, symlinkTarget.seal);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("activated projection policy composes Finder metadata with the one rename ctime change", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-mode-cache-finder-rename-"));
+  try {
+    const staged = join(root, "staged");
+    const active = join(root, "active");
+    mkdirSync(join(staged, "nested"), { recursive: true });
+    writeFileSync(join(staged, "nested", "runtime.js"), "sealed-runtime\n");
+    const stagedSeal = sealEnvironmentModeCacheTree(staged);
+    renameSync(staged, active);
+    const activeSeal = { ...stagedSeal, rootPath: active };
+    writeFileSync(join(active, "nested", ".DS_Store"), "finder-created\n");
+
+    assert.throws(
+      () => assertEnvironmentModeCacheTreeStatSealAfterRename(active, activeSeal),
+      /tree stat seal mismatch/,
+    );
+    assert.doesNotThrow(() => assertEnvironmentModeCacheProjectionStatSealAfterRename(
+      active,
+      activeSeal,
+      ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+    ));
+
+    writeFileSync(join(active, "nested", "runtime.js"), "changed-runtime\n");
+    assert.throws(
+      () => assertEnvironmentModeCacheProjectionStatSealAfterRename(
+        active,
+        activeSeal,
+        ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
+      ),
+      /projection stat seal mismatch/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

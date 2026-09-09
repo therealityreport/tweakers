@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 import sade from "sade";
+import { launchPortableDesktopFromOperator } from "./portable-desktop-launch.js";
 import kleur from "kleur";
 import { install, prebuiltCombinedCandidate } from "./commands/install.js";
 import type { PrebuiltCombinedCandidateCliOptions } from "./prebuilt-combined-candidate.js";
 import { uninstall } from "./commands/uninstall.js";
 import { repair } from "./commands/repair.js";
-import {
-  cancelCodexUpdate,
-  codexUpdateStatus,
-  reconcileCodexUpdate,
-  resumeCodexUpdate,
-  updateCodex,
-} from "./commands/update-codex.js";
+import { codexUpdateStatus } from "./commands/update-codex.js";
 import { selfUpdate } from "./commands/self-update.js";
 import { status } from "./commands/status.js";
+import { nativeHistorySetupCommand, type NativeHistorySetupCliOptions } from "./native-history-setup.js";
 import { debug } from "./commands/debug.js";
 import { browserUi } from "./commands/browser-ui.js";
 import { doctor } from "./commands/doctor.js";
@@ -23,7 +19,7 @@ import { migrate } from "./commands/migrate.js";
 import { TWEAKER_VERSION } from "./version.js";
 import { buildCliFailureIssueUrl, showPatchFailedAlert } from "./alerts.js";
 import { capKnownLogFiles } from "./logging.js";
-import { createTweakersVariant } from "./commands/create-variant.js";
+import { createTweakersVariant, refreshTweakersVariant } from "./commands/create-variant.js";
 import { runWatcherCycle } from "./watcher-cycle.js";
 import { ensureUserPaths } from "./paths.js";
 import {
@@ -33,6 +29,10 @@ import {
 } from "./commands/environment.js";
 import { codexSource, type CodexSourceOptions } from "./commands/codex-source.js";
 import {
+  codexBuildAttestation,
+  type CodexBuildAttestationCliOptions,
+} from "./commands/codex-build-attestation.js";
+import {
   adoptAccountHistoryCommand,
   type AdoptAccountHistoryCliOptions,
 } from "./commands/adopt-account-history.js";
@@ -40,6 +40,18 @@ import {
   prepareAccountHistoryCommand,
   type PrepareAccountHistoryCliOptions,
 } from "./commands/prepare-account-history.js";
+import {
+  sharedHistoryMigrationCommand,
+  type SharedHistoryMigrationCliOptions,
+} from "./shared-history-migration.js";
+import {
+  offlineMigrationLauncherCommand,
+  type OfflineMigrationLauncherCliOptions,
+} from "./offline-migration-launcher.js";
+import {
+  portableSettingsMigrationCommand,
+  type PortableSettingsMigrationCliOptions,
+} from "./portable-settings-migration.js";
 
 interface InstallCliOpts {
   app?: string;
@@ -203,6 +215,15 @@ const prog = sade("tweaker")
 
 capKnownLogFiles();
 
+for (const [command, target] of [["launch-official", "official"], ["launch-tweakers", "tweakers"]] as const) {
+  prog.command(command).describe("Merge portable settings while idle, then open the selected desktop")
+    .action(() => {
+      const result = launchPortableDesktopFromOperator(target);
+      console.log(JSON.stringify(result));
+      if (!result.launched) process.exitCode = 1;
+    });
+}
+
 prog
   .command("install")
   .describe("Patch Codex.app to load the tweak runtime")
@@ -240,12 +261,23 @@ prog
 
 prog
   .command("create-variant")
-  .describe("Create an isolated Tweakers ChatGPT app while keeping the official app untouched")
-  .option("--source", "Verified official OpenAI-signed ChatGPT.app to copy")
-  .option("--app", "Target path (default: /Applications/Tweakers ChatGPT.app)")
+  .describe("Create an isolated Tweakers.app while keeping the official app untouched")
+  .option("--source", "Verified official OpenAI-signed ChatGPT.app to copy (default: sealed inactive role)")
+  .option("--app", "Target path (default: /Applications/Tweakers.app)")
   .option("--user-root", "Isolated Tweakers state directory")
   .option("--user-data", "Isolated Electron user-data directory")
+  .option("--candidate-only", "Prepare a receipt-bound package without creating links, changing state, or promoting")
+  .option("--output", "Required private, absent package directory for --candidate-only")
   .action(wrap(createTweakersVariant));
+
+prog
+  .command("refresh-variant")
+  .describe("Atomically rebuild an existing Tweakers.app from the sealed official source")
+  .option("--source", "Verified official OpenAI-signed ChatGPT.app to copy (default: sealed inactive role)")
+  .option("--app", "Target path (default: /Applications/Tweakers.app)")
+  .option("--user-root", "Isolated Tweakers state directory")
+  .option("--user-data", "Isolated Electron user-data directory")
+  .action(wrap(refreshTweakersVariant));
 
 prog
   .command("uninstall")
@@ -266,47 +298,11 @@ prog
   .action(wrap(runRepair));
 
 prog
-  .command("update-chatgpt")
-  .describe("Start the durable official ChatGPT Update and Reload transaction")
-  .option("--app", "Path to Codex.app / install dir")
-  .option("--json", "Print the schema-v1 transaction receipt as JSON")
-  .action(wrap(updateCodex));
-
-// Compatibility alias retained for existing tweaker installs.
-prog
-  .command("update-codex")
-  .describe("Alias for update-chatgpt")
-  .option("--app", "Path to Codex.app / install dir")
-  .option("--json", "Print the schema-v1 transaction receipt as JSON")
-  .action(wrap(updateCodex));
-
-prog
   .command("update-chatgpt-status")
-  .describe("Print the durable desktop update transaction status")
+  .describe("Print read-only historical desktop update transaction status")
   .option("--app", "Path to Codex.app / install dir")
   .option("--json", "Print the schema-v1 transaction receipt as JSON", true)
   .action(wrap(codexUpdateStatus));
-
-prog
-  .command("update-chatgpt-resume")
-  .describe("Resume a timed-out desktop update while ChatGPT remains in official mode")
-  .option("--app", "Path to Codex.app / install dir")
-  .option("--json", "Print the schema-v1 transaction receipt as JSON")
-  .action(wrap(resumeCodexUpdate));
-
-prog
-  .command("update-chatgpt-reconcile")
-  .describe("Reconcile an interrupted desktop update without relaunching ChatGPT")
-  .option("--app", "Path to Codex.app / install dir")
-  .option("--json", "Print the transaction receipt or explicit idle result as JSON")
-  .action(wrap(reconcileCodexUpdate));
-
-prog
-  .command("update-chatgpt-cancel")
-  .describe("Cancel an active desktop update continuation")
-  .option("--app", "Path to Codex.app / install dir")
-  .option("--json", "Print the schema-v1 transaction receipt as JSON")
-  .action(wrap(cancelCodexUpdate));
 
 prog
   .command("codex-source <action>")
@@ -328,6 +324,21 @@ prog
   .option("--approval-file", "Exact restart approval file (cutover/rollback only)")
   .option("--json", "Print machine-readable output", true)
   .action(wrap((action: string, options: CodexSourceOptions) => codexSource(action, options)));
+
+prog
+  .command("codex-build-attestation <action>")
+  .describe("Review and explicitly accept one exact frozen codex-source build")
+  .option("--transaction", "Exact codex-source transaction ID (review only)")
+  .option("--derived-receipt", "Exact schema-v2 codex-derived receipt path (review only)")
+  .option("--review-manifest", "Exact owner-private review manifest path (accept only)")
+  .option(
+    "--accept-reviewed-manifest-sha256",
+    "Explicit release-owner acceptance bound to the exact review-manifest SHA-256 (accept only)",
+  )
+  .option("--json", "Print machine-readable output", true)
+  .action(wrap((action: string, options: CodexBuildAttestationCliOptions) =>
+    codexBuildAttestation(action, options)
+  ));
 
 prog
   .command("update")
@@ -474,6 +485,20 @@ prog.command("migrate")
   .option("--target-root", "Tweakers user root (defaults to the active user root)")
   .action(wrap(migrate));
 prog
+  .command("link-native-accounts")
+  .describe("Register existing Codex history and saved account homes in place; no history or credential copies")
+  .option("--apply", "Publish the registration only after both apps and account backends are idle")
+  .option("--dry-run", "Preview registration without writing (default)")
+  .option("--legacy-router-root", "Exact existing two-account router root")
+  .option("--source-codex-root", "Exact existing native Codex home")
+  .option("--source-sqlite-root", "Exact existing native Codex database home")
+  .option("--secondary-codex-root", "Optional existing live home signed into the other saved account")
+  .option("--secondary-sqlite-root", "Database home paired with --secondary-codex-root")
+  .option("--global-root", "Exact absent shared broker root")
+  .option("--app", "Exact original desktop app path")
+  .option("--tweakers-app", "Exact customized desktop app path")
+  .action(wrap((options: NativeHistorySetupCliOptions) => nativeHistorySetupCommand(options)));
+prog
   .command("prepare-account-history")
   .describe("Prepare a private verified history copy; originals are never changed")
   .option("--apply", "Create the verified private copy after repeated idle checks")
@@ -495,6 +520,66 @@ prog
   .option("--app", "Exact desktop app path used only for the idle census")
   .action(wrap((options: AdoptAccountHistoryCliOptions) => {
     adoptAccountHistoryCommand(options);
+  }));
+prog
+  .command("shared-history-migration <action>")
+  .describe("Explicit adoption preparation, canonical-history capacity preview/migration, recovery, and read-only rollback/export preparation")
+  .option("--apply", "Permit the apply action after its dry-run preview; never restarts the app")
+  .option("--dry-run", "Force a read-only preview (the default unless apply is explicitly requested)")
+  .option("--legacy-router-root", "Exact private legacy v2 router root")
+  .option("--legacy-codex-root", "Exact immutable legacy CODEX_HOME source root")
+  .option("--legacy-sqlite-root", "Exact immutable legacy CODEX_SQLITE_HOME source root")
+  .option("--legacy-definitions-root", "Optional exact owner-controlled source for allowlisted Skills and selected plugin packages")
+  .option("--shared-skills-root", "Repeatable exact canonical root allowed for legacy Skills symlink targets")
+  .option("--shared-plugin-inventory", "Exact private normalized effective-plugin inventory; required for preview, apply, and recover")
+  .option("--global-root", "Exact absent private global v3 broker root")
+  .option("--app", "Exact primary ChatGPT app path used only for the offline census")
+  .option("--tweakers-app", "Exact separate Tweakers app path required for every offline census")
+  .option("--projection-output", "Exact absent private review directory written only by preview")
+  .option("--capacity-receipt", "Exact private capacity receipt from a matching preview; required by apply --apply")
+  .option("--transaction", "Caller-stable migration transaction ID, required by recover")
+  .option("--output", "Exact absent private rollback-export directory, required by export")
+  .action(wrap((action: string, options: SharedHistoryMigrationCliOptions) => {
+    sharedHistoryMigrationCommand(action, options);
+  }));
+prog
+  .command("offline-migration-launcher <action>")
+  .describe("Explicitly prepare, inspect, or arm one private offline global-v3 migration LaunchAgent")
+  .option("--transaction", "Caller-stable offline migration transaction ID (prepare only)")
+  .option("--launcher-root", "Exact private transaction directory (created by prepare)")
+  .option("--launch-agents-root", "Exact private LaunchAgents directory (prepare only)")
+  .option("--manager-generation-root", "Exact immutable sealed manager generation; its target.seal selects Node and manager.mjs (prepare only)")
+  .option("--legacy-router-root", "Exact private legacy v2 router root (prepare only)")
+  .option("--legacy-codex-root", "Exact immutable legacy CODEX_HOME source root (prepare only)")
+  .option("--legacy-sqlite-root", "Exact immutable legacy CODEX_SQLITE_HOME source root (prepare only)")
+  .option("--legacy-definitions-root", "Optional exact owner-controlled source for allowlisted Skills and selected plugin packages (prepare only)")
+  .option("--shared-skills-root", "Repeatable exact trusted shared Skills root (prepare only)")
+  .option("--shared-plugin-inventory", "Exact sealed effective-plugin inventory (prepare only)")
+  .option("--sealed-inventory", "Repeatable additional exact private inventory to seal (prepare only)")
+  .option("--global-root", "Exact absent private global-v3 root (prepare only)")
+  .option("--app", "Exact primary ChatGPT app path used only for writer census (prepare only)")
+  .option("--tweakers-app", "Exact independent Tweakers app path used only for writer census (prepare only)")
+  .option("--tweakers-promotion-receipt", "Exact current private Tweakers runtime-ready receipt (prepare only)")
+  .option("--tweakers-promotion-fingerprint", "Exact SHA-256 fingerprint of that receipt (prepare only)")
+  .option("--capacity-receipt", "Exact private receipt from shared-history-migration preview (prepare only)")
+  .action(wrap((action: string, options: OfflineMigrationLauncherCliOptions) => {
+    offlineMigrationLauncherCommand(action, options);
+  }));
+prog
+  .command("portable-settings-migration <action>")
+  .describe("Preview, apply, inspect, or recover the explicit offline allowlisted Tweakers settings migration")
+  .option("--transaction", "Caller-stable portable-settings transaction ID")
+  .option("--source-codex-home-root", "Exact source Codex home containing the native project projection")
+  .option("--source-tweakers-root", "Exact source Tweakers root containing Projects and enablement settings")
+  .option("--target-codex-home-root", "Exact isolated Tweakers Codex home to receive portable native projects")
+  .option("--target-tweakers-root", "Exact isolated Tweakers root to receive allowlisted tweak settings")
+  .option("--global-root", "Exact ready global-v3 broker root that supplies canonical public conversation handles")
+  .option("--app", "Exact official ChatGPT app path used only for the zero-writer census")
+  .option("--tweakers-app", "Exact independent Tweakers app path used only for the zero-writer census")
+  .option("--intent-fingerprint", "Exact preview fingerprint required by apply")
+  .option("--apply", "Permit the apply action; never launches, quits, or restarts an app")
+  .action(wrap((action: string, options: PortableSettingsMigrationCliOptions) => {
+    portableSettingsMigrationCommand(action, options);
   }));
 prog.command("watcher-run").describe("Run one internal watcher cycle").action(wrap(() =>
   runWatcherCycle({ userRoot: ensureUserPaths().root }).then(() => undefined)

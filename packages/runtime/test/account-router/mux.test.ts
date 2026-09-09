@@ -3,8 +3,9 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 import { AccountRouterMux, RouterPreDispatchError, type RouterChild, type RouterChildFactory } from "../../src/account-router/mux";
 import { routerConfigFingerprint } from "../../src/account-router/config";
+import type { AccountQuotaObservation } from "../../src/account-router/quota";
 import { createInitialRouterState } from "../../src/account-router/state-store";
-import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type JsonRpcMessage, type OpaqueAccountId, type RouterConfig, type RouterConfigV2, type RouterState } from "../../src/account-router/types";
+import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type JsonRpcMessage, type OpaqueAccountId, type RouterConfig, type RouterConfigV2, type RouterConfigV3, type RouterState } from "../../src/account-router/types";
 
 const accountA = `ar_${"A".repeat(43)}` as const;
 const accountB = `ar_${"B".repeat(43)}` as const;
@@ -40,6 +41,23 @@ function manualConfig(): RouterConfigV2 {
     mode: "manual",
     policy: null,
     generation: active.generation + 1,
+  };
+  return { ...draft, fingerprint: routerConfigFingerprint(draft) };
+}
+
+function balancedTokensConfig(): RouterConfigV3 {
+  const draft: Omit<RouterConfigV3, "fingerprint"> = {
+    schemaVersion: 3,
+    mode: "quota_aware",
+    policy: "balanced_tokens_v1",
+    generation: 3,
+    protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
+    primaryOpaqueAccountId: accountA,
+    accounts: [
+      { opaqueAccountId: accountA, included: true, weight: 1, capabilityFingerprint: `sha256:${"a".repeat(64)}`, label: "Account 1" },
+      { opaqueAccountId: accountB, included: true, weight: 1, capabilityFingerprint: `sha256:${"b".repeat(64)}`, label: "Account 2" },
+    ],
+    updatedAt: "2026-08-31T12:00:00.000Z",
   };
   return { ...draft, fingerprint: routerConfigFingerprint(draft) };
 }
@@ -181,6 +199,29 @@ test("initialize always projects the configured primary response, not arrival or
   mux.shutdown();
 });
 
+test("feature enablement broadcasts to every account and returns the configured primary response", () => {
+  const store = fakeStore(createInitialRouterState(config));
+  const factory = new FakeFactory();
+  const desktop: JsonRpcMessage[] = [];
+  const mux = new AccountRouterMux({ config, store: store as never, childFactory: factory, writeDesktop: (message) => desktop.push(message), controlSecret: Buffer.alloc(32, 31) });
+  mux.start();
+  mux.receiveDesktop({ jsonrpc: "2.0", id: "init", method: "initialize", params: {} });
+  for (const child of factory.children.values()) child.emit(responseFor(child.sent[0], initializeResult(child)));
+  desktop.length = 0;
+  mux.receiveDesktop({ jsonrpc: "2.0", id: "feature", method: "experimentalFeature/enablement/set", params: { feature: "fixture", enabled: true } });
+  const primary = factory.children.get(accountA)!;
+  const secondary = factory.children.get(accountB)!;
+  const primaryRequest = primary.sent.at(-1)!;
+  const secondaryRequest = secondary.sent.at(-1)!;
+  assert.equal(primaryRequest.method, "experimentalFeature/enablement/set");
+  assert.equal(secondaryRequest.method, "experimentalFeature/enablement/set");
+  secondary.emit(responseFor(secondaryRequest, { account: "secondary" }));
+  assert.equal(desktop.length, 0);
+  primary.emit(responseFor(primaryRequest, { account: "primary" }));
+  assert.deepEqual(desktop.pop(), { jsonrpc: "2.0", id: "feature", result: { account: "primary" } });
+  mux.shutdown();
+});
+
 test("mux rejects child-originated requests for unknown threads without desktop forwarding", () => {
   const store = fakeStore(createInitialRouterState(config));
   const factory = new FakeFactory();
@@ -297,6 +338,73 @@ test("v2 uses only fresh two-account official quota readings, exposes active tru
   mux.shutdown();
 });
 
+test("v2 preserves bounded Codex quota metadata and clears it after a failed rate-limit probe", () => {
+  const now = Date.parse("2026-08-31T12:00:00.000Z");
+  const v2 = quotaConfig();
+  const store = fakeStore(createInitialRouterState(v2));
+  const factory = new FakeFactory();
+  const desktop: JsonRpcMessage[] = [];
+  const mux = new AccountRouterMux({
+    config: v2, store: store as never, childFactory: factory, writeDesktop: (message) => desktop.push(message), controlSecret: Buffer.alloc(32, 38), now: () => now,
+  });
+  assert.equal(mux.start(), true);
+  mux.receiveDesktop({ jsonrpc: "2.0", id: "init", method: "initialize", params: {} });
+  for (const child of factory.children.values()) child.emit(responseFor(child.sent[0], initializeResult(child)));
+
+  for (const [account, child] of factory.children) {
+    const accountRead = child.sent.findLast((message) => "method" in message && message.method === "account/read")!;
+    const rateRead = child.sent.findLast((message) => "method" in message && message.method === "account/rateLimits/read")!;
+    child.emit(responseFor(accountRead, { account: { authenticated: true, planType: "Pro" } }));
+    const exhausted = account === accountA;
+    child.emit(responseFor(rateRead, {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: exhausted ? 100 : 10, windowDurationMins: 300, resetsAt: Math.floor((now + 30_000) / 1_000) },
+        secondary: { usedPercent: exhausted ? 10 : 30, windowDurationMins: 10_080, resetsAt: Math.floor((now + 3_600_000) / 1_000) },
+        rateLimitReachedType: exhausted ? "primary" : null,
+      },
+      rateLimitResetCredits: { availableCount: exhausted ? 3 : 1 },
+    }));
+  }
+
+  const observations = (mux as unknown as { quota: Map<OpaqueAccountId, AccountQuotaObservation> }).quota;
+  assert.deepEqual(observations.get(accountA), {
+    health: "authenticated",
+    plan: "Pro",
+    observedAt: now,
+    weeklyRemainingPercent: 90,
+    weeklyResetAt: now + 3_600_000,
+    shortWindowPressure: 100,
+    shortWindowResetAt: now + 30_000,
+    rateLimitReached: true,
+    resetCredits: 3,
+  });
+  mux.receiveDesktop({ jsonrpc: "2.0", id: "start", method: "thread/start", params: { input: "route around reached quota" } });
+  assert.equal([...factory.children.values()].some((child) => child.sent.at(-1)?.method === "thread/start"), false,
+    "the fixed v2 pool fails closed when reached or exhausted Codex quota is present");
+  assert.equal((desktop.pop() as { error?: { data?: { code?: string } } }).error?.data?.code, "pool_depleted");
+
+  const first = factory.children.get(accountA)!;
+  first.emit({ jsonrpc: "2.0", method: "account/rateLimits/updated", params: {} });
+  const refreshedAccount = first.sent.findLast((message) => "method" in message && message.method === "account/read")!;
+  const refreshedRates = first.sent.findLast((message) => "method" in message && message.method === "account/rateLimits/read")!;
+  first.emit(responseFor(refreshedAccount, { account: { authenticated: true, planType: "Pro" } }));
+  if (!("id" in refreshedRates)) throw new Error("expected rate-limit request");
+  first.emit({ jsonrpc: "2.0", id: refreshedRates.id, error: { code: -32000, message: "private provider failure" } });
+  assert.deepEqual(observations.get(accountA), {
+    health: "authenticated",
+    plan: "Pro",
+    observedAt: now,
+    weeklyRemainingPercent: null,
+    weeklyResetAt: null,
+    shortWindowPressure: null,
+    shortWindowResetAt: null,
+    rateLimitReached: false,
+    resetCredits: null,
+  });
+  mux.shutdown();
+});
+
 test("v2 never retries or migrates a new thread to the other account after pre-dispatch or ambiguous delivery", () => {
   const now = Date.parse("2026-08-31T12:00:00.000Z");
   const v2 = quotaConfig();
@@ -394,6 +502,23 @@ test("v2 control status keeps the running active intent when a later manual conf
   assert.deepEqual(status.active, { mode: "quota_aware", policy: "quota_aware_v1", generation: 1, fingerprint: active.fingerprint });
   assert.deepEqual(status.pending, { mode: "manual", policy: null, generation: 2, fingerprint: pending.fingerprint });
   assert.equal(status.restartRequired, true);
+  mux.shutdown();
+});
+
+test("v3 status preserves the active balanced-tokens policy", () => {
+  const v3 = balancedTokensConfig();
+  const mux = new AccountRouterMux({
+    config: v3,
+    store: fakeStore(createInitialRouterState(v3)) as never,
+    childFactory: new FakeFactory(),
+    writeDesktop: () => {},
+    controlSecret: Buffer.alloc(32, 39),
+  });
+  assert.equal(mux.start(), true);
+  const status = mux.status();
+  assert.equal(status.schemaVersion, 3);
+  if (status.schemaVersion !== 3) throw new Error("expected v3 status");
+  assert.equal(status.active.policy, "balanced_tokens_v1");
   mux.shutdown();
 });
 

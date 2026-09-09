@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
+import asarPackage from "@electron/asar";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { finished } from "node:stream/promises";
 import test from "node:test";
 import {
   environmentModeCacheGenerationPaths,
   environmentModeCachePaths,
+  invalidateCurrentEnvironmentModePair,
   readCurrentEnvironmentModePair,
   sealEnvironmentModeCacheTree,
 } from "../src/environment-mode-cache";
@@ -29,6 +36,7 @@ import {
   createEnvironmentModeProductionBindings,
   environmentModeWarmCommitTargetIdentity,
   environmentModeCacheV2Enabled,
+  observeOrReopenExactVisibleDesktop,
   resolveEnvironmentModeV2PreparedCommitCli,
   type EnvironmentModeProductionDeps,
 } from "../src/environment-mode-production";
@@ -36,6 +44,7 @@ import type { ProcessInfo } from "../src/commands/debug";
 import type { EnvironmentSelection } from "../src/environment-profile";
 import type { PreparedEnvironmentEvidence } from "../src/environment-transaction";
 import type { McpModeBridge } from "../src/mcp-mode-bridge";
+import { writePlist } from "../src/plist";
 import {
   environmentWarmCommitJournalFile,
   writeEnvironmentWarmCommitReceipt,
@@ -55,12 +64,12 @@ interface ProductionFixture {
 }
 
 function withFixture(run: (fixture: ProductionFixture) => Promise<void> | void): Promise<void> {
-  // The pair cache rejects symlink ancestors. Keep every destructive test
-  // artifact below the physical workspace root rather than /tmp -> /var.
-  const root = mkdtempSync(join(realpathSync(process.cwd()), ".tweaker-production-v2-"));
+  // Resolve the temporary root to avoid /tmp symlink ancestors, and keep
+  // disposable app bundles outside the workspace observed by Finder.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-production-v2-"));
   return Promise.resolve()
     .then(() => run(makeFixture(root)))
-    .finally(() => { rmSync(root, { recursive: true, force: true }); });
+    .finally(() => { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); });
 }
 
 function makeFixture(root: string): ProductionFixture {
@@ -242,6 +251,98 @@ function createBindings(
 }
 
 /**
+ * Give the two disposable fixture apps the same on-disk identity surfaces that
+ * bounded production preflight reads: Info.plist, a readable ASAR marker, and
+ * codesign output.  The production binding remains unmodified and therefore
+ * cannot skip any role or signature assertion for these tests.
+ */
+async function prepareBoundedRoleFixture(fixture: ProductionFixture): Promise<void> {
+  await writeBoundedRoleApp(
+    fixture,
+    fixture.current.selectedDesktopPath,
+    "live-chatgpt",
+    "chatgpt",
+    "26.818.0",
+    "9000",
+  );
+  await writeBoundedRoleApp(
+    fixture,
+    fixture.preparedEvidence().candidate.artifactPath,
+    "candidate-tweakers",
+    "tweakers",
+    "26.818.1",
+    "9001",
+  );
+}
+
+async function writeBoundedRoleApp(
+  fixture: ProductionFixture,
+  appPath: string,
+  sourceName: string,
+  experience: "chatgpt" | "tweakers",
+  version: string,
+  build: string,
+): Promise<void> {
+  writePlist(join(appPath, "Contents", "Info.plist"), {
+    CFBundleIdentifier: "com.openai.codex",
+    CFBundleShortVersionString: version,
+    CFBundleVersion: build,
+  });
+  const source = join(fixture.root, "bounded-role-asar-source", sourceName);
+  mkdirSync(source, { recursive: true });
+  const main = experience === "tweakers" ? "tweaker-loader.cjs" : "official.js";
+  writeFileSync(join(source, "package.json"), `${JSON.stringify({
+    name: sourceName,
+    version: "1.0.0",
+    main,
+    ...(experience === "tweakers" ? { __tweaker: {} } : {}),
+  })}\n`);
+  writeFileSync(join(source, main), "export {};\n");
+  const archive = asar(appPath);
+  if (existsSync(archive)) unlinkSync(archive);
+  const output = await asarPackage.createPackageWithOptions(source, archive, {
+    globOptions: { dot: true },
+  });
+  await finished(output);
+}
+
+async function withFixtureCodesign<T>(
+  fixture: ProductionFixture,
+  run: () => Promise<T>,
+): Promise<T> {
+  const bin = join(fixture.root, "bounded-role-bin");
+  const executable = join(bin, "codesign");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    "last=",
+    "for arg in \"$@\"; do",
+    "  if [ \"$arg\" = \"--verify\" ]; then exit 0; fi",
+    "  last=\"$arg\"",
+    "done",
+    "case \"$last\" in",
+    "  */environment-cache/*)",
+    "    printf '%s\\n' 'Signature=adhoc' 'TeamIdentifier=not set' >&2",
+    "    ;;",
+    "  *)",
+    `    printf '%s\\n' 'TeamIdentifier=${OPENAI_TEAM}' >&2`,
+    "    ;;",
+    "esac",
+    "exit 0",
+    "",
+  ].join("\n"));
+  chmodSync(executable, 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = priorPath === undefined ? bin : `${bin}:${priorPath}`;
+  try {
+    return await run();
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH;
+    else process.env.PATH = priorPath;
+  }
+}
+
+/**
  * Reverse the fixture direction: Tweakers is the live experience at the shared
  * desktop path and ChatGPT is the requested (inactive) target. The candidate
  * evidence carries the pristine OpenAI trust claim that the receipt pins for
@@ -342,6 +443,248 @@ test("tweakers-live warm preflight binds the complete pair for a pristine ChatGP
     assert.equal(target.runtimeDigest, result.receipt.tweakers.runtime.digest);
     assert.equal(target.managedRuntimeDigest, result.receipt.tweakers.managedRuntime.digest);
     assert.equal(target.nativeHostDigest, result.receipt.tweakers.nativeHost.digest);
+  });
+});
+
+test("warm preflight reopens and re-proves an absent exact source before cutover", async () => {
+  const appPath = "/Applications/ChatGPT.app";
+  let source: { pid: number; visibleWindow: boolean } | null = null;
+  const reopened: string[] = [];
+  const sleeps: number[] = [];
+
+  const observed = await observeOrReopenExactVisibleDesktop(
+    appPath,
+    () => source,
+    (path) => {
+      reopened.push(path);
+      source = { pid: 808, visibleWindow: true };
+    },
+    async (milliseconds) => { sleeps.push(milliseconds); },
+  );
+
+  assert.deepEqual(reopened, [appPath]);
+  assert.deepEqual(observed, { pid: 808, visibleWindow: true });
+  assert.deepEqual(sleeps, []);
+});
+
+test("warm preflight source reopen stays bounded when the exact app remains absent", async () => {
+  const appPath = "/Applications/ChatGPT.app";
+  const reopened: string[] = [];
+  const sleeps: number[] = [];
+
+  const observed = await observeOrReopenExactVisibleDesktop(
+    appPath,
+    () => null,
+    (path) => { reopened.push(path); },
+    async (milliseconds) => { sleeps.push(milliseconds); },
+  );
+
+  assert.equal(observed, null);
+  assert.deepEqual(reopened, [appPath]);
+  assert.equal(sleeps.length, 240);
+  assert.equal(sleeps.every((milliseconds) => milliseconds === 250), true);
+});
+
+test("production preflight reopens the exact absent source and revalidates the pair", async () => {
+  await withFixture(async (fixture) => {
+    await prepareBoundedRoleFixture(fixture);
+    await withFixtureCodesign(fixture, async () => {
+      let source: { pid: number; visibleWindow: boolean } | null = null;
+      const reopened: string[] = [];
+      const bindings = createBindings(fixture, {
+        observeDesktop: () => source,
+        reopenDesktop: (appPath) => {
+          reopened.push(appPath);
+          source = { pid: 808, visibleWindow: true };
+        },
+        sleep: async () => {},
+      });
+      const prepared = await bindings.prepare({
+        current: fixture.current,
+        requested: fixture.requested,
+        generationId: "binding-source-reopen",
+      });
+      assert.ok(prepared.receipt);
+
+      const preflight = await bindings.warmCommit.preflight(prepared.receipt);
+
+      assert.equal(preflight.state, "ready");
+      if (preflight.state !== "ready") assert.fail(preflight.reason);
+      assert.deepEqual(reopened, [fixture.current.selectedDesktopPath]);
+      assert.deepEqual(preflight.source, {
+        appPath: fixture.current.selectedDesktopPath,
+        pid: 808,
+        visibleWindow: true,
+      });
+    });
+  });
+});
+
+test("production preflight keeps persistent exact-source absence bounded and stale", async () => {
+  await withFixture(async (fixture) => {
+    await prepareBoundedRoleFixture(fixture);
+    await withFixtureCodesign(fixture, async () => {
+      const reopened: string[] = [];
+      const sleeps: number[] = [];
+      let observations = 0;
+      const bindings = createBindings(fixture, {
+        observeDesktop: () => {
+          observations += 1;
+          return null;
+        },
+        reopenDesktop: (appPath) => { reopened.push(appPath); },
+        sleep: async (milliseconds) => { sleeps.push(milliseconds); },
+      });
+      const prepared = await bindings.prepare({
+        current: fixture.current,
+        requested: fixture.requested,
+        generationId: "binding-source-absent",
+      });
+      assert.ok(prepared.receipt);
+
+      const preflight = await bindings.warmCommit.preflight(prepared.receipt);
+
+      assert.deepEqual(preflight, {
+        state: "stale_requires_prepare",
+        reason: "exact source process with visible window is absent after bounded reopen",
+      });
+      assert.deepEqual(reopened, [fixture.current.selectedDesktopPath]);
+      assert.equal(observations, 241);
+      assert.equal(sleeps.length, 240);
+      assert.equal(sleeps.every((milliseconds) => milliseconds === 250), true);
+    });
+  });
+});
+
+test("production preflight rejects sealed-pair drift introduced during exact-source reopen", async () => {
+  await withFixture(async (fixture) => {
+    await prepareBoundedRoleFixture(fixture);
+    await withFixtureCodesign(fixture, async () => {
+      let source: { pid: number; visibleWindow: boolean } | null = null;
+      const bindings = createBindings(fixture, {
+        observeDesktop: () => source,
+        reopenDesktop: () => { source = { pid: 909, visibleWindow: true }; },
+        sleep: async () => {},
+      });
+      const prepared = await bindings.prepare({
+        current: fixture.current,
+        requested: fixture.requested,
+        generationId: "binding-source-reopen-drift",
+      });
+      assert.ok(prepared.receipt);
+      const cachedCli = join(
+        prepared.receipt.paths.managedRuntimeRoot,
+        "packages",
+        "installer",
+        "dist",
+        "cli.js",
+      );
+      const driftBindings = createBindings(fixture, {
+        observeDesktop: () => source,
+        reopenDesktop: () => {
+          writeFileSync(cachedCli, "changed during reopen\n");
+          source = { pid: 909, visibleWindow: true };
+        },
+        sleep: async () => {},
+      });
+
+      const preflight = await driftBindings.warmCommit.preflight(prepared.receipt);
+
+      assert.equal(preflight.state, "stale_requires_prepare");
+      if (preflight.state !== "stale_requires_prepare") assert.fail("expected stale preflight");
+      assert.match(preflight.reason, /stat seal mismatch/);
+    });
+  });
+});
+
+test("prepare survives Finder creating .DS_Store in a sealed managed-runtime projection", async () => {
+  await withFixture(async (fixture) => {
+    const generationId = "finder-projection-generation";
+    const preparationRoot = environmentModeCachePaths(fixture.root).preparationRoot;
+    const managedProjection = join(
+      preparationRoot,
+      generationId,
+      "projection",
+      "managed-runtime",
+    );
+    const finderMetadata = join(managedProjection, ".DS_Store");
+    let injected = false;
+    const bindings = createBindings(fixture, {
+      validateOfficial: () => {
+        if (!injected && existsSync(managedProjection)) {
+          writeFileSync(finderMetadata, "finder-created-after-seal\n");
+          injected = true;
+        }
+      },
+    });
+
+    const result = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId,
+    });
+
+    assert.equal(result.state, "ready");
+    assert.equal(injected, true);
+    assert.ok(result.receipt);
+    const promotedFinderMetadata = join(
+      result.receipt.paths.generationRoot,
+      "projection",
+      "managed-runtime",
+      ".DS_Store",
+    );
+    assert.equal(existsSync(promotedFinderMetadata), true);
+    const control = JSON.parse(readFileSync(
+      join(result.receipt.paths.generationRoot, "control-v2.json"),
+      "utf8",
+    )) as { schemaVersion: number; projection: { metadataPolicy: string } };
+    assert.equal(control.schemaVersion, 2);
+    assert.equal(control.projection.metadataPolicy, "macos-ds-store-regular-v1");
+  });
+});
+
+test("missing or unknown projection metadata policy always forces fresh preparation", async () => {
+  await withFixture(async (fixture) => {
+    const bindings = createBindings(fixture);
+    const first = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId: "policy-generation-one",
+    });
+    assert.ok(first.receipt);
+    const firstControlFile = join(first.receipt.paths.generationRoot, "control-v2.json");
+    const firstControl = JSON.parse(readFileSync(firstControlFile, "utf8")) as {
+      projection: { metadataPolicy?: string };
+    };
+    delete firstControl.projection.metadataPolicy;
+    writeFileSync(firstControlFile, `${JSON.stringify(firstControl, null, 2)}\n`);
+
+    const second = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId: "policy-generation-two",
+    });
+    assert.ok(second.receipt);
+    assert.equal(second.receipt.generationId, "policy-generation-two");
+    const secondControlFile = join(second.receipt.paths.generationRoot, "control-v2.json");
+    const secondControl = JSON.parse(readFileSync(secondControlFile, "utf8")) as {
+      projection: { metadataPolicy: string };
+    };
+    secondControl.projection.metadataPolicy = "unknown-policy";
+    writeFileSync(secondControlFile, `${JSON.stringify(secondControl, null, 2)}\n`);
+
+    const third = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId: "policy-generation-three",
+    });
+    assert.ok(third.receipt);
+    assert.equal(third.receipt.generationId, "policy-generation-three");
+    assert.deepEqual(fixture.builderTransactionIds, [
+      "policy-generation-one",
+      "policy-generation-two",
+      "policy-generation-three",
+    ]);
   });
 });
 
@@ -705,5 +1048,62 @@ test("an abandoned paused watcher promotion from a terminal transaction is recla
       sourceExpectedFingerprint: "f".repeat(64),
     });
     assert.equal(finished.length, 1);
+  });
+});
+
+test("a terminally released pair reclaims its orphaned nonterminal watcher pause", async () => {
+  await withFixture(async (fixture) => {
+    const appRoot = fixture.current.selectedDesktopPath;
+    const watcherFile = join(fixture.root, "transactions", "environment-watcher.json");
+    const deadGeneration = "terminal-pair-nonterminal-journal";
+    const begun: string[] = [];
+    const finished: Array<{ transactionId: string; targetAppRoot: string; targetExpectedFingerprint: string }> = [];
+    const bindings = createBindings(fixture, {
+      beginWatcher: ((_file, input) => {
+        begun.push(input.transactionId);
+        return abandonedPausedPromotion(input.transactionId, appRoot);
+      }) as EnvironmentModeProductionDeps["beginWatcher"],
+      finishWatcher: ((_file, input) => {
+        finished.push(input);
+        return abandonedPausedPromotion(input.transactionId, appRoot);
+      }) as EnvironmentModeProductionDeps["finishWatcher"],
+    });
+    const prepared = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId: deadGeneration,
+    });
+    assert.equal(prepared.state, "ready");
+    assert.ok(prepared.receipt);
+    const cachePaths = environmentModeCachePaths(fixture.root);
+    invalidateCurrentEnvironmentModePair(cachePaths, deadGeneration, NOW);
+    const replacement = await bindings.prepare({
+      current: fixture.current,
+      requested: fixture.requested,
+      generationId: "fresh-generation",
+    });
+    assert.equal(replacement.state, "ready");
+    assert.equal(replacement.receipt?.generationId, "fresh-generation");
+    assert.equal(readCurrentEnvironmentModePair(cachePaths)?.generationId, "fresh-generation");
+    const generationRoot = environmentModeCacheGenerationPaths(cachePaths, deadGeneration).generationRoot;
+    writeWatcherPromotionReceipt(watcherFile, abandonedPausedPromotion(deadGeneration, appRoot));
+    writeEnvironmentWarmCommitReceipt(
+      join(generationRoot, "warm-commit.json"),
+      terminalWarmJournal(deadGeneration, appRoot, false),
+    );
+
+    await bindings.warmCommit.pauseWatcher({
+      transactionId: "fresh-generation",
+      sourceAppRoot: appRoot,
+      targetAppRoot: appRoot,
+      sourceExpectedFingerprint: "f".repeat(64),
+    });
+
+    assert.deepEqual(finished, [{
+      transactionId: deadGeneration,
+      targetAppRoot: appRoot,
+      targetExpectedFingerprint: "f".repeat(64),
+    }]);
+    assert.deepEqual(begun, ["fresh-generation"]);
   });
 });

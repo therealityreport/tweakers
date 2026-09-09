@@ -148,6 +148,50 @@ export interface PreparedManagedRuntimeEvidence {
   rollback: PreparedManagedRuntimeRollbackArtifactEvidence;
 }
 
+/**
+ * First injection has no pre-existing installer state or watcher definition.
+ * Keep both the bytes that will be installed and the exact prior-byte
+ * rollback (including an explicit absence) inside the environment receipt.
+ */
+export interface PreparedBootstrapArtifactEvidence {
+  artifactPath: string;
+  artifactDigest: string;
+}
+
+export interface PreparedBootstrapRollbackArtifactEvidence {
+  existed: boolean;
+  artifactPath: string;
+  artifactDigest: string | null;
+}
+
+export interface PreparedInstallerStateBootstrapEvidence {
+  targetPath: string;
+  requested: PreparedBootstrapArtifactEvidence;
+  rollback: PreparedBootstrapRollbackArtifactEvidence;
+}
+
+export interface PreparedWatcherBootstrapEvidence {
+  targetPath: string | null;
+  requested: PreparedBootstrapArtifactEvidence | null;
+  rollback: PreparedBootstrapRollbackArtifactEvidence;
+}
+
+/** Immutable manager generation that supplied the receipt-owned CLI stage. */
+export interface PreparedManagedRuntimeGenerationEvidence {
+  generationId: string;
+  fingerprint: string;
+  provenanceKind: "sealed-manager-managed-runtime";
+  sourceRuntimeHash: string | null;
+  cliPath: string;
+  cliArtifactDigest: string;
+}
+
+export interface PreparedEnvironmentBootstrapEvidence {
+  installerState: PreparedInstallerStateBootstrapEvidence;
+  watcher: PreparedWatcherBootstrapEvidence;
+  managedRuntimeGeneration: PreparedManagedRuntimeGenerationEvidence;
+}
+
 export interface PreparedEnvironmentEvidence {
   preparedAt: string;
   candidate: PreparedDesktopCandidateEvidence;
@@ -155,6 +199,8 @@ export interface PreparedEnvironmentEvidence {
   swapHost?: PreparedSwapHostEvidence;
   runtime?: PreparedRuntimeEvidence;
   managedRuntime?: PreparedManagedRuntimeEvidence;
+  /** Required by the coordinator when a pristine ChatGPT source has no state. */
+  bootstrap?: PreparedEnvironmentBootstrapEvidence;
   rollback: PreparedRollbackEvidence;
 }
 
@@ -287,7 +333,25 @@ export function preparedEvidenceMatches(
     && prepared.rollback.desktopPath === current.selectedDesktopPath
     && selectionsMatch(prepared.rollback.selection, current, true)
     && prepared.rollback.bundleId === current.selectedDesktopBundleId
-    && prepared.rollback.backendLane === current.backendLane;
+    && prepared.rollback.backendLane === current.backendLane
+    && bootstrapEvidenceMatches(prepared, current, requested);
+}
+
+function bootstrapEvidenceMatches(
+  prepared: PreparedEnvironmentEvidence,
+  current: EnvironmentSelection,
+  requested: EnvironmentSelection,
+): boolean {
+  const bootstrap = prepared.bootstrap;
+  if (bootstrap === undefined) return true;
+  if (current.appExperience !== "chatgpt" || requested.appExperience !== "tweakers"
+    || prepared.runtime === undefined || prepared.managedRuntime === undefined) return false;
+  const managed = prepared.managedRuntime.requested;
+  return prepared.runtime.requested.runtimeFingerprint === managed.runtimeFingerprint
+    && prepared.runtime.requested.fileCount === managed.fileCount
+    && managed.cliPath === bootstrap.managedRuntimeGeneration.cliPath
+    && managed.cliArtifactDigest === bootstrap.managedRuntimeGeneration.cliArtifactDigest
+    && managed.sourceRuntimeHash === bootstrap.managedRuntimeGeneration.sourceRuntimeHash;
 }
 
 export function appliedEvidenceProvesRequest(
@@ -423,34 +487,8 @@ function normalizeTerminalEnvironmentTransactionReceipt(value: unknown): unknown
 }
 
 function isEnvironmentTransactionReceipt(value: unknown): value is EnvironmentTransactionReceipt {
-  if (!isRecord(value)) return false;
-  const baseValid = value.schemaVersion === ENVIRONMENT_TRANSACTION_SCHEMA_VERSION
-    && value.kind === "environment"
-    && typeof value.transactionId === "string"
-    && value.transactionId.length > 0
-    && isEnvironmentTransactionPhase(value.phase)
-    && (value.error === null || typeof value.error === "string")
-    && positiveInteger(value.ownerPid)
-    && isEnvironmentSelection(value.source)
-    && isEnvironmentSelection(value.requested)
-    && (value.prepared === null || isPreparedEnvironmentEvidence(value.prepared))
-    && (value.applied === null || isEnvironmentAppliedEvidence(value.applied))
-    && (value.oldMainPid === null || positiveInteger(value.oldMainPid))
-    && (value.newMainPid === null || positiveInteger(value.newMainPid))
-    && typeof value.attempt === "number"
-    && Number.isInteger(value.attempt)
-    && value.attempt >= 0
-    && (value.applyProgress === undefined
-      || value.applyProgress === null
-      || typeof value.applyProgress === "string")
-    && (value.timing === undefined || isEnvironmentTimingEvidence(value.timing))
-    && validIso(value.createdAt)
-    && validIso(value.updatedAt)
-    && nullableIso(value.committedAt)
-    && nullableIso(value.rolledBackAt)
-    && nullableIso(value.cancelledAt);
-  if (!baseValid) return false;
-  const receipt = value as unknown as EnvironmentTransactionReceipt;
+  const receipt = parseEnvironmentTransactionReceipt(value);
+  if (receipt === null) return false;
   if (receipt.prepared !== null && !preparedEvidenceMatches(receipt.prepared, receipt.source, receipt.requested)) {
     return false;
   }
@@ -485,6 +523,65 @@ function isEnvironmentTransactionReceipt(value: unknown): value is EnvironmentTr
   }
   if (receipt.phase === "cancelled" && receipt.cancelledAt === null) return false;
   return true;
+}
+
+/**
+ * Build the typed receipt only after every field has passed its canonical
+ * validator. Keeping this conversion explicit avoids treating a JSON object
+ * as a trusted receipt through a type assertion at the storage boundary.
+ */
+function parseEnvironmentTransactionReceipt(value: unknown): EnvironmentTransactionReceipt | null {
+  if (!isRecord(value)
+    || value.schemaVersion !== ENVIRONMENT_TRANSACTION_SCHEMA_VERSION
+    || value.kind !== "environment"
+    || typeof value.transactionId !== "string"
+    || value.transactionId.length === 0
+    || !isEnvironmentTransactionPhase(value.phase)
+    || (value.error !== null && typeof value.error !== "string")
+    || !positiveInteger(value.ownerPid)
+    || !isEnvironmentSelection(value.source)
+    || !isEnvironmentSelection(value.requested)
+    || (value.prepared !== null && !isPreparedEnvironmentEvidence(value.prepared))
+    || (value.applied !== null && !isEnvironmentAppliedEvidence(value.applied))
+    || (value.oldMainPid !== null && !positiveInteger(value.oldMainPid))
+    || (value.newMainPid !== null && !positiveInteger(value.newMainPid))
+    || !nonNegativeInteger(value.attempt)
+    || (value.applyProgress !== undefined
+      && value.applyProgress !== null
+      && typeof value.applyProgress !== "string")
+    || (value.timing !== undefined && !isEnvironmentTimingEvidence(value.timing))
+    || !validIso(value.createdAt)
+    || !validIso(value.updatedAt)
+    || !nullableIso(value.committedAt)
+    || !nullableIso(value.rolledBackAt)
+    || !nullableIso(value.cancelledAt)) return null;
+
+  const prepared = value.prepared;
+  const applied = value.applied;
+  const applyProgress = value.applyProgress;
+  const timing = value.timing;
+  return {
+    schemaVersion: ENVIRONMENT_TRANSACTION_SCHEMA_VERSION,
+    kind: "environment",
+    transactionId: value.transactionId,
+    phase: value.phase,
+    error: value.error,
+    ownerPid: value.ownerPid,
+    source: value.source,
+    requested: value.requested,
+    prepared,
+    applied,
+    oldMainPid: value.oldMainPid,
+    newMainPid: value.newMainPid,
+    attempt: value.attempt,
+    ...(applyProgress === undefined ? {} : { applyProgress }),
+    ...(timing === undefined ? {} : { timing }),
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    committedAt: value.committedAt,
+    rolledBackAt: value.rolledBackAt,
+    cancelledAt: value.cancelledAt,
+  };
 }
 
 function isEnvironmentTimingEvidence(value: unknown): value is EnvironmentTimingEvidence {
@@ -548,6 +645,7 @@ function isPreparedEnvironmentEvidence(value: unknown): value is PreparedEnviron
   if (runtimePresent
     && (!isPreparedRuntimeEvidence(value.runtime)
       || !isPreparedManagedRuntimeEvidence(value.managedRuntime))) return false;
+  if (value.bootstrap !== undefined && !isPreparedEnvironmentBootstrapEvidence(value.bootstrap)) return false;
   return isRecord(rollback)
     && isEnvironmentSelection(rollback.selection)
     && exactAbsolutePath(rollback.desktopPath)
@@ -567,6 +665,65 @@ function isPreparedEnvironmentEvidence(value: unknown): value is PreparedEnviron
     && rollback.desktopPath === rollback.selection.selectedDesktopPath
     && rollback.bundleId === rollback.selection.selectedDesktopBundleId
     && rollback.backendLane === rollback.selection.backendLane;
+}
+
+function isPreparedEnvironmentBootstrapEvidence(value: unknown): value is PreparedEnvironmentBootstrapEvidence {
+  if (!isExactRecord(value, ["installerState", "managedRuntimeGeneration", "watcher"])) return false;
+  return isPreparedInstallerStateBootstrapEvidence(value.installerState)
+    && isPreparedWatcherBootstrapEvidence(value.watcher)
+    && isPreparedManagedRuntimeGenerationEvidence(value.managedRuntimeGeneration);
+}
+
+function isPreparedInstallerStateBootstrapEvidence(value: unknown): value is PreparedInstallerStateBootstrapEvidence {
+  return isExactRecord(value, ["requested", "rollback", "targetPath"])
+    && exactAbsolutePath(value.targetPath)
+    && isPreparedBootstrapArtifactEvidence(value.requested)
+    && isPreparedBootstrapRollbackArtifactEvidence(value.rollback);
+}
+
+function isPreparedWatcherBootstrapEvidence(value: unknown): value is PreparedWatcherBootstrapEvidence {
+  if (!isExactRecord(value, ["requested", "rollback", "targetPath"])) return false;
+  if (value.targetPath === null) {
+    return value.requested === null
+      && isPreparedBootstrapRollbackArtifactEvidence(value.rollback);
+  }
+  return exactAbsolutePath(value.targetPath)
+    && isPreparedBootstrapArtifactEvidence(value.requested)
+    && isPreparedBootstrapRollbackArtifactEvidence(value.rollback);
+}
+
+function isPreparedBootstrapArtifactEvidence(value: unknown): value is PreparedBootstrapArtifactEvidence {
+  return isExactRecord(value, ["artifactDigest", "artifactPath"])
+    && exactAbsolutePath(value.artifactPath)
+    && lowerSha256(value.artifactDigest);
+}
+
+function isPreparedBootstrapRollbackArtifactEvidence(
+  value: unknown,
+): value is PreparedBootstrapRollbackArtifactEvidence {
+  if (!isExactRecord(value, ["artifactDigest", "artifactPath", "existed"])
+    || typeof value.existed !== "boolean"
+    || !exactAbsolutePath(value.artifactPath)) return false;
+  return value.existed ? lowerSha256(value.artifactDigest) : value.artifactDigest === null;
+}
+
+function isPreparedManagedRuntimeGenerationEvidence(
+  value: unknown,
+): value is PreparedManagedRuntimeGenerationEvidence {
+  return isExactRecord(value, [
+    "cliArtifactDigest",
+    "cliPath",
+    "fingerprint",
+    "generationId",
+    "provenanceKind",
+    "sourceRuntimeHash",
+  ])
+    && lowerSha256(value.generationId)
+    && lowerSha256(value.fingerprint)
+    && value.provenanceKind === "sealed-manager-managed-runtime"
+    && (value.sourceRuntimeHash === null || lowerSha256(value.sourceRuntimeHash))
+    && exactAbsolutePath(value.cliPath)
+    && lowerSha256(value.cliArtifactDigest);
 }
 
 function isPreparedRuntimeEvidence(value: unknown): value is PreparedRuntimeEvidence {
@@ -695,6 +852,10 @@ function sha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
 }
 
+function lowerSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
 function validDigest(value: unknown): value is string {
   return sha256(value);
 }
@@ -733,6 +894,14 @@ function isBackendLane(value: unknown): value is BackendLane {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isExactRecord(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value).sort((left, right) => left.localeCompare(right));
+  const sortedExpected = [...expected].sort((left, right) => left.localeCompare(right));
+  return keys.length === sortedExpected.length
+    && keys.every((key, index) => key === sortedExpected[index]);
 }
 
 function errorMessage(error: unknown): string {

@@ -38,19 +38,22 @@ import {
   assertEnvironmentModePairExchangeReadyEvidence,
   assertEnvironmentModePairMaterialized,
   assertEnvironmentModePairWarmCommitMaterialized,
-  assertEnvironmentModeCacheTreeStatSealOnly,
-  assertEnvironmentModeCacheTreeStatSealAfterRename,
+  assertEnvironmentModeCacheProjectionStatSealOnly,
+  assertEnvironmentModeCacheProjectionStatSealAfterRename,
   compareEnvironmentModeCacheInvalidation,
+  ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
   environmentModeCacheGenerationPaths,
   environmentModeCachePaths,
   finalizeEnvironmentModePairReceipt,
   isEnvironmentModeCacheTreeStatSeal,
   prepareOrReuseEnvironmentModePair,
   readCurrentEnvironmentModePair,
+  readEnvironmentModePairGeneration,
   releaseCurrentEnvironmentModePairBeforeCutover,
   sealEnvironmentModeCacheTree,
   type EnvironmentModeCacheInvalidationSnapshot,
   type EnvironmentModeCachePaths,
+  type EnvironmentModeCacheProjectionMetadataPolicy,
   type EnvironmentModeCacheTreeStatSeal,
   type EnvironmentModePairReceipt,
 } from "./environment-mode-cache.js";
@@ -86,6 +89,7 @@ import {
 } from "./environment-warm-recovery.js";
 import { copyDirectoryPreservingModes } from "./fs-copy.js";
 import { managedSourceRoot } from "./managed-runtime.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "./accounts-transfer-compatibility.js";
 import { createMcpModeBridge, defaultMcpModeHelperFile, type McpModeBridge } from "./mcp-mode-bridge.js";
 import { getOpenReport, listProcesses, type ProcessInfo } from "./commands/debug.js";
 import { locateCodexAtExactPath } from "./platform.js";
@@ -104,7 +108,7 @@ import {
   type PreparedSwapHostEvidence,
 } from "./environment-transaction.js";
 
-export const ENVIRONMENT_MODE_V2_CONTROL_SCHEMA_VERSION = 1 as const;
+export const ENVIRONMENT_MODE_V2_CONTROL_SCHEMA_VERSION = 2 as const;
 export const ENVIRONMENT_MODE_V2_CONTROL_KIND = "environment-mode-v2-control" as const;
 /** The one rollout flag. Missing, malformed, or untrusted config means off. */
 export const ENVIRONMENT_MODE_CACHE_V2_FLAG = "environmentModeCacheV2" as const;
@@ -163,6 +167,7 @@ export interface EnvironmentModeV2Control {
     certificateLeafHash: string | null;
   };
   projection: {
+    metadataPolicy: EnvironmentModeCacheProjectionMetadataPolicy;
     runtimeRelativePath: string;
     managedRuntimeRelativePath: string;
     /** Complete stat-only seal for the pre-staged runtime projection. */
@@ -467,16 +472,83 @@ export function createEnvironmentModeProductionBindings(
   const assertBoundedPair = (pair: EnvironmentModePairReceipt): EnvironmentModeV2Control => {
     const control = assertBoundedPairBase(pair);
     assertBoundedProjectionIdentity(pair, control, fileFingerprint, options.environmentRoot);
+    assertAccountsTransferPairReaders(pair, control);
     return control;
   };
 
-  const preflight = (pair: EnvironmentModePairReceipt): EnvironmentWarmCommitPreflight => {
+  const accountsTransferRoots = (pair: EnvironmentModePairReceipt): string[] => ([...new Set([
+    ...accountsTransferBrokerRoots(options.environmentRoot, pair.roles.live.appPath),
+    ...accountsTransferBrokerRoots(options.environmentRoot, pair.paths.inactiveAppPath),
+  ])]);
+
+  const assertAccountsTransferPairReaders = (
+    pair: EnvironmentModePairReceipt,
+    control: EnvironmentModeV2Control,
+  ): void => {
+    const roots = accountsTransferRoots(pair);
+    const activeRuntime = join(options.environmentRoot, "runtime");
+    assertAccountsTransferRuntimeCompatible(activeRuntime, roots);
+    const stagedRuntime = resolveControlledPath(pair.paths.generationRoot, control.projection.runtimeRelativePath);
+    if (existsSync(stagedRuntime)) {
+      assertAccountsTransferRuntimeCompatible(stagedRuntime, roots);
+    } else {
+      // The staged path may disappear only through the receipt-bound projection
+      // rename. Re-prove that stat seal before treating active as the staged copy.
+      assertEnvironmentModeV2ProjectionTree(
+        stagedRuntime,
+        activeRuntime,
+        control.projection.runtimeStatSeal,
+        control.projection.metadataPolicy,
+      );
+      assertAccountsTransferRuntimeCompatible(activeRuntime, roots);
+    }
+    const stagedManagedRuntime = resolveControlledPath(
+      pair.paths.generationRoot,
+      control.projection.managedRuntimeRelativePath,
+    );
+    const activeManagedRuntime = managedSourceRoot(options.environmentRoot);
+    const bundledRuntime = (managedRoot: string): string => (
+      join(managedRoot, "packages", "installer", "assets", "runtime")
+    );
+    assertAccountsTransferRuntimeCompatible(bundledRuntime(activeManagedRuntime), roots);
+    if (existsSync(stagedManagedRuntime)) {
+      assertAccountsTransferRuntimeCompatible(bundledRuntime(stagedManagedRuntime), roots);
+    } else {
+      assertEnvironmentModeV2ProjectionTree(
+        stagedManagedRuntime,
+        activeManagedRuntime,
+        control.projection.managedRuntimeStatSeal,
+        control.projection.metadataPolicy,
+      );
+      assertAccountsTransferRuntimeCompatible(bundledRuntime(activeManagedRuntime), roots);
+    }
+  };
+
+  const preflight = async (pair: EnvironmentModePairReceipt): Promise<EnvironmentWarmCommitPreflight> => {
     try {
       assertBoundedPair(pair);
-      const source = observeDesktop(pair.roles.live.appPath);
+      // Menu Bar owns a standalone updater window, so the selected desktop can
+      // legitimately be closed (or hidden) by the time a freshly built pair
+      // reaches its bounded commit preflight. Activate the exact sealed source
+      // and bind the cutover to the process that appears at that same app path.
+      // The pair was validated immediately above and is validated again below,
+      // so this never turns a path-only launch into authority.
+      const source = await observeOrReopenExactVisibleDesktop(
+        pair.roles.live.appPath,
+        observeDesktop,
+        reopenDesktop,
+        sleep,
+      );
       if (source === null || !source.visibleWindow) {
-        return { state: "stale_requires_prepare", reason: "exact source process with visible window is absent" };
+        return {
+          state: "stale_requires_prepare",
+          reason: "exact source process with visible window is absent after bounded reopen",
+        };
       }
+      // Opening the source can trigger normal desktop bookkeeping. Re-bind
+      // every bounded seal before recording the exchange evidence or pausing
+      // the watcher.
+      assertBoundedPair(pair);
       const target = pair.roles.inactive;
       // Validate the captured evidence against the prepared seals HERE, while
       // the source app is still intact. Drift between seal rotation and this
@@ -622,6 +694,7 @@ export function createEnvironmentModeProductionBindings(
     const pair = readCurrentEnvironmentModePair(paths);
     if (pair === null) throw new Error("Environment mode v2 exchange has no current pair");
     const control = readControl(pair);
+    assertAccountsTransferPairReaders(pair, control);
     const nativeHost = controlNativeHost(pair, control);
     const bound = dependencies.bindExchange
       ? dependencies.bindExchange(first, second, nativeHost)
@@ -631,6 +704,7 @@ export function createEnvironmentModeProductionBindings(
 
   const projectTarget = (pair: EnvironmentModePairReceipt): EnvironmentWarmCommitProjection => {
     const control = readControl(pair);
+    assertAccountsTransferPairReaders(pair, control);
     const target = selectionForExperience(control, pair.roles.live.experience);
     if (target.selectedDesktopPath !== pair.roles.live.appPath) {
       throw new Error("Environment mode v2 target selection does not bind the live outer app path");
@@ -641,9 +715,18 @@ export function createEnvironmentModeProductionBindings(
         const stagedRuntime = resolveControlledPath(pair.paths.generationRoot, control.projection.runtimeRelativePath);
         const activeRuntime = join(options.environmentRoot, "runtime");
         if (existsSync(stagedRuntime)) {
-          restoration.push(promotePreparedDirectory(stagedRuntime, activeRuntime));
+          restoration.push(promotePreparedDirectory(
+            stagedRuntime,
+            activeRuntime,
+            (previous) => assertAccountsTransferRuntimeCompatible(previous, accountsTransferRoots(pair)),
+          ));
         } else {
-          assertEnvironmentModeV2ProjectionTree(stagedRuntime, activeRuntime, control.projection.runtimeStatSeal);
+          assertEnvironmentModeV2ProjectionTree(
+            stagedRuntime,
+            activeRuntime,
+            control.projection.runtimeStatSeal,
+            control.projection.metadataPolicy,
+          );
         }
         const stagedManagedRuntime = resolveControlledPath(
           pair.paths.generationRoot,
@@ -651,12 +734,20 @@ export function createEnvironmentModeProductionBindings(
         );
         const activeManagedRuntime = managedSourceRoot(options.environmentRoot);
         if (existsSync(stagedManagedRuntime)) {
-          restoration.push(promotePreparedDirectory(stagedManagedRuntime, activeManagedRuntime));
+          restoration.push(promotePreparedDirectory(
+            stagedManagedRuntime,
+            activeManagedRuntime,
+            (previous) => assertAccountsTransferRuntimeCompatible(
+              join(previous, "packages", "installer", "assets", "runtime"),
+              accountsTransferRoots(pair),
+            ),
+          ));
         } else {
           assertEnvironmentModeV2ProjectionTree(
             stagedManagedRuntime,
             activeManagedRuntime,
             control.projection.managedRuntimeStatSeal,
+            control.projection.metadataPolicy,
           );
         }
         if (control.backend.lane === "managed-alpha") {
@@ -741,8 +832,9 @@ export function createEnvironmentModeProductionBindings(
    * (live failure 2026-08-25: the failed generation de3c0aaf… held the
    * watcher paused for a day and refused the healthy generation ff1bd9f1…).
    * Reclaim only a pause whose owning transaction is provably finished: its
-   * warm journal reached a terminal timestamp, or no journal exists and the
-   * transaction no longer holds the current prepared grant. The reclaim
+   * warm journal reached a terminal timestamp, its durable pair receipt was
+   * terminally released, or no journal exists and the transaction no longer
+   * holds the current prepared grant. The reclaim
    * resumes the watcher against the CURRENT pause request's live evidence,
    * which moves the stale receipt to a terminal phase so the new pause can
    * begin; an active or ambiguous owner keeps the strict refusal.
@@ -777,25 +869,37 @@ export function createEnvironmentModeProductionBindings(
       return;
     }
     if (!existsSync(generationRoot)) return;
+    let current: EnvironmentModePairReceipt | null;
+    try {
+      current = readCurrentEnvironmentModePair(paths);
+    } catch {
+      return;
+    }
+    const ownsCurrentGrant = current !== null
+      && current.generationId === existing.transactionId
+      && current.pin.state === "prepared"
+      && current.pin.releasedAt === null;
+    if (ownsCurrentGrant) return;
+
     let journal: EnvironmentWarmCommitReceipt | null;
     try {
       journal = readEnvironmentWarmCommitReceipt(join(generationRoot, "warm-commit.json"));
     } catch {
       return;
     }
-    if (journal !== null && journal.terminalAt === null) return;
-    if (journal === null) {
-      let current: EnvironmentModePairReceipt | null = null;
+    if (journal !== null && journal.terminalAt === null) {
+      let generation: EnvironmentModePairReceipt | null;
       try {
-        current = readCurrentEnvironmentModePair(paths);
+        generation = readEnvironmentModePairGeneration(paths, existing.transactionId);
       } catch {
         return;
       }
-      const ownsCurrentGrant = current !== null
-        && current.generationId === existing.transactionId
-        && current.pin.state === "prepared"
-        && current.pin.releasedAt === null;
-      if (ownsCurrentGrant) return;
+      const generationWasTerminallyReleased = generation !== null
+        && generation.timestamps.terminalAt !== null
+        && generation.pin.releasedAt !== null
+        && generation.pin.state !== "prepared"
+        && generation.pin.state !== "post_cutover_recovery";
+      if (!generationWasTerminallyReleased) return;
     }
     try {
       finishWatcher(options.watcherPromotionFile, {
@@ -848,6 +952,7 @@ export function createEnvironmentModeProductionBindings(
     source: EnvironmentWarmCommitSourceProjectionIdentity;
   }): EnvironmentWarmCommitProjection => {
     const control = readControl(input.pair);
+    assertAccountsTransferPairReaders(input.pair, control);
     const sourceSelection = selectionForExperience(control, input.source.appExperience);
     if (sourceSelection.selectedDesktopPath !== input.pair.roles.live.appPath) {
       throw new Error("Environment mode v2 recovery source selection is not at the live path");
@@ -1052,6 +1157,7 @@ function createEnvironmentModeV2Control(input: {
       certificateLeafHash: input.prepared.swapHost.certificateLeafHash,
     },
     projection: {
+      metadataPolicy: ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY,
       runtimeRelativePath: join(PROJECTION_ROOT, "runtime"),
       managedRuntimeRelativePath: join(PROJECTION_ROOT, "managed-runtime"),
       runtimeStatSeal: sealEnvironmentModeCacheTree(join(input.generationRoot, PROJECTION_ROOT, "runtime")),
@@ -1164,13 +1270,15 @@ function validateStagedEnvironmentModePair(input: {
   sealEnvironmentModeCacheTree(preparation.inactiveAppPath);
   sealEnvironmentModeCacheTree(preparation.runtimeRoot);
   sealEnvironmentModeCacheTree(preparation.managedRuntimeRoot);
-  assertEnvironmentModeCacheTreeStatSealOnly(
+  assertEnvironmentModeCacheProjectionStatSealOnly(
     resolveControlledPath(preparation.generationRoot, control.projection.runtimeRelativePath),
     control.projection.runtimeStatSeal,
+    control.projection.metadataPolicy,
   );
-  assertEnvironmentModeCacheTreeStatSealOnly(
+  assertEnvironmentModeCacheProjectionStatSealOnly(
     resolveControlledPath(preparation.generationRoot, control.projection.managedRuntimeRelativePath),
     control.projection.managedRuntimeStatSeal,
+    control.projection.metadataPolicy,
   );
   readEnvironmentModeV2ControlAt(join(preparation.generationRoot, CONTROL_FILE), input.fileFingerprint);
 }
@@ -1208,13 +1316,15 @@ function createValidatedEnvironmentModePairReceipt(input: {
     || input.directoryFingerprint(generation.managedRuntimeRoot) !== prepared.managedRuntime.requested.artifactDigest) {
     throw new Error("Environment mode v2 generation did not survive full promotion validation");
   }
-  assertEnvironmentModeCacheTreeStatSealOnly(
+  assertEnvironmentModeCacheProjectionStatSealOnly(
     resolveControlledPath(generation.generationRoot, input.control.projection.runtimeRelativePath),
     input.control.projection.runtimeStatSeal,
+    input.control.projection.metadataPolicy,
   );
-  assertEnvironmentModeCacheTreeStatSealOnly(
+  assertEnvironmentModeCacheProjectionStatSealOnly(
     resolveControlledPath(generation.generationRoot, input.control.projection.managedRuntimeRelativePath),
     input.control.projection.managedRuntimeStatSeal,
+    input.control.projection.metadataPolicy,
   );
   const live = appEvidence({
     appPath: input.input.current.selectedDesktopPath,
@@ -1583,11 +1693,13 @@ function assertBoundedProjectionIdentity(
     resolveControlledPath(pair.paths.generationRoot, control.projection.runtimeRelativePath),
     join(environmentRoot, "runtime"),
     control.projection.runtimeStatSeal,
+    control.projection.metadataPolicy,
   );
   assertEnvironmentModeV2ProjectionTree(
     resolveControlledPath(pair.paths.generationRoot, control.projection.managedRuntimeRelativePath),
     managedSourceRoot(environmentRoot),
     control.projection.managedRuntimeStatSeal,
+    control.projection.metadataPolicy,
   );
   const stagedBackend = resolveControlledPath(pair.paths.generationRoot, control.backend.projectionRelativePath);
   if (existsSync(stagedBackend)) {
@@ -1606,14 +1718,16 @@ function assertEnvironmentModeV2ProjectionTree(
   stagedPath: string,
   activatedPath: string,
   seal: EnvironmentModeCacheTreeStatSeal,
+  metadataPolicy: EnvironmentModeCacheProjectionMetadataPolicy,
 ): void {
   if (existsSync(stagedPath)) {
-    assertEnvironmentModeCacheTreeStatSealOnly(stagedPath, seal);
+    assertEnvironmentModeCacheProjectionStatSealOnly(stagedPath, seal, metadataPolicy);
     return;
   }
-  assertEnvironmentModeCacheTreeStatSealAfterRename(
+  assertEnvironmentModeCacheProjectionStatSealAfterRename(
     activatedPath,
     rebaseEnvironmentModeV2ProjectionSeal(seal, activatedPath),
+    metadataPolicy,
   );
 }
 
@@ -1808,7 +1922,11 @@ function targetProof(
   };
 }
 
-function promotePreparedDirectory(source: string, destination: string): () => void {
+function promotePreparedDirectory(
+  source: string,
+  destination: string,
+  preRestore?: (retainedPrevious: string) => void,
+): () => void {
   assertRealPath(source, "prepared projection directory", "directory");
   const previous = `${destination}.environment-v2-previous-${process.pid}-${Date.now()}`;
   mkdirSync(dirname(destination), { recursive: true });
@@ -1818,10 +1936,17 @@ function promotePreparedDirectory(source: string, destination: string): () => vo
   try {
     renameSync(source, destination);
   } catch (error) {
-    if (hadPrevious && !existsSync(destination) && existsSync(previous)) renameSync(previous, destination);
+    if (hadPrevious && !existsSync(destination) && existsSync(previous)) {
+      preRestore?.(previous);
+      renameSync(previous, destination);
+    }
     throw error;
   }
   return () => {
+    if (hadPrevious && !existsSync(previous)) {
+      throw new Error(`Environment mode v2 retained previous projection is missing at ${previous}`);
+    }
+    preRestore?.(previous);
     if (existsSync(destination)) rmSync(destination, { recursive: true, force: true });
     if (hadPrevious && existsSync(previous)) renameSync(previous, destination);
   };
@@ -1891,6 +2016,36 @@ async function waitForFreshVisibleProcess(
   throw new Error(`Environment mode v2 did not observe a fresh visible target PID at ${appPath}`);
 }
 
+/**
+ * Recover a warm preflight whose exact sealed source is closed or windowless.
+ * This helper deliberately establishes process presence only; its caller owns
+ * sealed-pair validation both before and after the launch boundary.
+ */
+export async function observeOrReopenExactVisibleDesktop(
+  appPath: string,
+  observe: (path: string) => CodexMainProcessObservation | null,
+  reopen: (path: string) => void,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<CodexMainProcessObservation | null> {
+  const current = observe(appPath);
+  if (current !== null && current.visibleWindow) return current;
+  reopen(appPath);
+  return waitForVisibleProcess(appPath, observe, sleep);
+}
+
+async function waitForVisibleProcess(
+  appPath: string,
+  observe: (path: string) => CodexMainProcessObservation | null,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<CodexMainProcessObservation | null> {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    const observed = observe(appPath);
+    if (observed !== null && observed.visibleWindow) return observed;
+    await sleep(250);
+  }
+  return null;
+}
+
 function requireSourceProjection(value: EnvironmentWarmCommitSourceProjectionIdentity | null | undefined): EnvironmentWarmCommitSourceProjectionIdentity {
   if (value === null || value === undefined) throw new Error("Environment mode v2 recovery journal lacks its source projection");
   return value;
@@ -1958,6 +2113,7 @@ function isEnvironmentModeV2Control(value: unknown): value is EnvironmentModeV2C
     && (host.teamIdentifier === null || typeof host.teamIdentifier === "string")
     && Array.isArray(host.authority) && host.authority.every((entry) => typeof entry === "string")
     && (host.certificateLeafHash === null || typeof host.certificateLeafHash === "string")
+    && projection.metadataPolicy === ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY
     && projection.runtimeRelativePath === join(PROJECTION_ROOT, "runtime")
     && projection.managedRuntimeRelativePath === join(PROJECTION_ROOT, "managed-runtime")
     && isEnvironmentModeCacheTreeStatSeal(projection.runtimeStatSeal)

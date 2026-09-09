@@ -220,7 +220,7 @@ function assertVerifiedOfficialBundle(
     throw new Error(`Direct update bundle is not signed by OpenAI Team ${OPENAI_TEAM_ID}`);
   }
   const gatekeeper = deps.assessGatekeeper ?? ((appPath: string) => {
-    const result = spawnSync("spctl", ["--assess", "--type", "execute", appPath], { encoding: "utf8" });
+    const result = spawnSync("/usr/sbin/spctl", ["--assess", "--type", "execute", appPath], { encoding: "utf8" });
     return result.status === 0;
   });
   if (!gatekeeper(staged)) {

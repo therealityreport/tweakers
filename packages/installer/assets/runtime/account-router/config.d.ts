@@ -1,4 +1,4 @@
-import { type RouterConfig, type RouterConfigV2 } from "./types";
+import { type RouterConfig, type RouterConfigV2, type RouterConfigV3 } from "./types";
 export declare const ACCOUNT_SWITCHER_TWEAK_ID = "co.tweakers.account-switcher";
 export declare const ACCOUNT_ROUTER_CONFIG_FILE = "account-router-config.json";
 export type RouterLaunchReason = "balanced" | "quota_aware" | "manual" | "history-adoption-required" | "missing-config" | "invalid-config" | "unsupported-protocol";
@@ -16,5 +16,7 @@ export declare function validateRouterConfig(value: unknown): RouterConfig | nul
  * purposefully excludes `fingerprint` and `updatedAt`; timestamp-only writes
  * therefore cannot pretend to be a new routing generation.
  */
-export declare function routerConfigFingerprint(config: Omit<RouterConfigV2, "fingerprint"> | RouterConfigV2): `sha256:${string}`;
+export declare function routerConfigFingerprint(config: Omit<RouterConfigV2, "fingerprint"> | RouterConfigV2 | Omit<RouterConfigV3, "fingerprint"> | RouterConfigV3): `sha256:${string}`;
 export declare function isRouterConfigV2(config: RouterConfig): config is RouterConfigV2;
+export declare function isRouterConfigV3(config: RouterConfig): config is RouterConfigV3;
+export declare function isQuotaAwareRouterConfig(config: RouterConfig): config is RouterConfigV2 | RouterConfigV3;

@@ -55,6 +55,7 @@ export function createInitialRouterState(config: RouterConfig): RouterState {
     reservations: [],
     accountEligibility,
     correlations: [],
+    pendingHandoffs: {},
     stagedDisable: null,
   };
 }
@@ -99,16 +100,76 @@ export class RouterStateStore {
     const raw = readFileSync(this.path, "utf8");
     if (Buffer.byteLength(raw) > MAX_STATE_BYTES) throw new Error("account-router state exceeds its bounded size");
     const parsed = JSON.parse(raw) as unknown;
-    if (!validateRouterState(parsed, this.config)) throw new Error("account-router state failed strict validation");
+    if (!validateRouterState(parsed, this.config)) {
+      const migrated = migrateIdleRouterStateV3(parsed, this.config);
+      if (!migrated) throw new Error("account-router state failed strict validation");
+      writePrivateJsonAtomic(this.root, this.fileName, migrated);
+      return migrated;
+    }
     return parsed;
   }
+}
+
+/**
+ * v3 may enroll or disable accounts without discarding the existing ledger or
+ * sticky task owners. Migration is deliberately limited to a terminal, idle
+ * state: ambiguous requests, correlations, pending owners, or active children
+ * continue to fail closed.
+ */
+export function migrateIdleRouterStateV3(value: unknown, config: RouterConfig): RouterState | null {
+  if (config.schemaVersion !== 3 || !isPlainRecord(value)) return null;
+  if (value.schemaVersion !== ACCOUNT_ROUTER_SCHEMA_VERSION
+    || value.protocolFingerprint !== ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT
+    || !Number.isInteger(value.epoch) || Number(value.epoch) < 1
+    || !isPlainRecord(value.threadOwners) || !isPlainRecord(value.pendingThreadOwners)
+    || !isPlainRecord(value.ledger) || !isPlainRecord(value.accountEligibility)
+    || !Array.isArray(value.reservations) || !Array.isArray(value.correlations)
+    || value.correlations.length !== 0 || Object.keys(value.pendingThreadOwners).length !== 0
+    || (value.pendingHandoffs !== undefined && (!isPlainRecord(value.pendingHandoffs) || Object.keys(value.pendingHandoffs).length !== 0))
+    || value.stagedDisable !== null) return null;
+  const configured = new Map<string, (typeof config.accounts)[number]>(
+    config.accounts.map((account) => [account.opaqueAccountId, account]),
+  );
+  const existingIds = Object.keys(value.ledger);
+  if (existingIds.length < 1 || existingIds.some((opaqueId) => !configured.has(opaqueId))
+    || Object.keys(value.accountEligibility).some((opaqueId) => !existingIds.includes(opaqueId))) return null;
+  if (!allOwnerValuesConfigured(value.threadOwners, new Set(configured.keys()))) return null;
+  if (value.reservations.some((reservation) => !isPlainRecord(reservation)
+    || !["released_pre_dispatch", "reconciled"].includes(String(reservation.state)))) return null;
+  // `validating` has no active child/request and is the normal durable state
+  // immediately after an owner cold start. It is safe to extend an idle V3
+  // pool at that point; reservations and active work remain fail-closed.
+  if (Object.values(value.accountEligibility).some((eligibility) => ["reserved", "active"].includes(String(eligibility)))) return null;
+
+  const migrated = structuredClone(value) as unknown as RouterState;
+  for (const account of config.accounts) {
+    const existing = migrated.ledger[account.opaqueAccountId];
+    if (existing) {
+      if (!isPlainRecord(existing)
+        || [existing.completedInputTokens, existing.completedOutputTokens, existing.reservedRequestCost, existing.assignedThreadCount]
+          .some((number) => !Number.isInteger(number) || Number(number) < 0)) return null;
+      existing.weight = account.weight;
+    } else {
+      migrated.ledger[account.opaqueAccountId] = {
+        completedInputTokens: 0,
+        completedOutputTokens: 0,
+        reservedRequestCost: 0,
+        weight: account.weight,
+        assignedThreadCount: 0,
+      };
+    }
+    migrated.accountEligibility[account.opaqueAccountId] = account.included
+      ? (migrated.accountEligibility[account.opaqueAccountId] ?? "validating")
+      : "disabled";
+  }
+  return validateRouterState(migrated, config) ? migrated : null;
 }
 
 export function validateRouterState(value: unknown, config: RouterConfig): value is RouterState {
   if (!isPlainRecord(value)) return false;
   const allowed = new Set([
     "schemaVersion", "protocolFingerprint", "epoch", "threadOwners", "pendingThreadOwners", "ledger",
-    "reservations", "accountEligibility", "correlations", "stagedDisable",
+    "reservations", "accountEligibility", "correlations", "pendingHandoffs", "nativeSectionOrders", "stagedDisable",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) return false;
   const epoch = value.epoch;
@@ -123,7 +184,47 @@ export function validateRouterState(value: unknown, config: RouterConfig): value
   if (!validateLedger(value.ledger, config) || !validateEligibility(value.accountEligibility, configured)) return false;
   if (!value.reservations.every((reservation) => validateReservation(reservation, configured, epoch))) return false;
   if (!value.correlations.every((correlation) => validateCorrelation(correlation, configured))) return false;
+  if (value.pendingHandoffs !== undefined && !validatePendingHandoffs(value.pendingHandoffs, configured)) return false;
+  if (value.nativeSectionOrders !== undefined && !validateNativeSectionOrders(value.nativeSectionOrders)) return false;
   return value.stagedDisable === null || validateStagedDisable(value.stagedDisable);
+}
+
+function validateNativeSectionOrders(value: unknown): boolean {
+  if (!isPlainRecord(value) || Object.keys(value).length > 512) return false;
+  let total = 0;
+  return Object.entries(value).every(([section, threads]) => {
+    if (!/^nso_[A-Za-z0-9_-]{32,64}$/.test(section) || !Array.isArray(threads) || threads.length > 10_000) return false;
+    total += threads.length;
+    return total <= 10_000 && new Set(threads).size === threads.length
+      && threads.every((thread) => typeof thread === "string" && thread.length > 0 && thread.length <= 512 && !/[\u0000-\u001f\u007f]/.test(thread));
+  });
+}
+
+/**
+ * Legacy state files legitimately lack this V3 broker extension.  Once
+ * present, recovery metadata is strictly bounded and intentionally carries no
+ * continuation/request body.
+ */
+function validatePendingHandoffs(value: unknown, configured: Set<string>): boolean {
+  if (!isPlainRecord(value) || Object.keys(value).length > 64) return false;
+  return Object.entries(value).every(([key, handoff]) => {
+    if (!isPlainRecord(handoff)) return false;
+    const allowed = new Set([
+      "version", "handoffRef", "confirmationId", "conversationId", "taskRef", "originRendererRef", "fromOpaqueAccountId", "toOpaqueAccountId", "state", "expiresAt",
+    ]);
+    return Object.keys(handoff).every((field) => allowed.has(field))
+      && handoff.version === 1
+      && handoff.handoffRef === key && typeof handoff.handoffRef === "string" && /^bh_[A-Za-z0-9_-]{16,128}$/.test(handoff.handoffRef)
+      && typeof handoff.confirmationId === "string" && /^bc_[A-Za-z0-9_-]{16,128}$/.test(handoff.confirmationId)
+      && typeof handoff.conversationId === "string" && /^lc_[A-Za-z0-9_-]{16,128}$/.test(handoff.conversationId)
+      && typeof handoff.taskRef === "string" && /^bt_[A-Za-z0-9_-]{16,128}$/.test(handoff.taskRef)
+      && typeof handoff.originRendererRef === "string" && /^br_[A-Za-z0-9_-]{16,128}$/.test(handoff.originRendererRef)
+      && isOpaqueAccountId(handoff.fromOpaqueAccountId) && configured.has(handoff.fromOpaqueAccountId)
+      && isOpaqueAccountId(handoff.toOpaqueAccountId) && configured.has(handoff.toOpaqueAccountId)
+      && handoff.fromOpaqueAccountId !== handoff.toOpaqueAccountId
+      && (handoff.state === "pending" || handoff.state === "forwarding" || handoff.state === "ambiguous")
+      && typeof handoff.expiresAt === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(handoff.expiresAt);
+  });
 }
 
 function allOwnerValuesConfigured(value: Record<string, unknown>, configured: Set<string>): boolean {
@@ -204,12 +305,23 @@ export function assertPrivateRegularFile(path: string, maxBytes: number): void {
 }
 
 export function writePrivateJsonAtomic(root: string, fileName: string, value: unknown): void {
+  writePrivateJsonAtomicBounded(root, fileName, value, MAX_STATE_BYTES);
+}
+
+/**
+ * Atomic private JSON writer with a caller-owned byte ceiling.  The ordinary
+ * router state retains its smaller default bound; canonical history has a
+ * separately validated 16 MiB format and must not be routed through that
+ * unrelated 2 MiB policy.
+ */
+export function writePrivateJsonAtomicBounded(root: string, fileName: string, value: unknown, maxBytes: number): void {
   ensurePrivateDirectory(root);
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error("invalid account-router private write bound");
   if (basename(fileName) !== fileName || fileName.includes("..")) throw new Error("unsafe account-router file name");
   const target = join(root, fileName);
   if (dirname(target) !== resolve(root)) throw new Error("account-router path escaped its state root");
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
-  if (bytes.byteLength > MAX_STATE_BYTES) throw new Error("account-router refused an oversized state write");
+  if (bytes.byteLength > maxBytes) throw new Error("account-router refused an oversized state write");
   const temporary = join(root, `.${fileName}.${process.pid}.${Date.now()}.tmp`);
   let descriptor: number | undefined;
   try {
@@ -219,11 +331,11 @@ export function writePrivateJsonAtomic(root: string, fileName: string, value: un
     closeSync(descriptor);
     descriptor = undefined;
     chmodSync(temporary, PRIVATE_FILE_MODE);
-    assertPrivateRegularFile(temporary, MAX_STATE_BYTES);
-    if (existsSync(target)) assertPrivateRegularFile(target, MAX_STATE_BYTES);
+    assertPrivateRegularFile(temporary, maxBytes);
+    if (existsSync(target)) assertPrivateRegularFile(target, maxBytes);
     renameSync(temporary, target);
     chmodSync(target, PRIVATE_FILE_MODE);
-    assertPrivateRegularFile(target, MAX_STATE_BYTES);
+    assertPrivateRegularFile(target, maxBytes);
     fsyncDirectory(root);
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);

@@ -537,6 +537,8 @@ export function isCodexRunning(appRoot: string): boolean {
 export interface CodexMainProcessObservation {
   pid: number;
   visibleWindow: boolean;
+  /** Exact `ps lstart` token for this PID, used to reject PID reuse. */
+  startedAtRaw?: string | null;
 }
 
 export interface QuitCodexMainProcessDeps {
@@ -556,6 +558,7 @@ export function codexMainProcessObservationFromReport(
   return {
     pid: report.pid,
     visibleWindow: report.visibleWindow === true || report.status === "open",
+    startedAtRaw: report.openedAtRaw,
   };
 }
 
@@ -663,7 +666,9 @@ export function codexReopenScript(
     lines.push(
       "delay 0.50",
       "try",
+      "with timeout of 5 seconds",
       `tell application id ${appleScriptString(bundleId)} to activate`,
+      "end timeout",
       "end try",
     );
   }

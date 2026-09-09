@@ -183,6 +183,26 @@ export interface LoadedEnvironmentState {
   migratedFromLegacy: boolean;
 }
 
+export interface CanonicalManagerEnvironmentPublication {
+  sourceRoot: string;
+  destinationRoot: string;
+  registryFile: string;
+  selectionFile: string;
+  bootstrapped: boolean;
+  /**
+   * Compensate a later independent-app promotion failure only while the exact
+   * snapshot published by this call is still current. A concurrent writer is
+   * never overwritten.
+   */
+  restoreOnFailure(): void;
+}
+
+export interface BootstrapCanonicalManagerEnvironmentDeps {
+  loadState?: typeof loadEnvironmentState;
+  validateOfficial?: typeof validateOfficialEnvironmentProfile;
+  publishSnapshot?: typeof publishEnvironmentSnapshot;
+}
+
 export interface CreateEnvironmentSelectionInput {
   profile: EnvironmentProfileRecord;
   appExperience: AppExperience;
@@ -1091,7 +1111,7 @@ export function validateOfficialEnvironmentProfile(
 export const validateEnvironmentSelection = validateOfficialEnvironmentProfile;
 
 function assessGatekeeper(appPath: string): TrustCheckResult {
-  const result = spawnSync("spctl", ["--assess", "--type", "execute", "--verbose=4", appPath], {
+  const result = spawnSync("/usr/sbin/spctl", ["--assess", "--type", "execute", "--verbose=4", appPath], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1102,7 +1122,7 @@ function assessGatekeeper(appPath: string): TrustCheckResult {
 }
 
 function readDesignatedRequirement(appPath: string): DesignatedRequirementResult {
-  const result = spawnSync("codesign", ["-dr", "-", appPath], {
+  const result = spawnSync("/usr/bin/codesign", ["-dr", "-", appPath], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1404,6 +1424,206 @@ export function publishEnvironmentSnapshot(
     throw new Error("Environment registry last-known-working selection does not match the environment snapshot selection");
   }
   commitEnvironmentDocumentsAtomically(registryFile, registry, selectionFile, selection, {});
+}
+
+/**
+ * Materialize the verified environment authority consumed by the sealed
+ * global manager. This is intentionally a narrow activation-time bridge: an
+ * existing canonical pair is authoritative, an incomplete pair fails closed,
+ * and legacy state is consulted only when no canonical pair has ever been
+ * published.
+ */
+export function bootstrapCanonicalManagerEnvironmentSnapshot(
+  input: { sourceRoot: string; destinationRoot: string },
+  deps: BootstrapCanonicalManagerEnvironmentDeps = {},
+): CanonicalManagerEnvironmentPublication {
+  const sourceRoot = requireExactEnvironmentRoot(input.sourceRoot, "Environment source root");
+  const destinationRoot = requireExactEnvironmentRoot(input.destinationRoot, "Canonical manager environment root");
+  const registryFile = join(destinationRoot, "environment-registry.json");
+  const selectionFile = join(destinationRoot, "environment-selection.json");
+  const legacyRegistryFile = join(destinationRoot, "environment-profiles.json");
+  const loadState = deps.loadState ?? loadEnvironmentState;
+  const validateOfficial = deps.validateOfficial ?? validateOfficialEnvironmentProfile;
+  const publishSnapshot = deps.publishSnapshot ?? publishEnvironmentSnapshot;
+
+  if (readEnvironmentDocumentCommit(registryFile, selectionFile) !== null) {
+    throw new Error("Canonical manager environment has an unfinished state commit");
+  }
+  const registryPresent = existsSync(registryFile);
+  const selectionPresent = existsSync(selectionFile);
+  if (existsSync(legacyRegistryFile) || registryPresent !== selectionPresent) {
+    throw new Error("Canonical manager environment state is incomplete or uses an unsupported legacy registry");
+  }
+
+  const load = (root: string): LoadedEnvironmentState => loadState({
+    legacyStateFile: join(root, "state.json"),
+    registryFile: join(root, "environment-registry.json"),
+    selectionFile: join(root, "environment-selection.json"),
+    environmentRoot: root,
+    stableDesktopPath: STABLE_DESKTOP_PATH,
+    alphaDesktopPath: ALPHA_DESKTOP_PATH,
+  }, { recoverCommit: false });
+
+  if (registryPresent && selectionPresent) {
+    const persistedRegistry = readEnvironmentProfileRegistry(registryFile);
+    if (persistedRegistry === null) {
+      throw new Error("Canonical manager environment registry disappeared during validation");
+    }
+    const canonical = load(destinationRoot);
+    assertCanonicalOfficialChatGPTAuthority(canonical);
+    validateOfficial(canonical.current);
+    assertStoredOfficialEvidenceMatchesObservation(
+      persistedRegistry.profiles.stable,
+      canonical.registry.profiles.stable,
+    );
+    return {
+      sourceRoot: destinationRoot,
+      destinationRoot,
+      registryFile,
+      selectionFile,
+      bootstrapped: false,
+      restoreOnFailure: () => {
+        // This call did not publish the already-authoritative canonical pair.
+      },
+    };
+  }
+
+  const sourceRegistryFile = join(sourceRoot, "environment-registry.json");
+  const sourceSelectionFile = join(sourceRoot, "environment-selection.json");
+  if (readEnvironmentDocumentCommit(sourceRegistryFile, sourceSelectionFile) !== null) {
+    throw new Error("Environment source has an unfinished state commit");
+  }
+  const source = load(sourceRoot);
+  assertCanonicalOfficialChatGPTAuthority(source);
+  validateOfficial(source.current);
+
+  // Carry only verified official-app observations and preparation capability.
+  // Artifact paths and their mutable fingerprints are destination-owned and
+  // are deliberately rebuilt under the canonical manager root.
+  const portableEvidence = (profile: EnvironmentProfileRecord): EnvironmentProfileEvidenceInput => ({
+    officialVersion: profile.officialVersion,
+    officialBuild: profile.officialBuild,
+    strictSignature: profile.strictSignature,
+    gatekeeper: profile.gatekeeper,
+    teamIdentifier: profile.teamIdentifier,
+    designatedRequirement: profile.designatedRequirement,
+    signatureCheckedAt: profile.signatureCheckedAt,
+    officialBackendVersion: profile.officialBackendVersion,
+    officialBackendFingerprint: profile.officialBackendFingerprint,
+    backendChannel: profile.backendChannel,
+    backendInstallable: profile.backendInstallable,
+    patchedPayloadBuildable: profile.patchedPayloadBuildable,
+  });
+  const registry = createEnvironmentProfileRegistry({
+    stableDesktopPath: source.registry.profiles.stable.officialPath,
+    alphaDesktopPath: source.registry.profiles.alpha.officialPath,
+    environmentRoot: destinationRoot,
+    selected: source.current,
+    lastKnownWorkingSelection: source.current,
+    stableEvidence: portableEvidence(source.registry.profiles.stable),
+    alphaEvidence: portableEvidence(source.registry.profiles.alpha),
+  });
+  assertSelectionUsesRegistry(source.current, registry);
+  publishSnapshot(registryFile, selectionFile, registry, source.current);
+  const publishedRegistry = readFileSync(registryFile);
+  const publishedSelection = readFileSync(selectionFile);
+  let restored = false;
+
+  return {
+    sourceRoot,
+    destinationRoot,
+    registryFile,
+    selectionFile,
+    bootstrapped: true,
+    restoreOnFailure: () => {
+      if (restored) return;
+      if (!existsSync(registryFile)
+        || !existsSync(selectionFile)
+        || !readFileSync(registryFile).equals(publishedRegistry)
+        || !readFileSync(selectionFile).equals(publishedSelection)) {
+        throw new Error("Refusing to restore canonical manager environment over a concurrent publication");
+      }
+      try {
+        // Removing the selection first leaves any interrupted rollback in a
+        // fail-closed state: no mutation may trust a registry by itself.
+        restoreExactBytes(selectionFile, null);
+        restoreExactBytes(registryFile, null);
+      } catch (error) {
+        const recoveryErrors: unknown[] = [];
+        try {
+          if (!existsSync(registryFile)) restoreExactBytes(registryFile, publishedRegistry);
+        } catch (recoveryError) {
+          recoveryErrors.push(recoveryError);
+        }
+        try {
+          if (!existsSync(selectionFile)) restoreExactBytes(selectionFile, publishedSelection);
+        } catch (recoveryError) {
+          recoveryErrors.push(recoveryError);
+        }
+        if (recoveryErrors.length > 0) {
+          throw new AggregateError([error, ...recoveryErrors], "Canonical manager environment rollback was incomplete");
+        }
+        throw error;
+      }
+      restored = true;
+    },
+  };
+}
+
+function requireExactEnvironmentRoot(value: string, label: string): string {
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new Error(`${label} must be an exact absolute path: ${value}`);
+  }
+  return value;
+}
+
+function assertCanonicalOfficialChatGPTAuthority(state: LoadedEnvironmentState): void {
+  const selection = state.current;
+  const stable = state.registry.profiles.stable;
+  if (selection.selectedDesktopPath !== STABLE_DESKTOP_PATH
+    || selection.selectedDesktopBundleId !== "com.openai.codex"
+    || selection.releaseProfile !== "stable"
+    || selection.appExperience !== "chatgpt"
+    || selection.backendLane !== "official-bundled"
+    || !isEnvironmentSelectionHealthy(selection)
+    || !isPristineOpenAiRecoveryEnvironment(selection)
+    || stable.officialPath !== STABLE_DESKTOP_PATH
+    || stable.officialBundleId !== "com.openai.codex") {
+    throw new Error(`Canonical manager authority requires the verified stable ChatGPT app at ${STABLE_DESKTOP_PATH}`);
+  }
+}
+
+function assertStoredOfficialEvidenceMatchesObservation(
+  stored: EnvironmentProfileRecord,
+  observed: EnvironmentProfileRecord,
+): void {
+  const fields: Array<keyof EnvironmentProfileRecord> = [
+    "selectedDesktopPath",
+    "selectedDesktopBundleId",
+    "officialPath",
+    "officialBundleId",
+    "officialVersion",
+    "officialBuild",
+    "strictSignature",
+    "gatekeeper",
+    "teamIdentifier",
+    "designatedRequirement",
+    "officialBackendPath",
+    "officialBackendVersion",
+    "officialBackendFingerprint",
+  ];
+  for (const field of fields) {
+    // Official-source registration deliberately clears backend evidence when
+    // the desktop build changes instead of carrying a version or fingerprint
+    // observed from the prior app.  A null stored value is therefore an
+    // explicit unknown that the trusted live observation may fill.  Known
+    // stored evidence must still match exactly.
+    const storedBackendEvidenceIsUnknown = stored[field] === null
+      && (field === "officialBackendVersion" || field === "officialBackendFingerprint");
+    if (!storedBackendEvidenceIsUnknown && stored[field] !== observed[field]) {
+      throw new Error(`Canonical manager official ChatGPT ${field} does not match the revalidated app`);
+    }
+  }
 }
 
 /**

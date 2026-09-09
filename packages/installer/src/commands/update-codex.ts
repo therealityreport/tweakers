@@ -44,7 +44,7 @@ export function pruneParkedPatchedApps(
 }
 
 const DEFAULT_DEPS: UpdateCodexCommandDeps = {
-  createTransaction: (options) => createDesktopUpdateTransaction({ appPath: options.app }),
+  createTransaction: (options) => createDesktopUpdateTransaction({ appPath: options.app, officialOnly: true }),
   print: (line) => console.log(line),
 };
 
@@ -59,7 +59,7 @@ export async function updateCodex(
   appendLifecycleAuditRecord(ensureUserPaths().desktopUpdateLogFile, {
     event: "user_approval",
     action: "update-chatgpt",
-    detail: "Desktop Update and Reload initiated by explicit user command",
+    detail: "Official ChatGPT update initiated by explicit user command",
   });
   const receipt = await deps.createTransaction(opts).start();
   printReceipt(receipt, opts, deps);
@@ -79,7 +79,7 @@ export function codexUpdateStatus(
     });
   }
   else if (opts.json) deps.print(JSON.stringify({ schemaVersion: 1, kind: "desktop-update", transactionId: null, phase: "idle" }));
-  else deps.print(kleur.dim("No desktop Update and Reload transaction has started."));
+  else deps.print(kleur.dim("No official ChatGPT update transaction has started."));
   return receipt;
 }
 
@@ -186,7 +186,7 @@ function printReceipt(
   const tone = receipt.phase === "completed" ? kleur.green
     : receipt.phase === "failed" || receipt.phase === "rolled_back" ? kleur.yellow
     : kleur.cyan;
-  deps.print(tone(`Desktop Update and Reload: ${receipt.phase}`));
+  deps.print(tone(`ChatGPT App Update: ${receipt.phase}`));
   deps.print(kleur.dim(`Transaction ${receipt.transactionId}`));
   if (options.progress?.heartbeat) {
     const beat = options.progress.heartbeat;

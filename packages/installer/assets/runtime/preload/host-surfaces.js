@@ -3,7 +3,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.hostUiApi = exports.MCP_CARRIER_NONCE_PREFIX = void 0;
 exports.attachMcpFormCarrier = attachMcpFormCarrier;
 exports.attachMcpFormElement = attachMcpFormElement;
+exports.getSharedHistoryTarget = getSharedHistoryTarget;
 exports.queryHostSurfaces = queryHostSurfaces;
+const electron_1 = require("electron");
 const react_hook_1 = require("./react-hook");
 const MAX_MATCHES = 100;
 // Current desktop builds can place a standard MCP form beneath substantially
@@ -16,9 +18,25 @@ const MAX_MCP_IDENTITY_LENGTH = 512;
 const MAX_MCP_VISIBILITY_ANCESTORS = 128;
 const MCP_CARRIER_IDENTITY_KEYS = ["elicitation", "requestId", "conversationId", "hostId"];
 exports.MCP_CARRIER_NONCE_PREFIX = "__tweakers_carrier_nonce_";
+const SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL = "tweaker:shared-history-map-native-target";
+const SHARED_HISTORY_MAP_VERSION = 1;
+const MAX_SHARED_HISTORY_TURNS = 512;
+const MAX_SHARED_HISTORY_NATIVE_ID_LENGTH = 256;
+const SHARED_HISTORY_CONVERSATION_SELECTOR = '[data-testid="conversation"], [data-testid="conversation-view"]';
+const SHARED_HISTORY_COMPOSER_SELECTOR = '[data-testid="composer"]';
+const SHARED_HISTORY_ASSISTANT_TURN_SELECTOR = '[data-testid="conversation-turn"], [data-testid*="assistant-message" i]';
 const listeners = new Set();
 let sharedObserver = null;
 let pendingFrame = null;
+// Native Settings owns stable route slugs. A slug alone only identifies the
+// sidebar button, so a usable page surface requires an exact page heading too.
+// That intentionally leaves a changed/unknown renderer unmounted rather than
+// decorating a nearby settings row.
+const NATIVE_SETTINGS_SURFACES = {
+    "apps-settings": { routeSlugs: ["apps"], headings: ["Apps", "应用"] },
+    "plugins-settings": { routeSlugs: ["plugins"], headings: ["Plugins", "插件"] },
+    "mcp-settings": { routeSlugs: ["mcp", "mcp-servers"], headings: ["MCP servers", "MCP 服务器"] },
+};
 const SELECTORS = {
     "assistant-turns": '[data-testid="conversation-turn"], [data-testid*="assistant-message" i], [data-message-author-role="assistant"], [data-role="assistant"]',
     composer: '#prompt-textarea, [data-testid="composer"] textarea, [data-testid="composer"] [contenteditable="true"], form textarea:not([disabled]), form [contenteditable="true"]',
@@ -31,6 +49,7 @@ exports.hostUiApi = {
     query: queryHostSurfaces,
     snapshot,
     observe,
+    getSharedHistoryTarget,
     getActiveProject,
     attachFiles,
     attachMcpFormCarrier,
@@ -398,6 +417,126 @@ function asRecord(value) {
 function deliveryAcknowledgement(stage) {
     return Object.freeze({ version: 1, stage, contentRedacted: true });
 }
+/**
+ * Resolves the one current native conversation through the main-process
+ * mapper. Native identities stay in this function's stack and mapper request;
+ * only broker-issued public handles and Elements can leave preload.
+ */
+async function getSharedHistoryTarget() {
+    const native = currentNativeSharedHistoryTarget();
+    if (native.status !== "available")
+        return native;
+    let response;
+    try {
+        response = await electron_1.ipcRenderer.invoke(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, {
+            version: SHARED_HISTORY_MAP_VERSION,
+            conversationNativeId: native.target.conversationNativeId,
+            composerNativeId: native.target.composerNativeId,
+            assistantTurnNativeIds: native.target.assistantTurns.map((turn) => turn.nativeTurnId),
+        });
+    }
+    catch {
+        return { status: "unavailable", reason: "mapper_unavailable" };
+    }
+    if (!nativeSharedHistoryTargetConnected(native.target))
+        return { status: "unavailable", reason: "disconnected" };
+    const mapped = publicSharedHistoryMapping(response, native.target);
+    if (!mapped)
+        return { status: "unavailable", reason: "unmapped" };
+    const { statusRoot, composerRoot, assistantTurns } = native.target;
+    const target = Object.freeze({
+        kind: "shared-history-conversation",
+        conversationId: mapped.conversationId,
+        statusRoot,
+        composerRoot,
+        assistantTurns: Object.freeze(mapped.turns.map((turn) => Object.freeze({ turnId: turn.turnId, root: turn.root }))),
+        // Do not close over native identities. A remount observer obtains a fresh
+        // target through the mapper; this guard detects stale/disconnected roots.
+        isCurrent: () => statusRoot.isConnected
+            && composerRoot.isConnected
+            && assistantTurns.every((turn) => turn.root.isConnected),
+    });
+    return { status: "available", target };
+}
+function currentNativeSharedHistoryTarget() {
+    if (typeof document === "undefined")
+        return { status: "unavailable", reason: "not_found" };
+    const conversations = uniqueElements(document.querySelectorAll(SHARED_HISTORY_CONVERSATION_SELECTOR));
+    if (conversations.length !== 1)
+        return { status: "unavailable", reason: conversations.length > 1 ? "ambiguous" : "not_found" };
+    const statusRoot = conversations[0];
+    if (!statusRoot.isConnected)
+        return { status: "unavailable", reason: "disconnected" };
+    const conversationNativeId = exactNativeFiberIdentity(statusRoot, "conversationId");
+    if (!conversationNativeId)
+        return { status: "unavailable", reason: "invalid_identity" };
+    const composers = uniqueElements(document.querySelectorAll(SHARED_HISTORY_COMPOSER_SELECTOR))
+        .filter((element) => element.isConnected && exactNativeFiberIdentity(element, "conversationId") === conversationNativeId);
+    if (composers.length !== 1)
+        return { status: "unavailable", reason: composers.length > 1 ? "ambiguous" : "not_found" };
+    const composerRoot = composers[0];
+    const composerNativeId = exactNativeFiberIdentity(composerRoot, "composerId");
+    if (!composerNativeId)
+        return { status: "unavailable", reason: "invalid_identity" };
+    const assistantTurns = [];
+    const seenTurnIds = new Set();
+    const rawTurns = uniqueElements(statusRoot.querySelectorAll(SHARED_HISTORY_ASSISTANT_TURN_SELECTOR));
+    if (rawTurns.length > MAX_SHARED_HISTORY_TURNS)
+        return { status: "unavailable", reason: "ambiguous" };
+    for (const root of rawTurns) {
+        if (!root.isConnected || exactNativeFiberIdentity(root, "conversationId") !== conversationNativeId) {
+            return { status: "unavailable", reason: "invalid_identity" };
+        }
+        const nativeTurnId = exactNativeFiberIdentity(root, "turnId");
+        if (!nativeTurnId || seenTurnIds.has(nativeTurnId))
+            return { status: "unavailable", reason: "invalid_identity" };
+        seenTurnIds.add(nativeTurnId);
+        assistantTurns.push({ nativeTurnId, root });
+    }
+    return { status: "available", target: { conversationNativeId, composerNativeId, statusRoot, composerRoot, assistantTurns } };
+}
+function exactNativeFiberIdentity(element, key) {
+    if (!element.isConnected)
+        return null;
+    const fiber = (0, react_hook_1.fiberForNode)(element);
+    const props = asRecord(fiber?.memoizedProps);
+    const value = props?.[key];
+    return validNativeSharedHistoryId(value) ? value : null;
+}
+function validNativeSharedHistoryId(value) {
+    return typeof value === "string" && value.length >= 1 && value.length <= MAX_SHARED_HISTORY_NATIVE_ID_LENGTH
+        && /^[A-Za-z0-9._:-]+$/.test(value);
+}
+function nativeSharedHistoryTargetConnected(target) {
+    return target.statusRoot.isConnected && target.composerRoot.isConnected
+        && target.assistantTurns.every((turn) => turn.root.isConnected);
+}
+function publicSharedHistoryMapping(value, target) {
+    const response = asRecord(value);
+    if (!response || response.version !== SHARED_HISTORY_MAP_VERSION || response.status !== "mapped"
+        || !isPublicSharedHistoryConversationId(response.conversationId) || !Array.isArray(response.turnIds)
+        || response.turnIds.length !== target.assistantTurns.length)
+        return null;
+    const seenPublic = new Set();
+    const turns = [];
+    for (let index = 0; index < response.turnIds.length; index += 1) {
+        const turnId = response.turnIds[index];
+        if (!isPublicSharedHistoryTurnId(turnId) || seenPublic.has(turnId))
+            return null;
+        seenPublic.add(turnId);
+        // The sender-validated mapper commits that turnIds preserves the submitted
+        // native-identity sequence. Preload merely pairs each public result with
+        // the same local request slot; it never uses DOM position to infer identity.
+        turns.push({ turnId, root: target.assistantTurns[index].root });
+    }
+    return { conversationId: response.conversationId, turns };
+}
+function isPublicSharedHistoryConversationId(value) {
+    return typeof value === "string" && /^conversation_[A-Za-z0-9_-]{43}$/.test(value);
+}
+function isPublicSharedHistoryTurnId(value) {
+    return typeof value === "string" && /^turn_[A-Za-z0-9_-]{43}$/.test(value);
+}
 function queryHostSurfaces(kind) {
     if (typeof document === "undefined")
         return [];
@@ -407,6 +546,8 @@ function queryHostSurfaces(kind) {
         return threadContexts();
     if (kind === "usage")
         return usageSurfaces();
+    if (isNativeSettingsSurfaceKind(kind))
+        return nativeSettingsPageSurface(kind);
     const selector = SELECTORS[kind];
     return uniqueElements(document.querySelectorAll(selector))
         .filter((element) => semanticFilter(kind, element))
@@ -436,7 +577,12 @@ function observe(kinds, listener) {
 function ensureObserver() {
     if (sharedObserver || typeof MutationObserver === "undefined" || typeof document === "undefined")
         return;
-    sharedObserver = new MutationObserver(() => {
+    sharedObserver = new MutationObserver((records) => {
+        // Tweaks render inside explicit owned roots. Mutations wholly inside one
+        // of those roots cannot change host-surface identity and must not feed the
+        // renderer back into another discovery/render cycle.
+        if (records.length > 0 && records.every((record) => mutationIsInsideOwnedHostSurface(record)))
+            return;
         if (pendingFrame !== null)
             return;
         pendingFrame = requestAnimationFrame(() => {
@@ -447,11 +593,17 @@ function ensureObserver() {
     });
     sharedObserver.observe(document.documentElement, {
         attributes: true,
-        attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
+        attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-settings-panel-slug", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
         childList: true,
         characterData: true,
         subtree: true,
     });
+}
+function mutationIsInsideOwnedHostSurface(record) {
+    const target = record.target instanceof Element
+        ? record.target
+        : record.target.parentNode instanceof Element ? record.target.parentNode : null;
+    return Boolean(target?.closest?.("[data-tweakers-host-surface-owned='true']"));
 }
 function safelyNotify(entry, snapshots) {
     try {
@@ -511,6 +663,55 @@ function usageSurfaces() {
     const direct = uniqueElements(document.querySelectorAll('[data-usage-limit-key], [data-usage-limit], [data-testid*="usage" i], [aria-label*="usage" i], [class*="usage" i]'));
     const textual = uniqueElements(document.querySelectorAll("section, article, [role='listitem']")).filter((element) => /(?:usage|limit).*(?:remaining|reset|used)|(?:remaining|reset|used).*(?:usage|limit)/i.test(compact(element.textContent)));
     return uniqueElements([...direct, ...textual]).slice(0, MAX_MATCHES).map((element) => ({ kind: "usage", element, confidence: direct.includes(element) ? "high" : "medium", label: accessibleLabel(element) }));
+}
+function isNativeSettingsSurfaceKind(kind) {
+    return kind === "apps-settings" || kind === "plugins-settings" || kind === "mcp-settings";
+}
+/**
+ * Return one bounded native settings page only when two independent native
+ * signals agree: exactly one active route marker and exactly one matching page
+ * heading. Do not weaken this to role=listitem or generic settings-row
+ * discovery; those match unrelated controls across the renderer.
+ */
+function nativeSettingsPageSurface(kind) {
+    const definition = NATIVE_SETTINGS_SURFACES[kind];
+    const activeNativeRoutes = uniqueElements(document.querySelectorAll("[data-settings-panel-slug][aria-current='page']"));
+    if (activeNativeRoutes.length !== 1)
+        return [];
+    if (!routeMatchesNativeSettingsSurface(activeNativeRoutes[0], definition))
+        return [];
+    const headings = uniqueElements(document.querySelectorAll("h1, h2, h3"))
+        .filter((element) => headingMatchesNativeSettingsSurface(element, definition));
+    if (headings.length !== 1)
+        return [];
+    const container = boundedNativeSettingsPageContainer(headings[0]);
+    if (!container)
+        return [];
+    return [{ kind: kind, element: container, confidence: "high", label: accessibleLabel(headings[0]) }];
+}
+function routeMatchesNativeSettingsSurface(element, definition) {
+    const slug = normalizeNativeSettingsToken(element.getAttribute("data-settings-panel-slug"));
+    return Boolean(slug && definition.routeSlugs.includes(slug));
+}
+function headingMatchesNativeSettingsSurface(element, definition) {
+    const heading = normalizeNativeSettingsToken(element.textContent);
+    return Boolean(heading && definition.headings.some((candidate) => heading === normalizeNativeSettingsToken(candidate)));
+}
+function normalizeNativeSettingsToken(value) {
+    return compact(value).toLocaleLowerCase();
+}
+/**
+ * A heading is not a safe mounting target. Require a connected semantic page
+ * container and choose only the nearest such boundary; unknown DOM structure
+ * fails closed rather than falling back to a parent settings row.
+ */
+function boundedNativeSettingsPageContainer(heading) {
+    const container = heading.closest("[data-settings-panel-content], [data-settings-page], [role='main'], main, section, article");
+    if (!container || !container.isConnected)
+        return null;
+    if (container.querySelector("[data-settings-panel-slug]"))
+        return null;
+    return container;
 }
 function getActiveProject() {
     for (const match of queryHostSurfaces("thread-context")) {

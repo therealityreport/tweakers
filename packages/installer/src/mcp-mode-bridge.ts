@@ -1,8 +1,9 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AppExperience } from "./environment-profile.js";
+import { resolveSealedManagerRuntimeAssets, verifySealedManagerRuntimeAssets } from "./manager-runtime-assets.js";
 
 export const MCP_MODE_HELPER_SCHEMA_VERSION = 1 as const;
 
@@ -78,6 +79,8 @@ export interface McpModeBridge {
  * runtime code into the ESM installer or coupling the installer to chokidar.
  */
 export function defaultMcpModeHelperFile(): string {
+  const sealed = resolveSealedManagerRuntimeAssets();
+  if (sealed !== null) return join(sealed.root, "mcp-mode-headless.js");
   return fileURLToPath(new URL("../assets/runtime/mcp-mode-headless.js", import.meta.url));
 }
 
@@ -86,6 +89,7 @@ export function createMcpModeBridge(
   dependencies: McpModeBridgeDependencies = {},
 ): McpModeBridge {
   const helperFile = options.helperFile ?? defaultMcpModeHelperFile();
+  const sealedRuntime = options.helperFile === undefined ? resolveSealedManagerRuntimeAssets() : null;
   const executable = options.nodeExecutable ?? process.execPath;
   const timeout = Math.max(1, options.timeoutMs ?? 30_000);
   const run = dependencies.run ?? ((command, args, spawnOptions) => (
@@ -93,6 +97,7 @@ export function createMcpModeBridge(
   ));
 
   const assertReady = (): void => {
+    if (sealedRuntime !== null) verifySealedManagerRuntimeAssets(sealedRuntime);
     if (!existsSync(helperFile)) {
       throw new Error(`Tweakers MCP mode helper is missing at ${helperFile}`);
     }

@@ -12,7 +12,12 @@ export type RedactedErrorCode =
   | "protocol_drift"
   | "post_start_failure"
   | "ambiguous_dispatch"
+  | "provider_confirmation_required"
   | "invalid_correlation"
+  | "account_history_busy"
+  | "conversation_busy"
+  | "handoff_unavailable"
+  | "linked_continuation_required"
   | "capability_mismatch"
   | "router_stopping";
 
@@ -24,7 +29,7 @@ export function redactedRouterError(id: string | number | null, code: RedactedEr
   return {
     jsonrpc: "2.0",
     id,
-    error: { code: -32080, message: "Account router request could not be completed", data: { code } },
+    error: { code: -32080, message: code === "account_history_busy" ? "This account is busy in another app or remote session. Let that work finish or close its session, then Retry." : "Account router request could not be completed", data: { code } },
   };
 }
 

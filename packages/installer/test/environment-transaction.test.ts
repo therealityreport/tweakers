@@ -33,9 +33,11 @@ import {
   submitEnvironmentCommitHelper,
   writeEnvironmentTransactionReceipt,
   type EnvironmentAppliedEvidence,
+  type EnvironmentTransactionReceipt,
   type PreparedEnvironmentEvidence,
 } from "../src/environment-transaction";
 import { hashTree } from "../src/commands/refresh-local";
+import { fingerprintManagedRuntimeSource } from "../src/managed-runtime";
 import { acquireProcessLock } from "../src/process-lock";
 import { computeRuntimeFingerprint } from "../src/runtime-fingerprint";
 
@@ -624,6 +626,214 @@ test("default preparation accepts the canonical profile fingerprint for a pristi
       oldMainPid: 101,
     });
     assert.equal(prepared.candidate.artifactDigest, pristineFingerprint);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sealed first injection stages receipt-owned state, watcher, and managed-runtime rollback evidence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-sealed-initial-injection-"));
+  const liveApp = join(root, "Applications", "ChatGPT.app");
+  const leasedApp = join(root, "official-source", "ChatGPT.app");
+  const sealedManagedRuntime = join(root, "manager-generation", "managed-runtime");
+  const registryFile = join(root, "environment-registry.json");
+  const stateFile = join(root, "state.json");
+  const watcherFile = join(root, "watcher", "com.tweaker.watcher.plist");
+  const runtimeSourceHash = "a".repeat(64);
+  const candidateDigest = "b".repeat(64);
+  const rollbackDigest = "c".repeat(64);
+  const backendDigest = "d".repeat(64);
+  const originalAsarHash = "e".repeat(64);
+  const patchedAsarHash = "f".repeat(64);
+  let liveDigest = rollbackDigest;
+  let livePatched = false;
+  let liveAsarHash = originalAsarHash;
+  try {
+    for (const app of [liveApp, leasedApp]) {
+      mkdirSync(join(app, "Contents", "Resources"), { recursive: true });
+      writeFileSync(join(app, "Contents", "Resources", "codex"), "bundled backend\n");
+    }
+    writeManagedRuntimeFixture(sealedManagedRuntime, "sealed runtime\n", runtimeSourceHash);
+    const sealedFingerprint = fingerprintManagedRuntimeSource(sealedManagedRuntime);
+    const registry = createEnvironmentProfileRegistry({
+      stableDesktopPath: liveApp,
+      alphaDesktopPath: join(root, "Applications", "ChatGPT (Beta).app"),
+      environmentRoot: root,
+      stableEvidence: {
+        officialVersion: "26.999.0",
+        officialBuild: "9999",
+        strictSignature: true,
+        gatekeeper: true,
+        teamIdentifier: "2DC432GLL2",
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        signatureCheckedAt: "2026-09-04T00:00:00.000Z",
+        officialBackendVersion: "0.145.0",
+        officialBackendFingerprint: backendDigest,
+        backendVersion: "0.145.0",
+        backendFingerprint: backendDigest,
+        patchedPayloadBuildable: true,
+      },
+    });
+    const current = createEnvironmentSelection({
+      profile: registry.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-04T00:00:00.000Z",
+      appliedAt: "2026-09-04T00:00:01.000Z",
+    });
+    const requested = createEnvironmentSelection({
+      profile: registry.profiles.stable,
+      appExperience: "tweakers",
+      requestedAt: "2026-09-04T00:01:00.000Z",
+    });
+    const selectedRegistry = { ...registry, selected: current, lastKnownWorkingSelection: current };
+    writeEnvironmentProfileRegistry(registryFile, selectedRegistry);
+    const requestedWatcherBytes = Buffer.from("sealed watcher definition\n", "utf8");
+    const requestedWatcherDigest = createHash("sha256").update(requestedWatcherBytes).digest("hex");
+
+    const adapters = createDefaultEnvironmentAdapters({
+      registryFile,
+      receiptRoot: join(root, "receipts"),
+      configFile: join(root, "config.json"),
+      stateFile,
+      environmentRoot: root,
+      sealedCandidateSourceApp: leasedApp,
+      sealedManagedRuntime: {
+        sourceRoot: sealedManagedRuntime,
+        generationId: "1".repeat(64),
+        fingerprint: sealedFingerprint,
+        sourceRuntimeHash: runtimeSourceHash,
+      },
+    }, {
+      assertMcpModeReady: () => {},
+      loadState: () => ({ registry: selectedRegistry, current, migratedFromLegacy: false }),
+      captureWatcherConfiguration: () => ({ targetPath: watcherFile, existed: false, bytes: null, digest: null }),
+      createWatcherConfiguration: () => ({
+        targetPath: watcherFile,
+        existed: true,
+        bytes: requestedWatcherBytes,
+        digest: requestedWatcherDigest,
+      }),
+      cloneApp: (source, destination) => {
+        rmSync(destination, { recursive: true, force: true });
+        cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
+      },
+      replaceApp: (source, destination, validate) => {
+        rmSync(destination, { recursive: true, force: true });
+        cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
+        livePatched = source.includes("candidate.app");
+        liveDigest = livePatched ? candidateDigest : rollbackDigest;
+        liveAsarHash = livePatched ? patchedAsarHash : originalAsarHash;
+        if (!validate(destination)) throw new Error("replacement did not prove the requested app");
+      },
+      replaceDirectory: (source, destination) => {
+        rmSync(destination, { recursive: true, force: true });
+        cpSync(source, destination, { recursive: true, verbatimSymlinks: true });
+      },
+      requiresSwapHostForExistingApp: false,
+      stageSwapHost: () => null,
+      preparePatchedPayload: (_profile, destination, runtimeDestination, _bundled, stateDestination) => {
+        if (stateDestination === undefined) throw new Error("initial injection must request a candidate state artifact");
+        cpSync(leasedApp, destination, { recursive: true, verbatimSymlinks: true });
+        writeRuntimeFixture(runtimeDestination, "sealed runtime\n");
+        mkdirSync(dirname(stateDestination), { recursive: true });
+        writeFileSync(stateDestination, `${JSON.stringify({
+          version: "1.0.0",
+          installedAt: "2026-09-04T00:01:05.000Z",
+          appRoot: destination,
+          originalAsarHash,
+          patchedAsarHash,
+          codexVersion: "26.999.0",
+          fuseFlipped: true,
+          resigned: true,
+          signingMode: "local-identity",
+          originalEntryPoint: "main.js",
+          watcher: "none",
+          mode: "tweakers",
+          codexBundleId: "com.openai.codex",
+        })}\n`);
+        return { state: { artifactPath: stateDestination, artifactDigest: fileDigest(stateDestination) } };
+      },
+      readMarker: (path) => {
+        if (path.includes("candidate.app")) return "present";
+        if (path === join(liveApp, "Contents", "Resources", "app.asar")) return livePatched ? "present" : "absent";
+        return "absent";
+      },
+      readAsarHeaderHash: (path) => path.includes("candidate.app") ? patchedAsarHash : liveAsarHash,
+      appFingerprint: (path) => {
+        if (path.includes("candidate.app")) return candidateDigest;
+        if (path === liveApp) return liveDigest;
+        return rollbackDigest;
+      },
+      fileFingerprint: () => backendDigest,
+      readDesktopIdentity: () => ({ bundleId: "com.openai.codex", version: "26.999.0", build: "9999" }),
+      verifyOfficial: () => ({
+        strict: true,
+        gatekeeper: true,
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        teamIdentifier: "2DC432GLL2",
+      }),
+      verifyPatched: () => ({
+        strict: true,
+        gatekeeper: false,
+        designatedRequirement: 'designated => identifier "com.openai.codex"',
+        teamIdentifier: null,
+      }),
+      readBackendVersion: () => "0.145.0",
+      readPatchedAsarEvidence: () => ({
+        headerHash: liveAsarHash,
+        stat: { size: 1, mtimeMs: 1 },
+      }),
+      writeBackendLane: () => {},
+      writeAppState: () => {},
+      reconcileMcpMode: () => {},
+      now: () => "2026-09-04T00:01:05.000Z",
+    });
+
+    const prepared = await adapters.preparePrerequisites({
+      transactionId: "sealed-initial-injection",
+      current,
+      requested,
+      oldMainPid: 7001,
+    });
+    if (prepared.bootstrap === undefined) assert.fail("sealed initial injection must create bootstrap evidence");
+    assert.equal(prepared.bootstrap.installerState.rollback.existed, false);
+    assert.equal(prepared.bootstrap.watcher.rollback.existed, false);
+    assert.equal(prepared.bootstrap.managedRuntimeGeneration.fingerprint, sealedFingerprint);
+    assert.equal(prepared.bootstrap.managedRuntimeGeneration.provenanceKind, "sealed-manager-managed-runtime");
+    assert.equal(existsSync(stateFile), false, "preparation must not create live installer state");
+    assert.equal(existsSync(join(root, "runtime")), false, "preparation must not create live active runtime");
+    assert.equal(existsSync(join(root, "managed-runtime", "current")), false, "preparation must not create live managed runtime");
+
+    const receipt: EnvironmentTransactionReceipt = {
+      schemaVersion: 1,
+      kind: "environment",
+      transactionId: "sealed-initial-injection",
+      phase: "prepared",
+      error: null,
+      ownerPid: process.pid,
+      source: current,
+      requested,
+      prepared,
+      applied: null,
+      oldMainPid: 7001,
+      newMainPid: null,
+      attempt: 0,
+      createdAt: "2026-09-04T00:01:00.000Z",
+      updatedAt: "2026-09-04T00:01:05.000Z",
+      committedAt: null,
+      rolledBackAt: null,
+      cancelledAt: null,
+    };
+    adapters.validatePreparedEnvironment({ receipt, prepared });
+    await adapters.applyPreparedEnvironment({ direction: "requested", receipt, prepared });
+    assert.equal(readFileSync(stateFile, "utf8"), readFileSync(prepared.bootstrap.installerState.requested.artifactPath, "utf8"));
+    assert.equal(existsSync(join(root, "runtime")), true);
+    assert.equal(existsSync(join(root, "managed-runtime", "current")), true);
+
+    await adapters.applyPreparedEnvironment({ direction: "rollback", receipt, prepared });
+    assert.equal(existsSync(stateFile), false, "rollback must restore the explicitly absent state");
+    assert.equal(existsSync(join(root, "runtime")), false, "rollback must remove only the newly created runtime");
+    assert.equal(existsSync(join(root, "managed-runtime", "current")), false, "rollback must remove only the newly created managed runtime");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1476,6 +1686,47 @@ test("a pre-cutover cleanup failure cancels without overwriting or rolling back 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+for (const failGate of [false, true]) test(`coordinated activation gate runs after quiescence and ${failGate ? "cancels safely on failure" : "before apply"}`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-coordinated-activation-"));
+  const { current, requested } = selections();
+  const events: string[] = [];
+  let pid: number | null = 101;
+  const coordinator = createEnvironmentCoordinator({
+    environmentRoot: root,
+    verificationPolls: 1,
+    verificationIntervalMs: 0,
+  }, {
+    createId: () => `coordinated-activation-${failGate}`,
+    preparePrerequisites: () => preparedEvidence(current, requested),
+    observeDesktop: () => pid === null ? null : { pid, visibleWindow: true },
+    quitDesktop: () => { events.push("quit"); pid = null; },
+    processAlive: (candidate) => candidate === pid,
+    cleanupHelpers: () => { events.push("cleanup"); },
+    beforeApplyPreparedEnvironment: async ({ receipt }) => {
+      assert.equal(pid, null);
+      assert.equal(receipt.phase, "committing");
+      await Promise.resolve();
+      events.push("registration-gate");
+      if (failGate) throw new Error("registration refused");
+    },
+    applyPreparedEnvironment: ({ direction }) => { events.push(`apply:${direction}`); },
+    reopenDesktop: () => { events.push("reopen"); pid = 303; },
+    proveAppliedEnvironment: ({ direction }) => direction === "rollback"
+      ? appliedEvidence(current, "rollback") : appliedEvidence(requested),
+    publishSelection: () => {},
+    refreshWatcher: () => {},
+    sleep: async () => {},
+  });
+  const prepared = await coordinator.prepare({ current, requested });
+  assert.deepEqual(events, [], "preparation never invokes the final activation gate");
+  const result = await coordinator.commit(prepared.transactionId);
+  assert.equal(result.phase, failGate ? "cancelled" : "committed");
+  assert.deepEqual(events, failGate
+    ? ["quit", "cleanup", "registration-gate", "reopen"]
+    : ["quit", "cleanup", "registration-gate", "apply:requested", "reopen"]);
+  if (failGate) assert.match(result.error ?? "", /registration refused/);
 });
 
 test("a changed main PID before cutover cancels without applying a false rollback", async () => {
@@ -4317,3 +4568,66 @@ test("legacy receipts without asar integrity evidence stay readable when termina
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const failure of ["before-apply", "verification"] as const) {
+  for (const predicateThrows of [false, true]) test(`coordinated recovery defers ${failure} failure${predicateThrows ? " when its check throws" : " until outer rollback"}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "tweaker-deferred-recovery-"));
+    const { current, requested } = selections();
+    const events: string[] = [];
+    let pid: number | null = 101;
+    let gateCalls = 0;
+    try {
+      const coordinator = createEnvironmentCoordinator({
+        environmentRoot: root,
+        verificationPolls: 1,
+        verificationIntervalMs: 0,
+      }, {
+        createId: () => `deferred-${failure}-${predicateThrows}`,
+        preparePrerequisites: () => preparedEvidence(current, requested),
+        observeDesktop: () => pid === null ? null : { pid, visibleWindow: true },
+        quitDesktop: () => { events.push("quit"); pid = null; },
+        processAlive: (candidate) => candidate === pid,
+        cleanupHelpers: () => { events.push("cleanup"); },
+        pauseWatcher: () => { events.push("pause"); },
+        resumeWatcher: () => { events.push("resume"); },
+        beforeApplyPreparedEnvironment: () => {
+          if (failure === "before-apply") throw new Error("registration publication failed");
+        },
+        deferCommitFailureRecovery: async ({ receipt }) => {
+          gateCalls += 1;
+          events.push("defer");
+          assert.equal(receipt.phase, "failed");
+          assert.equal(coordinator.status()?.phase, "failed", "failure is durable before ownership handoff");
+          await Promise.resolve();
+          if (predicateThrows) throw new Error("registration presence unreadable");
+          return true;
+        },
+        applyPreparedEnvironment: ({ direction }) => { events.push(`apply:${direction}`); },
+        reopenDesktop: () => { events.push("reopen"); pid = 303; },
+        proveAppliedEnvironment: ({ direction }) => direction === "rollback"
+          ? appliedEvidence(current, "rollback") : null,
+        publishSelection: () => {},
+        sleep: async () => {},
+      });
+      const prepared = await coordinator.prepare({ current, requested });
+      const result = await coordinator.commit(prepared.transactionId);
+      assert.equal(result.phase, "failed");
+      assert.equal(gateCalls, 1);
+      assert.equal(events.includes("apply:rollback"), false);
+      assert.equal(events.includes("resume"), false);
+      assert.deepEqual(events.slice(events.indexOf("defer") + 1), [], "no writer reopens after recovery is deferred");
+      if (failure === "before-apply") assert.equal(events.includes("reopen"), false);
+      assert.match(result.error ?? "", failure === "before-apply" ? /registration publication failed/ : /not been applied/);
+      if (predicateThrows) assert.match(result.error ?? "", /registration presence unreadable/);
+      // Represents the outer coordinator removing registration and proving
+      // recovery authority before explicitly restoring the environment.
+      events.push("outer-authority-cleared");
+      const restored = await coordinator.rollback(prepared.transactionId);
+      assert.equal(restored.phase, failure === "before-apply" ? "cancelled" : "rolled-back");
+      assert.ok(events.indexOf("resume") > events.indexOf("outer-authority-cleared"));
+      assert.equal(gateCalls, 1, "explicit rollback does not re-enter commit's deferral gate");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}

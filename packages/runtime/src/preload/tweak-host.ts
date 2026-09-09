@@ -16,6 +16,7 @@ import { ipcRenderer } from "electron";
 import { registerSection, registerPage, openRegisteredPage, clearSections, setListedTweaks, updateListedTweakLifecycle } from "./settings-injector";
 import { fiberForNode } from "./react-hook";
 import { hostUiApi } from "./host-surfaces";
+import { accountsNativeApi, accountsNativeBridge } from "./accounts-native";
 import { DEFAULT_TWEAK_STARTUP_TIMEOUT_MS, runWithStartupTimeout } from "../tweak-lifecycle";
 import type { TweakHealthRecord, TweakStatus, TweakStoreEntry } from "../tweak-store";
 import type {
@@ -79,6 +80,10 @@ const loaded = new Map<string, { stop?: () => void }>();
 let cachedPaths: UserPaths | null = null;
 
 export async function startTweakHost(): Promise<void> {
+  // Revalidate at startup and re-enable even when Accounts was disabled when
+  // this payload was prepared. This never initializes an unreviewed wrapper.
+  try { accountsNativeBridge.setCompatibility(ipcRenderer.sendSync("tweaker:accounts-native-compatibility")); }
+  catch { accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts compatibility could not be checked.", hookSetSha256: "" }); }
   const tweaks = (await ipcRenderer.invoke("tweaker:list-tweaks")) as ListedTweak[];
   const paths = (await ipcRenderer.invoke("tweaker:user-paths")) as UserPaths;
   cachedPaths = paths;
@@ -101,6 +106,10 @@ export async function startTweakHost(): Promise<void> {
     }
     if (!t.enabled) {
       sendLifecycle(t.manifest.id, t.status === "quarantined" ? "quarantined" : "disabled");
+      continue;
+    }
+    if (t.manifest.id === "co.tweakers.account-switcher" && !accountsNativeApi.status().compatible) {
+      sendLifecycle(t.manifest.id, "failed", "Accounts is unavailable in this desktop build. Refresh Tweakers to restore the native account screens.");
       continue;
     }
     sendLifecycle(t.manifest.id, "starting");
@@ -247,6 +256,7 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
   return {
     manifest,
     process: "renderer",
+    accountsNative: accountsNativeApi,
     log: {
       debug: (...a) => log("debug", ...a),
       info: (...a) => log("info", ...a),

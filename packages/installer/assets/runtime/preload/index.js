@@ -11,6 +11,7 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
+const accounts_native_1 = require("./accounts-native");
 const react_hook_1 = require("./react-hook");
 const settings_injector_1 = require("./settings-injector");
 const tweak_host_1 = require("./tweak-host");
@@ -71,6 +72,15 @@ function safeStringify(v) {
     }
 }
 fileLog("preload entry", { url: location.href });
+// React values stay in the page. This transport exposes only the reviewed
+// account data operations and a receipt-bound initialization handshake.
+try {
+    accounts_native_1.accountsNativeBridge.setCompatibility(electron_1.ipcRenderer.sendSync("tweaker:accounts-native-compatibility"));
+    electron_1.contextBridge.exposeInMainWorld("__tweakersAccountsTransportV1", accounts_native_1.accountsNativeTransport);
+}
+catch {
+    accounts_native_1.accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts native initialization failed.", hookSetSha256: "" });
+}
 const promotionAttempt = (0, promotion_renderer_mount_1.promotionRendererAuthorizationAttempt)(location.href);
 let promotionNonce = null;
 if (promotionAttempt.kind === "candidate") {

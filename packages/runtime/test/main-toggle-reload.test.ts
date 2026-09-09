@@ -23,21 +23,39 @@ const fullReloadSequence = [
   "broadcastReload",
 ];
 
-test("source toggle handler returns the serialized lifecycle reload", () => {
-  const body = extractHandlerBody(runtimeSource, "tweaker:set-tweak-enabled");
-
-  assert.match(body, /setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
-  assert.doesNotMatch(body, /mcpReconciler\?\.request/);
-  assert.match(body, /return setTweakEnabledAndReload/);
-});
-
-test("bundled toggle handler returns the serialized lifecycle reload", () => {
-  const body = extractHandlerBody(bundledRuntime, "tweaker:set-tweak-enabled");
-
-  assert.match(body, /setTweakEnabledAndReload\(id,\s*enabled,\s*tweakLifecycleDeps\)/);
-  assert.doesNotMatch(body, /mcpReconciler\?\.request/);
-  assert.match(body, /return setTweakEnabledAndReload/);
-});
+for (const [label, source] of [["source", runtimeSource], ["bundled", bundledRuntime]]) {
+  test(`${label} toggle handler waits for the lifecycle result before refreshing native projects`, async () => {
+    const body = extractHandlerBody(source, "tweaker:set-tweak-enabled");
+    const compiled = ts.transpileModule(`globalThis.toggle = async (id, enabled) => {${body}};`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+    }).outputText;
+    const calls: string[] = [];
+    const deps = {};
+    let finish!: (value: boolean) => void;
+    const reload = new Promise<boolean>((resolve) => { finish = resolve; });
+    const sandbox: Record<string, unknown> = {
+      tweakLifecycleDeps: deps,
+      setTweakEnabledAndReload(id: string, enabled: boolean, actualDeps: unknown) {
+        assert.equal(id, "co.tweakers.account-switcher");
+        assert.equal(enabled, false);
+        assert.equal(actualDeps, deps);
+        calls.push("reload");
+        return reload;
+      },
+      __tweakersAccountsNativeMainV1: { refreshProjects() { calls.push("refreshProjects"); } },
+    };
+    runInNewContext(compiled, sandbox);
+    let settled = false;
+    const pending = (sandbox.toggle as (id: string, enabled: boolean) => Promise<boolean>)("co.tweakers.account-switcher", false)
+      .then((result) => { settled = true; return result; });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.deepEqual(calls, ["reload"]);
+    finish(true);
+    assert.equal(await pending, true);
+    assert.deepEqual(calls, ["reload", "refreshProjects"]);
+  });
+}
 
 test("source lifecycle helper normalizes enabled value before persisting", () => {
   const body = extractFunctionBody(lifecycleSource, "setTweakEnabledAndReload");

@@ -6,6 +6,8 @@ exports.readRouterLaunchSelection = readRouterLaunchSelection;
 exports.validateRouterConfig = validateRouterConfig;
 exports.routerConfigFingerprint = routerConfigFingerprint;
 exports.isRouterConfigV2 = isRouterConfigV2;
+exports.isRouterConfigV3 = isRouterConfigV3;
+exports.isQuotaAwareRouterConfig = isQuotaAwareRouterConfig;
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -30,8 +32,9 @@ function readRouterLaunchSelection(configPath, readFile = node_fs_1.readFileSync
         // Legacy v1 remains readable for UI/installer compatibility, but it has
         // no signed history-adoption contract and therefore can never select a
         // process mux. V2 manual is mux-backed after the preflight receipt gate.
-        if (config.schemaVersion !== 2)
+        if (config.schemaVersion !== 2 && config.schemaVersion !== 3) {
             return { mode: "direct", reason: "history-adoption-required", config };
+        }
         return { mode: "mux", reason: config.mode, config };
     }
     catch {
@@ -46,7 +49,47 @@ function validateRouterConfig(value) {
         return validateRouterConfigV1(value);
     if (value.schemaVersion === types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V2)
         return validateRouterConfigV2(value);
+    if (value.schemaVersion === types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V3)
+        return validateRouterConfigV3(value);
     return null;
+}
+function validateRouterConfigV3(value) {
+    const allowed = new Set([
+        "schemaVersion", "mode", "policy", "generation", "fingerprint", "protocolFingerprint", "primaryOpaqueAccountId", "accounts", "updatedAt",
+    ]);
+    if (Object.keys(value).some((key) => !allowed.has(key)))
+        return null;
+    const mode = value.mode === "manual" || value.mode === "quota_aware" ? value.mode : null;
+    const policy = value.policy === "quota_aware_v2" || value.policy === "balanced_tokens_v1" ? value.policy : value.policy === null ? null : undefined;
+    if (!mode || policy === undefined || (mode === "quota_aware" && policy !== "quota_aware_v2" && policy !== "balanced_tokens_v1") || (mode === "manual" && policy !== null))
+        return null;
+    if (typeof value.generation !== "number" || !Number.isSafeInteger(value.generation) || value.generation < 1 || !(0, types_1.isFingerprint)(value.fingerprint))
+        return null;
+    if (!(0, types_1.isFingerprint)(value.protocolFingerprint) || value.protocolFingerprint !== types_1.ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT || !(0, types_1.isOpaqueAccountId)(value.primaryOpaqueAccountId))
+        return null;
+    if (!isIsoTimestamp(value.updatedAt) || !Array.isArray(value.accounts) || value.accounts.length < 1)
+        return null;
+    const accounts = value.accounts.map(validateAccountConfigV2);
+    if (accounts.some((account) => account === null))
+        return null;
+    const validAccounts = accounts;
+    if (new Set(validAccounts.map((account) => account.opaqueAccountId)).size !== validAccounts.length)
+        return null;
+    const primary = validAccounts.find((account) => account.opaqueAccountId === value.primaryOpaqueAccountId);
+    if (!primary || !primary.included || (mode === "quota_aware" && !validAccounts.some((account) => account.included)))
+        return null;
+    const config = {
+        schemaVersion: types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V3,
+        mode,
+        policy,
+        generation: value.generation,
+        fingerprint: value.fingerprint,
+        protocolFingerprint: value.protocolFingerprint,
+        primaryOpaqueAccountId: value.primaryOpaqueAccountId,
+        accounts: validAccounts,
+        updatedAt: value.updatedAt,
+    };
+    return routerConfigFingerprint(config) === config.fingerprint ? config : null;
 }
 /** Strict legacy validator: do not make a v1 file acquire v2 requirements. */
 function validateRouterConfigV1(value) {
@@ -166,7 +209,7 @@ function validateAccountConfigV2(value) {
  */
 function routerConfigFingerprint(config) {
     const canonical = {
-        schemaVersion: types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V2,
+        schemaVersion: config.schemaVersion,
         mode: config.mode,
         policy: config.policy,
         generation: config.generation,
@@ -184,6 +227,12 @@ function routerConfigFingerprint(config) {
 }
 function isRouterConfigV2(config) {
     return config.schemaVersion === types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V2;
+}
+function isRouterConfigV3(config) {
+    return config.schemaVersion === types_1.ACCOUNT_ROUTER_SCHEMA_VERSION_V3;
+}
+function isQuotaAwareRouterConfig(config) {
+    return isRouterConfigV2(config) || isRouterConfigV3(config);
 }
 function isIsoTimestamp(value) {
     if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value))

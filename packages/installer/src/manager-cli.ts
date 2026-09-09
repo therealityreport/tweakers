@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import {
   MANAGER_PROTOCOL_VERSION,
   TWEAKERS_MANAGER_ID,
+  TWEAKERS_MANAGER_ACTION_IDS_V1,
+  type ManagerActionAvailabilityV1,
   type ManagerExecutableIdentityV1,
   type ManagerImpactV1,
   type TweakersManagerActionIdV1,
@@ -22,28 +24,60 @@ import {
   type ExecuteManagerActionResult,
   type PrepareManagerActionResult,
 } from "./manager-action-adapter.js";
-import { createTweakersManagerStatusSnapshot } from "./manager-status.js";
+import { createTweakersManagerStatusSnapshot, managerStatusPaths } from "./manager-status.js";
 import { ManagerStrictJsonError, parseManagerStrictJsonObject } from "./manager-strict-json.js";
 import { resolveManagerExecutableIdentity } from "./manager-launcher-identity.js";
+import { resolveSealedTweakersManagerUserRoot } from "./manager-descriptor.js";
+import {
+  OFFLINE_MIGRATION_MANAGER_RUN_COMMAND,
+  runOfflineMigrationLauncherManagerCommand,
+} from "./offline-migration-launcher.js";
+import {
+  NATIVE_HISTORY_ACTIVATION_MANAGER_RUN_COMMAND,
+  runNativeHistoryActivationManagerCommand,
+} from "./native-history-activation.js";
+// Operator-only preparation API. Importing the immutable bundle does not run
+// its CLI; these exports add no public action or native launcher argv route.
+export {
+  prepareNativeHistoryActivationContext,
+  armNativeHistoryActivationLaunchAgent,
+} from "./native-history-activation.js";
+
+import {
+  PORTABLE_DESKTOP_PRELAUNCH_MANAGER_RUN_COMMAND,
+  PORTABLE_DESKTOP_HANDOFF_OFFICIAL_MANAGER_RUN_COMMAND,
+  PORTABLE_DESKTOP_HANDOFF_TWEAKERS_MANAGER_RUN_COMMAND,
+  runPortableDesktopManagerCommand,
+} from "./portable-desktop-launch.js";
 
 const STATE_TOKEN = /^sha256:[a-f0-9]{64}$/;
 const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const ACTION_IDS = new Set<TweakersManagerActionIdV1>([
-  "environment.cancel",
-  "environment.recover",
-  "desktop-update.resume",
-  "desktop-update.cancel",
-  "environment.switch",
-  "desktop-update.start",
-  "repair.run",
-  "self-update.run",
-  "refresh.full",
-  "app.restart-runtime-proof",
+  ...TWEAKERS_MANAGER_ACTION_IDS_V1,
 ]);
+// The manager status contract intentionally exposes only the two Tweakers
+// actions consumed by the public host. `official-source.register` remains an
+// internal prepare/execute capability used to establish the source binding
+// for an independent refresh; it must not widen the public action list.
+const PUBLIC_STATUS_ACTION_IDS = [
+  "refresh.injected",
+  "refresh.independent",
+] as const satisfies readonly TweakersManagerActionIdV1[];
 
 interface ParsedStatusRequest {
   command: "status";
+  requestId: string;
+}
+
+/**
+ * This is intentionally a separate fixed protocol command, not another
+ * public status action. It lets the independent reapply surface discover the
+ * single prerequisite it may offer for confirmation without turning source
+ * registration into a generic host-selected action.
+ */
+interface ParsedOfficialSourceRegistrationRequest {
+  command: "official-source-registration";
   requestId: string;
 }
 
@@ -62,7 +96,10 @@ interface ParsedOperationRequest {
   operationId: string;
 }
 
-type ParsedTweakersManagerRequest = ParsedStatusRequest | ParsedPrepareRequest | ParsedOperationRequest;
+type ParsedTweakersManagerRequest = ParsedStatusRequest
+  | ParsedOfficialSourceRegistrationRequest
+  | ParsedPrepareRequest
+  | ParsedOperationRequest;
 
 export interface TweakersManagerStatusResponseV1 {
   protocolVersion: typeof MANAGER_PROTOCOL_VERSION;
@@ -72,6 +109,22 @@ export interface TweakersManagerStatusResponseV1 {
   stateToken: `sha256:${string}`;
   status: ReturnType<typeof createTweakersManagerStatusSnapshot>["status"];
   actions: ReturnType<typeof createTweakersManagerStatusSnapshot>["actions"];
+}
+
+/**
+ * Narrow source-registration discovery surface for the independent reapply
+ * flow. The generic `status` command keeps its two public actions and this
+ * response deliberately omits the broader manager dashboard.
+ */
+export interface TweakersManagerOfficialSourceRegistrationResponseV1 {
+  protocolVersion: typeof MANAGER_PROTOCOL_VERSION;
+  managerId: typeof TWEAKERS_MANAGER_ID;
+  requestId: string;
+  generatedAt: string;
+  stateToken: `sha256:${string}`;
+  officialSourceRegistration: ManagerActionAvailabilityV1 & {
+    actionId: "official-source.register";
+  };
 }
 
 export interface TweakersManagerPrepareResponseV1 extends PrepareManagerActionResult {
@@ -113,6 +166,8 @@ export interface RunTweakersManagerCliDependencies {
   status?: typeof createTweakersManagerStatusSnapshot;
   executable?: () => ManagerExecutableIdentityV1;
   adapter?: TweakersManagerActionAdapter;
+  /** Explicit test/CLI root; a launched sealed manager uses the canonical global root. */
+  userRoot?: () => string;
   now?: () => string;
   readStdin?: () => Uint8Array;
   write?: (line: string) => void;
@@ -152,6 +207,12 @@ export function parseTweakersManagerArguments(argv: readonly string[]): ParsedTw
   if (command === "status") {
     if (argv.length !== 4 || argv[1] !== "--request-id" || argv[3] !== "--json") {
       throw managerCliError("invalid_request", "Expected: status --request-id <lowercase-uuid> --json");
+    }
+    return { command, requestId: parseUuid(argv[2], "request-id") };
+  }
+  if (command === "official-source-registration") {
+    if (argv.length !== 4 || argv[1] !== "--request-id" || argv[3] !== "--json") {
+      throw managerCliError("invalid_request", "Expected: official-source-registration --request-id <lowercase-uuid> --json");
     }
     return { command, requestId: parseUuid(argv[2], "request-id") };
   }
@@ -211,23 +272,42 @@ export async function runTweakersManagerCli(
     const parsed = parseTweakersManagerArguments(argv);
     requestId = parsed.requestId;
     const executable = (dependencies.executable ?? resolveManagerExecutableIdentity)();
+    const userRoot = dependencies.userRoot ?? resolveSealedTweakersManagerUserRoot;
+    const boundUserRoot = userRoot();
     // The status response and prepare/execute path must use the same fixed
     // adapter instance so allowedActions cannot advertise a capability that
     // the sealed process did not link.
-    const adapter = dependencies.adapter ?? createSealedTweakersManagerActionAdapter();
+    const adapter = dependencies.adapter ?? createSealedTweakersManagerActionAdapter({ userRoot: () => boundUserRoot });
+    const snapshot = (officialSourceVerification: "projected" | "strict" = "projected") => (dependencies.status ?? createTweakersManagerStatusSnapshot)({
+      executable,
+      paths: managerStatusPaths(boundUserRoot),
+      enabledActionIds: adapterActionIds(adapter),
+      officialSourceVerification,
+    });
     if (parsed.command === "status") {
-      const snapshot = (dependencies.status ?? createTweakersManagerStatusSnapshot)({
-        executable,
-        enabledActionIds: adapterActionIds(adapter),
-      });
+      const status = snapshot();
       const response: TweakersManagerStatusResponseV1 = {
-        protocolVersion: snapshot.protocolVersion,
-        managerId: snapshot.managerId,
+        protocolVersion: status.protocolVersion,
+        managerId: status.managerId,
         requestId: parsed.requestId,
-        generatedAt: snapshot.generatedAt,
-        stateToken: snapshot.stateToken,
-        status: snapshot.status,
-        actions: snapshot.actions,
+        generatedAt: status.generatedAt,
+        stateToken: status.stateToken,
+        status: status.status,
+        actions: publicStatusActions(status.actions),
+      };
+      writeJson(write, response);
+      return 0;
+    }
+
+    if (parsed.command === "official-source-registration") {
+      const status = snapshot("strict");
+      const response: TweakersManagerOfficialSourceRegistrationResponseV1 = {
+        protocolVersion: status.protocolVersion,
+        managerId: status.managerId,
+        requestId: parsed.requestId,
+        generatedAt: status.generatedAt,
+        stateToken: status.stateToken,
+        officialSourceRegistration: officialSourceRegistrationAction(status.actions),
       };
       writeJson(write, response);
       return 0;
@@ -302,6 +382,35 @@ function adapterActionIds(adapter: TweakersManagerActionAdapter): readonly Tweak
   return typeof candidate.actionIds === "function"
     ? (candidate.actionIds as () => readonly TweakersManagerActionIdV1[])()
     : [];
+}
+
+function publicStatusActions(
+  actions: ReturnType<typeof createTweakersManagerStatusSnapshot>["actions"],
+): ReturnType<typeof createTweakersManagerStatusSnapshot>["actions"] {
+  return PUBLIC_STATUS_ACTION_IDS
+    .map((actionId) => actions.find((action) => action.actionId === actionId))
+    .filter((action): action is ReturnType<typeof createTweakersManagerStatusSnapshot>["actions"][number] => action !== undefined);
+}
+
+function officialSourceRegistrationAction(
+  actions: ReturnType<typeof createTweakersManagerStatusSnapshot>["actions"],
+): TweakersManagerOfficialSourceRegistrationResponseV1["officialSourceRegistration"] {
+  const action = actions.find((candidate) => candidate.actionId === "official-source.register");
+  if (action?.actionId === "official-source.register") {
+    return {
+      actionId: "official-source.register",
+      available: action.available,
+      reason: action.reason,
+    };
+  }
+  // A status implementation that cannot account for this fixed internal
+  // action must fail closed. Do not infer availability from any source path,
+  // descriptor, or caller-provided input.
+  return {
+    actionId: "official-source.register",
+    available: false,
+    reason: "official-source registration is unavailable in this manager status snapshot",
+  };
 }
 
 function parsePrepareParameters(input: Uint8Array, actionId: TweakersManagerActionIdV1): Record<string, never> {
@@ -383,5 +492,23 @@ function isDirectExecution(): boolean {
 }
 
 if (isDirectExecution()) {
-  process.exitCode = await runTweakersManagerCli(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv[0] === OFFLINE_MIGRATION_MANAGER_RUN_COMMAND) {
+    // This fixed argv route is intentionally separate from the manager JSON
+    // protocol. The launcher itself proves launchd PID/plist/context binding.
+    runOfflineMigrationLauncherManagerCommand(argv);
+    process.exitCode = 0;
+  } else if (argv[0] === NATIVE_HISTORY_ACTIVATION_MANAGER_RUN_COMMAND) {
+    // Private launchd route: the runner authenticates its exact operation,
+    // context digest, manager generation, and launchd process before acting.
+    await runNativeHistoryActivationManagerCommand(argv);
+    process.exitCode = 0;
+  } else if ([PORTABLE_DESKTOP_PRELAUNCH_MANAGER_RUN_COMMAND, PORTABLE_DESKTOP_HANDOFF_OFFICIAL_MANAGER_RUN_COMMAND,
+    PORTABLE_DESKTOP_HANDOFF_TWEAKERS_MANAGER_RUN_COMMAND].some((command) => command === argv[0])) {
+    const result = runPortableDesktopManagerCommand(argv);
+    writeSync(1, `${JSON.stringify(result.result)}\n`);
+    process.exitCode = result.exitCode;
+  } else {
+    process.exitCode = await runTweakersManagerCli(argv);
+  }
 }

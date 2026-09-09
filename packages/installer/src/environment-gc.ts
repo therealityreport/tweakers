@@ -13,6 +13,7 @@ import {
 } from "./environment-transaction.js";
 import {
   assertEnvironmentModePairMaterialized,
+  environmentModeCacheGcEligibility,
   environmentModePairReceiptDigest,
   environmentModeCacheGenerationPaths,
   environmentModeCacheReachability,
@@ -248,7 +249,16 @@ function collectSnapshot(
       bytes: size.bytes,
     };
     if (storeUnsafeReason) return [{ ...base, action: "keep", reason: storeUnsafeReason }];
-    if (!record) return [{ ...base, action: "keep", reason: "no archived receipt owns this prepared directory" }];
+    if (!record) {
+      const v2Reason = cachePaths === undefined
+        ? null
+        : terminalUnreachableV2PreparedPayloadReason(cachePaths, transactionId);
+      if (v2Reason === null) {
+        return [{ ...base, action: "keep", reason: "no archived receipt owns this prepared directory" }];
+      }
+      if (size.error) return [{ ...base, action: "keep", reason: size.error }];
+      return [{ ...base, action: "delete", reason: v2Reason }];
+    }
     if (record.error || !receipt) return [{ ...base, action: "keep", reason: record.error ?? "receipt is invalid" }];
     if (currentReceipt?.transactionId === transactionId && !TERMINAL_PHASES.has(receipt.phase)) {
       return [{ ...base, action: "keep", reason: "referenced by the current environment transaction receipt" }];
@@ -485,18 +495,45 @@ function collectModeCacheSnapshot(paths: EnvironmentModeCachePaths): ModeCacheGc
       if (reachability === "post_cutover_recovery") {
         return { ...withReceipt, action: "keep", reason: "post-cutover reachability lacks a clear nonterminal recovery journal" };
       }
+      const eligibility = environmentModeCacheGcEligibility(receipt, current?.generationId ?? null);
+      if (!eligibility.eligible) {
+        return { ...withReceipt, action: "keep", reason: eligibility.reason };
+      }
       try {
         const payloadPaths = environmentModeGenerationPayloadPaths(generation);
         assertGenerationPayloadContained(paths, generation.generationRoot, payloadPaths);
         const bytes = payloadPaths.reduce((total, path) => total + (existsSync(path)
           ? directoryBytesWithoutFollowingSymlinks(path, generation.generationRoot)
           : 0), 0);
-        return { ...withReceipt, bytes, action: "delete", reason: "generation is unreachable and has no recovery owner" };
+        return { ...withReceipt, bytes, action: "delete", reason: eligibility.reason };
       } catch (error) {
         return { ...withReceipt, action: "keep", reason: `generation payload is unsafe or unreadable: ${errorMessage(error)}` };
       }
     });
   return { entries };
+}
+
+/**
+ * Schema-v2 prepares use the generation ID as the transaction ID, but do not
+ * archive a schema-v1 transaction receipt. A directory without that legacy
+ * receipt is therefore reclaimable only when its exact generation receipt is
+ * independently terminal and no longer reachable. Any absent, malformed,
+ * current, or pinned cache evidence remains an ownership boundary.
+ */
+function terminalUnreachableV2PreparedPayloadReason(
+  paths: EnvironmentModeCachePaths,
+  transactionId: string,
+): string | null {
+  try {
+    const current = readCurrentEnvironmentModePair(paths);
+    const receipt = readEnvironmentModePairGeneration(paths, transactionId);
+    if (receipt === null) return null;
+    const eligibility = environmentModeCacheGcEligibility(receipt, current?.generationId ?? null);
+    if (!eligibility.eligible) return null;
+    return `matching schema-v2 generation is ${eligibility.reason}`;
+  } catch {
+    return null;
+  }
 }
 
 function assertGenerationPayloadContained(

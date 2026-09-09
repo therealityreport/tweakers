@@ -7,10 +7,10 @@
  * We are in CJS land here (matches Electron's main process and Codex's own
  * code). The renderer-side runtime is bundled separately into preload.js.
  */
-import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, MenuItem, Notification, protocol, session, shell, systemPreferences, webContents, type OpenDialogOptions } from "electron";
+import { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, protocol, screen, session, shell, systemPreferences, webContents, type MessageBoxOptions, type OpenDialogOptions } from "electron";
 import { cpSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as originalFs from "original-fs";
-import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -19,6 +19,8 @@ import { pipeline } from "node:stream/promises";
 import { extract as extractTar, list as listTar } from "tar";
 import chokidar from "chokidar";
 import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
+import { ACCOUNTS_NATIVE_COMPATIBILITY_CHANNEL, readAccountsNativeCompatibility } from "./accounts-native-compatibility";
+import { invokeAccountsNativeBrowserAction } from "./accounts-native-browser";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
 import { applyHealthProbeDialogSuppression } from "./health-probe-dialog";
@@ -101,8 +103,31 @@ import {
   submitInstalledCliWithLaunchd,
   type LaunchdSubmitOptions,
 } from "./installed-cli-launch";
-import { createDesktopUpdateStartupReconciler } from "./desktop-update-startup";
-import { assertProtectedUpdateQuarantine } from "./protected-bootstrap";
+import {
+  assertTweakersVariantBootstrap,
+  desktopUpdateStartupEnabled,
+  publishIndependentTweakersRuntimeReadyReceipt,
+  type TweakersVariantFilesystem,
+} from "./desktop-update-startup";
+import {
+  AccountsBrokerSocketClientV1,
+  readAccountsBrokerSecret,
+  resolveAccountsBrokerRootResolution,
+} from "./account-router/broker-socket";
+import { readAccountsBrokerSetupState } from "./account-router/broker-readiness";
+import {
+  ACCOUNT_ROUTER_CONFIG_FILE,
+  readRouterLaunchSelection,
+} from "./account-router/config";
+import {
+  AccountsBrokerRendererAdapterV1,
+  type RendererBrokerEventV1,
+} from "./account-router/broker-adapter";
+import {
+  createOpaqueAppToolsRef,
+  createOpaqueRendererRef,
+} from "./account-router/broker";
+import type { AccountsBrokerIpcEnvelopeV1, BrokerResponseV1 } from "./account-router/types";
 import { dispatchCrossTweakRead } from "./cross-tweak-read";
 import {
   answerPromotionHealthRequest,
@@ -168,19 +193,20 @@ import {
   getCodexSparkleBridge,
   type SparkleAppcastMetadata,
 } from "./codex-sparkle-bridge";
-import { installCodexAppServerParent } from "./codex-app-server-parent";
+import { installCodexAppServerParent, resolveAccountsAuthorityMode } from "./codex-app-server-parent";
 import {
-  createCodexDesktopUpdateService,
-  type CodexDesktopUpdateCheckResult,
   type CodexDesktopUpdateMetadata,
   type CodexDesktopUpdateTarget,
 } from "./codex-desktop-update-service";
 import {
+  readTweakersManagerOfficialSourceRegistration,
+  readTweakersManagerStatus,
+  startTweakersManagerOfficialSourceRegistration,
+  startTweakersManagerAction,
+  type TweakersManagerStatus,
+} from "./tweakers-manager-client";
+import {
   environmentModeCacheMenuInputFromStatus,
-  syncCodexDesktopUpdateMenuLabel as syncCodexDesktopUpdateMenu,
-  syncEnvironmentModeCacheMenuItem,
-  type CodexDesktopUpdateMenuLike,
-  type EnvironmentModeCacheMenuInput,
 } from "./codex-desktop-update-menu";
 import {
   activeVerifiedCodexDesktopProfileIdentity,
@@ -226,6 +252,102 @@ if (!userRoot || !runtimeDir) {
 }
 
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
+const runningAppRoot = inferMacAppRoot();
+const derivedVariant = !desktopUpdateStartupEnabled(process.env, {
+  appPath: runningAppRoot,
+  bundleIdentifier: runningAppRoot ? readBundleIdentifier(runningAppRoot) : null,
+});
+// This is deliberately ahead of app-server interception and every tweak
+// lifecycle. A derived process that cannot prove its committed generation
+// never gets a chance to create a local broker, child, or renderer surface.
+// Electron's ordinary fs facade presents app.asar as a virtual directory.
+// The active-generation receipt must hash the physical archive and bundle, so
+// pass the adapter that bypasses Electron's ASAR virtualization. This is kept
+// local to the receipt verifier; process.noAsar is intentionally never set.
+assertTweakersVariantBootstrap({ fileSystem: originalFs as unknown as TweakersVariantFilesystem });
+const accountsBrokerRootResolution = resolveAccountsBrokerRootResolution({ userRoot, derivedVariant });
+const accountsBrokerRoot = accountsBrokerRootResolution.root;
+// This boolean is the only invalid-root fact passed to the app-server parent;
+// no raw alias value is projected to renderer or tweak code.
+const accountsBrokerRootConfigured = accountsBrokerRootResolution.configured;
+// This mode is chosen in main before any Accounts tweak code or renderer IPC
+// executes. It contains no path, config, secret, or broker-health details.
+const accountsAuthorityMode = resolveAccountsAuthorityMode({
+  userRoot,
+  brokerRoot: accountsBrokerRoot,
+  brokerRootConfigured: accountsBrokerRootConfigured,
+});
+Object.defineProperty(globalThis, "__tweakersAccountsDesktopProjectsEnabledV1", {
+  value: () => derivedVariant && accountsAuthorityMode === "global-v3",
+  configurable: false,
+  writable: false,
+});
+const DERIVED_VARIANT_ACTION_DISABLED_REASON =
+  "Independent Tweakers maintenance is available only through the verified global manager.";
+
+interface MainAccountsBrokerClient {
+  socket: AccountsBrokerSocketClientV1;
+  adapter: AccountsBrokerRendererAdapterV1;
+}
+
+/**
+ * An OAuth handoff is tied to one exact main-frame document, not merely the
+ * lifetime of its WebContents. The opaque context object is created by the
+ * main IPC handler and is the only capability a main tweak can forward back
+ * into the Accounts bridge; none of this state is exposed to a renderer.
+ */
+interface AccountsBrokerRendererInvocation {
+  readonly webContentsId: number;
+  readonly mainFrame: Electron.WebFrameMain;
+  readonly documentUrl: string;
+  readonly navigationEpoch: number;
+}
+
+interface AccountsBrokerNavigationTracker {
+  epoch: number;
+  readonly onNavigation: (
+    event: Electron.Event,
+    url: string,
+    isInPlace: boolean,
+    isMainFrame: boolean,
+  ) => void;
+}
+
+const SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL = "tweaker:shared-history-map-native-target";
+const SHARED_HISTORY_MAX_NATIVE_TARGET_IDS = 128;
+const SHARED_HISTORY_MAX_NATIVE_TARGET_ID_BYTES = 512;
+
+interface SharedHistoryNativeTargetRequestV1 {
+  version: 1;
+  conversationNativeId: string;
+  composerNativeId: string;
+  assistantTurnNativeIds: readonly string[];
+}
+
+type SharedHistoryNativeTargetResponseV1 =
+  | { version: 1; status: "mapped"; conversationId: `conversation_${string}`; turnIds: Array<`turn_${string}`> }
+  | { version: 1; status: "unavailable" };
+
+// Keep the owner-private capability in main only. The app-server parent gets
+// HMAC-derived endpoint refs at spawn time, never this value or a socket path.
+const accountsBrokerSecret = accountsBrokerRoot ? readAccountsBrokerSecret(accountsBrokerRoot) : null;
+const accountsBrokerClients = new Map<number, MainAccountsBrokerClient>();
+const accountsBrokerInvocationContexts = new WeakMap<object, AccountsBrokerRendererInvocation>();
+const accountsBrokerNavigationTrackers = new Map<number, AccountsBrokerNavigationTracker>();
+// A process-local nonce makes otherwise identical `webContents.id` values in
+// ChatGPT and the derived Tweakers app different broker principals. It stays
+// in main only; clients receive the derived HMAC refs, never this binding.
+const accountsBrokerSessionNonce = randomUUID();
+const accountsBrokerClientKind = derivedVariant ? "tweakers" as const : "chatgpt" as const;
+const accountsBrokerBundleIdentity = derivedVariant ? "co.tweakers.desktop" : "com.openai.chatgpt";
+
+function accountsBrokerIdentityBinding() {
+  return {
+    clientKind: accountsBrokerClientKind,
+    bundleIdentity: accountsBrokerBundleIdentity,
+    sessionNonce: accountsBrokerSessionNonce,
+  };
+}
 
 /**
  * How long a health process may take to answer the promotion request AFTER its
@@ -242,7 +364,397 @@ const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;
 // This keeps the locally signed desktop shell outside the native browser
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
-const codexAppServerParent = installCodexAppServerParent();
+const codexAppServerParent = installCodexAppServerParent({
+  secondaryVariant: derivedVariant,
+  secondaryVariantSharedSqliteHome: derivedVariant
+    ? process.env.CODEX_SQLITE_HOME
+    : undefined,
+  accountRouter: accountsBrokerRoot ? {
+    userRoot,
+    brokerRoot: accountsBrokerRoot,
+    brokerRootConfigured: accountsBrokerRootConfigured,
+    resolveBrokerDesktopIdentity: () => {
+      if (!accountsBrokerSecret) return null;
+      const owner = BrowserWindow.getFocusedWindow() ?? getPrimaryCodexWindow();
+      const webContentsId = owner?.webContents?.id;
+      if (!webContentsId || !ownedCodexRenderer(webContentsId)) return null;
+      const binding = accountsBrokerIdentityBinding();
+      return {
+        rendererRef: createOpaqueRendererRef(accountsBrokerSecret, webContentsId, binding),
+        appToolsRef: createOpaqueAppToolsRef(accountsBrokerSecret, webContentsId, binding),
+      };
+    },
+  } : {
+    userRoot,
+    brokerRoot: null,
+    brokerRootConfigured: accountsBrokerRootConfigured,
+  },
+});
+
+// Renderer identities are resolved at the main boundary and then converted to
+// HMAC-derived opaque refs. Neither a renderer nor a tweak receives the socket
+// path, the shared capability, or another desktop's endpoint.
+function accountsBrokerClientForRenderer(webContentsId: number): MainAccountsBrokerClient | null {
+  const renderer = ownedCodexRenderer(webContentsId);
+  if (accountsAuthorityMode !== "global-v3" || !accountsBrokerRoot || !accountsBrokerSecret || !renderer) return null;
+  const existing = accountsBrokerClients.get(webContentsId);
+  if (existing) return existing;
+  try {
+    const binding = accountsBrokerIdentityBinding();
+    const rendererRef = createOpaqueRendererRef(accountsBrokerSecret, webContentsId, binding);
+    const socket = new AccountsBrokerSocketClientV1({
+      root: accountsBrokerRoot,
+      secret: accountsBrokerSecret,
+      clientKind: accountsBrokerClientKind,
+      rendererRef,
+      appToolsRef: createOpaqueAppToolsRef(accountsBrokerSecret, webContentsId, binding),
+    });
+    const client = {
+      socket,
+      adapter: new AccountsBrokerRendererAdapterV1({ secret: accountsBrokerSecret, client: socket, rendererRef }),
+    } satisfies MainAccountsBrokerClient;
+    replaceAccountsBrokerClient(webContentsId, client);
+    renderer.once("destroyed", () => disposeAccountsBrokerClient(webContentsId, client));
+    if (renderer.isDestroyed()) {
+      disposeAccountsBrokerClient(webContentsId, client);
+      return null;
+    }
+    return client;
+  } catch {
+    return null;
+  }
+}
+
+function replaceAccountsBrokerClient(webContentsId: number, client: MainAccountsBrokerClient): void {
+  const previous = accountsBrokerClients.get(webContentsId);
+  accountsBrokerClients.set(webContentsId, client);
+  if (previous && previous !== client) closeAccountsBrokerClient(previous);
+}
+
+function disposeAccountsBrokerClient(webContentsId: number, expected?: MainAccountsBrokerClient): void {
+  const client = accountsBrokerClients.get(webContentsId);
+  if (!client || (expected && client !== expected)) return;
+  accountsBrokerClients.delete(webContentsId);
+  closeAccountsBrokerClient(client);
+}
+
+function closeAccountsBrokerClient(client: MainAccountsBrokerClient): void {
+  void client.socket.close().catch(() => {});
+}
+
+async function invokeAccountsBroker(
+  input: Readonly<{ webContentsId: number }>,
+  envelope: AccountsBrokerIpcEnvelopeV1,
+): Promise<BrokerResponseV1> {
+  const client = accountsBrokerClientForRenderer(input.webContentsId);
+  if (!client) {
+    markRuntimeReadyBrokerState(accountsAuthorityMode === "blocked" ? "blocked" : "unavailable");
+    const setupRequired = accountsAuthorityMode !== "legacy"
+      && ownedCodexRenderer(input.webContentsId) !== null
+      && readAccountsBrokerSetupState(accountsBrokerRoot) === "setup-required";
+    return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: false,
+      error: { code: setupRequired ? "broker_setup_required" : "broker_unavailable", retryable: !setupRequired } };
+  }
+  try {
+    const nativeParams = envelope.params && typeof envelope.params === "object" && !Array.isArray(envelope.params)
+      ? envelope.params as Record<string, unknown> : null;
+    if (envelope.command === "native.request" && nativeParams
+      && typeof nativeParams.method === "string" && nativeParams.method.startsWith("browser.")) {
+      const params = nativeParams;
+      const invocation = accountsBrokerInvocationContexts.get(input);
+      const translated = client.adapter.translateNativeBrowserRequest({ accountId: params.accountId, method: params.method, params: params.params });
+      if (!invocation || params.surface !== "plugins" || !translated || typeof params.accountId !== "string") {
+        return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: false, error: { code: "invalid_request", retryable: false } };
+      }
+      const result = await invokeAccountsNativeBrowserAction({ accountId: params.accountId, ...translated }, {
+        isCurrent: () => isTweakEnabled("co.tweakers.account-switcher") && isCurrentAccountsBrokerRendererInvocation(invocation, client),
+        compatibility: () => readAccountsNativeCompatibility(join(process.resourcesPath, "app.asar")),
+        bridge: () => (globalThis as any).__tweakersAccountsNativeMainV1,
+        context: (accountId) => client.adapter.resolveNativeBrowserContext(accountId),
+        request: (accountId, method, requestParams) => client.adapter.invokeNativeBrowserRequest(accountId, method, requestParams),
+      });
+      return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: true, result: { accountId: params.accountId, surface: "plugins", result } };
+    }
+    const response = await client.adapter.invoke(envelope);
+    markRuntimeReadyBrokerState(response.ok ? "connected" : "unavailable");
+    if (isMcpOAuthAuthorizationRequest(envelope)) {
+      const invocation = accountsBrokerInvocationContexts.get(input);
+      if (!invocation || invocation.webContentsId !== input.webContentsId) {
+        return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: false, error: { code: "broker_unavailable", retryable: true } };
+      }
+      return consumeMcpOAuthAuthorizationHandoff(invocation, envelope, client, response);
+    }
+    return response;
+  } catch {
+    markRuntimeReadyBrokerState("unavailable");
+    return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: false, error: { code: "broker_unavailable", retryable: true } };
+  }
+}
+
+/**
+ * OAuth URLs are an initiating-renderer-bound, main-process-only handoff.
+ * The broker adapter has already validated the private account/definition
+ * binding and safe HTTPS URL; this boundary rechecks the public binding before
+ * asking the operating system to open it, then returns only connection state.
+ * No tweak or renderer receives the provider URL.
+ */
+async function consumeMcpOAuthAuthorizationHandoff(
+  input: AccountsBrokerRendererInvocation,
+  envelope: AccountsBrokerIpcEnvelopeV1,
+  client: MainAccountsBrokerClient,
+  response: BrokerResponseV1,
+): Promise<BrokerResponseV1> {
+  const handoff = validatedMcpOAuthAuthorizationHandoff(envelope, response);
+  if (!handoff) {
+    return { version: 1, requestId: accountsBrokerRequestId(envelope), ok: false, error: { code: "provider_confirmation_required", retryable: false } };
+  }
+  // The initiating document can disappear or be replaced while the private
+  // broker request is pending. Never let that stale response launch a browser
+  // for a later account/connection selection or a destroyed renderer.
+  if (!isCurrentAccountsBrokerRendererInvocation(input, client)) {
+    return { version: 1, requestId: handoff.requestId, ok: false, error: { code: "broker_unavailable", retryable: true } };
+  }
+  try {
+    await shell.openExternal(handoff.oauthUrl);
+  } catch {
+    return { version: 1, requestId: handoff.requestId, ok: false, error: { code: "broker_unavailable", retryable: true } };
+  }
+  return {
+    version: 1,
+    requestId: handoff.requestId,
+    ok: true,
+    result: { accountId: handoff.accountId, connections: [handoff.connection] },
+  };
+}
+
+function accountsBrokerInvocationForMainFrame(
+  event: Electron.IpcMainInvokeEvent,
+  renderer: Electron.WebContents,
+): AccountsBrokerRendererInvocation | null {
+  const mainFrame = event.senderFrame;
+  if (!mainFrame || mainFrame !== renderer.mainFrame) return null;
+  const tracker = accountsBrokerNavigationTracker(renderer);
+  return Object.freeze({
+    webContentsId: renderer.id,
+    mainFrame,
+    documentUrl: mainFrame.url,
+    navigationEpoch: tracker.epoch,
+  });
+}
+
+function accountsBrokerNavigationTracker(renderer: Electron.WebContents): AccountsBrokerNavigationTracker {
+  const existing = accountsBrokerNavigationTrackers.get(renderer.id);
+  if (existing) return existing;
+  const tracker: AccountsBrokerNavigationTracker = {
+    epoch: 0,
+    onNavigation: (_event, _url, _isInPlace, isMainFrame) => {
+      // The old document is not permitted to finish an OAuth handoff once a
+      // main-frame navigation or reload has begun, even before it commits.
+      if (isMainFrame) tracker.epoch += 1;
+    },
+  };
+  accountsBrokerNavigationTrackers.set(renderer.id, tracker);
+  renderer.on("did-start-navigation", tracker.onNavigation);
+  renderer.once("destroyed", () => {
+    renderer.removeListener("did-start-navigation", tracker.onNavigation);
+    if (accountsBrokerNavigationTrackers.get(renderer.id) === tracker) accountsBrokerNavigationTrackers.delete(renderer.id);
+  });
+  return tracker;
+}
+
+/** Exact sender document proof checked after every asynchronous OAuth wait. */
+function isCurrentAccountsBrokerRendererInvocation(
+  input: AccountsBrokerRendererInvocation,
+  client: MainAccountsBrokerClient,
+): boolean {
+  const renderer = ownedCodexRenderer(input.webContentsId);
+  const tracker = accountsBrokerNavigationTrackers.get(input.webContentsId);
+  const current = renderer && tracker ? {
+    webContentsId: renderer.id,
+    mainFrame: renderer.mainFrame,
+    documentUrl: renderer.mainFrame.url,
+    navigationEpoch: tracker.epoch,
+  } : null;
+  return accountsBrokerClients.get(input.webContentsId) === client
+    && isSameAccountsBrokerDocument(input, current);
+}
+
+/** Pure comparison kept separately testable for same-WebContents reload races. */
+function isSameAccountsBrokerDocument(
+  input: Readonly<{ webContentsId: number; mainFrame: object; documentUrl: string; navigationEpoch: number }>,
+  current: Readonly<{ webContentsId: number; mainFrame: object; documentUrl: string; navigationEpoch: number }> | null,
+): boolean {
+  return current !== null
+    && input.webContentsId === current.webContentsId
+    && input.mainFrame === current.mainFrame
+    && input.documentUrl === current.documentUrl
+    && input.navigationEpoch === current.navigationEpoch;
+}
+
+function isMcpOAuthAuthorizationRequest(envelope: AccountsBrokerIpcEnvelopeV1): boolean {
+  if (envelope.command !== "connection.authorize" || !isMainRecord(envelope.params)) return false;
+  const params = envelope.params;
+  return Object.keys(params).sort().join("\0") === ["accountId", "connectionId", "surface"].join("\0")
+    && isMainPublicAccountId(params.accountId)
+    && isMainPublicConnectionId(params.connectionId)
+    && params.surface === "mcp";
+}
+
+function validatedMcpOAuthAuthorizationHandoff(
+  envelope: AccountsBrokerIpcEnvelopeV1,
+  response: BrokerResponseV1,
+): { requestId: string; accountId: string; connection: Record<string, unknown>; oauthUrl: string } | null {
+  if (!isMcpOAuthAuthorizationRequest(envelope) || !response.ok || response.requestId !== envelope.requestId || !isMainRecord(response.result)) return null;
+  const params = envelope.params as Record<string, unknown>;
+  const result = response.result;
+  if (Object.keys(result).sort().join("\0") !== ["accountId", "connections", "oauthUrl"].join("\0")
+    || result.accountId !== params.accountId || !isHostSafeOAuthUrl(result.oauthUrl) || !Array.isArray(result.connections) || result.connections.length !== 1) return null;
+  const connection = result.connections[0];
+  if (!isMainRecord(connection)
+    || Object.keys(connection).sort().join("\0") !== ["authorizationAvailable", "connectionId", "label", "status", "surface"].join("\0")
+    || connection.connectionId !== params.connectionId || connection.surface !== "mcp" || connection.authorizationAvailable !== true
+    || typeof connection.label !== "string" || connection.label.length < 1 || connection.label.length > 128 || /[\u0000-\u001f\u007f]/.test(connection.label)
+    || !["connected", "setup_required", "expired", "unavailable"].includes(String(connection.status))) return null;
+  return { requestId: response.requestId, accountId: result.accountId as string, connection, oauthUrl: result.oauthUrl };
+}
+
+function isHostSafeOAuthUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 12 || value.length > 2_048) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.hash || (url.port && url.port !== "443")) return false;
+    for (const [key, item] of url.searchParams) {
+      if (/^(?:access_?token|refresh_?token|id_?token|token|code|client_?secret|credential|cookie)$/i.test(key)) return false;
+      if (/(?:bearer\s+|sk-[A-Za-z0-9]|\/auth\.json|BEGIN [A-Z ]+PRIVATE KEY)/i.test(item)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isMainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isMainPublicAccountId(value: unknown): value is string {
+  return typeof value === "string" && /^account_[A-Za-z0-9_-]{16,128}$/.test(value);
+}
+
+function isMainPublicConnectionId(value: unknown): value is string {
+  return typeof value === "string" && /^connection_[A-Za-z0-9_-]{16,128}$/.test(value);
+}
+
+function markRuntimeReadyBrokerState(state: RuntimeReadyBrokerState): void {
+  runtimeReadyBrokerState = state;
+  tryWriteRuntimeReadyReceipt();
+}
+
+function subscribeAccountsBroker(
+  input: Readonly<{ webContentsId: number }>,
+  handler: (event: RendererBrokerEventV1) => void,
+): () => void {
+  if (typeof handler !== "function") return () => {};
+  const client = accountsBrokerClientForRenderer(input.webContentsId);
+  return client ? client.adapter.subscribe(handler) : () => {};
+}
+
+function accountsBrokerRequestId(value: unknown): string {
+  return value && typeof value === "object" && typeof (value as { requestId?: unknown }).requestId === "string"
+    && /^[A-Za-z0-9_-]{1,128}$/.test((value as { requestId: string }).requestId)
+    ? (value as { requestId: string }).requestId
+    : "invalid";
+}
+
+/**
+ * The privileged preload owns native DOM identifiers. This runtime-only
+ * channel maps them through the renderer-bound broker adapter, then drops
+ * every native identifier before replying. It is deliberately not part of
+ * the Accounts tweak IPC surface or BrokerCommandV1 vocabulary.
+ */
+async function mapSharedHistoryNativeTarget(
+  webContentsId: number,
+  payload: unknown,
+): Promise<SharedHistoryNativeTargetResponseV1> {
+  const request = parseSharedHistoryNativeTargetRequest(payload);
+  const client = request ? accountsBrokerClientForRenderer(webContentsId) : null;
+  if (!request || !client) return sharedHistoryTargetUnavailable();
+  try {
+    const mapped = await client.adapter.mapBoundNativeTargets(request);
+    return publicSharedHistoryTargetResponse(request, mapped);
+  } catch {
+    return sharedHistoryTargetUnavailable();
+  }
+}
+
+function parseSharedHistoryNativeTargetRequest(value: unknown): SharedHistoryNativeTargetRequestV1 | null {
+  if (!isExactRecord(value, ["assistantTurnNativeIds", "composerNativeId", "conversationNativeId", "version"])
+    || value.version !== 1
+    || !isBoundedNativeTargetId(value.conversationNativeId)
+    || !isBoundedNativeTargetId(value.composerNativeId)
+    || !Array.isArray(value.assistantTurnNativeIds)
+    || value.assistantTurnNativeIds.length > SHARED_HISTORY_MAX_NATIVE_TARGET_IDS
+    || !value.assistantTurnNativeIds.every(isBoundedNativeTargetId)) return null;
+  const ids = new Set(value.assistantTurnNativeIds);
+  if (ids.size !== value.assistantTurnNativeIds.length) return null;
+  return {
+    version: 1,
+    conversationNativeId: value.conversationNativeId,
+    composerNativeId: value.composerNativeId,
+    assistantTurnNativeIds: value.assistantTurnNativeIds,
+  };
+}
+
+function publicSharedHistoryTargetResponse(
+  request: SharedHistoryNativeTargetRequestV1,
+  value: unknown,
+): SharedHistoryNativeTargetResponseV1 {
+  if (isExactRecord(value, ["status", "version"]) && value.version === 1 && value.status === "unavailable") {
+    return sharedHistoryTargetUnavailable();
+  }
+  if (!isExactRecord(value, ["conversationId", "status", "turnIds", "version"])
+    || value.version !== 1
+    || value.status !== "mapped"
+    || !isPublicSharedHistoryConversationId(value.conversationId)
+    || !Array.isArray(value.turnIds)
+    || value.turnIds.length !== request.assistantTurnNativeIds.length) return sharedHistoryTargetUnavailable();
+
+  const turnIds: Array<`turn_${string}`> = [];
+  const publicIds = new Set<string>();
+  for (const turnId of value.turnIds) {
+    if (!isPublicSharedHistoryTurnId(turnId) || publicIds.has(turnId)) return sharedHistoryTargetUnavailable();
+    publicIds.add(turnId);
+    turnIds.push(turnId);
+  }
+  return { version: 1, status: "mapped", conversationId: value.conversationId, turnIds };
+}
+
+function sharedHistoryTargetUnavailable(): SharedHistoryNativeTargetResponseV1 {
+  return { version: 1, status: "unavailable" };
+}
+
+function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function isBoundedNativeTargetId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= SHARED_HISTORY_MAX_NATIVE_TARGET_ID_BYTES
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function isPublicSharedHistoryConversationId(value: unknown): value is `conversation_${string}` {
+  return typeof value === "string" && /^conversation_[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+function isPublicSharedHistoryTurnId(value: unknown): value is `turn_${string}` {
+  return typeof value === "string" && /^turn_[A-Za-z0-9_-]{43}$/.test(value);
+}
 
 // Same seam, same reason: OpenAI's main captures `dialog` when it loads, so a
 // disposable health process has to be blinded to modal panels before that
@@ -269,12 +781,20 @@ const MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({
 });
 const CODEX_CONFIG_FILE = MCP_RUNTIME_PATHS.configPath;
 const INSTALLER_STATE_FILE = join(userRoot, "state.json");
-const UPDATE_MODE_FILE = join(userRoot, "update-mode.json");
 const SELF_UPDATE_STATE_FILE = join(userRoot, "self-update-state.json");
 const MCP_SYNC_STATE_FILE = MCP_RUNTIME_PATHS.statePath;
 const ENVIRONMENT_SELECTION_FILE = join(userRoot, "environment-selection.json");
 const ENVIRONMENT_REGISTRY_FILE = join(userRoot, "environment-registry.json");
 const ENVIRONMENT_RUNTIME_PROOF_FILE = join(userRoot, "environment-runtime-proof.json");
+// A manager-staged expectation turns the post-promotion readiness file into a
+// one-use, operation-bound receipt. It is optional for older transactions;
+// when absent we retain the existing environment-runtime-proof compatibility
+// path without inventing an operation identity.
+const RUNTIME_READY_EXPECTATION_FILE = join(userRoot, "runtime-ready-expectation.json");
+const RUNTIME_READY_FILE = join(userRoot, "runtime-ready.json");
+const INDEPENDENT_TWEAKERS_LIVE_HEALTH_FILE = join(userRoot, "independent-live-health.json");
+const INDEPENDENT_TWEAKERS_APP_ROOT = "/Applications/Tweakers.app";
+const INDEPENDENT_TWEAKERS_BUNDLE_ID: "com.therealityreport.tweakers" = "com.therealityreport.tweakers";
 const ENVIRONMENT_STATUS_TIMEOUT_MS = 60_000;
 const ENVIRONMENT_PREPARE_TIMEOUT_MS = 15 * 60_000;
 const ENVIRONMENT_ACTION_TIMEOUT_MS = 30_000;
@@ -283,6 +803,30 @@ const TWEAK_CATALOG_FILE = join(runtimeDir, "catalog.json");
 const TWEAK_BUNDLED_SOURCE_DIR = join(runtimeDir, "tweaks");
 const TWEAK_LIFECYCLE_FILE = join(userRoot, "tweak-lifecycle.json");
 const TWEAK_STARTUP_TIMEOUT_ENV = "TWEAKERS_TWEAK_STARTUP_TIMEOUT_MS";
+let runtimeReadyPreloadInitialized = false;
+let runtimeReadyMainInitialized = false;
+let runtimeReadyPublished = false;
+let runtimeReadySettingsMounted = false;
+type RuntimeReadyBrokerState = "connected" | "unavailable" | "blocked";
+let runtimeReadyBrokerState: RuntimeReadyBrokerState | null = null;
+let runtimeReadySettingsOpenTimer: ReturnType<typeof setInterval> | null = null;
+const RUNTIME_READY_SETTINGS_OPEN_INTERVAL_MS = 2_000;
+const RUNTIME_READY_SETTINGS_OPEN_ACK_GRACE_MS = 6_000;
+const RUNTIME_READY_SETTINGS_OPEN_DEADLINE_MS = 45_000;
+const RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS = 30;
+let runtimeReadySettingsOpenAttemptCount = 0;
+let runtimeReadySettingsOpenAttemptOperationId: string | null = null;
+let runtimeReadySettingsOpenTerminalOperationId: string | null = null;
+let independentTweakersLiveHealth: IndependentTweakersLiveHealthV1 | null = null;
+let independentTweakersLiveHealthCapture: Promise<void> | null = null;
+let independentTweakersZoomNormalized = false;
+let independentTweakersBrokerProbeInFlight = false;
+
+if (derivedVariant) {
+  // A receipt belongs to one process and one manager operation. Never let a
+  // newly launched process inherit proof from a prior promotion.
+  try { rmSync(RUNTIME_READY_FILE, { force: true }); } catch {}
+}
 const healthOriginalMain = healthCheckOnly
   && process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
 
@@ -352,7 +896,6 @@ if (!healthCheckOnly) {
     log("warn", "single-instance lock setup failed", { message: (error as Error).message });
   }
 }
-const SIGNED_CODEX_BACKUP = join(userRoot, "backup", "Codex.app");
 const TWEAKER_VERSION = "1.0.0";
 const TWEAKER_REPO = "therealityreport/tweakers";
 const TWEAK_STORE_INDEX_URL = process.env.TWEAKER_STORE_INDEX_URL
@@ -434,11 +977,6 @@ interface PersistedState {
     }>>;
     /** Captures are profile/identity scoped. Native request headers are never persisted. */
     codexDesktopProfileFeeds?: Partial<Record<"stable" | "alpha", CapturedCodexDesktopProfileFeed>>;
-    codexDesktopUpdateNotification?: {
-      marketingVersion: string | null;
-      build: string | null;
-      notifiedAt: string;
-    };
   };
   /** Per-tweak enable flags. Missing entries default to enabled. */
   tweaks?: Record<string, { enabled?: boolean }>;
@@ -456,6 +994,101 @@ interface TweakerUpdateCheck {
   releaseNotes: string | null;
   updateAvailable: boolean;
   error?: string;
+}
+
+interface IndependentManagerStatusProjection {
+  deploymentKind: "injected" | "independent";
+  manager: {
+    available: boolean;
+    reason: string | null;
+    status: TweakersManagerStatus["status"] | null;
+    actions: TweakersManagerStatus["actions"];
+  };
+}
+
+const INDEPENDENT_MANAGER_STARTUP_REASON =
+  "Tweakers is finishing its verified refresh. Manager status will be available after startup.";
+
+/**
+ * A manager-owned promotion verifies its freshly opened renderer on a strict
+ * deadline. Manager status currently performs signed executable and app
+ * validation in child processes; invoking that synchronous path from an IPC
+ * handler blocks Electron's main thread and can prevent the renderer from
+ * publishing the very receipt the manager is awaiting. The operation-bound
+ * expectation is stronger authority than a status refresh, so defer only
+ * those read projections until the receipt has been published.
+ */
+function independentRuntimeReadyCommitPending(): boolean {
+  return derivedVariant && readRuntimeReadyExpectation() !== null;
+}
+
+function independentManagerStatusDeferredForRuntimeReady(): boolean {
+  return !runtimeReadyPublished && independentRuntimeReadyCommitPending();
+}
+
+function independentManagerStatusProjection(): IndependentManagerStatusProjection {
+  if (!derivedVariant) {
+    return {
+      deploymentKind: "injected",
+      manager: { available: false, reason: null, status: null, actions: [] },
+    };
+  }
+  if (independentManagerStatusDeferredForRuntimeReady()) {
+    return {
+      deploymentKind: "independent",
+      manager: {
+        available: false,
+        reason: INDEPENDENT_MANAGER_STARTUP_REASON,
+        status: null,
+        actions: [],
+      },
+    };
+  }
+  try {
+    const status = readTweakersManagerStatus();
+    return {
+      deploymentKind: "independent",
+      manager: { available: true, reason: null, status: status.status, actions: status.actions },
+    };
+  } catch {
+    // An independent app must not revive any legacy control plane just because
+    // the global manager descriptor is absent, stale, or untrusted.
+    return {
+      deploymentKind: "independent",
+      manager: {
+        available: false,
+        reason: "The verified global Tweakers manager is unavailable. This app is read-only until manager authority is restored.",
+        status: null,
+        actions: [],
+      },
+    };
+  }
+}
+
+function derivedVariantActionBlocked(action: string): {
+  started: false;
+  disabled: true;
+  action: string;
+  reason: string;
+} {
+  return {
+    started: false,
+    disabled: true,
+    action,
+    reason: DERIVED_VARIANT_ACTION_DISABLED_REASON,
+  };
+}
+
+function derivedVariantTweakerUpdateCheck(): TweakerUpdateCheck {
+  return {
+    checkedAt: new Date().toISOString(),
+    currentVersion: TWEAKER_VERSION,
+    latestVersion: null,
+    releaseUrl: null,
+    releaseNotes: null,
+    updateAvailable: false,
+    error: DERIVED_VARIANT_ACTION_DISABLED_REASON,
+  };
 }
 
 type SelfUpdateChannel = "stable" | "prerelease" | "custom";
@@ -569,7 +1202,10 @@ const codexCliBootstrap = applyManagedCodexCliLaneAtBootstrap({
     writeState(state);
   },
 });
-if (!healthCheckOnly) writeEnvironmentRuntimeProof();
+// The schema-v2 environment proof belongs only to the injected ChatGPT mode
+// transaction. Independent Tweakers has its own operation-bound runtime-ready
+// receipt and deliberately has no injected managed-runtime/current tree.
+if (!healthCheckOnly && !derivedVariant) writeEnvironmentRuntimeProof();
 
 const CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases?per_page=100";
 const MAX_CODEX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
@@ -609,198 +1245,6 @@ const codexCliManager = createCodexCliManager({
   deps: createCodexCliManagerDependencies(),
 });
 if (!healthCheckOnly) codexCliManager.recover();
-
-const CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL = "tweaker:codex-desktop-update-changed";
-let lastPublishedCodexDesktopUpdate: CodexDesktopUpdateCheckResult | null = null;
-let lastObservedEnvironmentModeCache: EnvironmentModeCacheMenuInput | null = null;
-let originalSetApplicationMenu: typeof Menu.setApplicationMenu | null = null;
-
-function desktopUpdateResultWithNativeState(
-  result: CodexDesktopUpdateCheckResult,
-): CodexDesktopUpdateCheckResult {
-  const bridge = getCodexSparkleBridge();
-  const sparkle = bridge.getSnapshot();
-  return {
-    ...result,
-    installed: { ...result.installed },
-    latest: { ...result.latest },
-    nativeUpdateControlActive: bridge.nativeUpdateControlActive(),
-    javaScriptUpdaterManagerAvailable: sparkle.available,
-    javaScriptUpdaterManagerReason: sparkle.available
-      ? null
-      : "OpenAI's JavaScript updater manager did not initialize the native Sparkle bridge.",
-  };
-}
-
-function publishCodexDesktopUpdateResult(result: CodexDesktopUpdateCheckResult): void {
-  getCodexSparkleBridge().setSafeUpdateAvailable(result.status === "update-available");
-  const published = desktopUpdateResultWithNativeState(result);
-  lastPublishedCodexDesktopUpdate = published;
-  broadcastCodexDesktopUpdateResult(published);
-}
-
-function selectedDesktopUpdateSetupResult(): CodexDesktopUpdateCheckResult | null {
-  const target = selectedCodexDesktopUpdateTarget();
-  if (target.available || !target.setupRequired) return null;
-  return {
-    schemaVersion: 1,
-    status: "unavailable",
-    profile: target.profile,
-    installed: { marketingVersion: null, build: null },
-    latest: { marketingVersion: null, build: null },
-    checkedAt: new Date().toISOString(),
-    reason: target.unavailableReason,
-    retryRequested: false,
-    updateAndReloadRequested: false,
-    setupRequired: target.setupRequired,
-  };
-}
-
-function broadcastCodexDesktopUpdateResult(result: CodexDesktopUpdateCheckResult): void {
-  rebuildCodexDesktopUpdateMenu(result);
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
-    window.webContents.send(CODEX_DESKTOP_UPDATE_CHANGED_CHANNEL, result);
-  }
-}
-
-function syncCodexDesktopUpdateMenuBeforeAttach(
-  menu: Electron.Menu,
-  result: CodexDesktopUpdateCheckResult | null,
-): void {
-  syncCodexDesktopUpdateMenu(menu as unknown as CodexDesktopUpdateMenuLike, result?.status === "update-available", () => {
-    void requestCodexDesktopManualCheck("application-menu");
-  }, !!result?.setupRequired);
-  if (lastObservedEnvironmentModeCache) {
-    syncEnvironmentModeCacheMenuItem(
-      menu as unknown as CodexDesktopUpdateMenuLike,
-      lastObservedEnvironmentModeCache,
-      (item) => new MenuItem(item) as unknown as CodexDesktopUpdateMenuLike["items"][number],
-    );
-  }
-}
-
-function publishEnvironmentModeCacheMenuStatus(input: EnvironmentModeCacheMenuInput): void {
-  lastObservedEnvironmentModeCache = input;
-  const applicationMenu = Menu.getApplicationMenu();
-  if (!applicationMenu || !originalSetApplicationMenu) return;
-  if (!syncEnvironmentModeCacheMenuItem(
-    applicationMenu as unknown as CodexDesktopUpdateMenuLike,
-    input,
-    (item) => new MenuItem(item) as unknown as CodexDesktopUpdateMenuLike["items"][number],
-  )) return;
-  Reflect.apply(originalSetApplicationMenu, Menu, [applicationMenu]);
-}
-
-function rebuildCodexDesktopUpdateMenu(result: CodexDesktopUpdateCheckResult): void {
-  const applicationMenu = Menu.getApplicationMenu();
-  if (!applicationMenu || !originalSetApplicationMenu) return;
-  try {
-    const template = applicationMenu.items.map(
-      (item) => item as unknown as Electron.MenuItemConstructorOptions,
-    );
-    const rebuilt = Menu.buildFromTemplate(template);
-    syncCodexDesktopUpdateMenuBeforeAttach(rebuilt, result);
-    Reflect.apply(originalSetApplicationMenu, Menu, [rebuilt]);
-  } catch (error) {
-    log("warn", "desktop update menu rebuild failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-function installCodexDesktopUpdateMenuReplay(): void {
-  const setApplicationMenu = Menu.setApplicationMenu;
-  originalSetApplicationMenu = setApplicationMenu;
-  try {
-    Menu.setApplicationMenu = function tweakerSetApplicationMenu(menu: Electron.Menu | null): void {
-      if (menu) {
-        syncCodexDesktopUpdateMenuBeforeAttach(
-          menu,
-          lastPublishedCodexDesktopUpdate ?? selectedDesktopUpdateSetupResult(),
-        );
-      }
-      Reflect.apply(setApplicationMenu, Menu, [menu]);
-    };
-  } catch (error) {
-    log("warn", "desktop update menu replay unavailable", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-installCodexDesktopUpdateMenuReplay();
-
-const codexDesktopUpdateService = createCodexDesktopUpdateService({
-  resolveTarget: async () => selectedCodexDesktopUpdateTarget(),
-  refreshMetadata: refreshCodexDesktopUpdateMetadata,
-  showDialog: async (options) => dialog.showMessageBox({
-    type: options.type,
-    title: options.title,
-    message: options.message,
-    detail: options.detail,
-    buttons: options.buttons,
-    defaultId: options.defaultId,
-    cancelId: options.cancelId,
-    noLink: options.noLink,
-  }),
-  startUpdateAndReload: startCodexDesktopUpdateTransaction,
-  onResult: publishCodexDesktopUpdateResult,
-});
-
-async function requestCodexDesktopManualCheck(source: "application-menu" | "native-sparkle"): Promise<void> {
-  const sparkle = getCodexSparkleBridge().getSnapshot();
-  if (!sparkle.available) {
-    log("warn", "desktop JavaScript updater manager unavailable; using Tweakers metadata service", {
-      source,
-      reason: sparkle.installPrerequisiteFailure,
-    });
-  }
-  await codexDesktopUpdateService.checkAndPresent();
-}
-
-const PROACTIVE_DESKTOP_UPDATE_INITIAL_DELAY_MS = 15_000;
-const PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
-
-function scheduleProactiveDesktopUpdateChecks(): void {
-  const schedule = (delay: number): void => {
-    const timer = setTimeout(() => {
-      void runProactiveDesktopUpdateCheck().then(
-        () => schedule(PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS),
-        (error) => {
-          log("warn", "proactive desktop update check failed", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-          schedule(PROACTIVE_DESKTOP_UPDATE_INTERVAL_MS);
-        },
-      );
-    }, delay);
-    timer.unref?.();
-  };
-  schedule(PROACTIVE_DESKTOP_UPDATE_INITIAL_DELAY_MS);
-}
-
-async function runProactiveDesktopUpdateCheck(): Promise<void> {
-  const result = await codexDesktopUpdateService.checkSilently();
-  if (result.status !== "update-available") return;
-  const state = readState();
-  const prior = state.tweaker?.codexDesktopUpdateNotification;
-  if (prior?.marketingVersion === result.latest.marketingVersion && prior.build === result.latest.build) return;
-  if (!Notification.isSupported()) return;
-  const version = result.latest.marketingVersion ?? "a newer version";
-  const build = result.latest.build ? ` (build ${result.latest.build})` : "";
-  new Notification({
-    title: "ChatGPT Update Available",
-    body: `${version}${build} is available. Use Check for Updates… or Update and Reload.`,
-  }).show();
-  state.tweaker ??= {};
-  state.tweaker.codexDesktopUpdateNotification = {
-    marketingVersion: result.latest.marketingVersion,
-    build: result.latest.build,
-    notifiedAt: new Date().toISOString(),
-  };
-  writeState(state);
-}
 
 function createCodexCliManagerDependencies(): CodexCliManagerDependencies {
   return {
@@ -1151,7 +1595,7 @@ function lifecycleStartupTimeoutMs(): number {
 beginTweakLifecycleAttempt();
 
 function installSparkleUpdateHook(): void {
-  if (process.platform !== "darwin") return;
+  if (process.platform !== "darwin" || (!healthCheckOnly && !derivedVariant)) return;
 
   const Module = require("node:module") as typeof import("node:module") & {
     _load?: (request: string, parent: unknown, isMain: boolean) => unknown;
@@ -1168,103 +1612,19 @@ function installSparkleUpdateHook(): void {
   };
 }
 
-function restorePristineCodexApp(backup: string, appRoot: string): void {
-  // Prefer an APFS clonefile (near-instant copy-on-write) over ditto's full
-  // ~1.4 GB byte copy that stalled the Electron main thread. `cp -Rc` clones
-  // on the same volume; clone into a sibling, then atomically rename into
-  // place so the running bundle is swapped, not mutated underneath the live
-  // process. Any failure (cross-volume, no clonefile support, etc.) falls
-  // back to the exact previous behavior: a `ditto` overlay.
-  const staged = `${appRoot}.tweakers-sparkle-restore`;
-  try { rmSync(staged, { recursive: true, force: true }); } catch {}
-  try {
-    execFileSync("/bin/cp", ["-Rc", backup, staged], { stdio: "ignore" });
-    rmSync(appRoot, { recursive: true, force: true });
-    renameSync(staged, appRoot);
-    return;
-  } catch {
-    try { rmSync(staged, { recursive: true, force: true }); } catch {}
-  }
-  execFileSync("ditto", [backup, appRoot], { stdio: "ignore" });
-}
-
-function prepareSignedCodexForSparkleInstall(): boolean {
-  if (process.platform !== "darwin") return false;
-  if (existsSync(UPDATE_MODE_FILE)) {
-    log("info", "Sparkle update prep skipped; update mode already active");
-    return true;
-  }
-  if (!existsSync(SIGNED_CODEX_BACKUP)) {
-    log("warn", "Sparkle update prep skipped; signed Codex.app backup is missing");
-    return false;
-  }
-  if (!isDeveloperIdSignedApp(SIGNED_CODEX_BACKUP)) {
-    log("warn", "Sparkle update prep skipped; Codex.app backup is not Developer ID signed");
-    return false;
-  }
-
-  const state = readInstallerState();
-  const appRoot = state?.appRoot ?? inferMacAppRoot();
-  if (!appRoot) {
-    log("warn", "Sparkle update prep skipped; could not infer Codex.app path");
-    return false;
-  }
-
-  const mode = {
-    enabledAt: new Date().toISOString(),
-    appRoot,
-    codexVersion: state?.codexVersion ?? null,
-  };
-  try {
-    restorePristineCodexApp(SIGNED_CODEX_BACKUP, appRoot);
-    try {
-      execFileSync("xattr", ["-dr", "com.apple.quarantine", appRoot], { stdio: "ignore" });
-    } catch {}
-    // Commit update mode only after the pristine bundle is fully restored.
-    // An interrupted restore must never leave a marker that authorizes Sparkle.
-    writeFileSync(UPDATE_MODE_FILE, JSON.stringify(mode, null, 2));
-    log("info", "Restored signed Codex.app before Sparkle install", { appRoot });
-    return true;
-  } catch (e) {
-    try { rmSync(UPDATE_MODE_FILE, { force: true }); } catch {}
-    log("error", "Failed to restore signed Codex.app before Sparkle install", {
-      message: (e as Error).message,
-    });
-    throw e;
-  }
-}
-
-function codexDesktopInstallPrerequisiteFailure(): string | null {
-  if (!existsSync(SIGNED_CODEX_BACKUP)) {
-    return "The verified Developer ID signed Codex.app backup is missing. Refresh Tweakers before installing the desktop update.";
-  }
-  if (!isDeveloperIdSignedApp(SIGNED_CODEX_BACKUP)) {
-    return "The Codex.app backup is not Developer ID signed. Refresh Tweakers before installing the desktop update.";
-  }
-  if (!(readInstallerState()?.appRoot ?? inferMacAppRoot())) {
-    return "Tweakers could not determine the installed Codex.app location.";
-  }
-  return null;
-}
-
-function isDeveloperIdSignedApp(appRoot: string): boolean {
-  const result = spawnSync("codesign", ["-dv", "--verbose=4", appRoot], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  return (
-    result.status === 0 &&
-    /Authority=Developer ID Application:/.test(output) &&
-    !/Signature=adhoc/.test(output) &&
-    !/TeamIdentifier=not set/.test(output)
-  );
-}
-
 function inferMacAppRoot(): string | null {
   const marker = ".app/Contents/MacOS/";
   const idx = process.execPath.indexOf(marker);
   return idx >= 0 ? process.execPath.slice(0, idx + ".app".length) : null;
+}
+
+function readBundleIdentifier(appRoot: string): string | null {
+  try {
+    const plist = readFileSync(join(appRoot, "Contents", "Info.plist"), "utf8");
+    return /<key>CFBundleIdentifier<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function writeEnvironmentRuntimeProof(): void {
@@ -1302,7 +1662,7 @@ function writeEnvironmentRuntimeProof(): void {
     const managedRuntime = readRuntimeFingerprintEvidence(managedRuntimePath);
     if (!managedRuntime) throw new Error(`managed runtime fingerprint is invalid at ${managedRuntimePath}`);
     const managedSourceRuntimeHash = readManagedRuntimeSourceHash(proofUserRoot);
-    const installedDesktop = installedCodexDesktopVersion();
+    const installedDesktop = installedCodexDesktopVersion(appRoot);
     if (!installedDesktop.installedMarketingVersion || !installedDesktop.installedBuild) {
       throw new Error("could not prove the running desktop version and build");
     }
@@ -1341,6 +1701,940 @@ function writeEnvironmentRuntimeProof(): void {
   }
 }
 
+interface RuntimeReadyExpectation {
+  schemaVersion: 5;
+  kind: "tweakers-independent-runtime-ready-expectation";
+  operationId: string;
+  promotionId: string;
+  activePromotionReceiptSha256: string;
+  appRoot: string;
+  bundleId: "com.therealityreport.tweakers";
+  appAsarHeaderHash: string;
+  runtimeFingerprint: string;
+  appUserDataRoot: string;
+  codexHomeRoot: string;
+  accountsBrokerRoot: string;
+  brokerAuthorityExpectation: RuntimeReadyBrokerAuthorityExpectation;
+  appearanceExpectation: RuntimeReadyAppearanceBinding;
+  expectedTweakIds: string[];
+  createdAt: string;
+}
+
+interface RuntimeReadyAppearanceBinding {
+  status: "normal";
+  normalized: true;
+}
+
+interface RuntimeReadyBrokerAuthorityExpectation {
+  globalRootState: "absent" | "valid-v3";
+  configSha256: string | null;
+}
+
+interface IndependentTweakersAppearanceMetricsV1 {
+  electronZoomLevel: number | null;
+  electronZoomFactor: number | null;
+  cssWindowZoom: number | null;
+  rootZoom: number | null;
+  bodyZoom: number | null;
+  rootFontSizePx: number | null;
+  bodyFontSizePx: number | null;
+  visualViewportScale: number | null;
+  devicePixelRatio: number | null;
+  displayScaleFactor: number | null;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+interface IndependentTweakersLiveHealthV1 {
+  schemaVersion: 1;
+  kind: "tweakers-independent-live-health";
+  pid: number;
+  processStartToken: string;
+  appRoot: string;
+  bundleId: "com.therealityreport.tweakers";
+  appAsarHeaderHash: string;
+  appSignatureSha256: string;
+  runtimeFingerprint: string;
+  appUserDataRoot: string;
+  codexHomeRoot: string;
+  accountsBrokerRoot: string;
+  accountsBrokerConfigSha256: string | null;
+  sharedHistoryBrokerState: "connected" | "blocked";
+  initializedTweakIds: string[];
+  lifecycleFailures: Array<{
+    tweakId: string;
+    process: "main" | "renderer";
+    status: "failed" | "timedout" | "quarantined" | "pending";
+  }>;
+  appearance: {
+    status: "normal" | "needs_attention" | "not_observed";
+    normalized: boolean;
+    windowId: number | null;
+    before: IndependentTweakersAppearanceMetricsV1 | null;
+    after: IndependentTweakersAppearanceMetricsV1 | null;
+  };
+  observedAt: string;
+}
+
+function isRuntimeReadyExpectation(value: unknown): value is RuntimeReadyExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = [
+    "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "appRoot", "bundleId", "appAsarHeaderHash",
+    "runtimeFingerprint", "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot", "brokerAuthorityExpectation", "appearanceExpectation", "expectedTweakIds", "createdAt",
+  ];
+  if (Object.keys(record).sort().join("\0") !== [...keys].sort().join("\0")) return false;
+  return record.schemaVersion === 5
+    && record.kind === "tweakers-independent-runtime-ready-expectation"
+    && typeof record.operationId === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.operationId)
+    && typeof record.promotionId === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.promotionId)
+    && typeof record.activePromotionReceiptSha256 === "string"
+    && /^[a-f0-9]{64}$/i.test(record.activePromotionReceiptSha256)
+    && typeof record.appRoot === "string"
+    && isAbsolute(record.appRoot)
+    && resolve(record.appRoot) === record.appRoot
+    && record.bundleId === "com.therealityreport.tweakers"
+    && typeof record.appAsarHeaderHash === "string"
+    && /^[a-f0-9]{64}$/i.test(record.appAsarHeaderHash)
+    && typeof record.runtimeFingerprint === "string"
+    && /^[a-f0-9]{64}$/i.test(record.runtimeFingerprint)
+    && typeof record.appUserDataRoot === "string"
+    && isAbsolute(record.appUserDataRoot)
+    && resolve(record.appUserDataRoot) === record.appUserDataRoot
+    && typeof record.codexHomeRoot === "string"
+    && isAbsolute(record.codexHomeRoot)
+    && resolve(record.codexHomeRoot) === record.codexHomeRoot
+    && typeof record.accountsBrokerRoot === "string"
+    && isAbsolute(record.accountsBrokerRoot)
+    && resolve(record.accountsBrokerRoot) === record.accountsBrokerRoot
+    && isRuntimeReadyBrokerAuthorityExpectation(record.brokerAuthorityExpectation)
+    && isRuntimeReadyAppearanceBinding(record.appearanceExpectation)
+    && Array.isArray(record.expectedTweakIds)
+    && record.expectedTweakIds.length > 0
+    && record.expectedTweakIds.length <= 128
+    && new Set(record.expectedTweakIds).size === record.expectedTweakIds.length
+    && record.expectedTweakIds.every((id) => typeof id === "string" && /^[A-Za-z0-9._-]{1,160}$/.test(id))
+    && typeof record.createdAt === "string"
+    && !Number.isNaN(Date.parse(record.createdAt));
+}
+
+function isRuntimeReadyBrokerAuthorityExpectation(value: unknown): value is RuntimeReadyBrokerAuthorityExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).sort().join("\0") !== ["configSha256", "globalRootState"].join("\0")) return false;
+  if (record.globalRootState === "absent") return record.configSha256 === null;
+  return record.globalRootState === "valid-v3"
+    && typeof record.configSha256 === "string"
+    && /^[a-f0-9]{64}$/i.test(record.configSha256);
+}
+
+function isRuntimeReadyAppearanceBinding(value: unknown): value is RuntimeReadyAppearanceBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const appearance = value as Record<string, unknown>;
+  return Object.keys(appearance).sort().join("\0") === ["normalized", "status"].join("\0")
+    && appearance.status === "normal"
+    && appearance.normalized === true;
+}
+
+function sameRuntimeReadyAppearanceBinding(
+  left: RuntimeReadyAppearanceBinding,
+  right: RuntimeReadyAppearanceBinding,
+): boolean {
+  return left.status === right.status && left.normalized === right.normalized;
+}
+
+function readRuntimeReadyExpectation(): RuntimeReadyExpectation | null {
+  try {
+    const stat = lstatSync(RUNTIME_READY_EXPECTATION_FILE);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("expectation is not a regular file");
+    const parsed = JSON.parse(readFileSync(RUNTIME_READY_EXPECTATION_FILE, "utf8")) as unknown;
+    return isRuntimeReadyExpectation(parsed) ? parsed : null;
+  } catch (error) {
+    if (existsSync(RUNTIME_READY_EXPECTATION_FILE)) {
+      log("warn", "runtime-ready expectation is unavailable", { message: String((error as Error)?.message ?? error) });
+    }
+    return null;
+  }
+}
+
+function runtimeReadyInitializedTweakIds(): string[] | null {
+  if (!runtimeReadyMainInitialized || !runtimeReadyPreloadInitialized) return null;
+  const enabled = tweakState.discovered
+    .filter((tweak) => isTweakEnabled(tweak.manifest.id))
+    .sort((left, right) => left.manifest.id.localeCompare(right.manifest.id));
+  const ids: string[] = [];
+  for (const tweak of enabled) {
+    const id = tweak.manifest.id;
+    const mainRecord = lifecycleJournal.records[lifecycleRecordKey("main", id)];
+    const rendererRecord = lifecycleJournal.records[lifecycleRecordKey("renderer", id)];
+    const mainReady = mainRecord?.attemptId === lifecycleAttemptId && mainRecord.status === "ready";
+    const rendererReady = rendererRecord?.attemptId === lifecycleAttemptId && rendererRecord.status === "ready";
+    if ((tweak.manifest.scope === "main" && !mainReady)
+      || (tweak.manifest.scope === "renderer" && !rendererReady)
+      || (tweak.manifest.scope === "both" && (!mainReady || !rendererReady))) return null;
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * The broker configuration is a sealed cross-app authority boundary.  A
+ * missing file is a known blocked state; a present file is useful only when it
+ * is an exact, validated global-v3 configuration.  Malformed or partial files
+ * deliberately produce no readiness evidence at all.
+ */
+function currentRuntimeReadyBrokerAuthorityExpectation(): RuntimeReadyBrokerAuthorityExpectation | null {
+  if (!accountsBrokerRoot) return null;
+  let rootBefore: ReturnType<typeof lstatSync>;
+  try {
+    rootBefore = lstatSync(accountsBrokerRoot);
+  } catch (error) {
+    // Only the canonical global root itself being absent is the durable
+    // blocked state.  A root that exists but lacks a strict v3 config is not
+    // equivalent to the unpublished-root case.
+    return (error as NodeJS.ErrnoException | null)?.code === "ENOENT"
+      ? { globalRootState: "absent", configSha256: null }
+      : null;
+  }
+  const ownerUid = process.getuid?.();
+  if (!rootBefore.isDirectory() || rootBefore.isSymbolicLink()
+    || (ownerUid !== undefined && rootBefore.uid !== ownerUid)
+    || (rootBefore.mode & 0o077) !== 0) return null;
+  const configPath = join(accountsBrokerRoot, ACCOUNT_ROUTER_CONFIG_FILE);
+  let configBefore: ReturnType<typeof lstatSync>;
+  try {
+    configBefore = lstatSync(configPath);
+    if (!configBefore.isFile() || configBefore.isSymbolicLink() || configBefore.nlink !== 1
+      || (ownerUid !== undefined && configBefore.uid !== ownerUid)
+      || (configBefore.mode & 0o077) !== 0) return null;
+    const bytesBefore = readFileSync(configPath);
+    const selection = readRouterLaunchSelection(configPath);
+    if (selection.config?.schemaVersion !== 3) return null;
+    const configAfter = lstatSync(configPath);
+    const rootAfter = lstatSync(accountsBrokerRoot);
+    const bytesAfter = readFileSync(configPath);
+    if (!rootAfter.isDirectory() || rootAfter.isSymbolicLink()
+      || (ownerUid !== undefined && rootAfter.uid !== ownerUid)
+      || (rootAfter.mode & 0o077) !== 0
+      || rootBefore.dev !== rootAfter.dev || rootBefore.ino !== rootAfter.ino
+      || !configAfter.isFile() || configAfter.isSymbolicLink() || configAfter.nlink !== 1
+      || (ownerUid !== undefined && configAfter.uid !== ownerUid)
+      || (configAfter.mode & 0o077) !== 0
+      || configBefore.dev !== configAfter.dev || configBefore.ino !== configAfter.ino
+      || !bytesBefore.equals(bytesAfter)) return null;
+    return {
+      globalRootState: "valid-v3",
+      configSha256: createHash("sha256").update(bytesAfter).digest("hex"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameRuntimeReadyBrokerAuthorityExpectation(
+  left: RuntimeReadyBrokerAuthorityExpectation,
+  right: RuntimeReadyBrokerAuthorityExpectation,
+): boolean {
+  return left.globalRootState === right.globalRootState && left.configSha256 === right.configSha256;
+}
+
+function expectedRuntimeReadyBrokerState(
+  expectation: RuntimeReadyBrokerAuthorityExpectation,
+): "connected" | "blocked" {
+  return expectation.globalRootState === "valid-v3" ? "connected" : "blocked";
+}
+
+function isExactIndependentTweakersProcess(): boolean {
+  return derivedVariant
+    && !healthCheckOnly
+    && runningAppRoot === INDEPENDENT_TWEAKERS_APP_ROOT
+    && readBundleIdentifier(INDEPENDENT_TWEAKERS_APP_ROOT) === INDEPENDENT_TWEAKERS_BUNDLE_ID;
+}
+
+/**
+ * Unlike the general helper, this has no focused-window or first-window
+ * fallback.  Auth, update, and auxiliary windows are therefore never targets
+ * for a native zoom read or write.
+ */
+function exactIndependentTweakersPrimaryWindow(): Electron.BrowserWindow | null {
+  if (!isExactIndependentTweakersProcess()) return null;
+  const services = getCodexWindowServices();
+  const fromServices = typeof services?.getPrimaryWindow === "function"
+    ? services.getPrimaryWindow("local")
+    : null;
+  const fromManager = !fromServices && typeof services?.windowManager?.getPrimaryWindow === "function"
+    ? services.windowManager.getPrimaryWindow.call(services.windowManager)
+    : null;
+  const primary = fromServices ?? fromManager;
+  if (!primary || primary.isDestroyed()) return null;
+  if (!BrowserWindow.getAllWindows().some((window) => window === primary)) return null;
+  return primary.webContents.isDestroyed() ? null : primary;
+}
+
+function finiteMetric(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function cssMetric(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === "normal") return normalized === "normal" ? 1 : null;
+  const percent = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(normalized);
+  if (percent) return finiteMetric(Number(percent[1]) / 100);
+  return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(normalized) ? finiteMetric(Number(normalized)) : null;
+}
+
+function readElectronZoomMetric(window: Electron.BrowserWindow, method: "getZoomLevel" | "getZoomFactor"): number | null {
+  try {
+    const candidate = window.webContents as unknown as Record<string, unknown>;
+    const reader = candidate[method];
+    return typeof reader === "function" ? finiteMetric(Reflect.apply(reader, window.webContents, [])) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readIndependentTweakersAppearanceMetrics(
+  window: Electron.BrowserWindow,
+): Promise<IndependentTweakersAppearanceMetricsV1> {
+  const bounds = window.getBounds();
+  const displayScaleFactor = (() => {
+    try { return finiteMetric(screen.getDisplayMatching(bounds).scaleFactor); } catch { return null; }
+  })();
+  const base: IndependentTweakersAppearanceMetricsV1 = {
+    electronZoomLevel: readElectronZoomMetric(window, "getZoomLevel"),
+    electronZoomFactor: readElectronZoomMetric(window, "getZoomFactor"),
+    cssWindowZoom: null,
+    rootZoom: null,
+    bodyZoom: null,
+    rootFontSizePx: null,
+    bodyFontSizePx: null,
+    visualViewportScale: null,
+    devicePixelRatio: null,
+    displayScaleFactor,
+    bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+  };
+  try {
+    const measured = await withTimeout(window.webContents.executeJavaScript(`(() => {
+      const root = document.documentElement;
+      const body = document.body;
+      const rootStyle = root ? getComputedStyle(root) : null;
+      const bodyStyle = body ? getComputedStyle(body) : null;
+      return {
+        cssWindowZoom: rootStyle?.getPropertyValue("--codex-window-zoom") ?? null,
+        rootZoom: rootStyle?.zoom ?? null,
+        bodyZoom: bodyStyle?.zoom ?? null,
+        rootFontSizePx: rootStyle?.fontSize ?? null,
+        bodyFontSizePx: bodyStyle?.fontSize ?? null,
+        visualViewportScale: window.visualViewport?.scale ?? null,
+        devicePixelRatio: window.devicePixelRatio ?? null,
+      };
+    })()`, true), 1_500) as unknown;
+    if (!measured || typeof measured !== "object" || Array.isArray(measured)) return base;
+    const values = measured as Record<string, unknown>;
+    return {
+      ...base,
+      cssWindowZoom: cssMetric(values.cssWindowZoom),
+      rootZoom: cssMetric(values.rootZoom),
+      bodyZoom: cssMetric(values.bodyZoom),
+      rootFontSizePx: cssMetric(values.rootFontSizePx?.toString().replace(/px$/i, "") ?? null),
+      bodyFontSizePx: cssMetric(values.bodyFontSizePx?.toString().replace(/px$/i, "") ?? null),
+      visualViewportScale: finiteMetric(values.visualViewportScale),
+      devicePixelRatio: finiteMetric(values.devicePixelRatio),
+    };
+  } catch {
+    return base;
+  }
+}
+
+function nativeZoomNeedsNormalization(
+  metrics: Pick<IndependentTweakersAppearanceMetricsV1, "electronZoomLevel" | "electronZoomFactor">,
+): boolean {
+  return (metrics.electronZoomLevel !== null && Math.abs(metrics.electronZoomLevel) > 0.0001)
+    || (metrics.electronZoomFactor !== null && Math.abs(metrics.electronZoomFactor - 1) > 0.0001);
+}
+
+function nativeZoomObservedAtActualSize(metrics: IndependentTweakersAppearanceMetricsV1 | null): boolean {
+  if (!metrics || (metrics.electronZoomLevel === null && metrics.electronZoomFactor === null)) return false;
+  return !nativeZoomNeedsNormalization(metrics);
+}
+
+function appearanceNeedsAttention(metrics: IndependentTweakersAppearanceMetricsV1): boolean {
+  return nativeZoomNeedsNormalization(metrics)
+    || [metrics.cssWindowZoom, metrics.rootZoom, metrics.bodyZoom]
+      .some((value) => value !== null && Math.abs(value - 1) > 0.0001);
+}
+
+function appearanceStatus(
+  before: IndependentTweakersAppearanceMetricsV1 | null,
+  after: IndependentTweakersAppearanceMetricsV1 | null,
+): IndependentTweakersLiveHealthV1["appearance"]["status"] {
+  if (!before || !after || (after.electronZoomLevel === null && after.electronZoomFactor === null)) return "not_observed";
+  return appearanceNeedsAttention(after) ? "needs_attention" : "normal";
+}
+
+function runtimeReadyAppearanceBinding(
+  appearance: IndependentTweakersLiveHealthV1["appearance"],
+): RuntimeReadyAppearanceBinding | null {
+  return appearance.status === "normal" && appearance.normalized === true
+    ? { status: "normal", normalized: true }
+    : null;
+}
+
+/**
+ * The persisted live-health sample establishes CSS and viewport state. Re-read
+ * Electron's native zoom immediately before receipt publication as well, so a
+ * stale healthy sample cannot certify a primary window that has subsequently
+ * left Actual Size.
+ */
+function primaryIndependentTweakersNativeZoomAtActualSize(window: Electron.BrowserWindow): boolean {
+  const electronZoomLevel = readElectronZoomMetric(window, "getZoomLevel");
+  const electronZoomFactor = readElectronZoomMetric(window, "getZoomFactor");
+  return (electronZoomLevel !== null || electronZoomFactor !== null)
+    && !nativeZoomNeedsNormalization({ electronZoomLevel, electronZoomFactor });
+}
+
+function exactLifecycleHealth(): Pick<IndependentTweakersLiveHealthV1, "initializedTweakIds" | "lifecycleFailures"> {
+  const initializedTweakIds: string[] = [];
+  const lifecycleFailures: IndependentTweakersLiveHealthV1["lifecycleFailures"] = [];
+  const enabled = tweakState.discovered
+    .filter((tweak) => isTweakEnabled(tweak.manifest.id))
+    .sort((left, right) => left.manifest.id.localeCompare(right.manifest.id));
+  for (const tweak of enabled) {
+    const requiredProcesses: TweakProcess[] = tweak.manifest.scope === "both"
+      ? ["main", "renderer"]
+      : tweak.manifest.scope === "main"
+        ? ["main"]
+        : tweak.manifest.scope === "renderer"
+          ? ["renderer"]
+          : [];
+    let initialized = runtimeReadyMainInitialized && runtimeReadyPreloadInitialized;
+    for (const processKind of requiredProcesses) {
+      const record = lifecycleJournal.records[lifecycleRecordKey(processKind, tweak.manifest.id)];
+      const status = record?.attemptId === lifecycleAttemptId ? record.status : undefined;
+      if (status === "ready") continue;
+      initialized = false;
+      if (status === "failed" || status === "quarantined") {
+        lifecycleFailures.push({ tweakId: tweak.manifest.id, process: processKind, status });
+      } else if (status === "timed_out") {
+        lifecycleFailures.push({ tweakId: tweak.manifest.id, process: processKind, status: "timedout" });
+      } else {
+        lifecycleFailures.push({ tweakId: tweak.manifest.id, process: processKind, status: "pending" });
+      }
+    }
+    if (initialized) initializedTweakIds.push(tweak.manifest.id);
+  }
+  return { initializedTweakIds, lifecycleFailures };
+}
+
+function independentTweakersAppSignatureSha256(appRoot: string): string | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const result = spawnSync("/usr/bin/codesign", ["-dv", "--verbose=4", appRoot], {
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 8 * 1024,
+    });
+    if (result.status !== 0) return null;
+    const evidence = `${String(result.stdout ?? "")}\n${String(result.stderr ?? "")}`
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^(Identifier=|TeamIdentifier=|CDHash=|CodeDirectory|Signature=|Format=)/.test(line))
+      .join("\n");
+    return evidence.length > 0
+      ? createHash("sha256").update(evidence, "utf8").digest("hex")
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+interface IndependentTweakersLiveHealthProjection {
+  appearance: IndependentTweakersLiveHealthV1["appearance"];
+  observedAt: string;
+}
+
+function independentTweakersLiveHealthProjection(
+  health: IndependentTweakersLiveHealthV1 | null,
+): IndependentTweakersLiveHealthProjection | null {
+  return health ? {
+    appearance: health.appearance,
+    observedAt: health.observedAt,
+  } : null;
+}
+
+function isExactIndependentTweakersPrimaryMainFrame(
+  sender: Electron.WebContents,
+  senderFrame: Electron.WebFrameMain | null,
+): boolean {
+  const primary = exactIndependentTweakersPrimaryWindow();
+  return primary !== null
+    && sender === primary.webContents
+    && senderFrame === primary.webContents.mainFrame;
+}
+
+function publishIndependentTweakersLiveHealth(health: IndependentTweakersLiveHealthV1): void {
+  independentTweakersLiveHealth = health;
+  try {
+    publishIndependentTweakersRuntimeReadyReceipt(INDEPENDENT_TWEAKERS_LIVE_HEALTH_FILE, health);
+  } catch (error) {
+    log("warn", "independent live health was not published", { message: String((error as Error)?.message ?? error) });
+  }
+  const primary = exactIndependentTweakersPrimaryWindow();
+  if (primary && !primary.webContents.isDestroyed()) {
+    primary.webContents.mainFrame.send(
+      "tweaker:independent-live-health-changed",
+      independentTweakersLiveHealthProjection(health),
+    );
+  }
+}
+
+function scheduleIndependentTweakersLiveHealthCapture(): void {
+  if (!derivedVariant || independentTweakersLiveHealthCapture) return;
+  independentTweakersLiveHealthCapture = captureIndependentTweakersLiveHealth()
+    .catch((error) => log("warn", "independent live health capture failed", { message: String((error as Error)?.message ?? error) }))
+    .finally(() => {
+      independentTweakersLiveHealthCapture = null;
+      tryWriteRuntimeReadyReceipt();
+    });
+}
+
+async function captureIndependentTweakersLiveHealth(): Promise<void> {
+  if (!isExactIndependentTweakersProcess()) return;
+  const brokerAuthority = currentRuntimeReadyBrokerAuthorityExpectation();
+  const processStartToken = currentProcessStartToken();
+  const appAsarHeaderHash = promotionAppHeaderHash();
+  const runtimeFingerprint = readRuntimeFingerprintEvidence(runtimeDir!)?.fingerprint;
+  const appUserDataRoot = process.env.CODEX_ELECTRON_USER_DATA_PATH;
+  const appSignatureSha256 = independentTweakersAppSignatureSha256(INDEPENDENT_TWEAKERS_APP_ROOT);
+  if (!brokerAuthority || !processStartToken || !runtimeFingerprint || !appUserDataRoot || !appSignatureSha256 || !accountsBrokerRoot) return;
+  const lifecycle = exactLifecycleHealth();
+  const brokerState: "connected" | "blocked" = runtimeReadyBrokerState === "connected" ? "connected" : "blocked";
+  const primary = exactIndependentTweakersPrimaryWindow();
+  if (!primary) {
+    publishIndependentTweakersLiveHealth({
+      schemaVersion: 1,
+      kind: "tweakers-independent-live-health",
+      pid: process.pid,
+      processStartToken,
+      appRoot: INDEPENDENT_TWEAKERS_APP_ROOT,
+      bundleId: INDEPENDENT_TWEAKERS_BUNDLE_ID,
+      appAsarHeaderHash,
+      appSignatureSha256,
+      runtimeFingerprint,
+      appUserDataRoot,
+      codexHomeRoot: MCP_RUNTIME_PATHS.codexHome,
+      accountsBrokerRoot,
+      accountsBrokerConfigSha256: brokerAuthority.configSha256,
+      sharedHistoryBrokerState: brokerState,
+      ...lifecycle,
+      appearance: { status: "not_observed", normalized: false, windowId: null, before: null, after: null },
+      observedAt: new Date().toISOString(),
+    });
+    return;
+  }
+  const before = await readIndependentTweakersAppearanceMetrics(primary);
+  const provisional = {
+    schemaVersion: 1 as const,
+    kind: "tweakers-independent-live-health" as const,
+    pid: process.pid,
+    processStartToken,
+    appRoot: INDEPENDENT_TWEAKERS_APP_ROOT,
+    bundleId: INDEPENDENT_TWEAKERS_BUNDLE_ID,
+    appAsarHeaderHash,
+    appSignatureSha256,
+    runtimeFingerprint,
+    appUserDataRoot,
+    codexHomeRoot: MCP_RUNTIME_PATHS.codexHome,
+    accountsBrokerRoot,
+    accountsBrokerConfigSha256: brokerAuthority.configSha256,
+    sharedHistoryBrokerState: brokerState,
+    ...lifecycle,
+  };
+  // Write the pre-normalization observation before touching native zoom.  The
+  // final record repeats it beside the post-operation measurement.
+  publishIndependentTweakersLiveHealth({
+    ...provisional,
+    appearance: { status: appearanceStatus(before, null), normalized: false, windowId: primary.id, before, after: null },
+    observedAt: new Date().toISOString(),
+  });
+  if (independentTweakersZoomNormalized && nativeZoomNeedsNormalization(before)) {
+    independentTweakersZoomNormalized = false;
+  }
+  if (!independentTweakersZoomNormalized && nativeZoomNeedsNormalization(before)) {
+    try {
+      primary.webContents.setZoomLevel(0);
+      primary.webContents.setZoomFactor(1);
+    } catch (error) {
+      log("warn", "independent primary-window zoom normalization failed", { message: String((error as Error)?.message ?? error) });
+    }
+  }
+  await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 0));
+  const after = primary.isDestroyed() || primary.webContents.isDestroyed()
+    ? null
+    : await readIndependentTweakersAppearanceMetrics(primary);
+  const normalized = nativeZoomObservedAtActualSize(after);
+  independentTweakersZoomNormalized = normalized;
+  publishIndependentTweakersLiveHealth({
+    ...provisional,
+    appearance: { status: appearanceStatus(before, after), normalized, windowId: primary.id, before, after },
+    observedAt: new Date().toISOString(),
+  });
+}
+
+function requestRuntimeReadyBrokerConnection(window: Electron.BrowserWindow | null = exactIndependentTweakersPrimaryWindow()): void {
+  if (!derivedVariant || independentTweakersBrokerProbeInFlight) return;
+  const authority = currentRuntimeReadyBrokerAuthorityExpectation();
+  if (!authority) return;
+  if (authority.globalRootState === "absent") {
+    markRuntimeReadyBrokerState("blocked");
+    return;
+  }
+  if (!window || !accountsBrokerRoot || !accountsBrokerSecret) return;
+  const client = accountsBrokerClientForRenderer(window.webContents.id);
+  if (!client) {
+    markRuntimeReadyBrokerState("blocked");
+    return;
+  }
+  independentTweakersBrokerProbeInFlight = true;
+  void client.socket.invoke({
+    version: 1,
+    requestId: `runtime-ready-${randomUUID()}`,
+    command: "profile.read",
+  }).then((response) => {
+    markRuntimeReadyBrokerState(response.ok ? "connected" : "blocked");
+  }).catch(() => {
+    markRuntimeReadyBrokerState("blocked");
+  }).finally(() => {
+    independentTweakersBrokerProbeInFlight = false;
+    scheduleIndependentTweakersLiveHealthCapture();
+  });
+}
+
+function tryWriteRuntimeReadyReceipt(): void {
+  if (!derivedVariant || runtimeReadyPublished) return;
+  const expectation = readRuntimeReadyExpectation();
+  if (!expectation) return;
+  const brokerAuthority = currentRuntimeReadyBrokerAuthorityExpectation();
+  if (!brokerAuthority || !sameRuntimeReadyBrokerAuthorityExpectation(
+    brokerAuthority,
+    expectation.brokerAuthorityExpectation,
+  )) return;
+  if (!runtimeReadySettingsMounted) {
+    requestRuntimeReadySettingsMount();
+  }
+  const initializedTweakIds = runtimeReadyInitializedTweakIds();
+  if (!initializedTweakIds) return;
+  if (!runtimeReadySettingsMounted) return;
+  const expectedBrokerState = expectedRuntimeReadyBrokerState(brokerAuthority);
+  if (runtimeReadyBrokerState === null || runtimeReadyBrokerState !== expectedBrokerState) {
+    requestRuntimeReadyBrokerConnection();
+    return;
+  }
+  if (!independentTweakersLiveHealth
+    || independentTweakersLiveHealth.pid !== process.pid
+    || independentTweakersLiveHealth.processStartToken !== currentProcessStartToken()
+    || independentTweakersLiveHealth.accountsBrokerConfigSha256 !== brokerAuthority.configSha256
+    || independentTweakersLiveHealth.sharedHistoryBrokerState !== expectedBrokerState) {
+    scheduleIndependentTweakersLiveHealthCapture();
+    return;
+  }
+  // A missing authoritative primary window remains useful diagnostics for the
+  // Settings row, but must not create a hot retry loop or a readiness receipt.
+  const primary = exactIndependentTweakersPrimaryWindow();
+  const appearance = runtimeReadyAppearanceBinding(independentTweakersLiveHealth.appearance);
+  if (!primary
+    || independentTweakersLiveHealth.appearance.windowId !== primary.id
+    || !independentTweakersLiveHealth.appearance.before
+    || !independentTweakersLiveHealth.appearance.after
+    || !appearance
+    || !sameRuntimeReadyAppearanceBinding(appearance, expectation.appearanceExpectation)) return;
+  if (!primaryIndependentTweakersNativeZoomAtActualSize(primary)) {
+    // The persisted observation was normal, but the native surface changed
+    // before this synchronous receipt write. Re-capture once so normalizing
+    // logic can repair it; if that capture remains unhealthy, its current
+    // diagnostics stay visible without a hot retry loop.
+    const shouldRecapture = independentTweakersZoomNormalized;
+    independentTweakersZoomNormalized = false;
+    if (shouldRecapture) scheduleIndependentTweakersLiveHealthCapture();
+    return;
+  }
+  try {
+    const appRoot = inferMacAppRoot();
+    const appAsarHeaderHash = promotionAppHeaderHash();
+    const runtimeFingerprint = readRuntimeFingerprintEvidence(runtimeDir!)?.fingerprint;
+    const appUserDataRoot = process.env.CODEX_ELECTRON_USER_DATA_PATH;
+    const bundleId = appRoot ? readBundleIdentifier(appRoot) : null;
+    const processStartToken = currentProcessStartToken();
+    if (!appRoot || !runtimeFingerprint || !appUserDataRoot
+      || !processStartToken
+      || bundleId !== expectation.bundleId
+      || appRoot !== expectation.appRoot
+      || appAsarHeaderHash.toLowerCase() !== expectation.appAsarHeaderHash.toLowerCase()
+      || runtimeFingerprint.toLowerCase() !== expectation.runtimeFingerprint.toLowerCase()
+      || appUserDataRoot !== expectation.appUserDataRoot
+      || MCP_RUNTIME_PATHS.codexHome !== expectation.codexHomeRoot
+      || accountsBrokerRoot !== expectation.accountsBrokerRoot) {
+      log("warn", "runtime-ready expectation does not match this process");
+      return;
+    }
+    const receipt = {
+      schemaVersion: 5,
+      kind: "tweakers-independent-runtime-ready",
+      operationId: expectation.operationId,
+      promotionId: expectation.promotionId,
+      activePromotionReceiptSha256: expectation.activePromotionReceiptSha256,
+      pid: process.pid,
+      processStartToken,
+      appRoot,
+      bundleId,
+      appAsarHeaderHash,
+      runtimeFingerprint,
+      appUserDataRoot,
+      codexHomeRoot: MCP_RUNTIME_PATHS.codexHome,
+      accountsBrokerRoot,
+      brokerAuthorityExpectation: brokerAuthority,
+      appearance,
+      mainInitialized: true,
+      preloadInitialized: true,
+      settingsMounted: true,
+      sharedHistoryBrokerState: runtimeReadyBrokerState,
+      initializedTweakIds,
+      observedAt: new Date().toISOString(),
+    } as const;
+    publishIndependentTweakersRuntimeReadyReceipt(RUNTIME_READY_FILE, receipt);
+    stopRuntimeReadySettingsMountAttempts();
+    runtimeReadyPublished = true;
+    log("info", "runtime-ready receipt published", { operationId: expectation.operationId, tweakCount: initializedTweakIds.length });
+  } catch (error) {
+    log("warn", "runtime-ready receipt was not published", { message: String((error as Error)?.message ?? error) });
+  }
+}
+
+function currentProcessStartToken(): string | null {
+  if (process.platform !== "darwin") {
+    return `pid-${process.pid}-uptime-${Math.floor(process.uptime() * 1_000)}`;
+  }
+  try {
+    const result = spawnSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="], {
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 8 * 1024,
+    });
+    const token = result.status === 0 ? String(result.stdout ?? "").trim() : "";
+    return token.length > 0 && token.length <= 128 && !/[\u0000-\u001f\u007f]/.test(token)
+      ? token
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+type RuntimeReadySettingsMountRetryStopReason =
+  | "mounted"
+  | "published"
+  | "expectation-removed"
+  | "deadline"
+  | "exhausted"
+  | "cancelled";
+
+interface RuntimeReadySettingsMountRetryControllerOptions<Owner> {
+  now: () => number;
+  schedule: (callback: () => void, delayMs: number) => unknown;
+  cancel: (timer: unknown) => void;
+  intervalMs: number;
+  acknowledgementGraceMs: number;
+  deadlineMs: number;
+  maxAttempts: number;
+  initialOperationId: string;
+  initialAttemptCount: number;
+  readExpectation: () => { operationId: string } | null;
+  isMounted: () => boolean;
+  isPublished: () => boolean;
+  isReady: () => boolean;
+  getExactPrimary: () => Owner | null;
+  open: (owner: Owner) => boolean;
+  onAttemptStateChange: (operationId: string, attemptCount: number) => void;
+  onRequest: (attemptCount: number, accepted: boolean) => void;
+  onStopped: (reason: RuntimeReadySettingsMountRetryStopReason, operationId: string) => void;
+}
+
+interface RuntimeReadySettingsMountRetryController {
+  start(): void;
+  stop(): void;
+}
+
+/**
+ * One operation-bound Settings opener. The deadline starts when this
+ * controller starts, even if lifecycle readiness or the exact primary window
+ * is delayed. A successful menu callback gets a longer acknowledgement grace
+ * so a normal renderer mount does not receive duplicate menu invocations.
+ */
+function createRuntimeReadySettingsMountRetryController<Owner>(
+  options: RuntimeReadySettingsMountRetryControllerOptions<Owner>,
+): RuntimeReadySettingsMountRetryController {
+  let started = false;
+  let stopped = false;
+  let timer: unknown = null;
+  let deadlineAt = 0;
+  let operationId = options.initialOperationId;
+  let attemptCount = options.initialAttemptCount;
+
+  const stop = (reason: RuntimeReadySettingsMountRetryStopReason): void => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== null) options.cancel(timer);
+    timer = null;
+    options.onStopped(reason, operationId);
+  };
+
+  const schedule = (callback: () => void, delayMs: number): void => {
+    const remaining = deadlineAt - options.now();
+    if (remaining <= 0) {
+      stop("deadline");
+      return;
+    }
+    timer = options.schedule(() => {
+      timer = null;
+      callback();
+    }, Math.min(delayMs, remaining));
+  };
+
+  const attempt = (): void => {
+    if (stopped) return;
+    const now = options.now();
+    if (now >= deadlineAt) {
+      stop("deadline");
+      return;
+    }
+    if (options.isMounted()) {
+      stop("mounted");
+      return;
+    }
+    if (options.isPublished()) {
+      stop("published");
+      return;
+    }
+    const expectation = options.readExpectation();
+    if (!expectation) {
+      stop("expectation-removed");
+      return;
+    }
+    if (operationId !== expectation.operationId) {
+      operationId = expectation.operationId;
+      attemptCount = 0;
+      options.onAttemptStateChange(operationId, attemptCount);
+    }
+    if (attemptCount >= options.maxAttempts) {
+      stop("exhausted");
+      return;
+    }
+    // Do not request Settings before the current lifecycle attempt is ready;
+    // this check deliberately does not consume an attempt or reset the clock.
+    if (!options.isReady()) {
+      schedule(attempt, options.intervalMs);
+      return;
+    }
+    if (options.now() >= deadlineAt) {
+      stop("deadline");
+      return;
+    }
+    attemptCount += 1;
+    const owner = options.getExactPrimary();
+    const accepted = owner !== null && options.open(owner);
+    options.onAttemptStateChange(operationId, attemptCount);
+    options.onRequest(attemptCount, accepted);
+    if (attemptCount >= options.maxAttempts) {
+      stop("exhausted");
+      return;
+    }
+    schedule(attempt, accepted ? options.acknowledgementGraceMs : options.intervalMs);
+  };
+
+  return {
+    start: () => {
+      if (started) return;
+      started = true;
+      deadlineAt = options.now() + options.deadlineMs;
+      attempt();
+    },
+    stop: () => stop("cancelled"),
+  };
+}
+
+let runtimeReadySettingsOpenController: RuntimeReadySettingsMountRetryController | null = null;
+
+function stopRuntimeReadySettingsMountAttempts(): void {
+  const controller = runtimeReadySettingsOpenController;
+  runtimeReadySettingsOpenController = null;
+  if (controller) controller.stop();
+  if (runtimeReadySettingsOpenTimer !== null) clearTimeout(runtimeReadySettingsOpenTimer as ReturnType<typeof setTimeout>);
+  runtimeReadySettingsOpenTimer = null;
+}
+
+function requestRuntimeReadySettingsMount(): void {
+  if (runtimeReadySettingsMounted || runtimeReadySettingsOpenController !== null) return;
+  const expectation = readRuntimeReadyExpectation();
+  if (!expectation) return;
+  if (runtimeReadySettingsOpenAttemptOperationId !== expectation.operationId) {
+    runtimeReadySettingsOpenAttemptOperationId = expectation.operationId;
+    runtimeReadySettingsOpenAttemptCount = 0;
+    runtimeReadySettingsOpenTerminalOperationId = null;
+  }
+  if (runtimeReadySettingsOpenTerminalOperationId === expectation.operationId
+    || runtimeReadySettingsOpenAttemptCount >= RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS) return;
+
+  let controller: RuntimeReadySettingsMountRetryController;
+  controller = createRuntimeReadySettingsMountRetryController({
+    now: () => Date.now(),
+    schedule: (callback, delayMs) => {
+      const scheduled = setTimeout(() => {
+        if (runtimeReadySettingsOpenTimer === scheduled) runtimeReadySettingsOpenTimer = null;
+        callback();
+      }, delayMs);
+      runtimeReadySettingsOpenTimer = scheduled;
+      return scheduled;
+    },
+    cancel: (scheduled) => clearTimeout(scheduled as ReturnType<typeof setTimeout>),
+    intervalMs: RUNTIME_READY_SETTINGS_OPEN_INTERVAL_MS,
+    acknowledgementGraceMs: RUNTIME_READY_SETTINGS_OPEN_ACK_GRACE_MS,
+    deadlineMs: RUNTIME_READY_SETTINGS_OPEN_DEADLINE_MS,
+    maxAttempts: RUNTIME_READY_SETTINGS_OPEN_MAX_ATTEMPTS,
+    initialOperationId: expectation.operationId,
+    initialAttemptCount: runtimeReadySettingsOpenAttemptCount,
+    readExpectation: () => {
+      const current = readRuntimeReadyExpectation();
+      return current ? { operationId: current.operationId } : null;
+    },
+    isMounted: () => runtimeReadySettingsMounted,
+    isPublished: () => runtimeReadyPublished,
+    isReady: () => runtimeReadyInitializedTweakIds() !== null,
+    getExactPrimary: () => exactIndependentTweakersPrimaryWindow(),
+    open: (owner) => openNativeSettingsFromApplicationMenu(owner),
+    onAttemptStateChange: (operationId, attemptCount) => {
+      if (runtimeReadySettingsOpenAttemptOperationId !== operationId) {
+        runtimeReadySettingsOpenTerminalOperationId = null;
+      }
+      runtimeReadySettingsOpenAttemptOperationId = operationId;
+      runtimeReadySettingsOpenAttemptCount = attemptCount;
+    },
+    onRequest: (attemptCount, accepted) => {
+      if (accepted) log("info", "runtime-ready Settings mount requested", { attempt: attemptCount });
+    },
+    onStopped: (reason, operationId) => {
+      if (runtimeReadySettingsOpenController === controller) runtimeReadySettingsOpenController = null;
+      if (reason === "deadline" || reason === "exhausted") {
+        runtimeReadySettingsOpenTerminalOperationId = operationId;
+      }
+      if (reason === "deadline") log("warn", "runtime-ready Settings mount deadline reached");
+      else if (reason === "exhausted") log("warn", "runtime-ready Settings mount attempts exhausted");
+    },
+  });
+  runtimeReadySettingsOpenController = controller;
+  controller.start();
+}
+
 function readManagedRuntimeSourceHash(root: string): string | null {
   try {
     const provenance = JSON.parse(readFileSync(
@@ -1365,43 +2659,17 @@ process.on("unhandledRejection", (e) => {
 });
 
 function configureCodexSparkleForProcess(): void {
-  if (healthCheckOnly) {
-    // The original main initializes and may invoke its updater while the
-    // renderer proof is running. Keep the native methods wrapped/inert, but do
-    // not connect any health-only invocation to networking, dialogs,
-    // notifications, transactions, signed-app preparation, or persistence.
+  // The installed ChatGPT app owns Sparkle outright. Only disposable health
+  // probes and the locally signed independent app receive the inert wrapper:
+  // it prevents an inherited native updater from touching a probe or derived
+  // bundle, while leaving every official launch unwrapped and native-owned.
+  if (healthCheckOnly || derivedVariant) {
     configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
-    return;
   }
-
-  configureCodexSparkleBridge({
-    assertProtectedUpdateAllowed: () => {
-      const authorityRoot = process.env.TWEAKERS_PROTECTED_AUTHORITY_ROOT;
-      if (!authorityRoot) return;
-      assertProtectedUpdateQuarantine({ authorityRoot, route: "Sparkle" });
-    },
-    requestManualCheck: async () => {
-      await requestCodexDesktopManualCheck("native-sparkle");
-    },
-    requestBackgroundCheck: runProactiveDesktopUpdateCheck,
-    requestInstall: startCodexDesktopUpdateTransaction,
-    prepareForInstall: prepareSignedCodexForSparkleInstall,
-    getInstallPrerequisite: codexDesktopInstallPrerequisiteFailure,
-    onFeedCaptured: persistCapturedCodexDesktopProfileFeed,
-    onNativeControlActivityChanged: () => {
-      queueMicrotask(() => {
-        if (!lastPublishedCodexDesktopUpdate) return;
-        const published = desktopUpdateResultWithNativeState(lastPublishedCodexDesktopUpdate);
-        if (published.nativeUpdateControlActive === lastPublishedCodexDesktopUpdate.nativeUpdateControlActive) return;
-        lastPublishedCodexDesktopUpdate = published;
-        broadcastCodexDesktopUpdateResult(published);
-      });
-    },
-  });
 }
 
 configureCodexSparkleForProcess();
-installSparkleUpdateHook();
+if (healthCheckOnly || derivedVariant) installSparkleUpdateHook();
 
 interface LoadedMainTweak {
   stop?: () => void;
@@ -1487,10 +2755,11 @@ const tweakState = {
 };
 const mainIpcHandlerRegistrations = new Map<string, symbol>();
 
-// Candidate health probes run from a disposable user root and must remain
-// observational. In particular, they must never watch or reconcile the real
-// ~/.codex/config.toml while validating a staged runtime.
-const mcpReconciler = healthCheckOnly ? null : createMcpReconciler({
+// Candidate health probes and the derived Tweakers app must remain
+// observational. In particular, neither may watch or reconcile the real
+// ~/.codex/config.toml while validating a staged runtime or hosting the
+// isolated app.
+const mcpReconciler = healthCheckOnly || derivedVariant ? null : createMcpReconciler({
   configPath: CODEX_CONFIG_FILE,
   statePath: MCP_SYNC_STATE_FILE,
   getTweaks: () => mcpSyncTweaks(true),
@@ -1568,7 +2837,9 @@ function registerPreload(s: Electron.Session, label: string): void {
     }).registerPreloadScript;
     if (typeof reg === "function") {
       reg.call(s, { type: "frame", filePath: PRELOAD_PATH, id: "tweaker" });
+      runtimeReadyPreloadInitialized = true;
       log("info", `preload registered (registerPreloadScript) on ${label}:`, PRELOAD_PATH);
+      tryWriteRuntimeReadyReceipt();
       return;
     }
     // Fallback for older Electron versions.
@@ -1576,10 +2847,14 @@ function registerPreload(s: Electron.Session, label: string): void {
     if (!existing.includes(PRELOAD_PATH)) {
       s.setPreloads([...existing, PRELOAD_PATH]);
     }
+    runtimeReadyPreloadInitialized = true;
     log("info", `preload registered (setPreloads) on ${label}:`, PRELOAD_PATH);
+    tryWriteRuntimeReadyReceipt();
   } catch (e) {
     if (e instanceof Error && e.message.includes("existing ID")) {
+      runtimeReadyPreloadInitialized = true;
       log("info", `preload already registered on ${label}:`, PRELOAD_PATH);
+      tryWriteRuntimeReadyReceipt();
       return;
     }
     log("error", `preload registration on ${label} failed:`, e);
@@ -2658,24 +3933,6 @@ const originalMainPromotionProbe = healthOriginalMain
   ? createPromotionOriginalMainProbe()
   : null;
 
-const desktopUpdateStartupReconciler = createDesktopUpdateStartupReconciler({
-  windowReady: () => BrowserWindow.getAllWindows().some((window) => (
-    !window.isDestroyed() && window.isVisible()
-  )),
-  launch: () => {
-    const cli = desktopUpdateCli();
-    startInstalledCli(cli, ["update-chatgpt-reconcile", "--json"]);
-  },
-  setTimer: (callback, delayMs) => {
-    const timer = setTimeout(callback, delayMs);
-    timer.unref?.();
-    return timer;
-  },
-  onEvent: (event) => {
-    log(event.result === "submitted" ? "info" : "warn", event.event, event);
-  },
-});
-
 app.whenReady().then(() => {
   log("info", "app ready fired");
   originalMainPromotionProbe?.registerSession(session.defaultSession, "defaultSession-whenReady");
@@ -2691,13 +3948,6 @@ app.whenReady().then(() => {
         app.exit(0);
       }, 12_000);
       watchdog.unref?.();
-    }
-  } else {
-    // Raw Sparkle scheduling stays disabled in the locally signed app. This
-    // bounded metadata-only loop restores proactive update notification safely.
-    scheduleProactiveDesktopUpdateChecks();
-    if (process.platform === "darwin") {
-      desktopUpdateStartupReconciler.schedule();
     }
   }
   void (async () => {
@@ -2807,6 +4057,24 @@ if (!healthCheckOnly) {
 
 // DIAGNOSTIC: log every webContents creation. Useful for verifying our
 // preload reaches every renderer Codex spawns.
+if (derivedVariant && !healthCheckOnly) {
+  app.on("browser-window-created", (_event, window) => {
+    const identifyPrimaryWindow = (title = window.getTitle()): void => {
+      if (window.isDestroyed() || exactIndependentTweakersPrimaryWindow() !== window) return;
+      const detail = title.replace(/^(?:Tweakers|ChatGPT|Codex)(?:\s*[-–—:]\s*|$)/, "").trim();
+      window.setTitle(detail ? `Tweakers — ${detail}` : "Tweakers");
+    };
+    window.on("page-title-updated", (event, title) => {
+      if (exactIndependentTweakersPrimaryWindow() !== window) return;
+      event.preventDefault();
+      identifyPrimaryWindow(title);
+    });
+    window.on("show", () => identifyPrimaryWindow());
+    window.on("focus", () => identifyPrimaryWindow());
+    window.webContents.on("did-finish-load", () => identifyPrimaryWindow());
+  });
+}
+
 app.on("web-contents-created", (_e, wc) => {
   try {
     const wp = (wc as unknown as { getLastWebPreferences?: () => Record<string, unknown> })
@@ -2902,7 +4170,15 @@ ipcMain.handle("tweaker:open-settings", (event) => {
   return openNativeSettingsFromApplicationMenu(owner);
 });
 ipcMain.handle("tweaker:list-tweaks", async () => {
-  await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
+  // The promotion journal fingerprints config.json until the manager accepts
+  // the runtime-ready receipt and durably commits the generation. Settings
+  // must remain readable during that proof, but its background release checks
+  // update checkedAt fields in config.json. Defer those Tweakers-owned writes
+  // until the one-use expectation disappears so a healthy startup cannot be
+  // mistaken for promotion drift or make compensating rollback ambiguous.
+  if (!independentRuntimeReadyCommitPending()) {
+    await Promise.all(tweakState.discovered.map((t) => ensureTweakUpdateCheck(t)));
+  }
   const updateChecks = readState().tweakUpdateChecks ?? {};
   const catalog = readBundledTweakCatalog();
   const discoveredById = new Map(tweakState.discovered.map((t) => [t.manifest.id, t]));
@@ -2933,7 +4209,16 @@ ipcMain.handle("tweaker:list-tweaks", async () => {
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 });
 ipcMain.handle("tweaker:get-tweaks-health", () => buildTweakHealthSnapshot());
-ipcMain.on("tweaker:tweak-lifecycle", (_event, payload: unknown) => {
+// Reserved privileged-preload bridge. It is intentionally registered outside
+// the tweak IPC registry so renderer tweaks cannot route native IDs through
+// their public command surface.
+ipcMain.handle(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, async (event, payload: unknown) => {
+  const sender = ownedCodexRenderer(event.sender.id);
+  if (!sender || sender !== event.sender) return sharedHistoryTargetUnavailable();
+  return mapSharedHistoryNativeTarget(sender.id, payload);
+});
+ipcMain.on("tweaker:tweak-lifecycle", (event, payload: unknown) => {
+  if (derivedVariant && !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return;
   if (!payload || typeof payload !== "object") return;
   const value = payload as { id?: unknown; process?: unknown; status?: unknown; error?: unknown };
   if (typeof value.id !== "string" || !/^[a-zA-Z0-9._-]+$/.test(value.id)) return;
@@ -2948,6 +4233,20 @@ ipcMain.on("tweaker:tweak-lifecycle", (_event, payload: unknown) => {
     "quarantined",
   ].includes(status)) return;
   recordTweakLifecycle(value.id, "renderer", status, value.error);
+  if (status === "ready") tryWriteRuntimeReadyReceipt();
+});
+ipcMain.on("tweaker:settings-mounted", (event, payload: unknown) => {
+  if (!derivedVariant || runtimeReadySettingsMounted) return;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || Object.keys(payload as Record<string, unknown>).join(",") !== "version"
+    || (payload as { version?: unknown }).version !== 1) return;
+  if (!isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return;
+  runtimeReadySettingsMounted = true;
+  stopRuntimeReadySettingsMountAttempts();
+  log("info", "runtime-ready Settings mount observed", { webContentsId: event.sender.id });
+  requestRuntimeReadyBrokerConnection(exactIndependentTweakersPrimaryWindow());
+  scheduleIndependentTweakersLiveHealthCapture();
+  tryWriteRuntimeReadyReceipt();
 });
 ipcMain.handle("tweaker:get-tweak-lifecycle", () => lifecycleJournal);
 ipcMain.handle(
@@ -2963,8 +4262,21 @@ ipcMain.handle(
 );
 
 ipcMain.handle("tweaker:get-tweak-enabled", (_e, id: string) => isTweakEnabled(id));
+ipcMain.on(ACCOUNTS_NATIVE_COMPATIBILITY_CHANNEL, (event) => {
+  if (!ownedCodexRenderer(event.sender.id)) {
+    event.returnValue = { compatible: false, reason: "Accounts is unavailable in this window.", hookSetSha256: null, build: null };
+    return;
+  }
+  event.returnValue = readAccountsNativeCompatibility(join(process.resourcesPath, "app.asar"));
+});
 ipcMain.handle("tweaker:set-tweak-enabled", async (_e, id: string, enabled: boolean) => {
-  return setTweakEnabledAndReload(id, enabled, tweakLifecycleDeps);
+  if (id === "co.tweakers.account-switcher" && enabled) {
+    const compatibility = readAccountsNativeCompatibility(join(process.resourcesPath, "app.asar"));
+    if (!compatibility.compatible) throw new Error(compatibility.reason ?? "Accounts requires a compatible desktop refresh.");
+  }
+  const result = await setTweakEnabledAndReload(id, enabled, tweakLifecycleDeps);
+  if (id === "co.tweakers.account-switcher") (globalThis as any).__tweakersAccountsNativeMainV1?.refreshProjects?.();
+  return result;
 });
 ipcMain.handle("tweaker:recover-tweak", (_e, id: string) => recoverTweak(id));
 ipcMain.handle("tweaker:clear-tweak-health", (_e, id: string) => {
@@ -2987,8 +4299,7 @@ function codexReleaseIsNewer(latest: string | null, installed: string | null): b
   return !!latestVersion && !!installedVersion && compareCodexVersions(latestVersion, installedVersion) > 0;
 }
 
-function installedCodexDesktopVersion(): { installedMarketingVersion: string | null; installedBuild: string | null } {
-  const root = readInstallerState()?.appRoot ?? inferMacAppRoot();
+function installedCodexDesktopVersion(root: string | null): { installedMarketingVersion: string | null; installedBuild: string | null } {
   let plistMarketingVersion: string | null = null;
   let plistBuild: string | null = null;
   try {
@@ -2998,17 +4309,57 @@ function installedCodexDesktopVersion(): { installedMarketingVersion: string | n
       plistBuild = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1] ?? null;
     }
   } catch {}
-  let appVersion: string | null = null;
-  try { appVersion = app.getVersion(); } catch {}
   return probeCodexDesktopVersion({
-    appVersion,
+    appVersion: null,
     infoPlistMarketingVersion: plistMarketingVersion,
     infoPlistBuild: plistBuild,
-    stateMarketingVersion: readInstallerState()?.codexVersion ?? null,
+    stateMarketingVersion: null,
   });
 }
 
 function selectedCodexDesktopUpdateTarget(): CodexDesktopUpdateTarget {
+  if (derivedVariant) {
+    if (independentManagerStatusDeferredForRuntimeReady()) {
+      return {
+        profile: "stable",
+        appPath: null,
+        available: false,
+        unavailableReason: INDEPENDENT_MANAGER_STARTUP_REASON,
+        setupRequired: null,
+        identityKey: null,
+        feedUrl: null,
+        fallbackFeedUrl: null,
+      };
+    }
+    try {
+      const official = readTweakersManagerStatus().status.environment?.officialApp;
+      if (official?.state !== "valid" || !official.appPath || !official.bundleId) {
+        throw new Error("The manager has no verified official ChatGPT app");
+      }
+      const profile = official.bundleId === "com.openai.codex.beta" ? "alpha" : "stable";
+      return {
+        profile,
+        appPath: official.appPath,
+        available: true,
+        unavailableReason: null,
+        setupRequired: null,
+        identityKey: createHash("sha256").update(`${profile}\0${official.appPath}\0${official.bundleId}`).digest("hex"),
+        feedUrl: null,
+        fallbackFeedUrl: null,
+      };
+    } catch (error) {
+      return {
+        profile: "stable",
+        appPath: null,
+        available: false,
+        unavailableReason: error instanceof Error ? error.message : String(error),
+        setupRequired: null,
+        identityKey: null,
+        feedUrl: null,
+        fallbackFeedUrl: null,
+      };
+    }
+  }
   let profile: CodexDesktopUpdateTarget["profile"] = "stable";
   try {
     const selection = JSON.parse(readFileSync(ENVIRONMENT_SELECTION_FILE, "utf8")) as { releaseProfile?: unknown };
@@ -3033,7 +4384,7 @@ async function refreshCodexDesktopUpdateMetadata(
       throw new Error("The verified Alpha appcast capture is unavailable");
     }
   }
-  const installed = installedCodexDesktopVersion();
+  const installed = installedCodexDesktopVersion(target.appPath ?? null);
   const cacheKey = installed.installedMarketingVersion
     ? `${installed.installedMarketingVersion}:${installed.installedBuild ?? ""}`
     : null;
@@ -3133,7 +4484,7 @@ function persistCodexAppcast(
   // a health probe must remain observational: its expected promotion surfaces
   // were sealed before launch. Suppress only this cache writer so every other
   // unexpected config mutation still fails the exact surface comparison.
-  if (healthCheckOnly) return;
+  if (healthCheckOnly || derivedVariant) return;
   if (!desktopVersion || metadata.error || metadata.stale) return;
   const feedUrl = safeAppcastCacheUrl(metadata.feedUrl);
   const releaseUrl = metadata.releaseUrl === null ? null : safeAppcastCacheUrl(metadata.releaseUrl);
@@ -3170,6 +4521,7 @@ function persistCodexAppcast(
 function persistCapturedCodexDesktopProfileFeed(
   capture: { feedUrl: string | null; fallbackFeedUrl: string | null },
 ): void {
+  if (derivedVariant) return;
   const registry = readJsonDocument(ENVIRONMENT_REGISTRY_FILE);
   const selection = readJsonDocument(ENVIRONMENT_SELECTION_FILE);
   const identity = activeVerifiedCodexDesktopProfileIdentity(registry, selection, inferMacAppRoot());
@@ -3241,7 +4593,7 @@ async function getCodexVersionsSnapshot(force: boolean): Promise<CodexVersionsSn
       }
     },
   });
-  const installedDesktop = installedCodexDesktopVersion();
+  const installedDesktop = installedCodexDesktopVersion(desktopTarget.appPath ?? null);
   const desktopCacheKey = installedDesktop.installedMarketingVersion
     ? `${installedDesktop.installedMarketingVersion}:${installedDesktop.installedBuild ?? ""}`
     : null;
@@ -3470,17 +4822,20 @@ ipcMain.handle("tweaker:get-codex-versions", async (_e, ...args: unknown[]) => {
 
 ipcMain.handle("tweaker:refresh-codex-versions", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "refresh-codex-versions");
+  if (derivedVariant) return getCodexVersionsSnapshot(false);
   return getCodexVersionsSnapshot(true);
 });
 
 ipcMain.handle("tweaker:install-codex-beta", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "install-codex-beta");
+  if (derivedVariant) return derivedVariantActionBlocked("install-codex-beta");
   await codexCliManager.installBeta();
   return getCodexVersionsSnapshot(false);
 });
 
 ipcMain.handle("tweaker:rollback-codex-beta", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "rollback-codex-beta");
+  if (derivedVariant) return derivedVariantActionBlocked("rollback-codex-beta");
   await codexCliManager.rollbackBeta();
   return getCodexVersionsSnapshot(false);
 });
@@ -3508,56 +4863,104 @@ ipcMain.handle("tweaker:set-codex-feature", async (_e, payload: unknown) => {
   return getCodexVersionsSnapshot(false);
 });
 
-ipcMain.handle("tweaker:check-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "check-codex-desktop-update");
-  return codexDesktopUpdateService.checkAndPresent();
-});
-
-ipcMain.handle("tweaker:get-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "get-codex-desktop-update");
-  const snapshot = lastPublishedCodexDesktopUpdate ?? codexDesktopUpdateService.getSnapshot();
-  const result = snapshot ?? selectedDesktopUpdateSetupResult();
-  return result ? desktopUpdateResultWithNativeState(result) : null;
-});
-
-ipcMain.handle("tweaker:start-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "start-codex-desktop-update");
-  startCodexDesktopUpdateTransaction();
-  return { started: true, checkedAt: new Date().toISOString() };
-});
-
-ipcMain.handle("tweaker:get-codex-desktop-update-transaction", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "get-codex-desktop-update-transaction");
-  return runInstalledCliJson(["update-chatgpt-status", "--json"]);
-});
-
-ipcMain.handle("tweaker:resume-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "resume-codex-desktop-update");
-  const cli = desktopUpdateCli();
-  startInstalledCli(cli, ["update-chatgpt-resume", "--json"]);
-  return { started: true, checkedAt: new Date().toISOString() };
-});
-
-ipcMain.handle("tweaker:cancel-codex-desktop-update", async (_e, ...args: unknown[]) => {
-  assertNoIpcArguments(args, "cancel-codex-desktop-update");
-  return runInstalledCliJson(["update-chatgpt-cancel", "--json"]);
+ipcMain.handle("tweaker:reapply-tweakers", async (event, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "reapply-tweakers");
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
+  const independent = derivedVariant;
+  // An independent refresh has no safe fallback source. When the manager has
+  // proved the normal official app but has not yet sealed it, make that fixed
+  // registration action explicit and stop there; a later, separately
+  // confirmed click performs the independent rebuild.
+  const managerAction: "refresh.independent" | "refresh.injected" = independent
+    ? "refresh.independent"
+    : "refresh.injected";
+  let registrationRequired = false;
+  if (independent) {
+    const manager = readTweakersManagerStatus();
+    const refresh = manager.actions.find((action) => action.actionId === "refresh.independent");
+    if (!refresh?.available) {
+      // Source registration is intentionally not a fourth generic status
+      // action. Discover its fixed capability through the narrow manager
+      // command, then either offer its dedicated confirmation or return one
+      // exact safe terminal state before any prepare/execute attempt.
+      const registration = readTweakersManagerOfficialSourceRegistration();
+      if (!registration.officialSourceRegistration.available) {
+        return {
+          started: false,
+          blocked: true,
+          action: "refresh.independent",
+          reason: registration.officialSourceRegistration.reason,
+        };
+      }
+      registrationRequired = true;
+    }
+  }
+  const confirmationOptions: MessageBoxOptions = {
+    type: "question",
+    title: registrationRequired ? "Seal Official ChatGPT Source?" : independent ? "Rebuild Independent Tweakers?" : "Reinject ChatGPT?",
+    message: registrationRequired
+      ? "Create one manager-sealed copy of the exact current /Applications/ChatGPT.app source?"
+      : independent
+      ? "Rebuild only /Applications/Tweakers.app from the verified official source?"
+      : "Consume the verified candidate for only /Applications/ChatGPT.app?",
+    detail: registrationRequired
+      ? "This does not invoke ChatGPT's native updater, replace ChatGPT, or restart ChatGPT. It only verifies and seals the exact official source for a later independent Tweakers rebuild."
+      : independent
+      ? "ChatGPT will not be replaced or restarted. Only the independent Tweakers app may require quiescence."
+      : "The independent Tweakers app will not be replaced or restarted. A genuine receipt-bound candidate is required.",
+    buttons: [registrationRequired ? "Seal Official Source" : independent ? "Rebuild Tweakers App" : "Reinject ChatGPT", "Cancel"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  };
+  const confirmation = owner
+    ? await dialog.showMessageBox(owner, confirmationOptions)
+    : await dialog.showMessageBox(confirmationOptions);
+  if (confirmation.response !== 0) return { started: false, cancelled: true };
+  if (registrationRequired) {
+    const result = startTweakersManagerOfficialSourceRegistration();
+    return {
+      ...result,
+      registrationRequired: true,
+      nextAction: "refresh.independent",
+      detail: "Official source sealing has started. When it completes, choose Rebuild Tweakers App again.",
+    };
+  }
+  return startTweakersManagerAction(managerAction);
 });
 
 ipcMain.handle("tweaker:get-environment-status", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-environment-status");
+  if (derivedVariant) return derivedVariantActionBlocked("get-environment-status");
   const status = await runInstalledCliJson(
     ["environment", "status", "--observe", "--json"],
     ENVIRONMENT_STATUS_TIMEOUT_MS,
   );
-  const cache = environmentModeCacheMenuInputFromStatus(status);
-  if (cache) publishEnvironmentModeCacheMenuStatus(cache);
+  // Environment preparation remains available for the separately authorized
+  // mode-switch workflow, but never changes ChatGPT's native update menu.
+  void environmentModeCacheMenuInputFromStatus(status);
   return status;
+});
+
+// This status-only projection is the sole Settings entry point for the
+// independent app. It deliberately does not expose a fallback descriptor,
+// legacy environment route, watcher, or self-update capability.
+ipcMain.handle("tweaker:get-independent-manager-status", (_e, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-independent-manager-status");
+  return independentManagerStatusProjection();
+});
+
+ipcMain.handle("tweaker:get-independent-live-health", (event, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "get-independent-live-health");
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) return null;
+  return independentTweakersLiveHealthProjection(independentTweakersLiveHealth);
 });
 
 // The native runtime owns the file chooser. Renderer code receives only the
 // verified status/result, never an arbitrary filesystem path to validate.
 ipcMain.handle("tweaker:choose-alpha-environment", async (event, ...args: unknown[]) => {
   assertNoIpcArguments(args, "choose-alpha-environment");
+  if (derivedVariant) return derivedVariantActionBlocked("choose-alpha-environment");
   const owner = BrowserWindow.fromWebContents(event.sender) ?? BrowserWindow.getFocusedWindow() ?? undefined;
   const dialogOptions: OpenDialogOptions = {
     title: "Choose OpenAI Beta app",
@@ -3578,6 +4981,7 @@ ipcMain.handle("tweaker:choose-alpha-environment", async (event, ...args: unknow
 
 ipcMain.handle("tweaker:get-environment-transaction", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-environment-transaction");
+  if (derivedVariant) return derivedVariantActionBlocked("get-environment-transaction");
   const transaction = await runInstalledCliJson(
     ["environment", "transaction", "--json"],
     ENVIRONMENT_ACTION_TIMEOUT_MS,
@@ -3586,6 +4990,7 @@ ipcMain.handle("tweaker:get-environment-transaction", async (_e, ...args: unknow
 });
 
 ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
+  if (derivedVariant) return derivedVariantActionBlocked("prepare-environment");
   assertEnvironmentRequest(payload);
   await buildDevelopmentEnvironmentControlPlane();
   if (payload.appExperience === "tweakers" && payload.releaseProfile === "alpha") {
@@ -3603,6 +5008,7 @@ ipcMain.handle("tweaker:prepare-environment", async (_e, payload: unknown) => {
 });
 
 ipcMain.handle("tweaker:commit-environment", async (_e, payload: unknown) => {
+  if (derivedVariant) return derivedVariantActionBlocked("commit-environment");
   assertEnvironmentCommitRequest(payload);
   return runInstalledCliJson([
     "environment",
@@ -3616,6 +5022,7 @@ ipcMain.handle("tweaker:commit-environment", async (_e, payload: unknown) => {
 });
 
 ipcMain.handle("tweaker:cancel-environment", async (_e, payload: unknown) => {
+  if (derivedVariant) return derivedVariantActionBlocked("cancel-environment");
   assertEnvironmentTransactionRequest(payload);
   return runInstalledCliJson([
     "environment",
@@ -3627,6 +5034,7 @@ ipcMain.handle("tweaker:cancel-environment", async (_e, payload: unknown) => {
 });
 
 ipcMain.handle("tweaker:rollback-environment", async (_e, payload: unknown) => {
+  if (derivedVariant) return derivedVariantActionBlocked("rollback-environment");
   assertEnvironmentTransactionRequest(payload);
   return runInstalledCliJson([
     "environment",
@@ -3641,6 +5049,7 @@ ipcMain.handle("tweaker:rollback-environment", async (_e, payload: unknown) => {
 // bytes, so it is the safe action to offer in the UI; rollback stays available
 // for callers that specifically want the recorded payload restored.
 ipcMain.handle("tweaker:recover-environment", async (_e, payload: unknown) => {
+  if (derivedVariant) return derivedVariantActionBlocked("recover-environment");
   assertEnvironmentTransactionRequest(payload);
   return runInstalledCliJson([
     "environment",
@@ -3669,6 +5078,7 @@ ipcMain.handle("tweaker:get-config", () => {
 });
 
 ipcMain.handle("tweaker:set-auto-update", (_e, enabled: boolean) => {
+  if (derivedVariant) return derivedVariantActionBlocked("set-auto-update");
   setTweakerAutoUpdate(!!enabled);
   return { autoUpdate: isTweakerAutoUpdateEnabled() };
 });
@@ -3678,6 +5088,7 @@ ipcMain.handle("tweaker:set-update-config", (_e, config: {
   updateRepo?: string;
   updateRef?: string;
 }) => {
+  if (derivedVariant) return derivedVariantActionBlocked("set-update-config");
   setTweakerUpdateConfig(config);
   const s = readState();
   return {
@@ -3688,10 +5099,12 @@ ipcMain.handle("tweaker:set-update-config", (_e, config: {
 });
 
 ipcMain.handle("tweaker:check-tweaker-update", async (_e, force?: boolean) => {
+  if (derivedVariant) return derivedVariantTweakerUpdateCheck();
   return ensureTweakerUpdateCheck(force === true);
 });
 
 ipcMain.handle("tweaker:run-tweaker-update", async () => {
+  if (derivedVariant) return derivedVariantActionBlocked("run-tweaker-update");
   const sourceRoot = readInstallerState()?.sourceRoot ?? fallbackSourceRoot();
   if (!sourceRoot) {
     throw new Error("Tweakers source CLI was not found. Run the installer once, then try again.");
@@ -3710,7 +5123,19 @@ ipcMain.handle("tweaker:start-local-refresh", async (_e, requested?: "smart" | "
   startLocalRefresh(requested)
 ));
 
-ipcMain.handle("tweaker:get-watcher-health", () => getAndPublishWatcherHealth(userRoot!));
+ipcMain.handle("tweaker:get-watcher-health", () => {
+  if (derivedVariant) {
+    return {
+      checkedAt: new Date().toISOString(),
+      status: "warn",
+      title: "Automatic maintenance unavailable",
+      summary: DERIVED_VARIANT_ACTION_DISABLED_REASON,
+      watcher: "Unavailable",
+      checks: [],
+    };
+  }
+  return getAndPublishWatcherHealth(userRoot!);
+});
 ipcMain.handle("tweaker:get-runtime-fingerprint", (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-runtime-fingerprint");
   const installedRuntimeFingerprint =
@@ -3732,6 +5157,7 @@ ipcMain.handle("tweaker:get-runtime-fingerprint", (_e, ...args: unknown[]) => {
 });
 ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "repair-auto-maintenance");
+  if (derivedVariant) return derivedVariantActionBlocked("repair-auto-maintenance");
   const cli = localRefreshCli();
   if (!existsSync(cli)) throw new Error("Tweakers maintenance CLI is unavailable");
   startInstalledCli(cli, ["watcher-run"]);
@@ -3740,6 +5166,7 @@ ipcMain.handle("tweaker:repair-auto-maintenance", async (_e, ...args: unknown[])
 ipcMain.handle("tweaker:get-mcp-sync-state", () => mcpReconciler?.readState() ?? null);
 ipcMain.handle("tweaker:repair-mcp", async (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "repair-mcp");
+  if (derivedVariant) return derivedVariantActionBlocked("repair-mcp");
   if (!mcpReconciler) throw new Error("MCP repair is unavailable during a health-only probe");
   return mcpReconciler.reconcileNow("manual-repair");
 });
@@ -4041,6 +5468,7 @@ try {
 
 async function loadAllMainTweaks(): Promise<void> {
   if (healthCheckOnly) return;
+  const startupPromises: Promise<void>[] = [];
   try {
     tweakState.discovered = discoverTweaks(TWEAKS_DIR);
     log(
@@ -4094,7 +5522,7 @@ async function loadAllMainTweaks(): Promise<void> {
           stop: bindMainTweakStop(tweak),
           storage,
         });
-        void runWithStartupTimeout(() => startResult, lifecycleStartupTimeoutMs()).then((result) => {
+        const startup = runWithStartupTimeout(() => startResult, lifecycleStartupTimeoutMs()).then((result) => {
           if (result.status === "timed_out") {
             recordTweakLifecycle(t.manifest.id, "main", "timed_out", `startup exceeded ${lifecycleStartupTimeoutMs()}ms`);
             log("error", `tweak ${t.manifest.id} startup timed out`);
@@ -4106,6 +5534,7 @@ async function loadAllMainTweaks(): Promise<void> {
           recordTweakLifecycle(t.manifest.id, "main", "failed", error);
           log("error", `tweak ${t.manifest.id} failed to start:`, error);
         });
+        startupPromises.push(startup);
       } else {
         recordTweakLifecycle(t.manifest.id, "main", "failed", "tweak has no start() function");
       }
@@ -4115,6 +5544,9 @@ async function loadAllMainTweaks(): Promise<void> {
       log("error", `tweak ${t.manifest.id} failed to start:`, e);
     }
   }
+  await Promise.all(startupPromises);
+  runtimeReadyMainInitialized = true;
+  tryWriteRuntimeReadyReceipt();
 }
 
 function stopAllMainTweaks(): void {
@@ -4166,6 +5598,7 @@ const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
 
 async function ensureTweakerUpdateCheck(force = false): Promise<TweakerUpdateCheck> {
+  if (derivedVariant) return derivedVariantTweakerUpdateCheck();
   const state = readState();
   const cached = state.tweaker?.updateCheck;
   const channel = state.tweaker?.updateChannel ?? "stable";
@@ -4862,6 +6295,7 @@ function describeInstallationSource(sourceRoot: string | null): InstallationSour
 }
 
 function startInstalledCli(cli: string, args: string[]): void {
+  if (derivedVariant) return;
   if (process.platform === "darwin" && startInstalledCliWithLaunchd(cli, args)) {
     return;
   }
@@ -4875,15 +6309,10 @@ function startInstalledCli(cli: string, args: string[]): void {
   child.unref();
 }
 
-function startCodexDesktopUpdateTransaction(): void {
-  const cli = desktopUpdateCli();
-  startInstalledCli(cli, ["update-chatgpt", "--json"]);
-}
-
-function desktopUpdateCli(status?: LocalRefreshStatusValue): string {
+function installedTweakersCli(status?: LocalRefreshStatusValue): string {
   void status;
   const cli = localRefreshCli();
-  if (!existsSync(cli)) throw new Error("Tweakers desktop-update CLI is unavailable");
+  if (!existsSync(cli)) throw new Error("Tweakers installer CLI is unavailable");
   return cli;
 }
 
@@ -4952,8 +6381,9 @@ async function buildDevelopmentEnvironmentControlPlane(): Promise<void> {
 }
 
 async function runInstalledCliJson(args: string[], timeoutMs = 10_000): Promise<unknown> {
+  if (derivedVariant) return derivedVariantActionBlocked(args[0] ?? "command");
   const status = await localRefreshStatus();
-  const cli = desktopUpdateCli(status);
+  const cli = installedTweakersCli(status);
   const runtime = localCliRuntime(cli, args);
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(runtime.command, runtime.args, {
@@ -5078,6 +6508,18 @@ interface LocalRefreshStatusValue {
   checkedAt: string;
 }
 
+function derivedVariantLocalRefreshStatus(): LocalRefreshStatusValue {
+  return {
+    available: false,
+    source: "current",
+    phase: "disabled",
+    developmentSourceRoot: null,
+    detail: DERIVED_VARIANT_ACTION_DISABLED_REASON,
+    error: `derived-variant: ${DERIVED_VARIANT_ACTION_DISABLED_REASON}`,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
 interface LocalRefreshSourceBinding {
   /** Exact CLI selected once for this runtime process. */
   cli: string;
@@ -5106,6 +6548,7 @@ const REFRESH_STATUS_TTL_MS = 4_000;
 const LOCAL_REFRESH_SOURCE_BINDING = resolveLocalRefreshSourceBinding();
 
 function localRefreshStatus(): Promise<LocalRefreshStatusValue> {
+  if (derivedVariant) return Promise.resolve(derivedVariantLocalRefreshStatus());
   if (refreshStatusCache && Date.now() - refreshStatusCache.at < REFRESH_STATUS_TTL_MS) {
     return Promise.resolve(refreshStatusCache.value);
   }
@@ -5249,6 +6692,7 @@ function buildLocalRefreshDispatch(
 async function startLocalRefresh(
   requested?: "smart" | "development" | "stable",
 ): Promise<LocalRefreshStartResult> {
+  if (derivedVariant) return { started: false, status: derivedVariantLocalRefreshStatus() };
   const status = await localRefreshStatus();
   if (!status.available) return { started: false, status };
   const appRoot = readInstallerState()?.appRoot;
@@ -5299,6 +6743,7 @@ function localRefreshCli(): string {
 // application attribution, so it survives the app quitting; the per-PID label
 // and EXIT trap's bootout + plist removal make the transient job self-remove.
 function startInstalledCliWithLaunchd(cli: string, args: string[]): boolean {
+  if (derivedVariant) return false;
   const label = `com.therealityreport.tweakers.patch-helper.${process.pid}.${Date.now()}`;
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
   if (uid === null) return false;
@@ -5486,8 +6931,11 @@ function makeMainIpc(tweak: DiscoveredTweak) {
         if (!sender || sender !== event.sender) {
           throw new Error("IPC invoke sender is not an owned Codex renderer");
         }
+        const senderContext = Object.freeze({ webContentsId: sender.id });
+        const brokerInvocation = accountsBrokerInvocationForMainFrame(event, sender);
+        if (brokerInvocation) accountsBrokerInvocationContexts.set(senderContext, brokerInvocation);
         const context = Object.freeze({
-          sender: Object.freeze({ webContentsId: sender.id }),
+          sender: senderContext,
         });
         return handler(context, ...args);
       });
@@ -6237,6 +7685,22 @@ function makeCodexApi(tweak: DiscoveredTweak) {
     cdp: {
       getStatus: async () => getCdpStatus(),
       listTargets: async () => listCdpTargets(),
+    },
+    // Main tweaks receive a redacted adapter only. The Accounts tweak binds
+    // the caller's already-validated renderer id through handleWithContext;
+    // no renderer opens or learns an owner-private broker socket.
+    accounts: {
+      // Main tweaks may observe this opaque authority state, but no renderer
+      // message can provide, override, or derive it from broker reachability.
+      authorityMode: () => accountsAuthorityMode,
+      invoke: (
+        input: Readonly<{ webContentsId: number }>,
+        envelope: AccountsBrokerIpcEnvelopeV1,
+      ) => invokeAccountsBroker(input, envelope),
+      subscribe: (
+        input: Readonly<{ webContentsId: number }>,
+        handler: (event: RendererBrokerEventV1) => void,
+      ) => subscribeAccountsBroker(input, handler),
     },
     native: {
       loadModule: async (options: NativeModuleLoadOptions) => {

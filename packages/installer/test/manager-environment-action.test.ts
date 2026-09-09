@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -115,6 +115,58 @@ test("manager-safe cancellation accepts preparing but refuses post-cutover and i
       /Environment transaction receipt is invalid/,
     );
     assert.equal(existsSync(join(archive, `${TRANSACTION_ID}.json`)), true, "existing terminal history is never overwritten by invalid input");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("receipt validation rejects bootstrap evidence outside an initial ChatGPT-to-Tweakers transition", () => {
+  const root = fixtureRoot();
+  try {
+    const { receipt } = fixtureReceipt();
+    if (receipt.prepared === null) assert.fail("fixture must include prepared evidence");
+    const bootstrap = {
+      installerState: {
+        targetPath: "/tmp/manager-environment/state.json",
+        requested: {
+          artifactPath: "/tmp/manager-environment/prepared/state/requested.json",
+          artifactDigest: "a".repeat(64),
+        },
+        rollback: {
+          existed: false,
+          artifactPath: "/tmp/manager-environment/prepared/state/rollback.json",
+          artifactDigest: null,
+        },
+      },
+      watcher: {
+        targetPath: null,
+        requested: null,
+        rollback: {
+          existed: false,
+          artifactPath: "/tmp/manager-environment/prepared/watcher/rollback.definition",
+          artifactDigest: null,
+        },
+      },
+      managedRuntimeGeneration: {
+        generationId: "b".repeat(64),
+        fingerprint: "c".repeat(64),
+        provenanceKind: "sealed-manager-managed-runtime",
+        sourceRuntimeHash: null,
+        cliPath: "/tmp/manager-environment/prepared/managed-runtime/requested/packages/installer/dist/cli.js",
+        cliArtifactDigest: "d".repeat(64),
+      },
+    };
+    const file = join(root, "transactions", "environment.json");
+    mkdirSync(join(root, "transactions"), { recursive: true });
+    writeFileSync(file, `${JSON.stringify({
+      ...receipt,
+      prepared: { ...receipt.prepared, bootstrap },
+    })}\n`);
+
+    assert.throws(
+      () => readEnvironmentTransactionReceipt(file),
+      /Environment transaction receipt is invalid/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

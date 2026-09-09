@@ -10,9 +10,10 @@
  *   2. Hook `require` so renderer preloads can find our runtime.
  *   3. Load the runtime's main-process entry BEFORE the original main entry.
  *      The runtime patches Electron's BrowserWindow to inject our preload script.
- *   4. Load the original main entry. If anything in our pipeline throws, log
- *      it but always fall through to the original main so Codex still launches
- *      (broken tweak system > broken Codex).
+ *   4. Load the original main entry. A normal ChatGPT launch may continue in
+ *      degraded mode when the optional Tweakers runtime fails. The independent
+ *      Tweakers bundle is different: it must fail closed rather than silently
+ *      presenting an unmodified ChatGPT shell.
  */
 
 "use strict";
@@ -25,6 +26,15 @@ const pkg = require("./package.json");
 const meta = pkg.__tweaker || {};
 const originalMain = meta.originalMain;
 const appUserDataRoot = meta.appUserDataRoot;
+const independentTweakers = isIndependentTweakersBundle();
+// The installer writes this exact manager-owned rendezvous into both desktop
+// packages. It must win over a parent-process environment so standard ChatGPT
+// and the derived Tweakers app cannot select different brokers.
+const accountsBrokerRoot = typeof meta.accountsBrokerRoot === "string"
+  && path.isAbsolute(meta.accountsBrokerRoot)
+  && path.resolve(meta.accountsBrokerRoot) === meta.accountsBrokerRoot
+  ? meta.accountsBrokerRoot
+  : undefined;
 const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY === "1";
 const runOriginalMainDuringHealth = process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1";
 const configuredHealthUserRoot = process.env.TWEAKERS_HEALTH_USER_ROOT;
@@ -42,7 +52,24 @@ const pairedOriginalMainHealthLaunch = healthCheckOnly
   && runOriginalMainDuringHealth
   && validHealthUserRoot;
 let runtimeInitialized = false;
+let runtimeBootstrapError = null;
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
+
+function isIndependentTweakersBundle() {
+  // productName is rewritten inside app.asar and remains available even when
+  // an older bundle lost its LSEnvironment marker. The Info.plist check is a
+  // second binding for launches where the package metadata is stale.
+  if (pkg.productName === "Tweakers") return true;
+  try {
+    const resourcesPath = process.resourcesPath;
+    if (typeof resourcesPath !== "string") return false;
+    const appRoot = path.dirname(path.dirname(resourcesPath));
+    const info = fs.readFileSync(path.join(appRoot, "Contents", "Info.plist"), "utf8");
+    return /<key>CFBundleIdentifier<\/key>\s*<string>com\.therealityreport\.tweakers<\/string>/.test(info);
+  } catch {
+    return false;
+  }
+}
 
 function isContainedHealthUserRoot(root) {
   if (!path.isAbsolute(root) || path.resolve(root) !== root) return false;
@@ -79,10 +106,66 @@ function appendCappedLog(file, line) {
   fs.appendFileSync(file, incoming);
 }
 
+function showIndependentTweakersRecovery() {
+  const title = "Tweakers failed to start";
+  const message = [
+    "Tweakers stopped because its runtime did not pass startup verification.",
+    "",
+    "The ordinary ChatGPT interface was not opened in its place.",
+    "Rebuild Independent Tweakers from the verified Tweakers manager, or review the Tweakers loader log for details.",
+  ].join("\n");
+  try {
+    const electron = require("electron");
+    if (electron?.dialog && typeof electron.dialog.showErrorBox === "function") {
+      // Electron explicitly supports showErrorBox before app.ready, which is
+      // the only dependable native surface after an early loader failure.
+      electron.dialog.showErrorBox(title, message);
+    }
+    if (electron?.app && typeof electron.app.exit === "function") {
+      electron.app.exit(1);
+    }
+  } catch (error) {
+    process.stderr.write(`[tweaker] native recovery surface unavailable: ${error}\n`);
+  }
+}
+
+function showChatGPTOverlayUnavailable() {
+  const options = {
+    type: "warning",
+    title: "Tweakers overlay unavailable",
+    message: "ChatGPT opened without Tweakers customizations.",
+    detail: [
+      "The Tweakers runtime did not pass startup verification, so no Tweakers code was loaded.",
+      "Your ChatGPT data was not changed. Review the Tweakers loader log before reapplying the overlay.",
+    ].join("\n\n"),
+    buttons: ["Continue to ChatGPT"],
+    defaultId: 0,
+  };
+  try {
+    const electron = require("electron");
+    const show = () => {
+      if (!electron?.dialog || typeof electron.dialog.showMessageBox !== "function") return;
+      Promise.resolve(electron.dialog.showMessageBox(options)).catch((error) => {
+        process.stderr.write(`[tweaker] overlay-unavailable notice failed: ${error}\n`);
+      });
+    };
+    if (electron?.app && typeof electron.app.isReady === "function" && electron.app.isReady()) {
+      show();
+    } else if (electron?.app && typeof electron.app.whenReady === "function") {
+      Promise.resolve(electron.app.whenReady()).then(show).catch((error) => {
+        process.stderr.write(`[tweaker] overlay-unavailable notice scheduling failed: ${error}\n`);
+      });
+    }
+  } catch (error) {
+    process.stderr.write(`[tweaker] overlay-unavailable notice unavailable: ${error}\n`);
+  }
+}
+
 function safe(label, fn) {
   try {
     fn();
   } catch (e) {
+    runtimeBootstrapError ||= e;
     try {
       if (!userRoot) throw e;
       const logDir = path.join(userRoot, "log");
@@ -99,6 +182,10 @@ function safe(label, fn) {
 if (appUserDataRoot && normalLaunch) {
   safe("app-user-data", () => {
     fs.mkdirSync(appUserDataRoot, { recursive: true });
+    // OpenAI's early bootstrap computes userData again immediately before it
+    // acquires Electron's single-instance lock. Bind its supported override so
+    // a derived Tweakers launch cannot be routed into the live ChatGPT process.
+    process.env.CODEX_ELECTRON_USER_DATA_PATH = appUserDataRoot;
     require("electron").app.setPath("userData", appUserDataRoot);
   });
 }
@@ -109,6 +196,10 @@ safe("init", () => {
   }
   if (!userRoot) {
     throw new Error("loader: package.json missing __tweaker.userRoot");
+  }
+  if (accountsBrokerRoot) {
+    process.env.TWEAKERS_ACCOUNTS_BROKER_ROOT = accountsBrokerRoot;
+    process.env.TWEAKER_ACCOUNTS_BROKER_ROOT = accountsBrokerRoot;
   }
 
   // Allow user-installed runtime modules to be require()d from anywhere.
@@ -129,8 +220,9 @@ safe("init", () => {
       runtimeInitialized = true;
     });
   } else {
+    runtimeBootstrapError = new Error(`runtime missing at ${runtimeDir}`);
     process.stderr.write(
-      `[tweaker] runtime missing at ${runtimeDir}; loading Codex untweaked.\n`,
+      `[tweaker] runtime missing at ${runtimeDir}; independent Tweakers launch refused.\n`,
     );
   }
 });
@@ -138,6 +230,15 @@ safe("init", () => {
 // Normal launches always start Codex. A disposable health launch starts it
 // only through the exact paired opt-in above; a bare health flag, a run flag
 // on its own, or a non-absolute health root all fail closed.
-if (normalLaunch || (pairedOriginalMainHealthLaunch && runtimeInitialized)) {
+if (normalLaunch && independentTweakers && !runtimeInitialized) {
+  const detail = runtimeBootstrapError && (runtimeBootstrapError.stack || runtimeBootstrapError.message)
+    || "runtime initialization did not complete";
+  process.stderr.write(`[tweaker] independent Tweakers launch refused: ${detail}\n`);
+  process.exitCode = 1;
+  showIndependentTweakersRecovery();
+} else if (normalLaunch || (pairedOriginalMainHealthLaunch && runtimeInitialized)) {
+  if (normalLaunch && !independentTweakers && !runtimeInitialized) {
+    showChatGPTOverlayUnavailable();
+  }
   require("./" + originalMain);
 }

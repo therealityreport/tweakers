@@ -14,6 +14,7 @@ import {
   readdirSync,
   readSync,
   realpathSync,
+  statfsSync,
   writeFileSync,
   writeSync,
   type Stats,
@@ -54,6 +55,24 @@ const MAX_FIRST_RECORD_BYTES = 128 * 1024;
 const COPY_BUFFER_BYTES = 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = MAX_HISTORY_FILES;
 const MAX_ARCHIVE_BYTES = MAX_HISTORY_BYTES;
+const MAX_ARCHIVE_RECOVERY_BYTES = 1024 * 1024 * 1024;
+const GZIP_INSPECTION_TIMEOUT_MS = 60_000;
+const GZIP_RECOVERY_TIMEOUT_MS = 10 * 60_000;
+const GZIP_CONTROL_MAX_BYTES = 8 * 1024;
+const RECOVERED_ARCHIVE_DIRECTORY = "recovered-by-tweakers-v1";
+const RECOVERED_ARCHIVE_ROOT = `archived_sessions/${RECOVERED_ARCHIVE_DIRECTORY}`;
+const ARCHIVE_EXACT_METADATA_PATHS = new Set<string>([
+  "archived_sessions/keep-codex-fast-20260531-161915/RESTORE_MANIFEST.json",
+  "archived_sessions/keep-codex-fast-20260531-173902/RESTORE_MANIFEST.json",
+  "archived_sessions/completed-or-obsolete-2026-08-26/MANIFEST.json",
+  "archived_sessions/.relocation-manifest.json",
+  "session-cold-storage/2026-08-20-older-than-14-days/manifest.json",
+  "session-cold-storage/2026-08-20-older-than-14-days/manifest.sha256",
+  "session-cold-storage/2026-08-20-older-than-14-days/conversion-journal.jsonl",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite-wal",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite-shm",
+]);
 const TRUSTED_DESKTOP_APP_PATHS = [
   "/Applications/Tweakers.app",
   "/Applications/Tweakers ChatGPT.app",
@@ -98,6 +117,10 @@ export interface PrivateHistoryNormalizationDependencies {
   census(input: { appPath: string; protectedPaths: readonly string[] }): HistoryAdoptionCensus;
   now(): string;
   randomId(): string;
+  /** Test and safety injection only: may lower, never raise, the fixed 1 GiB gzip output cap. */
+  archiveRecoveryByteCap?: number;
+  /** Test-only filesystem-free-space oracle; production uses statfs synchronously. */
+  freeSpaceBytes?(path: string): bigint;
   beforePhase?(phase: PrivateHistoryNormalizationPhase): void;
 }
 
@@ -122,6 +145,11 @@ export interface PrivateHistoryNormalizationResult {
   importedThreadCount: number;
   rewrittenRolloutPaths: number;
   clearedMissingRolloutPaths: number;
+  recoveredSourceStaleRolloutPaths: number;
+  recoveredArchiveRolloutPaths: number;
+  decompressedArchiveFiles: number;
+  decompressedArchiveBytes: number;
+  excludedMetadataFiles: number;
   databasesPresent: number;
   sessionIndexPresent: boolean;
   nextAction: "apply-normalization" | "run-adoption-dry-run";
@@ -173,9 +201,19 @@ interface HistoryFileEvidence {
   bytes: number;
 }
 
+interface HistoryMetadataEvidence {
+  artifact: HistoryTree;
+  relativePath: string;
+  sourcePath: string;
+  identity: FileIdentity;
+  sha256: Sha256Fingerprint;
+  bytes: number;
+}
+
 interface HistoryInventory {
   directories: readonly DirectoryEvidence[];
   files: readonly HistoryFileEvidence[];
+  metadata: readonly HistoryMetadataEvidence[];
   fingerprint: Sha256Fingerprint;
   regularHistoryFiles: number;
   linkedHistoryFiles: number;
@@ -204,10 +242,22 @@ interface ArchiveDirectoryEvidence {
   names: readonly string[];
 }
 
-interface ArchiveFileEvidence {
+type ArchiveRolloutEncoding = "plain" | "gzip";
+
+interface ArchiveRolloutEvidence {
   relativePath: string;
   path: string;
   id: string;
+  encoding: ArchiveRolloutEncoding;
+  identity: FileIdentity;
+  compressedSha256: Sha256Fingerprint;
+  compressedBytes: number;
+  gzipTrailerIsize: number | null;
+}
+
+interface ArchiveMetadataEvidence {
+  relativePath: string;
+  path: string;
   identity: FileIdentity;
   sha256: Sha256Fingerprint;
   bytes: number;
@@ -215,14 +265,16 @@ interface ArchiveFileEvidence {
 
 interface ArchiveInventory {
   directories: readonly ArchiveDirectoryEvidence[];
-  files: readonly ArchiveFileEvidence[];
+  rollouts: readonly ArchiveRolloutEvidence[];
+  metadata: readonly ArchiveMetadataEvidence[];
   entryPaths: ReadonlySet<string>;
   fingerprint: Sha256Fingerprint;
 }
 
 interface ArchiveScanState {
   directories: ArchiveDirectoryEvidence[];
-  files: ArchiveFileEvidence[];
+  rollouts: ArchiveRolloutEvidence[];
+  metadata: ArchiveMetadataEvidence[];
   entryPaths: Set<string>;
   seenIds: Set<string>;
   bytes: number;
@@ -231,6 +283,28 @@ interface ArchiveScanState {
 interface PhysicalRecord {
   id: string;
   localPath: string;
+  sha256: Sha256Fingerprint;
+  bytes: number;
+  file: HistoryFileEvidence;
+}
+
+type RecoverySourceKind = "source-stale-path" | "archive-plain" | "archive-gzip";
+
+interface RecoveryPlanEntry {
+  id: string;
+  sourceKind: RecoverySourceKind;
+  snapshotLocalPath: string;
+  sourceLocalPath: string | null;
+  archive: ArchiveRolloutEvidence | null;
+  plannedNormalizedSha256: Sha256Fingerprint | null;
+  plannedNormalizedBytes: number | null;
+}
+
+interface MaterializedArchiveRecovery {
+  id: string;
+  snapshotLocalPath: string;
+  normalizedSha256: Sha256Fingerprint;
+  normalizedBytes: number;
 }
 
 interface NormalizationPlan {
@@ -241,10 +315,13 @@ interface NormalizationPlan {
   threadRowsFingerprint: Sha256Fingerprint;
   nonRolloutRowsFingerprint: Sha256Fingerprint;
   physicalRecords: readonly PhysicalRecord[];
+  recoveries: readonly RecoveryPlanEntry[];
   updates: readonly PrivateHistoryRolloutUpdate[];
   importedThreadIds: readonly string[];
   missingFingerprint: Sha256Fingerprint;
   rewriteFingerprint: Sha256Fingerprint;
+  recoveryFingerprint: Sha256Fingerprint;
+  metadataFingerprint: Sha256Fingerprint;
   sourceFingerprint: Sha256Fingerprint;
 }
 
@@ -260,6 +337,29 @@ interface PrivateHistoryNormalizationManifestV1 {
   nonRolloutRowsFingerprint: Sha256Fingerprint;
   missingFingerprint: Sha256Fingerprint;
   rewriteFingerprint: Sha256Fingerprint;
+  archiveRecovery: {
+    recoveryFingerprint: Sha256Fingerprint;
+    metadataFingerprint: Sha256Fingerprint;
+    counts: {
+      recoveredSourceStaleRolloutPaths: number;
+      recoveredArchiveRolloutPaths: number;
+      decompressedArchiveFiles: number;
+      decompressedArchiveBytes: number;
+      excludedMetadataFiles: number;
+    };
+    entries: readonly {
+      sourceKind: RecoverySourceKind;
+      canonicalIdFingerprint: Sha256Fingerprint;
+      sourceRelativePathFingerprint: Sha256Fingerprint | null;
+      archiveRelativePathFingerprint: Sha256Fingerprint | null;
+      compressedSha256: Sha256Fingerprint | null;
+      compressedBytes: number | null;
+      normalizedSha256: Sha256Fingerprint | null;
+      normalizedBytes: number | null;
+      encoding: ArchiveRolloutEncoding | null;
+      snapshotRelativePath: string;
+    }[];
+  };
   counts: {
     regularHistoryFiles: number;
     linkedHistoryFiles: number;
@@ -268,6 +368,11 @@ interface PrivateHistoryNormalizationManifestV1 {
     importedThreadCount: number;
     rewrittenRolloutPaths: number;
     clearedMissingRolloutPaths: number;
+    recoveredSourceStaleRolloutPaths: number;
+    recoveredArchiveRolloutPaths: number;
+    decompressedArchiveFiles: number;
+    decompressedArchiveBytes: number;
+    excludedMetadataFiles: number;
     databasesPresent: number;
   };
   histories: readonly {
@@ -300,6 +405,7 @@ export function normalizePrivateHistory(
   } as PrivateHistoryNormalizationDependencies;
   const paths = normalizationPaths(input);
   const apply = input.apply === true;
+  const archiveRecoveryByteCap = normalizedArchiveRecoveryByteCap(dependencies.archiveRecoveryByteCap);
   let candidateRoot: string | null = null;
   let snapshotParent: SnapshotParentAnchor | null = null;
   let candidateAnchor: SnapshotCandidateAnchor | null = null;
@@ -318,6 +424,12 @@ export function normalizePrivateHistory(
 
     assertIdle(dependencies.census({ appPath: paths.appPath, protectedPaths: protectedPaths(paths) }));
     dependencies.beforePhase?.("after-second-census");
+    assertRecoveryFreeSpaceBeforeCandidate(
+      snapshotParent.path,
+      plan,
+      archiveRecoveryByteCap,
+      dependencies.freeSpaceBytes,
+    );
 
     candidateRoot = uniqueSibling(paths.snapshotRoot, ".history-normalization-candidate", dependencies.randomId());
     createSnapshotRoot(candidateRoot, snapshotParent);
@@ -327,6 +439,13 @@ export function normalizePrivateHistory(
     const candidateCodexRoot = join(candidateRoot, "codex-home");
     const candidateSqliteRoot = join(candidateRoot, "sqlite-home");
     copyHistoryInventory(plan.histories, candidateCodexRoot);
+    const materializedRecoveries = materializeArchiveRecoveries(
+      plan,
+      candidateCodexRoot,
+      snapshotParent.path,
+      archiveRecoveryByteCap,
+      dependencies.freeSpaceBytes,
+    );
     dependencies.beforePhase?.("after-history-copied");
 
     cloneDatabases(plan.databases, candidateSqliteRoot, dependencies.sqlite);
@@ -335,7 +454,7 @@ export function normalizePrivateHistory(
     dependencies.beforePhase?.("after-database-rewrite");
 
     const normalizedHistories = inspectNormalizedHistories(candidateCodexRoot);
-    assertNormalizedHistories(plan.histories, normalizedHistories);
+    assertNormalizedHistories(plan.histories, plan.recoveries, materializedRecoveries, normalizedHistories);
     const normalizedDatabases = inspectDatabases(candidateSqliteRoot, dependencies.sqlite);
     assertCandidateDatabaseRows(plan, candidateSqliteRoot, dependencies.sqlite);
 
@@ -348,7 +467,14 @@ export function normalizePrivateHistory(
       databases: normalizedDatabases.fingerprint,
       threadRows: threadRowsFingerprint(dependencies.sqlite.readThreadRows(join(candidateSqliteRoot, "state_5.sqlite"))),
     });
-    const manifest = createManifest(plan, normalizedHistories, normalizedDatabases, normalizedFingerprint, dependencies.now());
+    const manifest = createManifest(
+      plan,
+      materializedRecoveries,
+      normalizedHistories,
+      normalizedDatabases,
+      normalizedFingerprint,
+      dependencies.now(),
+    );
     writePrivateJsonNew(join(candidateRoot, PRIVATE_HISTORY_NORMALIZATION_MANIFEST), manifest);
     dependencies.beforePhase?.("before-publication");
     const retainedOnPublicationFailure = uniqueSibling(
@@ -365,7 +491,7 @@ export function normalizePrivateHistory(
     );
     candidateRoot = null;
     if (publication === "retained") throw failure("snapshot-publication-path-drift");
-    return resultFor("normalized", plan, normalizedFingerprint);
+    return resultFor("normalized", plan, normalizedFingerprint, materializedRecoveries);
   } catch (error) {
     if (candidateRoot && snapshotParent && candidateAnchor && !isCommittedRenameFailure(error)) {
       try {
@@ -395,6 +521,14 @@ function defaultDependencies(): PrivateHistoryNormalizationDependencies {
     now: () => new Date().toISOString(),
     randomId: () => randomUUID(),
   };
+}
+
+function normalizedArchiveRecoveryByteCap(value: number | undefined): number {
+  if (value === undefined) return MAX_ARCHIVE_RECOVERY_BYTES;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_ARCHIVE_RECOVERY_BYTES) {
+    throw failure("invalid-archive-recovery-cap");
+  }
+  return value;
 }
 
 function normalizationPaths(input: PrivateHistoryNormalizationInput): {
@@ -444,14 +578,17 @@ function buildPlan(
   const histories = inspectSourceHistories(paths.sourceCodexRoot, paths.allowedLinkRoot);
   const databases = inspectDatabases(paths.sourceSqliteRoot, sqlite);
   const archive = inspectAllowedArchive(paths.allowedLinkRoot);
+  assertRecoveryNamespaceAvailable(paths.sourceCodexRoot);
   const statePath = databases.paths.get("state_5.sqlite");
   const threadRows = statePath ? readThreadRows(sqlite, statePath) : [];
   const physicalRecords = physicalRecordMap(histories);
+  assertSourceArchiveContentAgreement(physicalRecords, archive);
   const physicalByLocal = new Map(physicalRecords.map((record) => [record.localPath, record.id]));
-  const physicalById = new Map(physicalRecords.map((record) => [record.id, record.localPath]));
-  const archiveById = new Map(archive.files.map((record) => [record.id, record.relativePath]));
+  const physicalById = new Map(physicalRecords.map((record) => [record.id, record]));
+  const archiveById = new Map(archive.rollouts.map((record) => [record.id, record]));
   const seenDatabaseIds = new Set<string>();
   const updates: PrivateHistoryRolloutUpdate[] = [];
+  const recoveries: RecoveryPlanEntry[] = [];
   const missingEvidence: Array<{ id: string; rolloutPath: string }> = [];
 
   for (const row of threadRows) {
@@ -476,7 +613,44 @@ function buildPlan(
       });
       continue;
     }
-    if (physicalById.has(row.id) || archiveById.has(row.id)) throw failure("missing-path-recoverable");
+    const physical = physicalById.get(row.id);
+    if (physical) {
+      const snapshotLocalPath = physical.localPath;
+      updates.push({
+        id: row.id,
+        expectedRolloutPath: row.rollout_path,
+        rolloutPath: join(paths.snapshotRoot, "codex-home", ...snapshotLocalPath.split("/")),
+      });
+      recoveries.push({
+        id: row.id,
+        sourceKind: "source-stale-path",
+        snapshotLocalPath,
+        sourceLocalPath: physical.localPath,
+        archive: null,
+        plannedNormalizedSha256: physical.sha256,
+        plannedNormalizedBytes: physical.bytes,
+      });
+      continue;
+    }
+    const archiveRecord = archiveById.get(row.id);
+    if (archiveRecord) {
+      const snapshotLocalPath = archiveRecoveryLocalPath(row.id);
+      updates.push({
+        id: row.id,
+        expectedRolloutPath: row.rollout_path,
+        rolloutPath: join(paths.snapshotRoot, "codex-home", ...snapshotLocalPath.split("/")),
+      });
+      recoveries.push({
+        id: row.id,
+        sourceKind: archiveRecord.encoding === "gzip" ? "archive-gzip" : "archive-plain",
+        snapshotLocalPath,
+        sourceLocalPath: null,
+        archive: archiveRecord,
+        plannedNormalizedSha256: archiveRecord.encoding === "plain" ? archiveRecord.compressedSha256 : null,
+        plannedNormalizedBytes: archiveRecord.encoding === "plain" ? archiveRecord.compressedBytes : null,
+      });
+      continue;
+    }
     assertNoExactArchiveCandidate(archive, local);
     missingEvidence.push({ id: row.id, rolloutPath: row.rollout_path });
     updates.push({ id: row.id, expectedRolloutPath: row.rollout_path, rolloutPath: null });
@@ -487,10 +661,18 @@ function buildPlan(
   const nonRolloutFingerprint = nonRolloutRowsFingerprint(threadRows);
   const missingFingerprint = canonicalSha256Fingerprint(missingEvidence.sort(compareId));
   const rewriteFingerprint = canonicalSha256Fingerprint(updates.map(redactedUpdate).sort(compareId));
+  const sortedRecoveries = recoveries.sort(compareId);
+  const recoveryFingerprint = canonicalSha256Fingerprint(sortedRecoveries.map(recoveryFingerprintEvidence));
+  const metadataFingerprint = canonicalSha256Fingerprint({
+    source: histories.metadata.map(historyMetadataFingerprintEvidence),
+    archive: archive.metadata.map(archiveMetadataFingerprintEvidence),
+  });
   const sourceFingerprint = canonicalSha256Fingerprint({
     histories: histories.fingerprint,
     databases: databases.fingerprint,
     archive: archive.fingerprint,
+    recoveries: recoveryFingerprint,
+    metadata: metadataFingerprint,
     threadRows: threadFingerprint,
     nonRolloutRows: nonRolloutFingerprint,
     missing: missingFingerprint,
@@ -504,10 +686,13 @@ function buildPlan(
     threadRowsFingerprint: threadFingerprint,
     nonRolloutRowsFingerprint: nonRolloutFingerprint,
     physicalRecords,
+    recoveries: sortedRecoveries,
     updates: updates.sort((left, right) => left.id.localeCompare(right.id)),
     importedThreadIds,
     missingFingerprint,
     rewriteFingerprint,
+    recoveryFingerprint,
+    metadataFingerprint,
     sourceFingerprint,
   };
 }
@@ -515,16 +700,17 @@ function buildPlan(
 function inspectSourceHistories(sourceCodexRoot: string, allowedLinkRoot: string): HistoryInventory {
   const directories: DirectoryEvidence[] = [];
   const files: HistoryFileEvidence[] = [];
+  const metadata: HistoryMetadataEvidence[] = [];
   for (const artifact of ["sessions", "archived_sessions"] as const) {
     const root = join(sourceCodexRoot, artifact);
     if (optionalLstat(root, "history-artifact") === null) continue;
-    scanHistoryDirectory(root, artifact, "", allowedLinkRoot, directories, files);
+    scanHistoryDirectory(root, artifact, "", allowedLinkRoot, directories, files, metadata);
   }
   const index = join(sourceCodexRoot, "session_index.jsonl");
   if (optionalLstat(index, "session-index") !== null) {
     files.push(regularHistoryFile(index, "session_index.jsonl", "session_index.jsonl"));
   }
-  return finalizeHistoryInventory(directories, files);
+  return finalizeHistoryInventory(directories, files, metadata);
 }
 
 /**
@@ -541,17 +727,20 @@ function inspectAllowedArchive(allowedRoot: string): ArchiveInventory {
   assertExactDirectory(allowedRoot, "archive-root", false);
   const state: ArchiveScanState = {
     directories: [],
-    files: [],
+    rollouts: [],
+    metadata: [],
     entryPaths: new Set<string>(),
     seenIds: new Set<string>(),
     bytes: 0,
   };
   scanArchiveDirectory(allowedRoot, allowedRoot, "", state);
   const directories = [...state.directories].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
-  const files = [...state.files].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  const rollouts = [...state.rollouts].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  const metadata = [...state.metadata].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
   const inventory: ArchiveInventory = {
     directories,
-    files,
+    rollouts,
+    metadata,
     entryPaths: new Set(state.entryPaths),
     fingerprint: canonicalSha256Fingerprint({
       directories: directories.map((entry) => ({
@@ -559,9 +748,17 @@ function inspectAllowedArchive(allowedRoot: string): ArchiveInventory {
         identity: entry.identity,
         names: entry.names,
       })),
-      files: files.map((entry) => ({
+      rollouts: rollouts.map((entry) => ({
         path: entry.relativePath,
         id: entry.id,
+        encoding: entry.encoding,
+        identity: entry.identity,
+        compressedBytes: entry.compressedBytes,
+        compressedSha256: entry.compressedSha256,
+        gzipTrailerIsize: entry.gzipTrailerIsize,
+      })),
+      metadata: metadata.map((entry) => ({
+        path: entry.relativePath,
         identity: entry.identity,
         bytes: entry.bytes,
         sha256: entry.sha256,
@@ -602,23 +799,16 @@ function scanArchiveDirectory(
       scanArchiveDirectory(allowedRoot, path, relativePath, state);
       continue;
     }
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size <= 0) throw failure("archive-entry-unsafe");
+    if (!stat.isFile() || stat.nlink !== 1) throw failure("archive-entry-unsafe");
     assertArchivePath(allowedRoot, path, relativePath);
-    const id = rolloutFirstRecordThreadId(path, stat);
-    if (state.seenIds.has(id)) throw failure("duplicate-rollout-thread-id");
-    const sha256 = hashStableRegular(path, stat);
-    if (!sameIdentity(identity(safeLstat(path, "archive-file")), identity(stat))) {
-      throw failure("archive-file-drift");
+    if (isArchiveMetadataPath(relativePath)) {
+      state.metadata.push(archiveMetadataFile(path, relativePath, stat));
+    } else {
+      const rollout = archiveRolloutFile(path, relativePath, stat);
+      if (state.seenIds.has(rollout.id)) throw failure("duplicate-rollout-thread-id");
+      state.seenIds.add(rollout.id);
+      state.rollouts.push(rollout);
     }
-    state.seenIds.add(id);
-    state.files.push({
-      relativePath,
-      path,
-      id,
-      identity: identity(stat),
-      sha256,
-      bytes: stat.size,
-    });
     state.bytes += stat.size;
     assertArchiveInventoryLimits(state);
   }
@@ -627,20 +817,35 @@ function scanArchiveDirectory(
 function revalidateArchiveInventory(allowedRoot: string, inventory: ArchiveInventory): void {
   revalidateArchiveDirectories(allowedRoot, inventory);
   const seenIds = new Set<string>();
-  for (const file of inventory.files) {
-    const path = archivePath(allowedRoot, file.relativePath);
-    if (path !== file.path) throw failure("archive-path-escape");
-    assertArchivePath(allowedRoot, path, file.relativePath);
+  for (const rollout of inventory.rollouts) {
+    const path = archivePath(allowedRoot, rollout.relativePath);
+    if (path !== rollout.path) throw failure("archive-path-escape");
+    assertArchivePath(allowedRoot, path, rollout.relativePath);
     const stat = safeLstat(path, "archive-file");
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size <= 0
-      || !sameIdentity(identity(stat), file.identity)) {
+      || !sameIdentity(identity(stat), rollout.identity)) {
       throw failure("archive-file-drift");
     }
-    if (rolloutFirstRecordThreadId(path, stat) !== file.id || seenIds.has(file.id)) {
+    const current = archiveRolloutFile(path, rollout.relativePath, stat);
+    if (current.id !== rollout.id || current.encoding !== rollout.encoding
+      || current.compressedBytes !== rollout.compressedBytes
+      || current.compressedSha256 !== rollout.compressedSha256
+      || current.gzipTrailerIsize !== rollout.gzipTrailerIsize
+      || seenIds.has(rollout.id)) {
       throw failure("archive-file-drift");
     }
-    if (hashStableRegular(path, stat) !== file.sha256) throw failure("archive-file-drift");
-    seenIds.add(file.id);
+    seenIds.add(rollout.id);
+  }
+  for (const metadata of inventory.metadata) {
+    const path = archivePath(allowedRoot, metadata.relativePath);
+    if (path !== metadata.path || !isArchiveMetadataPath(metadata.relativePath)) throw failure("archive-path-escape");
+    assertArchivePath(allowedRoot, path, metadata.relativePath);
+    const stat = safeLstat(path, "archive-metadata");
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+      || !sameIdentity(identity(stat), metadata.identity)
+      || hashStableRegular(path, stat) !== metadata.sha256) {
+      throw failure("archive-metadata-drift");
+    }
   }
   // A final directory pass detects changes made while file identities and
   // hashes were being revalidated, including a newly inserted symlink.
@@ -666,7 +871,7 @@ function revalidateArchiveDirectories(allowedRoot: string, inventory: ArchiveInv
 }
 
 function assertArchiveInventoryLimits(state: ArchiveScanState): void {
-  const entryCount = state.directories.length + state.files.length;
+  const entryCount = state.directories.length + state.rollouts.length + state.metadata.length;
   if (!Number.isSafeInteger(entryCount) || entryCount > MAX_ARCHIVE_ENTRIES) {
     throw failure("archive-entry-count-exceeded");
   }
@@ -709,6 +914,75 @@ function sameNames(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((name, index) => name === right[index]);
 }
 
+function isSourceHistoryMetadataName(name: string): boolean {
+  return name === ".DS_Store" || name.startsWith("._");
+}
+
+function isArchiveMetadataPath(relativePath: string): boolean {
+  return isSourceHistoryMetadataName(basename(relativePath)) || ARCHIVE_EXACT_METADATA_PATHS.has(relativePath);
+}
+
+function sourceHistoryMetadataFile(
+  path: string,
+  artifact: HistoryTree,
+  relativePath: string,
+  stat: Stats,
+): HistoryMetadataEvidence {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw failure("unsafe-history-metadata");
+  return {
+    artifact,
+    relativePath,
+    sourcePath: path,
+    identity: identity(stat),
+    sha256: hashStableRegular(path, stat),
+    bytes: stat.size,
+  };
+}
+
+function archiveMetadataFile(path: string, relativePath: string, stat: Stats): ArchiveMetadataEvidence {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw failure("archive-entry-unsafe");
+  return {
+    relativePath,
+    path,
+    identity: identity(stat),
+    sha256: hashStableRegular(path, stat),
+    bytes: stat.size,
+  };
+}
+
+function archiveRolloutFile(path: string, relativePath: string, stat: Stats): ArchiveRolloutEvidence {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size <= 0) {
+    throw failure("archive-entry-unsafe");
+  }
+  let encoding: ArchiveRolloutEncoding;
+  let id: string;
+  let gzipTrailerIsize: number | null = null;
+  if (relativePath.endsWith(".jsonl")) {
+    if (archiveHasGzipMagic(path, stat)) throw failure("archive-rollout-encoding-mismatch");
+    encoding = "plain";
+    id = rolloutFirstRecordThreadId(path, stat);
+  } else if (relativePath.endsWith(".jsonl.gz")) {
+    if (!archiveHasGzipMagic(path, stat)) throw failure("archive-rollout-encoding-mismatch");
+    encoding = "gzip";
+    id = gzipRolloutFirstRecordThreadId(path, stat);
+    gzipTrailerIsize = gzipTrailerIsizeValue(path, stat);
+  } else {
+    throw failure("archive-entry-unknown");
+  }
+  const compressedSha256 = hashStableRegular(path, stat);
+  if (!sameIdentity(identity(safeLstat(path, "archive-file")), identity(stat))) throw failure("archive-file-drift");
+  return {
+    relativePath,
+    path,
+    id,
+    encoding,
+    identity: identity(stat),
+    compressedSha256,
+    compressedBytes: stat.size,
+    gzipTrailerIsize,
+  };
+}
+
 function inspectNormalizedHistories(codexRoot: string): HistoryInventory {
   const directories: DirectoryEvidence[] = [];
   const files: HistoryFileEvidence[] = [];
@@ -725,7 +999,7 @@ function inspectNormalizedHistories(codexRoot: string): HistoryInventory {
     }
     files.push(regularHistoryFile(index, "session_index.jsonl", "session_index.jsonl"));
   }
-  return finalizeHistoryInventory(directories, files);
+  return finalizeHistoryInventory(directories, files, []);
 }
 
 function scanHistoryDirectory(
@@ -735,6 +1009,7 @@ function scanHistoryDirectory(
   allowedLinkRoot: string,
   directories: DirectoryEvidence[],
   files: HistoryFileEvidence[],
+  metadata: HistoryMetadataEvidence[],
 ): void {
   const directoryStat = safeLstat(directory, "history-directory");
   if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw failure("unsafe-history-directory");
@@ -744,7 +1019,9 @@ function scanHistoryDirectory(
     const local = localRoot ? `${localRoot}/${name}` : name;
     const stat = safeLstat(path, "history-entry");
     if (stat.isDirectory()) {
-      scanHistoryDirectory(path, artifact, local, allowedLinkRoot, directories, files);
+      scanHistoryDirectory(path, artifact, local, allowedLinkRoot, directories, files, metadata);
+    } else if (isSourceHistoryMetadataName(name)) {
+      metadata.push(sourceHistoryMetadataFile(path, artifact, local, stat));
     } else if (stat.isSymbolicLink()) {
       files.push(linkedHistoryFile(path, artifact, local, allowedLinkRoot, stat));
     } else if (stat.isFile()) {
@@ -752,7 +1029,7 @@ function scanHistoryDirectory(
     } else {
       throw failure("unsafe-history-entry");
     }
-    assertInventoryLimits(files);
+    assertInventoryLimits(files, metadata);
   }
 }
 
@@ -848,16 +1125,20 @@ function linkedHistoryFile(
 function finalizeHistoryInventory(
   directories: readonly DirectoryEvidence[],
   files: readonly HistoryFileEvidence[],
+  metadata: readonly HistoryMetadataEvidence[],
 ): HistoryInventory {
   const sortedDirectories = [...directories].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
   const sortedFiles = [...files].sort((left, right) => historyLocalPath(left).localeCompare(historyLocalPath(right)));
-  assertInventoryLimits(sortedFiles);
+  const sortedMetadata = [...metadata].sort((left, right) => historyMetadataLocalPath(left).localeCompare(historyMetadataLocalPath(right)));
+  assertInventoryLimits(sortedFiles, sortedMetadata);
   return {
     directories: sortedDirectories,
     files: sortedFiles,
+    metadata: sortedMetadata,
     fingerprint: canonicalSha256Fingerprint({
       directories: sortedDirectories.map((entry) => ({ path: entry.relativePath, identity: entry.identity })),
       files: sortedFiles.map(fileFingerprintEvidence),
+      metadata: sortedMetadata.map(historyMetadataFingerprintEvidence),
     }),
     regularHistoryFiles: sortedFiles.filter((file) => file.artifact !== "session_index.jsonl" && file.kind === "regular").length,
     linkedHistoryFiles: sortedFiles.filter((file) => file.kind === "linked").length,
@@ -893,7 +1174,13 @@ function physicalRecordMap(histories: HistoryInventory): PhysicalRecord[] {
     const id = rolloutFirstRecordThreadId(file.copySourcePath);
     if (seenIds.has(id)) throw failure("duplicate-rollout-thread-id");
     seenIds.add(id);
-    records.push({ id, localPath: historyLocalPath(file) });
+    records.push({
+      id,
+      localPath: historyLocalPath(file),
+      sha256: file.sha256,
+      bytes: file.bytes,
+      file,
+    });
   }
   return records.sort((left, right) => left.id.localeCompare(right.id));
 }
@@ -912,6 +1199,168 @@ function copyHistoryInventory(source: HistoryInventory, destinationCodexRoot: st
       ? join(destinationCodexRoot, "session_index.jsonl")
       : join(destinationCodexRoot, file.artifact, ...file.relativePath.split("/"));
     copyStableRegular(file, destination);
+  }
+}
+
+function materializeArchiveRecoveries(
+  plan: NormalizationPlan,
+  destinationCodexRoot: string,
+  snapshotParent: string,
+  archiveRecoveryByteCap: number,
+  freeSpaceBytes: PrivateHistoryNormalizationDependencies["freeSpaceBytes"],
+): readonly MaterializedArchiveRecovery[] {
+  const archiveRecoveries = plan.recoveries.filter((entry) => entry.archive !== null);
+  if (archiveRecoveries.length === 0) return [];
+  const archivedSessions = join(destinationCodexRoot, "archived_sessions");
+  if (!existsSync(archivedSessions)) mkdirPrivateNew(archivedSessions);
+  const recoveryRoot = join(archivedSessions, RECOVERED_ARCHIVE_DIRECTORY);
+  mkdirPrivateNew(recoveryRoot);
+
+  const materialized: MaterializedArchiveRecovery[] = [];
+  let normalizedBytes = plan.histories.historyBytes;
+  const databaseBytes = recoveryDatabaseBytes(plan.databases);
+  let remainingPlainArchiveBytes = recoveryPlainArchiveBytes(archiveRecoveries);
+  for (const recovery of archiveRecoveries) {
+    const archive = recovery.archive;
+    if (!archive) throw failure("archive-recovery-plan-invalid");
+    const remaining = MAX_HISTORY_BYTES - normalizedBytes;
+    if (!Number.isSafeInteger(remaining) || remaining <= 0) throw failure("history-size-exceeded");
+    const destination = join(destinationCodexRoot, ...recovery.snapshotLocalPath.split("/"));
+    let output: MaterializedArchiveRecovery;
+    if (archive.encoding === "plain") {
+      if (archive.compressedBytes > remaining) throw failure("history-size-exceeded");
+      output = copyArchivePlainRecovery(archive, recovery.snapshotLocalPath, destination);
+    } else {
+      const outputCap = Math.min(archiveRecoveryByteCap, remaining);
+      assertRecoveryFreeSpaceForGzip(
+        snapshotParent,
+        outputCap,
+        databaseBytes + remainingPlainArchiveBytes,
+        freeSpaceBytes,
+      );
+      output = decompressArchiveGzipRecovery(
+        archive,
+        recovery.snapshotLocalPath,
+        destination,
+        outputCap,
+      );
+    }
+    if (output.id !== recovery.id || output.snapshotLocalPath !== recovery.snapshotLocalPath
+      || !Number.isSafeInteger(output.normalizedBytes)
+      || output.normalizedBytes <= 0
+      || output.normalizedBytes > remaining) {
+      throw failure("archive-recovery-output-mismatch");
+    }
+    if (recovery.plannedNormalizedSha256 !== null && output.normalizedSha256 !== recovery.plannedNormalizedSha256
+      || recovery.plannedNormalizedBytes !== null && output.normalizedBytes !== recovery.plannedNormalizedBytes) {
+      throw failure("archive-recovery-output-mismatch");
+    }
+    if (archive.encoding === "plain") {
+      const archiveBytes = recoveryByteCount(archive.compressedBytes);
+      if (archiveBytes > remainingPlainArchiveBytes) throw failure("archive-recovery-plan-invalid");
+      remainingPlainArchiveBytes -= archiveBytes;
+    }
+    normalizedBytes += output.normalizedBytes;
+    materialized.push(output);
+  }
+  return materialized.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function copyArchivePlainRecovery(
+  archive: ArchiveRolloutEvidence,
+  snapshotLocalPath: string,
+  destination: string,
+): MaterializedArchiveRecovery {
+  if (archive.encoding !== "plain") throw failure("archive-recovery-plan-invalid");
+  revalidateArchiveRollout(archive);
+  copyStableRegular({
+    artifact: "archived_sessions",
+    relativePath: snapshotLocalPath.slice("archived_sessions/".length),
+    sourcePath: archive.path,
+    copySourcePath: archive.path,
+    kind: "regular",
+    sourceIdentity: archive.identity,
+    targetIdentity: null,
+    linkText: null,
+    targetParents: [],
+    sha256: archive.compressedSha256,
+    bytes: archive.compressedBytes,
+  }, destination);
+  const stat = assertRegular(destination, "archive-recovery-output", true, false);
+  const normalizedSha256 = hashStableRegular(destination, stat);
+  if (stat.size !== archive.compressedBytes || normalizedSha256 !== archive.compressedSha256
+    || rolloutFirstRecordThreadId(destination, stat) !== archive.id) {
+    throw failure("archive-recovery-output-mismatch");
+  }
+  revalidateArchiveRollout(archive);
+  return {
+    id: archive.id,
+    snapshotLocalPath,
+    normalizedSha256,
+    normalizedBytes: stat.size,
+  };
+}
+
+function decompressArchiveGzipRecovery(
+  archive: ArchiveRolloutEvidence,
+  snapshotLocalPath: string,
+  destination: string,
+  outputCap: number,
+): MaterializedArchiveRecovery {
+  if (archive.encoding !== "gzip" || !Number.isSafeInteger(outputCap) || outputCap <= 0
+    || outputCap > MAX_ARCHIVE_RECOVERY_BYTES || existsSync(destination)) {
+    throw failure("archive-recovery-plan-invalid");
+  }
+  revalidateArchiveRollout(archive);
+  let sourceDescriptor: number | undefined;
+  let destinationDescriptor: number | undefined;
+  try {
+    sourceDescriptor = openSync(archive.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!sameIdentity(identity(fstatSync(sourceDescriptor)), archive.identity)) throw failure("archive-file-drift");
+    destinationDescriptor = openSync(
+      destination,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      PRIVATE_FILE_MODE,
+    );
+    const result = spawnSync("/usr/bin/python3", ["-c", GZIP_COPY_HELPER, String(outputCap)], {
+      encoding: "utf8",
+      timeout: GZIP_RECOVERY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: GZIP_CONTROL_MAX_BYTES,
+      // Both ends are descriptors opened with O_NOFOLLOW; the helper never
+      // receives an archive or snapshot path.
+      stdio: [sourceDescriptor, destinationDescriptor, "pipe"],
+    });
+    if (result.error || result.status !== 0 || typeof result.stderr !== "string") {
+      throw failure("archive-gzip-decompression-failed");
+    }
+    const control = parseGzipCopyControl(result.stderr);
+    if (!sameIdentity(identity(fstatSync(sourceDescriptor)), archive.identity)) throw failure("archive-file-drift");
+    fsyncSync(destinationDescriptor);
+    closeSync(destinationDescriptor);
+    destinationDescriptor = undefined;
+    closeSync(sourceDescriptor);
+    sourceDescriptor = undefined;
+    chmodSync(destination, PRIVATE_FILE_MODE);
+    const destinationStat = assertRegular(destination, "archive-recovery-output", true, false);
+    const normalizedSha256 = hashStableRegular(destination, destinationStat);
+    if (destinationStat.size !== control.bytes || normalizedSha256 !== control.sha256
+      || destinationStat.size > outputCap
+      || rolloutFirstRecordThreadId(destination, destinationStat) !== archive.id) {
+      throw failure("archive-recovery-output-mismatch");
+    }
+    revalidateArchiveRollout(archive);
+    return {
+      id: archive.id,
+      snapshotLocalPath,
+      normalizedSha256,
+      normalizedBytes: destinationStat.size,
+    };
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("archive-gzip-decompression-failed");
+  } finally {
+    if (sourceDescriptor !== undefined) closeSync(sourceDescriptor);
+    if (destinationDescriptor !== undefined) closeSync(destinationDescriptor);
   }
 }
 
@@ -992,12 +1441,28 @@ function assertThreadRewrite(
   }
 }
 
-function assertNormalizedHistories(source: HistoryInventory, normalized: HistoryInventory): void {
+function assertNormalizedHistories(
+  source: HistoryInventory,
+  recoveries: readonly RecoveryPlanEntry[],
+  materializedRecoveries: readonly MaterializedArchiveRecovery[],
+  normalized: HistoryInventory,
+): void {
+  const materializedById = new Map(materializedRecoveries.map((entry) => [entry.id, entry]));
+  const recoveryFiles = recoveries.filter((entry) => entry.archive !== null).map((entry) => {
+    const materialized = materializedById.get(entry.id);
+    if (!materialized) throw failure("archive-recovery-output-missing");
+    return {
+      local: materialized.snapshotLocalPath,
+      bytes: materialized.normalizedBytes,
+      sha256: materialized.normalizedSha256,
+    };
+  });
+  if (materializedById.size !== recoveryFiles.length) throw failure("archive-recovery-output-mismatch");
   const sourceFiles = source.files.map((file) => ({
     local: historyLocalPath(file),
     bytes: file.bytes,
     sha256: file.sha256,
-  }));
+  })).concat(recoveryFiles).sort((left, right) => left.local.localeCompare(right.local));
   const normalizedFiles = normalized.files.map((file) => ({
     local: historyLocalPath(file),
     bytes: file.bytes,
@@ -1005,20 +1470,77 @@ function assertNormalizedHistories(source: HistoryInventory, normalized: History
   }));
   if (canonicalSha256Fingerprint(sourceFiles) !== canonicalSha256Fingerprint(normalizedFiles)
     || normalized.linkedHistoryFiles !== 0
-    || normalized.regularHistoryFiles !== source.regularHistoryFiles + source.linkedHistoryFiles
+    || normalized.regularHistoryFiles !== source.regularHistoryFiles + source.linkedHistoryFiles + recoveryFiles.length
+    || normalized.historyBytes !== source.historyBytes + recoveryFiles.reduce((sum, file) => sum + file.bytes, 0)
     || normalized.sessionIndexPresent !== source.sessionIndexPresent) {
     throw failure("normalized-history-mismatch");
   }
 }
 
+function archiveRecoveryCounts(
+  plan: NormalizationPlan,
+  materializedRecoveries: readonly MaterializedArchiveRecovery[],
+): {
+  recoveredSourceStaleRolloutPaths: number;
+  recoveredArchiveRolloutPaths: number;
+  decompressedArchiveFiles: number;
+  decompressedArchiveBytes: number;
+  excludedMetadataFiles: number;
+} {
+  return {
+    recoveredSourceStaleRolloutPaths: plan.recoveries.filter((entry) => entry.sourceKind === "source-stale-path").length,
+    recoveredArchiveRolloutPaths: plan.recoveries.filter((entry) => entry.archive !== null).length,
+    decompressedArchiveFiles: plan.recoveries.filter((entry) => entry.sourceKind === "archive-gzip").length,
+    // A dry run does not decompress archive records. On apply this is the
+    // authoritative streamed byte count, never a gzip trailer estimate.
+    decompressedArchiveBytes: materializedRecoveries
+      .filter((entry) => plan.recoveries.find((recovery) => recovery.id === entry.id)?.sourceKind === "archive-gzip")
+      .reduce((sum, entry) => sum + entry.normalizedBytes, 0),
+    excludedMetadataFiles: plan.histories.metadata.length + plan.archive.metadata.length,
+  };
+}
+
+function archiveRecoveryManifestEntries(
+  plan: NormalizationPlan,
+  materializedRecoveries: readonly MaterializedArchiveRecovery[],
+): PrivateHistoryNormalizationManifestV1["archiveRecovery"]["entries"] {
+  const materializedById = new Map(materializedRecoveries.map((entry) => [entry.id, entry]));
+  return plan.recoveries.map((entry) => {
+    const materialized = materializedById.get(entry.id);
+    const normalizedSha256 = materialized?.normalizedSha256 ?? entry.plannedNormalizedSha256;
+    const normalizedBytes = materialized?.normalizedBytes ?? entry.plannedNormalizedBytes;
+    if (entry.archive !== null && (normalizedSha256 === null || normalizedBytes === null)) {
+      throw failure("archive-recovery-output-missing");
+    }
+    return {
+      sourceKind: entry.sourceKind,
+      canonicalIdFingerprint: canonicalSha256Fingerprint(entry.id),
+      sourceRelativePathFingerprint: entry.sourceLocalPath === null
+        ? null
+        : canonicalSha256Fingerprint(entry.sourceLocalPath),
+      archiveRelativePathFingerprint: entry.archive === null
+        ? null
+        : canonicalSha256Fingerprint(entry.archive.relativePath),
+      compressedSha256: entry.archive?.compressedSha256 ?? null,
+      compressedBytes: entry.archive?.compressedBytes ?? null,
+      normalizedSha256,
+      normalizedBytes,
+      encoding: entry.archive?.encoding ?? null,
+      snapshotRelativePath: entry.snapshotLocalPath,
+    };
+  });
+}
+
 function createManifest(
   plan: NormalizationPlan,
+  materializedRecoveries: readonly MaterializedArchiveRecovery[],
   normalizedHistories: HistoryInventory,
   normalizedDatabases: DatabaseInventory,
   normalizedFingerprint: Sha256Fingerprint,
   now: string,
 ): PrivateHistoryNormalizationManifestV1 {
   if (!isCanonicalTimestamp(now)) throw failure("invalid-timestamp");
+  const recoveryCounts = archiveRecoveryCounts(plan, materializedRecoveries);
   return {
     schemaVersion: PRIVATE_HISTORY_NORMALIZATION_SCHEMA_VERSION,
     kind: "private-history-normalization",
@@ -1031,6 +1553,12 @@ function createManifest(
     nonRolloutRowsFingerprint: plan.nonRolloutRowsFingerprint,
     missingFingerprint: plan.missingFingerprint,
     rewriteFingerprint: plan.rewriteFingerprint,
+    archiveRecovery: {
+      recoveryFingerprint: plan.recoveryFingerprint,
+      metadataFingerprint: plan.metadataFingerprint,
+      counts: recoveryCounts,
+      entries: archiveRecoveryManifestEntries(plan, materializedRecoveries),
+    },
     counts: {
       regularHistoryFiles: plan.histories.regularHistoryFiles,
       linkedHistoryFiles: plan.histories.linkedHistoryFiles,
@@ -1039,6 +1567,11 @@ function createManifest(
       importedThreadCount: plan.importedThreadIds.length,
       rewrittenRolloutPaths: plan.updates.filter((update) => update.rolloutPath !== null).length,
       clearedMissingRolloutPaths: plan.updates.filter((update) => update.rolloutPath === null).length,
+      recoveredSourceStaleRolloutPaths: recoveryCounts.recoveredSourceStaleRolloutPaths,
+      recoveredArchiveRolloutPaths: recoveryCounts.recoveredArchiveRolloutPaths,
+      decompressedArchiveFiles: recoveryCounts.decompressedArchiveFiles,
+      decompressedArchiveBytes: recoveryCounts.decompressedArchiveBytes,
+      excludedMetadataFiles: recoveryCounts.excludedMetadataFiles,
       databasesPresent: plan.databases.entries.filter((entry) => entry.present).length,
     },
     histories: plan.histories.files.map((file) => ({
@@ -1059,7 +1592,9 @@ function resultFor(
   status: PrivateHistoryNormalizationResult["status"],
   plan: NormalizationPlan,
   normalizedFingerprint: Sha256Fingerprint | null,
+  materializedRecoveries: readonly MaterializedArchiveRecovery[] = [],
 ): PrivateHistoryNormalizationResult {
+  const recoveryCounts = archiveRecoveryCounts(plan, materializedRecoveries);
   return {
     status,
     sourceFingerprint: plan.sourceFingerprint,
@@ -1071,6 +1606,11 @@ function resultFor(
     importedThreadCount: plan.importedThreadIds.length,
     rewrittenRolloutPaths: plan.updates.filter((update) => update.rolloutPath !== null).length,
     clearedMissingRolloutPaths: plan.updates.filter((update) => update.rolloutPath === null).length,
+    recoveredSourceStaleRolloutPaths: recoveryCounts.recoveredSourceStaleRolloutPaths,
+    recoveredArchiveRolloutPaths: recoveryCounts.recoveredArchiveRolloutPaths,
+    decompressedArchiveFiles: recoveryCounts.decompressedArchiveFiles,
+    decompressedArchiveBytes: recoveryCounts.decompressedArchiveBytes,
+    excludedMetadataFiles: recoveryCounts.excludedMetadataFiles,
     databasesPresent: plan.databases.entries.filter((entry) => entry.present).length,
     sessionIndexPresent: plan.histories.sessionIndexPresent,
     nextAction: status === "dry-run" ? "apply-normalization" : "run-adoption-dry-run",
@@ -1194,6 +1734,75 @@ export function privateHistoryProcessCensus(
 
 function protectedPaths(paths: ReturnType<typeof normalizationPaths>): readonly string[] {
   return [paths.sourceCodexRoot, paths.sourceSqliteRoot, paths.allowedLinkRoot, dirname(paths.snapshotRoot)];
+}
+
+function assertRecoveryFreeSpaceBeforeCandidate(
+  snapshotParent: string,
+  plan: NormalizationPlan,
+  archiveRecoveryByteCap: number,
+  freeSpaceBytes: PrivateHistoryNormalizationDependencies["freeSpaceBytes"],
+): void {
+  const archiveRecoveries = plan.recoveries.filter((entry) => entry.archive !== null);
+  if (archiveRecoveries.length === 0) return;
+  const sourceHistoryBytes = recoveryByteCount(plan.histories.historyBytes);
+  const databaseBytes = recoveryDatabaseBytes(plan.databases);
+  const plainArchiveBytes = recoveryPlainArchiveBytes(archiveRecoveries);
+  const gzipTrailerEstimateBytes = archiveRecoveries.reduce((sum, entry) => {
+    if (entry.archive?.encoding !== "gzip") return sum;
+    return sum + recoveryByteCount(entry.archive.gzipTrailerIsize ?? 0);
+  }, 0n);
+  assertFreeSpace(snapshotParent, sourceHistoryBytes + databaseBytes + plainArchiveBytes
+    + gzipTrailerEstimateBytes + recoveryByteCount(archiveRecoveryByteCap), freeSpaceBytes);
+}
+
+function assertRecoveryFreeSpaceForGzip(
+  snapshotParent: string,
+  outputCap: number,
+  remainingKnownBytes: bigint,
+  freeSpaceBytes: PrivateHistoryNormalizationDependencies["freeSpaceBytes"],
+): void {
+  if (remainingKnownBytes < 0n) throw failure("snapshot-free-space-calculation-invalid");
+  // A gzip can exceed its ISIZE trailer estimate through concatenated members.
+  // Reserve its hard cap, every database still awaiting a private clone, and
+  // exact plain archive outputs which have not been copied yet. Each later
+  // gzip repeats this gate before it starts decompression.
+  assertFreeSpace(snapshotParent, recoveryByteCount(outputCap) + remainingKnownBytes, freeSpaceBytes);
+}
+
+function recoveryDatabaseBytes(databases: DatabaseInventory): bigint {
+  return databases.entries.reduce((sum, entry) => sum + recoveryByteCount(entry.bytes), 0n);
+}
+
+function recoveryPlainArchiveBytes(recoveries: readonly RecoveryPlanEntry[]): bigint {
+  return recoveries.reduce((sum, entry) => {
+    if (entry.archive?.encoding !== "plain") return sum;
+    return sum + recoveryByteCount(entry.archive.compressedBytes);
+  }, 0n);
+}
+
+function recoveryByteCount(value: number): bigint {
+  if (!Number.isSafeInteger(value) || value < 0) throw failure("snapshot-free-space-calculation-invalid");
+  return BigInt(value);
+}
+
+function assertFreeSpace(
+  path: string,
+  requiredBytes: bigint,
+  freeSpaceBytes: PrivateHistoryNormalizationDependencies["freeSpaceBytes"],
+): void {
+  if (requiredBytes <= 0n) throw failure("snapshot-free-space-calculation-invalid");
+  try {
+    const availableBytes = freeSpaceBytes
+      ? freeSpaceBytes(path)
+      : (() => {
+        const stats = statfsSync(path, { bigint: true });
+        return stats.bavail * stats.bsize;
+      })();
+    if (typeof availableBytes !== "bigint" || availableBytes < 0n) throw failure("snapshot-free-space-unavailable");
+    if (availableBytes < requiredBytes) throw failure("snapshot-free-space-insufficient");
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("snapshot-free-space-unavailable");
+  }
 }
 
 function assertIdle(census: HistoryAdoptionCensus): void {
@@ -1386,6 +1995,52 @@ function assertNoExactArchiveCandidate(archive: ArchiveInventory, local: string)
   }
 }
 
+function assertRecoveryNamespaceAvailable(sourceCodexRoot: string): void {
+  const namespace = join(sourceCodexRoot, ...RECOVERED_ARCHIVE_ROOT.split("/"));
+  if (optionalLstat(namespace, "recovery-namespace") !== null) throw failure("archive-recovery-namespace-exists");
+}
+
+function archiveRecoveryLocalPath(id: string): string {
+  if (!isCanonicalThreadId(id)) throw failure("invalid-rollout-thread-id");
+  return `${RECOVERED_ARCHIVE_ROOT}/${id}.jsonl`;
+}
+
+function assertSourceArchiveContentAgreement(
+  physicalRecords: readonly PhysicalRecord[],
+  archive: ArchiveInventory,
+): void {
+  const archiveById = new Map(archive.rollouts.map((record) => [record.id, record]));
+  for (const source of physicalRecords) {
+    const archiveRecord = archiveById.get(source.id);
+    if (!archiveRecord) continue;
+    if (archiveRecord.encoding === "plain") {
+      if (source.bytes !== archiveRecord.compressedBytes || source.sha256 !== archiveRecord.compressedSha256) {
+        throw failure("source-archive-rollout-divergence");
+      }
+      continue;
+    }
+    const normalized = gzipNormalizedHash(archiveRecord);
+    if (source.bytes !== normalized.bytes || source.sha256 !== normalized.sha256) {
+      throw failure("source-archive-rollout-divergence");
+    }
+  }
+}
+
+function revalidateArchiveRollout(rollout: ArchiveRolloutEvidence): void {
+  const stat = safeLstat(rollout.path, "archive-file");
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size <= 0
+    || !sameIdentity(identity(stat), rollout.identity)) {
+    throw failure("archive-file-drift");
+  }
+  const current = archiveRolloutFile(rollout.path, rollout.relativePath, stat);
+  if (current.id !== rollout.id || current.encoding !== rollout.encoding
+    || current.compressedBytes !== rollout.compressedBytes
+    || current.compressedSha256 !== rollout.compressedSha256
+    || current.gzipTrailerIsize !== rollout.gzipTrailerIsize) {
+    throw failure("archive-file-drift");
+  }
+}
+
 function containedRolloutLocal(sourceCodexRoot: string, rolloutPath: string): string {
   if (!isAbsolute(rolloutPath) || resolve(rolloutPath) !== rolloutPath) throw failure("rollout-path-escape");
   for (const artifact of ["sessions", "archived_sessions"] as const) {
@@ -1418,26 +2073,234 @@ function rolloutFirstRecordThreadId(path: string, suppliedStat?: Stats): string 
       || !sameIdentity(identity(safeLstat(path, "rollout-first-record")), expected)) {
       throw failure("rollout-first-record-drift");
     }
-    const newline = buffer.subarray(0, count).indexOf(0x0a);
-    if (newline < 0) throw failure("invalid-rollout-first-record");
-    let value: unknown;
-    try { value = JSON.parse(buffer.subarray(0, newline).toString("utf8")) as unknown; }
-    catch { throw failure("invalid-rollout-first-record"); }
-    let id: unknown = null;
-    if (isPlainRecord(value) && value.type === "session_meta" && isPlainRecord(value.payload)) id = value.payload.id;
-    if (id === null && isPlainRecord(value) && isPlainRecord(value.session_meta)
-      && isPlainRecord(value.session_meta.payload)) id = value.session_meta.payload.id;
-    if (!isCanonicalThreadId(id)) throw failure("invalid-rollout-thread-id");
-    return id;
+    return rolloutFirstRecordIdFromLine(buffer.subarray(0, count), true);
   } finally {
     buffer.fill(0);
     if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
-function assertInventoryLimits(files: readonly HistoryFileEvidence[]): void {
-  if (files.length > MAX_HISTORY_FILES) throw failure("history-file-count-exceeded");
-  const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
+const GZIP_FIRST_RECORD_HELPER = String.raw`
+import gzip
+import sys
+
+try:
+    cap = int(sys.argv[1])
+    if cap <= 0:
+        raise ValueError()
+    line = bytearray()
+    with gzip.GzipFile(fileobj=sys.stdin.buffer, mode="rb") as stream:
+        while len(line) < cap:
+            chunk = stream.read(min(8192, cap - len(line)))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            if newline >= 0:
+                line.extend(chunk[:newline])
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+                sys.exit(0)
+            line.extend(chunk)
+except Exception:
+    pass
+sys.exit(2)
+`;
+
+const GZIP_HASH_HELPER = String.raw`
+import gzip
+import hashlib
+import sys
+
+try:
+    cap = int(sys.argv[1])
+    if cap <= 0:
+        raise ValueError()
+    total = 0
+    digest = hashlib.sha256()
+    with gzip.GzipFile(fileobj=sys.stdin.buffer, mode="rb") as stream:
+        while True:
+            chunk = stream.read(1048576)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise ValueError()
+            digest.update(chunk)
+    sys.stdout.write(str(total) + " sha256:" + digest.hexdigest() + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
+except Exception:
+    sys.exit(2)
+`;
+
+const GZIP_COPY_HELPER = String.raw`
+import gzip
+import hashlib
+import sys
+
+try:
+    cap = int(sys.argv[1])
+    if cap <= 0:
+        raise ValueError()
+    total = 0
+    digest = hashlib.sha256()
+    output = sys.stdout.buffer
+    with gzip.GzipFile(fileobj=sys.stdin.buffer, mode="rb") as stream:
+        while True:
+            chunk = stream.read(1048576)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise ValueError()
+            output.write(chunk)
+            digest.update(chunk)
+    output.flush()
+    sys.stderr.write("ok " + str(total) + " sha256:" + digest.hexdigest() + "\n")
+    sys.stderr.flush()
+    sys.exit(0)
+except Exception:
+    sys.exit(2)
+`;
+
+function gzipRolloutFirstRecordThreadId(path: string, suppliedStat: Stats): string {
+  const expected = identity(suppliedStat);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!sameIdentity(identity(fstatSync(descriptor)), expected)) throw failure("archive-file-drift");
+    const result = spawnSync("/usr/bin/python3", ["-c", GZIP_FIRST_RECORD_HELPER, String(MAX_FIRST_RECORD_BYTES)], {
+      timeout: GZIP_INSPECTION_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: MAX_FIRST_RECORD_BYTES + 1,
+      stdio: [descriptor, "pipe", "ignore"],
+    });
+    if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout)
+      || !sameIdentity(identity(fstatSync(descriptor)), expected)
+      || !sameIdentity(identity(safeLstat(path, "archive-file")), expected)) {
+      throw failure("invalid-rollout-first-record");
+    }
+    return rolloutFirstRecordIdFromLine(result.stdout, false);
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("invalid-rollout-first-record");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function archiveHasGzipMagic(path: string, suppliedStat: Stats): boolean {
+  const expected = identity(suppliedStat);
+  const magic = Buffer.alloc(2);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!sameIdentity(identity(fstatSync(descriptor)), expected)) throw failure("archive-file-drift");
+    const count = readSync(descriptor, magic, 0, magic.byteLength, 0);
+    if (!sameIdentity(identity(fstatSync(descriptor)), expected)
+      || !sameIdentity(identity(safeLstat(path, "archive-file")), expected)) {
+      throw failure("archive-file-drift");
+    }
+    return count === 2 && magic[0] === 0x1f && magic[1] === 0x8b;
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("archive-file-drift");
+  } finally {
+    magic.fill(0);
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function gzipTrailerIsizeValue(path: string, suppliedStat: Stats): number {
+  if (suppliedStat.size < 4) throw failure("archive-gzip-trailer-invalid");
+  const expected = identity(suppliedStat);
+  const trailer = Buffer.alloc(4);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!sameIdentity(identity(fstatSync(descriptor)), expected)) throw failure("archive-file-drift");
+    const count = readSync(descriptor, trailer, 0, trailer.byteLength, expected.size - trailer.byteLength);
+    if (count !== trailer.byteLength || !sameIdentity(identity(fstatSync(descriptor)), expected)
+      || !sameIdentity(identity(safeLstat(path, "archive-file")), expected)) {
+      throw failure("archive-file-drift");
+    }
+    return trailer.readUInt32LE(0);
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("archive-gzip-trailer-invalid");
+  } finally {
+    trailer.fill(0);
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function gzipNormalizedHash(archive: ArchiveRolloutEvidence): { bytes: number; sha256: Sha256Fingerprint } {
+  if (archive.encoding !== "gzip") throw failure("archive-recovery-plan-invalid");
+  revalidateArchiveRollout(archive);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(archive.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!sameIdentity(identity(fstatSync(descriptor)), archive.identity)) throw failure("archive-file-drift");
+    const result = spawnSync("/usr/bin/python3", ["-c", GZIP_HASH_HELPER, String(MAX_ARCHIVE_RECOVERY_BYTES)], {
+      encoding: "utf8",
+      timeout: GZIP_RECOVERY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: GZIP_CONTROL_MAX_BYTES,
+      stdio: [descriptor, "pipe", "ignore"],
+    });
+    if (result.error || result.status !== 0 || typeof result.stdout !== "string"
+      || !sameIdentity(identity(fstatSync(descriptor)), archive.identity)) {
+      throw failure("archive-gzip-decompression-failed");
+    }
+    const normalized = parseGzipHashControl(result.stdout);
+    revalidateArchiveRollout(archive);
+    return normalized;
+  } catch (error) {
+    throw error instanceof PrivateHistoryNormalizationFailure ? error : failure("archive-gzip-decompression-failed");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function parseGzipHashControl(value: string): { bytes: number; sha256: Sha256Fingerprint } {
+  const match = /^(\d+) (sha256:[a-f0-9]{64})\n?$/.exec(value);
+  if (!match) throw failure("archive-gzip-decompression-failed");
+  const bytes = Number(match[1]);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_ARCHIVE_RECOVERY_BYTES) {
+    throw failure("archive-gzip-decompression-failed");
+  }
+  return { bytes, sha256: match[2] as Sha256Fingerprint };
+}
+
+function parseGzipCopyControl(value: string): { bytes: number; sha256: Sha256Fingerprint } {
+  const match = /^ok (\d+) (sha256:[a-f0-9]{64})\n?$/.exec(value);
+  if (!match) throw failure("archive-gzip-decompression-failed");
+  const bytes = Number(match[1]);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_ARCHIVE_RECOVERY_BYTES) {
+    throw failure("archive-gzip-decompression-failed");
+  }
+  return { bytes, sha256: match[2] as Sha256Fingerprint };
+}
+
+function rolloutFirstRecordIdFromLine(value: Buffer, requireNewline: boolean): string {
+  const newline = value.indexOf(0x0a);
+  const line = requireNewline ? (newline < 0 ? null : value.subarray(0, newline)) : value;
+  if (line === null || line.byteLength >= MAX_FIRST_RECORD_BYTES) throw failure("invalid-rollout-first-record");
+  let parsed: unknown;
+  try { parsed = JSON.parse(line.toString("utf8")) as unknown; }
+  catch { throw failure("invalid-rollout-first-record"); }
+  let id: unknown = null;
+  if (isPlainRecord(parsed) && parsed.type === "session_meta" && isPlainRecord(parsed.payload)) id = parsed.payload.id;
+  if (id === null && isPlainRecord(parsed) && isPlainRecord(parsed.session_meta)
+    && isPlainRecord(parsed.session_meta.payload)) id = parsed.session_meta.payload.id;
+  if (!isCanonicalThreadId(id)) throw failure("invalid-rollout-thread-id");
+  return id;
+}
+
+function assertInventoryLimits(
+  files: readonly HistoryFileEvidence[],
+  metadata: readonly HistoryMetadataEvidence[] = [],
+): void {
+  if (files.length + metadata.length > MAX_HISTORY_FILES) throw failure("history-file-count-exceeded");
+  const bytes = files.reduce((sum, file) => sum + file.bytes, 0)
+    + metadata.reduce((sum, file) => sum + file.bytes, 0);
   if (!Number.isSafeInteger(bytes) || bytes > MAX_HISTORY_BYTES) throw failure("history-size-exceeded");
 }
 
@@ -1454,8 +2317,50 @@ function fileFingerprintEvidence(file: HistoryFileEvidence): Record<string, unkn
   };
 }
 
+function historyMetadataFingerprintEvidence(file: HistoryMetadataEvidence): Record<string, unknown> {
+  return {
+    path: historyMetadataLocalPath(file),
+    bytes: file.bytes,
+    sha256: file.sha256,
+    identity: file.identity,
+  };
+}
+
+function archiveMetadataFingerprintEvidence(file: ArchiveMetadataEvidence): Record<string, unknown> {
+  return {
+    path: file.relativePath,
+    bytes: file.bytes,
+    sha256: file.sha256,
+    identity: file.identity,
+  };
+}
+
+function recoveryFingerprintEvidence(entry: RecoveryPlanEntry): Record<string, unknown> {
+  return {
+    id: entry.id,
+    sourceKind: entry.sourceKind,
+    snapshotLocalPath: entry.snapshotLocalPath,
+    sourceLocalPath: entry.sourceLocalPath,
+    archive: entry.archive === null ? null : {
+      relativePath: entry.archive.relativePath,
+      id: entry.archive.id,
+      encoding: entry.archive.encoding,
+      identity: entry.archive.identity,
+      compressedSha256: entry.archive.compressedSha256,
+      compressedBytes: entry.archive.compressedBytes,
+      gzipTrailerIsize: entry.archive.gzipTrailerIsize,
+    },
+    plannedNormalizedSha256: entry.plannedNormalizedSha256,
+    plannedNormalizedBytes: entry.plannedNormalizedBytes,
+  };
+}
+
 function historyLocalPath(file: Pick<HistoryFileEvidence, "artifact" | "relativePath">): string {
   return file.artifact === "session_index.jsonl" ? "session_index.jsonl" : `${file.artifact}/${file.relativePath}`;
+}
+
+function historyMetadataLocalPath(file: Pick<HistoryMetadataEvidence, "artifact" | "relativePath">): string {
+  return `${file.artifact}/${file.relativePath}`;
 }
 
 function identity(stat: Stats): FileIdentity {

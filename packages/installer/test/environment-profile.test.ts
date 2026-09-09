@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { userPaths } from "../src/paths";
 import {
+  bootstrapCanonicalManagerEnvironmentSnapshot,
   createEnvironmentSelection,
   createProtectedEnvironmentSelection,
   createEnvironmentProfileRegistry,
@@ -30,6 +31,59 @@ import {
   writeEnvironmentProfileRegistry,
   type EnvironmentProfileRegistry,
 } from "../src/environment-profile";
+
+function trustedProfileEvidence(releaseProfile: "stable" | "alpha") {
+  const available = releaseProfile === "stable";
+  return {
+    officialVersion: available ? "26.831.21537" : null,
+    officialBuild: available ? "7579" : null,
+    strictSignature: available,
+    gatekeeper: available,
+    teamIdentifier: available ? "2DC432GLL2" : null,
+    designatedRequirement: available
+      ? 'designated => identifier "com.openai.codex" and anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2"'
+      : null,
+    signatureCheckedAt: available ? "2026-09-03T07:00:00.000Z" : null,
+    officialBackendVersion: available ? "0.152.1" : null,
+    officialBackendFingerprint: available ? "official-backend-7579" : null,
+    backendVersion: null,
+    backendFingerprint: null,
+    backendInstallable: releaseProfile === "alpha",
+    patchedPayloadBuildable: true,
+  };
+}
+
+function testEnvironmentLoader(
+  input: Parameters<typeof loadEnvironmentState>[0],
+  deps: Parameters<typeof loadEnvironmentState>[1] = {},
+) {
+  return loadEnvironmentState(input, {
+    ...deps,
+    inspectProfile: (profile) => trustedProfileEvidence(profile.releaseProfile),
+  });
+}
+
+function acceptTestOfficialSelection(selection: Parameters<typeof validateOfficialEnvironmentProfile>[0]) {
+  return {
+    selection,
+    trust: {
+      strictSignature: { ok: true, output: "strict" },
+      signatureIdentity: {
+        ok: true,
+        adHoc: false,
+        teamIdentifier: "2DC432GLL2",
+        authority: ["Developer ID Application: OpenAI, L.L.C. (2DC432GLL2)"],
+        output: "identity",
+      },
+      gatekeeper: { ok: true, output: "accepted" },
+      designatedRequirement: {
+        ok: true,
+        requirement: `designated => identifier "${selection.selectedDesktopBundleId}" and anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2"`,
+        output: "designated",
+      },
+    },
+  };
+}
 
 test("read-only profile inspection never executes a support-root Stable backend", () => {
   const registry = createEnvironmentProfileRegistry({
@@ -885,6 +939,289 @@ test("publishEnvironmentSnapshot refuses a registry whose selected or last-known
     }, selection), /last-known-working selection does not match/);
     assert.equal(existsSync(registryFile), false);
     assert.equal(existsSync(selectionFile), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical manager bootstrap validates legacy authority and rewrites destination-owned artifact paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-bootstrap-"));
+  const sourceRoot = join(root, "legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const sourceBase = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: sourceRoot,
+      stableEvidence: trustedProfileEvidence("stable"),
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: sourceBase.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    const sourceRegistry = {
+      ...sourceBase,
+      selected: selection,
+      lastKnownWorkingSelection: selection,
+    };
+    publishEnvironmentSnapshot(
+      join(sourceRoot, "environment-registry.json"),
+      join(sourceRoot, "environment-selection.json"),
+      sourceRegistry,
+      selection,
+    );
+    const sourceRegistryBefore = readFileSync(join(sourceRoot, "environment-registry.json"));
+    const sourceSelectionBefore = readFileSync(join(sourceRoot, "environment-selection.json"));
+
+    const publication = bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+      loadState: testEnvironmentLoader,
+      validateOfficial: acceptTestOfficialSelection,
+    });
+
+    assert.equal(publication.bootstrapped, true);
+    assert.deepEqual(readFileSync(join(sourceRoot, "environment-registry.json")), sourceRegistryBefore);
+    assert.deepEqual(readFileSync(join(sourceRoot, "environment-selection.json")), sourceSelectionBefore);
+    const canonicalRegistry = readEnvironmentProfileRegistry(publication.registryFile)!;
+    assert.deepEqual(readEnvironmentSelection(publication.selectionFile), selection);
+    assert.deepEqual(canonicalRegistry.selected, selection);
+    assert.deepEqual(canonicalRegistry.lastKnownWorkingSelection, selection);
+    assert.equal(
+      canonicalRegistry.profiles.stable.pristineBackupPath,
+      join(destinationRoot, "environments", "stable", "pristine", "ChatGPT.app"),
+    );
+    assert.equal(
+      canonicalRegistry.profiles.alpha.backendPath,
+      join(destinationRoot, "environments", "alpha", "backend", "codex"),
+    );
+    assert.ok(!JSON.stringify(canonicalRegistry).includes(sourceRoot));
+
+    publication.restoreOnFailure();
+    publication.restoreOnFailure();
+    assert.equal(existsSync(publication.registryFile), false);
+    assert.equal(existsSync(publication.selectionFile), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an existing canonical manager environment is authoritative and legacy state is not consulted", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-existing-"));
+  const sourceRoot = join(root, "missing-legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: destinationRoot,
+      stableEvidence: trustedProfileEvidence("stable"),
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    const registry = { ...base, selected: selection, lastKnownWorkingSelection: selection };
+    publishEnvironmentSnapshot(
+      join(destinationRoot, "environment-registry.json"),
+      join(destinationRoot, "environment-selection.json"),
+      registry,
+      selection,
+    );
+    const registryBefore = readFileSync(join(destinationRoot, "environment-registry.json"));
+    const selectionBefore = readFileSync(join(destinationRoot, "environment-selection.json"));
+
+    const publication = bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+      loadState: testEnvironmentLoader,
+      validateOfficial: acceptTestOfficialSelection,
+      publishSnapshot: () => {
+        throw new Error("existing canonical authority must not be republished");
+      },
+    });
+
+    assert.equal(publication.bootstrapped, false);
+    publication.restoreOnFailure();
+    assert.deepEqual(readFileSync(publication.registryFile), registryBefore);
+    assert.deepEqual(readFileSync(publication.selectionFile), selectionBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("existing canonical manager metadata fails closed when its stored build differs from the revalidated app", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-stale-"));
+  const sourceRoot = join(root, "unused-legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: destinationRoot,
+      stableEvidence: { ...trustedProfileEvidence("stable"), officialBuild: "7524" },
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    publishEnvironmentSnapshot(
+      join(destinationRoot, "environment-registry.json"),
+      join(destinationRoot, "environment-selection.json"),
+      { ...base, selected: selection, lastKnownWorkingSelection: selection },
+      selection,
+    );
+    const registryBefore = readFileSync(join(destinationRoot, "environment-registry.json"));
+    const selectionBefore = readFileSync(join(destinationRoot, "environment-selection.json"));
+
+    assert.throws(
+      () => bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+        loadState: testEnvironmentLoader,
+        validateOfficial: acceptTestOfficialSelection,
+      }),
+      /official ChatGPT officialBuild does not match the revalidated app/,
+    );
+    assert.deepEqual(readFileSync(join(destinationRoot, "environment-registry.json")), registryBefore);
+    assert.deepEqual(readFileSync(join(destinationRoot, "environment-selection.json")), selectionBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical manager bootstrap accepts deliberately cleared official backend evidence and revalidates it live", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-backend-unknown-"));
+  const sourceRoot = join(root, "unused-legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const stableEvidence = {
+      ...trustedProfileEvidence("stable"),
+      officialBackendVersion: null,
+      officialBackendFingerprint: null,
+      backendVersion: null,
+      backendFingerprint: null,
+    };
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: destinationRoot,
+      stableEvidence,
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    publishEnvironmentSnapshot(
+      join(destinationRoot, "environment-registry.json"),
+      join(destinationRoot, "environment-selection.json"),
+      { ...base, selected: selection, lastKnownWorkingSelection: selection },
+      selection,
+    );
+    const registryBefore = readFileSync(join(destinationRoot, "environment-registry.json"));
+    const selectionBefore = readFileSync(join(destinationRoot, "environment-selection.json"));
+
+    const publication = bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+      loadState: testEnvironmentLoader,
+      validateOfficial: acceptTestOfficialSelection,
+    });
+
+    assert.equal(publication.bootstrapped, false);
+    assert.deepEqual(readFileSync(publication.registryFile), registryBefore);
+    assert.deepEqual(readFileSync(publication.selectionFile), selectionBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical manager bootstrap refuses a valid non-stable selection instead of retargeting the update lane", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-alpha-"));
+  const sourceRoot = join(root, "legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: sourceRoot,
+      stableEvidence: trustedProfileEvidence("stable"),
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.alpha,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    publishEnvironmentSnapshot(
+      join(sourceRoot, "environment-registry.json"),
+      join(sourceRoot, "environment-selection.json"),
+      { ...base, selected: selection, lastKnownWorkingSelection: selection },
+      selection,
+    );
+
+    assert.throws(
+      () => bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+        loadState: testEnvironmentLoader,
+        validateOfficial: acceptTestOfficialSelection,
+      }),
+      /requires the verified stable ChatGPT app at \/Applications\/ChatGPT\.app/,
+    );
+    assert.equal(existsSync(join(destinationRoot, "environment-registry.json")), false);
+    assert.equal(existsSync(join(destinationRoot, "environment-selection.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical manager bootstrap fails closed on partial state and refuses conflicting rollback", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-guards-"));
+  const sourceRoot = join(root, "legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    mkdirSync(destinationRoot, { recursive: true });
+    writeFileSync(join(destinationRoot, "environment-selection.json"), "{}\n");
+    assert.throws(
+      () => bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }),
+      /incomplete or uses an unsupported legacy registry/,
+    );
+    rmSync(join(destinationRoot, "environment-selection.json"));
+
+    const sourceBase = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: sourceRoot,
+      stableEvidence: trustedProfileEvidence("stable"),
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: sourceBase.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    publishEnvironmentSnapshot(
+      join(sourceRoot, "environment-registry.json"),
+      join(sourceRoot, "environment-selection.json"),
+      { ...sourceBase, selected: selection, lastKnownWorkingSelection: selection },
+      selection,
+    );
+    const publication = bootstrapCanonicalManagerEnvironmentSnapshot({ sourceRoot, destinationRoot }, {
+      loadState: testEnvironmentLoader,
+      validateOfficial: acceptTestOfficialSelection,
+    });
+    writeFileSync(publication.selectionFile, `${JSON.stringify({ concurrent: true })}\n`);
+    assert.throws(
+      () => publication.restoreOnFailure(),
+      /Refusing to restore canonical manager environment over a concurrent publication/,
+    );
+    assert.equal(existsSync(publication.registryFile), true);
+    assert.equal(readFileSync(publication.selectionFile, "utf8"), '{"concurrent":true}\n');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

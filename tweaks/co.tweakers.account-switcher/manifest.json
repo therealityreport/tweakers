@@ -1,9 +1,9 @@
 {
   "id": "co.tweakers.account-switcher",
   "name": "Accounts",
-  "version": "0.4.4",
+  "version": "0.10.2",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Use two saved ChatGPT accounts with clear profile names, simple setup language, and automatic routing for new conversations.",
+  "description": "Manage saved Codex accounts, pooled usage, quota-aware routing, safe failover, and paired devices.",
   "author": "hulibrands",
   "tags": [
     "accounts",

@@ -89,6 +89,10 @@ export interface CodexSourceEvidence {
   archiveDigest: NamedDigest | null;
   treeDigest: NamedDigest;
   patchSeriesDigest: NamedDigest;
+  /** Canonical `git diff --cached --binary --full-index` bytes for the applied review set. */
+  reviewedDiffDigest?: NamedDigest;
+  /** Exact argv used for the locked release build. Required by accepted-build issuance. */
+  buildCommand?: readonly string[];
   toolchainDigests: readonly NamedDigest[];
   lockfileDigests: readonly NamedDigest[];
 }
@@ -665,6 +669,9 @@ function isSourceEvidence(value: unknown): value is CodexSourceEvidence {
     && (value.archiveDigest === null || isNamedDigest(value.archiveDigest))
     && isNamedDigest(value.treeDigest)
     && isNamedDigest(value.patchSeriesDigest)
+    && (value.reviewedDiffDigest === undefined || isNamedDigest(value.reviewedDiffDigest))
+    && (value.buildCommand === undefined
+      || (Array.isArray(value.buildCommand) && value.buildCommand.length > 0 && value.buildCommand.every(nonEmptyString)))
     && Array.isArray(value.toolchainDigests)
     && value.toolchainDigests.every(isNamedDigest)
     && Array.isArray(value.lockfileDigests)

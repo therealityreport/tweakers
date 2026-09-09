@@ -12,6 +12,18 @@ const STORAGE_KEY = "usageHistory";
 const SCHEMA_VERSION = 2;
 const MAX_HISTORY = 24;
 const MAX_TRACKED_LIMITS = 12;
+const ACCOUNTS_CONTEXT_VERSION = 1;
+const ACCOUNTS_CONTEXT_EVENT = "tweakers:accounts-context";
+const ACCOUNTS_CONTEXT_REQUEST_EVENT = "tweakers:accounts-context-request";
+const ACCOUNTS_SELECTION_EVENT = "tweakers:accounts-select";
+const ACCOUNTS_RESET_REQUEST_EVENT = "tweakers:accounts-reset-credit-request";
+const ACCOUNTS_RESET_RESULT_EVENT = "tweakers:accounts-reset-credit-result";
+// Accounts context carries only broker-issued public HMAC handles. Provider
+// IDs never belong in this cross-tweak event or in Usage Tracker state.
+const ACCOUNT_PUBLIC_ID = /^account_[A-Za-z0-9_-]{43}$/;
+// Account pools are not cardinality-limited. Context is accepted only when
+// the complete, validated payload stays within this serialized-byte bound.
+const ACCOUNTS_CONTEXT_MAX_SERIALIZED_BYTES = 512 * 1024;
 const UNKNOWN = Object.freeze({ kind: "unknown", label: "Unknown" });
 
 function emptyState() {
@@ -37,6 +49,70 @@ function safeKey(value, fallback = "usage-limit") {
   if (/(?:token|cookie|secret|credential|password|bearer|@)/i.test(compact)) return fallback;
   const key = compact.replace(/[^a-zA-Z0-9._:-]/g, "-").replace(/-+/g, "-");
   return key || fallback;
+}
+
+function safeAccountId(value) {
+  return typeof value === "string" && ACCOUNT_PUBLIC_ID.test(value) ? value : null;
+}
+
+function accountsContextWithinByteBound(value) {
+  try {
+    const serialized = JSON.stringify(value);
+    if (typeof serialized !== "string") return false;
+    const bytes = typeof TextEncoder === "function"
+      ? new TextEncoder().encode(serialized).byteLength
+      : typeof Buffer !== "undefined" && typeof Buffer.byteLength === "function"
+        ? Buffer.byteLength(serialized, "utf8")
+        : encodeURIComponent(serialized).replace(/%[0-9A-F]{2}|./gi, "x").length;
+    return Number.isInteger(bytes) && bytes >= 0 && bytes <= ACCOUNTS_CONTEXT_MAX_SERIALIZED_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+function safeAccountContextLabel(value) {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/\s+/g, " ").trim().slice(0, 80);
+  // Accounts labels are presentation-only. Reject values that could contain
+  // credentials or an email identity before Usage Tracker retains them.
+  if (!compact || /(?:bearer|token|cookie|credential|password|secret|@)/i.test(compact)) return null;
+  return compact;
+}
+
+function safeAccountContextQuota(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const remainingPercent = finiteNumber(value.remainingPercent);
+  return {
+    remainingPercent: remainingPercent === null || remainingPercent < 0 || remainingPercent > 100 ? null : Math.round(remainingPercent),
+    resetAt: isoOrNull(value.resetAt),
+    depleted: value.depleted === true || remainingPercent === 0,
+    resetCredits: Number.isInteger(value.resetCredits) && value.resetCredits >= 0 && value.resetCredits <= 10_000 ? value.resetCredits : null,
+  };
+}
+
+function normalizeAccountsContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== ACCOUNTS_CONTEXT_VERSION
+    || !Array.isArray(value.accounts) || !accountsContextWithinByteBound(value)) return null;
+  const accounts = value.accounts.map((account) => {
+    if (!account || typeof account !== "object" || Array.isArray(account)) return null;
+    const accountId = safeAccountId(account.accountId);
+    const label = safeAccountContextLabel(account.label);
+    const quota = safeAccountContextQuota(account.quota);
+    if (!accountId || !label || !quota) return null;
+    return { accountId, label, enabled: account.enabled !== false, quota };
+  }).filter(Boolean);
+  if (accounts.length !== value.accounts.length || new Set(accounts.map((account) => account.accountId)).size !== accounts.length) return null;
+  const selectedAccountId = safeAccountId(value.selectedAccountId);
+  const context = {
+    accounts,
+    selectedAccountId: selectedAccountId && accounts.some((account) => account.accountId === selectedAccountId) ? selectedAccountId : accounts[0]?.accountId || null,
+  };
+  return accountsContextWithinByteBound(context) ? context : null;
+}
+
+function usageContextRequestId(instance) {
+  instance.contextRequestNonce = (instance.contextRequestNonce || 0) + 1;
+  return `usage-reset-${Date.now().toString(36)}-${instance.contextRequestNonce.toString(36)}`.slice(0, 64);
 }
 
 function isoOrNull(value) {
@@ -496,9 +572,130 @@ function pruneBadges(instance) {
   }
 }
 
+function nativeUsageSelectorTarget(matches) {
+  if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
+    const slots = Array.from(document.querySelectorAll('[data-tweakers-native-surface="usage"]'))
+      .filter((element) => element?.isConnected !== false && typeof element.append === "function");
+    if (slots.length === 1) return slots[0];
+  }
+  const roots = [...new Set((Array.isArray(matches) ? matches : [])
+    .filter((match) => match?.kind === "usage" && match.confidence === "high" && match.element?.isConnected !== false)
+    .map((match) => match.element.closest?.('[role="dialog"], [aria-modal="true"], section, article') || match.element)
+    .filter((element) => element && typeof element.append === "function"))];
+  const outermost = roots.filter((candidate) => !roots.some((other) => other !== candidate && other.contains?.(candidate)));
+  // A selector must belong to exactly one semantically identified native Usage
+  // surface. Multiple candidates mean the host ownership is uncertain, so do
+  // not inject into any of them.
+  return outermost.length === 1 ? outermost[0] : null;
+}
+
+function removeNativeUsageSelectors(instance) {
+  for (const node of [...(instance.nativeAccountSelectors || [])]) {
+    try { node.remove?.(); } catch {}
+  }
+  instance.nativeAccountSelectors?.clear?.();
+}
+
+function pruneNativeUsageSelectors(instance) {
+  for (const node of [...(instance.nativeAccountSelectors || [])]) {
+    if (!node || node.isConnected === false) instance.nativeAccountSelectors.delete(node);
+  }
+}
+
+function nativeUsageSelectorRevision(instance) {
+  return String(Math.max(0, Number(instance.accountContextRevision) || 0));
+}
+
+function refreshNativeUsageAccountSelectors(instance, matches = null) {
+  if (typeof document === "undefined" || instance?.stopped) return;
+  pruneNativeUsageSelectors(instance);
+  const context = instance.accountContext;
+  const target = nativeUsageSelectorTarget(matches || instance.api?.react?.host?.query?.("usage") || []);
+  if (!target || !context?.accounts?.length) {
+    removeNativeUsageSelectors(instance);
+    return;
+  }
+  // A route transition can leave an old native card connected briefly. Remove
+  // its owned control rather than retaining a selector on the wrong surface.
+  for (const node of [...instance.nativeAccountSelectors]) {
+    if (!target.contains?.(node)) {
+      try { node.remove?.(); } catch {}
+      instance.nativeAccountSelectors.delete(node);
+    }
+  }
+  const existing = [...(target.children || [])]
+    .filter((child) => child?.dataset?.tweakersUsageAccountSelector === "true");
+  const revision = nativeUsageSelectorRevision(instance);
+  if (existing.length === 1 && existing[0].dataset.tweakersUsageAccountRevision === revision) {
+    instance.nativeAccountSelectors.add(existing[0]);
+    return;
+  }
+  for (const node of existing) {
+    try { node.remove?.(); } catch {}
+    instance.nativeAccountSelectors.delete(node);
+  }
+  const selector = renderNativeUsageAccountSelector(instance, context);
+  if (!selector) return;
+  target.dataset.tweakersHostSurfaceOwned = "true";
+  selector.dataset.tweakersUsageAccountSelector = "true";
+  selector.dataset.tweakersUsageAccountRevision = revision;
+  selector.dataset.tweakersHostSurfaceOwned = "true";
+  target.append(selector);
+  instance.nativeAccountSelectors.add(selector);
+}
+
+function renderNativeUsageAccountSelector(instance, context) {
+  if (!context?.accounts?.length) return null;
+  const card = document.createElement("div");
+  card.className = "border-token-border bg-token-foreground/5 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border p-3";
+  const copy = document.createElement("div");
+  copy.className = "flex min-w-0 flex-col gap-1";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Subscription";
+  const selector = document.createElement("select");
+  selector.className = "border-token-border bg-token-bg-primary h-token-button-composer max-w-[280px] rounded-md border px-3 text-sm text-token-text-primary";
+  selector.setAttribute("aria-label", "Usage subscription");
+  for (const account of context.accounts) {
+    const option = document.createElement("option");
+    option.value = account.accountId;
+    option.textContent = account.label;
+    selector.append(option);
+  }
+  selector.value = context.selectedAccountId || context.accounts[0].accountId;
+  const selected = context.accounts.find((account) => account.accountId === selector.value) || context.accounts[0];
+  const detail = document.createElement("div");
+  detail.className = "text-token-text-secondary text-sm";
+  detail.textContent = usageAccountContextText(selected);
+  selector.addEventListener("change", () => {
+    const accountId = safeAccountId(selector.value);
+    if (!accountId) return;
+    instance.accountContext = { ...context, selectedAccountId: accountId };
+    instance.accountContextRevision += 1;
+    dispatchAccountsEvent(ACCOUNTS_SELECTION_EVENT, { version: ACCOUNTS_CONTEXT_VERSION, accountId });
+    if (instance.settingsRoot) renderSettings(instance.settingsRoot, instance);
+    refreshNativeUsageAccountSelectors(instance);
+  });
+  copy.append(title, selector, detail);
+  const actions = document.createElement("div");
+  actions.className = "flex items-center gap-2";
+  const credits = selected.quota?.resetCredits;
+  if (Number.isInteger(credits) && credits > 0) {
+    const useCredit = document.createElement("button");
+    useCredit.type = "button";
+    useCredit.className = "border-token-border bg-token-bg-primary hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
+    useCredit.textContent = `Use reset credit (${credits})`;
+    useCredit.addEventListener("click", () => requestUsageResetCredit(instance, selected.accountId));
+    actions.append(useCredit);
+  }
+  card.append(copy, actions);
+  return card;
+}
+
 function renderSettings(root, instance) {
   root.replaceChildren();
   root.className = "flex flex-col gap-4";
+  root.appendChild(renderAccountsUsageContext(instance));
   const live = document.createElement("div");
   live.className = "rounded-lg border border-token-border p-3 text-sm text-token-text-secondary";
   const liveCount = instance.api?.react?.host?.snapshot?.("usage")?.count || 0;
@@ -630,10 +827,152 @@ function renderSettings(root, instance) {
   root.appendChild(actions);
 }
 
+function renderAccountsUsageContext(instance) {
+  const card = document.createElement("div");
+  card.className = "border-token-border flex flex-col divide-y-[0.5px] divide-token-border rounded-lg border";
+  card.style.backgroundColor = "var(--color-background-panel, var(--color-token-bg-fog))";
+  const context = instance.accountContext;
+  const row = document.createElement("div");
+  row.className = "flex flex-wrap items-center justify-between gap-4 p-3";
+  const copy = document.createElement("div");
+  copy.className = "flex min-w-0 flex-col gap-1";
+  const title = document.createElement("div");
+  title.className = "text-sm text-token-text-primary";
+  title.textContent = "Selected subscription";
+  const detail = document.createElement("div");
+  detail.className = "text-sm text-token-text-secondary";
+  if (!context?.accounts?.length) {
+    detail.textContent = "Open Accounts to choose a subscription for reset-credit actions.";
+    copy.append(title, detail);
+    row.append(copy);
+    card.append(row);
+    return card;
+  }
+  const selector = document.createElement("select");
+  selector.className = "border-token-border bg-token-foreground/5 h-token-button-composer max-w-[280px] rounded-md border px-3 text-sm text-token-text-primary";
+  selector.setAttribute("aria-label", "Usage subscription");
+  for (const account of context.accounts) {
+    const option = document.createElement("option");
+    option.value = account.accountId;
+    option.textContent = account.label;
+    selector.append(option);
+  }
+  selector.value = context.selectedAccountId || context.accounts[0].accountId;
+  const selected = context.accounts.find((account) => account.accountId === selector.value) || context.accounts[0];
+  detail.textContent = usageAccountContextText(selected);
+  selector.addEventListener("change", () => {
+    const accountId = safeAccountId(selector.value);
+    if (!accountId) return;
+    instance.accountContext = { ...context, selectedAccountId: accountId };
+    instance.accountContextRevision += 1;
+    dispatchAccountsEvent(ACCOUNTS_SELECTION_EVENT, { version: ACCOUNTS_CONTEXT_VERSION, accountId });
+    if (instance.settingsRoot) renderSettings(instance.settingsRoot, instance);
+    refreshNativeUsageAccountSelectors(instance);
+  });
+  copy.append(title, selector, detail);
+  const actions = document.createElement("div");
+  actions.className = "flex items-center gap-2";
+  const credits = selected.quota?.resetCredits;
+  if (Number.isInteger(credits) && credits > 0) {
+    const useCredit = document.createElement("button");
+    useCredit.type = "button";
+    useCredit.className = "border-token-border bg-token-foreground/5 hover:bg-token-foreground/10 h-token-button-composer rounded-md border px-3 text-sm text-token-text-primary";
+    useCredit.textContent = `Use reset credit (${credits})`;
+    useCredit.addEventListener("click", () => requestUsageResetCredit(instance, selected.accountId));
+    actions.append(useCredit);
+  }
+  row.append(copy, actions);
+  card.append(row);
+  if (instance.resetCreditStatus) {
+    const status = document.createElement("div");
+    status.className = "p-3 text-sm text-token-text-secondary";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = instance.resetCreditStatus;
+    card.append(status);
+  }
+  return card;
+}
+
+function usageAccountContextText(account) {
+  if (!account) return "Subscription context is unavailable.";
+  const quota = account.quota || {};
+  if (quota.depleted) return `Usage is depleted${quota.resetAt ? ` · resets ${formatExpiration({ expiresAt: quota.resetAt, precision: "instant" })}` : ""}`;
+  return Number.isFinite(quota.remainingPercent)
+    ? `${quota.remainingPercent}% usage left${quota.resetAt ? ` · resets ${formatExpiration({ expiresAt: quota.resetAt, precision: "instant" })}` : ""}`
+    : "Usage is not available yet.";
+}
+
+function dispatchAccountsEvent(type, detail) {
+  if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") return false;
+  try {
+    window.dispatchEvent(new CustomEvent(type, { detail }));
+    return true;
+  } catch { return false; }
+}
+
+function requestUsageResetCredit(instance, accountId) {
+  if (!safeAccountId(accountId)) return;
+  if (typeof window !== "undefined" && typeof window.confirm === "function"
+    && !window.confirm("Use one reset credit for this subscription? This cannot be undone and never happens automatically.")) return;
+  const requestId = usageContextRequestId(instance);
+  instance.pendingResetCreditRequestId = requestId;
+  instance.resetCreditStatus = "Requesting a reset credit…";
+  const delivered = dispatchAccountsEvent(ACCOUNTS_RESET_REQUEST_EVENT, { version: ACCOUNTS_CONTEXT_VERSION, requestId, accountId });
+  if (!delivered) {
+    instance.pendingResetCreditRequestId = null;
+    instance.resetCreditStatus = "Accounts is unavailable, so the reset credit was not used.";
+  }
+  if (instance.settingsRoot) renderSettings(instance.settingsRoot, instance);
+  refreshNativeUsageAccountSelectors(instance);
+}
+
+function handleAccountsContext(instance, raw) {
+  const context = normalizeAccountsContext(raw);
+  if (!context) return;
+  instance.accountContext = context;
+  instance.accountContextRevision += 1;
+  if (instance.settingsRoot) renderSettings(instance.settingsRoot, instance);
+  refreshNativeUsageAccountSelectors(instance);
+}
+
+function handleAccountsResetResult(instance, raw) {
+  if (!raw || typeof raw !== "object" || raw.version !== ACCOUNTS_CONTEXT_VERSION
+    || raw.requestId !== instance.pendingResetCreditRequestId || typeof raw.ok !== "boolean") return;
+  instance.pendingResetCreditRequestId = null;
+  if (!raw.ok) {
+    instance.resetCreditStatus = "The reset credit was not used. No usage history was changed.";
+  } else {
+    instance.resetCreditStatus = raw.result?.continuation?.confirmationId
+      ? "Confirmation is required in Accounts before the reset credit can be used."
+      : raw.result?.consumed === true ? "One reset credit was used. Observed history stays here in Usage Limit Resets Tracker."
+        : "The reset-credit request was completed.";
+    const accountId = safeAccountId(raw.result?.accountId);
+    const quota = safeAccountContextQuota(raw.result?.quota);
+    const account = instance.accountContext?.accounts?.find((candidate) => candidate.accountId === accountId);
+    if (account && quota) account.quota = quota;
+  }
+  instance.accountContextRevision += 1;
+  if (instance.settingsRoot) renderSettings(instance.settingsRoot, instance);
+  refreshNativeUsageAccountSelectors(instance);
+}
+
 function startTracker(api, instance) {
   const stored = readStoredState(api.storage);
   instance.state = stored.state;
   instance.unknownSchema = stored.unknownSchema;
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    const onAccountsContext = (event) => handleAccountsContext(instance, event?.detail);
+    const onResetResult = (event) => handleAccountsResetResult(instance, event?.detail);
+    window.addEventListener(ACCOUNTS_CONTEXT_EVENT, onAccountsContext);
+    window.addEventListener(ACCOUNTS_RESET_RESULT_EVENT, onResetResult);
+    instance.cleanups.push(() => window.removeEventListener(ACCOUNTS_CONTEXT_EVENT, onAccountsContext));
+    instance.cleanups.push(() => window.removeEventListener(ACCOUNTS_RESET_RESULT_EVENT, onResetResult));
+    // Accounts runs continuously in the renderer. Request its bounded context
+    // when this page starts so Usage does not need to inspect account state or
+    // retain any account credentials of its own.
+    dispatchAccountsEvent(ACCOUNTS_CONTEXT_REQUEST_EVENT, { version: ACCOUNTS_CONTEXT_VERSION });
+  }
   if (api.settings?.registerPage) {
     instance.settings = api.settings.registerPage({
       id: "usage-history",
@@ -659,6 +998,7 @@ function startTracker(api, instance) {
       let changed = false;
       let observed = 0;
       const semantic = api.react?.host?.query?.("usage") || [];
+      refreshNativeUsageAccountSelectors(instance, semantic);
       const observations = semantic.length
         ? semantic.flatMap((match) => collectDisplayedObservations(match.element, new Date()))
         : collectDisplayedObservations(document, new Date());
@@ -726,6 +1066,13 @@ const tweak = {
       scanning: false,
       scanQueued: false,
       unknownSchema: false,
+      accountContext: null,
+      accountContextRevision: 0,
+      resetCreditStatus: "",
+      pendingResetCreditRequestId: null,
+      contextRequestNonce: 0,
+      nativeAccountSelectors: new Set(),
+      stopped: false,
     };
     this._instance = instance;
     startTracker(api, instance);
@@ -733,9 +1080,14 @@ const tweak = {
   stop() {
     const instance = this._instance;
     if (!instance) return;
+    instance.stopped = true;
     instance.observer?.disconnect?.();
     for (const badge of instance.badges) badge.remove?.();
     instance.badges.clear();
+    removeNativeUsageSelectors(instance);
+    if (typeof document !== "undefined") {
+      for (const node of document.querySelectorAll?.("[data-tweakers-usage-account-selector]") || []) node.remove?.();
+    }
     for (const cleanup of instance.cleanups.splice(0).reverse()) {
       try { cleanup(); } catch {}
     }
@@ -773,6 +1125,10 @@ module.exports.__test = {
   formatExpiration,
   resetCauseLabel,
   pruneBadges,
+  normalizeAccountsContext,
+  safeAccountContextQuota,
+  safeAccountId,
+  nativeUsageSelectorTarget,
   usageDisplayState(instance) {
     return instance?.unknownSchema ? "Unknown" : Object.keys(instance?.state?.limits || {}).length ? "Observed" : "Empty";
   },

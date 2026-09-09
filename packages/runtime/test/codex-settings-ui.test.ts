@@ -5,9 +5,7 @@ import test from "node:test";
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
-  desktopUpdatePresentation,
   humanizeCodexPhase,
-  desktopUpdateStatusPresentation,
   preparedEnvironmentReceiptNeedsFreshV2Preparation,
   restoreEnvironmentFocus,
   type EnvironmentConfigEffects,
@@ -49,13 +47,6 @@ function testEnvironmentEffects(
   };
 }
 
-test("Desktop Update never presents stale, unavailable, or unchecked state as healthy", () => {
-  assert.deepEqual(desktopUpdateStatusPresentation(undefined), { label: "Not checked", tone: "warn" });
-  assert.deepEqual(desktopUpdateStatusPresentation("stale"), { label: "Stale", tone: "warn" });
-  assert.deepEqual(desktopUpdateStatusPresentation("unavailable"), { label: "Unavailable", tone: "warn" });
-  assert.deepEqual(desktopUpdateStatusPresentation("error"), { label: "Error", tone: "error" });
-  assert.deepEqual(desktopUpdateStatusPresentation("current"), { label: "Up to date", tone: "ok" });
-});
 
 test("sealed-pair Menu Bar presentation makes stale generations require preparation", () => {
   assert.deepEqual(environmentModeCacheMenuLabel({
@@ -98,151 +89,12 @@ test("Config blocks only a schema-v2 receipt bound to the same stale generation"
   assert.match(source, /it will not switch automatically/);
 });
 
-test("Desktop Update phase labels humanize both receipt separators", () => {
+test("Environment receipt phase labels humanize both separators", () => {
   assert.equal(humanizeCodexPhase("rolled_back"), "Rolled Back");
   assert.equal(humanizeCodexPhase("awaiting_native_update"), "Awaiting Native Update");
   assert.equal(humanizeCodexPhase("rolled-back"), "Rolled Back");
 });
 
-test("Desktop Update presents awaiting and resumable rollback receipts with their intended actions", () => {
-  assert.deepEqual(desktopUpdatePresentation({
-    busy: false,
-    status: "update-available",
-    transaction: {
-      phase: "awaiting_native_update",
-      resumable: false,
-      safeOfficialMode: true,
-    },
-  }), {
-    phaseLabel: "Awaiting Native Update",
-    tone: "warn",
-    actions: [{ kind: "cancel", label: "Cancel", disabled: false }],
-    updateDisabled: true,
-  });
-
-  assert.deepEqual(desktopUpdatePresentation({
-    busy: false,
-    status: "update-available",
-    transaction: {
-      phase: "rolled_back",
-      resumable: true,
-      safeOfficialMode: true,
-    },
-  }), {
-    phaseLabel: "Rolled Back",
-    tone: "warn",
-    actions: [
-      { kind: "resume", label: "Resume", disabled: false },
-      { kind: "cancel", label: "Cancel", disabled: false },
-    ],
-    updateDisabled: true,
-  });
-});
-
-test("Desktop Update actions cover every reconciliation result without opening a blocked retry", () => {
-  const cases = [
-    {
-      name: "explicit idle result",
-      transaction: { phase: "idle", resumable: false, safeOfficialMode: false },
-      actions: [],
-      updateDisabled: false,
-    },
-    {
-      name: "live preparation",
-      transaction: { phase: "preparing", resumable: false, safeOfficialMode: false },
-      actions: [],
-      updateDisabled: true,
-    },
-    {
-      name: "native updater wait",
-      transaction: { phase: "awaiting_native_update", resumable: false, safeOfficialMode: true },
-      actions: ["cancel"],
-      updateDisabled: true,
-    },
-    {
-      name: "recovered before native advancement",
-      transaction: { phase: "failed", resumable: false, safeOfficialMode: true },
-      actions: [],
-      updateDisabled: false,
-    },
-    {
-      name: "recovered after native advancement",
-      transaction: { phase: "failed", resumable: true, safeOfficialMode: true },
-      actions: ["resume", "cancel"],
-      updateDisabled: true,
-    },
-    {
-      name: "rolled back with continuation",
-      transaction: { phase: "rolled_back", resumable: true, safeOfficialMode: true },
-      actions: ["resume", "cancel"],
-      updateDisabled: true,
-    },
-    {
-      name: "rolled back safely",
-      transaction: { phase: "rolled_back", resumable: false, safeOfficialMode: false },
-      actions: [],
-      updateDisabled: false,
-    },
-    {
-      name: "completed",
-      transaction: { phase: "completed", resumable: false, safeOfficialMode: false },
-      actions: [],
-      updateDisabled: false,
-    },
-    {
-      name: "unsafe recovery can be retried",
-      transaction: {
-        phase: "failed",
-        resumable: false,
-        safeOfficialMode: false,
-        environmentTransactionId: "environment-1",
-      },
-      actions: ["cancel"],
-      updateDisabled: true,
-    },
-    {
-      name: "unsafe failure without recovery evidence stays blocked",
-      transaction: {
-        phase: "failed",
-        resumable: false,
-        safeOfficialMode: false,
-        environmentTransactionId: null,
-      },
-      actions: [],
-      updateDisabled: true,
-    },
-    {
-      name: "canonical rollback-failure blocker stays closed",
-      transaction: {
-        phase: "failed",
-        resumable: false,
-        safeOfficialMode: true,
-        error: "return failed; rollback failed: disk error",
-        blocksLifecycle: true,
-      },
-      actions: [],
-      updateDisabled: true,
-    },
-  ] as const;
-
-  for (const scenario of cases) {
-    const presentation = desktopUpdatePresentation({
-      busy: false,
-      status: "update-available",
-      transaction: scenario.transaction,
-    });
-    assert.deepEqual(
-      presentation.actions.map((action) => action.kind),
-      scenario.actions,
-      `${scenario.name} actions`,
-    );
-    assert.equal(
-      presentation.updateDisabled,
-      scenario.updateDisabled,
-      `${scenario.name} update availability`,
-    );
-  }
-});
 
 test("Environment stages app experience and release profile independently", () => {
   const controller = createEnvironmentConfigController(selectedStableChatGpt, testEnvironmentEffects());
@@ -385,20 +237,39 @@ test("Config card updates remain independent and reject stale completion", () =>
   });
 });
 
-test("Config follows the native structure and keeps operational sections separate", () => {
-  const body = functionBody("renderConfigPage", "renderCodexVersionsSection");
-  const calls = [
+test("Config selects manager-backed independent Settings before exposing legacy operational controls", () => {
+  const config = functionBody("renderConfigPage", "renderIndependentSettingsSurface");
+  const independent = functionBody("renderIndependentSettingsSurface", "renderInjectedSettingsSurface");
+  const appearance = functionBody("renderIndependentAppearanceHealthSection", "renderInjectedSettingsSurface");
+  const injected = functionBody("renderInjectedSettingsSurface", "renderIndependentManagerStatusSection");
+  const unavailable = functionBody("renderIndependentRefreshUnavailableSection", "renderEnvironmentSection");
+  assert.match(config, /tweaker:get-independent-manager-status/);
+  assert.match(config, /projection\?\.deploymentKind === "independent"/);
+  assert.match(config, /Failure to establish the deployment authority/);
+  assert.match(independent, /renderIndependentManagerStatusSection/);
+  assert.match(independent, /renderIndependentAppearanceHealthSection/);
+  assert.match(independent, /renderTweakersRuntimeRefreshSection\(sectionsWrap, cardUpdates, "independent", projection\)/);
+  assert.match(independent, /renderIndependentRefreshUnavailableSection/);
+  assert.doesNotMatch(independent, /renderEnvironmentSection|renderMcpIntegrationSection|renderAutomaticMaintenanceSection|renderTweakerConfig|renderAdvancedRuntimeSection|uninstallRow/);
+  assert.match(appearance, /tweaker:get-independent-live-health/);
+  assert.match(appearance, /tweaker:independent-live-health-changed/);
+  assert.match(appearance, /Normal/);
+  assert.match(appearance, /Needs attention/);
+  assert.match(appearance, /Not observed/);
+  assert.match(appearance, /Native or CSS scaling still needs a later Actual Size validation/);
+  assert.match(appearance, /ipcRenderer\.removeListener/);
+  for (const control of [
     "renderEnvironmentSection(sectionsWrap, cardUpdates)",
-    "renderDesktopUpdateSection(sectionsWrap, cardUpdates)",
+    'renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "injected")',
     "renderTweaksHealthSection(sectionsWrap, cardUpdates)",
     "renderMcpIntegrationSection(sectionsWrap, cardUpdates)",
     "renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates)",
     'sectionTitle("Tweakers Updates")',
     "renderAdvancedRuntimeSection(sectionsWrap)",
     'sectionTitle("Maintenance")',
-  ].map((text) => body.indexOf(text));
-  assert.ok(calls.every((index) => index >= 0));
-  assert.deepEqual([...calls].sort((a, b) => a - b), calls);
+  ]) assert.match(injected, new RegExp(control.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(unavailable, /read-only/);
+  assert.doesNotMatch(unavailable, /GitHub|watcher|repair|refresh-variant/i);
   assert.doesNotMatch(source, /function renderModeSection/);
   assert.doesNotMatch(source, /sectionTitle\("App Mode"\)/);
   assert.doesNotMatch(source, /tweaker:switch-app-mode/);
@@ -439,7 +310,7 @@ test("Environment stages independent selections, prepares before one confirmatio
   assert.match(body, /!pendingAvailability\.available/);
   const availability = functionBody("environmentSelectionAvailability", "environmentUnavailableReason");
   assert.match(availability, /channel\.availability\?\.\[selection\.appExperience\]/);
-  const modal = functionBody("openEnvironmentConfirmModal", "renderDesktopUpdateSection");
+  const modal = functionBody("openEnvironmentConfirmModal", "renderTweakersRuntimeRefreshSection");
   assert.doesNotMatch(modal, /ipcRenderer\.invoke/);
   assert.match(modal, /Cancel/);
   assert.match(modal, /Apply & Restart/);
@@ -509,41 +380,16 @@ test("Environment transaction status surfaces durable helper failure and log det
   assert.doesNotMatch(inFlight, /outcomePhase !== "failed"/);
 });
 
-test("Desktop Update uses the shared check and durable Update and Reload transaction", () => {
-  const body = functionBody("renderDesktopUpdateSection", "renderMcpIntegrationSection");
-  assert.match(body, /tweaker:get-codex-desktop-update/);
-  assert.match(body, /tweaker:codex-desktop-update-changed/);
-  assert.match(body, /ipcRenderer\.on\(/);
-  assert.match(body, /ipcRenderer\.removeListener\(/);
-  assert.match(body, /initialResultSuperseded/);
-  assert.match(body, /nextTime < currentTime/);
-  assert.match(body, /Check for Updates…/);
-  assert.match(body, /tweaker:check-codex-desktop-update/);
-  assert.match(body, /Update and Reload/);
-  assert.match(body, /tweaker:start-codex-desktop-update/);
-  assert.match(body, /tweaker:get-codex-desktop-update-transaction/);
-  assert.match(body, /tweaker:resume-codex-desktop-update/);
-  assert.match(body, /tweaker:cancel-codex-desktop-update/);
-  assert.match(body, /void loadTransaction\(\)/);
-  assert.match(body, /scheduleTransactionPoll/);
-  assert.match(body, /transactionPollFailures \+= 1/);
-  assert.match(body, /Math\.min\(30_000/);
-  assert.match(body, /scheduleTransactionPoll\(backoff \+ jitter\)/);
-  assert.match(body, /transactionPollFailures = 0/);
-  assert.match(body, /awaitingTransactionReceiptUntil = Date\.now\(\) \+ 10_000/);
-  assert.match(body, /did not create a transaction receipt/);
-  assert.match(body, /const idleWithoutReceipt = observed\?\.phase === "idle" && observed\.transactionId === null/);
-  assert.match(body, /transaction = idleWithoutReceipt \? null : observed/);
-  assert.doesNotMatch(source, /tweaker:install-codex-desktop-update/);
-});
-
-test("Desktop Update explains gated Alpha setup inline and disables its dead-end check", () => {
-  const body = functionBody("renderDesktopUpdateSection", "renderMcpIntegrationSection");
-  assert.match(body, /result\?\.setupRequired/);
-  assert.match(body, /Register OpenAI Beta/);
-  assert.match(body, /Launch OpenAI Beta once/);
-  assert.match(body, /check\.disabled = busy \|\| !!result\?\.setupRequired/);
-  assert.match(body, /Alpha update checks stay disabled/);
+test("Tweakers refresh is manager-owned and never invokes ChatGPT update IPC", () => {
+  const body = functionBody("renderTweakersRuntimeRefreshSection", "renderMcpIntegrationSection");
+  assert.match(body, /Tweakers App Update/);
+  assert.match(body, /Tweaker Mode Runtime/);
+  assert.match(body, /Rebuild Tweakers App/);
+  assert.match(body, /Refresh Tweaker Mode/);
+  assert.match(body, /ChatGPT remains on its own native updater/);
+  assert.match(body, /tweaker:reapply-tweakers/);
+  assert.doesNotMatch(body, /codex-desktop-update|Update ChatGPT|desktop-update/);
+  assert.doesNotMatch(source, /tweaker:(?:check|get|start|resume|cancel)-codex-desktop-update/);
 });
 
 test("MCP and automatic maintenance expose health and repair actions separately", () => {
@@ -576,7 +422,7 @@ test("Automatic Maintenance waits for a newer completed watcher cycle", () => {
 });
 
 test("Environment confirmation restores focus to a surviving control", () => {
-  const modal = functionBody("openEnvironmentConfirmModal", "renderDesktopUpdateSection");
+  const modal = functionBody("openEnvironmentConfirmModal", "renderTweakersRuntimeRefreshSection");
   assert.match(modal, /document\.activeElement/);
   assert.match(modal, /data-tweaker-environment-card/);
   assert.match(modal, /requestAnimationFrame\(restoreFocus\)/);
@@ -665,17 +511,13 @@ test("renderer consumes the canonical Codex snapshot instead of speculative alia
   assert.doesNotMatch(source, /CodexVersionsSnapshotView|featureUnion|bundledCli|betaCli|fallbackError/);
 });
 
-test("Codex UI exposes only the approved runtime and update IPC actions", () => {
+test("Codex UI exposes only approved runtime IPC actions and no ChatGPT update interceptor", () => {
   for (const channel of [
     "tweaker:install-codex-beta",
     "tweaker:rollback-codex-beta",
     "tweaker:set-codex-feature",
-    "tweaker:check-codex-desktop-update",
-    "tweaker:start-codex-desktop-update",
-    "tweaker:get-codex-desktop-update-transaction",
-    "tweaker:resume-codex-desktop-update",
-    "tweaker:cancel-codex-desktop-update",
   ]) assert.match(source, new RegExp(channel));
+  assert.doesNotMatch(source, /tweaker:(?:check|get|start|resume|cancel)-codex-desktop-update/);
   assert.doesNotMatch(source, /tweaker:set-codex-cli-lane/);
   assert.match(source, /\{ lane, name: feature\.name, enabled: next \}/);
   assert.doesNotMatch(source, /tweaker:(?:install-codex-beta|rollback-codex-beta)[^\n]*\{[^}]*url/);

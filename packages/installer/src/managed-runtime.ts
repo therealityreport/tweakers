@@ -14,9 +14,10 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { installCliShims, type CliShimOptions, type CliShimResult } from "./cli-shim.js";
-import { isMacOsJunkName, sweepMacOsJunk } from "./fs-copy.js";
+import { copyDirectoryPreservingModes, isMacOsJunkName, sweepMacOsJunk } from "./fs-copy.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "./accounts-transfer-compatibility.js";
 
-const MANAGED_RUNTIME_COPY_ALLOWLIST = [
+export const MANAGED_RUNTIME_COPY_ALLOWLIST = [
   "package.json",
   "package-lock.json",
   "bin",
@@ -27,6 +28,23 @@ const MANAGED_RUNTIME_COPY_ALLOWLIST = [
   join("packages", "sdk", "package.json"),
   join("packages", "sdk", "dist"),
 ] as const;
+
+/** A manager generation never stages its own executable into the runtime it
+ * later verifies. Keeping this list separate prevents a self-referential
+ * fingerprint when `manager.mjs` is rebuilt. */
+export const MANAGER_MANAGED_RUNTIME_COPY_ALLOWLIST = [
+  "package.json",
+  "package-lock.json",
+  "bin",
+  "node_modules",
+  join("packages", "installer", "package.json"),
+  join("packages", "installer", "dist"),
+  join("packages", "installer", "assets"),
+  join("packages", "sdk", "package.json"),
+  join("packages", "sdk", "dist"),
+] as const;
+
+export const MANAGED_RUNTIME_FINGERPRINT_FILE = "managed-runtime-fingerprint.json" as const;
 
 const MANAGED_RUNTIME_CONTROL_PLANE_ALLOWLIST = [
   "package.json",
@@ -52,6 +70,12 @@ export interface StageManagedRuntimeOptions {
    * development-bootstrap receipt.
    */
   provenance?: ManagedRuntimeProvenance;
+}
+
+export interface ManagedRuntimeTreeFingerprint {
+  schemaVersion: 1;
+  fingerprint: string;
+  fileCount: number;
 }
 
 export function managedSourceRoot(userRoot: string): string {
@@ -106,6 +130,42 @@ export function fingerprintManagedRuntimeSource(sourceRoot: string): string {
 }
 
 /**
+ * The generated manager source contains this same allowlist, with manager.mjs
+ * and the generated managed-runtime tree omitted. It is intentionally an
+ * explicit API rather than an option on ordinary staging so callers cannot
+ * accidentally relabel a mutable development tree as manager-sealed.
+ */
+export function fingerprintManagerManagedRuntimeSource(sourceRoot: string): string {
+  return fingerprintManagedRuntimeEntries(sourceRoot, MANAGER_MANAGED_RUNTIME_COPY_ALLOWLIST);
+}
+
+export function readManagedRuntimeFingerprintEvidence(root: string): ManagedRuntimeTreeFingerprint | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(join(root, MANAGED_RUNTIME_FINGERPRINT_FILE), "utf8"));
+  } catch {
+    return null;
+  }
+  if (!isManagedRuntimeTreeFingerprint(value)) return null;
+  if (fingerprintManagerManagedRuntimeSource(root) !== value.fingerprint) return null;
+  return value;
+}
+
+export function isManagedRuntimeTreeFingerprint(value: unknown): value is ManagedRuntimeTreeFingerprint {
+  return isRecord(value)
+    && value.schemaVersion === 1
+    && typeof value.fingerprint === "string"
+    && /^[a-f0-9]{64}$/.test(value.fingerprint)
+    && Number.isInteger(value.fileCount)
+    && typeof value.fileCount === "number"
+    && value.fileCount >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
  * Fingerprint the compiled control plane loaded by the installer CLI.
  *
  * Development preparation builds before staging. Comparing this digest on
@@ -138,7 +198,14 @@ export function stageManagedRuntime(
     if (!existsSync(source)) continue;
     const target = join(destination, relative);
     mkdirSync(dirname(target), { recursive: true });
-    cpSync(source, target, { recursive: true, verbatimSymlinks: true });
+    const sourceStat = lstatSync(source);
+    if (sourceStat.isDirectory() && !sourceStat.isSymbolicLink()) {
+      // The generation fingerprint includes directory permissions. cpSync
+      // alone recreates private sealed directories using the process umask.
+      copyDirectoryPreservingModes(source, target);
+    } else {
+      cpSync(source, target, { recursive: true, verbatimSymlinks: true });
+    }
   }
   sanitizeManagedRuntimeSymlinks(destination);
   // Junk copied from a Finder-browsed source checkout must never enter a
@@ -202,7 +269,11 @@ function pathEntryExists(path: string): boolean {
   }
 }
 
-export function installManagedRuntime(sourceRoot: string, userRoot: string): string {
+export function installManagedRuntime(
+  sourceRoot: string,
+  userRoot: string,
+  options: { appRoot?: string } = {},
+): string {
   const destination = managedSourceRoot(userRoot);
   if (resolve(sourceRoot) === resolve(destination)) return destination;
   const parent = dirname(destination);
@@ -212,11 +283,21 @@ export function installManagedRuntime(sourceRoot: string, userRoot: string): str
   rmSync(next, { recursive: true, force: true });
   rmSync(previous, { recursive: true, force: true });
   stageManagedRuntime(sourceRoot, next);
-  if (existsSync(destination)) renameSync(destination, previous);
+  const brokerRoots = accountsTransferBrokerRoots(userRoot, options.appRoot);
+  const bundledRuntime = (managedRoot: string): string => (
+    join(managedRoot, "packages", "installer", "assets", "runtime")
+  );
+  assertAccountsTransferRuntimeCompatible(bundledRuntime(next), brokerRoots);
+  const hadPrevious = existsSync(destination);
+  if (hadPrevious) renameSync(destination, previous);
   try {
     renameSync(next, destination);
     rmSync(previous, { recursive: true, force: true });
   } catch (error) {
+    if (hadPrevious && !existsSync(previous)) {
+      throw new Error(`Managed runtime retained previous tree is missing at ${previous}`, { cause: error });
+    }
+    assertAccountsTransferRuntimeCompatible(bundledRuntime(previous), brokerRoots);
     rmSync(destination, { recursive: true, force: true });
     if (existsSync(previous)) renameSync(previous, destination);
     throw error;

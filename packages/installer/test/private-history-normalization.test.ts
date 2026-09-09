@@ -19,8 +19,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { gzipSync } from "node:zlib";
 import {
   PRIVATE_HISTORY_NORMALIZATION_MANIFEST,
   normalizePrivateHistory,
@@ -38,7 +39,21 @@ import {
 const THREAD_A = "01a05546-cf93-7383-96ed-dc76ce3d1b3c";
 const THREAD_B = "01a05547-cf93-7383-96ed-dc76ce3d1b3c";
 const THREAD_C = "01a05548-cf93-7383-96ed-dc76ce3d1b3c";
+const THREAD_D = "01a05549-cf93-7383-96ed-dc76ce3d1b3c";
+const THREAD_E = "01a0554a-cf93-7383-96ed-dc76ce3d1b3c";
 const FIXED_TIME = "2026-09-02T01:00:00.000Z";
+const ARCHIVE_EXACT_METADATA_PATHS = [
+  "archived_sessions/keep-codex-fast-20260531-161915/RESTORE_MANIFEST.json",
+  "archived_sessions/keep-codex-fast-20260531-173902/RESTORE_MANIFEST.json",
+  "archived_sessions/completed-or-obsolete-2026-08-26/MANIFEST.json",
+  "archived_sessions/.relocation-manifest.json",
+  "session-cold-storage/2026-08-20-older-than-14-days/manifest.json",
+  "session-cold-storage/2026-08-20-older-than-14-days/manifest.sha256",
+  "session-cold-storage/2026-08-20-older-than-14-days/conversion-journal.jsonl",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite-wal",
+  "session-cold-storage/2026-08-20-older-than-14-days/metadata/state_5-before.sqlite-shm",
+] as const;
 
 test("trusted desktop identities remain additive even when a caller supplies another app path", () => {
   const census = privateHistoryProcessCensus([
@@ -151,7 +166,14 @@ class Fixture {
     ]);
   }
 
-  run(apply: boolean, beforePhase?: (phase: string) => void) {
+  run(
+    apply: boolean,
+    beforePhase?: (phase: string) => void,
+    options: {
+      archiveRecoveryByteCap?: number;
+      freeSpaceBytes?: (path: string) => bigint;
+    } = {},
+  ) {
     return normalizePrivateHistory({
       sourceCodexRoot: this.sourceCodexRoot,
       sourceSqliteRoot: this.sourceSqliteRoot,
@@ -165,6 +187,8 @@ class Fixture {
       census: () => structuredClone(this.census),
       now: () => FIXED_TIME,
       randomId: () => `${String(++this.sequence).padStart(8, "0")}-safe`,
+      archiveRecoveryByteCap: options.archiveRecoveryByteCap,
+      freeSpaceBytes: options.freeSpaceBytes,
       beforePhase: beforePhase as ((phase: never) => void) | undefined,
     });
   }
@@ -343,16 +367,276 @@ test("outside-root and dangling links fail closed during a read-only plan", () =
   assert.equal(existsSync(dangling.snapshotRoot), false);
 });
 
-test("a relocated physical record anywhere in the approved archive blocks a NULL rewrite", () => {
+test("an archive-only plain rollout recovers a stale database path into the deterministic private namespace", () => {
   const fixture = new Fixture();
   const relocatedDirectory = join(fixture.allowedLinkRoot, "relocated", "deeply");
   privateDirectory(join(fixture.allowedLinkRoot, "relocated"));
   privateDirectory(relocatedDirectory);
   writeRollout(join(relocatedDirectory, "different-name.jsonl"), THREAD_C, "recoverable");
+  const archiveBefore = readFileSync(join(relocatedDirectory, "different-name.jsonl"));
+  const sourceRows = fixture.sqlite.readThreadRows(fixture.sourceState);
 
-  assert.throws(() => fixture.run(false), /history-normalization-missing-path-recoverable/);
-  assert.equal(existsSync(fixture.snapshotRoot), false);
+  const result = fixture.run(true);
+  const recovered = join(
+    fixture.snapshotRoot,
+    "codex-home",
+    "archived_sessions",
+    "recovered-by-tweakers-v1",
+    `${THREAD_C}.jsonl`,
+  );
+  assert.equal(result.status, "normalized");
+  assert.equal(result.recoveredArchiveRolloutPaths, 1);
+  assert.equal(result.decompressedArchiveFiles, 0);
+  assert.equal(result.clearedMissingRolloutPaths, 0);
+  assert.deepEqual(readFileSync(recovered), archiveBefore);
+  assert.equal(lstatSync(recovered).isSymbolicLink(), false);
+  assert.equal(statSync(recovered).mode & 0o777, 0o600);
+  assert.equal(
+    fixture.sqlite.readThreadRows(join(fixture.snapshotRoot, "sqlite-home", "state_5.sqlite"))
+      .find((row) => row.id === THREAD_C)?.rollout_path,
+    recovered,
+  );
+  assert.deepEqual(fixture.sqlite.readThreadRows(fixture.sourceState), sourceRows);
   assert.equal(existsSync(fixture.sourceMissing), false);
+});
+
+test("a stale local pointer reuses an existing same-ID source rollout before consulting the archive", () => {
+  const fixture = new Fixture();
+  const relocated = join(fixture.sourceSessions, "relocated-source.jsonl");
+  writeRollout(relocated, THREAD_C, "source-stale-recovery");
+  const sourceRows = fixture.sqlite.readThreadRows(fixture.sourceState);
+
+  const result = fixture.run(true);
+  const copied = join(fixture.snapshotRoot, "codex-home", "sessions", "relocated-source.jsonl");
+  assert.equal(result.status, "normalized");
+  assert.equal(result.recoveredSourceStaleRolloutPaths, 1);
+  assert.equal(result.recoveredArchiveRolloutPaths, 0);
+  assert.equal(result.clearedMissingRolloutPaths, 0);
+  assert.equal(
+    fixture.sqlite.readThreadRows(join(fixture.snapshotRoot, "sqlite-home", "state_5.sqlite"))
+      .find((row) => row.id === THREAD_C)?.rollout_path,
+    copied,
+  );
+  assert.equal(lstatSync(copied).isSymbolicLink(), false);
+  assert.deepEqual(fixture.sqlite.readThreadRows(fixture.sourceState), sourceRows);
+});
+
+test("a gzip archive rollout is planned by decompressed metadata and streamed into a private normalized file", () => {
+  const fixture = new Fixture();
+  const archive = join(fixture.allowedLinkRoot, "cold", "unrelated-name.jsonl.gz");
+  writeGzipRollout(archive, THREAD_D, "gzip-recovery");
+  addThread(fixture, THREAD_D, join(fixture.sourceSessions, "stale-gzip.jsonl"));
+  const sourceRows = fixture.sqlite.readThreadRows(fixture.sourceState);
+  const archiveBefore = readFileSync(archive);
+
+  const dryRun = fixture.run(false);
+  assert.equal(dryRun.recoveredArchiveRolloutPaths, 1);
+  assert.equal(dryRun.decompressedArchiveFiles, 1);
+  assert.equal(dryRun.decompressedArchiveBytes, 0);
+  assert.equal(existsSync(fixture.snapshotRoot), false);
+
+  const result = fixture.run(true);
+  const recovered = join(
+    fixture.snapshotRoot,
+    "codex-home",
+    "archived_sessions",
+    "recovered-by-tweakers-v1",
+    `${THREAD_D}.jsonl`,
+  );
+  const expected = rolloutBytes(THREAD_D, "gzip-recovery");
+  assert.equal(result.status, "normalized");
+  assert.equal(result.decompressedArchiveFiles, 1);
+  assert.equal(result.decompressedArchiveBytes, expected.byteLength);
+  assert.deepEqual(readFileSync(recovered), expected);
+  assert.equal(statSync(recovered).mode & 0o777, 0o600);
+  assert.equal(lstatSync(recovered).isSymbolicLink(), false);
+  assert.equal(
+    fixture.sqlite.readThreadRows(join(fixture.snapshotRoot, "sqlite-home", "state_5.sqlite"))
+      .find((row) => row.id === THREAD_D)?.rollout_path,
+    recovered,
+  );
+  assert.deepEqual(fixture.sqlite.readThreadRows(fixture.sourceState), sourceRows);
+  assert.deepEqual(readFileSync(archive), archiveBefore);
+
+  const manifest = JSON.parse(readFileSync(join(fixture.snapshotRoot, PRIVATE_HISTORY_NORMALIZATION_MANIFEST), "utf8")) as {
+    archiveRecovery: { entries: Array<Record<string, unknown>> };
+  };
+  const entry = manifest.archiveRecovery.entries.find((value) => value.snapshotRelativePath === `archived_sessions/recovered-by-tweakers-v1/${THREAD_D}.jsonl`);
+  assert.ok(entry);
+  assert.equal(entry.encoding, "gzip");
+  assert.equal(entry.normalizedBytes, expected.byteLength);
+  assert.match(String(entry.compressedSha256), /^sha256:[a-f0-9]{64}$/);
+  assert.match(String(entry.normalizedSha256), /^sha256:[a-f0-9]{64}$/);
+});
+
+test("gzip recovery accepts concatenated members only after streaming every member to EOF", () => {
+  const fixture = new Fixture();
+  const archive = join(fixture.allowedLinkRoot, "concatenated.jsonl.gz");
+  const first = rolloutBytes(THREAD_D, "first-member");
+  const second = Buffer.from("{\"marker\":\"second-member\"}\n", "utf8");
+  const expected = Buffer.concat([first, second]);
+  writeFileSync(archive, Buffer.concat([gzipSync(first), gzipSync(second)]), { mode: 0o600 });
+  addThread(fixture, THREAD_D, join(fixture.sourceSessions, "stale-concatenated.jsonl"));
+
+  const result = fixture.run(true);
+  const recovered = join(
+    fixture.snapshotRoot,
+    "codex-home",
+    "archived_sessions",
+    "recovered-by-tweakers-v1",
+    `${THREAD_D}.jsonl`,
+  );
+  assert.equal(result.status, "normalized");
+  assert.equal(result.decompressedArchiveBytes, expected.byteLength);
+  assert.deepEqual(readFileSync(recovered), expected);
+});
+
+test("exact archive and source metadata exclusions are hashed, omitted, and do not broaden to unfamiliar controls", () => {
+  const fixture = new Fixture();
+  writeFileSync(join(fixture.sourceSessions, ".DS_Store"), "source finder metadata", { mode: 0o600 });
+  writeFileSync(join(fixture.sourceSessions, "._regular.jsonl"), "source apple double", { mode: 0o600 });
+  for (const relativePath of ARCHIVE_EXACT_METADATA_PATHS) {
+    writeArchiveControl(fixture.allowedLinkRoot, relativePath, `control:${relativePath}`);
+  }
+  writeArchiveControl(fixture.allowedLinkRoot, "cold/.DS_Store", "archive finder metadata");
+  writeArchiveControl(fixture.allowedLinkRoot, "cold/._rollout.jsonl", "archive apple double");
+
+  const dryRun = fixture.run(false);
+  assert.equal(dryRun.excludedMetadataFiles, 14);
+  const result = fixture.run(true);
+  assert.equal(result.status, "normalized");
+  assert.equal(existsSync(join(fixture.snapshotRoot, "codex-home", "sessions", ".DS_Store")), false);
+  assert.equal(existsSync(join(fixture.snapshotRoot, "codex-home", "sessions", "._regular.jsonl")), false);
+
+  const unknown = new Fixture();
+  writeArchiveControl(unknown.allowedLinkRoot, "archived_sessions/not-approved/MANIFEST.json", "not approved");
+  assert.throws(() => unknown.run(false), /history-normalization-archive-entry-unknown/);
+
+  const malformed = new Fixture();
+  writeArchiveControl(malformed.allowedLinkRoot, "unknown.jsonl", "{not-json}\n");
+  assert.throws(() => malformed.run(false), /history-normalization-invalid-rollout-first-record/);
+
+  const wrongMagic = new Fixture();
+  writeArchiveControl(wrongMagic.allowedLinkRoot, "wrong-magic.jsonl.gz", rolloutBytes(THREAD_D, "plain-but-gzip-named").toString("utf8"));
+  assert.throws(() => wrongMagic.run(false), /history-normalization-archive-rollout-encoding-mismatch/);
+
+  const unknownSource = new Fixture();
+  writeFileSync(join(unknownSource.sourceSessions, "unknown.txt"), "not a rollout\n", { mode: 0o600 });
+  assert.throws(() => unknownSource.run(false), /history-normalization-invalid-rollout-first-record/);
+});
+
+test("gzip recovery fails closed on CRC/truncation, compressed drift, output drift, and a bounded decompression cap", () => {
+  const truncated = new Fixture();
+  const truncatedArchive = join(truncated.allowedLinkRoot, "truncated.jsonl.gz");
+  writeGzipRollout(truncatedArchive, THREAD_D, "truncated".repeat(4096));
+  writeFileSync(truncatedArchive, readFileSync(truncatedArchive).subarray(0, -4), { mode: 0o600 });
+  addThread(truncated, THREAD_D, join(truncated.sourceSessions, "stale-truncated.jsonl"));
+  const sourceRows = truncated.sqlite.readThreadRows(truncated.sourceState);
+  assert.throws(() => truncated.run(true), /history-normalization-archive-gzip-decompression-failed/);
+  assert.deepEqual(truncated.sqlite.readThreadRows(truncated.sourceState), sourceRows);
+  assert.equal(existsSync(truncated.snapshotRoot), false);
+
+  const drift = new Fixture();
+  const driftArchive = join(drift.allowedLinkRoot, "drift.jsonl.gz");
+  writeGzipRollout(driftArchive, THREAD_D, "before-drift");
+  addThread(drift, THREAD_D, join(drift.sourceSessions, "stale-drift.jsonl"));
+  assert.throws(() => drift.run(true, (phase) => {
+    if (phase === "after-candidate-created") writeGzipRollout(driftArchive, THREAD_E, "after-drift");
+  }), /history-normalization-archive-file-drift/);
+
+  const outputDrift = new Fixture();
+  const outputArchive = join(outputDrift.allowedLinkRoot, "output-drift.jsonl.gz");
+  writeGzipRollout(outputArchive, THREAD_D, "output-drift");
+  addThread(outputDrift, THREAD_D, join(outputDrift.sourceSessions, "stale-output.jsonl"));
+  assert.throws(() => outputDrift.run(true, (phase) => {
+    if (phase !== "after-history-copied") return;
+    const candidate = readdirSync(outputDrift.snapshotParent)
+      .find((name) => name.startsWith(".history-normalization-candidate-"));
+    assert.ok(candidate);
+    appendFileSync(join(outputDrift.snapshotParent, candidate, "codex-home", "archived_sessions", "recovered-by-tweakers-v1", `${THREAD_D}.jsonl`), "late\n");
+  }), /history-normalization-normalized-history-mismatch/);
+
+  const capped = new Fixture();
+  const cappedArchive = join(capped.allowedLinkRoot, "capped.jsonl.gz");
+  writeGzipRollout(cappedArchive, THREAD_D, "x".repeat(512));
+  addThread(capped, THREAD_D, join(capped.sourceSessions, "stale-capped.jsonl"));
+  assert.throws(
+    () => capped.run(true, undefined, { archiveRecoveryByteCap: 64 }),
+    /history-normalization-archive-gzip-decompression-failed/,
+  );
+});
+
+test("each gzip recovery reserves its cap plus databases and later exact plain archive work", () => {
+  const fixture = new Fixture();
+  const gzipArchive = join(fixture.allowedLinkRoot, "first-recovery.jsonl.gz");
+  const secondGzipArchive = join(fixture.allowedLinkRoot, "second-recovery.jsonl.gz");
+  const plainArchive = join(fixture.allowedLinkRoot, "later-recovery.jsonl");
+  writeGzipRollout(gzipArchive, THREAD_C, "first-gzip-recovery");
+  writeGzipRollout(secondGzipArchive, THREAD_D, "second-gzip-recovery");
+  writeRollout(plainArchive, THREAD_E, "later-plain-recovery");
+  addThread(fixture, THREAD_D, join(fixture.sourceSessions, "stale-second-gzip.jsonl"));
+  addThread(fixture, THREAD_E, join(fixture.sourceSessions, "stale-later-plain.jsonl"));
+
+  const outputCap = 1024;
+  const databaseBytes = OFFICIAL_CODEX_DATABASES.reduce(
+    (sum, name) => sum + BigInt(statSync(join(fixture.sourceSqliteRoot, name)).size),
+    0n,
+  );
+  const plainBytes = BigInt(statSync(plainArchive).size);
+  const requiredForSecondGzip = BigInt(outputCap) + databaseBytes + plainBytes;
+  // Preflight and the first gzip have ample capacity. The second gzip sees
+  // enough for its cap alone but not enough to preserve the later DB/plain work.
+  const freeSpaceObservations = [10_000_000n, 10_000_000n, requiredForSecondGzip - 1n];
+  const sourceRows = fixture.sqlite.readThreadRows(fixture.sourceState);
+
+  assert.throws(
+    () => fixture.run(true, undefined, {
+      archiveRecoveryByteCap: outputCap,
+      freeSpaceBytes: () => freeSpaceObservations.shift() ?? 0n,
+    }),
+    /history-normalization-snapshot-free-space-insufficient/,
+  );
+  assert.equal(freeSpaceObservations.length, 0);
+  assert.deepEqual(fixture.sqlite.readThreadRows(fixture.sourceState), sourceRows);
+  assert.equal(existsSync(fixture.snapshotRoot), false);
+});
+
+test("duplicate and divergent archive claims fail, while an exact source symlink to an archive plain rollout remains one record", () => {
+  const duplicate = new Fixture();
+  writeRollout(join(duplicate.allowedLinkRoot, "duplicate-one.jsonl"), THREAD_D, "one");
+  writeRollout(join(duplicate.allowedLinkRoot, "duplicate-two.jsonl"), THREAD_D, "two");
+  assert.throws(() => duplicate.run(false), /history-normalization-duplicate-rollout-thread-id/);
+
+  const divergent = new Fixture();
+  writeRollout(join(divergent.allowedLinkRoot, "different-source-a.jsonl"), THREAD_A, "different");
+  assert.throws(() => divergent.run(false), /history-normalization-source-archive-rollout-divergence/);
+
+  const exactSymlink = new Fixture();
+  assert.doesNotThrow(() => exactSymlink.run(false));
+});
+
+test("metadata drift and a preexisting recovery namespace block publication without altering originals", () => {
+  const metadataDrift = new Fixture();
+  const sourceMetadata = join(metadataDrift.sourceSessions, ".DS_Store");
+  writeFileSync(sourceMetadata, "before", { mode: 0o600 });
+  assert.throws(() => metadataDrift.run(true, (phase) => {
+    if (phase === "after-history-copied") appendFileSync(sourceMetadata, "after");
+  }), /history-normalization-source-drift/);
+  assert.equal(existsSync(metadataDrift.snapshotRoot), false);
+
+  const archiveMetadataDrift = new Fixture();
+  const archiveMetadata = join(archiveMetadataDrift.allowedLinkRoot, ".DS_Store");
+  writeFileSync(archiveMetadata, "before", { mode: 0o600 });
+  assert.throws(() => archiveMetadataDrift.run(true, (phase) => {
+    if (phase === "after-history-copied") appendFileSync(archiveMetadata, "after");
+  }), /history-normalization-source-drift/);
+  assert.equal(existsSync(archiveMetadataDrift.snapshotRoot), false);
+
+  const collision = new Fixture();
+  const archived = join(collision.sourceCodexRoot, "archived_sessions");
+  privateDirectory(archived);
+  privateDirectory(join(archived, "recovered-by-tweakers-v1"));
+  assert.throws(() => collision.run(false), /history-normalization-archive-recovery-namespace-exists/);
 });
 
 test("the approved archive inventory rejects symlinks and hardlinks", () => {
@@ -411,9 +695,31 @@ function privateDirectory(path: string): void {
 }
 
 function writeRollout(path: string, id: string, marker: string): void {
-  writeFileSync(path,
+  writeFileSync(path, rolloutBytes(id, marker), { mode: 0o600 });
+}
+
+function rolloutBytes(id: string, marker: string): Buffer {
+  return Buffer.from(
     `${JSON.stringify({ type: "session_meta", payload: { id } })}\n${JSON.stringify({ marker })}\n`,
-    { mode: 0o600 });
+    "utf8",
+  );
+}
+
+function writeGzipRollout(path: string, id: string, marker: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, gzipSync(rolloutBytes(id, marker)), { mode: 0o600 });
+}
+
+function writeArchiveControl(root: string, relativePath: string, contents: string): void {
+  const path = join(root, ...relativePath.split("/"));
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, contents, { mode: 0o600 });
+}
+
+function addThread(fixture: Fixture, id: string, rolloutPath: string): void {
+  const rows = fixture.sqlite.rows.get(fixture.sourceState);
+  assert.ok(rows);
+  rows.push({ id, rollout_path: rolloutPath, title: `Thread ${id}`, archived: true });
 }
 
 function realSqliteFixture(): {

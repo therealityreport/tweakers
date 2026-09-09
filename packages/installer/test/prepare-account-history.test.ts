@@ -20,6 +20,11 @@ const DRY_RUN_RESULT: PrivateHistoryNormalizationResult = {
   importedThreadCount: 7603,
   rewrittenRolloutPaths: 1512,
   clearedMissingRolloutPaths: 6091,
+  recoveredSourceStaleRolloutPaths: 2,
+  recoveredArchiveRolloutPaths: 5,
+  decompressedArchiveFiles: 3,
+  decompressedArchiveBytes: 2048,
+  excludedMetadataFiles: 4,
   databasesPresent: 6,
   sessionIndexPresent: true,
   nextAction: "apply-normalization",
@@ -55,6 +60,8 @@ test("prepare-account-history defaults to a redacted dry run with exact private 
   });
   assert.equal(result.status, "dry-run");
   assert.deepEqual(JSON.parse(output[0]!), formatPrepareAccountHistoryResult(DRY_RUN_RESULT));
+  assert.equal(JSON.parse(output[0]!).recoveredArchiveRolloutPaths, 5);
+  assert.equal(JSON.parse(output[0]!).decompressedArchiveBytes, 2048);
   assert.doesNotMatch(output[0]!, /Users|Volumes|01a055/);
 });
 

@@ -87,6 +87,7 @@ export declare class AccountRouterMux {
     shutdown(): void;
     private routeDesktopRequest;
     private initialize;
+    private dispatchFeatureEnablement;
     private dispatchNewThread;
     /** A request is delivered once, only after fresh two-account capacity exists. */
     private dispatchSelectedNewThread;

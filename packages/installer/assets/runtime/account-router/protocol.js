@@ -77,7 +77,7 @@ const AGGREGATE_READS = new Set(["thread/list", "thread/search", "thread/loaded/
 // agree afterwards, so it refuses them and requires a fresh direct startup.
 const CAPABILITY_MUTATIONS = new Set([
     "config/batchWrite", "config/mcpServer/reload", "config/value/write",
-    "experimentalFeature/enablement/set", "skills/config/write", "skills/extraRoots/set",
+    "skills/config/write", "skills/extraRoots/set",
     "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/remove", "marketplace/upgrade",
     "mcpServer/oauth/login",
 ]);
@@ -90,6 +90,8 @@ function classifyClientMethod(method, params) {
         return "fanout_initialize_intersection";
     if (method === "thread/start")
         return "balance_new_thread";
+    if (method === "experimentalFeature/enablement/set")
+        return "fanout_feature_enablement";
     // Section writes remain manual-only; section reads are namespaced inside
     // the mux and never expose a child-home identifier to the desktop.
     if (method === "threadSection/list")
@@ -133,13 +135,16 @@ function isKnownServerRequest(method) {
     return typeof method === "string" && SERVER_REQUEST_METHODS.has(method);
 }
 function hasThreadId(params) {
-    return (0, types_1.isPlainRecord)(params) && typeof params.threadId === "string" && params.threadId.length > 0;
+    return (0, types_1.isPlainRecord)(params) && ((typeof params.threadId === "string" && params.threadId.length > 0)
+        || (typeof params.thread_id === "string" && params.thread_id.length > 0));
 }
 function threadIdFrom(params) {
     if (!(0, types_1.isPlainRecord)(params))
         return null;
     if (typeof params.threadId === "string" && params.threadId.length > 0)
         return params.threadId;
+    if (typeof params.thread_id === "string" && params.thread_id.length > 0)
+        return params.thread_id;
     const thread = params.thread;
     return (0, types_1.isPlainRecord)(thread) && typeof thread.id === "string" && thread.id.length > 0 ? thread.id : null;
 }
