@@ -152,21 +152,36 @@ Mode discipline:
 
 ## Update handling
 
-When Codex auto-updates via Sparkle:
+Official ChatGPT updates are owned exclusively by ChatGPT's native macOS
+updater. Tweakers never wraps, routes, repairs, replaces, or otherwise owns
+that updater. A native update can remove an injected Tweaker patch; the
+separate injected-mode lifecycle may then repair Tweakers' own patch after the
+new official bundle has been observed. That patch repair is not an updater.
 
-1. Sparkle downloads a new Codex.app and replaces ours on disk.
-2. Our patch is gone; the new app launches normally.
-3. Our launchd / systemd / scheduled-task watcher fires (macOS and Linux watch `app.asar`; Windows runs at logon).
-4. The watcher runs `tweaker repair --quiet`.
-5. `repair` is idempotent: if the current asar hash still matches `patchedAsarHash`, it exits without touching the app; if the hash drifted after an update, it re-runs the install patch against the new app bundle.
+Independent Tweakers updates use the manager-owned `refresh.independent`
+action. It accepts only a sealed official ChatGPT source, builds and promotes
+`/Applications/Tweakers.app`, and leaves `/Applications/ChatGPT.app` in its
+normal official mode. The separately chosen `refresh.injected` action patches
+or restores ChatGPT Tweaker mode; it is a mode operation, not an updater.
+
+The independent deployment keeps its own Electron data, Codex home, cookies,
+credentials, and writable databases. A receipt-bound portable-settings lane
+handles the small subset of user organization that is safe to reproduce. It
+reads validated source fields and writes only local project records, workspace
+labels, sanitized Projects nodes, canonical `lh_…` task references, and known
+tweak enable flags. Unproven native ordering, native pin, and native appearance
+schemas are deliberately excluded. Preview is read-only; apply is offline,
+requires the exact preview digest, publishes a receipt last, and has its own
+journal and rollback outcome. Canonical shared history is an independent
+authority and is never reversed because settings carryover fails.
 
 ## Tweaker self-updates
 
-The watcher also runs hourly using the GitHub-installed local CLI at `~/.tweaker/source/packages/installer/dist/cli.js`. It checks the latest Tweaker GitHub Release, downloads and rebuilds a newer release when available, then runs `repair`. When the app patch is intact but the installed Tweaker version in `state.json` is older than the running CLI, `repair` refreshes `<user-data-dir>/runtime/` and updates state. It does not modify user tweak folders.
-
-Users can disable Tweaker runtime auto-updates from Settings → Tweaker → Config. The setting is stored in `<user-data-dir>/config.json`; app-update repair still works, but intact-app runtime refreshes are skipped while auto-update is disabled.
-
-The Config page can also check for Tweaker updates manually. It reads GitHub release metadata and opens GitHub release pages for review.
+Tweakers runtime and independent-app refreshes are separate from ChatGPT's
+native updater. The manager records source, candidate, installation, and live
+evidence for `refresh.independent`; it never treats a ChatGPT updater receipt
+or a source change as an independent-app update. User tweak folders and
+account credentials remain outside the refresh payload.
 
 ## What's not protected against
 

@@ -98,6 +98,7 @@ import {
 } from "./managed-runtime.js";
 import { getLocalRefreshStatus, hashTree, nodeAugmentedEnvironment, npmCommand } from "./commands/refresh-local.js";
 import { readRuntimeFingerprintEvidence, type RuntimeTreeFingerprint } from "./runtime-fingerprint.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "./accounts-transfer-compatibility.js";
 import { findSourceRoot } from "./source-root.js";
 import { assertInstallerUpdateQuarantineClear } from "./protected-update-quarantine.js";
 import {
@@ -144,6 +145,9 @@ import {
   type PreparedCandidateSignatureEvidence,
   type PreparedDesktopCandidateEvidence,
   type PreparedEnvironmentEvidence,
+  type PreparedEnvironmentBootstrapEvidence,
+  type PreparedBootstrapArtifactEvidence,
+  type PreparedBootstrapRollbackArtifactEvidence,
   type PreparedManagedRuntimeArtifactEvidence,
   type PreparedManagedRuntimeEvidence,
   type PreparedManagedRuntimeRollbackArtifactEvidence,
@@ -153,6 +157,14 @@ import {
   type PreparedRuntimeRollbackArtifactEvidence,
   type PreparedSwapHostEvidence,
 } from "./manager-environment-action.js";
+import {
+  captureWatcherConfiguration,
+  createWatcherConfiguration,
+  installWatcher,
+  restoreWatcherConfiguration,
+  writeWatcherConfiguration,
+  type WatcherConfigurationSnapshot,
+} from "./watcher.js";
 
 export {
   ENVIRONMENT_TRANSACTION_PHASES,
@@ -169,6 +181,9 @@ export type {
   PreparedCandidateSignatureEvidence,
   PreparedDesktopCandidateEvidence,
   PreparedEnvironmentEvidence,
+  PreparedEnvironmentBootstrapEvidence,
+  PreparedBootstrapArtifactEvidence,
+  PreparedBootstrapRollbackArtifactEvidence,
   PreparedManagedRuntimeArtifactEvidence,
   PreparedManagedRuntimeEvidence,
   PreparedManagedRuntimeRollbackArtifactEvidence,
@@ -604,6 +619,10 @@ export interface EnvironmentCoordinatorOptions {
   lockFile?: string;
   lifecycleLockFile?: string;
   watcherPromotionFile?: string;
+  /** Immutable manager-verified source used only for a disposable candidate. */
+  sealedCandidateSourceApp?: string;
+  /** Immutable manager-published control-plane generation for managed staging. */
+  sealedManagedRuntime?: DefaultEnvironmentAdapterOptions["sealedManagedRuntime"];
   bundledDerivedReceiptFile?: string;
   verificationPolls?: number;
   verificationIntervalMs?: number;
@@ -615,6 +634,16 @@ export interface EnvironmentCoordinatorDeps {
   now?: () => string;
   timingClock?: EnvironmentTimingClock;
   createId?: () => string;
+  /** Internal coordinated-activation gate, after source quiescence and before any apply. */
+  beforeApplyPreparedEnvironment?: (input: {
+    receipt: EnvironmentTransactionReceipt;
+    prepared: PreparedEnvironmentEvidence;
+  }) => void | Promise<void>;
+  /** Coordinated activation may need to remove shared authority before reopening a source app. */
+  deferCommitFailureRecovery?: (input: {
+    receipt: EnvironmentTransactionReceipt;
+    prepared: PreparedEnvironmentEvidence;
+  }) => boolean | Promise<boolean>;
   preparePrerequisites?: (input: {
     transactionId: string;
     current: EnvironmentSelection;
@@ -725,7 +754,23 @@ export interface DefaultEnvironmentAdapterOptions {
   mcpConfigFile?: string;
   mcpStateFile?: string;
   tweaksRoot?: string;
+  /**
+   * Immutable candidate source supplied by the manager's registered-source
+   * lease. When present, preparation must not fall back to the live app.
+   */
+  sealedCandidateSourceApp?: string;
   sourceRoot?: string;
+  /**
+   * An already verified manager-owned control-plane generation. Unlike
+   * `sourceRoot`, this is immutable source authority and must never invoke a
+   * checkout build or acquire the mutable managed-runtime/current tree.
+   */
+  sealedManagedRuntime?: {
+    sourceRoot: string;
+    generationId: string;
+    fingerprint: string;
+    sourceRuntimeHash: string | null;
+  };
   /**
    * Explicit opt-in receipt for a backend derived from the exact Codex tag
    * bundled in the installed desktop. It remains on the bundled lane.
@@ -763,7 +808,9 @@ export interface DefaultEnvironmentAdapterDeps {
     destination: string,
     runtimeDestination: string,
     bundledDerivedBackend?: ValidatedBundledDerivedArtifact,
-  ) => void | Promise<void>;
+    stateDestination?: string,
+  ) => { state: { artifactPath: string; artifactDigest: string } | null } | void
+    | Promise<{ state: { artifactPath: string; artifactDigest: string } | null } | void>;
   prepareRuntimeAssets?: (destination: string) => void | Promise<void>;
   prepareManagedRuntime?: (
     sourceRoot: string,
@@ -810,6 +857,10 @@ export interface DefaultEnvironmentAdapterDeps {
   reconcileMcpMode?: (appExperience: AppExperience) => void;
   /** Read-only proof that the selected app experience owns the live MCP set. */
   proveMcpMode?: (appExperience: AppExperience) => boolean;
+  /** Read-only watcher-definition snapshot captured into first-injection evidence. */
+  captureWatcherConfiguration?: () => WatcherConfigurationSnapshot;
+  /** Build the requested watcher bytes before any live watcher mutation. */
+  createWatcherConfiguration?: (appRoot: string) => WatcherConfigurationSnapshot;
   readPatchedAsarEvidence?: (appRoot: string) => EnvironmentPatchedAsarEvidence;
   writeAppState?: (
     stateFile: string,
@@ -1517,6 +1568,7 @@ interface ManagedRuntimeSourcePlan {
   sourceRuntimeHash: string | null;
   sourceArtifactHash: string;
   sourceControlHash: string;
+  sealedGeneration?: { generationId: string; fingerprint: string };
 }
 
 function resolvedDefaultEnvironmentAdapterDeps(
@@ -1555,20 +1607,31 @@ function resolvedDefaultEnvironmentAdapterDeps(
       destination,
       runtimeDestination,
       bundledDerivedBackend,
+      stateDestination,
     ) => {
+      const leasedSource = options.sealedCandidateSourceApp;
+      if (leasedSource !== undefined
+        && (!exactAbsolutePath(leasedSource) || !existsSync(leasedSource))) {
+        throw new Error("The sealed manager candidate source is unavailable");
+      }
       const officialAsar = join(profile.officialPath, "Contents", "Resources", "app.asar");
-      const sourceApp = existsSync(profile.officialPath) && readAsarMarker(officialAsar) === "absent"
-        ? profile.officialPath
-        : profile.pristineBackupPath;
+      const sourceApp = leasedSource
+        ?? (existsSync(profile.officialPath) && readAsarMarker(officialAsar) === "absent"
+          ? profile.officialPath
+          : profile.pristineBackupPath);
+      if (leasedSource !== undefined && sameCanonicalPath(leasedSource, profile.officialPath)) {
+        throw new Error("A sealed manager candidate must not use the live official ChatGPT app as its source");
+      }
       if (!existsSync(sourceApp)) {
         throw new Error(`No pristine ${profile.releaseProfile} app is available to build a patched payload`);
       }
-      await buildPatchedCandidateOnly({
+      return buildPatchedCandidateOnly({
         sourceApp,
         destinationApp: destination,
         destinationRuntime: runtimeDestination,
         finalUserRoot: options.environmentRoot ?? userPaths().root,
         ...(bundledDerivedBackend ? { bundledDerivedBackend } : {}),
+        ...(stateDestination ? { destinationState: stateDestination } : {}),
       });
     }),
     prepareRuntimeAssets: deps.prepareRuntimeAssets ?? ((destination) => {
@@ -1626,6 +1689,8 @@ function resolvedDefaultEnvironmentAdapterDeps(
       mcpModeBridge.reconcile(appExperience);
     }),
     proveMcpMode: deps.proveMcpMode ?? mcpModeBridge.prove,
+    captureWatcherConfiguration: deps.captureWatcherConfiguration ?? captureWatcherConfiguration,
+    createWatcherConfiguration: deps.createWatcherConfiguration ?? createWatcherConfiguration,
     readPatchedAsarEvidence: deps.readPatchedAsarEvidence ?? ((appRoot) => {
       const asarPath = join(appRoot, "Contents", "Resources", "app.asar");
       const asarStat = lstatSync(asarPath);
@@ -1684,6 +1749,38 @@ async function prepareManagedRuntimeSourcePlan(
   options: DefaultEnvironmentAdapterOptions,
   deps: ResolvedDefaultEnvironmentAdapterDeps,
 ): Promise<ManagedRuntimeSourcePlan> {
+  if (options.sealedManagedRuntime) {
+    const sealed = options.sealedManagedRuntime;
+    if (!exactAbsolutePath(sealed.sourceRoot) || !pathEntryExists(sealed.sourceRoot)) {
+      throw new Error("The sealed manager managed-runtime source is unavailable");
+    }
+    if (!lowerSha256(sealed.generationId)
+      || !lowerSha256(sealed.fingerprint)
+      || (sealed.sourceRuntimeHash !== null && !lowerSha256(sealed.sourceRuntimeHash))) {
+      throw new Error("The sealed manager managed-runtime binding is malformed");
+    }
+    const sourceArtifactHash = fingerprintManagedRuntimeSource(sealed.sourceRoot);
+    if (sourceArtifactHash !== sealed.fingerprint) {
+      throw new Error("The sealed manager managed-runtime source no longer matches its compiled fingerprint");
+    }
+    const sourceControlHash = fingerprintManagedRuntimeControlPlane(sealed.sourceRoot);
+    return {
+      sourceRoot: sealed.sourceRoot,
+      sourceRuntimeHash: sealed.sourceRuntimeHash,
+      sourceArtifactHash,
+      sourceControlHash,
+      provenance: {
+        kind: "sealed-manager-managed-runtime",
+        installedAt: preparedAt,
+        ...(sealed.sourceRuntimeHash === null ? {} : { sourceRuntimeHash: sealed.sourceRuntimeHash }),
+        sourceArtifactHash,
+        sourceControlHash,
+        generationId: sealed.generationId,
+        generationFingerprint: sealed.fingerprint,
+      },
+      sealedGeneration: { generationId: sealed.generationId, fingerprint: sealed.fingerprint },
+    };
+  }
   if (options.sourceRoot) {
     if (!pathEntryExists(options.sourceRoot)) {
       throw new Error(`No managed runtime source is available at ${options.sourceRoot}`);
@@ -1843,11 +1940,22 @@ async function prepareEnvironmentPrerequisites(
   const rollbackRuntimeArtifactPath = join(preparedRoot, "runtime", "rollback");
   const requestedManagedRuntimeArtifactPath = join(preparedRoot, "managed-runtime", "requested");
   const rollbackManagedRuntimeArtifactPath = join(preparedRoot, "managed-runtime", "rollback");
+  const requestedStateArtifactPath = join(preparedRoot, "state", "requested.json");
+  const rollbackStateArtifactPath = join(preparedRoot, "state", "rollback.json");
+  const requestedWatcherArtifactPath = join(preparedRoot, "watcher", "requested.definition");
+  const rollbackWatcherArtifactPath = join(preparedRoot, "watcher", "rollback.definition");
   const needsRuntimeEvidence = input.current.appExperience === "tweakers"
     || input.requested.appExperience === "tweakers";
   const environmentRoot = options.environmentRoot ?? dirname(options.configFile);
   const activeRuntimeTarget = join(environmentRoot, "runtime");
   const managedRuntimeTarget = managedSourceRoot(environmentRoot);
+  // Receipt-owned bootstrap is an injected-refresh requirement: its sealed
+  // manager source is the only authority permitted to create a first global
+  // installer state and watcher baseline. Preserve the legacy environment
+  // coordinator's established path for ordinary non-manager transitions.
+  const requiresBootstrapEvidence = options.sealedCandidateSourceApp !== undefined
+    && input.current.appExperience === "chatgpt"
+    && !pathEntryExists(options.stateFile);
   const requestedManagedRuntimePlan = input.requested.appExperience === "tweakers"
     ? await prepareManagedRuntimeSourcePlan(
       environmentRoot,
@@ -1870,15 +1978,17 @@ async function prepareEnvironmentPrerequisites(
     && options.bundledDerivedReceiptFile !== undefined
     ? loadBundledDerivedBackend(options.bundledDerivedReceiptFile, requestedProfile, deps)
     : undefined;
+  let candidateBuild: { state: { artifactPath: string; artifactDigest: string } | null } | void;
   if (input.requested.appExperience === "tweakers"
-    && requestedProfile.patchedPayloadBuildable) {
+    && (requestedProfile.patchedPayloadBuildable || options.sealedCandidateSourceApp !== undefined)) {
     // A patched app is coupled to the external runtime it loads. Rebuild it
     // for every new transaction so the receipt captures those exact bytes.
-    await deps.preparePatchedPayload(
+    candidateBuild = await deps.preparePatchedPayload(
       requestedProfile,
       candidateArtifactPath,
       requestedRuntimeArtifactPath,
       bundledDerivedBackend,
+      requiresBootstrapEvidence ? requestedStateArtifactPath : undefined,
     );
   } else {
     if (!existsSync(candidateSource)) throw new Error(`requested desktop artifact is missing at ${candidateSource}`);
@@ -1886,6 +1996,7 @@ async function prepareEnvironmentPrerequisites(
       requireArtifact(candidateSource, expectedCandidateFingerprint, deps.appFingerprint, "requested desktop");
     }
     deps.cloneApp(candidateSource, candidateArtifactPath);
+    candidateBuild = undefined;
   }
   deps.cloneApp(input.current.selectedDesktopPath, rollbackArtifactPath);
 
@@ -1982,6 +2093,57 @@ async function prepareEnvironmentPrerequisites(
     }
   }
 
+  let bootstrap: PreparedEnvironmentBootstrapEvidence | undefined;
+  if (requiresBootstrapEvidence) {
+    if (input.requested.appExperience !== "tweakers"
+      || candidateBuild === undefined
+      || candidateBuild.state === null
+      || requestedManagedRuntimePlan?.sealedGeneration === undefined
+      || runtime === undefined
+      || managedRuntime === undefined) {
+      throw new Error(
+        "Initial ChatGPT-to-Tweakers injection requires a receipt-owned candidate state and sealed managed-runtime generation",
+      );
+    }
+    if (candidateBuild.state.artifactPath !== requestedStateArtifactPath
+      || sha256File(candidateBuild.state.artifactPath) !== candidateBuild.state.artifactDigest) {
+      throw new Error("Initial injection candidate state artifact changed before receipt preparation");
+    }
+    const managedCliPath = managedRuntime.requested.cliPath;
+    const managedCliArtifactDigest = managedRuntime.requested.cliArtifactDigest;
+    if (managedCliPath === undefined || managedCliArtifactDigest === undefined) {
+      throw new Error("Initial injection managed runtime lacks receipt-owned CLI evidence");
+    }
+    const stateRollback = snapshotBootstrapFileArtifact(options.stateFile, rollbackStateArtifactPath);
+    const watcherBefore = deps.captureWatcherConfiguration();
+    const requestedWatcher = deps.createWatcherConfiguration(input.requested.selectedDesktopPath);
+    const watcherRollback = snapshotWatcherConfigurationArtifact(watcherBefore, rollbackWatcherArtifactPath);
+    const watcherRequested = stageWatcherConfigurationArtifact(requestedWatcher, requestedWatcherArtifactPath);
+    bootstrap = {
+      installerState: {
+        targetPath: options.stateFile,
+        requested: {
+          artifactPath: candidateBuild.state.artifactPath,
+          artifactDigest: candidateBuild.state.artifactDigest,
+        },
+        rollback: stateRollback,
+      },
+      watcher: {
+        targetPath: requestedWatcher.targetPath,
+        requested: watcherRequested,
+        rollback: watcherRollback,
+      },
+      managedRuntimeGeneration: {
+        generationId: requestedManagedRuntimePlan.sealedGeneration.generationId,
+        fingerprint: requestedManagedRuntimePlan.sealedGeneration.fingerprint,
+        provenanceKind: "sealed-manager-managed-runtime",
+        sourceRuntimeHash: requestedManagedRuntimePlan.sourceRuntimeHash,
+        cliPath: managedCliPath,
+        cliArtifactDigest: managedCliArtifactDigest,
+      },
+    };
+  }
+
   const candidateIdentity = deps.readDesktopIdentity(candidateArtifactPath);
   if (candidateIdentity.bundleId !== input.requested.selectedDesktopBundleId) {
     throw new Error(
@@ -2053,6 +2215,12 @@ async function prepareEnvironmentPrerequisites(
   const candidateBackendDigest = deps.fileFingerprint(candidateBackendArtifact);
   const expectedBackendFingerprint = input.requested.backendLane === "managed-alpha"
     ? requestedProfile.backendFingerprint
+    : input.requested.appExperience === "tweakers"
+      // The official bundled backend is part of the candidate's signed Contents
+      // tree. Re-signing changes its bytes, so bind the staged backend to the
+      // already verified locally signed candidate rather than to the pristine
+      // Developer ID fingerprint recorded before derivation.
+      ? deps.fileFingerprint(candidateBackendSource)
     : bundledDerivedBackend?.fingerprint ?? requestedProfile.officialBackendFingerprint;
   if (expectedBackendFingerprint !== null && expectedBackendFingerprint !== candidateBackendDigest) {
     throw new Error(
@@ -2136,6 +2304,7 @@ async function prepareEnvironmentPrerequisites(
     },
     ...(runtime ? { runtime } : {}),
     ...(managedRuntime ? { managedRuntime } : {}),
+    ...(bootstrap ? { bootstrap } : {}),
     rollback: {
       selection: input.current,
       desktopPath: input.current.selectedDesktopPath,
@@ -2196,6 +2365,61 @@ function loadBundledDerivedBackend(
     );
   }
   return artifact;
+}
+
+function snapshotBootstrapFileArtifact(
+  source: string,
+  destination: string,
+): PreparedBootstrapRollbackArtifactEvidence {
+  rmSync(destination, { force: true });
+  if (!pathEntryExists(source)) {
+    return { existed: false, artifactPath: destination, artifactDigest: null };
+  }
+  const sourceStat = lstatSync(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+    throw new Error(`Bootstrap rollback source must be a regular file: ${source}`);
+  }
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(source, destination);
+  const destinationStat = lstatSync(destination);
+  if (!destinationStat.isFile() || destinationStat.isSymbolicLink()) {
+    throw new Error(`Bootstrap rollback artifact did not stage as a regular file: ${destination}`);
+  }
+  return { existed: true, artifactPath: destination, artifactDigest: sha256File(destination) };
+}
+
+function snapshotWatcherConfigurationArtifact(
+  snapshot: WatcherConfigurationSnapshot,
+  destination: string,
+): PreparedBootstrapRollbackArtifactEvidence {
+  if (!snapshot.existed) {
+    return { existed: false, artifactPath: destination, artifactDigest: null };
+  }
+  if (snapshot.bytes === null || snapshot.digest === null) {
+    throw new Error("Existing watcher configuration lacks exact rollback bytes");
+  }
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, snapshot.bytes, { mode: 0o600 });
+  if (sha256File(destination) !== snapshot.digest) {
+    throw new Error("Watcher rollback configuration changed while it was staged");
+  }
+  return { existed: true, artifactPath: destination, artifactDigest: snapshot.digest };
+}
+
+function stageWatcherConfigurationArtifact(
+  snapshot: WatcherConfigurationSnapshot,
+  destination: string,
+): PreparedBootstrapArtifactEvidence | null {
+  if (snapshot.targetPath === null) return null;
+  if (snapshot.bytes === null || snapshot.digest === null) {
+    throw new Error("Requested watcher configuration lacks exact bytes");
+  }
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, snapshot.bytes, { mode: 0o600 });
+  if (sha256File(destination) !== snapshot.digest) {
+    throw new Error("Requested watcher configuration changed while it was staged");
+  }
+  return { artifactPath: destination, artifactDigest: snapshot.digest };
 }
 
 function requireRuntimeArtifact(
@@ -2670,6 +2894,7 @@ function validatePreparedEnvironment(
     const runtimeEvidence = requestedDirection
       ? prepared.runtime.requested
       : prepared.runtime.rollback;
+    assertAccountsTransferRuntimeCompatible(runtimeEvidence.artifactPath, accountsTransferBrokerRoots(environmentRoot, appSelection.selectedDesktopPath));
     const managedRuntimeEvidence = requestedDirection
       ? prepared.managedRuntime.requested
       : prepared.managedRuntime.rollback;
@@ -2704,6 +2929,104 @@ function validatePreparedEnvironment(
         deps,
       );
     }
+  }
+  if (prepared.bootstrap !== undefined) {
+    validatePreparedBootstrapEvidence(receipt, prepared, options, deps);
+  }
+}
+
+function validatePreparedBootstrapEvidence(
+  receipt: EnvironmentTransactionReceipt,
+  prepared: PreparedEnvironmentEvidence,
+  options: DefaultEnvironmentAdapterOptions,
+  deps: ResolvedDefaultEnvironmentAdapterDeps,
+): void {
+  const bootstrap = prepared.bootstrap;
+  if (bootstrap === undefined) return;
+  if (receipt.source.appExperience !== "chatgpt" || receipt.requested.appExperience !== "tweakers") {
+    throw new Error("Bootstrap evidence is valid only for a pristine ChatGPT-to-Tweakers transition");
+  }
+  if (bootstrap.installerState.targetPath !== options.stateFile) {
+    throw new Error("Bootstrap installer state target does not match the environment root");
+  }
+  const preparedRoot = join(options.receiptRoot, receipt.transactionId, "prepared");
+  assertPreparedArtifactContained(preparedRoot, bootstrap.installerState.requested.artifactPath, "bootstrap requested state", false, "file");
+  assertPreparedArtifactContained(preparedRoot, bootstrap.installerState.rollback.artifactPath, "bootstrap rollback state", !bootstrap.installerState.rollback.existed, "file");
+  if (sha256File(bootstrap.installerState.requested.artifactPath) !== bootstrap.installerState.requested.artifactDigest) {
+    throw new Error("Prepared bootstrap requested state artifact is missing or changed");
+  }
+  if (bootstrap.installerState.rollback.existed) {
+    if (bootstrap.installerState.rollback.artifactDigest === null
+      || sha256File(bootstrap.installerState.rollback.artifactPath) !== bootstrap.installerState.rollback.artifactDigest) {
+      throw new Error("Prepared bootstrap rollback state artifact is missing or changed");
+    }
+  } else if (pathEntryExists(bootstrap.installerState.rollback.artifactPath)) {
+    throw new Error("Prepared absent bootstrap rollback state unexpectedly exists");
+  }
+  const candidateState = readState(bootstrap.installerState.requested.artifactPath);
+  if (candidateState === null
+    || candidateState.mode !== "tweakers"
+    || candidateState.appRoot !== prepared.candidate.artifactPath
+    || candidateState.codexBundleId !== prepared.candidate.bundleId
+    || candidateState.codexVersion !== prepared.candidate.version
+    || candidateState.originalAsarHash !== prepared.rollback.desktopAsarHeaderHash
+    || candidateState.patchedAsarHash !== prepared.candidate.asarHeaderHash
+    || candidateState.signingMode !== "local-identity") {
+    throw new Error("Prepared bootstrap state does not bind the candidate app, ASAR, bundle, version, and signing mode");
+  }
+  if (!prepared.runtime || !prepared.managedRuntime
+    || prepared.runtime.requested.runtimeFingerprint !== prepared.managedRuntime.requested.runtimeFingerprint
+    || prepared.runtime.requested.fileCount !== prepared.managedRuntime.requested.fileCount
+    || prepared.managedRuntime.requested.cliPath !== bootstrap.managedRuntimeGeneration.cliPath
+    || prepared.managedRuntime.requested.cliArtifactDigest !== bootstrap.managedRuntimeGeneration.cliArtifactDigest
+    || prepared.managedRuntime.requested.sourceRuntimeHash !== bootstrap.managedRuntimeGeneration.sourceRuntimeHash) {
+    throw new Error("Prepared bootstrap managed runtime does not match the sealed generation and CLI evidence");
+  }
+  const managedProvenance = readManagedRuntimeProvenance(prepared.managedRuntime.requested.artifactPath);
+  if (managedProvenance?.kind !== "sealed-manager-managed-runtime"
+    || managedProvenance.generationId !== bootstrap.managedRuntimeGeneration.generationId
+    || managedProvenance.generationFingerprint !== bootstrap.managedRuntimeGeneration.fingerprint
+    || managedProvenance.sourceArtifactHash !== bootstrap.managedRuntimeGeneration.fingerprint) {
+    throw new Error("Prepared bootstrap managed runtime provenance is not bound to the sealed manager generation");
+  }
+  validatePreparedBootstrapWatcher(bootstrap, preparedRoot);
+  // The runtime artifact digest is a different whole-tree oracle than the
+  // generation fingerprint. Re-read it here so a receipt cannot pair a valid
+  // state artifact with a relabelled mutable managed runtime.
+  if (deps.directoryFingerprint(prepared.managedRuntime.requested.artifactPath)
+    !== prepared.managedRuntime.requested.artifactDigest) {
+    throw new Error("Prepared bootstrap managed runtime artifact changed");
+  }
+}
+
+function validatePreparedBootstrapWatcher(
+  bootstrap: PreparedEnvironmentBootstrapEvidence,
+  preparedRoot: string,
+): void {
+  const watcher = bootstrap.watcher;
+  assertPreparedArtifactContained(
+    preparedRoot,
+    watcher.rollback.artifactPath,
+    "bootstrap rollback watcher",
+    !watcher.rollback.existed,
+    "file",
+  );
+  if (watcher.rollback.existed) {
+    if (watcher.rollback.artifactDigest === null
+      || sha256File(watcher.rollback.artifactPath) !== watcher.rollback.artifactDigest) {
+      throw new Error("Prepared bootstrap rollback watcher configuration is missing or changed");
+    }
+  } else if (pathEntryExists(watcher.rollback.artifactPath)) {
+    throw new Error("Prepared absent bootstrap rollback watcher configuration unexpectedly exists");
+  }
+  if (watcher.targetPath === null) {
+    if (watcher.requested !== null) throw new Error("Prepared bootstrap watcher has bytes without a supported target");
+    return;
+  }
+  if (watcher.requested === null) throw new Error("Prepared bootstrap watcher target lacks requested bytes");
+  assertPreparedArtifactContained(preparedRoot, watcher.requested.artifactPath, "bootstrap requested watcher", false, "file");
+  if (sha256File(watcher.requested.artifactPath) !== watcher.requested.artifactDigest) {
+    throw new Error("Prepared bootstrap requested watcher configuration is missing or changed");
   }
 }
 
@@ -3089,14 +3412,21 @@ function applyPreparedEnvironment(
     : requestedDirection && input.prepared.rollback.selection.appExperience === "chatgpt"
       ? deps.readAsarHeaderHash(input.prepared.rollback.desktopArtifactPath)
       : null;
-  stamp("state-write");
-  deps.writeAppState(
+  const bootstrapRestoredExactState = applyPreparedBootstrapState(
+    input.direction,
+    input.prepared.bootstrap,
     options.stateFile,
-    selection,
-    desktopVersion,
-    patchedAsarEvidence,
-    originalAsarHash,
   );
+  stamp("state-write");
+  if (!bootstrapRestoredExactState) {
+    deps.writeAppState(
+      options.stateFile,
+      selection,
+      desktopVersion,
+      patchedAsarEvidence,
+      originalAsarHash,
+    );
+  }
   // The source desktop is already stopped when this adapter runs. Project the
   // target MCP ownership before reopen so regular ChatGPT never inherits
   // Tweakers MCP servers, and rollback restores the source projection before
@@ -3104,6 +3434,66 @@ function applyPreparedEnvironment(
   stamp("mcp-reconcile");
   deps.reconcileMcpMode(selection.appExperience);
   stamp("done");
+}
+
+/**
+ * The first injected switch starts with no global state. The only authority to
+ * create it is the candidate's staged state artifact. On rollback restore its
+ * exact prior bytes (or its explicit absence) rather than synthesizing a new
+ * official-mode record.
+ */
+function applyPreparedBootstrapState(
+  direction: "requested" | "rollback",
+  bootstrap: PreparedEnvironmentBootstrapEvidence | undefined,
+  stateFile: string,
+): boolean {
+  if (bootstrap === undefined) return false;
+  const state = bootstrap.installerState;
+  if (state.targetPath !== stateFile) {
+    throw new Error("Bootstrap state target drifted from the coordinator state file");
+  }
+  if (direction === "requested") {
+    if (!state.rollback.existed && pathEntryExists(stateFile)) {
+      throw new Error("Bootstrap state appeared after preparation; refusing to overwrite unbound bytes");
+    }
+    replaceBootstrapFile(state.requested.artifactPath, state.requested.artifactDigest, stateFile);
+    return false;
+  }
+  restoreBootstrapFile(state.rollback, stateFile);
+  return true;
+}
+
+function replaceBootstrapFile(source: string, digest: string, target: string): void {
+  if (!pathEntryExists(source) || sha256File(source) !== digest) {
+    throw new Error("Bootstrap source artifact is missing or changed");
+  }
+  const sourceStat = lstatSync(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+    throw new Error("Bootstrap source artifact must be a regular file");
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  const temporary = `${target}.environment-bootstrap-${process.pid}-${randomUUID()}`;
+  try {
+    copyFileSync(source, temporary);
+    if (sha256File(temporary) !== digest) throw new Error("Bootstrap temporary state digest drifted");
+    renameSync(temporary, target);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  if (sha256File(target) !== digest) throw new Error("Bootstrap state did not persist exact receipt bytes");
+}
+
+function restoreBootstrapFile(
+  rollback: PreparedBootstrapRollbackArtifactEvidence,
+  target: string,
+): void {
+  if (!rollback.existed) {
+    rmSync(target, { force: true });
+    if (pathEntryExists(target)) throw new Error("Bootstrap rollback state should be absent");
+    return;
+  }
+  if (rollback.artifactDigest === null) throw new Error("Bootstrap rollback state has no digest");
+  replaceBootstrapFile(rollback.artifactPath, rollback.artifactDigest, target);
 }
 
 function applyRuntimeArtifact(
@@ -3275,9 +3665,19 @@ function proveAppliedEnvironment(
     ? input.prepared.managedRuntime?.requested
     : input.prepared.managedRuntime?.rollback;
   const state = deps.readAppState(options.stateFile);
+  const bootstrapRollbackWithoutState = !requestedDirection
+    && input.prepared.bootstrap !== undefined
+    && !input.prepared.bootstrap.installerState.rollback.existed;
   const stateAsarHash = expected.appExperience === "tweakers"
     ? state?.patchedAsarHash
     : state?.originalAsarHash;
+  const stateMatches = bootstrapRollbackWithoutState
+    ? state === null && !pathEntryExists(options.stateFile)
+    : state !== null
+      && state.appExperience === expected.appExperience
+      && state.appRoot === expected.selectedDesktopPath
+      && state.bundleId === expected.selectedDesktopBundleId
+      && stateAsarHash === asarHeaderHash;
   const configuredLane = deps.readBackendLane(options.configFile);
   const runtimeProof = expected.appExperience === "tweakers"
     ? deps.readRuntimeProof(options.runtimeProofFile ?? join(dirname(options.configFile), "environment-runtime-proof.json"))
@@ -3289,10 +3689,7 @@ function proveAppliedEnvironment(
     || identity.version !== desktopVersion
     || identity.build !== desktopBuild
     || observedAppExperience(expected.selectedDesktopPath, deps) !== expected.appExperience
-    || state?.appExperience !== expected.appExperience
-    || state.appRoot !== expected.selectedDesktopPath
-    || state.bundleId !== expected.selectedDesktopBundleId
-    || stateAsarHash !== asarHeaderHash
+    || !stateMatches
     || deps.readAsarHeaderHash(expected.selectedDesktopPath) !== asarHeaderHash
     || !backendLanesProve(configuredLane, expected.backendLane)
     || !existsSync(backendPath)
@@ -3383,24 +3780,107 @@ function bindWatcherTarget(
   const originalAsarHash = input.applied.selection.appExperience === "chatgpt"
     ? expectedAsarHeaderHash
     : null;
-  deps.writeAppState(
-    options.stateFile,
-    input.applied.selection,
-    input.applied.desktopVersion,
-    patchedAsarEvidence,
-    originalAsarHash,
-  );
+  const bootstrapRollback = input.direction === "rollback" && input.prepared.bootstrap !== undefined;
+  if (!bootstrapRollback) {
+    deps.writeAppState(
+      options.stateFile,
+      input.applied.selection,
+      input.applied.desktopVersion,
+      patchedAsarEvidence,
+      originalAsarHash,
+    );
+  }
   const state = deps.readAppState(options.stateFile);
   const stateAsarHash = input.applied.selection.appExperience === "tweakers"
     ? state?.patchedAsarHash
     : state?.originalAsarHash;
-  if (state === null
-    || state.appExperience !== input.applied.selection.appExperience
-    || state.appRoot !== input.applied.selection.selectedDesktopPath
-    || state.bundleId !== input.applied.selection.selectedDesktopBundleId
-    || stateAsarHash !== expectedAsarHeaderHash
+  const stateMatches = bootstrapRollback
+    ? bootstrapRollbackStateMatches(input.prepared.bootstrap, options.stateFile)
+    : state !== null
+      && state.appExperience === input.applied.selection.appExperience
+      && state.appRoot === input.applied.selection.selectedDesktopPath
+      && state.bundleId === input.applied.selection.selectedDesktopBundleId
+      && stateAsarHash === expectedAsarHeaderHash;
+  if (!stateMatches
     || deps.readAsarHeaderHash(input.applied.selection.selectedDesktopPath) !== expectedAsarHeaderHash) {
     throw new Error("Watcher target expectation did not persist exact proven app state");
+  }
+  applyPreparedBootstrapWatcher(
+    input.direction,
+    input.applied.selection.selectedDesktopPath,
+    input.prepared.bootstrap,
+  );
+}
+
+function bootstrapRollbackStateMatches(
+  bootstrap: PreparedEnvironmentBootstrapEvidence | undefined,
+  stateFile: string,
+): boolean {
+  if (bootstrap === undefined) return false;
+  const rollback = bootstrap.installerState.rollback;
+  if (!rollback.existed) return !pathEntryExists(stateFile);
+  return rollback.artifactDigest !== null
+    && pathEntryExists(stateFile)
+    && sha256File(stateFile) === rollback.artifactDigest;
+}
+
+function applyPreparedBootstrapWatcher(
+  direction: "requested" | "rollback",
+  appRoot: string,
+  bootstrap: PreparedEnvironmentBootstrapEvidence | undefined,
+): void {
+  if (bootstrap === undefined) return;
+  const watcher = bootstrap.watcher;
+  if (watcher.targetPath === null) {
+    if (watcher.requested !== null) {
+      throw new Error("Bootstrap watcher has staged bytes without a supported watcher target");
+    }
+    return;
+  }
+  if (direction === "rollback") {
+    const rollback = watcher.rollback;
+    if (!rollback.existed) {
+      restoreWatcherConfiguration({
+        targetPath: watcher.targetPath,
+        existed: false,
+        bytes: null,
+        digest: null,
+      });
+      return;
+    }
+    if (rollback.artifactDigest === null || !pathEntryExists(rollback.artifactPath)) {
+      throw new Error("Bootstrap watcher rollback artifact is missing");
+    }
+    const bytes = readFileSync(rollback.artifactPath);
+    if (sha256File(rollback.artifactPath) !== rollback.artifactDigest) {
+      throw new Error("Bootstrap watcher rollback artifact changed");
+    }
+    restoreWatcherConfiguration({
+      targetPath: watcher.targetPath,
+      existed: true,
+      bytes,
+      digest: rollback.artifactDigest,
+    });
+    return;
+  }
+  const requested = watcher.requested;
+  if (requested === null || !pathEntryExists(requested.artifactPath)
+    || sha256File(requested.artifactPath) !== requested.artifactDigest) {
+    throw new Error("Bootstrap watcher requested artifact is missing or changed");
+  }
+  const bytes = readFileSync(requested.artifactPath);
+  writeWatcherConfiguration({
+    targetPath: watcher.targetPath,
+    existed: true,
+    bytes,
+    digest: requested.artifactDigest,
+  });
+  if (!pathEntryExists(watcher.targetPath) || sha256File(watcher.targetPath) !== requested.artifactDigest) {
+    throw new Error("Bootstrap watcher definition did not persist exact receipt bytes");
+  }
+  installWatcher(appRoot);
+  if (!pathEntryExists(watcher.targetPath) || sha256File(watcher.targetPath) !== requested.artifactDigest) {
+    throw new Error("Bootstrap watcher installation changed its receipt-owned definition");
   }
 }
 
@@ -3594,7 +4074,7 @@ function defaultVerifyPatchedCandidate(appRoot: string): PreparedCandidateSignat
   if (!strict.ok) throw new Error(`Prepared patched candidate failed strict signature verification: ${strict.output}`);
   verifyStagedNativeHostForApp(appRoot);
   const identity = signatureInfo(appRoot);
-  const requirementResult = spawnSync("codesign", ["-dr", "-", appRoot], {
+  const requirementResult = spawnSync("/usr/bin/codesign", ["-dr", "-", appRoot], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -3606,7 +4086,7 @@ function defaultVerifyPatchedCandidate(appRoot: string): PreparedCandidateSignat
   if (requirementResult.status !== 0 || requirement.length === 0) {
     throw new Error("Prepared patched candidate has no valid designated requirement");
   }
-  const gatekeeperResult = spawnSync("spctl", ["--assess", "--type", "execute", "--verbose=4", appRoot], {
+  const gatekeeperResult = spawnSync("/usr/sbin/spctl", ["--assess", "--type", "execute", "--verbose=4", appRoot], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -3946,6 +4426,12 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       mcpConfigFile: this.mcpConfigFile,
       mcpStateFile: this.mcpStateFile,
       tweaksRoot: this.tweaksRoot,
+      ...(options.sealedCandidateSourceApp === undefined
+        ? {}
+        : { sealedCandidateSourceApp: options.sealedCandidateSourceApp }),
+      ...(options.sealedManagedRuntime === undefined
+        ? {}
+        : { sealedManagedRuntime: options.sealedManagedRuntime }),
       ...(options.bundledDerivedReceiptFile
         ? { bundledDerivedReceiptFile: options.bundledDerivedReceiptFile }
         : {}),
@@ -4085,6 +4571,8 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
       stagePreparedEnvironment: deps.stagePreparedEnvironment
         ?? (deps.preparePrerequisites ? (() => {}) : defaultAdapters.stagePreparedEnvironment),
       applyPreparedEnvironment: deps.applyPreparedEnvironment ?? defaultAdapters.applyPreparedEnvironment,
+      beforeApplyPreparedEnvironment: deps.beforeApplyPreparedEnvironment ?? (() => undefined),
+      deferCommitFailureRecovery: deps.deferCommitFailureRecovery ?? (() => false),
       // Injected preparation seams own their own evidence shape, so migration
       // stays inert for them exactly like validation does.
       migrateSwapHost: deps.migrateSwapHost
@@ -4409,6 +4897,23 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
     let sourceObservedAfterStopFailure = false;
     let watcherPaused = false;
     const reopenFailures: string[] = [];
+    let failureRecoveryEvaluated = false;
+    const deferFailureRecovery = async (reason: string): Promise<boolean> => {
+      // Persist the failure before handing recovery ownership to an outer
+      // transaction. A failed journal write or predicate must never reopen a
+      // writer, and the predicate must not be evaluated twice through catch.
+      failureRecoveryEvaluated = true;
+      receipt = this.update(receipt, { phase: "failed", error: reason }, true);
+      try {
+        return await this.deps.deferCommitFailureRecovery({ receipt, prepared });
+      } catch (error) {
+        receipt = this.update(receipt, {
+          phase: "failed",
+          error: `${reason}; coordinated recovery check failed: ${errorMessage(error)}`,
+        }, true);
+        return true;
+      }
+    };
     try {
       receipt = this.withTiming(receipt, "approval-helper-launch", "complete");
       receipt = this.withTiming(receipt, "watcher-pause", "start");
@@ -4458,6 +4963,7 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
           receipt = await this.stopAndCleanTimed(receipt, receipt.source.selectedDesktopPath, replacement.pid);
         }
       }
+      await this.deps.beforeApplyPreparedEnvironment({ receipt, prepared });
       receipt = this.update(receipt, { phase: "applying", applyProgress: null });
       receipt = this.withTiming(receipt, "exchange-apply", "start");
       await this.deps.applyPreparedEnvironment({
@@ -4530,15 +5036,17 @@ export class InstallerEnvironmentCoordinator implements EnvironmentCoordinator {
         lastVerification?.error ?? "requested environment did not become ready",
         reopenFailureSummary(reopenFailures),
       ].filter((value): value is string => value !== null).join("; ");
-      receipt = this.update(receipt, { error: reason });
+      if (await deferFailureRecovery(reason)) return receipt;
       return this.rollbackInternal(receipt, `Commit failed after one retry: ${reason}`);
     } catch (error) {
+      if (failureRecoveryEvaluated) throw error;
       const reason = [
         errorMessage(error),
         reopenFailureSummary(reopenFailures),
       ].filter((value): value is string => value !== null).join("; ");
-      receipt = this.update(receipt, { error: reason });
-      if (receipt.attempt === 0 && receipt.phase === "committing") {
+      const failedBeforeApply = receipt.attempt === 0 && receipt.phase === "committing";
+      if (await deferFailureRecovery(reason)) return receipt;
+      if (failedBeforeApply) {
         // applyPreparedEnvironment has not started, so the live bundle is
         // still the source artifact. A PID can legitimately change while the
         // candidate is being prepared (for example, an app self-restart).
@@ -5337,6 +5845,10 @@ function nonEmpty(value: unknown): value is string {
 
 function sha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+
+function lowerSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function validDigest(value: unknown): value is string {

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   cancelRefreshLocal,
+  assertStableRefreshAccountsTransferCompatible,
   getLocalRefreshStatus,
   handoffRefreshLocalToLaunchd,
   hashRefreshSourceTree,
@@ -152,6 +153,22 @@ test("stable refresh stages a release separately and holds a promotable candidat
   assert.match(source, /refresh-stable-stage/);
   assert.match(source, /candidateOnlyReason: "coordinated-refresh"/);
   assert.match(source, /managedCliPath\(stableStageRoot\).*"repair"/s);
+});
+
+test("stable refresh refuses an older staged CLI runtime before handoff", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-stable-transfer-gate-"));
+  try {
+    const stagedRoot = join(root, "stable-stage");
+    const userRoot = join(root, "user");
+    const broker = join(userRoot, "tweak-data", "co.tweakers.account-switcher");
+    mkdirSync(broker, { recursive: true });
+    mkdirSync(join(managedSourceRoot(stagedRoot), "packages", "installer", "assets", "runtime"), { recursive: true });
+    writeFileSync(join(broker, "native-transfer.minimum-runtime.json"), JSON.stringify({ version: 1, minimumTransferVersion: 2 }));
+    assert.throws(
+      () => assertStableRefreshAccountsTransferCompatible(stagedRoot, userRoot, join(root, "ChatGPT.app")),
+      /requires runtime reader v2/,
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("macOS refresh-local hands promotion to launchd before quitting the app", () => {
@@ -339,7 +356,7 @@ test("both promote branches restore coordinator metadata after the runtime insta
   const source = readFileSync(new URL("../src/commands/refresh-local.ts", import.meta.url), "utf8");
   assert.match(source, new RegExp([
     /promote: async \(\) => \{/.source,
-    /[\s\S]*?installManagedRuntime\(preparedStableSource, paths\.root\);/.source,
+    /[\s\S]*?installManagedRuntime\(preparedStableSource, paths\.root, \{ appRoot \}\);/.source,
     /[\s\S]*?writeDevelopmentProvenanceHash\(managed, hashTree\(sourceRoot, false\)\);/.source,
     /[\s\S]*?\}\s*await restoreModeCoordinatorMetadata\(\);\s*\},/.source,
   ].join("")));

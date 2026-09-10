@@ -433,7 +433,9 @@ test("task-scoped cancellation saves an opaque draft, rotates token on resume, a
 test("resume mount timeouts leave the original token usable across repeated retries", async (t) => {
   const harness = await startBrokerHarness(t);
   const { child, messages } = await startServer(t, {
-    env: { ...harness.env, USER_QUESTIONS_DISPLAY_TIMEOUT_MS: "60" },
+    // Leave enough time to create the initial cancelled draft under the full
+    // suite's process load. Each unmounted resume must still expire below.
+    env: { ...harness.env, USER_QUESTIONS_DISPLAY_TIMEOUT_MS: "1000" },
   });
   const token = await createCancelledRound(harness, child, messages, 2, { answer: "built_in" });
   const store = createDraftStore({ dataDir: harness.dataDir, tweakId: TWEAK_ID });

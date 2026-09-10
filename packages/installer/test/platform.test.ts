@@ -7,6 +7,7 @@ import {
   inferCodexChannel,
   locateCodex,
   locateCodexAtExactPath,
+  resolveMacElectronFrameworkBinary,
   resolveLinuxInstall,
 } from "../src/platform";
 
@@ -14,7 +15,7 @@ test("inferCodexChannel detects stable and beta metadata", () => {
   assert.equal(inferCodexChannel("com.openai.codex", "Codex"), "stable");
   assert.equal(inferCodexChannel("com.openai.codex.beta", "Codex (Beta)"), "beta");
   assert.equal(inferCodexChannel(null, "Codex (Beta)"), "beta");
-  assert.equal(inferCodexChannel("com.therealityreport.tweakers.chatgpt", "Tweakers ChatGPT"), "stable");
+  assert.equal(inferCodexChannel("com.therealityreport.tweakers", "Tweakers"), "stable");
 });
 
 test("locateCodex reads beta bundle metadata from override path on macOS", { skip: process.platform !== "darwin" }, () => {
@@ -53,6 +54,41 @@ test("exact-path lookup never falls back to another installed desktop", { skip: 
     () => locateCodexAtExactPath("/path/that/does/not/exist/ChatGPT.app"),
     /Exact Codex app path is not a valid com\.openai\.codex bundle/,
   );
+});
+
+test("macOS framework resolver recognizes current Codex Framework and legacy Electron layouts", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-platform-framework-"));
+  try {
+    const modern = join(root, "Modern.app");
+    const modernBinary = join(
+      modern,
+      "Contents",
+      "Frameworks",
+      "Codex Framework.framework",
+      "Versions",
+      "Current",
+      "Codex Framework",
+    );
+    mkdirSync(join(modernBinary, ".."), { recursive: true });
+    writeFileSync(modernBinary, "modern", { mode: 0o755 });
+    assert.equal(resolveMacElectronFrameworkBinary(modern), modernBinary);
+
+    const legacy = join(root, "Legacy.app");
+    const legacyBinary = join(
+      legacy,
+      "Contents",
+      "Frameworks",
+      "Electron Framework.framework",
+      "Versions",
+      "A",
+      "Electron Framework",
+    );
+    mkdirSync(join(legacyBinary, ".."), { recursive: true });
+    writeFileSync(legacyBinary, "legacy", { mode: 0o755 });
+    assert.equal(resolveMacElectronFrameworkBinary(legacy), legacyBinary);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("resolveLinuxInstall supports am-will codex-app install directory", () => {

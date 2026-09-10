@@ -1,9 +1,9 @@
 {
   "id": "co.tweakers.account-switcher",
-  "name": "Easy Account Switcher",
-  "version": "0.2.1",
+  "name": "Accounts",
+  "version": "0.10.2",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Switch existing local Codex sessions, protect remote-plugin receipts, and stage an optional two-account balanced router without duplicating credentials.",
+  "description": "Manage saved Codex accounts, pooled usage, quota-aware routing, safe failover, and paired devices.",
   "author": "hulibrands",
   "tags": [
     "accounts",

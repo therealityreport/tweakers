@@ -1,6 +1,7 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import type { Writable } from "node:stream";
 import {
   defaultAccountRouterConfigPath,
   readRouterLaunchSelection,
@@ -8,6 +9,8 @@ import {
 import { preflightRouterHomes } from "./account-router/app-server-mux";
 
 const INSTALL_MARKER = Symbol.for("co.tweakers.codex-app-server-parent");
+export const ACCOUNTS_BROKER_IDENTITY_FD_ENV = "TWEAKERS_ACCOUNTS_BROKER_IDENTITY_FD";
+export const ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS = 20_000;
 
 /**
  * The native browser peer authorizer validates three generations of process
@@ -101,6 +104,10 @@ export interface CodexAppServerParentInstallOptions {
   platform?: NodeJS.Platform;
   pathExists?: (path: string) => boolean;
   accountRouter?: AccountRouterParentOptions;
+  /** Derived desktop shell: retain only its per-window app-tools MCP. */
+  secondaryVariant?: boolean;
+  /** Shared task index requested by the derived shell; never renderer-owned. */
+  secondaryVariantSharedSqliteHome?: string;
 }
 
 /**
@@ -110,10 +117,82 @@ export interface CodexAppServerParentInstallOptions {
  */
 export interface AccountRouterParentOptions {
   userRoot?: string;
+  /**
+   * Manager-global v3 broker rendezvous root. Derived variants must provide
+   * this exact root; they may not derive a variant-local state/config root.
+   */
+  brokerRoot?: string | null;
+  /**
+   * Set only by runtime main when either global-root alias was explicitly
+   * configured. A true value with no resolved root is a terminal blocked
+   * launch, not an absent-global legacy fallback.
+   */
+  brokerRootConfigured?: boolean;
   configPath?: string | null;
   runtimeEntrypointPath?: string;
+  brokerEntrypointPath?: string;
   pathExists?: (path: string) => boolean;
   readFile?: (path: string, encoding: BufferEncoding) => string;
+  /**
+   * Main-process session identity for the app-server bridge. It is resolved at
+   * spawn time so the bridge and Accounts IPC use the same opaque endpoint.
+   */
+  resolveBrokerDesktopIdentity?: () => { rendererRef: string; appToolsRef: string } | null;
+}
+
+/**
+ * The Accounts UI gets only this non-secret, main-owned authority result. It
+ * must never infer local-writer permission from whether a broker socket happens
+ * to be reachable.
+ */
+export type AccountsAuthorityMode = "global-v3" | "legacy" | "blocked";
+
+export interface AccountsAuthorityResolutionOptions {
+  userRoot?: string;
+  /** A resolved manager-global root; it is never sent to a renderer. */
+  brokerRoot?: string | null;
+  /** Distinguishes an absent broker-root setting from an invalid configured one. */
+  brokerRootConfigured?: boolean;
+  configPath?: string | null;
+  pathExists?: (path: string) => boolean;
+  readFile?: (path: string, encoding: BufferEncoding) => string;
+}
+
+/**
+ * Select the sole Accounts authority before any tweak lifecycle begins.
+ *
+ * A present manager-global config is a publication boundary: a valid v3 file
+ * remains globally authoritative even when its broker is unavailable, while
+ * every other present global state blocks local writers.  Only an absent global
+ * config plus a valid, launch-preflight-safe local v1/v2 selection can retain
+ * the legacy writer.
+ */
+export function resolveAccountsAuthorityMode(
+  options: AccountsAuthorityResolutionOptions = {},
+): AccountsAuthorityMode {
+  try {
+    const userRoot = options.userRoot ?? process.env.TWEAKERS_USER_ROOT ?? process.env.TWEAKER_USER_ROOT;
+    const localConfigPath = options.configPath ?? defaultAccountRouterConfigPath(userRoot);
+    const pathExists = options.pathExists ?? existsSync;
+    const brokerRoot = options.brokerRoot;
+    if (options.brokerRootConfigured === true && !brokerRoot) return "blocked";
+
+    if (brokerRoot) {
+      const globalConfigPath = join(brokerRoot, "account-router-config.json");
+      if (pathExists(globalConfigPath)) {
+        const globalSelection = readRouterLaunchSelection(globalConfigPath, options.readFile, pathExists);
+        return globalSelection.config?.schemaVersion === 3 ? "global-v3" : "blocked";
+      }
+    }
+
+    if (!localConfigPath) return "blocked";
+    const localSelection = readRouterLaunchSelection(localConfigPath, options.readFile, pathExists);
+    if (localSelection.config?.schemaVersion === 1) return "legacy";
+    if (localSelection.config?.schemaVersion !== 2 || localSelection.mode !== "mux") return "blocked";
+    return preflightRouterHomes(localSelection.config, dirname(localConfigPath)) ? "legacy" : "blocked";
+  } catch {
+    return "blocked";
+  }
 }
 
 export interface CodexAppServerParentInstallResult {
@@ -162,8 +241,77 @@ export function buildAccountRouterMuxArgs(
   configPath: string,
   command: string,
   args: readonly string[],
+  sharedSqliteHome?: string,
 ): string[] {
-  return [entrypoint, "--config", configPath, "--state-root", dirname(configPath), "--", command, ...args];
+  return [
+    entrypoint,
+    "--config", configPath,
+    "--state-root", dirname(configPath),
+    ...(sharedSqliteHome ? ["--shared-sqlite-home", sharedSqliteHome] : []),
+    "--", command, ...args,
+  ];
+}
+
+/** V3 uses a shared broker client and deliberately never accepts shared SQLite. */
+export function buildAccountsBrokerAppServerArgs(
+  entrypoint: string,
+  configPath: string,
+  command: string,
+  args: readonly string[],
+): string[] {
+  return [
+    entrypoint,
+    "--config", configPath,
+    "--state-root", dirname(configPath),
+    "--", command, ...args,
+  ];
+}
+
+/** A V3 preflight failure is terminal, never permission to launch direct. */
+export const ACCOUNTS_BROKER_BLOCKED_SOURCE = String.raw`
+"use strict";
+process.stderr.write("Tweakers Accounts broker: unavailable\n");
+process.exitCode = 1;
+process.stdin.resume();
+process.stdin.once("data", () => process.exit(1));
+setTimeout(() => process.exit(1), 1000).unref();
+`;
+
+export function buildAccountsBrokerBlockedArgs(): string[] {
+  return ["-e", ACCOUNTS_BROKER_BLOCKED_SOURCE];
+}
+
+/**
+ * A derived desktop has its own Codex configuration home, but OpenAI's main
+ * process still supplies every enabled desktop plugin as a CLI override. Keep
+ * the one per-window `codex_app` pipe and remove all other MCP/plugin
+ * projections so a side-by-side launch cannot duplicate the primary app's
+ * complete child-process fleet.
+ */
+export function secondaryVariantAppServerArgs(args: readonly string[]): string[] {
+  const output: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const current = args[index];
+    const value = args[index + 1];
+    if (current === "-c" && typeof value === "string" && isSecondaryConnectionOverride(value)) {
+      index += 1;
+      continue;
+    }
+    output.push(current);
+  }
+  return output;
+}
+
+export const SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV =
+  "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED";
+
+function isSecondaryConnectionOverride(value: string): boolean {
+  const separator = value.indexOf("=");
+  if (separator <= 0) return false;
+  const key = value.slice(0, separator).trim();
+  if (key.startsWith("plugins.")) return true;
+  if (!key.startsWith("mcp_servers.")) return false;
+  return key !== "mcp_servers.codex_app" && !key.startsWith("mcp_servers.codex_app.");
 }
 
 export function installCodexAppServerParent(
@@ -214,22 +362,53 @@ export function installCodexAppServerParent(
       if (installed.cleanupStarted) {
         throw new Error("Tweakers Codex parent: app-server cleanup has started");
       }
+      const appServerArgs = options.secondaryVariant
+        ? secondaryVariantAppServerArgs(argsOrOptions)
+        : [...argsOrOptions];
       const router = accountRouterLaunch({
         router: options.accountRouter,
         bundledNodePath,
         defaultPathExists: pathExists,
       });
-      const childArgs = router
-        ? buildAccountRouterMuxArgs(router.entrypoint, router.configPath, command, argsOrOptions)
-        : buildCodexAppServerParentArgs(command, argsOrOptions);
+      const childArgs = router?.kind === "mux"
+        ? buildAccountRouterMuxArgs(
+          router.entrypoint,
+          router.configPath,
+          command,
+          appServerArgs,
+          options.secondaryVariant ? options.secondaryVariantSharedSqliteHome : undefined,
+        )
+        : router?.kind === "broker"
+          ? buildAccountsBrokerAppServerArgs(router.entrypoint, router.configPath, command, appServerArgs)
+          : router?.kind === "blocked"
+            ? buildAccountsBrokerBlockedArgs()
+            : buildCodexAppServerParentArgs(command, appServerArgs);
+      const spawnOptions = sanitizeParentSpawnOptions(
+        maybeOptions,
+        options.secondaryVariant === true,
+        router?.kind === "broker" || router?.kind === "blocked",
+        router?.kind === "broker" ? router.identity : null,
+      );
+      const bootstrapIdentity = router?.kind === "broker" && !router.identity;
+      if (bootstrapIdentity) {
+        // Native can start its app-server before creating the first window.
+        // Keep native stdin untouched while main binds the real renderer.
+        const stdio = spawnOptions.stdio;
+        spawnOptions.stdio = Array.isArray(stdio)
+          ? [stdio[0] ?? "pipe", stdio[1] ?? "pipe", stdio[2] ?? "pipe", "pipe"]
+          : stdio === "inherit" ? [0, 1, 2, "pipe"]
+            : [stdio ?? "pipe", stdio ?? "pipe", stdio ?? "pipe", "pipe"];
+        spawnOptions.env![ACCOUNTS_BROKER_IDENTITY_FD_ENV] = "3";
+      }
       const child = Reflect.apply(originalSpawn, this, [
         bundledNodePath,
         childArgs,
-        sanitizeParentSpawnOptions(maybeOptions),
+        spawnOptions,
       ]) as ChildProcess;
       installed.children.add(child);
       child.once?.("exit", () => installed.children.delete(child));
       child.once?.("error", () => installed.children.delete(child));
+      if (bootstrapIdentity) bootstrapBrokerDesktopIdentity(child, options.accountRouter?.resolveBrokerDesktopIdentity);
       return child;
     }
     return Reflect.apply(originalSpawn, this, [command, argsOrOptions, maybeOptions]) as ChildProcess;
@@ -241,25 +420,123 @@ export function installCodexAppServerParent(
   return result(true, bundledNodePath, "installed", childProcess, installed);
 }
 
+type AccountRouterLaunch =
+  | { kind: "mux"; entrypoint: string; configPath: string }
+  | { kind: "broker"; entrypoint: string; configPath: string; identity: { rendererRef: string; appToolsRef: string } | null }
+  | { kind: "blocked" };
+
 function accountRouterLaunch(options: {
   router: AccountRouterParentOptions | undefined;
   bundledNodePath: string;
   defaultPathExists: (path: string) => boolean;
-}): { entrypoint: string; configPath: string } | null {
+}): AccountRouterLaunch | null {
+  const brokerRoot = options.router?.brokerRoot;
+  // This must happen before any local router config is read. An explicit but
+  // invalid/conflicting manager-global root has no safe local-writer fallback.
+  if (options.router?.brokerRootConfigured === true && !brokerRoot) return { kind: "blocked" };
   const userRoot = options.router?.userRoot ?? process.env.TWEAKERS_USER_ROOT ?? process.env.TWEAKER_USER_ROOT;
-  const configPath = options.router?.configPath ?? defaultAccountRouterConfigPath(userRoot);
+  const localConfigPath = options.router?.configPath ?? defaultAccountRouterConfigPath(userRoot);
   const pathExists = options.router?.pathExists ?? options.defaultPathExists;
-  const selection = readRouterLaunchSelection(configPath, options.router?.readFile, pathExists);
+  let configPath = localConfigPath;
+  let selection = readRouterLaunchSelection(configPath, options.router?.readFile, pathExists);
+  if (brokerRoot) {
+    const brokerConfigPath = join(brokerRoot, "account-router-config.json");
+    // The manager-global file is the publication boundary. Once it exists,
+    // every non-v3 result is unsafe to reinterpret as a local legacy config:
+    // that would reopen a mux/direct writer after v3 publication failed.
+    if (pathExists(brokerConfigPath)) {
+      configPath = brokerConfigPath;
+      selection = readRouterLaunchSelection(brokerConfigPath, options.router?.readFile, pathExists);
+      if (selection.config?.schemaVersion !== 3) return { kind: "blocked" };
+    }
+  }
+  // A local/derived v3 file without the manager-global rendezvous root must
+  // not silently split a durable ledger. Do not fall through to direct.
+  const selectedBrokerConfigPath = brokerRoot ? join(brokerRoot, "account-router-config.json") : null;
+  if (selection.config?.schemaVersion === 3 && (!brokerRoot || configPath !== selectedBrokerConfigPath)) {
+    return { kind: "blocked" };
+  }
   if (selection.mode !== "mux" || !configPath) return null;
+  if (selection.config?.schemaVersion === 3) {
+    const entrypoint = options.router?.brokerEntrypointPath ?? join(__dirname, "account-router", "broker-app-server.js");
+    if (!pathExists(entrypoint) || !preflightRouterHomes(selection.config, dirname(configPath))) return { kind: "blocked" };
+    const identity = options.router?.resolveBrokerDesktopIdentity?.() ?? null;
+    return { kind: "broker", entrypoint, configPath, identity: validBrokerDesktopIdentity(identity) ? identity : null };
+  }
   const entrypoint = options.router?.runtimeEntrypointPath ?? join(__dirname, "account-router", "app-server-mux.js");
   if (!pathExists(entrypoint) || !preflightRouterHomes(selection.config!, dirname(configPath))) return null;
-  return { entrypoint, configPath };
+  return { kind: "mux", entrypoint, configPath };
 }
 
-function sanitizeParentSpawnOptions(options?: SpawnOptions): SpawnOptions {
+function sanitizeParentSpawnOptions(
+  options?: SpawnOptions,
+  secondaryVariant = false,
+  brokerMode = false,
+  brokerIdentity: { rendererRef: string; appToolsRef: string } | null = null,
+): SpawnOptions {
   const env = { ...(options?.env ?? process.env) };
   delete env.NODE_OPTIONS;
+  if (secondaryVariant || brokerMode) env[SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV] = "1";
+  if (brokerMode) {
+    delete env.TWEAKERS_ACCOUNTS_BROKER_RENDERER_REF;
+    delete env.TWEAKERS_ACCOUNTS_BROKER_APP_TOOLS_REF;
+    delete env[ACCOUNTS_BROKER_IDENTITY_FD_ENV];
+  }
+  if (brokerIdentity) {
+    env.TWEAKERS_ACCOUNTS_BROKER_RENDERER_REF = brokerIdentity.rendererRef;
+    env.TWEAKERS_ACCOUNTS_BROKER_APP_TOOLS_REF = brokerIdentity.appToolsRef;
+  }
   return { ...(options ?? {}), env };
+}
+
+function bootstrapBrokerDesktopIdentity(
+  child: ChildProcess,
+  resolveIdentity: AccountRouterParentOptions["resolveBrokerDesktopIdentity"],
+): void {
+  const pipe = child.stdio?.[3] as Writable | null | undefined;
+  if (!pipe || typeof pipe.end !== "function") return;
+  let poll: ReturnType<typeof setInterval> | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  const cleanup = (): void => {
+    if (poll) clearInterval(poll);
+    if (timeout) clearTimeout(timeout);
+    child.removeListener("exit", cancel);
+    child.removeListener("error", cancel);
+  };
+  const cancel = (): void => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    pipe.destroy();
+  };
+  const attempt = (): void => {
+    if (settled) return;
+    try {
+      const identity = resolveIdentity?.();
+      if (!validBrokerDesktopIdentity(identity)) return;
+      settled = true;
+      cleanup();
+      pipe.end(`${JSON.stringify({ rendererRef: identity.rendererRef, appToolsRef: identity.appToolsRef })}\n`);
+    } catch { cancel(); }
+  };
+  // Retain the error listener through end/destroy: a child exiting during the
+  // final write must never raise an unhandled EPIPE in Electron main.
+  pipe.on("error", cancel);
+  pipe.once("close", cancel);
+  child.once("exit", cancel);
+  child.once("error", cancel);
+  poll = setInterval(attempt, 25);
+  timeout = setTimeout(cancel, ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS);
+  poll.unref();
+  timeout.unref();
+  attempt();
+}
+
+function validBrokerDesktopIdentity(value: unknown): value is { rendererRef: string; appToolsRef: string } {
+  return !!value && typeof value === "object"
+    && /^br_[A-Za-z0-9_-]{16,128}$/.test((value as { rendererRef?: unknown }).rendererRef as string)
+    && /^bat_[A-Za-z0-9_-]{16,128}$/.test((value as { appToolsRef?: unknown }).appToolsRef as string);
 }
 
 function result(

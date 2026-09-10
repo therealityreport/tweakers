@@ -315,7 +315,43 @@ export interface TweakApi {
   fs: TweakFs;
   /** Main-only: native Codex integration points exposed by Tweakers. */
   codex?: CodexApi;
+  /** Renderer-only: data bridge for guarded native Accounts slots. */
+  accountsNative?: AccountsNativeApi;
 }
+
+export type AccountsNativeRequestSurface = "profile" | "apps" | "plugins" | "mcp" | "usage";
+export type AccountsNativeSlotSurface = AccountsNativeRequestSurface | "account-menu" | "thread-summary";
+
+export interface AccountsNativeStatus {
+  compatible: boolean;
+  enabled: boolean;
+  generation: number;
+  reason?: string;
+}
+
+export interface AccountsNativeSelection {
+  accountId: string | null;
+  generation: number;
+}
+
+export interface AccountsNativeAdapter {
+  project?(surface: AccountsNativeRequestSurface, kind: string, input: unknown): unknown;
+  request(
+    surface: AccountsNativeRequestSurface,
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    selection: AccountsNativeSelection,
+  ): Promise<unknown>;
+}
+
+export interface AccountsNativeApi {
+  status(): AccountsNativeStatus;
+  register(adapter: AccountsNativeAdapter): () => void;
+  /** Update one native slot without changing routing ownership elsewhere. */
+  select(surface: AccountsNativeSlotSurface, accountId: string | null): void;
+}
+
+export * from "./accounts-native-compatibility.js";
 
 export interface TweakStorage {
   get<T = unknown>(key: string, fallback?: T): T;
@@ -416,6 +452,12 @@ export type HostSurfaceKind =
   | "command-menu"
   | "account-menu"
   | "settings-rows"
+  /** Native Settings > Apps page, proven by its active native route and heading. */
+  | "apps-settings"
+  /** Native Settings > Plugins page, proven by its active native route and heading. */
+  | "plugins-settings"
+  /** Native Settings > MCP Servers page, proven by its active native route and heading. */
+  | "mcp-settings"
   | "titlebar-controls";
 
 export interface HostSurfaceMatch {
@@ -442,11 +484,36 @@ export interface HostUiApi {
   query(kind: HostSurfaceKind): HostSurfaceMatch[];
   snapshot(kind: HostSurfaceKind): HostSurfaceSnapshot;
   observe(kinds: HostSurfaceKind[], listener: (snapshots: HostSurfaceSnapshot[]) => void): () => void;
+  /**
+   * Resolves one exact current conversation through the privileged preload
+   * mapper. The returned target contains Elements and public broker handles
+   * only; native host identities never enter tweak state or TweakApi.ipc.
+   */
+  getSharedHistoryTarget(): Promise<HostSharedHistoryTargetResult>;
   getActiveProject(): HostProjectContext | null;
   attachFiles(files: HostAttachmentFile[]): Promise<HostAttachmentResult>;
   /** Attach fail-closed to one exact nonce-bearing standard MCP form. */
   attachMcpFormCarrier(nonce: string): HostMcpFormAttachResult;
 }
+
+export interface HostSharedHistoryAssistantTurnTarget {
+  turnId: string;
+  root: Element;
+}
+
+export interface HostSharedHistoryTarget {
+  kind: "shared-history-conversation";
+  conversationId: string;
+  statusRoot: Element;
+  composerRoot: Element;
+  assistantTurns: readonly HostSharedHistoryAssistantTurnTarget[];
+  /** False when a host replacement or identity change invalidates this target. */
+  isCurrent(): boolean;
+}
+
+export type HostSharedHistoryTargetResult =
+  | { status: "available"; target: HostSharedHistoryTarget }
+  | { status: "unavailable"; reason: "not_found" | "ambiguous" | "disconnected" | "invalid_identity" | "unmapped" | "mapper_unavailable" };
 
 export interface HostMcpFormIdentity {
   requestId: string;

@@ -29,6 +29,12 @@ import {
   type ManagerDescriptorDependencies,
 } from "../src/manager-descriptor";
 import { TWEAKERS_MANAGER_ID } from "../src/manager-contract";
+import {
+  REQUIRED_SEALED_MANAGER_SUPPORT_FILES,
+  SEALED_MANAGER_SUPPORT_DIRECTORY,
+} from "../src/manager-runtime-assets";
+import { fingerprintManagerManagedRuntimeSource } from "../src/managed-runtime";
+import { computeRuntimeFingerprint } from "../src/runtime-fingerprint";
 
 const isDarwinUser = process.platform === "darwin" && typeof process.getuid === "function" && typeof process.getgid === "function";
 const FIXED_NOW = "2026-08-27T23:00:00.000Z";
@@ -52,6 +58,9 @@ test("publishes a sealed immutable status manager generation before its descript
     assert.equal(lstatSync(first.generationRoot).mode & 0o7777, 0o700);
     assert.equal(lstatSync(first.launcher).mode & 0o7777, 0o500);
     assert.equal(lstatSync(first.bundle).mode & 0o7777, 0o400);
+    assert.equal(lstatSync(first.runtime).mode & 0o7777, 0o700);
+    assert.equal(lstatSync(first.managedRuntime).mode & 0o7777, 0o700);
+    assert.equal(seal.managedRuntimeFingerprint, first.managedRuntime.split("/").at(-1));
     assert.equal(lstatSync(first.seal).mode & 0o7777, 0o400);
     assert.equal(lstatSync(fixture.descriptorFile).mode & 0o7777, 0o600);
     const second = publish(fixture);
@@ -113,6 +122,24 @@ test("publisher fails closed on signing evidence and descriptor publication fail
     );
     assert.equal(existsSync(fixture.descriptorFile), false, "descriptor must remain unpublished after a generation-stage failure");
     assert.equal(existsSync(join(fixture.userRoot, "managers", TWEAKERS_MANAGER_ID, "generations")), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("publisher restores the prior descriptor after an injected post-publication failure", { skip: !isDarwinUser }, () => {
+  const fixture = makeFixture();
+  try {
+    publish(fixture);
+    const priorDescriptor = readFileSync(fixture.descriptorFile, "utf8");
+    assert.throws(
+      () => publish(fixture, {
+        now: () => "2026-08-28T00:00:00.000Z",
+        afterDescriptorPublish: () => { throw new Error("injected post-publication failure"); },
+      }),
+      /injected post-publication failure/,
+    );
+    assert.equal(readFileSync(fixture.descriptorFile, "utf8"), priorDescriptor);
   } finally {
     fixture.cleanup();
   }
@@ -230,6 +257,8 @@ interface Fixture {
   descriptorFile: string;
   launcher: string;
   bundle: string;
+  runtime: string;
+  managedRuntime: string;
   nodePath: string;
   owner: { uid: number; gid: number };
   signing: { authority: string; designatedRequirement: string };
@@ -250,8 +279,40 @@ function makeFixture(): Fixture {
   mkdirSync(assets, { mode: 0o700 });
   const launcher = join(assets, TWEAKERS_MANAGER_LAUNCHER_NAME);
   const bundle = join(assets, TWEAKERS_MANAGER_BUNDLE_NAME);
+  const runtime = join(assets, "runtime");
+  const managedRuntime = join(assets, "managed-runtime");
   writeFileSync(launcher, "fixed signed launcher fixture\n", "utf8");
-  writeFileSync(bundle, "export const fixture = true;\n", "utf8");
+  mkdirSync(runtime, { mode: 0o700 });
+  writeFileSync(join(runtime, "main.js"), "module.exports = true;\n", "utf8");
+  const support = join(runtime, SEALED_MANAGER_SUPPORT_DIRECTORY);
+  for (const relativePath of REQUIRED_SEALED_MANAGER_SUPPORT_FILES) {
+    const file = join(support, relativePath);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, `fixture ${relativePath}\n`, "utf8");
+    if (relativePath.includes("Launcher") || relativePath.endsWith("Tweakers Swap Helper")) {
+      chmodSync(file, 0o500);
+    }
+  }
+  const runtimeEvidence = computeRuntimeFingerprint(runtime);
+  writeFileSync(join(runtime, "runtime-fingerprint.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    fingerprint: runtimeEvidence.fingerprint,
+    fileCount: runtimeEvidence.fileCount,
+  }, null, 2)}\n`, "utf8");
+  mkdirSync(managedRuntime, { mode: 0o700 });
+  writeFileSync(join(managedRuntime, "package.json"), '{"private":true}\n', "utf8");
+  chmodSync(join(managedRuntime, "package.json"), 0o400);
+  const managedRuntimeFingerprint = fingerprintManagerManagedRuntimeSource(managedRuntime);
+  writeFileSync(join(managedRuntime, "managed-runtime-fingerprint.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    fingerprint: managedRuntimeFingerprint,
+    fileCount: 1,
+  }, null, 2)}\n`, "utf8");
+  writeFileSync(
+    bundle,
+    `export const fixture = true;\n//# TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1=${runtimeEvidence.fingerprint}\n//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=${managedRuntimeFingerprint}\n`,
+    "utf8",
+  );
   chmodSync(launcher, 0o500);
   chmodSync(bundle, 0o400);
   const owner = { uid: process.getuid!(), gid: process.getgid!() };
@@ -267,6 +328,8 @@ function makeFixture(): Fixture {
     descriptorFile: join(descriptorRoot, `${TWEAKERS_MANAGER_ID}.json`),
     launcher,
     bundle,
+    runtime,
+    managedRuntime,
     nodePath,
     owner,
     signing,
@@ -278,7 +341,12 @@ function publish(fixture: Fixture, dependencies: Partial<ManagerDescriptorDepend
   return publishTweakersManagerDescriptor({
     userRoot: fixture.userRoot,
     descriptorRoot: fixture.descriptorRoot,
-    assets: { launcher: fixture.launcher, bundle: fixture.bundle },
+    assets: {
+      launcher: fixture.launcher,
+      bundle: fixture.bundle,
+      runtime: fixture.runtime,
+      managedRuntime: fixture.managedRuntime,
+    },
     dependencies: {
       owner: () => fixture.owner,
       nodePath: () => fixture.nodePath,

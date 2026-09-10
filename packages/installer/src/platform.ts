@@ -102,21 +102,31 @@ function macInstallAtRoot(appRoot: string): CodexInstall {
     resourcesDir,
     asarPath: join(resourcesDir, "app.asar"),
     metaPath: join(appRoot, "Contents", "Info.plist"),
-    electronBinary: join(
-      appRoot,
-      "Contents",
-      "Frameworks",
-      "Electron Framework.framework",
-      "Versions",
-      "A",
-      "Electron Framework",
-    ),
+    electronBinary: resolveMacElectronFrameworkBinary(appRoot),
     executable: join(appRoot, "Contents", "MacOS", info.executable),
     appName: info.name,
     bundleId: info.bundleId,
     channel: inferCodexChannel(info.bundleId, info.name),
     platform: "darwin",
   };
+}
+
+/**
+ * OpenAI's newer desktop builds rename Electron Framework.framework to Codex
+ * Framework.framework and use a versioned Current link.  Keep recognizing the
+ * legacy layout so existing desktop releases remain repairable.
+ */
+export function resolveMacElectronFrameworkBinary(appRoot: string): string {
+  const frameworks = join(appRoot, "Contents", "Frameworks");
+  const candidates = [
+    join(frameworks, "Codex Framework.framework", "Versions", "Current", "Codex Framework"),
+    join(frameworks, "Codex Framework.framework", "Codex Framework"),
+    join(frameworks, "Electron Framework.framework", "Versions", "Current", "Electron Framework"),
+    join(frameworks, "Electron Framework.framework", "Versions", "A", "Electron Framework"),
+    join(frameworks, "Electron Framework.framework", "Electron Framework"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate))
+    ?? join(frameworks, "Electron Framework.framework", "Versions", "A", "Electron Framework");
 }
 
 function findMacCodexApps(dir: string): string[] {

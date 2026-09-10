@@ -16,9 +16,11 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { PROMOTION_POLICY_FILE_MAX_BYTES } from "@therealityreport/tweakers-sdk";
 import {
+  assertLivePromotionPolicyCompatible,
   buildPromotionHealthExpectation,
 } from "../src/commands/install";
 import {
+  comparePromotionPolicyPaths,
   fingerprintPromotionPolicyPath as fingerprintInstallerPolicy,
   trustedPromotionPolicyMode as installerTrustedPolicyMode,
 } from "../src/promotion-policy";
@@ -97,6 +99,84 @@ test("installer and runtime share stable semantic policy fingerprints", () => {
     writePolicy(policy, nonPolicy);
     assert.equal(fingerprintInstallerPolicy(policy), expected, "unrelated UI/session state is excluded");
     assert.equal(fingerprintRuntimePolicy(policy), expected);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("prepared policy survives intentional quit persistence and unrelated task creation", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-promotion-policy-quit-flush-"));
+  try {
+    const preparedPolicy = join(root, "candidate", ".codex-global-state.json");
+    const livePolicy = join(root, "live", ".codex-global-state.json");
+    mkdirSync(dirname(preparedPolicy), { recursive: true });
+    mkdirSync(dirname(livePolicy), { recursive: true });
+    const prepared = policyState();
+    const preparedAtoms = prepared["electron-persisted-atom-state"] as Record<string, unknown>;
+    const preparedThreads = preparedAtoms["heartbeat-thread-permissions-by-id"] as Record<string, unknown>;
+    const alpha = preparedThreads.alpha as Record<string, unknown>;
+    alpha.activePermissionProfile = { id: ":danger-full-access", extends: null };
+    alpha.approvalPolicy = "never";
+    alpha.sandboxPolicy = { type: "dangerFullAccess" };
+    writePolicy(preparedPolicy, prepared);
+    writePolicy(livePolicy, prepared);
+    const expectedPreparedFingerprint = fingerprintInstallerPolicy(preparedPolicy);
+
+    // This is the production ordering: candidate health has already bound the
+    // prepared snapshot, then intentional desktop quit persists the redundant
+    // active profile and a newly created task before promotion rechecks live.
+    const flushed = structuredClone(prepared);
+    const flushedAtoms = flushed["electron-persisted-atom-state"] as Record<string, unknown>;
+    const flushedThreads = flushedAtoms["heartbeat-thread-permissions-by-id"] as Record<string, unknown>;
+    (flushedThreads.alpha as Record<string, unknown>).activePermissionProfile = null;
+    flushedThreads["task-created-after-prepare"] = {
+      activePermissionProfile: { id: ":workspace", extends: null },
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "workspaceWrite" },
+      approvalsReviewer: "user",
+      runtimeWorkspaceRoots: ["/private/new-task"],
+    };
+    writePolicy(livePolicy, flushed);
+
+    const comparison = comparePromotionPolicyPaths(preparedPolicy, livePolicy);
+    assert.equal(comparison.preparedFingerprint, expectedPreparedFingerprint);
+    assert.notEqual(comparison.liveFingerprint, expectedPreparedFingerprint);
+    assert.equal(comparison.compatible, true);
+    assert.doesNotThrow(() => assertLivePromotionPolicyCompatible({
+      expectedPreparedFingerprint,
+      preparedPolicyPath: preparedPolicy,
+      livePolicyPath: livePolicy,
+    }));
+
+    const authorizationDrifts: Array<(state: Record<string, unknown>) => void> = [
+      (state) => { state["electron-openai-mcp-form-elicitations-enabled"] = true; },
+      (state) => {
+        const atoms = state["electron-persisted-atom-state"] as Record<string, unknown>;
+        (atoms["agent-mode-by-host-id"] as Record<string, unknown>).local = "read-only";
+      },
+      (state) => {
+        const record = existingThreadRecord(state);
+        record.activePermissionProfile = { id: ":workspace", extends: null };
+      },
+      (state) => { existingThreadRecord(state).approvalPolicy = "on-request"; },
+      (state) => { existingThreadRecord(state).sandboxPolicy = { type: "readOnly" }; },
+      (state) => { existingThreadRecord(state).approvalsReviewer = "system"; },
+      (state) => { existingThreadRecord(state).runtimeWorkspaceRoots = ["/different"]; },
+      (state) => {
+        const atoms = state["electron-persisted-atom-state"] as Record<string, unknown>;
+        delete (atoms["heartbeat-thread-permissions-by-id"] as Record<string, unknown>).alpha;
+      },
+    ];
+    for (const mutate of authorizationDrifts) {
+      const drifted = structuredClone(flushed);
+      mutate(drifted);
+      writePolicy(livePolicy, drifted);
+      assert.throws(() => assertLivePromotionPolicyCompatible({
+        expectedPreparedFingerprint,
+        preparedPolicyPath: preparedPolicy,
+        livePolicyPath: livePolicy,
+      }), /Live promotion policy drifted after candidate preparation/);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -513,6 +593,12 @@ test("expectation permits unrelated UI/session persistence under the same semant
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function existingThreadRecord(state: Record<string, unknown>): Record<string, unknown> {
+  const atoms = state["electron-persisted-atom-state"] as Record<string, unknown>;
+  const threads = atoms["heartbeat-thread-permissions-by-id"] as Record<string, unknown>;
+  return threads.alpha as Record<string, unknown>;
+}
 
 function reverseObjectOrder(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(reverseObjectOrder);

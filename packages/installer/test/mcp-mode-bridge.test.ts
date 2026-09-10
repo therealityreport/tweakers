@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { build } from "esbuild";
+import { computeRuntimeFingerprint } from "../src/runtime-fingerprint";
 import {
   createMcpModeBridge,
   parseMcpModeHelperResponse,
@@ -10,6 +13,42 @@ import {
 } from "../src/mcp-mode-bridge";
 
 const fingerprint = "a".repeat(64);
+
+test("sealed manager executes its pinned MCP helper and rejects changed runtime bytes", async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweaker-sealed-mcp-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const ownerRoot = join(root, "manager");
+  const generationRoot = join(ownerRoot, "generations", "b".repeat(64));
+  const runtimeParent = join(ownerRoot, "runtime-generations");
+  const staged = join(runtimeParent, "staged");
+  mkdirSync(generationRoot, { recursive: true, mode: 0o700 });
+  mkdirSync(staged, { recursive: true, mode: 0o700 });
+  writeFileSync(join(staged, "mcp-mode-headless.js"), helperSource({
+    ok: true, changed: false, conflicts: [], error: null, exitCode: 0,
+  }), { mode: 0o400 });
+  const evidence = computeRuntimeFingerprint(staged);
+  writeFileSync(join(staged, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...evidence }), { mode: 0o400 });
+  const runtime = join(runtimeParent, evidence.fingerprint);
+  renameSync(staged, runtime);
+  const bundle = join(generationRoot, "manager.mjs");
+  await build({
+    entryPoints: [fileURLToPath(new URL("../src/mcp-mode-bridge.ts", import.meta.url))],
+    outfile: bundle, bundle: true, format: "esm", platform: "node", logLevel: "silent",
+    define: { __TWEAKERS_MANAGER_RUNTIME_FINGERPRINT__: JSON.stringify(evidence.fingerprint) },
+  });
+  const imported = await import(pathToFileURL(bundle).href);
+  const helper = join(runtime, "mcp-mode-headless.js");
+  assert.equal(imported.defaultMcpModeHelperFile(), helper);
+  const bridge = imported.createMcpModeBridge({
+    configPath: join(root, "config.toml"), statePath: join(root, "state.json"),
+    tweaksRoot: join(root, "tweaks"), tweakersConfigPath: join(root, "config.json"),
+  });
+  assert.equal(bridge.prove("chatgpt"), true);
+  chmodSync(helper, 0o600);
+  writeFileSync(helper, "throw new Error('changed runtime must never execute');\n");
+  chmodSync(helper, 0o400);
+  assert.throws(() => bridge.prove("chatgpt"), /runtime failed its compiled fingerprint/);
+});
 
 test("headless MCP bridge sends the exact request and accepts verified reconcile/proof evidence", () => {
   withHelper(`

@@ -35,6 +35,7 @@ export interface WatcherHealthPublisherDependencies {
 }
 export interface LaunchdLoadedState {
     loaded: boolean;
+    disabled?: boolean | null;
     running: boolean;
     lastExitCode: number | null;
     command?: string | null;
@@ -90,6 +91,7 @@ export declare function analyzeScheduledTaskWatcher(taskExists: (name: string) =
 export declare function analyzeWatcherLogTail(tail: string): WatcherHealthCheck;
 export declare function analyzeWatcherCycleReceipt(receipt: WatcherCycleReceipt): WatcherHealthCheck;
 export declare function classifyRuntimeFingerprints(values: RuntimeFingerprintSet): RuntimeFingerprintHealth;
+export declare function launchdDisabledState(output: string | null, label: string): boolean | null;
 export declare function parseLaunchdLoadedCommand(output: string): string | null;
 export declare function readRuntimeFingerprintEvidence(root: string): RuntimeFingerprintEvidence | null;
 export {};

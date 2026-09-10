@@ -2,6 +2,8 @@ export type CodexDesktopReleaseProfile = "stable" | "alpha";
 
 export interface CodexDesktopUpdateTarget {
   profile: CodexDesktopReleaseProfile;
+  /** Exact manager-verified official OpenAI app. Never the derived client bundle. */
+  appPath?: string | null;
   available: boolean;
   unavailableReason: string | null;
   setupRequired?: "register-beta" | "launch-beta" | null;
@@ -42,10 +44,23 @@ export interface CodexDesktopUpdateCheckResult {
   checkedAt: string;
   reason: string | null;
   retryRequested: boolean;
+  /** New official-ChatGPT-only action result. */
+  officialUpdateRequested: boolean;
+  /** Compatibility alias for readers predating the split updater. */
   updateAndReloadRequested: boolean;
   nativeUpdateControlActive?: boolean;
   javaScriptUpdaterManagerAvailable?: boolean;
   javaScriptUpdaterManagerReason?: string | null;
+  /**
+   * A manager-owned action may be ready even when no independently verified
+   * remote update metadata has been published. It must never be rendered as
+   * an update-available claim.
+   */
+  managerAction?: {
+    actionId: "desktop-update.start";
+    available: boolean;
+    reason: string;
+  } | null;
   setupRequired?: "register-beta" | "launch-beta" | null;
 }
 
@@ -65,7 +80,7 @@ export interface CodexDesktopUpdateServiceDependencies {
   resolveTarget(): Promise<CodexDesktopUpdateTarget>;
   refreshMetadata(target: CodexDesktopUpdateTarget): Promise<CodexDesktopUpdateMetadata>;
   showDialog(dialog: CodexDesktopUpdateDialog): Promise<{ response: number }>;
-  startUpdateAndReload(): void | Promise<void>;
+  startOfficialUpdate(): void | Promise<void>;
   scheduleRetry?(retry: () => void): void;
   /** Publishes each completed metadata check to renderer and native UI surfaces. */
   onResult?(result: CodexDesktopUpdateCheckResult): void;
@@ -179,7 +194,7 @@ async function runCheck(
   }
 
   // A refresh failure must not hide a last-known verified newer build. The
-  // durable Update and Reload transaction revalidates before changing apps.
+  // durable official update transaction revalidates before changing apps.
   const status: CodexDesktopUpdateCheckStatus = metadata.updateAvailable
     ? "update-available"
     : metadata.stale
@@ -196,6 +211,7 @@ async function runCheck(
     checkedAt: metadata.checkedAt,
     reason: metadata.error,
     retryRequested: false,
+    officialUpdateRequested: false,
     updateAndReloadRequested: false,
   };
 }
@@ -217,8 +233,8 @@ async function presentResult(
 
   if (initial.status === "update-available" && response === 0) {
     try {
-      await dependencies.startUpdateAndReload();
-      return { ...initial, updateAndReloadRequested: true };
+      await dependencies.startOfficialUpdate();
+      return { ...initial, officialUpdateRequested: true, updateAndReloadRequested: true };
     } catch (error) {
       return presentResult(dependencies, {
         ...initial,
@@ -248,6 +264,7 @@ function resultForFailure(
     checkedAt: new Date().toISOString(),
     reason,
     retryRequested: false,
+    officialUpdateRequested: false,
     updateAndReloadRequested: false,
   };
 }
@@ -262,7 +279,7 @@ function dialogFor(result: CodexDesktopUpdateCheckResult): CodexDesktopUpdateDia
       title: "ChatGPT Update Available",
       message: `ChatGPT ${latest} is available.`,
       detail: `Installed: ${installed}\nRelease profile: ${profile}`,
-      buttons: ["Update and Reload", "Later"],
+      buttons: ["Update ChatGPT", "Later"],
       defaultId: 0,
       cancelId: 1,
       noLink: true,

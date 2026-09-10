@@ -33,6 +33,7 @@ import {
  */
 export const ENVIRONMENT_MODE_CACHE_SCHEMA_VERSION = 2 as const;
 export const ENVIRONMENT_MODE_CACHE_KIND = "environment-mode-pair" as const;
+export const ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY = "macos-ds-store-regular-v1" as const;
 
 const SAFE_GENERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/i;
@@ -51,6 +52,8 @@ export type EnvironmentModeCacheReachability =
   | "unreachable";
 export type EnvironmentModeCacheEntryType = "directory" | "file" | "symlink";
 export type EnvironmentModeCacheValidationState = "ready" | "stale_requires_prepare" | "unavailable";
+export type EnvironmentModeCacheProjectionMetadataPolicy =
+  typeof ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY;
 
 export interface EnvironmentModeCachePaths {
   /** `.../environment-cache`; this is always an installer-owned real directory. */
@@ -292,6 +295,16 @@ export interface EnvironmentModePairRecoveryLease {
   completeTerminalRecovery(): EnvironmentModePairReceipt;
   /** A verified newer official desktop permanently releases this cache grant. */
   invalidateForVerifiedOfficialUpdate(invalidatedAt: string): EnvironmentModePairReceipt;
+  release(): void;
+}
+
+/**
+ * Holds the canonical cache mutex while an external consumer verifies and
+ * copies the sealed inactive ChatGPT source. The lease exposes no cache
+ * mutation capability: it exists only to close the seal/trust/copy race.
+ */
+export interface SealedInactiveEnvironmentModeSourceLease {
+  readonly receipt: EnvironmentModePairReceipt;
   release(): void;
 }
 
@@ -826,6 +839,148 @@ export function assertEnvironmentModeCacheTreeStatSealAfterRename(
   if (!sameJson(actual.entries, rebound)) {
     throw new Error(`Environment mode cache tree stat seal mismatch at ${root}`);
   }
+}
+
+/**
+ * Finder may create or remove a regular `.DS_Store` while a prepared
+ * projection is visible in the filesystem. The generic cache seal remains
+ * fully strict; this receipt-bound projection policy is the sole exception.
+ * It ignores only lstat-proven regular `.DS_Store` entries and only the
+ * size/mtime/ctime churn on each ignored entry's direct parent directory.
+ */
+export function assertEnvironmentModeCacheProjectionStatSealOnly(
+  rootPath: string,
+  expected: EnvironmentModeCacheTreeStatSeal,
+  policy: EnvironmentModeCacheProjectionMetadataPolicy,
+): void {
+  assertEnvironmentModeCacheProjectionMetadataPolicy(policy);
+  const root = assertCanonicalAbsolutePath(rootPath, "environment mode cache tree root");
+  if (expected.rootPath !== root) {
+    throw new Error("Environment mode cache tree seal root does not match its expected canonical path");
+  }
+  try {
+    assertEnvironmentModeCacheTreeStatSealOnly(root, expected);
+    return;
+  } catch (error) {
+    if (!isEnvironmentModeCacheTreeStatMismatch(error, root)) throw error;
+  }
+  assertEnvironmentModeCacheProjectionFinderEquivalent(root, expected, false);
+}
+
+/**
+ * Activated projections have the same narrow Finder allowance plus the root
+ * ctime change already accepted for one same-filesystem rename.
+ */
+export function assertEnvironmentModeCacheProjectionStatSealAfterRename(
+  rootPath: string,
+  expected: EnvironmentModeCacheTreeStatSeal,
+  policy: EnvironmentModeCacheProjectionMetadataPolicy,
+): void {
+  assertEnvironmentModeCacheProjectionMetadataPolicy(policy);
+  if (!isEnvironmentModeCacheTreeStatSeal(expected)) {
+    throw new Error("Environment mode cache tree seal is invalid");
+  }
+  const root = assertCanonicalAbsolutePath(rootPath, "environment mode cache tree root");
+  if (expected.rootPath !== root) {
+    throw new Error("Environment mode cache tree seal root does not match its expected canonical path");
+  }
+  try {
+    assertEnvironmentModeCacheTreeStatSealAfterRename(root, expected);
+    return;
+  } catch (error) {
+    if (!isEnvironmentModeCacheTreeStatMismatch(error, root)) throw error;
+  }
+  assertEnvironmentModeCacheProjectionFinderEquivalent(root, expected, true);
+}
+
+function assertEnvironmentModeCacheProjectionMetadataPolicy(
+  policy: EnvironmentModeCacheProjectionMetadataPolicy,
+): void {
+  if (policy !== ENVIRONMENT_MODE_CACHE_PROJECTION_METADATA_POLICY) {
+    throw new Error("Environment mode cache projection metadata policy is invalid");
+  }
+}
+
+function isEnvironmentModeCacheTreeStatMismatch(error: unknown, root: string): boolean {
+  return error instanceof Error
+    && error.message === `Environment mode cache tree stat seal mismatch at ${root}`;
+}
+
+function assertEnvironmentModeCacheProjectionFinderEquivalent(
+  root: string,
+  expected: EnvironmentModeCacheTreeStatSeal,
+  afterRename: boolean,
+): void {
+  const actual = collectEnvironmentModeCacheTreeStatSeal(root);
+  const expectedIgnoredParents = finderMetadataParents(expected.entries);
+  const actualIgnoredParents = finderMetadataParents(actual.entries);
+  const toleratedDirectoryPaths = new Set([...expectedIgnoredParents, ...actualIgnoredParents]);
+  const expectedEntries = expected.entries.filter((entry) => !isRegularFinderMetadata(entry));
+  const actualEntries = actual.entries.filter((entry) => !isRegularFinderMetadata(entry));
+  const limit = Math.max(expectedEntries.length, actualEntries.length);
+
+  for (let index = 0; index < limit; index += 1) {
+    const expectedEntry = expectedEntries[index];
+    const actualEntry = actualEntries[index];
+    if (expectedEntry === undefined || actualEntry === undefined
+      || expectedEntry.relativePath !== actualEntry.relativePath
+      || expectedEntry.type !== actualEntry.type) {
+      throw projectionSealMismatch(
+        root,
+        `topology differs at index ${index}: expected ${projectionEntryLabel(expectedEntry)}, observed ${projectionEntryLabel(actualEntry)}`,
+      );
+    }
+
+    const toleratedFields = new Set<keyof EnvironmentModeCacheStatSealRecord>();
+    if (expectedEntry.type === "directory" && toleratedDirectoryPaths.has(expectedEntry.relativePath)) {
+      toleratedFields.add("size");
+      toleratedFields.add("mtimeNs");
+      toleratedFields.add("ctimeNs");
+    }
+    if (afterRename && expectedEntry.relativePath === "") toleratedFields.add("ctimeNs");
+
+    for (const field of [
+      "dev",
+      "ino",
+      "size",
+      "mode",
+      "mtimeNs",
+      "ctimeNs",
+      "symlinkTarget",
+    ] as const) {
+      if (!toleratedFields.has(field) && expectedEntry[field] !== actualEntry[field]) {
+        throw projectionSealMismatch(
+          root,
+          `field ${field} changed at ${projectionEntryLabel(actualEntry)}`,
+        );
+      }
+    }
+  }
+}
+
+function finderMetadataParents(entries: EnvironmentModeCacheStatSealRecord[]): Set<string> {
+  return new Set(entries
+    .filter(isRegularFinderMetadata)
+    .map((entry) => {
+      const separator = entry.relativePath.lastIndexOf("/");
+      return separator < 0 ? "" : entry.relativePath.slice(0, separator);
+    }));
+}
+
+function isRegularFinderMetadata(entry: EnvironmentModeCacheStatSealRecord): boolean {
+  if (entry.type !== "file") return false;
+  const separator = entry.relativePath.lastIndexOf("/");
+  const basename = separator < 0 ? entry.relativePath : entry.relativePath.slice(separator + 1);
+  return basename === ".DS_Store";
+}
+
+function projectionEntryLabel(entry: EnvironmentModeCacheStatSealRecord | undefined): string {
+  if (entry === undefined) return "<absent>";
+  return `${entry.type}:${entry.relativePath === "" ? "." : entry.relativePath}`;
+}
+
+function projectionSealMismatch(root: string, detail: string): Error {
+  return new Error(`Environment mode cache projection stat seal mismatch at ${root}: ${detail}`);
 }
 
 export function isEnvironmentModeCacheTreeStatSeal(value: unknown): value is EnvironmentModeCacheTreeStatSeal {
@@ -2295,6 +2450,54 @@ export function assertEnvironmentModeCacheSteadyState(paths: EnvironmentModeCach
     throw new Error("Environment mode cache current generation is not a reachable prepared pair");
   }
   return current;
+}
+
+/**
+ * Resolve the pristine inactive ChatGPT bundle only from a steady, published
+ * receipt and re-read its complete seal immediately before an external caller
+ * copies it. This is deliberately separate from the lightweight status
+ * observer: copying a desktop bundle is a source-trust boundary, not polling.
+ */
+export function assertSealedInactiveEnvironmentModeSource(
+  paths: EnvironmentModeCachePaths,
+): EnvironmentModePairReceipt {
+  const receipt = assertEnvironmentModeCacheSteadyState(paths);
+  if (receipt.roles.inactive.role !== "inactive" || receipt.roles.inactive.experience !== "chatgpt") {
+    throw new Error("Environment mode cache has no inactive ChatGPT source role");
+  }
+  assertEnvironmentModePairMaterialized(paths, receipt);
+  // Keep this explicit even though the materialized-pair check currently
+  // covers it: source selection must continue to demand a full byte-level
+  // inactive-tree proof if that broader helper ever gains another use case.
+  assertEnvironmentModeCacheTreeSeal(receipt.paths.inactiveAppPath, receipt.seals.inactiveApp);
+  return receipt;
+}
+
+/**
+ * Claim the canonical cache mutex before handing an inactive source path to a
+ * copier. Holding this lease across the caller's independent source-trust
+ * check and clone prevents a concurrent cache publication from changing the
+ * sealed role between check and use.
+ */
+export function acquireSealedInactiveEnvironmentModeSourceLease(
+  paths: EnvironmentModeCachePaths,
+): SealedInactiveEnvironmentModeSourceLease {
+  assertEnvironmentModeCacheRootIsReal(paths);
+  const lock = acquireProcessLock(paths.lockFile, {
+    onContended: () => new Error("Environment mode cache source lease is already held"),
+  });
+  try {
+    const receipt = assertSealedInactiveEnvironmentModeSource(paths);
+    return {
+      receipt,
+      release() {
+        lock.release();
+      },
+    };
+  } catch (error) {
+    lock.release();
+    throw error;
+  }
 }
 
 /** Check all required roots are real, mutually same-device directories, and still match their full stat seals. */

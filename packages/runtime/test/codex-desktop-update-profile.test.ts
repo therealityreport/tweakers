@@ -113,7 +113,7 @@ test("active capture binding rejects another path or profile", () => {
   }, alphaPath), null);
 });
 
-test("Stable stays available without a captured feed and cannot inherit Alpha state", () => {
+test("Stable requires a manager-verified official app and cannot inherit Alpha state", () => {
   const alphaIdentity = verifiedCodexDesktopProfileIdentity(registry(), "alpha");
   assert.ok(alphaIdentity);
   const alphaFeed = createCapturedCodexDesktopProfileFeed(alphaIdentity, {
@@ -127,7 +127,8 @@ test("Stable stays available without a captured feed and cannot inherit Alpha st
     identity: null,
     capturedFeed: alphaFeed,
   });
-  assert.equal(stable.available, true);
+  assert.equal(stable.available, false);
+  assert.match(stable.unavailableReason ?? "", /global manager.*verified official ChatGPT app/i);
   assert.equal(stable.setupRequired, null);
   assert.equal(stable.feedUrl, null);
   assert.equal(stable.identityKey, "official-stable-default");

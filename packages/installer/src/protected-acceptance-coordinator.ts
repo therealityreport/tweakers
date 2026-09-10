@@ -801,7 +801,7 @@ function collectCanonicalProtectedAppSignatureReceipt(input: {
   }
   const designated = runEvidence("codesign", ["-dr", "-", codex.appRoot]);
   const entitlements = runEvidence("codesign", ["-d", "--entitlements", ":-", codex.appRoot]);
-  const gatekeeper = runEvidence("spctl", ["--assess", "--type", "execute", "--verbose=4", codex.appRoot]);
+  const gatekeeper = runEvidence("/usr/sbin/spctl", ["--assess", "--type", "execute", "--verbose=4", codex.appRoot]);
   const integrity = getIntegrity(codex);
   if (!integrity || integrity.algorithm !== "SHA256" || integrity.hash.toLowerCase() !== headerHash.toLowerCase()) {
     throw new Error("Protected signing collector cannot prove Electron ASAR integrity");

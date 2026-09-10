@@ -14,9 +14,14 @@ import { readConfigFile } from "../config.js";
 import { collectDesktopUpdateDiagnostics } from "../desktop-update-diagnostics.js";
 import { readRendererPatchRecord, type RendererPatchRecord } from "../renderer-patch-outcome.js";
 import { environmentModeCachePaths, observeEnvironmentModeCache } from "../environment-mode-cache.js";
+import { defaultTweakersAccountsBrokerRoot } from "../macos-variant.js";
+import { targetUserHome } from "../ownership.js";
 import {
   formatAccountRouterEvidence,
+  canonicalIndependentTweakersVariantRoot,
+  inspectIndependentTweakersLiveHealth,
   inspectAccountRouter,
+  readRegisteredDevelopmentSourceRoot,
   type AccountRouterEvidence,
 } from "../account-router-status.js";
 
@@ -25,8 +30,13 @@ export async function status(): Promise<void> {
   const state = readState(paths.stateFile);
   const accountRouter = await inspectAccountRouter({
     userRoot: paths.root,
-    sourceRoot: state?.sourceRoot ?? null,
+    brokerRoot: defaultTweakersAccountsBrokerRoot(targetUserHome()),
+    registeredDevelopmentSourceRoot: readRegisteredDevelopmentSourceRoot(readConfigFile(paths.configFile)),
     installedRuntimeRoot: paths.runtime,
+  });
+  const independentVariantRoot = canonicalIndependentTweakersVariantRoot(targetUserHome());
+  const independentLiveHealth = inspectIndependentTweakersLiveHealth(independentVariantRoot, {
+    expectedAccountsBrokerRoot: defaultTweakersAccountsBrokerRoot(targetUserHome()),
   });
 
   console.log(kleur.bold("tweaker status"));
@@ -74,6 +84,7 @@ export async function status(): Promise<void> {
 
   if (!state) {
     printAccountRouterStatus(accountRouter);
+    printIndependentTweakersLiveHealthStatus(independentLiveHealth);
     console.log(kleur.yellow("Not installed. Run `tweaker install`."));
     return;
   }
@@ -97,6 +108,7 @@ export async function status(): Promise<void> {
     codex = locateCodex(state.appRoot);
   } catch (e) {
     console.log(kleur.red(`Codex not found at recorded path: ${(e as Error).message}`));
+    printIndependentTweakersLiveHealthStatus(independentLiveHealth);
     return;
   }
 
@@ -172,6 +184,7 @@ export async function status(): Promise<void> {
   }
 
   printAccountRouterStatus(accountRouter);
+  printIndependentTweakersLiveHealthStatus(independentLiveHealth);
 }
 
 function printAccountRouterStatus(evidence: AccountRouterEvidence): void {
@@ -180,10 +193,52 @@ function printAccountRouterStatus(evidence: AccountRouterEvidence): void {
   for (const line of formatAccountRouterEvidence(evidence)) console.log(line);
   if (evidence.live.state !== "active" || !evidence.live.status) return;
   for (const account of evidence.live.status.accounts) {
-    console.log(`  ${account.label}:    ${account.eligibility}; spend ${account.normalizedSpend}; assigned ${account.assignedThreadCount}`);
+    const quota = account.weekly
+      ? `weekly ${account.weekly.remainingPercent ?? "unknown"}%; ${account.weekly.freshness}${account.weekly.resetAt ? `; resets ${account.weekly.resetAt}` : ""}`
+      : `legacy spend ${account.normalizedSpend}`;
+    console.log(`  ${account.label}:    ${account.eligibility}; ${account.plan ?? "plan unknown"}${account.identifierMasked ? `; ${account.identifierMasked}` : ""}; ${quota}; short window ${account.shortWindowPressure ?? "unknown"}%; reset credits ${account.resetCredits ?? "unknown"}; assigned ${account.assignedThreadCount}`);
+  }
+  if (evidence.live.status.schemaVersion === 2 || evidence.live.status.schemaVersion === 3) {
+    const enabled = evidence.live.status.accounts.filter((account) => account.eligibility !== "disabled").length;
+    console.log(`  pool remaining: ${evidence.live.status.poolRemainingPercent ?? "unknown"}% of ${enabled * 100}% across ${enabled} enabled ${enabled === 1 ? "account" : "accounts"}`);
+    if (evidence.live.status.pending) {
+      console.log(`  runtime pending: ${evidence.live.status.pending.mode.replaceAll("_", " ")}${evidence.live.status.pending.policy ? ` (${evidence.live.status.pending.policy})` : ""}; generation ${evidence.live.status.pending.generation}; ${evidence.live.status.pending.fingerprint.slice(0, 15)}…`);
+    }
   }
   if (evidence.live.status.degradedReason) {
     console.log(`  degraded:     ${evidence.live.status.degradedReason.replaceAll("_", " ")}`);
+  }
+  if (evidence.broker.state === "active" && evidence.broker.status) {
+    const broker = evidence.broker.status;
+    console.log(`  broker clients: ${broker.registeredClients.total} (ChatGPT ${broker.registeredClients.chatgpt}; Tweakers ${broker.registeredClients.tweakers})`);
+    console.log(`  broker children: ${broker.residentChildren}/${broker.maxResidentChildren} resident; held work ${broker.heldWorkCount}`);
+    console.log(`  broker handoffs: ${broker.pendingHandoffs.pendingCount} pending; ${broker.pendingHandoffs.ambiguousCount} ambiguous`);
+    console.log(`  browser evidence: ${broker.browserEvidence.observed ? "observed" : "not observed"}`);
+  }
+}
+
+function printIndependentTweakersLiveHealthStatus(
+  evidence: ReturnType<typeof inspectIndependentTweakersLiveHealth>,
+): void {
+  console.log();
+  console.log(kleur.bold("independent Tweakers live health"));
+  if (evidence.state === "missing") {
+    console.log(kleur.yellow("  state:        not observed"));
+    return;
+  }
+  if (evidence.state !== "current") {
+    console.log(kleur.red(`  state:        rejected (${evidence.state.replaceAll("_", " ")})`));
+    return;
+  }
+  const health = evidence.health;
+  const broker = health.sharedHistoryBrokerState === "connected"
+    ? `connected (${health.accountsBrokerConfigSha256?.slice(0, 16)}…)`
+    : "blocked (no global-v3 broker config)";
+  console.log(kleur.green(`  state:        current; PID ${health.pid}; ${health.initializedTweakIds.length} initialized tweaks`));
+  console.log(`  broker:       ${broker}`);
+  console.log(`  appearance:   ${health.appearance.status.replaceAll("_", " ")}; ${health.appearance.normalized ? "normalized" : "not normalized"}`);
+  if (health.lifecycleFailures.length > 0) {
+    console.log(kleur.red(`  lifecycle:    rejected; ${health.lifecycleFailures.length} recorded failure${health.lifecycleFailures.length === 1 ? "" : "s"}`));
   }
 }
 

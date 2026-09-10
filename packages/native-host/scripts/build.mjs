@@ -8,9 +8,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const src = resolve(root, "src", "tweaker_native_host.mm");
 const managerLauncherSource = resolve(root, "src", "tweakers_manager_launcher.mm");
+const appLauncherSource = resolve(root, "src", "tweakers_app_launcher.mm");
 const outDir = resolve(root, "dist");
 const out = resolve(outDir, "tweaker_native_host.node");
 const managerLauncherOutput = resolve(outDir, "Tweakers Manager Launcher");
+const appLauncherOutput = resolve(outDir, "Tweakers App Launcher");
 const managerLauncherAsset = resolve(root, "assets", "Tweakers Manager Launcher");
 const managerSigningPolicy = readManagerSigningPolicy(resolve(root, "manager-signing-policy.json"));
 const releaseManagerLauncher = process.argv.includes("--release-manager-launcher");
@@ -63,6 +65,22 @@ console.log(`[native-host] built ${out}`);
 run("xcrun", [
   "clang++",
   "-std=c++20",
+  "-mmacosx-version-min=13.0",
+  "-isysroot",
+  sdkPath,
+  "-framework",
+  "AppKit",
+  appLauncherSource,
+  "-o",
+  appLauncherOutput,
+], { stdio: "inherit" });
+run("codesign", ["--force", "--sign", "-", appLauncherOutput], { stdio: "inherit" });
+run("codesign", ["--verify", "--strict", appLauncherOutput], { stdio: "inherit" });
+console.log(`[native-host] built ${appLauncherOutput}`);
+
+run("xcrun", [
+  "clang++",
+  "-std=c++20",
   "-fobjc-arc",
   "-ObjC++",
   "-mmacosx-version-min=13.0",
@@ -72,6 +90,7 @@ run("xcrun", [
   "Foundation",
   "-framework",
   "Security",
+  "-DTWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS=1",
   `-DTWEAKERS_MANAGER_CERTIFICATE_LEAF_SHA1=\"${managerSigningPolicy.certificateLeafSha1}\"`,
   managerLauncherSource,
   "-o",

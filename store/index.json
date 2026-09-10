@@ -11,10 +11,10 @@
       },
       "manifest": {
         "id": "co.tweakers.account-switcher",
-        "name": "Easy Account Switcher",
-        "version": "0.2.1",
+        "name": "Accounts",
+        "version": "0.10.2",
         "githubRepo": "therealityreport/tweakers",
-        "description": "Switch existing local Codex sessions, protect remote-plugin receipts, and stage an optional two-account balanced router without duplicating credentials.",
+        "description": "Manage saved Codex accounts, pooled usage, quota-aware routing, safe failover, and paired devices.",
         "author": "hulibrands",
         "tags": [
           "accounts",
@@ -136,7 +136,7 @@
       "manifest": {
         "id": "co.tweakers.projects",
         "name": "Projects",
-        "version": "0.7.0",
+        "version": "0.7.4",
         "githubRepo": "therealityreport/tweakers",
         "description": "Project-colored sidebar rows, folder-local task sorting and pinning, project settings, connection references, and read-only repository inventory.",
         "author": "hulibrands",
@@ -277,7 +277,7 @@
       "manifest": {
         "id": "co.tweakers.usage-limit-resets-tracker",
         "name": "Usage Limit Resets Tracker",
-        "version": "0.2.2",
+        "version": "0.4.0",
         "githubRepo": "therealityreport/tweakers",
         "description": "Track observed usage-limit resets and clearly label observed versus estimated times.",
         "author": "hulibrands",

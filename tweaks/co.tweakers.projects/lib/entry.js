@@ -8,12 +8,14 @@ const state = require("./state");
 const policy = require("./policy");
 const inventory = require("./inventory");
 const service = require("./service");
+const nativeProjectMenu = require("./native-project-menu");
 const sidebar = require("./sidebar");
 const settings = require("./settings");
 
 const IPC = "projects";
 const SERVICE_KEY = "__tweakersProjectsServiceV1";
 const HANDLER_KEY = "__tweakersProjectsHandlerV1";
+const NATIVE_MENU_BRIDGE_KEY = "__tweakersProjectsNativeMenuBridgeV1";
 const settingsPresenter = settings.createSettingsPresenter({
   openNativeProjectEditDialog: sidebar.openNativeProjectEditDialog,
 });
@@ -29,6 +31,8 @@ function startMain(api) {
     });
     globalThis[HANDLER_KEY] = typeof unregister === "function" ? unregister : true;
   }
+  globalThis[NATIVE_MENU_BRIDGE_KEY]?.dispose?.();
+  globalThis[NATIVE_MENU_BRIDGE_KEY] = nativeProjectMenu.installNativeProjectMenuBridge(api);
   api.log?.info?.("Projects service ready");
 }
 
@@ -167,6 +171,9 @@ const tweak = {
       const unregister = globalThis[HANDLER_KEY];
       if (typeof unregister === "function") { try { unregister(); } catch {} }
       globalThis[HANDLER_KEY] = null;
+      const nativeMenuBridge = globalThis[NATIVE_MENU_BRIDGE_KEY];
+      nativeMenuBridge?.dispose?.();
+      if (globalThis[NATIVE_MENU_BRIDGE_KEY] === nativeMenuBridge) globalThis[NATIVE_MENU_BRIDGE_KEY] = null;
     }
     this._page?.unregister?.();
     this._page = null;
@@ -182,6 +189,7 @@ const tweak = {
     detectConnections: service.detectConnections,
     normalizeGitHubArgs: service.normalizeGitHubArgs,
     runGitHubForProject: service.runGitHubForProject,
+    ...nativeProjectMenu,
     ...sidebar,
     projectAppearanceEditor: settings.projectAppearanceEditor,
     branchInventoryDisclosure: settings.branchInventoryDisclosure,

@@ -18,9 +18,8 @@ test("managed Codex CLI bootstrap remains synchronous before tweak deferral", ()
   assert.ok(bootstrap < deferral, "managed lane must remain before tweak deferral");
 });
 
-test("Sparkle restore prefers an APFS clone and keeps the ditto fallback", () => {
-  assert.match(mainSource, /cp["'\s,\]]/);
-  assert.match(mainSource, /execFileSync\("\/bin\/cp", \["-Rc"/);
-  assert.match(mainSource, /renameSync\(staged, appRoot\)/);
-  assert.match(mainSource, /execFileSync\("ditto"/);
+test("the runtime never stages, restores, or prepares the official app for Sparkle", () => {
+  assert.doesNotMatch(mainSource, /prepareSignedCodexForSparkleInstall|restorePristineCodexApp/);
+  assert.doesNotMatch(mainSource, /execFileSync\("\/bin\/cp"|execFileSync\("ditto"/);
+  assert.doesNotMatch(mainSource, /update-chatgpt(?:-reconcile|-resume|-cancel)?/);
 });

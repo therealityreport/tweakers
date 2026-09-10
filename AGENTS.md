@@ -3,11 +3,25 @@
 This file governs repository-wide work. For implementation details inside
 `tweaks/`, also follow `tweaks/AGENTS.md`.
 
+## Project rules
+
+- Review the applicable files in `rules/` before starting related work.
+- Before builds, refreshes, promotions, or artifact cleanup, read and follow
+  [Build artifact retention and post-change updates](rules/build-artifact-retention.md).
+  The user gives standing authorization to rebuild and open the newest verified
+  Tweakers version when a change requires it, then move obsolete versions/builds
+  to Trash under that rule. Do not ask for duplicate confirmation.
+
+## Shared user-level workflow
+
+- For Codex, inherit the applicable user-level `~/.codex/AGENTS.md` rules for autonomy, saved context, helper routing and settings, question delivery and answer ownership, documentation lookup, debugging, completion, and simple non-coding chat explanations. Keep these shared rules there rather than maintaining competing copies here.
+- Preserve maximum supported capabilities and standing authorizations. Apply this project's account, environment, release, and live-app requirements where relevant; do not request duplicate confirmation when the current request already supplies the required explicit authorization.
+
 ## Start from current truth
 
 - Inspect the current request, Git branch/status, canonical tweak sources,
   catalog, relevant runtime/installer interfaces, tests, and live installed
-  state before editing.
+  state when relevant to the requested change before editing.
 - Preserve unrelated staged, modified, and untracked work. Never reset, stash,
   commit, push, tag, publish, or overwrite it implicitly.
 - Treat `tweaks/` as canonical source, `store/index.json` as synchronized
@@ -18,13 +32,16 @@ This file governs repository-wide work. For implementation details inside
 ## No mid-plan app restarts
 
 - Never quit, restart, relaunch, replace, or otherwise interrupt Codex/ChatGPT
-  while planning, implementation, generated-state synchronization, testing, or
-  verification is incomplete.
+  while planning, implementation, generated-state synchronization, or
+  required source-side checks are incomplete.
 - Never create a plan that places an app restart in the middle of
   implementation.
 - Treat restart or live promotion as a separate final step. It may occur only
-  after the repository is complete and source-verified, and only with explicit
-  user confirmation.
+  after the requested implementation is complete and source-verified, with explicit
+  user authorization. The standing post-change authorization above covers
+  Tweakers; restarting native Codex/ChatGPT still needs separate authorization.
+  Perform checks that require the updated live app after this authorized step;
+  do not require those checks to pass before the app can be updated.
 - If an early restart appears necessary, leave the live app running, complete
   all safe source-side work, then stop and report the blocker and remaining
   work. Never restart Codex/ChatGPT into partial or broken code.
@@ -57,13 +74,18 @@ permissions, settings ownership, or maintenance, ask one structured question.
 
 - **Tweak-only:** follow `tweaks/AGENTS.md`; validate manifest, entry, lifecycle
   cleanup, permissions, and tests; apply a semantic-version bump; run
-  `npm run sync:tweaks`; run focused tests, catalog check, build, and full suite;
-  then run one safe `tweaker dev-sync` snapshot and verify the live app.
-- **Runtime/installer:** run focused tests, typecheck/build, and full suite. Do
-  not quit or replace the live app automatically; leave full promotion to the
-  user-confirmed title-bar refresh flow.
+  `npm run sync:tweaks`; run focused tests, catalog check, and build. Broaden to
+  the full suite for shared runtime/lifecycle changes, cross-tweak effects, or
+  evidence of wider risk; then run one safe `tweaker dev-sync` snapshot and verify
+  the live app. Documentation-only changes require instruction/reference review,
+  not version bumps, regeneration, or live sync.
+- **Runtime/installer:** run focused tests, typecheck/build, and full suite.
+  When needed to apply the completed change, use the guarded refresh flow to
+  rebuild and open the newest verified Tweakers version under the standing
+  authorization, then perform live verification and eligible Trash cleanup.
 - **Release:** update versions and changelog, run synchronization in check mode,
-  history checks, build, and tests. A pushed semver tag is publication approval.
+  history checks, build, and tests. A semver tag push can trigger publication;
+  the existence of a tag is not evidence of user approval.
   Never push a tag or publish a release without explicit user authorization.
 
 ## Synchronization and live safety
@@ -84,16 +106,16 @@ permissions, settings ownership, or maintenance, ask one structured question.
 ## Chrome plugin profile
 
 - For [@Chrome](plugin://chrome@openai-bundled), use the friendly Chrome profile `codex` for this project.
-- Require exactly one extension backend whose `metadata.profileName` is `codex`; stop on zero or multiple matches instead of falling back to another profile.
+- Use any suitable supported browser tool and its profile-verification method. Verify `codex` on first use in a session and after a profile switch, reconnection, or evidence of an account change. Pause account-specific work on a missing or ambiguous match; continue independent work.
 
 ## Portless browser host
 
 - Use `https://tweakers.localhost/` as the only operator- and browser-facing URL for experimental browser host mode. The app-owned backend remains internal on `127.0.0.1:8765`.
-- Start the source checkout with `npm run browser -- --port 8765`. This command may restart Codex, so follow the no-mid-plan-restarts rule and obtain explicit user confirmation before running it.
+- Start the source checkout with `npm run browser -- --port 8765`. This command may restart Codex, so follow the no-mid-plan-restarts rule and require explicit user authorization before running it; do not ask again if that authorization is already present.
 - Never open the raw loopback URL in browser automation and never use `portless alias --force`; a conflicting route must fail before Codex is interrupted.
 
 ## Completion
 
-- Report the selected feature route, files/behavior changed, focused and full
-  verification, generated-state status, live sync/promotion result, remaining
-  restart requirement, and any unrelated work deliberately left untouched.
+- State the practical result, relevant verification, and anything unfinished. Scale detail to the task.
+- For feature work, include the selected owner/route. Include generated-state, live-sync, promotion, or restart status only when the task touches those surfaces. Explain skipped required checks.
+- For documentation-only work, report the instruction/reference checks; omit unrelated build, release, and live-app checklists.

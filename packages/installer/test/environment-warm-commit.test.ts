@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -70,12 +71,13 @@ function withFixture(
   run: (fixture: Fixture) => Promise<void> | void,
   sourceExperience: "chatgpt" | "tweakers" = "chatgpt",
 ): Promise<void> {
-  // The cache deliberately rejects symlink ancestors. Some Linux images make
-  // /tmp a /var alias, so use the physical test-workspace root instead.
-  const root = mkdtempSync(join(realpathSync(process.cwd()), ".tweaker-warm-commit-"));
+  // Resolve temporary-directory aliases so the cache still sees no symlink
+  // ancestors, without exposing transient fixtures to workspace Finder scans.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "tweaker-warm-commit-"));
   return Promise.resolve()
     .then(() => run(makeFixture(root, sourceExperience)))
-    .finally(() => { rmSync(root, { recursive: true, force: true }); });
+    // Finder can create .DS_Store between the recursive scan and final rmdir.
+    .finally(() => { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); });
 }
 
 function makeFixture(root: string, sourceExperience: "chatgpt" | "tweakers"): Fixture {

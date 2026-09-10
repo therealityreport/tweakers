@@ -591,7 +591,7 @@ test("update-chatgpt threads the exact --app option into its default transaction
   const source = readFileSync(new URL("../src/commands/update-codex.ts", import.meta.url), "utf8");
   assert.match(
     source,
-    /createDesktopUpdateTransaction\(\{ appPath: options\.app \}\)/,
+    /createDesktopUpdateTransaction\(\{ appPath: options\.app, officialOnly: true \}\)/,
   );
 });
 

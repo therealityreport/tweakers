@@ -98,6 +98,7 @@ const WINDOWS_LEGACY_INTERVAL_TASK_NAMES = [
 
 export interface LaunchdLoadedState {
   loaded: boolean;
+  disabled?: boolean | null;
   running: boolean;
   lastExitCode: number | null;
   command?: string | null;
@@ -598,9 +599,10 @@ function withWatcherRegistry(
   );
   const guardStatus = readWatcherStatus(
     join(lifecycleDirectory, "codex-mcp-guard-status.json"),
-    [1],
-    "v1",
+    [3],
+    "mcp-guard-status.v3",
     readJsonDocument,
+    true,
   );
 
   return {
@@ -705,6 +707,7 @@ function lifecycleProbe(
     statusSchemaVersion: number | null;
     policyVersion: string | null;
     error: string | null;
+    legacyStatusSchemaVersion: number | null;
   },
   pathExists: (path: string) => boolean,
   launchdState: (label: string) => LaunchdLoadedState,
@@ -713,6 +716,7 @@ function lifecycleProbe(
   return {
     installed: pathExists(plistPath),
     loaded: loaded.loaded,
+    disabled: loaded.disabled,
     running: loaded.running,
     lastExitCode: loaded.lastExitCode,
     lastRunAt: status.lastRunAt,
@@ -721,7 +725,8 @@ function lifecycleProbe(
     policyVersion: status.policyVersion,
     deferredReason: null,
     error: status.error,
-    supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [1],
+    supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [3],
+    legacyStatusSchemaVersion: status.legacyStatusSchemaVersion,
   };
 }
 
@@ -730,12 +735,14 @@ function readWatcherStatus(
   supportedSchemas: number[],
   fallbackPolicyVersion: string,
   readDocument: (path: string) => Record<string, unknown> | null = readJsonRecord,
+  requireGuardV3 = false,
 ): {
   lastRunAt: string | null;
   lastSuccessAt: string | null;
   statusSchemaVersion: number | null;
   policyVersion: string | null;
   error: string | null;
+  legacyStatusSchemaVersion: number | null;
 } {
   const document = readDocument(path);
   if (!document) {
@@ -745,6 +752,7 @@ function readWatcherStatus(
       statusSchemaVersion: null,
       policyVersion: fallbackPolicyVersion,
       error: `status missing: ${path}`,
+      legacyStatusSchemaVersion: null,
     };
   }
   const schemaVersion = numericValue(document.schema_version ?? document.schemaVersion);
@@ -754,6 +762,13 @@ function readWatcherStatus(
   const policyVersion = stringValue(
     document.cleanup_policy_version ?? document.policyVersion,
   ) ?? fallbackPolicyVersion;
+  const authority = stringValue(document.authority);
+  const taskDataAccess = stringValue(document.taskDataAccess);
+  const mutationCapabilities = document.mutationCapabilities;
+  const v3ContractValid = authority === "observation-and-notification-only"
+    && taskDataAccess === "none"
+    && Array.isArray(mutationCapabilities)
+    && mutationCapabilities.length === 0;
   const error = schemaVersion === null
     ? "status schema missing or invalid"
     : !supportedSchemas.includes(schemaVersion)
@@ -764,13 +779,18 @@ function readWatcherStatus(
           ? "status job missing or invalid"
           : jobOK === false
             ? stringValue(job.error) ?? "watcher reported an unhealthy run"
-            : null;
+            : requireGuardV3 && !v3ContractValid
+              ? "Guard v3 authority contract is missing or invalid"
+              : null;
   return {
     lastRunAt: generatedAt,
     lastSuccessAt: jobOK === true ? generatedAt : null,
     statusSchemaVersion: schemaVersion,
     policyVersion,
     error,
+    legacyStatusSchemaVersion: schemaVersion !== null && !supportedSchemas.includes(schemaVersion)
+      ? schemaVersion
+      : null,
   };
 }
 
@@ -846,20 +866,42 @@ function commandSucceeds(command: string, args: string[]): boolean {
 }
 
 function readLaunchdLoadedState(label = LAUNCHD_LABEL): LaunchdLoadedState {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const disabled = uid === null ? null : launchdDisabledState(
+    commandOutput("launchctl", ["print-disabled", `gui/${uid}`]),
+    label,
+  );
   const output = commandOutput("launchctl", ["list", label]);
-  if (output === null) return { loaded: false, running: false, lastExitCode: null };
+  if (output === null) return { loaded: false, disabled, running: false, lastExitCode: null };
   const pidMatch = output.match(/["']?PID["']?\s*[=:]\s*(\d+)/i);
   const exitMatch = output.match(/["']?LastExitStatus["']?\s*[=:]\s*(-?\d+)/i);
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
   const loadedDefinition = uid === null
     ? null
     : commandOutput("launchctl", ["print", `gui/${uid}/${label}`]);
   return {
     loaded: true,
+    disabled,
     running: Boolean(pidMatch && Number(pidMatch[1]) > 0),
     lastExitCode: exitMatch ? Number(exitMatch[1]) : null,
     command: loadedDefinition ? parseLaunchdLoadedCommand(loadedDefinition) : null,
   };
+}
+
+export function launchdDisabledState(output: string | null, label: string): boolean | null {
+  if (output === null) return null;
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = output.match(new RegExp(`(?:\\"|')?${escaped}(?:\\"|')?\\s*=>\\s*(true|false|disabled|enabled)(?=\\s|$|[,}])`, "i"));
+  if (!match?.[1]) return null;
+  switch (match[1].toLowerCase()) {
+    case "true":
+    case "disabled":
+      return true;
+    case "false":
+    case "enabled":
+      return false;
+    default:
+      return null;
+  }
 }
 
 export function parseLaunchdLoadedCommand(output: string): string | null {

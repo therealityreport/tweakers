@@ -10,6 +10,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -170,11 +171,14 @@ function fixture() {
 }
 
 /** Build one fully materialized, terminally proved v2 pair in this disposable GC fixture. */
-function makeProvedCurrentV2Pair(root: string): ReturnType<typeof environmentModeCachePaths> {
+function makeProvedCurrentV2Pair(
+  root: string,
+  generationId = "proved-v2-generation",
+): ReturnType<typeof environmentModeCachePaths> {
   const physicalRoot = realpathSync(root);
   const paths = environmentModeCachePaths(physicalRoot);
-  const generation = environmentModeCacheGenerationPaths(paths, "proved-v2-generation");
-  const liveAppPath = join(physicalRoot, "v2-live", "ChatGPT.app");
+  const generation = environmentModeCacheGenerationPaths(paths, generationId);
+  const liveAppPath = join(physicalRoot, `v2-live-${generationId}`, "ChatGPT.app");
   const writeApp = (appPath: string, marker: string): void => {
     mkdirSync(join(appPath, "Contents", "Resources"), { recursive: true });
     mkdirSync(join(appPath, "outer-only"), { recursive: true });
@@ -191,8 +195,8 @@ function makeProvedCurrentV2Pair(root: string): ReturnType<typeof environmentMod
   writeApp(generation.inactiveAppPath, "v2-target");
   writeTree(generation.runtimeRoot, "v2-runtime");
   writeTree(generation.managedRuntimeRoot, "v2-managed-runtime");
-  const backendRoot = join(physicalRoot, "v2-backend");
-  const nativeHostRoot = join(physicalRoot, "v2-native-host");
+  const backendRoot = join(physicalRoot, `v2-backend-${generationId}`);
+  const nativeHostRoot = join(physicalRoot, `v2-native-host-${generationId}`);
   writeTree(backendRoot, "v2-backend");
   writeTree(nativeHostRoot, "v2-native-host");
   writeFileSync(join(nativeHostRoot, "host"), "native-host");
@@ -492,6 +496,58 @@ test("a fully materialized current v2 pair with terminal journal proof safely su
     assert.equal(afterV2Proof.retainedRollbackTransactionId, null);
     assert.equal(afterV2Proof.entries.find((entry) => entry.transactionId === "old-committed")?.action, "delete");
     assert.equal(afterV2Proof.entries.find((entry) => entry.transactionId === "new-committed")?.action, "delete");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("GC reclaims a sparse 188 GiB schema-v2 prepared copy only when its exact generation is terminal and unreachable", () => {
+  const f = fixture();
+  try {
+    const obsoleteGenerationId = "obsolete-v2-generation";
+    const currentGenerationId = "current-v2-generation";
+    const missingGenerationId = "missing-v2-generation";
+    const cachePaths = makeProvedCurrentV2Pair(f.root, obsoleteGenerationId);
+    makeProvedCurrentV2Pair(f.root, currentGenerationId);
+
+    const obsoletePrepared = join(f.receiptRoot, obsoleteGenerationId, "prepared");
+    const currentPrepared = join(f.receiptRoot, currentGenerationId, "prepared");
+    const missingPrepared = join(f.receiptRoot, missingGenerationId, "prepared");
+    mkdirSync(obsoletePrepared, { recursive: true });
+    mkdirSync(currentPrepared, { recursive: true });
+    mkdirSync(missingPrepared, { recursive: true });
+    // This is sparse: it exercises the reported 188 GiB leak shape without
+    // consuming fixture disk space.
+    const sparsePayload = join(obsoletePrepared, "candidate-copy.sparse");
+    writeFileSync(sparsePayload, "");
+    truncateSync(sparsePayload, 188 * 1024 ** 3);
+    writeFileSync(join(currentPrepared, "payload"), "current must remain");
+    writeFileSync(join(missingPrepared, "payload"), "missing authority must remain");
+
+    const planned = runEnvironmentTransactionGc({
+      receiptRoot: f.receiptRoot,
+      transactionFile: f.transactionFile,
+      cachePaths,
+      mode: "dry-run",
+    });
+    const byId = new Map(planned.entries.map((entry) => [entry.transactionId, entry]));
+    assert.equal(byId.get(obsoleteGenerationId)?.action, "delete");
+    assert.match(byId.get(obsoleteGenerationId)?.reason ?? "", /matching schema-v2 generation.*terminal/);
+    assert.ok((byId.get(obsoleteGenerationId)?.bytes ?? 0) >= 188 * 1024 ** 3);
+    assert.equal(byId.get(currentGenerationId)?.action, "keep");
+    assert.equal(byId.get(missingGenerationId)?.action, "keep");
+    assert.match(byId.get(missingGenerationId)?.reason ?? "", /no archived receipt/);
+
+    const applied = runEnvironmentTransactionGc({
+      receiptRoot: f.receiptRoot,
+      transactionFile: f.transactionFile,
+      cachePaths,
+      mode: "apply",
+    });
+    assert.equal(applied.entries.find((entry) => entry.transactionId === obsoleteGenerationId)?.action, "deleted");
+    assert.equal(existsSync(obsoletePrepared), false);
+    assert.equal(existsSync(currentPrepared), true);
+    assert.equal(existsSync(missingPrepared), true);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

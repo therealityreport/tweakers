@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MCP_CANDIDATE_CODEX_HOME_ENV = exports.MCP_CANDIDATE_RECONCILIATION_ENV = void 0;
+exports.MCP_DERIVED_VARIANT_ENV = exports.MCP_CANDIDATE_CODEX_HOME_ENV = exports.MCP_CANDIDATE_RECONCILIATION_ENV = void 0;
 exports.resolveMcpRuntimePaths = resolveMcpRuntimePaths;
 exports.reconcileMcpConfig = reconcileMcpConfig;
 exports.createMcpReconciler = createMcpReconciler;
@@ -15,13 +15,16 @@ const node_util_1 = require("node:util");
 const mcp_sync_1 = require("./mcp-sync");
 exports.MCP_CANDIDATE_RECONCILIATION_ENV = "TWEAKERS_CANDIDATE_MCP_RECONCILIATION";
 exports.MCP_CANDIDATE_CODEX_HOME_ENV = "CODEX_HOME";
+exports.MCP_DERIVED_VARIANT_ENV = "TWEAKERS_DERIVED_VARIANT";
 /**
  * Resolve the only MCP config and receipt paths the desktop reconciler may use.
  *
  * Ordinary launches intentionally retain the historical ~/.codex/config.toml
  * behavior, even when CODEX_HOME happens to be present. A disposable candidate
  * must explicitly opt in and supply an exact CODEX_HOME below its exact,
- * non-symlink Tweakers user root. Existing symlink components, the real
+ * non-symlink Tweakers user root. A derived variant also has to supply that
+ * isolated CODEX_HOME when its derived marker is active; unlike a candidate,
+ * its reconciler is disabled by main.ts. Existing symlink components, the real
  * ~/.codex tree, and paths outside the candidate root fail closed before a
  * watcher or reconciler can be created.
  */
@@ -31,6 +34,43 @@ function resolveMcpRuntimePaths(options) {
     const ordinaryCodexHome = (0, node_path_1.join)(options.homeDirectory, ".codex");
     const candidateOptIn = env[exports.MCP_CANDIDATE_RECONCILIATION_ENV];
     if (candidateOptIn === undefined || candidateOptIn === "") {
+        if (env[exports.MCP_DERIVED_VARIANT_ENV] === "1") {
+            const derivedCodexHome = env[exports.MCP_CANDIDATE_CODEX_HOME_ENV];
+            if (!derivedCodexHome) {
+                throw new Error(`${exports.MCP_CANDIDATE_CODEX_HOME_ENV} is required for derived variant MCP isolation`);
+            }
+            assertExactAbsolutePath(options.userRoot, "Tweakers derived user root");
+            assertExactAbsolutePath(derivedCodexHome, "Derived CODEX_HOME");
+            assertExistingDirectoryWithoutSymlinks(options.userRoot, "Tweakers derived user root");
+            assertPathHasNoExistingSymlink(derivedCodexHome, "Derived CODEX_HOME");
+            if (!isStrictDescendant(options.userRoot, derivedCodexHome)) {
+                throw new Error("Derived CODEX_HOME must be contained under the Tweakers derived user root");
+            }
+            const resolvedDerivedHome = resolveThroughExistingAncestor(derivedCodexHome);
+            const resolvedOrdinaryHome = resolveThroughExistingAncestor(ordinaryCodexHome);
+            if (resolvedDerivedHome === resolvedOrdinaryHome
+                || isStrictDescendant(resolvedOrdinaryHome, resolvedDerivedHome)
+                || isStrictDescendant(resolvedDerivedHome, resolvedOrdinaryHome)) {
+                throw new Error("Derived CODEX_HOME must not resolve to or contain the real ~/.codex directory");
+            }
+            if ((0, node_fs_1.existsSync)(derivedCodexHome) && !(0, node_fs_1.lstatSync)(derivedCodexHome).isDirectory()) {
+                throw new Error("Derived CODEX_HOME must be a directory when it already exists");
+            }
+            const configPath = (0, node_path_1.join)(derivedCodexHome, "config.toml");
+            assertPathHasNoExistingSymlink(configPath, "Derived Codex config");
+            assertPathHasNoExistingSymlink(statePath, "Derived MCP receipt");
+            assertRegularFileWhenPresent(configPath, "Derived Codex config");
+            assertRegularFileWhenPresent(statePath, "Derived MCP receipt");
+            return {
+                codexHome: derivedCodexHome,
+                configPath,
+                statePath,
+                // This flag remains a proof of the explicit disposable-candidate
+                // opt-in. A normal derived app uses isolated paths but must not satisfy
+                // the candidate health gate merely because both mode markers exist.
+                candidateIsolated: false,
+            };
+        }
         return {
             codexHome: ordinaryCodexHome,
             configPath: (0, node_path_1.join)(ordinaryCodexHome, "config.toml"),

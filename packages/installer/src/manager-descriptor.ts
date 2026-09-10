@@ -23,9 +23,23 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { MANAGER_PROTOCOL_VERSION, TWEAKERS_MANAGER_ID } from "./manager-contract.js";
 import { targetUserHome, targetUserOwnership, type UserOwnership } from "./ownership.js";
+import { explicitTweakersUserRoot } from "./paths.js";
+import { readRuntimeFingerprintEvidence, type RuntimeTreeFingerprint } from "./runtime-fingerprint.js";
+import {
+  REQUIRED_SEALED_MANAGER_SUPPORT_FILES,
+  SEALED_MANAGER_SUPPORT_DIRECTORY,
+} from "./manager-runtime-assets.js";
+import {
+  readManagedRuntimeFingerprintEvidence,
+  type ManagedRuntimeTreeFingerprint,
+} from "./managed-runtime.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultAssetsRoot = resolve(here, "..", "assets", "manager-launcher");
+const defaultRuntimeAssetsRoot = resolve(here, "..", "assets", "runtime");
+const defaultManagedRuntimeAssetsRoot = resolve(here, "..", "assets", "managed-runtime");
+const MANAGER_RUNTIME_FINGERPRINT_MARKER = "TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1";
+const MANAGER_MANAGED_RUNTIME_FINGERPRINT_MARKER = "TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1";
 
 /** The descriptor is a publisher-owned declaration, never a host trust record. */
 export const MANAGER_DESCRIPTOR_SCHEMA_VERSION = 1 as const;
@@ -35,7 +49,15 @@ export const TWEAKERS_MANAGER_LAUNCHER_NAME = "Tweakers Manager Launcher" as con
 export const TWEAKERS_MANAGER_BUNDLE_NAME = "manager.mjs" as const;
 export const TWEAKERS_MANAGER_SEAL_NAME = "target.seal" as const;
 export const TWEAKERS_MANAGER_SEAL_HEADER = "TWEAKERS_MANAGER_TARGET_SEAL_V1" as const;
-const managerSigningPolicy = readManagerSigningPolicy(join(defaultAssetsRoot, "signing-policy.json"));
+const PINNED_MANAGER_DESIGNATED_REQUIREMENT =
+  'identifier "com.therealityreport.tweakers.manager-launcher" and certificate leaf = H"631275551276127985a524acf1f469bf5164d50d"';
+const managerSigningPolicyPath = join(defaultAssetsRoot, "signing-policy.json");
+// The sealed manager bundle is published without the source asset tree. Keep
+// the exact requirement compiled into that bundle while still validating the
+// policy file whenever the source/package layout provides it.
+const managerSigningPolicy = existsSync(managerSigningPolicyPath)
+  ? readManagerSigningPolicy(managerSigningPolicyPath)
+  : { designatedRequirement: PINNED_MANAGER_DESIGNATED_REQUIREMENT };
 // `codesign -d -r-` emits this exact canonical requirement for the fixed
 // launcher built by native-host. Treat it as a single opaque value: accepting
 // a substring would permit an attacker to append an `or` branch or another
@@ -75,11 +97,14 @@ export interface TweakersManagerTargetSealV1 {
   nodePath: string;
   nodeSha256: string;
   managerSha256: string;
+  managedRuntimeFingerprint: string;
 }
 
 export interface ManagerArtifactPaths {
   launcher: string;
   bundle: string;
+  runtime: string;
+  managedRuntime: string;
 }
 
 export interface TweakersManagerDescriptorPaths {
@@ -101,10 +126,18 @@ export interface PublishedTweakersManagerDescriptor {
   generationRoot: string;
   launcher: string;
   bundle: string;
+  runtime: string;
+  managedRuntime: string;
   seal: string;
   descriptor: TweakersManagerDescriptorV1;
   signing: ManagerSigningEvidence;
   reusedGeneration: boolean;
+  /**
+   * Compensate a later promotion failure only while this exact descriptor is
+   * still current. This deliberately refuses to overwrite a concurrent
+   * publisher's descriptor.
+   */
+  restoreOnFailure(): void;
 }
 
 export interface ManagerDescriptorDependencies {
@@ -114,6 +147,8 @@ export interface ManagerDescriptorDependencies {
   owner?: () => UserOwnership | null;
   nodePath?: () => string;
   beforeDescriptorPublish?: () => void;
+  /** Test-only fault seam after descriptor publication and round-trip verification. */
+  afterDescriptorPublish?: () => void;
 }
 
 export interface PublishTweakersManagerDescriptorOptions {
@@ -155,7 +190,31 @@ export function defaultManagerArtifactPaths(): ManagerArtifactPaths {
   return {
     launcher: join(defaultAssetsRoot, TWEAKERS_MANAGER_LAUNCHER_NAME),
     bundle: join(defaultAssetsRoot, TWEAKERS_MANAGER_BUNDLE_NAME),
+    runtime: defaultRuntimeAssetsRoot,
+    managedRuntime: defaultManagedRuntimeAssetsRoot,
   };
+}
+
+/**
+ * The manager always owns its immutable generations under the current
+ * Tweakers root. Independent app state is a child at `variants/tweakers`;
+ * it is never itself a manager-generation root.
+ */
+export function canonicalTweakersManagerRoot(homeRoot = targetUserHome() || homedir()): string {
+  const exactHome = requireExactAbsolutePath(resolve(homeRoot), "Tweakers manager home root");
+  return join(exactHome, "Library", "Application Support", "Tweakers");
+}
+
+/**
+ * A sealed launcher starts Node with an empty environment, so its ordinary
+ * route is the canonical global root. Explicit CLI/test root bindings retain
+ * precedence without reviving the archived on-disk fallback.
+ */
+export function resolveSealedTweakersManagerUserRoot(
+  explicitRoot = explicitTweakersUserRoot(),
+  homeRoot?: string,
+): string {
+  return explicitRoot ?? canonicalTweakersManagerRoot(homeRoot);
 }
 
 export function createTweakersManagerGenerationId(input: Omit<TweakersManagerTargetSealV1, "generationId">): string {
@@ -167,6 +226,7 @@ export function createTweakersManagerGenerationId(input: Omit<TweakersManagerTar
     `node-path=${input.nodePath}`,
     `node-sha256=${input.nodeSha256}`,
     `manager-sha256=${input.managerSha256}`,
+    `managed-runtime-fingerprint=${input.managedRuntimeFingerprint}`,
     "",
   ].join("\n");
   return sha256Text(preimage);
@@ -183,6 +243,7 @@ export function serializeTweakersManagerTargetSeal(seal: TweakersManagerTargetSe
     `node-path=${seal.nodePath}`,
     `node-sha256=${seal.nodeSha256}`,
     `manager-sha256=${seal.managerSha256}`,
+    `managed-runtime-fingerprint=${seal.managedRuntimeFingerprint}`,
     "",
   ].join("\n");
 }
@@ -193,7 +254,7 @@ export function parseTweakersManagerTargetSeal(text: string): TweakersManagerTar
   }
   const lines = text.split("\n");
   // The final empty string exists solely because the fixed format requires one LF.
-  if (lines.length !== 9 || lines[8] !== "" || lines[0] !== TWEAKERS_MANAGER_SEAL_HEADER) {
+  if (lines.length !== 10 || lines[9] !== "" || lines[0] !== TWEAKERS_MANAGER_SEAL_HEADER) {
     throw new Error("Tweakers manager target seal has an invalid fixed record count or header");
   }
   const values = [
@@ -204,6 +265,7 @@ export function parseTweakersManagerTargetSeal(text: string): TweakersManagerTar
     ["node-path", lines[5]],
     ["node-sha256", lines[6]],
     ["manager-sha256", lines[7]],
+    ["managed-runtime-fingerprint", lines[8]],
   ].map(([key, line]) => {
     const prefix = `${key}=`;
     if (typeof line !== "string" || !line.startsWith(prefix)) {
@@ -219,6 +281,7 @@ export function parseTweakersManagerTargetSeal(text: string): TweakersManagerTar
     nodePath: values[4]!,
     nodeSha256: values[5]!,
     managerSha256: values[6]!,
+    managedRuntimeFingerprint: values[7]!,
   };
   assertTargetSeal(seal);
   return seal;
@@ -318,6 +381,16 @@ export function publishTweakersManagerDescriptor(
   const assets = resolveManagerArtifactPaths(options.assets);
   assertSourceArtifact(assets.launcher, "Tweakers Manager Launcher");
   assertSourceArtifact(assets.bundle, "Tweakers manager bundle");
+  const runtimeEvidence = assertSourceRuntimeArtifact(assets.runtime);
+  const managedRuntimeEvidence = assertSourceManagedRuntimeArtifact(assets.managedRuntime);
+  const compiledRuntimeFingerprint = readManagerBundleRuntimeFingerprint(assets.bundle);
+  const compiledManagedRuntimeFingerprint = readManagerBundleManagedRuntimeFingerprint(assets.bundle);
+  if (compiledRuntimeFingerprint !== runtimeEvidence.fingerprint) {
+    throw new Error("Tweakers manager bundle and packaged runtime fingerprints do not match");
+  }
+  if (compiledManagedRuntimeFingerprint !== managedRuntimeEvidence.fingerprint) {
+    throw new Error("Tweakers manager bundle and packaged managed-runtime fingerprints do not match");
+  }
   const signing = (dependencies.verifyLauncherSignature ?? verifyTweakersManagerLauncherSignature)(assets.launcher);
   assertSigningEvidence(signing);
 
@@ -332,6 +405,7 @@ export function publishTweakersManagerDescriptor(
     nodePath: node.path,
     nodeSha256: node.sha256,
     managerSha256,
+    managedRuntimeFingerprint: managedRuntimeEvidence.fingerprint,
   } as const;
   const generationId = createTweakersManagerGenerationId(sealBase);
   const seal: TweakersManagerTargetSealV1 = { ...sealBase, generationId };
@@ -339,9 +413,35 @@ export function publishTweakersManagerDescriptor(
   const managerRoot = ensureManagedDirectory(join(paths.userRoot, "managers"), owner, "manager root");
   const managerIdRoot = ensureManagedDirectory(join(managerRoot, TWEAKERS_MANAGER_ID), owner, "manager identity root");
   const generationsRoot = ensureManagedDirectory(join(managerIdRoot, "generations"), owner, "manager generations root");
+  const runtimeGenerationsRoot = ensureManagedDirectory(
+    join(managerIdRoot, "runtime-generations"),
+    owner,
+    "manager runtime generations root",
+  );
+  const managedRuntimeGenerationsRoot = ensureManagedDirectory(
+    join(managerIdRoot, "managed-runtime-generations"),
+    owner,
+    "manager managed-runtime generations root",
+  );
   if (generationsRoot !== paths.generationsRoot) {
     throw new Error("Tweakers manager generation root resolution drifted");
   }
+  const runtimeGenerationRoot = join(runtimeGenerationsRoot, runtimeEvidence.fingerprint);
+  publishOrValidateRuntimeGeneration({
+    source: assets.runtime,
+    runtimeGenerationRoot,
+    runtimeGenerationsRoot,
+    owner,
+    evidence: runtimeEvidence,
+  });
+  const managedRuntimeGenerationRoot = join(managedRuntimeGenerationsRoot, managedRuntimeEvidence.fingerprint);
+  publishOrValidateManagedRuntimeGeneration({
+    source: assets.managedRuntime,
+    managedRuntimeGenerationRoot,
+    managedRuntimeGenerationsRoot,
+    owner,
+    evidence: managedRuntimeEvidence,
+  });
   const generationRoot = join(generationsRoot, generationId);
   const existing = existsSync(generationRoot);
   if (existing) {
@@ -353,7 +453,8 @@ export function publishTweakersManagerDescriptor(
   // at an unchecked object after a failed or concurrent publication attempt.
   validateTweakersManagerGeneration({ generationRoot, paths, owner, seal, signing, node });
 
-  dependencies.beforeDescriptorPublish?.();
+  ensureDescriptorDirectory(paths.descriptorRoot, owner);
+  const priorDescriptor = captureDescriptorSnapshot(paths.descriptorFile, owner);
   const descriptor: TweakersManagerDescriptorV1 = {
     schemaVersion: MANAGER_DESCRIPTOR_SCHEMA_VERSION,
     managerId: TWEAKERS_MANAGER_ID,
@@ -364,23 +465,43 @@ export function publishTweakersManagerDescriptor(
     updatedAt: normalizedNow(dependencies.now),
   };
   assertTweakersManagerDescriptor(descriptor);
-  ensureDescriptorDirectory(paths.descriptorRoot, owner);
-  writeDescriptorAtomically(paths.descriptorFile, serializeTweakersManagerDescriptor(descriptor), owner);
-  const written = parseTweakersManagerDescriptor(readFileSync(paths.descriptorFile, "utf8"));
-  if (serializeTweakersManagerDescriptor(written) !== serializeTweakersManagerDescriptor(descriptor)) {
-    throw new Error("Tweakers manager descriptor did not round-trip after atomic publication");
-  }
-  return {
-    paths,
-    generationId,
-    generationRoot,
-    launcher: descriptor.executable,
-    bundle: join(generationRoot, TWEAKERS_MANAGER_BUNDLE_NAME),
-    seal: join(generationRoot, TWEAKERS_MANAGER_SEAL_NAME),
-    descriptor,
-    signing,
-    reusedGeneration: existing,
+  const descriptorText = serializeTweakersManagerDescriptor(descriptor);
+  const restoreOnFailure = (): void => {
+    restoreDescriptorSnapshot(paths.descriptorFile, priorDescriptor, descriptorText, owner);
   };
+  try {
+    dependencies.beforeDescriptorPublish?.();
+    writeDescriptorAtomically(paths.descriptorFile, descriptorText, owner);
+    const written = parseTweakersManagerDescriptor(readFileSync(paths.descriptorFile, "utf8"));
+    if (serializeTweakersManagerDescriptor(written) !== descriptorText) {
+      throw new Error("Tweakers manager descriptor did not round-trip after atomic publication");
+    }
+    dependencies.afterDescriptorPublish?.();
+    return {
+      paths,
+      generationId,
+      generationRoot,
+      launcher: descriptor.executable,
+      bundle: join(generationRoot, TWEAKERS_MANAGER_BUNDLE_NAME),
+      runtime: runtimeGenerationRoot,
+      managedRuntime: managedRuntimeGenerationRoot,
+      seal: join(generationRoot, TWEAKERS_MANAGER_SEAL_NAME),
+      descriptor,
+      signing,
+      reusedGeneration: existing,
+      restoreOnFailure,
+    };
+  } catch (error) {
+    try {
+      restoreOnFailure();
+    } catch (restoreError) {
+      throw new AggregateError(
+        [error, restoreError],
+        "Tweakers manager descriptor publication failed and its prior descriptor could not be safely restored.",
+      );
+    }
+    throw error;
+  }
 }
 
 /**
@@ -436,6 +557,8 @@ export function validateTweakersManagerGeneration(input: ValidateTweakersManager
     [join(input.paths.userRoot, "managers"), "manager root"],
     [input.paths.managerRoot, "manager identity root"],
     [input.paths.generationsRoot, "manager generations root"],
+    [join(input.paths.managerRoot, "runtime-generations"), "manager runtime generations root"],
+    [join(input.paths.managerRoot, "managed-runtime-generations"), "manager managed-runtime generations root"],
     [exactGeneration, "manager generation"],
   ] as const) {
     assertExactOwnedDirectory(path, input.owner, MANAGER_DIRECTORY_MODE, label);
@@ -454,6 +577,17 @@ export function validateTweakersManagerGeneration(input: ValidateTweakersManager
   assertExactOwnedRegularFile(sealFile, input.owner, MANAGER_DATA_MODE, "Tweakers manager target seal");
   if (sha256File(launcher) !== input.seal.launcherSha256) throw new Error("Tweakers Manager Launcher digest drifted");
   if (sha256File(bundle) !== input.seal.managerSha256) throw new Error("Tweakers manager bundle digest drifted");
+  const runtimeFingerprint = readManagerBundleRuntimeFingerprint(bundle);
+  validateRuntimeGeneration(
+    join(input.paths.managerRoot, "runtime-generations", runtimeFingerprint),
+    input.owner,
+    { fingerprint: runtimeFingerprint, fileCount: null },
+  );
+  validateManagedRuntimeGeneration(
+    join(input.paths.managerRoot, "managed-runtime-generations", input.seal.managedRuntimeFingerprint),
+    input.owner,
+    { fingerprint: input.seal.managedRuntimeFingerprint, fileCount: null },
+  );
   const parsedSeal = parseTweakersManagerTargetSeal(readFileSync(sealFile, "utf8"));
   if (!sameTargetSeal(parsedSeal, input.seal)) throw new Error("Tweakers manager target seal drifted");
   const computedGeneration = createTweakersManagerGenerationId({
@@ -463,6 +597,7 @@ export function validateTweakersManagerGeneration(input: ValidateTweakersManager
     nodePath: parsedSeal.nodePath,
     nodeSha256: parsedSeal.nodeSha256,
     managerSha256: parsedSeal.managerSha256,
+    managedRuntimeFingerprint: parsedSeal.managedRuntimeFingerprint,
   });
   if (computedGeneration !== parsedSeal.generationId) throw new Error("Tweakers manager target seal generation digest is invalid");
   if (parsedSeal.nodePath !== input.node.path || parsedSeal.nodeSha256 !== input.node.sha256) {
@@ -519,11 +654,255 @@ function publishImmutableGeneration(input: {
   });
 }
 
+function publishOrValidateRuntimeGeneration(input: {
+  source: string;
+  runtimeGenerationRoot: string;
+  runtimeGenerationsRoot: string;
+  owner: UserOwnership;
+  evidence: RuntimeTreeFingerprint;
+}): void {
+  if (existsSync(input.runtimeGenerationRoot)) {
+    validateRuntimeGeneration(input.runtimeGenerationRoot, input.owner, input.evidence);
+    return;
+  }
+  const staging = join(
+    input.runtimeGenerationsRoot,
+    `.${input.evidence.fingerprint}.staging-${randomUUID()}`,
+  );
+  assertChildPath(input.runtimeGenerationsRoot, staging, "Tweakers manager runtime staging generation");
+  mkdirSync(staging, { mode: MANAGER_DIRECTORY_MODE });
+  try {
+    normalizeOwnedPath(staging, input.owner, MANAGER_DIRECTORY_MODE, "Tweakers manager runtime staging generation");
+    copyRuntimeTreeContents(input.source, staging, input.owner);
+    fsyncDirectory(staging);
+    try {
+      renameSync(staging, input.runtimeGenerationRoot);
+    } catch (error) {
+      if (!existsSync(input.runtimeGenerationRoot)) throw error;
+    }
+    fsyncDirectory(input.runtimeGenerationsRoot);
+  } finally {
+    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+  }
+  validateRuntimeGeneration(input.runtimeGenerationRoot, input.owner, input.evidence);
+}
+
+function publishOrValidateManagedRuntimeGeneration(input: {
+  source: string;
+  managedRuntimeGenerationRoot: string;
+  managedRuntimeGenerationsRoot: string;
+  owner: UserOwnership;
+  evidence: ManagedRuntimeTreeFingerprint;
+}): void {
+  if (existsSync(input.managedRuntimeGenerationRoot)) {
+    validateManagedRuntimeGeneration(input.managedRuntimeGenerationRoot, input.owner, input.evidence);
+    return;
+  }
+  const staging = join(
+    input.managedRuntimeGenerationsRoot,
+    `.${input.evidence.fingerprint}.staging-${randomUUID()}`,
+  );
+  assertChildPath(input.managedRuntimeGenerationsRoot, staging, "Tweakers manager managed-runtime staging generation");
+  mkdirSync(staging, { mode: MANAGER_DIRECTORY_MODE });
+  try {
+    normalizeOwnedPath(staging, input.owner, MANAGER_DIRECTORY_MODE, "Tweakers manager managed-runtime staging generation");
+    copyRuntimeTreeContents(input.source, staging, input.owner);
+    fsyncDirectory(staging);
+    try {
+      renameSync(staging, input.managedRuntimeGenerationRoot);
+    } catch (error) {
+      if (!existsSync(input.managedRuntimeGenerationRoot)) throw error;
+    }
+    fsyncDirectory(input.managedRuntimeGenerationsRoot);
+  } finally {
+    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+  }
+  validateManagedRuntimeGeneration(input.managedRuntimeGenerationRoot, input.owner, input.evidence);
+}
+
+function copyRuntimeTreeContents(source: string, destination: string, owner: UserOwnership): void {
+  for (const entry of readdirSync(source, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+    const from = join(source, entry.name);
+    const to = join(destination, entry.name);
+    const stat = lstatSync(from);
+    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      mkdirSync(to, { mode: MANAGER_DIRECTORY_MODE });
+      normalizeOwnedPath(to, owner, MANAGER_DIRECTORY_MODE, "Tweakers manager runtime directory");
+      copyRuntimeTreeContents(from, to, owner);
+      fsyncDirectory(to);
+      continue;
+    }
+    if (!entry.isFile() || entry.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error(`Tweakers manager runtime source contains an unsupported entry: ${from}`);
+    }
+    const mode = (stat.mode & 0o100) !== 0 ? MANAGER_LAUNCHER_MODE : MANAGER_DATA_MODE;
+    copyImmutableArtifact(from, to, owner, mode, "Tweakers manager runtime file");
+  }
+}
+
+function validateRuntimeGeneration(
+  root: string,
+  owner: UserOwnership,
+  expected: { fingerprint: string; fileCount: number | null },
+): void {
+  if (basename(root) !== expected.fingerprint) {
+    throw new Error("Tweakers manager runtime generation path does not match its fingerprint");
+  }
+  assertExactOwnedDirectory(root, owner, MANAGER_DIRECTORY_MODE, "Tweakers manager runtime generation");
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        assertExactOwnedDirectory(path, owner, MANAGER_DIRECTORY_MODE, "Tweakers manager runtime directory");
+        walk(path);
+      } else if (entry.isFile() && !entry.isSymbolicLink()) {
+        const stat = lstatSync(path);
+        const mode = stat.mode & 0o7777;
+        if ((mode !== MANAGER_DATA_MODE && mode !== MANAGER_LAUNCHER_MODE)
+          || stat.uid !== owner.uid
+          || stat.nlink !== 1
+          || realpathSync(path) !== path) {
+          throw new Error("Tweakers manager runtime file has an unsafe owner, mode, or identity");
+        }
+      } else {
+        throw new Error("Tweakers manager runtime generation contains a symlink or unsupported entry");
+      }
+    }
+  };
+  walk(root);
+  const evidence = readRuntimeFingerprintEvidence(root);
+  if (evidence === null
+    || evidence.fingerprint !== expected.fingerprint
+    || (expected.fileCount !== null && evidence.fileCount !== expected.fileCount)) {
+    throw new Error("Tweakers manager runtime generation failed its content fingerprint");
+  }
+}
+
+function validateManagedRuntimeGeneration(
+  root: string,
+  owner: UserOwnership,
+  expected: { fingerprint: string; fileCount: number | null },
+): void {
+  if (basename(root) !== expected.fingerprint) {
+    throw new Error("Tweakers manager managed-runtime generation path does not match its fingerprint");
+  }
+  assertExactOwnedDirectory(root, owner, MANAGER_DIRECTORY_MODE, "Tweakers manager managed-runtime generation");
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        assertExactOwnedDirectory(path, owner, MANAGER_DIRECTORY_MODE, "Tweakers manager managed-runtime directory");
+        walk(path);
+      } else if (entry.isFile() && !entry.isSymbolicLink()) {
+        const stat = lstatSync(path);
+        const mode = stat.mode & 0o7777;
+        if ((mode !== MANAGER_DATA_MODE && mode !== MANAGER_LAUNCHER_MODE)
+          || stat.uid !== owner.uid
+          || stat.nlink !== 1
+          || realpathSync(path) !== path) {
+          throw new Error("Tweakers manager managed-runtime file has an unsafe owner, mode, or identity");
+        }
+      } else {
+        throw new Error("Tweakers manager managed-runtime generation contains a symlink or unsupported entry");
+      }
+    }
+  };
+  walk(root);
+  const evidence = readManagedRuntimeFingerprintEvidence(root);
+  if (evidence === null
+    || evidence.fingerprint !== expected.fingerprint
+    || (expected.fileCount !== null && evidence.fileCount !== expected.fileCount)) {
+    throw new Error("Tweakers manager managed-runtime generation failed its content fingerprint");
+  }
+}
+
+function assertSourceRuntimeArtifact(path: string): RuntimeTreeFingerprint {
+  const exact = requireExactAbsolutePath(path, "Tweakers manager runtime asset");
+  if (!existsSync(exact)) throw new Error(`Tweakers manager runtime asset is missing: ${exact}`);
+  const walk = (directory: string): void => {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("Tweakers manager runtime source must contain only real directories and regular files");
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      const childStat = lstatSync(child);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) walk(child);
+      else if (!entry.isFile() || entry.isSymbolicLink() || childStat.nlink !== 1) {
+        throw new Error(`Tweakers manager runtime source contains an unsupported entry: ${child}`);
+      }
+    }
+  };
+  walk(exact);
+  const supportRoot = join(exact, SEALED_MANAGER_SUPPORT_DIRECTORY);
+  for (const relativePath of REQUIRED_SEALED_MANAGER_SUPPORT_FILES) {
+    const file = join(supportRoot, relativePath);
+    let stat;
+    try {
+      stat = lstatSync(file);
+    } catch {
+      throw new Error(`Tweakers manager runtime source is missing support asset: ${relativePath}`);
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || realpathSync(file) !== file) {
+      throw new Error(`Tweakers manager runtime support asset has an unsafe identity: ${relativePath}`);
+    }
+  }
+  const evidence = readRuntimeFingerprintEvidence(exact);
+  if (evidence === null) throw new Error("Tweakers manager runtime asset failed its packaged fingerprint");
+  return evidence;
+}
+
+function assertSourceManagedRuntimeArtifact(path: string): ManagedRuntimeTreeFingerprint {
+  const exact = requireExactAbsolutePath(path, "Tweakers manager managed-runtime asset");
+  if (!existsSync(exact)) throw new Error(`Tweakers manager managed-runtime asset is missing: ${exact}`);
+  const walk = (directory: string): void => {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("Tweakers manager managed-runtime source must contain only real directories and regular files");
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      const childStat = lstatSync(child);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) walk(child);
+      else if (!entry.isFile() || entry.isSymbolicLink() || childStat.nlink !== 1) {
+        throw new Error(`Tweakers manager managed-runtime source contains an unsupported entry: ${child}`);
+      }
+    }
+  };
+  walk(exact);
+  const evidence = readManagedRuntimeFingerprintEvidence(exact);
+  if (evidence === null) throw new Error("Tweakers manager managed-runtime asset failed its packaged fingerprint");
+  return evidence;
+}
+
+function readManagerBundleRuntimeFingerprint(bundle: string): string {
+  return readSingleManagerBundleFingerprint(bundle, MANAGER_RUNTIME_FINGERPRINT_MARKER, "runtime");
+}
+
+function readManagerBundleManagedRuntimeFingerprint(bundle: string): string {
+  return readSingleManagerBundleFingerprint(bundle, MANAGER_MANAGED_RUNTIME_FINGERPRINT_MARKER, "managed-runtime");
+}
+
+function readSingleManagerBundleFingerprint(bundle: string, markerName: string, label: string): string {
+  const text = readFileSync(bundle, "utf8");
+  const marker = new RegExp(`(?:^|\\n)//# ${markerName}=([a-f0-9]{64})\\n`, "g");
+  const matches = [...text.matchAll(marker)];
+  if (matches.length !== 1 || !matches[0]?.[1]) {
+    throw new Error(`Tweakers manager bundle has no unique sealed packaged ${label} fingerprint`);
+  }
+  return matches[0][1];
+}
+
 function resolveManagerArtifactPaths(override: Partial<ManagerArtifactPaths> | undefined): ManagerArtifactPaths {
   const defaults = defaultManagerArtifactPaths();
   return {
     launcher: requireExactAbsolutePath(override?.launcher ?? defaults.launcher, "Tweakers Manager Launcher asset"),
     bundle: requireExactAbsolutePath(override?.bundle ?? defaults.bundle, "Tweakers manager bundle asset"),
+    runtime: requireExactAbsolutePath(override?.runtime ?? defaults.runtime, "Tweakers manager runtime asset"),
+    managedRuntime: requireExactAbsolutePath(
+      override?.managedRuntime ?? defaults.managedRuntime,
+      "Tweakers manager managed-runtime asset",
+    ),
   };
 }
 
@@ -700,6 +1079,50 @@ function writeDescriptorAtomically(path: string, text: string, owner: UserOwners
   }
 }
 
+interface DescriptorSnapshot {
+  text: string | null;
+}
+
+/**
+ * Preserve only an exact publisher-owned descriptor. A descriptor is a
+ * discovery record, so retaining its original bytes is required to undo a
+ * failed outer promotion without interpreting a previous protocol version.
+ */
+function captureDescriptorSnapshot(path: string, owner: UserOwnership): DescriptorSnapshot {
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if (isMissingPathError(error)) return { text: null };
+    throw error;
+  }
+  assertExactOwnedRegularFile(path, owner, DESCRIPTOR_MODE, "Tweakers manager descriptor");
+  return { text: readFileSync(path, "utf8") };
+}
+
+/**
+ * Restore only when the descriptor remains either the old snapshot or the
+ * exact bytes just published by this invocation. Any third state is a
+ * concurrent or hostile change and must remain untouched for investigation.
+ */
+function restoreDescriptorSnapshot(
+  path: string,
+  prior: DescriptorSnapshot,
+  publishedText: string,
+  owner: UserOwnership,
+): void {
+  const current = captureDescriptorSnapshot(path, owner);
+  if (current.text === prior.text) return;
+  if (current.text !== publishedText) {
+    throw new Error("Tweakers manager descriptor changed during publication; refusing to overwrite it during rollback");
+  }
+  if (prior.text === null) {
+    unlinkSync(path);
+    fsyncDirectory(dirname(path));
+    return;
+  }
+  writeDescriptorAtomically(path, prior.text, owner);
+}
+
 function assertSourceArtifact(path: string, label: string): void {
   const exact = requireExactAbsolutePath(path, `${label} asset`);
   if (!existsSync(exact)) throw new Error(`${label} asset is missing: ${exact}`);
@@ -788,6 +1211,7 @@ function assertTargetSeal(seal: TweakersManagerTargetSealV1): void {
     ["launcher", seal.launcherSha256],
     ["node", seal.nodeSha256],
     ["manager", seal.managerSha256],
+    ["managed-runtime", seal.managedRuntimeFingerprint],
   ] as const) {
     if (!SHA256_HEX.test(value)) throw new Error(`Tweakers manager target seal ${label} digest must be lowercase SHA-256`);
   }
@@ -801,6 +1225,7 @@ function assertTargetSeal(seal: TweakersManagerTargetSealV1): void {
     nodePath: seal.nodePath,
     nodeSha256: seal.nodeSha256,
     managerSha256: seal.managerSha256,
+    managedRuntimeFingerprint: seal.managedRuntimeFingerprint,
   });
   if (seal.generationId !== expectedGeneration) {
     throw new Error("Tweakers manager target seal generation-id does not bind its target identities");
@@ -814,7 +1239,8 @@ function sameTargetSeal(left: TweakersManagerTargetSealV1, right: TweakersManage
     && left.launcherSha256 === right.launcherSha256
     && left.nodePath === right.nodePath
     && left.nodeSha256 === right.nodeSha256
-    && left.managerSha256 === right.managerSha256;
+    && left.managerSha256 === right.managerSha256
+    && left.managedRuntimeFingerprint === right.managedRuntimeFingerprint;
 }
 
 function assertNoDuplicateTopLevelJsonKeys(text: string): void {

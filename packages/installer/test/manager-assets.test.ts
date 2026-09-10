@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { copyInstallerAssets } from "../scripts/copy-assets.mjs";
+import { readManagedRuntimeFingerprintEvidence } from "../src/managed-runtime";
 
 test("copy-assets publishes the signed launcher and standalone manager bundle as one manager asset pair", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-manager-assets-"));
@@ -24,12 +25,18 @@ test("copy-assets publishes the signed launcher and standalone manager bundle as
     mkdirSync(join(root, "packages", "loader"), { recursive: true });
     mkdirSync(join(root, "packages", "runtime", "dist"), { recursive: true });
     mkdirSync(join(root, "packages", "native-host", "assets"), { recursive: true });
+    mkdirSync(join(root, "packages", "native-host", "dist", "Tweakers Swap Helper.app", "Contents", "MacOS"), { recursive: true });
     mkdirSync(join(root, "packages", "installer", "dist"), { recursive: true });
     mkdirSync(join(root, "packages", "installer", "assets"), { recursive: true });
     mkdirSync(join(root, "tweaks", "alpha"), { recursive: true });
     mkdirSync(join(root, "store"), { recursive: true });
     writeFileSync(join(root, "packages", "loader", "loader.cjs"), "loader\n");
     writeFileSync(join(root, "packages", "runtime", "dist", "main.js"), "runtime\n");
+    writeFileSync(join(root, "packages", "installer", "assets", "protected-loader.cjs"), "protected loader\n");
+    writeFileSync(join(root, "packages", "installer", "assets", "tweakers.icns"), "icon\n");
+    writeFileSync(join(root, "packages", "installer", "assets", "tweakers.png"), "png\n");
+    writeFileSync(join(root, "packages", "native-host", "dist", "Tweakers App Launcher"), "app launcher\n");
+    writeFileSync(join(root, "packages", "native-host", "dist", "Tweakers Swap Helper.app", "Contents", "MacOS", "Tweakers Swap Helper"), "swap helper\n");
     writeFileSync(launcherSource, "signed launcher bytes\n");
     writeFileSync(policySource, "{\"schemaVersion\":1}\n");
     writeFileSync(bundleSource, "export const standalone = true;\n");
@@ -58,6 +65,18 @@ test("copy-assets publishes the signed launcher and standalone manager bundle as
     assert.equal(lstatSync(launcher).mode & 0o777, 0o755);
     assert.equal(lstatSync(bundle).mode & 0o777, 0o644);
     assert.equal(existsSync(join(assetRoot, "stale-file")), false);
+    const supportRoot = join(root, "packages", "installer", "assets", "runtime", ".manager-support");
+    assert.equal(readFileSync(join(supportRoot, "loader.cjs"), "utf8"), "loader\n");
+    assert.equal(readFileSync(join(supportRoot, "app-launcher", "Tweakers App Launcher"), "utf8"), "app launcher\n");
+    assert.equal(
+      readFileSync(join(supportRoot, "swap-helper", "Tweakers Swap Helper.app", "Contents", "MacOS", "Tweakers Swap Helper"), "utf8"),
+      "swap helper\n",
+    );
+    const managedRuntimeRoot = join(root, "packages", "installer", "assets", "managed-runtime");
+    const managedRuntimeEvidence = readManagedRuntimeFingerprintEvidence(managedRuntimeRoot);
+    assert.ok(managedRuntimeEvidence, "manager managed-runtime staging must carry a verified fingerprint");
+    assert.equal(existsSync(join(managedRuntimeRoot, "packages", "installer", "dist", "manager.mjs")), false);
+    assert.equal(existsSync(join(managedRuntimeRoot, "packages", "installer", "assets", "manager-launcher")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -22,6 +22,7 @@ import {
   copyFileSync,
   renameSync,
   lstatSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
@@ -32,9 +33,18 @@ import { isDeepStrictEqual } from "node:util";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { ensureUserPaths, type UserPaths } from "../paths.js";
 import { backupOnce, patchAsar, readFileInAsar, readHeaderHash } from "../asar.js";
-import { setIntegrity, getIntegrity } from "../integrity.js";
+import { assertResourceAsarIntegrity, setIntegrity, getIntegrity } from "../integrity.js";
 import { writeFuse } from "../fuses.js";
-import { clearQuarantine, codeSigningKeychainArgs, isDeveloperIdSignedBackup, prepareCodeSigning, signCodexApp, signatureInfo, verifySignature } from "../codesign.js";
+import {
+  clearQuarantine,
+  codeSigningKeychainArgs,
+  isDeveloperIdSignedBackup,
+  prepareCodeSigning,
+  signCodexApp,
+  signatureInfo,
+  verifySignature,
+  type PreparedSigningIdentity,
+} from "../codesign.js";
 import { assertInternalStoragePath } from "../internal-storage.js";
 import { fingerprintAppContents } from "../environment-profile.js";
 import {
@@ -64,6 +74,7 @@ import {
 } from "../codex-window-services.js";
 import { patchCodexModelSelectionInExtractedApp } from "../codex-model-selection.js";
 import { patchCodexInactiveThreadRetentionInExtractedApp } from "../codex-inactive-thread-retention.js";
+import { patchCodexAccountsNativeInExtractedApp } from "../codex-accounts-native.js";
 import {
   runOptionalRendererPatch,
   summarizeRendererPatches,
@@ -71,6 +82,14 @@ import {
 } from "../renderer-patch-outcome.js";
 import { chownForTargetUser, targetUserHome, targetUserOwnership } from "../ownership.js";
 import { publishTweakersManagerDescriptor } from "../manager-descriptor.js";
+import {
+  resolveSealedManagerRuntimeAssets,
+  resolveSealedManagerSupportAssets,
+  verifySealedManagerRuntimeAssets,
+  verifySealedManagerSupportAssets,
+} from "../manager-runtime-assets.js";
+import { readRuntimeFingerprintEvidence } from "../runtime-fingerprint.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "../accounts-transfer-compatibility.js";
 import { getOpenReport, listProcesses, reportsMainProcessRunning, type OpenReport, type ProcessInfo } from "./debug.js";
 import { openCodex, quitCodex, showCodexUpdateDetectedNotification } from "../alerts.js";
 import { terminateStaleHelperProcesses } from "../orphans.js";
@@ -103,12 +122,23 @@ import { migrateAutomatically } from "./migrate.js";
 import { readDevTweaksRoot } from "../config.js";
 import { ensureManagedRuntime, reconcileManagedCliShims } from "../managed-runtime.js";
 import { reconcileDock, reconcileLaunchServices } from "../macos-app-identity.js";
-import { applyMacAppIdentity, type MacAppIdentity } from "../macos-variant.js";
+import {
+  applyMacAppIdentity,
+  defaultTweakersAccountsBrokerRoot,
+  installMacAppLauncher,
+  TWEAKERS_VARIANT_BUNDLE_ID,
+  TWEAKERS_VARIANT_NAME,
+  type MacAppIdentity,
+} from "../macos-variant.js";
 import { parkedPayloadRoot } from "../mode-transition.js";
 import { ensureModeCoordinatorConfigured, removeStandaloneSwitcher } from "../switcher-setup.js";
 import { LEGACY_ASAR_META_KEY, LEGACY_DATA_DIR, LEGACY_DEV_SNAPSHOT_FILE, LEGACY_LOADER_FILE, LEGACY_WATCHER_ENV } from "../legacy-compat.js";
 import { migrateLegacyTweakNamespaces } from "../tweak-namespace-migration.js";
-import { fingerprintPromotionCodexConfigPath, fingerprintPromotionPolicyPath } from "../promotion-policy.js";
+import {
+  comparePromotionPolicyPaths,
+  fingerprintPromotionCodexConfigPath,
+  fingerprintPromotionPolicyPath,
+} from "../promotion-policy.js";
 import {
   fingerprintPath,
   inspectUserQuestionsSource,
@@ -151,6 +181,8 @@ interface Opts {
     finalUserRoot: string;
     bundledDerivedBackend?: BundledDerivedBackendArtifact;
   };
+  /** Candidate-only callers may bind app signing to a read-only prepared identity. */
+  preparedSigningIdentity?: PreparedSigningIdentity;
   /** Private receipt-bound prebuilt backend and reviewed-runtime candidate input. */
   prebuiltCombinedCandidate?: PrebuiltCombinedCandidateInput;
   /**
@@ -174,8 +206,26 @@ interface Opts {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
-const assetsDir = resolve(here, "..", "..", "assets");
+const ordinaryAssetsDir = resolve(here, "..", "..", "assets");
+const sealedManagerSupportAssets = resolveSealedManagerSupportAssets();
+const sealedManagerRuntimeAssets = sealedManagerSupportAssets?.runtime
+  ?? resolveSealedManagerRuntimeAssets();
+const assetsDir = sealedManagerSupportAssets?.root ?? ordinaryAssetsDir;
 const sourceRoot = findSourceRoot(here);
+
+export function packagedRuntimeAssetsRoot(): string {
+  if (sealedManagerRuntimeAssets !== null) {
+    verifySealedManagerRuntimeAssets(sealedManagerRuntimeAssets);
+    return sealedManagerRuntimeAssets.root;
+  }
+  return join(ordinaryAssetsDir, "runtime");
+}
+
+function verifyPackagedInstallerSupportAssets(): void {
+  if (sealedManagerSupportAssets !== null) {
+    verifySealedManagerSupportAssets(sealedManagerSupportAssets);
+  }
+}
 export const STAGED_NATIVE_HOST_RELATIVE_PATH = join(
   "Contents",
   "Resources",
@@ -1002,6 +1052,9 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   }
 
   const codex = locateCodex(opts.app);
+  const ordinaryInstallTarget = assertOrdinaryInstallTargetNotDerived(codex, {
+    requireReadableMetadata: true,
+  });
   const source = fingerprintCodex(codex);
   const basePayloadHash = installerPayloadHash();
   if (
@@ -1020,7 +1073,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
     opts.prebuiltCombinedCandidate
       ? validatePrebuiltCombinedCandidate(opts.prebuiltCombinedCandidate, {
         installerPayloadHash: basePayloadHash,
-        runtimeRoot: join(assetsDir, "runtime"),
+        runtimeRoot: packagedRuntimeAssetsRoot(),
         sourceAppRoot: codex.appRoot,
       })
       : undefined;
@@ -1106,7 +1159,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       ? (authority) => {
         const refreshed = validatePrebuiltCombinedCandidate(opts.prebuiltCombinedCandidate!, {
           installerPayloadHash: basePayloadHash,
-          runtimeRoot: join(assetsDir, "runtime"),
+          runtimeRoot: packagedRuntimeAssetsRoot(),
           sourceAppRoot: codex.appRoot,
         });
         if (
@@ -1265,6 +1318,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       try {
         const candidate = locateCodex(candidateRoot);
         if (candidate.platform === "darwin") {
+          assertResourceAsarIntegrity(candidate);
           const signature = verifySignature(candidateRoot);
           if (!signature.ok) throw new Error(`candidate signature invalid: ${signature.output.trim().slice(0, 400)}`);
           if (!signedBackupWiring.validateCandidate()) throw new Error("candidate Developer-ID backup missing or unsigned");
@@ -1336,7 +1390,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           // drift guards still run at promotion either way.
           const prior = reuseCandidateHealthReceipt(receiptFile, expected);
           if (prior !== null) {
-            if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot);
+            if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot, ordinaryInstallTarget);
             return prior;
           }
         }
@@ -1375,7 +1429,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         // The reader explains its own rejections; only an accepted receipt that
         // still reports nothing needs an account added here.
         const observed = readProductionHealthReceipt(receiptFile, expected);
-        if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot);
+        if (candidate.platform === "darwin") preflightAtomicAppBundleSwap(codex.appRoot, ordinaryInstallTarget);
         if (observed.detail || observed.host !== "unknown" || observed.session !== "unknown") return observed;
         return { ...observed, detail: `candidate probe answered from ${receiptFile} without observing host or session health` };
       } catch (error) {
@@ -1394,6 +1448,16 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       signedBackupWiring.snapshotLive();
     },
     promoteCandidate: async (candidateRoot, appRoot) => {
+      assertAccountsTransferRuntimeCompatible(candidatePaths.runtime, accountsTransferBrokerRoots(paths.root, appRoot));
+      assertOrdinaryInstallTargetNotDerived({
+        appRoot,
+        appName: codex.appName,
+        bundleId: codex.bundleId,
+        platform: codex.platform,
+      }, {
+        expectedPhysicalTarget: ordinaryInstallTarget,
+        requireReadableMetadata: true,
+      });
       // dev-sync already owns the schema-v2 managed-tree transaction. Load its
       // public seam lazily to avoid an eager install.ts <-> dev-sync.ts cycle.
       const {
@@ -1425,10 +1489,11 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
           requestedAt: new Date().toISOString(),
         });
         liveHealthExpectation = rollbackExpectation;
-        const currentPolicy = fingerprintPromotionPolicyPath(join(liveCodexHome, ".codex-global-state.json"));
-        if (currentPolicy !== candidatePromotionPreimages.policy) {
-          throw new Error("Live promotion policy drifted after candidate preparation");
-        }
+        assertLivePromotionPolicyCompatible({
+          expectedPreparedFingerprint: candidatePromotionPreimages.policy,
+          preparedPolicyPath: join(candidateCodexHome, ".codex-global-state.json"),
+          livePolicyPath: join(liveCodexHome, ".codex-global-state.json"),
+        });
         prepareDevSnapshot(candidatePaths.tweaks, paths.tweaks);
         const existingRollout = readUserQuestionsRolloutReceipt(liveUserQuestionsReceiptFile);
         liveUserQuestionsReceipt = existingRollout ?? planUserQuestionsRollout(defaultUserQuestionsRolloutOptions({
@@ -1466,7 +1531,29 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
         // the app. If a later app/runtime swap fails, restore backup continuity
         // immediately; the outer transaction owns app/runtime recovery.
         signedBackupWiring.promoteCandidate();
+        // Recheck at the last possible point before the live Contents swap.
+        // This closes aliases and target replacement after transaction entry.
+        assertOrdinaryInstallTargetNotDerived({
+          appRoot,
+          appName: codex.appName,
+          bundleId: codex.bundleId,
+          platform: codex.platform,
+        }, {
+          expectedPhysicalTarget: ordinaryInstallTarget,
+          requireReadableMetadata: true,
+        });
         replaceAppBundlePreservingIdentity(candidateRoot, appRoot, {
+          beforeSwap: () => {
+            assertOrdinaryInstallTargetNotDerived({
+              appRoot,
+              appName: codex.appName,
+              bundleId: codex.bundleId,
+              platform: codex.platform,
+            }, {
+              expectedPhysicalTarget: ordinaryInstallTarget,
+              requireReadableMetadata: true,
+            });
+          },
           validateDestination: (promotedRoot) => verifySignature(promotedRoot).ok,
           onCleanupFailure: (path, error) => {
             if (!opts.quiet) console.warn(kleur.yellow(`Old app payload cleanup will be retried on the next refresh (${path}): ${errorMessage(error)}`));
@@ -1521,7 +1608,28 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       }
     },
     restoreApp: (lastKnownGoodRoot, appRoot) => {
+      assertAccountsTransferRuntimeCompatible(join(dirname(lastKnownGoodRoot), "last-known-good-runtime"), accountsTransferBrokerRoots(paths.root, appRoot));
+      assertOrdinaryInstallTargetNotDerived({
+        appRoot,
+        appName: codex.appName,
+        bundleId: codex.bundleId,
+        platform: codex.platform,
+      }, {
+        expectedPhysicalTarget: ordinaryInstallTarget,
+        requireReadableMetadata: true,
+      });
       replaceAppBundlePreservingIdentity(lastKnownGoodRoot, appRoot, {
+        beforeSwap: () => {
+          assertOrdinaryInstallTargetNotDerived({
+            appRoot,
+            appName: codex.appName,
+            bundleId: codex.bundleId,
+            platform: codex.platform,
+          }, {
+            expectedPhysicalTarget: ordinaryInstallTarget,
+            requireReadableMetadata: true,
+          });
+        },
         validateDestination: (restoredRoot) => verifySignature(restoredRoot).ok,
         onCleanupFailure: (path, error) => {
           if (!opts.quiet) console.warn(kleur.yellow(`Old app payload cleanup will be retried on the next refresh (${path}): ${errorMessage(error)}`));
@@ -1534,6 +1642,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       }
     },
     restoreRuntime: (lastKnownGoodRuntimeRoot, runtimeRoot) => {
+      assertAccountsTransferRuntimeCompatible(lastKnownGoodRuntimeRoot, accountsTransferBrokerRoots(paths.root, codex.appRoot));
       if (existsSync(lastKnownGoodRuntimeRoot)) replaceDirectory(lastKnownGoodRuntimeRoot, runtimeRoot);
       else rmSync(runtimeRoot, { recursive: true, force: true });
       signedBackupWiring.restoreLive();
@@ -1764,7 +1873,7 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
       }
     }
     try {
-      migrateAutomatically(paths.root, join(assetsDir, "runtime", "tweaks"));
+      migrateAutomatically(paths.root, join(packagedRuntimeAssetsRoot(), "tweaks"));
     } catch (error) {
       // Migration never deletes or mutates its legacy input. Keep a successful
       // app promotion usable while reporting the isolated data item failure.
@@ -1849,6 +1958,162 @@ async function installWithLifecycle(opts: Opts, paths: UserPaths): Promise<void>
   }
 }
 
+/**
+ * The derived desktop has its own candidate builder and crash-safe refresh
+ * transaction.  Generic install/update/repair flows must never patch it in
+ * place because those flows own the official ChatGPT role and its runtime
+ * state.  Candidate builds bypass this function through candidateContext.
+ */
+export interface OrdinaryInstallTargetEvidence {
+  requestedAppRoot: string;
+  physicalAppRoot: string;
+  device: string | null;
+  inode: string | null;
+}
+
+export interface OrdinaryInstallTargetGuardOptions {
+  /** Override only for isolated tests; production checks both Applications roots. */
+  knownDerivedAppRoots?: readonly string[];
+  /** Bind a later mutation-site recheck to the exact directory inspected first. */
+  expectedPhysicalTarget?: OrdinaryInstallTargetEvidence | null;
+  /** Promotion and preflight sites fail closed if current bundle metadata is unreadable. */
+  requireReadableMetadata?: boolean;
+}
+
+export function assertOrdinaryInstallTargetNotDerived(
+  codex: Pick<CodexInstall, "appRoot" | "appName" | "bundleId" | "platform">,
+  options: OrdinaryInstallTargetGuardOptions = {},
+): OrdinaryInstallTargetEvidence | null {
+  if (codex.platform !== "darwin") return null;
+
+  const requestedAppRoot = resolve(codex.appRoot);
+  const physicalAppRoot = canonicalPathIfPresent(requestedAppRoot);
+  if (existsSync(requestedAppRoot)) {
+    const requestedEntry = lstatSync(requestedAppRoot);
+    if (requestedEntry.isSymbolicLink() || physicalAppRoot !== requestedAppRoot) {
+      throw new Error(
+        "Refusing app mutation because the requested app root is not its exact physical path.",
+      );
+    }
+  }
+  const physicalIdentity = appDirectoryIdentity(physicalAppRoot);
+  const currentMetadata = readOrdinaryInstallTargetMetadata(requestedAppRoot, options.requireReadableMetadata === true);
+  const bundleId = currentMetadata?.bundleId ?? codex.bundleId;
+  const appName = currentMetadata?.appName ?? codex.appName;
+  const derivedMarker = currentMetadata?.derivedMarker === true;
+  const normalizedDerivedBundle = TWEAKERS_VARIANT_BUNDLE_ID.toLowerCase();
+  const normalizedDerivedName = TWEAKERS_VARIANT_NAME.toLowerCase();
+  const targetsDerivedBundle = bundleId?.toLowerCase() === normalizedDerivedBundle;
+  const targetsDerivedPath = [requestedAppRoot, physicalAppRoot]
+    .some((path) => basename(path).toLowerCase() === `${normalizedDerivedName}.app`);
+  const targetsDerivedName = appName.toLowerCase() === normalizedDerivedName;
+  const knownDerivedAppRoots = options.knownDerivedAppRoots ?? [
+    "/Applications/Tweakers.app",
+    join(homedir(), "Applications", "Tweakers.app"),
+  ];
+  const targetsKnownDerivedDirectory = knownDerivedAppRoots.some((path) => {
+    if (!existsSync(path)) return false;
+    const knownPhysicalRoot = canonicalPathIfPresent(path);
+    if (knownPhysicalRoot === physicalAppRoot) return true;
+    const knownIdentity = appDirectoryIdentity(knownPhysicalRoot);
+    return sameAppDirectoryIdentity(physicalIdentity, knownIdentity);
+  });
+  const currentEvidence: OrdinaryInstallTargetEvidence = {
+    requestedAppRoot,
+    physicalAppRoot,
+    ...physicalIdentity,
+  };
+
+  if (options.expectedPhysicalTarget && !sameOrdinaryInstallTarget(
+    currentEvidence,
+    options.expectedPhysicalTarget,
+  )) {
+    throw new Error(
+      "Refusing to modify the app because its physical target changed after install preflight.",
+    );
+  }
+
+  if (
+    !targetsDerivedBundle
+    && !targetsDerivedPath
+    && !targetsDerivedName
+    && !derivedMarker
+    && !targetsKnownDerivedDirectory
+  ) return currentEvidence;
+  throw new Error(
+    "Refusing to modify Tweakers.app through the generic install/update path.\n" +
+      "Use tweaker refresh-variant so a sealed disposable candidate is validated and promoted atomically.",
+  );
+}
+
+function canonicalPathIfPresent(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function appDirectoryIdentity(path: string): Pick<OrdinaryInstallTargetEvidence, "device" | "inode"> {
+  try {
+    const stat = statSync(path, { bigint: true });
+    return { device: stat.dev.toString(), inode: stat.ino.toString() };
+  } catch {
+    return { device: null, inode: null };
+  }
+}
+
+function sameAppDirectoryIdentity(
+  left: Pick<OrdinaryInstallTargetEvidence, "device" | "inode">,
+  right: Pick<OrdinaryInstallTargetEvidence, "device" | "inode">,
+): boolean {
+  return left.device !== null
+    && left.inode !== null
+    && left.device === right.device
+    && left.inode === right.inode;
+}
+
+function sameOrdinaryInstallTarget(
+  left: OrdinaryInstallTargetEvidence,
+  right: OrdinaryInstallTargetEvidence,
+): boolean {
+  return left.requestedAppRoot === right.requestedAppRoot
+    && left.physicalAppRoot === right.physicalAppRoot
+    && sameAppDirectoryIdentity(left, right);
+}
+
+function readOrdinaryInstallTargetMetadata(
+  appRoot: string,
+  required: boolean,
+): { bundleId: string | null; appName: string; derivedMarker: boolean } | null {
+  const infoPath = join(appRoot, "Contents", "Info.plist");
+  if (!existsSync(infoPath)) {
+    if (required) throw new Error(`Refusing app mutation because bundle metadata is missing: ${infoPath}`);
+    return null;
+  }
+  try {
+    const info = readPlist(infoPath);
+    const bundleId = typeof info.CFBundleIdentifier === "string" ? info.CFBundleIdentifier : null;
+    const appName = typeof info.CFBundleDisplayName === "string"
+      ? info.CFBundleDisplayName
+      : typeof info.CFBundleName === "string"
+        ? info.CFBundleName
+        : "";
+    const environment = info.LSEnvironment;
+    const derivedMarker = environment !== null
+      && typeof environment === "object"
+      && !Array.isArray(environment)
+      && (environment as Record<string, unknown>).TWEAKERS_DERIVED_VARIANT === "1";
+    if (required && (!bundleId || !appName)) {
+      throw new Error(`Bundle metadata is incomplete: ${infoPath}`);
+    }
+    return { bundleId, appName, derivedMarker };
+  } catch (error) {
+    if (!required) return null;
+    throw new Error(`Refusing app mutation because bundle metadata cannot be verified: ${errorMessage(error)}`);
+  }
+}
+
 export function installMayRunWhileChatgptMode(
   opts: Pick<Opts, "modeTransition" | "prebuiltCombinedCandidate" | "candidateOnly" | "requirePreparedCandidate">,
 ): boolean {
@@ -1862,6 +2127,12 @@ export interface BuildPatchedCandidateOnlyInput {
   destinationApp: string;
   /** Durable receipt-owned copy of the runtime validated inside the candidate. */
   destinationRuntime: string;
+  /**
+   * Optional receipt-owned copy of the disposable candidate's canonical
+   * installer state. Environment transactions use this for first injection;
+   * callers that only need an app/runtime candidate may omit it.
+   */
+  destinationState?: string;
   finalUserRoot: string;
   /**
    * Exact receipt-validated backend derived from the installed desktop's
@@ -1869,6 +2140,15 @@ export interface BuildPatchedCandidateOnlyInput {
    * managed Stable/Beta selection.
    */
   bundledDerivedBackend?: BundledDerivedBackendArtifact;
+}
+
+export interface PatchedCandidateStateArtifact {
+  artifactPath: string;
+  artifactDigest: string;
+}
+
+export interface BuildPatchedCandidateOnlyResult {
+  state: PatchedCandidateStateArtifact | null;
 }
 
 export interface BundledDerivedBackendArtifact {
@@ -1884,11 +2164,12 @@ export interface BundledDerivedBackendArtifact {
  * destination. This is the environment coordinator's production candidate
  * builder: it never quits, opens, replaces, or mutates the source/live app.
  */
-export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnlyInput): Promise<void> {
+export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnlyInput): Promise<BuildPatchedCandidateOnlyResult> {
   const sourceApp = resolve(input.sourceApp);
   const destinationApp = resolve(input.destinationApp);
   const destinationRuntime = resolve(input.destinationRuntime);
   const finalUserRoot = resolve(input.finalUserRoot);
+  const destinationState = input.destinationState === undefined ? null : resolve(input.destinationState);
   if (!isAbsolute(input.sourceApp) || sourceApp !== input.sourceApp) {
     throw new Error("Patched candidate source must be an exact absolute path");
   }
@@ -1901,7 +2182,16 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
   if (!isAbsolute(input.finalUserRoot) || finalUserRoot !== input.finalUserRoot) {
     throw new Error("Patched candidate user root must be an exact absolute path");
   }
-  assertDisjointPatchedCandidatePaths([sourceApp, destinationApp, destinationRuntime]);
+  if (input.destinationState !== undefined
+    && (!isAbsolute(input.destinationState) || destinationState !== input.destinationState)) {
+    throw new Error("Patched candidate state destination must be an exact absolute path");
+  }
+  assertDisjointPatchedCandidatePaths([
+    sourceApp,
+    destinationApp,
+    destinationRuntime,
+    ...(destinationState === null ? [] : [destinationState]),
+  ]);
   const source = locateCodex(sourceApp);
   if (source.platform !== "darwin") throw new Error("Environment candidates are supported only for macOS app bundles");
   if (source.bundleId !== "com.openai.codex" && source.bundleId !== "com.openai.codex.beta") {
@@ -1919,6 +2209,7 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
   const candidateUserRoot = `${destinationApp}.tweakers-build-user`;
   rmSync(destinationApp, { recursive: true, force: true });
   rmSync(candidateUserRoot, { recursive: true, force: true });
+  let state: PatchedCandidateStateArtifact | null = null;
   try {
     cloneAppTree(sourceApp, destinationApp);
     await installCandidateInPlace({
@@ -1940,6 +2231,26 @@ export async function buildPatchedCandidateOnly(input: BuildPatchedCandidateOnly
     const candidateSignature = verifySignature(destinationApp);
     if (!candidateSignature.ok) throw new Error(`Patched candidate signature is invalid: ${candidateSignature.output}`);
     stagePatchedCandidateRuntimeArtifact(join(candidateUserRoot, "runtime"), destinationRuntime);
+    if (destinationState !== null) {
+      const candidateState = join(candidateUserRoot, "state.json");
+      const parsed = readState(candidateState);
+      if (parsed === null) {
+        throw new Error("Patched candidate did not produce a canonical installer state artifact");
+      }
+      if (parsed.appRoot !== destinationApp || parsed.codexBundleId !== source.bundleId
+        || parsed.mode !== "tweakers" || !parsed.originalAsarHash || !parsed.patchedAsarHash
+        || !parsed.signingMode) {
+        throw new Error("Patched candidate installer state does not bind its app, bundle, ASAR, and signing evidence");
+      }
+      mkdirSync(dirname(destinationState), { recursive: true });
+      copyFileSync(candidateState, destinationState);
+      const destinationStat = lstatSync(destinationState);
+      if (!destinationStat.isFile() || destinationStat.isSymbolicLink()) {
+        throw new Error("Patched candidate state artifact did not stage as a regular file");
+      }
+      state = { artifactPath: destinationState, artifactDigest: sha256Of(destinationState) };
+    }
+    return { state };
   } catch (error) {
     rmSync(destinationApp, { recursive: true, force: true });
     throw error;
@@ -2015,7 +2326,14 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   let preparedSigning: ReturnType<typeof prepareCodeSigning> = null;
   if (resign && codex.platform === "darwin") {
     try {
-      preparedSigning = prepareCodeSigning({ useLocalIdentity: localSigning });
+      if (opts.preparedSigningIdentity) {
+        if (!localSigning || opts.preparedSigningIdentity.created) {
+          throw new Error("Candidate signing requires one preexisting local signing identity.");
+        }
+        preparedSigning = opts.preparedSigningIdentity;
+      } else {
+        preparedSigning = prepareCodeSigning({ useLocalIdentity: localSigning });
+      }
     } catch (e) {
       throw new Error(`Tweakers Local Signing is required for promotable candidates.\n${(e as Error).message}`);
     }
@@ -2102,7 +2420,11 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
       opts.candidateContext?.finalUserRoot ?? paths.root,
       step.detail,
       opts.macAppIdentity?.appUserDataRoot,
-      opts.macAppIdentity?.displayName,
+      opts.macAppIdentity?.productName,
+      codex.platform === "darwin"
+        ? (opts.macAppIdentity?.accountsBrokerRoot
+          ?? defaultTweakersAccountsBrokerRoot(targetUserHome()))
+        : undefined,
     );
   const { headerHash: patchedAsarHash } = readHeaderHash(codex.asarPath);
   step.detail(`Patched app.asar (entry was ${kleur.dim(originalEntry)})`);
@@ -2115,6 +2437,8 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
   if (codex.platform === "darwin" && opts.macAppIdentity) {
     const changed = applyMacAppIdentity(codex.appRoot, opts.macAppIdentity);
     step.detail(`Applied isolated macOS app identity (${changed.length} plist${changed.length === 1 ? "" : "s"})`);
+    installMacAppLauncher(codex.appRoot, opts.macAppIdentity);
+    step.detail("Installed the pre-Electron Tweakers isolation launcher");
   }
 
   // 5. Belt-and-suspenders: flip the integrity validation fuse off.
@@ -2183,6 +2507,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     version: TWEAKER_VERSION,
     installedAt: new Date().toISOString(),
     appRoot: codex.appRoot,
+    mode: "tweakers",
     originalAsarHash,
     patchedAsarHash,
     codexVersion,
@@ -2367,6 +2692,24 @@ function promotionPreimageHashes(expectation: ProductionHealthExpectationV2): Pr
     name,
     expectation.surfaces[name].preimageHash,
   ])) as PromotionSurfaceHashes;
+}
+
+/**
+ * Re-bind the durable prepared snapshot, then compare it directionally with
+ * the live policy state that Codex may have flushed while intentionally
+ * quitting. The comparison itself permits only new task identities and the
+ * exact redundant managed-full-access persistence form; all prepared
+ * authorization controls remain strict.
+ */
+export function assertLivePromotionPolicyCompatible(input: {
+  expectedPreparedFingerprint: string;
+  preparedPolicyPath: string;
+  livePolicyPath: string;
+}): void {
+  const comparison = comparePromotionPolicyPaths(input.preparedPolicyPath, input.livePolicyPath);
+  if (comparison.preparedFingerprint !== input.expectedPreparedFingerprint || !comparison.compatible) {
+    throw new Error("Live promotion policy drifted after candidate preparation");
+  }
 }
 
 function fingerprintPromotionSurfaces(roots: PromotionSurfaceRoots): PromotionSurfaceHashes {
@@ -2744,10 +3087,15 @@ export function hashDirectoryTree(root: string): string {
 }
 
 export function installerPayloadHash(): string {
+  verifyPackagedInstallerSupportAssets();
   const hash = createHash("sha256");
   for (const root of [resolve(here, ".."), assetsDir]) {
     hash.update(root === assetsDir ? "assets" : "installer");
     hash.update(hashDirectoryTree(root));
+  }
+  if (sealedManagerRuntimeAssets !== null) {
+    hash.update("runtime");
+    hash.update(hashDirectoryTree(packagedRuntimeAssetsRoot()));
   }
   return hash.digest("hex");
 }
@@ -2771,6 +3119,12 @@ function replaceDirectory(source: string, destination: string): void {
 
 interface AppBundleReplacementAdapters {
   swapDirectories?: (first: string, second: string) => void;
+  /**
+   * Revalidate the live destination after staging and immediately before the
+   * first filesystem mutation that can replace it. This is deliberately
+   * separate from destination validation, which runs after cutover.
+   */
+  beforeSwap?: () => void;
   removeDirectory?: (path: string) => void;
   validateDestination?: (appRoot: string) => boolean;
   onCleanupFailure?: (path: string, error: unknown) => void;
@@ -2829,6 +3183,7 @@ export function replaceAppBundlePreservingIdentity(
   const sourceContents = join(source, "Contents");
   const destinationContents = join(destination, "Contents");
   if (!existsSync(destination)) {
+    adapters.beforeSwap?.();
     replaceDirectory(source, destination);
     if (adapters.validateDestination && !adapters.validateDestination(destination)) {
       rmSync(destination, { recursive: true, force: true });
@@ -2860,6 +3215,7 @@ export function replaceAppBundlePreservingIdentity(
   // rolled-back validation failure flips it back so we never park rejected bytes.
   let incomingHoldsOutgoing = false;
   try {
+    adapters.beforeSwap?.();
     swap(incoming, destinationContents);
     incomingHoldsOutgoing = true;
     if (adapters.validateDestination && !adapters.validateDestination(destination)) {
@@ -2927,6 +3283,7 @@ function moveDirectoryAcrossVolumes(source: string, destination: string): void {
 export const SWAP_HELPER_APP_NAME = "Tweakers Swap Helper.app";
 
 function swapHelperAssetRoot(): string {
+  verifyPackagedInstallerSupportAssets();
   return join(assetsDir, "swap-helper", SWAP_HELPER_APP_NAME);
 }
 
@@ -2979,7 +3336,17 @@ export function ensureSwapHelperInstalled(): string {
 
 function runSignedSwapHelper(first: string, second: string): void {
   const helperRoot = ensureSwapHelperInstalled();
-  const result = spawnSync(swapHelperBinary(helperRoot), ["--swap-directories", first, second], {
+  const firstIdentity = swapDirectoryIdentity(first, "first swap directory");
+  const secondIdentity = swapDirectoryIdentity(second, "second swap directory");
+  const result = spawnSync(swapHelperBinary(helperRoot), [
+    "--swap-directories",
+    first,
+    second,
+    firstIdentity.device,
+    firstIdentity.inode,
+    secondIdentity.device,
+    secondIdentity.inode,
+  ], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -2997,11 +3364,34 @@ function runSignedSwapHelper(first: string, second: string): void {
   throw new Error(`Tweakers signed swap helper failed: ${detail}`);
 }
 
+function swapDirectoryIdentity(path: string, label: string): { device: string; inode: string } {
+  if (!isAbsolute(path) || resolve(path) !== path || realpathSync(path) !== path) {
+    throw new Error(`${label} must be an exact absolute physical path`);
+  }
+  const entry = lstatSync(path, { bigint: true });
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory`);
+  }
+  return { device: entry.dev.toString(), inode: entry.ino.toString() };
+}
+
 /**
  * Exercise the real RENAME_SWAP operation inside the protected live app bundle
  * before quitting it. Only disposable empty directories are exchanged.
  */
-export function preflightAtomicAppBundleSwap(appRoot: string): void {
+export function preflightAtomicAppBundleSwap(
+  appRoot: string,
+  expectedPhysicalTarget: OrdinaryInstallTargetEvidence | null = null,
+): void {
+  assertOrdinaryInstallTargetNotDerived({
+    appRoot,
+    appName: "",
+    bundleId: null,
+    platform: "darwin",
+  }, {
+    expectedPhysicalTarget,
+    requireReadableMetadata: true,
+  });
   const first = join(appRoot, `.tweakers-swap-preflight-a-${process.pid}`);
   const second = join(appRoot, `.tweakers-swap-preflight-b-${process.pid}`);
   rmSync(first, { recursive: true, force: true });
@@ -3516,6 +3906,7 @@ async function injectLoader(
   step: (msg: string) => void = () => {},
   appUserDataRoot?: string,
   appDisplayName?: string,
+  accountsBrokerRoot?: string,
 ): Promise<{ originalMain: string; rendererPatches: RendererPatchOutcome[] }> {
   let originalMain = "";
   let rendererPatches: RendererPatchOutcome[] = [];
@@ -3531,11 +3922,13 @@ async function injectLoader(
     // Preserve the original entry across repairs while refreshing isolated paths.
     if (pkg["__tweaker"]) originalMain = String(pkg["__tweaker"].originalMain);
     if (pkg[LEGACY_ASAR_META_KEY]) originalMain = String(pkg[LEGACY_ASAR_META_KEY].originalMain);
+    const previousAccountsNative = pkg["__tweaker"]?.accountsNative;
     pkg["__tweaker"] = {
       originalMain,
       userRoot,
       loader: "tweaker-loader.cjs",
       ...(appUserDataRoot ? { appUserDataRoot } : {}),
+      ...(accountsBrokerRoot ? { accountsBrokerRoot } : {}),
     };
     delete pkg[LEGACY_ASAR_META_KEY];
     // The owl Electron fork resolves userData/singleton paths natively from
@@ -3549,6 +3942,7 @@ async function injectLoader(
     pkg.main = "tweaker-loader.cjs";
 
     // Copy our loader stub into the asar root.
+    verifyPackagedInstallerSupportAssets();
     const loaderSrc = join(assetsDir, "loader.cjs");
     if (!existsSync(loaderSrc)) {
       // Fall back to the in-repo path during development.
@@ -3577,6 +3971,25 @@ async function injectLoader(
       () => patchCodexInactiveThreadRetentionInExtractedApp(dir),
     );
     reportRendererPatch(step, inactiveThreadRetentionPatch, "Codex inactive-thread retention policy");
+
+    const accountsNative = patchCodexAccountsNativeInExtractedApp(dir, previousAccountsNative);
+    pkg["__tweaker"].accountsNative = accountsNative;
+    // Build the hooks even when disabled. Enabling Accounts later must not
+    // require guessing whether this app happened to contain compatible bytes.
+    let accountsEnabled = false;
+    if (existsSync(join(userRoot, "tweaks", "co.tweakers.account-switcher", "manifest.json"))) {
+      accountsEnabled = true;
+      const configPath = join(userRoot, "config.json");
+      if (existsSync(configPath)) {
+        const config = JSON.parse(readFileSync(configPath, "utf8"));
+        accountsEnabled = config.tweaker?.safeMode !== true
+          && config.tweaks?.["co.tweakers.account-switcher"]?.enabled !== false;
+      }
+    }
+    if (accountsEnabled && accountsNative.status !== "compatible") {
+      throw new Error(accountsNative.reason ?? "Accounts native integration is incompatible with this candidate.");
+    }
+    step(accountsNative.status === "compatible" ? "Verified native Accounts integration" : "Accounts unavailable for this desktop build; native behavior preserved");
 
     rendererPatches = [modelSelectionPatch, inactiveThreadRetentionPatch];
     // Overwrite rather than merge: carrying a stale "patched" claim into a build
@@ -3623,8 +4036,9 @@ async function injectProtectedLoader(
     if (!originalMain || originalMain === "protected-loader.cjs") {
       throw new Error("Protected shell cannot determine the recorded OpenAI main entry");
     }
+    verifyPackagedInstallerSupportAssets();
     const loaderSource = join(assetsDir, "protected-loader.cjs");
-    const bootstrapSource = join(assetsDir, "runtime", "protected-bootstrap.js");
+    const bootstrapSource = join(packagedRuntimeAssetsRoot(), "protected-bootstrap.js");
     if (!existsSync(loaderSource)) throw new Error(`Protected loader source is missing: ${loaderSource}`);
     if (!existsSync(bootstrapSource)) {
       throw new Error(
@@ -4055,7 +4469,20 @@ function formatWindowServicesHookFailure(
 }
 
 export function stageAssets(runtimeDir: string): void {
-  const src = join(assetsDir, "runtime");
+  const sealed = resolveSealedManagerRuntimeAssets();
+  if (sealed !== null) {
+    const sourceEvidence = verifySealedManagerRuntimeAssets(sealed);
+    replaceDirectory(sealed.root, runtimeDir);
+    const stagedEvidence = readRuntimeFingerprintEvidence(runtimeDir);
+    if (stagedEvidence === null
+      || stagedEvidence.fingerprint !== sealed.fingerprint
+      || stagedEvidence.fileCount !== sourceEvidence.fileCount) {
+      throw new Error("The sealed Tweakers manager runtime changed while it was staged");
+    }
+    chownForTargetUser(runtimeDir, { recursive: true });
+    return;
+  }
+  const src = join(ordinaryAssetsDir, "runtime");
   if (existsSync(src)) {
     replaceDirectory(src, runtimeDir);
     chownForTargetUser(runtimeDir, { recursive: true });
@@ -4212,7 +4639,7 @@ function isRealDevSnapshotDirectory(dest: string, folder: string, snapshotFolder
 }
 
 export function runtimeAssetsMatch(runtimeDir: string): boolean {
-  const packaged = join(assetsDir, "runtime");
+  const packaged = packagedRuntimeAssetsRoot();
   const source = existsSync(packaged)
     ? packaged
     : resolve(here, "..", "..", "..", "..", "runtime", "dist");

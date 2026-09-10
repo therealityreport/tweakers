@@ -55,6 +55,8 @@ import {
 import { targetUserHome } from "../ownership.js";
 import { readRendererPatchRecord, rendererPatchRetryWarranted } from "../renderer-patch-outcome.js";
 import { assertInstallerUpdateQuarantineClear } from "../protected-update-quarantine.js";
+import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible } from "../accounts-transfer-compatibility.js";
+import { resolveSealedManagerRuntimeAssets, verifySealedManagerRuntimeAssets } from "../manager-runtime-assets.js";
 
 interface Opts {
   app?: string;
@@ -96,6 +98,8 @@ export interface RepairDependencies {
   readActiveRuntimeFingerprint?: (runtimeRoot: string) => string | null;
   isAppRunning?: (appRoot: string) => boolean;
   stageAssets?: typeof stageAssets;
+  /** Exact source consumed by a custom stageAssets seam. */
+  runtimeAssetsSourceRoot?: () => string;
   stageBundledTweaks?: typeof stageBundledTweaks;
   now?: () => Date;
   /** Reconcile only after an explicit managed-adoption receipt exists. */
@@ -144,8 +148,8 @@ export async function repairWithOutcome(
         console.log(kleur.yellow(
           `${block.receiptKind === "environment" ? "Environment transaction" : "Desktop update"} ${block.transactionId} `
           + `was left behind by exited PID ${block.ownerPid} (phase ${block.phase}); `
-          + "check `tweaker update-chatgpt-status`, then `tweaker update-chatgpt-resume` if it is resumable, "
-          + "or `tweaker update-chatgpt-cancel` (`tweaker environment recover` for an environment-only orphan) to recover.",
+          + "check read-only `tweaker update-chatgpt-status`; official ChatGPT updates are handled by ChatGPT's native updater. "
+          + "Use explicit `tweaker environment recover` only for an environment-only orphan.",
         ));
       }
       return { status: "deferred", reason: "orphaned-transaction" };
@@ -381,6 +385,11 @@ async function repairWithLifecycle(
         const expectedFingerprint = (dependencies.readExpectedRuntimeFingerprint
           ?? (() => readRuntimeFingerprint(packagedRuntimeRoot())))();
         try {
+          const runtimeAssetsSource = (dependencies.runtimeAssetsSourceRoot ?? packagedRuntimeRoot)();
+          assertAccountsTransferRuntimeCompatible(
+            runtimeAssetsSource,
+            accountsTransferBrokerRoots(paths.root, codex.appRoot),
+          );
           (dependencies.stageAssets ?? stageAssets)(paths.runtime);
           (dependencies.stageBundledTweaks ?? stageBundledTweaks)(paths.tweaks, paths.runtime, {
             devTweaksRoot: readDevTweaksRoot(paths.configFile),
@@ -908,6 +917,11 @@ function isFingerprintNumber(value: unknown): value is number {
 }
 
 function packagedRuntimeRoot(): string {
+  const sealed = resolveSealedManagerRuntimeAssets();
+  if (sealed !== null) {
+    verifySealedManagerRuntimeAssets(sealed);
+    return sealed.root;
+  }
   const packaged = resolve(here, "..", "..", "assets", "runtime");
   return existsSync(packaged)
     ? packaged

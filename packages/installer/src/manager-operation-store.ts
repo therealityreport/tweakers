@@ -15,13 +15,17 @@ import process from "node:process";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   MANAGER_PROTOCOL_VERSION,
-  TWEAKERS_MANAGER_ACTION_IDS_V1,
+  MANAGER_REFRESH_TIMING_PHASES_V1,
+  TWEAKERS_MANAGER_RECORDED_ACTION_IDS_V1,
   TWEAKERS_MANAGER_ID,
   type ManagerImpactV1,
   type ManagerOperationPhaseV1,
   type ManagerPreparedReceiptBindingV1,
+  type ManagerRefreshTimingEvidenceV1,
+  type ManagerRefreshTimingPhaseEvidenceV1,
+  type ManagerRefreshTimingPhaseStateV1,
   type ManagerResolvedExecutableIdentityV1,
-  type TweakersManagerActionIdV1,
+  type TweakersManagerRecordedActionIdV1,
   type TweakersManagerPreparedOperationV1,
 } from "./manager-contract.js";
 import {
@@ -36,6 +40,13 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d
 const RECORD_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const MAX_RECORD_BYTES = 64 * 1024;
+const TIMING_REASON = /^[A-Za-z0-9 .,:;()_-]{1,160}$/;
+const PREPARED_OPERATION_KEYS = [
+  "schemaVersion", "kind", "managerId", "protocolVersion", "operationId", "preparedRequestId", "actionId", "moduleIdentity",
+  "boundStateToken", "parameters", "parametersSha256", "impact", "createdAt", "expiresAt", "phase",
+  "consumedAt", "cancelledAt", "completedAt", "failedAt", "recoveryRequiredAt", "stateTokenInputsSha256",
+  "receiptChronologyRevision", "receiptSnapshot", "receiptRefs", "outcome", "error",
+] as const;
 
 export class ManagerOperationStoreError extends Error {
   constructor(message: string) {
@@ -140,12 +151,12 @@ export function parsePreparedOperation(
   value: Record<string, unknown>,
   expectedOperationId?: string,
 ): TweakersManagerPreparedOperationV1 {
-  assertManagerExactObjectKeys(value, [
-    "schemaVersion", "kind", "managerId", "protocolVersion", "operationId", "preparedRequestId", "actionId", "moduleIdentity",
-    "boundStateToken", "parameters", "parametersSha256", "impact", "createdAt", "expiresAt", "phase",
-    "consumedAt", "cancelledAt", "completedAt", "failedAt", "recoveryRequiredAt", "stateTokenInputsSha256",
-    "receiptChronologyRevision", "receiptSnapshot", "receiptRefs", "outcome", "error",
-  ], "prepared operation");
+  const hasTiming = Object.hasOwn(value, "timing");
+  assertManagerExactObjectKeys(
+    value,
+    hasTiming ? [...PREPARED_OPERATION_KEYS, "timing"] : PREPARED_OPERATION_KEYS,
+    "prepared operation",
+  );
   if (value.schemaVersion !== 1 || value.kind !== "tweakers-manager-operation"
     || value.managerId !== TWEAKERS_MANAGER_ID || value.protocolVersion !== MANAGER_PROTOCOL_VERSION) {
     throw new ManagerOperationStoreError("prepared operation has an unsupported identity or schema");
@@ -157,8 +168,8 @@ export function parsePreparedOperation(
   }
   const preparedRequestId = string(value.preparedRequestId, "preparedRequestId");
   assertOperationId(preparedRequestId);
-  const actionId = string(value.actionId, "actionId") as TweakersManagerActionIdV1;
-  if (!(TWEAKERS_MANAGER_ACTION_IDS_V1 as readonly string[]).includes(actionId)) {
+  const actionId = string(value.actionId, "actionId") as TweakersManagerRecordedActionIdV1;
+  if (!(TWEAKERS_MANAGER_RECORDED_ACTION_IDS_V1 as readonly string[]).includes(actionId)) {
     throw new ManagerOperationStoreError("prepared operation has an unsupported action");
   }
   const moduleIdentity = parseModuleIdentity(value.moduleIdentity);
@@ -181,6 +192,10 @@ export function parsePreparedOperation(
   const receiptChronologyRevision = parseSha(value.receiptChronologyRevision, "receiptChronologyRevision");
   const receiptSnapshot = parseReceiptSnapshot(value.receiptSnapshot);
   const receiptRefs = parseReceiptRefs(value.receiptRefs);
+  const timing = hasTiming ? parseRefreshTiming(value.timing) : undefined;
+  if (timing !== undefined && actionId !== "refresh.injected" && actionId !== "refresh.independent") {
+    throw new ManagerOperationStoreError("prepared operation timing is only valid for a manager refresh action");
+  }
   const outcome = nullableString(value.outcome, "outcome");
   const error = nullableString(value.error, "error");
   assertPhaseTimestamps({ phase, consumedAt, cancelledAt, completedAt, failedAt, recoveryRequiredAt });
@@ -209,6 +224,7 @@ export function parsePreparedOperation(
     receiptChronologyRevision,
     receiptSnapshot,
     receiptRefs,
+    ...(timing === undefined ? {} : { timing }),
     outcome,
     error,
   };
@@ -341,7 +357,7 @@ function parseReceiptSnapshot(value: unknown): readonly ManagerPreparedReceiptBi
   return value.map((entry) => {
     if (!isManagerJsonObject(entry)
       || Object.keys(entry).length !== 5
-      || !["environment", "desktop-update", "environment-mode-cache", "codex-derived"].includes(String(entry.source))
+      || !["environment", "chatgpt-app-update", "desktop-update", "environment-mode-cache", "official-source", "codex-derived"].includes(String(entry.source))
       || !(entry.receiptId === null || typeof entry.receiptId === "string")
       || !(entry.phase === null || typeof entry.phase === "string")
       || typeof entry.revision !== "string"
@@ -363,6 +379,64 @@ function parseReceiptRefs(value: unknown): readonly string[] {
     throw new ManagerOperationStoreError("prepared operation receipt references are invalid");
   }
   return [...value] as string[];
+}
+
+function parseRefreshTiming(value: unknown): ManagerRefreshTimingEvidenceV1 {
+  if (!isManagerJsonObject(value) || value.schemaVersion !== 1 || !isManagerJsonObject(value.phases)) {
+    throw new ManagerOperationStoreError("prepared operation timing is invalid");
+  }
+  assertManagerExactObjectKeys(value, ["schemaVersion", "phases"], "prepared operation timing");
+  assertManagerExactObjectKeys(value.phases, MANAGER_REFRESH_TIMING_PHASES_V1, "prepared operation timing phases");
+  const phases = {} as Record<keyof typeof value.phases, ManagerRefreshTimingPhaseEvidenceV1>;
+  for (const phase of MANAGER_REFRESH_TIMING_PHASES_V1) {
+    phases[phase] = parseRefreshTimingPhase(value.phases[phase]);
+  }
+  return {
+    schemaVersion: 1,
+    phases: phases as Record<typeof MANAGER_REFRESH_TIMING_PHASES_V1[number], ManagerRefreshTimingPhaseEvidenceV1>,
+  };
+}
+
+function parseRefreshTimingPhase(value: unknown): ManagerRefreshTimingPhaseEvidenceV1 {
+  if (!isManagerJsonObject(value)) throw new ManagerOperationStoreError("prepared operation timing phase is invalid");
+  assertManagerExactObjectKeys(
+    value,
+    ["state", "startedAt", "completedAt", "durationMs", "reason"],
+    "prepared operation timing phase",
+  );
+  const state = value.state;
+  if (state !== "pending" && state !== "running" && state !== "completed"
+    && state !== "failed" && state !== "skipped" && state !== "unavailable") {
+    throw new ManagerOperationStoreError("prepared operation timing phase state is invalid");
+  }
+  const startedAt = value.startedAt === null ? null : parseTimestamp(value.startedAt, "timing startedAt");
+  const completedAt = value.completedAt === null ? null : parseTimestamp(value.completedAt, "timing completedAt");
+  const durationMs = value.durationMs;
+  if (durationMs !== null && (typeof durationMs !== "number" || !Number.isInteger(durationMs) || durationMs < 0)) {
+    throw new ManagerOperationStoreError("prepared operation timing phase duration is invalid");
+  }
+  const reason = value.reason;
+  if (reason !== null && (typeof reason !== "string" || !TIMING_REASON.test(reason))) {
+    throw new ManagerOperationStoreError("prepared operation timing phase reason is invalid");
+  }
+  assertTimingPhaseBoundaries(state, startedAt, completedAt, durationMs, reason);
+  return { state, startedAt, completedAt, durationMs, reason };
+}
+
+function assertTimingPhaseBoundaries(
+  state: ManagerRefreshTimingPhaseStateV1,
+  startedAt: string | null,
+  completedAt: string | null,
+  durationMs: number | null,
+  reason: string | null,
+): void {
+  if (state === "pending" && startedAt === null && completedAt === null && durationMs === null && reason === null) return;
+  if (state === "running" && startedAt !== null && completedAt === null && durationMs === null && reason === null) return;
+  if ((state === "completed" || state === "failed")
+    && startedAt !== null && completedAt !== null && durationMs !== null && reason === null) return;
+  if ((state === "skipped" || state === "unavailable")
+    && startedAt === null && completedAt === null && durationMs === null && reason !== null) return;
+  throw new ManagerOperationStoreError("prepared operation timing phase boundaries are inconsistent");
 }
 
 function nullableString(value: unknown, label: string): string | null {

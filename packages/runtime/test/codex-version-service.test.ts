@@ -114,6 +114,27 @@ test("desktop probing prefers live app marketing version and falls back through 
   });
 });
 
+test("official ChatGPT identity wins over the derived Tweakers bundle in the screenshot regression", () => {
+  const official = probeCodexDesktopVersion({
+    appVersion: null,
+    infoPlistMarketingVersion: "26.831.21537",
+    infoPlistBuild: "7579",
+    stateMarketingVersion: null,
+    stateBuild: null,
+  });
+  assert.deepEqual(official, {
+    installedMarketingVersion: "26.831.21537",
+    installedBuild: "7579",
+  });
+  assert.equal(isCodexDesktopUpdateNewer(
+    official.installedMarketingVersion,
+    official.installedBuild,
+    "26.901.20858",
+    "7658",
+  ), true);
+  assert.notEqual(official.installedBuild, "7524");
+});
+
 test("desktop update comparison prefers Sparkle builds and safely falls back to dotted versions", () => {
   assert.equal(isCodexDesktopUpdateNewer("26.707.51957", "5175", "26.707.62119", "5211"), true);
   assert.equal(isCodexDesktopUpdateNewer("26.707.62119", "5211", "26.707.62119", "5211"), false);

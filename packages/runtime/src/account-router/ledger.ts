@@ -7,6 +7,7 @@ import type {
   RouterState,
 } from "./types";
 import type { RouterStateStore } from "./state-store";
+import { accountObservationEligible, compareQuotaCandidates, type AccountQuotaObservation } from "./quota";
 
 export interface TokenUsage {
   inputTokens: number;
@@ -18,6 +19,11 @@ export type FairnessPrecision = "projected" | "exact_completed_spend" | "estimat
 export interface AccountSelection {
   opaqueAccountId: OpaqueAccountId;
   normalizedSpend: number;
+}
+
+export interface KnownThreadBinding {
+  threadId: string;
+  owner: OpaqueAccountId;
 }
 
 /**
@@ -67,6 +73,40 @@ export class AccountLedger {
     const chosen = candidates[0];
     this.lastSelection.set(chosen.opaqueAccountId, this.now());
     return { opaqueAccountId: chosen.opaqueAccountId, normalizedSpend: chosen.normalizedSpend };
+  }
+
+  /**
+   * The v2 policy is intentionally stricter than v1 fair balancing: either
+   * enrolled account lacking fresh, authenticated weekly capacity pauses new
+   * assignments. Existing owned threads do not use this selector.
+   */
+  selectQuotaAware(observations: ReadonlyMap<OpaqueAccountId, AccountQuotaObservation>): AccountSelection | null {
+    const state = this.store.snapshot();
+    const candidates = this.config.accounts.map((account, configuredIndex) => {
+      const observation = observations.get(account.opaqueAccountId);
+      const ledger = state.ledger[account.opaqueAccountId];
+      if (!account.included || state.accountEligibility[account.opaqueAccountId] !== "eligible"
+        || !ledger || !observation || !accountObservationEligible(observation, this.now())
+        || observation.weeklyRemainingPercent === null || observation.weeklyResetAt === null) return null;
+      return {
+        opaqueAccountId: account.opaqueAccountId,
+        weeklyRemainingPercent: observation.weeklyRemainingPercent,
+        weeklyResetAt: observation.weeklyResetAt,
+        shortWindowPressure: observation.shortWindowPressure,
+        assignedThreadCount: ledger.assignedThreadCount,
+        resetCredits: observation.resetCredits,
+        configuredIndex,
+      };
+    });
+    // Preserve v2's exact-pair fail-closed behavior. V3 intentionally selects
+    // from the currently eligible subset of the enabled pool.
+    if (this.config.schemaVersion === 2 && (candidates.length !== 2 || candidates.some((candidate) => candidate === null))) return null;
+    const eligible = candidates.filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+    if (eligible.length === 0) return null;
+    const sorted = eligible.sort((left, right) => compareQuotaCandidates(left, right, this.now()));
+    const chosen = sorted[0];
+    this.lastSelection.set(chosen.opaqueAccountId, this.now());
+    return { opaqueAccountId: chosen.opaqueAccountId, normalizedSpend: normalizedSpend(state, chosen.opaqueAccountId) };
   }
 
   reserve(opaqueAccountId: OpaqueAccountId, estimatedCost: number): Reservation {
@@ -140,6 +180,33 @@ export class AccountLedger {
       if (!state.threadOwners[threadId]) {
         state.threadOwners[threadId] = owner;
         state.ledger[owner].assignedThreadCount += 1;
+      }
+    });
+  }
+
+  /**
+   * Commit a fully validated fanout page in one state update. Any collision or
+   * malformed duplicate throws before the cloned durable state is persisted,
+   * so a later child page can never leave half of a list owner-bound.
+   */
+  bindKnownThreads(bindings: readonly KnownThreadBinding[]): void {
+    this.store.update((state) => {
+      const batch = new Map<string, OpaqueAccountId>();
+      for (const binding of bindings) {
+        if (!binding.threadId || !state.ledger[binding.owner]) throw new Error("invalid known thread binding");
+        const prior = batch.get(binding.threadId);
+        if (prior !== undefined) throw new Error("duplicate aggregate thread id");
+        batch.set(binding.threadId, binding.owner);
+      }
+      for (const [threadId, owner] of batch) {
+        const existing = state.threadOwners[threadId];
+        if (existing && existing !== owner) throw new Error("thread owner collision");
+      }
+      for (const [threadId, owner] of batch) {
+        if (!state.threadOwners[threadId]) {
+          state.threadOwners[threadId] = owner;
+          state.ledger[owner].assignedThreadCount += 1;
+        }
       }
     });
   }

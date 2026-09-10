@@ -191,6 +191,32 @@ test("the atomic bundle exchange uses the caller's verified swap function", () =
   });
 });
 
+test("the destination guard runs after staging and immediately before atomic exchange", () => {
+  withTempRoot("tweaker-swap-guard-", (root) => {
+    const source = join(root, "source.app");
+    const destination = join(root, "live.app");
+    mkdirSync(join(source, "Contents"), { recursive: true });
+    mkdirSync(join(destination, "Contents"), { recursive: true });
+    writeFileSync(join(source, "Contents", "marker"), "incoming");
+    writeFileSync(join(destination, "Contents", "marker"), "outgoing");
+    const order: string[] = [];
+
+    assert.throws(() => replaceAppBundlePreservingIdentity(source, destination, {
+      beforeSwap: () => {
+        order.push("guard");
+        const incoming = `${destination}.tweakers-contents-swap`;
+        assert.equal(readFileSync(join(incoming, "marker"), "utf8"), "incoming");
+        throw new Error("destination changed");
+      },
+      swapDirectories: () => { order.push("swap"); },
+      validateDestination: () => true,
+    }), /destination changed/);
+
+    assert.deepEqual(order, ["guard"]);
+    assert.equal(readFileSync(join(destination, "Contents", "marker"), "utf8"), "outgoing");
+  });
+});
+
 test("the warm exchange primitive binds one verified native host to the exact prepared Contents pair", () => {
   withTempRoot("tweaker-warm-native-exchange-", (root) => {
     const live = join(root, "live.app", "Contents");

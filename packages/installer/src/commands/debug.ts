@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, sep } from "node:path";
+import { TWEAKERS_VARIANT_BUNDLE_ID } from "../macos-variant.js";
 import { locateCodex, type CodexInstall } from "../platform.js";
 import { userPaths, type UserPaths } from "../paths.js";
 import {
@@ -243,8 +244,10 @@ function existingAware(entries: [label: string, path: string][]): DataPath[] {
   return entries.map(([label, path]) => ({ label, path, exists: existsSync(path) }));
 }
 
-export function getOpenReport(codex: CodexInstall): OpenReport {
-  const processes = listProcesses();
+export function getOpenReport(
+  codex: CodexInstall,
+  processes: ProcessInfo[] = listProcesses(),
+): OpenReport {
   const related = relatedCodexProcesses(codex, processes);
   const main = mainCodexProcesses(codex, related);
   const primary = earliestProcess(main) ?? earliestProcess(related) ?? null;
@@ -422,10 +425,21 @@ function relatedCodexProcesses(codex: CodexInstall, processes: ProcessInfo[]): P
 }
 
 function mainCodexProcesses(codex: CodexInstall, processes: ProcessInfo[]): ProcessInfo[] {
-  const executable = normalizePath(codex.executable);
+  const executables = [normalizePath(codex.executable)];
+  // Older independent Tweakers builds keep CFBundleExecutable pointed at a
+  // small launcher named ChatGPT. That launcher replaces itself with the
+  // exact, bundle-local `Tweakers Electron` binary, so ps never shows the
+  // declared executable while the app is running. Recognize only that fixed
+  // legacy executable for the verified Tweakers bundle identity; never broaden
+  // ordinary ChatGPT process matching to arbitrary binaries under MacOS/.
+  if (codex.platform === "darwin" && codex.bundleId === TWEAKERS_VARIANT_BUNDLE_ID) {
+    executables.push(normalizePath(join(codex.appRoot, "Contents", "MacOS", "Tweakers Electron")));
+  }
   return processes.filter((p) => {
     const command = normalizePath(p.command);
-    return command === executable || command.startsWith(`${executable} `);
+    return executables.some(
+      (executable) => command === executable || command.startsWith(`${executable} `),
+    );
   });
 }
 

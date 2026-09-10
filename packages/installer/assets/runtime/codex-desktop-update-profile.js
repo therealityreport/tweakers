@@ -121,8 +121,11 @@ function codexDesktopUpdateTargetForProfile(input) {
     if (input.profile === "stable") {
         return {
             profile: "stable",
-            available: true,
-            unavailableReason: null,
+            appPath: input.identity?.appPath ?? null,
+            available: input.identity !== null,
+            unavailableReason: input.identity
+                ? null
+                : "The global manager has not published a verified official ChatGPT app.",
             setupRequired: null,
             identityKey: input.identity?.identityKey ?? "official-stable-default",
             feedUrl: null,
@@ -143,6 +146,7 @@ function codexDesktopUpdateTargetForProfile(input) {
     if (!input.capturedFeed) {
         return {
             profile: "alpha",
+            appPath: input.identity.appPath,
             available: false,
             unavailableReason: "Launch the registered OpenAI Beta app once so Tweakers can capture that app's own Sparkle feed. No Beta feed URL is guessed.",
             setupRequired: "launch-beta",
@@ -153,6 +157,7 @@ function codexDesktopUpdateTargetForProfile(input) {
     }
     return {
         profile: "alpha",
+        appPath: input.identity.appPath,
         available: true,
         unavailableReason: null,
         setupRequired: null,

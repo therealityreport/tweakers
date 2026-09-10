@@ -40,7 +40,7 @@ test("registered page icons are constrained to the native sidebar size", () => {
   const itemStart = source.indexOf("function makeSidebarItem");
   const itemEnd = source.indexOf("function appendSidebarStoreUpdateBadge", itemStart);
   const body = source.slice(itemStart, itemEnd);
-  assert.match(body, /constrainSidebarIconSvg\(inner\.querySelector\("svg"\)\)/);
+  assert.match(body, /constrainSidebarIconSvg\(iconSlot\.querySelector\("svg"\)\)/);
 
   const helperStart = source.indexOf("function constrainSidebarIconSvg");
   const helperEnd = source.indexOf("function makeSidebarItem", helperStart);
@@ -49,6 +49,21 @@ test("registered page icons are constrained to the native sidebar size", () => {
   assert.match(helper, /setAttribute\("height", String\(size\)\)/);
   assert.match(helper, /style\.width = `\$\{size\}px`/);
   assert.match(helper, /classList\?\.add\("icon-sm", "inline-block", "shrink-0", "align-middle"\)/);
+});
+
+test("Tweaker-owned sidebar rows mirror the live Codex row structure", () => {
+  const itemStart = source.indexOf("function nativeSidebarItemTemplate");
+  const itemEnd = source.indexOf("function appendSidebarStoreUpdateBadge", itemStart);
+  assert.ok(itemStart >= 0 && itemEnd > itemStart);
+  const body = source.slice(itemStart, itemEnd);
+
+  assert.match(body, /button\[data-settings-panel-slug\]:not\(\[aria-current='page'\]\)/);
+  assert.match(body, /btn\.className = template\?\.className/);
+  assert.match(body, /inner\.className = templateInner\?\.className/);
+  assert.match(body, /iconSlot\.className = templateIconSlot\?\.className/);
+  assert.match(body, /text\.className = templateLabel\?\.className/);
+  assert.match(body, /"flex w-4 shrink-0 items-center justify-center"/);
+  assert.match(body, /"text-fade-truncate"/);
 });
 
 test("Tweaker settings pages own an opaque native main-surface background", () => {

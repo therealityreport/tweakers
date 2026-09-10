@@ -8,6 +8,7 @@ exports.analyzeScheduledTaskWatcher = analyzeScheduledTaskWatcher;
 exports.analyzeWatcherLogTail = analyzeWatcherLogTail;
 exports.analyzeWatcherCycleReceipt = analyzeWatcherCycleReceipt;
 exports.classifyRuntimeFingerprints = classifyRuntimeFingerprints;
+exports.launchdDisabledState = launchdDisabledState;
 exports.parseLaunchdLoadedCommand = parseLaunchdLoadedCommand;
 exports.readRuntimeFingerprintEvidence = readRuntimeFingerprintEvidence;
 const node_child_process_1 = require("node:child_process");
@@ -415,7 +416,7 @@ function withWatcherRegistry(health, userRoot, dependencies) {
     const repairProbeState = repairWatcherProbeState(health.latestCompletedCycle);
     const repairPlist = (0, node_path_1.join)(launchdDirectory, `${LAUNCHD_LABEL}.plist`);
     const lifecycleStatus = readWatcherStatus((0, node_path_1.join)(lifecycleDirectory, "codex-mcp-lifecycle-status.json"), [1, 2], "v1", readJsonDocument);
-    const guardStatus = readWatcherStatus((0, node_path_1.join)(lifecycleDirectory, "codex-mcp-guard-status.json"), [1], "v1", readJsonDocument);
+    const guardStatus = readWatcherStatus((0, node_path_1.join)(lifecycleDirectory, "codex-mcp-guard-status.json"), [3], "mcp-guard-status.v3", readJsonDocument, true);
     return {
         ...health,
         watchers: (0, watcher_registry_1.buildWatcherRegistry)({
@@ -496,6 +497,7 @@ function lifecycleProbe(label, plistPath, status, pathExists, launchdState) {
     return {
         installed: pathExists(plistPath),
         loaded: loaded.loaded,
+        disabled: loaded.disabled,
         running: loaded.running,
         lastExitCode: loaded.lastExitCode,
         lastRunAt: status.lastRunAt,
@@ -504,10 +506,11 @@ function lifecycleProbe(label, plistPath, status, pathExists, launchdState) {
         policyVersion: status.policyVersion,
         deferredReason: null,
         error: status.error,
-        supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [1],
+        supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [3],
+        legacyStatusSchemaVersion: status.legacyStatusSchemaVersion,
     };
 }
-function readWatcherStatus(path, supportedSchemas, fallbackPolicyVersion, readDocument = readJsonRecord) {
+function readWatcherStatus(path, supportedSchemas, fallbackPolicyVersion, readDocument = readJsonRecord, requireGuardV3 = false) {
     const document = readDocument(path);
     if (!document) {
         return {
@@ -516,6 +519,7 @@ function readWatcherStatus(path, supportedSchemas, fallbackPolicyVersion, readDo
             statusSchemaVersion: null,
             policyVersion: fallbackPolicyVersion,
             error: `status missing: ${path}`,
+            legacyStatusSchemaVersion: null,
         };
     }
     const schemaVersion = numericValue(document.schema_version ?? document.schemaVersion);
@@ -523,6 +527,13 @@ function readWatcherStatus(path, supportedSchemas, fallbackPolicyVersion, readDo
     const job = recordValue(document.job);
     const jobOK = job?.ok;
     const policyVersion = stringValue(document.cleanup_policy_version ?? document.policyVersion) ?? fallbackPolicyVersion;
+    const authority = stringValue(document.authority);
+    const taskDataAccess = stringValue(document.taskDataAccess);
+    const mutationCapabilities = document.mutationCapabilities;
+    const v3ContractValid = authority === "observation-and-notification-only"
+        && taskDataAccess === "none"
+        && Array.isArray(mutationCapabilities)
+        && mutationCapabilities.length === 0;
     const error = schemaVersion === null
         ? "status schema missing or invalid"
         : !supportedSchemas.includes(schemaVersion)
@@ -533,13 +544,18 @@ function readWatcherStatus(path, supportedSchemas, fallbackPolicyVersion, readDo
                     ? "status job missing or invalid"
                     : jobOK === false
                         ? stringValue(job.error) ?? "watcher reported an unhealthy run"
-                        : null;
+                        : requireGuardV3 && !v3ContractValid
+                            ? "Guard v3 authority contract is missing or invalid"
+                            : null;
     return {
         lastRunAt: generatedAt,
         lastSuccessAt: jobOK === true ? generatedAt : null,
         statusSchemaVersion: schemaVersion,
         policyVersion,
         error,
+        legacyStatusSchemaVersion: schemaVersion !== null && !supportedSchemas.includes(schemaVersion)
+            ? schemaVersion
+            : null,
     };
 }
 function repairWatcherProbeState(receipt) {
@@ -607,21 +623,41 @@ function commandSucceeds(command, args) {
     }
 }
 function readLaunchdLoadedState(label = LAUNCHD_LABEL) {
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const disabled = uid === null ? null : launchdDisabledState(commandOutput("launchctl", ["print-disabled", `gui/${uid}`]), label);
     const output = commandOutput("launchctl", ["list", label]);
     if (output === null)
-        return { loaded: false, running: false, lastExitCode: null };
+        return { loaded: false, disabled, running: false, lastExitCode: null };
     const pidMatch = output.match(/["']?PID["']?\s*[=:]\s*(\d+)/i);
     const exitMatch = output.match(/["']?LastExitStatus["']?\s*[=:]\s*(-?\d+)/i);
-    const uid = typeof process.getuid === "function" ? process.getuid() : null;
     const loadedDefinition = uid === null
         ? null
         : commandOutput("launchctl", ["print", `gui/${uid}/${label}`]);
     return {
         loaded: true,
+        disabled,
         running: Boolean(pidMatch && Number(pidMatch[1]) > 0),
         lastExitCode: exitMatch ? Number(exitMatch[1]) : null,
         command: loadedDefinition ? parseLaunchdLoadedCommand(loadedDefinition) : null,
     };
+}
+function launchdDisabledState(output, label) {
+    if (output === null)
+        return null;
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = output.match(new RegExp(`(?:\\"|')?${escaped}(?:\\"|')?\\s*=>\\s*(true|false|disabled|enabled)(?=\\s|$|[,}])`, "i"));
+    if (!match?.[1])
+        return null;
+    switch (match[1].toLowerCase()) {
+        case "true":
+        case "disabled":
+            return true;
+        case "false":
+        case "enabled":
+            return false;
+        default:
+            return null;
+    }
 }
 function parseLaunchdLoadedCommand(output) {
     const line = output

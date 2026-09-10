@@ -1,6 +1,8 @@
 export type CodexDesktopReleaseProfile = "stable" | "alpha";
 export interface CodexDesktopUpdateTarget {
     profile: CodexDesktopReleaseProfile;
+    /** Exact manager-verified official OpenAI app. Never the derived client bundle. */
+    appPath?: string | null;
     available: boolean;
     unavailableReason: string | null;
     setupRequired?: "register-beta" | "launch-beta" | null;
@@ -32,10 +34,23 @@ export interface CodexDesktopUpdateCheckResult {
     checkedAt: string;
     reason: string | null;
     retryRequested: boolean;
+    /** New official-ChatGPT-only action result. */
+    officialUpdateRequested: boolean;
+    /** Compatibility alias for readers predating the split updater. */
     updateAndReloadRequested: boolean;
     nativeUpdateControlActive?: boolean;
     javaScriptUpdaterManagerAvailable?: boolean;
     javaScriptUpdaterManagerReason?: string | null;
+    /**
+     * A manager-owned action may be ready even when no independently verified
+     * remote update metadata has been published. It must never be rendered as
+     * an update-available claim.
+     */
+    managerAction?: {
+        actionId: "desktop-update.start";
+        available: boolean;
+        reason: string;
+    } | null;
     setupRequired?: "register-beta" | "launch-beta" | null;
 }
 /** Electron MessageBoxOptions subset kept free of Electron so the service is unit-testable. */
@@ -55,7 +70,7 @@ export interface CodexDesktopUpdateServiceDependencies {
     showDialog(dialog: CodexDesktopUpdateDialog): Promise<{
         response: number;
     }>;
-    startUpdateAndReload(): void | Promise<void>;
+    startOfficialUpdate(): void | Promise<void>;
     scheduleRetry?(retry: () => void): void;
     /** Publishes each completed metadata check to renderer and native UI surfaces. */
     onResult?(result: CodexDesktopUpdateCheckResult): void;

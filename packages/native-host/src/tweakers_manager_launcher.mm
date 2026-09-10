@@ -33,6 +33,8 @@ constexpr char kManagerId[] = "com.thomashulihan.tweakers";
 constexpr char kLauncherName[] = "Tweakers Manager Launcher";
 constexpr char kSealName[] = "target.seal";
 constexpr char kManagerName[] = "manager.mjs";
+constexpr char kManagedRuntimeGenerationsName[] = "managed-runtime-generations";
+constexpr char kManagedRuntimeFingerprintMarker[] = "TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1";
 constexpr char kLauncherIdentifier[] = "com.therealityreport.tweakers.manager-launcher";
 constexpr char kCertificateLeafSha1[] = TWEAKERS_MANAGER_CERTIFICATE_LEAF_SHA1;
 constexpr mode_t kManagedDirectoryMode = 0700;
@@ -49,10 +51,14 @@ struct Seal {
   std::string nodePath;
   std::string nodeSha256;
   std::string managerSha256;
+  std::string managedRuntimeFingerprint;
 };
 
 enum class InvocationKind {
   kStatus,
+  kOfficialSourceRegistration,
+  kPortableDesktop,
+  kPrivateOffline,
 #if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
   kPrepare,
   kExecute,
@@ -122,16 +128,15 @@ bool IsRfc3339(const char *value) {
 
 bool IsSupportedAction(const char *value) {
   if (value == nullptr) return false;
-  static constexpr std::array<const char *, 10> actions = {
+  static constexpr std::array<const char *, 9> actions = {
     "environment.cancel",
     "environment.recover",
-    "desktop-update.resume",
-    "desktop-update.cancel",
     "environment.switch",
-    "desktop-update.start",
     "repair.run",
     "self-update.run",
-    "refresh.full",
+    "refresh.injected",
+    "refresh.independent",
+    "official-source.register",
     "app.restart-runtime-proof",
   };
   for (const char *action : actions) {
@@ -286,7 +291,8 @@ std::string GenerationIdPreimage(const Seal &seal) {
     + "launcher-sha256=" + seal.launcherSha256 + "\n"
     + "node-path=" + seal.nodePath + "\n"
     + "node-sha256=" + seal.nodeSha256 + "\n"
-    + "manager-sha256=" + seal.managerSha256 + "\n";
+    + "manager-sha256=" + seal.managerSha256 + "\n"
+    + "managed-runtime-fingerprint=" + seal.managedRuntimeFingerprint + "\n";
 }
 
 bool ParseSeal(const std::string &contents, Seal *seal) {
@@ -299,21 +305,64 @@ bool ParseSeal(const std::string &contents, Seal *seal) {
     lines.push_back(contents.substr(start, end - start));
     start = end + 1;
   }
-  if (lines.size() != 8 || lines[0] != "TWEAKERS_MANAGER_TARGET_SEAL_V1") return Fail("target seal has an invalid header or record count");
-  const std::array<std::string, 7> keys = {
-    "manager-id=", "protocol-version=", "generation-id=", "launcher-sha256=", "node-path=", "node-sha256=", "manager-sha256=",
+  if (lines.size() != 9 || lines[0] != "TWEAKERS_MANAGER_TARGET_SEAL_V1") return Fail("target seal has an invalid header or record count");
+  const std::array<std::string, 8> keys = {
+    "manager-id=", "protocol-version=", "generation-id=", "launcher-sha256=", "node-path=", "node-sha256=", "manager-sha256=", "managed-runtime-fingerprint=",
   };
-  std::array<std::string, 7> values {};
+  std::array<std::string, 8> values {};
   for (size_t index = 0; index < keys.size(); ++index) {
     if (lines[index + 1].rfind(keys[index], 0) != 0) return Fail("target seal record order is invalid");
     values[index] = lines[index + 1].substr(keys[index].size());
     if (values[index].empty() || values[index].find_first_of("\r\n\0", 0, 3) != std::string::npos) return Fail("target seal record is empty or contains control data");
   }
-  if (values[0] != kManagerId || values[1] != "1" || !IsHexLower64(values[2]) || !IsHexLower64(values[3]) || !IsHexLower64(values[5]) || !IsHexLower64(values[6])) {
+  if (values[0] != kManagerId || values[1] != "1" || !IsHexLower64(values[2]) || !IsHexLower64(values[3]) || !IsHexLower64(values[5]) || !IsHexLower64(values[6]) || !IsHexLower64(values[7])) {
     return Fail("target seal has an invalid fixed value");
   }
   if (values[4].front() != '/') return Fail("target seal node path is not absolute");
-  *seal = {values[2], values[3], values[4], values[5], values[6]};
+  *seal = {values[2], values[3], values[4], values[5], values[6], values[7]};
+  return true;
+}
+
+bool ValidateManagerManagedRuntimeFingerprintMarker(const std::string &managerScript, const Seal &seal) {
+  int fd = open(managerScript.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return Fail("could not open sealed manager bundle for fingerprint binding: " + std::string(std::strerror(errno)));
+
+  const std::string markerPrefix = std::string("//# ") + kManagedRuntimeFingerprintMarker + "=";
+  const std::string expected = markerPrefix + seal.managedRuntimeFingerprint + "\n";
+  std::array<char, 16384> buffer {};
+  std::string pending;
+  size_t expectedMatches = 0;
+  size_t markerRecords = 0;
+  while (true) {
+    const ssize_t count = read(fd, buffer.data(), buffer.size());
+    if (count < 0) {
+      const int error = errno;
+      close(fd);
+      return Fail("could not read sealed manager bundle for fingerprint binding: " + std::string(std::strerror(error)));
+    }
+    if (count == 0) break;
+    pending.append(buffer.data(), static_cast<size_t>(count));
+    size_t start = 0;
+    while (true) {
+      const size_t end = pending.find('\n', start);
+      if (end == std::string::npos) {
+        pending.erase(0, start);
+        break;
+      }
+      const std::string line = pending.substr(start, end - start + 1);
+      if (line.rfind(markerPrefix, 0) == 0) {
+        ++markerRecords;
+        if (line == expected) ++expectedMatches;
+      }
+      start = end + 1;
+    }
+    // A marker is an exact, short, line-oriented trailer record. Once the
+    // remaining unterminated line is longer than that record it cannot become
+    // a marker, so discard it rather than retaining attacker-controlled bytes.
+    if (pending.size() > markerPrefix.size() + 64) pending.clear();
+  }
+  if (close(fd) != 0) return Fail("could not close sealed manager bundle after fingerprint binding");
+  if (markerRecords != 1 || expectedMatches != 1) return Fail("sealed manager bundle managed-runtime fingerprint does not bind its target seal");
   return true;
 }
 
@@ -354,10 +403,33 @@ bool ValidateOwnCodeSignature(const std::string &path) {
 
 bool ValidateInvocation(int argc, char *const argv[], InvocationKind *kind) {
   if (kind == nullptr) return Fail("could not classify manager invocation");
+  if (argc == 2 && (std::strcmp(argv[1], "portable-desktop-prelaunch-v1") == 0
+      || std::strcmp(argv[1], "portable-desktop-handoff-official-v1") == 0
+      || std::strcmp(argv[1], "portable-desktop-handoff-tweakers-v1") == 0)) {
+    *kind = InvocationKind::kPortableDesktop;
+    return true;
+  }
+  if (argc == 8 && std::strcmp(argv[1], "native-history-activation-run-v1") == 0
+      && std::strcmp(argv[2], "--operation-id") == 0 && IsCanonicalUuid(argv[3])
+      && std::strcmp(argv[4], "--context-bytes") == 0 && std::strcmp(argv[6], "--context-sha256") == 0) {
+    const std::string count(argv[5]); const std::string digest(argv[7]);
+    if (!count.empty() && count.size() <= 5 && count[0] >= '1' && count[0] <= '9'
+        && count.find_first_not_of("0123456789") == std::string::npos && std::stoul(count) <= 65536
+        && digest.rfind("sha256:", 0) == 0 && IsHexLower64(digest.substr(7))) {
+      *kind = InvocationKind::kPrivateOffline;
+      return true;
+    }
+  }
   if (argc == 5 && std::strcmp(argv[1], "status") == 0
       && std::strcmp(argv[2], "--request-id") == 0 && IsCanonicalUuid(argv[3])
       && std::strcmp(argv[4], "--json") == 0) {
     *kind = InvocationKind::kStatus;
+    return true;
+  }
+  if (argc == 5 && std::strcmp(argv[1], "official-source-registration") == 0
+      && std::strcmp(argv[2], "--request-id") == 0 && IsCanonicalUuid(argv[3])
+      && std::strcmp(argv[4], "--json") == 0) {
+    *kind = InvocationKind::kOfficialSourceRegistration;
     return true;
   }
 #if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
@@ -379,7 +451,7 @@ bool ValidateInvocation(int argc, char *const argv[], InvocationKind *kind) {
     return true;
   }
 #endif
-  return Fail("only the fixed v1 status manager argv shape is supported");
+  return Fail("only fixed v1 manager protocol argv shapes are supported");
 }
 
 bool ValidatePrivilegeBoundary() {
@@ -422,6 +494,13 @@ bool ValidateGeneration(const std::string &launcher, Seal *seal, std::string *ma
   if (launcherDigest != seal->launcherSha256 || managerDigest != seal->managerSha256) return Fail("target seal digest mismatch");
   if (Sha256Bytes(GenerationIdPreimage(*seal)) != seal->generationId || Basename(generation) != seal->generationId) {
     return Fail("target seal generation identity mismatch");
+  }
+  const std::string managedRuntimeGenerations = managerRoot + "/" + kManagedRuntimeGenerationsName;
+  const std::string managedRuntimeGeneration = managedRuntimeGenerations + "/" + seal->managedRuntimeFingerprint;
+  if (!IsExpectedManagedDirectory(managedRuntimeGenerations, owner)
+      || !IsExpectedManagedDirectory(managedRuntimeGeneration, owner)
+      || !ValidateManagerManagedRuntimeFingerprintMarker(managerScript, *seal)) {
+    return false;
   }
   std::string canonicalNode;
   if (!CanonicalPath(seal->nodePath, &canonicalNode) || canonicalNode != seal->nodePath || !IsSafeNodeFile(canonicalNode, owner) || !ValidateSafeAncestors(Dirname(canonicalNode), owner)) {
@@ -486,7 +565,8 @@ int SpawnManager(
   const std::string &nodePath,
   const std::string &managerPath,
   int argc,
-  char *const argv[]
+  char *const argv[],
+  const std::string *prepareInput
 ) {
   posix_spawnattr_t attributes {};
   int result = posix_spawnattr_init(&attributes);
@@ -509,7 +589,6 @@ int SpawnManager(
   childArguments.push_back(nullptr);
   char *childEnvironment[] = {nullptr};
 #if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
-  const std::string *prepareInput = nullptr;
   posix_spawn_file_actions_t fileActions {};
   posix_spawn_file_actions_t *fileActionsPointer = nullptr;
   bool fileActionsInitialized = false;
@@ -609,5 +688,13 @@ int main(int argc, char *argv[]) {
   std::string managerPath;
   std::string nodePath;
   if (!ValidateGeneration(launcher, &seal, &managerPath, &nodePath)) return 70;
-  return SpawnManager(nodePath, managerPath, argc, argv);
+  std::string prepareInput;
+  const std::string *prepareInputPointer = nullptr;
+#if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
+  if (kind == InvocationKind::kPrepare) {
+    if (!ReadPrepareInput(&prepareInput)) return 64;
+    prepareInputPointer = &prepareInput;
+  }
+#endif
+  return SpawnManager(nodePath, managerPath, argc, argv, prepareInputPointer);
 }

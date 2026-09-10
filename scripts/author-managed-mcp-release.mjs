@@ -7,7 +7,7 @@
  *   3. Managed MCP fleet manifest        (managed-mcp-fleet.v1.json + catalogs + plugin bundles)
  *
  * Artifacts are written beneath the internal-storage install root (default
- * ~/Library/Application Support/codex-plusplus/managed-mcp-release) and are
+ * ~/Library/Application Support/Tweakers/managed-mcp-release) and are
  * validated with the REAL verifiers from packages/installer/dist:
  * stageCodexManagedMcpPackages and prepareManagedMcpLifecycleRuntime.
  *
@@ -43,7 +43,7 @@ const opt = (name, fallback) => {
 
 const INSTALL_ROOT = opt(
   "--install-root",
-  join(homedir(), "Library", "Application Support", "codex-plusplus"),
+  join(homedir(), "Library", "Application Support", "Tweakers"),
 );
 const ROOT = opt("--root", join(INSTALL_ROOT, "managed-mcp-release"));
 const CHROME_ROOT = join(ROOT, "chrome-devtools");

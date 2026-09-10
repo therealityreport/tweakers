@@ -142,7 +142,7 @@ test("environment readiness accepts a proved visible window even when it is inac
     openedAt: null,
     openedAtRaw: null,
     detail: "Main Codex process is running but not frontmost.",
-  }), { pid: 71, visibleWindow: true });
+  }), { pid: 71, visibleWindow: true, startedAtRaw: null });
   assert.deepEqual(codexMainProcessObservationFromReport({
     status: "open",
     pid: 72,
@@ -152,7 +152,7 @@ test("environment readiness accepts a proved visible window even when it is inac
     openedAt: null,
     openedAtRaw: null,
     detail: "Main Codex process is frontmost.",
-  }), { pid: 72, visibleWindow: true });
+  }), { pid: 72, visibleWindow: true, startedAtRaw: null });
 
   assert.deepEqual(codexMainProcessObservationFromReport({
     status: "inactive",
@@ -163,7 +163,7 @@ test("environment readiness accepts a proved visible window even when it is inac
     openedAt: null,
     openedAtRaw: null,
     detail: "Foreground state was not accessible.",
-  }), { pid: 73, visibleWindow: false });
+  }), { pid: 73, visibleWindow: false, startedAtRaw: null });
 });
 
 test("environment observation fails closed when the exact requested app disappears", () => {
@@ -627,6 +627,7 @@ test(
       assert.equal(calls.length, 1);
       const call = calls[0];
       assert.match(scriptFrom(call), /\/usr\/bin\/open '\/Applications\/ChatGPT\.app'/);
+      assert.match(scriptFrom(call), /with timeout of 5 seconds[\s\S]*to activate[\s\S]*end timeout/);
       assert.deepEqual(call.options, {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],

@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/stdio.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 struct TweakerBounds {
   double x;
@@ -491,6 +494,114 @@ static napi_value SwapDirectories(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
+// A zero-byte native Codex writer-lock inode is held with flock. Keep both
+// descriptors until release, and never unlink the shared pathname: another
+// native process may already have opened that same inode for its next resume.
+struct NativeWriterLease {
+  int directory = -1;
+  int file = -1;
+  bool locked = false;
+  std::string directoryPath;
+  std::string name;
+  struct stat directoryIdentity {};
+  struct stat fileIdentity {};
+  void close() {
+    if (file >= 0) { if (locked) flock(file, LOCK_UN); ::close(file); file = -1; locked = false; }
+    if (directory >= 0) { ::close(directory); directory = -1; }
+  }
+  ~NativeWriterLease() { close(); }
+};
+
+static bool SameInode(const struct stat &first, const struct stat &second) {
+  return first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+static bool WriterLeaseHeld(NativeWriterLease *lease) {
+  struct stat directory {}, file {};
+  return lease && lease->locked && lease->file >= 0 && lease->directory >= 0
+    && lstat(lease->directoryPath.c_str(), &directory) == 0
+    && S_ISDIR(directory.st_mode) && SameInode(directory, lease->directoryIdentity)
+    && directory.st_uid == geteuid() && !(directory.st_mode & 0022)
+    && fstatat(lease->directory, lease->name.c_str(), &file, AT_SYMLINK_NOFOLLOW) == 0
+    && S_ISREG(file.st_mode) && SameInode(file, lease->fileIdentity)
+    && file.st_uid == geteuid() && !(file.st_mode & 0022) && file.st_size == 0;
+}
+
+static napi_value NativeWriterLeaseRelease(napi_env env, napi_callback_info info) {
+  napi_value self;
+  napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr);
+  NativeWriterLease *lease = nullptr;
+  if (napi_unwrap(env, self, reinterpret_cast<void **>(&lease)) == napi_ok && lease) lease->close();
+  return Undefined(env);
+}
+
+static napi_value NativeWriterLeaseIsHeld(napi_env env, napi_callback_info info) {
+  napi_value self, result;
+  napi_get_cb_info(env, info, nullptr, nullptr, &self, nullptr);
+  NativeWriterLease *lease = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void **>(&lease));
+  napi_get_boolean(env, WriterLeaseHeld(lease), &result);
+  return result;
+}
+
+static napi_value AcquireNativeThreadWriterLease(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value args[4];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  std::string directory, name, expectedDev, expectedIno;
+  if (argc != 4 || !GetStringArgument(env, args[0], &directory) || !GetStringArgument(env, args[1], &name)
+    || !GetStringArgument(env, args[2], &expectedDev) || !GetStringArgument(env, args[3], &expectedIno)
+    || directory.empty() || directory[0] != '/' || directory.find('\0') != std::string::npos
+    || name.size() != 41 || name.substr(36) != ".lock") {
+    Throw(env, "Invalid native thread writer lease binding"); return Undefined(env);
+  }
+  for (size_t index = 0; index < 36; index++) {
+    const bool separator = index == 8 || index == 13 || index == 18 || index == 23;
+    if (separator ? name[index] != '-' : (name[index] < '0' || name[index] > '9') && (name[index] < 'a' || name[index] > 'f')) {
+      Throw(env, "Invalid native thread writer lease binding"); return Undefined(env);
+    }
+  }
+  auto *lease = new NativeWriterLease();
+  lease->directoryPath = directory;
+  lease->name = name;
+  lease->directory = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (lease->directory < 0 || fstat(lease->directory, &lease->directoryIdentity) != 0
+    || lease->directoryIdentity.st_uid != geteuid() || (lease->directoryIdentity.st_mode & 0022)
+    || std::to_string(lease->directoryIdentity.st_dev) != expectedDev
+    || std::to_string(lease->directoryIdentity.st_ino) != expectedIno) {
+    delete lease; Throw(env, "Native thread writer directory changed"); return Undefined(env);
+  }
+  lease->file = openat(lease->directory, name.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (lease->file < 0 || fstat(lease->file, &lease->fileIdentity) != 0
+    || !S_ISREG(lease->fileIdentity.st_mode) || lease->fileIdentity.st_uid != geteuid()
+    || (lease->fileIdentity.st_mode & 0022) || lease->fileIdentity.st_size != 0) {
+    delete lease; Throw(env, "Native thread writer file is unavailable"); return Undefined(env);
+  }
+  if (flock(lease->file, LOCK_EX | LOCK_NB) != 0) {
+    const bool busy = errno == EWOULDBLOCK || errno == EAGAIN;
+    delete lease;
+    if (busy) { napi_value result; napi_get_null(env, &result); return result; }
+    Throw(env, "Native thread writer lock failed"); return Undefined(env);
+  }
+  lease->locked = true;
+  if (!WriterLeaseHeld(lease)) {
+    delete lease; Throw(env, "Native thread writer lock identity changed"); return Undefined(env);
+  }
+  napi_value result, dev, ino;
+  napi_create_object(env, &result);
+  napi_create_string_utf8(env, std::to_string(lease->fileIdentity.st_dev).c_str(), NAPI_AUTO_LENGTH, &dev);
+  napi_create_string_utf8(env, std::to_string(lease->fileIdentity.st_ino).c_str(), NAPI_AUTO_LENGTH, &ino);
+  napi_set_named_property(env, result, "dev", dev);
+  napi_set_named_property(env, result, "ino", ino);
+  napi_wrap(env, result, lease, [](napi_env, void *data, void *) { delete static_cast<NativeWriterLease *>(data); }, nullptr, nullptr);
+  napi_property_descriptor methods[] = {
+    {"release", nullptr, NativeWriterLeaseRelease, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"isHeld", nullptr, NativeWriterLeaseIsHeld, nullptr, nullptr, nullptr, napi_default, nullptr},
+  };
+  napi_define_properties(env, result, 2, methods);
+  return result;
+}
+
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"getCapabilities", nullptr, GetCapabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -498,6 +609,7 @@ NAPI_MODULE_INIT() {
     {"attachView", nullptr, AttachView, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeAll", nullptr, DisposeAll, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"swapDirectories", nullptr, SwapDirectories, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"acquireNativeThreadWriterLease", nullptr, AcquireNativeThreadWriterLease, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
   return exports;

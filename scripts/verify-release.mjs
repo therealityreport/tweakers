@@ -69,10 +69,10 @@ export function verifyManagerReleaseArtifacts(root) {
   const name = policy.executableName;
   const canonicalLauncher = resolve(root, "packages/native-host/assets", name);
   const installerLauncher = resolve(root, "packages/installer/assets/manager-launcher", name);
-  const statusBundle = resolve(root, "packages/installer/assets/manager-launcher/manager.mjs");
+  const managerBundle = resolve(root, "packages/installer/assets/manager-launcher/manager.mjs");
   const packagedPolicy = resolve(root, "packages/installer/assets/manager-launcher/signing-policy.json");
   const canonicalPolicy = resolve(root, "packages/native-host/manager-signing-policy.json");
-  for (const path of [canonicalLauncher, installerLauncher, statusBundle, packagedPolicy]) {
+  for (const path of [canonicalLauncher, installerLauncher, managerBundle, packagedPolicy]) {
     if (!existsSync(path)) throw new Error(`missing committed manager release artifact: ${path}`);
   }
   if (sha256File(canonicalPolicy) !== sha256File(packagedPolicy)) {
@@ -106,11 +106,54 @@ export function verifyManagerReleaseArtifacts(root) {
   if (canonicalSha256 !== installerSha256) {
     throw new Error("installer manager launcher bytes differ from the committed canonical launcher");
   }
-  const bundle = readFileSync(statusBundle, "utf8");
-  for (const forbidden of ["environment.cancel", "desktop-update.resume", "createSealedTweakersManagerActionAdapter"]) {
-    if (bundle.includes(forbidden)) throw new Error(`status-only manager bundle contains dormant action marker: ${forbidden}`);
+  const bundle = readFileSync(managerBundle, "utf8");
+  for (const required of ["environment.cancel", "refresh.injected", "refresh.independent", "official-source.register", "createSealedTweakersManagerActionAdapter"]) {
+    if (!bundle.includes(required)) throw new Error(`fixed-action manager bundle is missing sealed action marker: ${required}`);
   }
-  return { canonicalLauncher, statusBundle, launcherSha256: canonicalSha256 };
+  if (bundle.includes("refresh.full")) {
+    throw new Error("fixed-action manager bundle contains the retired generic refresh action");
+  }
+  return { canonicalLauncher, managerBundle, launcherSha256: canonicalSha256 };
+}
+
+const MANAGER_BUNDLE_RELATIVE_PATH = "packages/installer/assets/manager-launcher/manager.mjs";
+const MANAGER_FINGERPRINT_MARKERS = [
+  "TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1",
+  "TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1",
+];
+
+/** Ignore only the runner-specific fingerprint values sealed into a manager build. */
+export function normalizeManagerBundleFingerprints(bundle, label = "manager bundle") {
+  let normalized = bundle;
+  for (const marker of MANAGER_FINGERPRINT_MARKERS) {
+    const pattern = new RegExp(`^//# ${marker}=([a-f0-9]{64})$`, "gm");
+    const matches = [...bundle.matchAll(pattern)];
+    if (matches.length !== 1) {
+      throw new Error(`${label} must contain exactly one valid ${marker} trailer`);
+    }
+    normalized = normalized.replaceAll(matches[0][1], `<${marker}>`);
+  }
+  return normalized;
+}
+
+/** Compare the post-build manager bundle to HEAD while retaining strict source-drift detection. */
+export function verifyGeneratedManagerBundle(root) {
+  const generatedPath = resolve(root, MANAGER_BUNDLE_RELATIVE_PATH);
+  if (!existsSync(generatedPath)) {
+    throw new Error(`missing generated manager bundle: ${generatedPath}`);
+  }
+  const generated = normalizeManagerBundleFingerprints(
+    readFileSync(generatedPath, "utf8"),
+    "generated manager bundle",
+  );
+  const committed = normalizeManagerBundleFingerprints(
+    run("git", ["show", `HEAD:${MANAGER_BUNDLE_RELATIVE_PATH}`], { cwd: root }),
+    "committed manager bundle",
+  );
+  if (generated !== committed) {
+    throw new Error("generated manager bundle differs from HEAD after normalizing runner-specific fingerprints");
+  }
+  return { managerBundle: generatedPath };
 }
 
 function parseSha256Sums(sums, tarball) {
@@ -138,8 +181,13 @@ function requireNonEmptyString(value, label) {
   return value;
 }
 
-function run(command, args, { includeStderr = false } = {}) {
-  const result = spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+function run(command, args, { cwd, includeStderr = false } = {}) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   if (result.status !== 0 || result.error) {
     throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message ?? `${result.stdout ?? ""}${result.stderr ?? ""}`}`);
   }
@@ -164,6 +212,9 @@ if (isDirectExecution()) {
   if (args.includes("--manager-artifacts")) {
     verifyManagerReleaseArtifacts(resolve(process.cwd()));
     console.log("manager release artifacts verified");
+  } else if (args.includes("--generated-manager-bundle")) {
+    verifyGeneratedManagerBundle(resolve(process.cwd()));
+    console.log("generated manager bundle verified");
   } else if (args.includes("--assets")) {
     verifyReleaseArchiveAssets(process.cwd(), tag);
     console.log("release assets verified");

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -45,7 +46,7 @@ import {
   watcherShellScript,
 } from "../src/watcher";
 import { hashDirectoryTree, stageBundledTweaks } from "../src/commands/install";
-import { hasReleaseProvenance, installManagedRuntime, managedCliPath, managedSourceRoot, stageManagedRuntime, writeReleaseProvenance } from "../src/managed-runtime";
+import { fingerprintManagedRuntimeControlPlane, fingerprintManagedRuntimeSource, hasReleaseProvenance, installManagedRuntime, managedCliPath, managedSourceRoot, stageManagedRuntime, writeReleaseProvenance } from "../src/managed-runtime";
 
 test("createTweak scaffolds a both-scope tweak", () => {
   withTempDir((root) => {
@@ -570,6 +571,33 @@ test("managed runtime can be staged to an isolated destination with deterministi
       );
     }
     assert.equal(readFileSync(join(live, "sentinel.txt"), "utf8"), "live runtime remains untouched\n");
+  });
+});
+
+test("sealed managed runtime staging preserves private directory permissions and source fingerprints", () => {
+  withTempDir((root) => {
+    const source = join(root, "sealed-generation");
+    const staged = join(root, "candidate");
+    const directories = ["bin", "packages/installer/dist", "packages/installer/dist/commands", "packages/sdk/dist"];
+    for (const relativePath of directories) {
+      const directory = join(source, relativePath);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "entry.js"), "export {};\n", { mode: 0o400 });
+      chmodSync(directory, 0o700);
+    }
+    chmodSync(join(source, "bin", "entry.js"), 0o500);
+    const sourceHash = fingerprintManagedRuntimeSource(source);
+    const controlHash = fingerprintManagedRuntimeControlPlane(source);
+
+    stageManagedRuntime(source, staged, { provenance: { kind: "sealed-manager-managed-runtime" } });
+
+    for (const relativePath of directories) {
+      assert.equal(lstatSync(join(staged, relativePath)).mode & 0o777, 0o700);
+    }
+    assert.equal(lstatSync(join(staged, "bin", "entry.js")).mode & 0o777, 0o500);
+    assert.equal(fingerprintManagedRuntimeControlPlane(staged), controlHash);
+    assert.equal(fingerprintManagedRuntimeSource(staged), sourceHash);
+    assert.equal(fingerprintManagedRuntimeSource(source), sourceHash, "staging must leave the sealed source unchanged");
   });
 });
 

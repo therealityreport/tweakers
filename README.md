@@ -125,11 +125,8 @@ Runtime flow:
 | `tweaker debug` | Show app path, runtime type, paths, open state, and bridge status. |
 | `tweaker repair` | Re-apply the patch after an app update or broken install. |
 | `tweaker update` | Install the latest published Tweakers release; keep the managed runtime unchanged when no release exists. |
-| `tweaker update-chatgpt` | Confirm official updates in ChatGPT mode, or show the required mode-switch steps in Tweakers mode. |
-| `tweaker update-chatgpt-resume` | Continue a safely paused desktop-update transaction. |
-| `tweaker update-chatgpt-cancel` | End a paused transaction while preserving the proved safe app state. |
-| `tweaker update-chatgpt-reconcile` | Reconcile an exited updater owner without relaunching the app. |
-| `tweaker update-codex` | Compatibility alias for `update-chatgpt`. |
+| `tweaker codex-build-attestation review` | Independently verify one frozen source build and write its immutable review manifest. |
+| `tweaker codex-build-attestation accept` | Explicitly accept the exact reviewed manifest hash and issue the private accepted-build pair. |
 | `tweaker doctor` | Diagnose signatures, integrity, permissions, and common failures. |
 | `tweaker safe-mode` | Disable all tweaks without deleting them. |
 | `tweaker safe-mode --off` | Leave safe mode. |
@@ -343,38 +340,46 @@ tweaker update
 There is currently no published GitHub release. Until one exists, `update`
 reports that state and keeps the installed managed runtime unchanged.
 
-Use **Update and Reload** in Tweakers Settings to run an official ChatGPT
-desktop update on macOS. The operation is durable:
+Official ChatGPT updates are always performed by ChatGPT's native macOS
+updater. Tweakers does not wrap, route, repair, replace, or otherwise own that
+updater. Keep `/Applications/ChatGPT.app` in normal official mode unless you
+explicitly choose the separate injected Tweaker-mode operation.
 
-1. Tweakers records the current desktop version and safely enters the pristine,
-   OpenAI-signed ChatGPT environment.
-2. The native updater installs the official update while Tweakers records
-   ownership and heartbeat evidence.
-3. After the version and build advance, Tweakers returns to the requested
-   environment, refreshes the runtime, and verifies the reopened app.
+Independent Tweakers updates are a separate manager-owned operation:
 
-If the owner exits, startup reconciliation classifies the durable receipt
-without relaunching the app. Settings offers **Resume** only when current
-official-app proof says continuation is safe, and **Cancel** when it can end
-the transaction without guessing. The equivalent commands are:
+1. `refresh.independent` validates a sealed official ChatGPT source.
+2. The manager builds and promotes only `/Applications/Tweakers.app`, with
+   rollback evidence bound to that candidate.
+3. ChatGPT remains untouched and in its native updater path.
 
-```sh
-tweaker update-chatgpt-resume
-tweaker update-chatgpt-cancel
-tweaker update-chatgpt-reconcile --json
-```
+`refresh.injected` is a separately chosen patch/mode operation for a ChatGPT
+Tweaker-mode deployment. It is not a ChatGPT updater and must not be used to
+update the official app. The two deployment forms have separate app identity,
+Electron data, account home, promotion lock, journal, rollback, and candidate
+process.
 
-Updater evidence lives under the Tweakers user-data directory:
+Normal ChatGPT is not a shared-history broker client. The broker is available
+to independent Tweakers and to ChatGPT only while ChatGPT is explicitly in
+Tweaker mode; credentials, cookies, account homes, provider sessions, and
+writable conversation databases remain isolated.
 
-- Current receipt: `transactions/desktop-update.json`
-- Receipt archive: `transactions/desktop-update/`
-- Heartbeat: `transactions/desktop-update.heartbeat.json`
-- Redacted event log: `log/desktop-update.log`
+Creating an independent app deliberately starts with isolated profile and
+account directories. Existing project organization and Tweakers preferences
+are carried over by a separate, explicit offline migration—not by copying the
+ChatGPT profile. `portable-settings-migration preview` projects only validated
+local projects, workspace labels, Projects groups/colors, broker-mapped task
+pins, and enable flags for tweaks bundled in the target. It excludes cookies,
+tokens, credentials, account homes, SQLite files, browser storage, OS grants,
+connections, repositories, and private native ordering fields. Apply requires
+the exact preview fingerprint, two zero-writer observations, and a ready
+canonical shared-history store. It records private preimages and a receipt so
+an interrupted publication can be explicitly recovered without rolling back
+the shared conversation store. Applying this migration still does not launch
+or activate either app.
 
-While a receipt is blocking, the watcher records a deferred cycle and performs
-no update or repair mutation. `tweaker status`, `tweaker debug`, and
-`tweaker doctor` expose the phase, safety, resumability, staleness, and evidence
-paths.
+`tweaker status`, `tweaker debug`, and `tweaker doctor` expose Tweakers'
+source, candidate, installation, and runtime evidence. They do not control or
+report ownership of ChatGPT's native updater.
 
 Building and verifying this source checkout does not replace the installed
 managed runtime. Promotion and any ChatGPT restart are a separate final action
@@ -436,6 +441,7 @@ See [Security](./SECURITY.md).
 - [Runtime And Lifecycle](./docs/tweaks/runtime-lifecycle.md)
 - [UI And DOM Patterns](./docs/tweaks/ui-and-dom.md)
 - [MCP Servers](./docs/tweaks/mcp.md)
+- [Codex Accepted-Build Attestation](./docs/CODEX-BUILD-ATTESTATION.md)
 - [Tweak Store And Pages Publishing](./store/README.md)
 - [Owl Runtime Surface](./docs/OWL-RUNTIME.md)
 - [Owl Bridge Roadmap](./docs/OWL-BRIDGE-ROADMAP.md)

@@ -235,6 +235,17 @@ function compatibilityEnvironmentResult(
   } as unknown as EnvironmentCommandResult;
 }
 
+function submittedEnvironmentHelperResult(transactionId = "mode-compatibility-1"): EnvironmentCommandResult {
+  return {
+    schemaVersion: 1,
+    kind: "environment-commit-helper",
+    transactionId,
+    phase: "submitted",
+    approvalAt: "2026-08-18T12:00:00.000Z",
+    error: null,
+  } as unknown as EnvironmentCommandResult;
+}
+
 /* ------------------------------------------------------------------------- */
 /* bootstrap inference                                                       */
 /* ------------------------------------------------------------------------- */
@@ -249,7 +260,7 @@ test("resolveMode: explicit repair intent wins while legacy state is inferred", 
   assert.equal(resolveMode(null, true), "tweakers");
 });
 
-test("production mode compatibility prepares before one confirmation and commits through Environment", async () => {
+test("production mode compatibility prepares, submits through launchd, then polls its exact durable transaction", async () => {
   await withTweakersHome(async () => {
     const sequence: string[] = [];
     const { deps, calls } = makeDeps({
@@ -258,7 +269,8 @@ test("production mode compatibility prepares before one confirmation and commits
         sequence.push(`${action}:${options.quiet === true ? "quiet" : "loud"}:${options.observe === true ? "observe" : "mutate"}`);
         if (action === "status") return compatibilityEnvironmentResult("status");
         if (action === "prepare") return compatibilityEnvironmentResult("prepared");
-        if (action === "commit") return compatibilityEnvironmentResult("committed");
+        if (action === "submit") return submittedEnvironmentHelperResult();
+        if (action === "transaction") return compatibilityEnvironmentResult("committed");
         throw new Error(`unexpected environment action ${action}`);
       },
       confirm: ({ target, appRoot }) => {
@@ -273,14 +285,15 @@ test("production mode compatibility prepares before one confirmation and commits
       "status:quiet:observe",
       "prepare:quiet:mutate",
       "confirm:chatgpt:/Applications/ChatGPT.app",
-      "commit:quiet:mutate",
+      "submit:quiet:mutate",
+      "transaction:quiet:mutate",
     ]);
     assert.equal(calls.includes("quit"), false);
     assert.equal(calls.includes("open"), false);
   });
 });
 
-test("production mode records approval immediately before its environment commit", async () => {
+test("production mode preserves approval from confirmation through launchd submission", async () => {
   await withTweakersHome(async () => {
     const observed: Array<{ action: string; approvalAt?: string }> = [];
     const { deps } = makeDeps({
@@ -290,7 +303,8 @@ test("production mode records approval immediately before its environment commit
         observed.push({ action, approvalAt: options.approvalAt });
         if (action === "status") return compatibilityEnvironmentResult("status");
         if (action === "prepare") return compatibilityEnvironmentResult("prepared");
-        if (action === "commit") return compatibilityEnvironmentResult("committed");
+        if (action === "submit") return submittedEnvironmentHelperResult();
+        if (action === "transaction") return compatibilityEnvironmentResult("committed");
         throw new Error(`unexpected environment action ${action}`);
       },
     });
@@ -299,12 +313,13 @@ test("production mode records approval immediately before its environment commit
     assert.deepEqual(observed.map(({ action, approvalAt }) => ({ action, approvalAt })), [
       { action: "status", approvalAt: undefined },
       { action: "prepare", approvalAt: undefined },
-      { action: "commit", approvalAt: "2026-08-18T12:00:00.000Z" },
+      { action: "submit", approvalAt: "2026-08-18T12:00:00.000Z" },
+      { action: "transaction", approvalAt: undefined },
     ]);
   });
 });
 
-test("production mode keeps the chatgpt/tweakers command names while carrying a v2 generation through confirmation and warm commit", async () => {
+test("production mode keeps the chatgpt/tweakers command names while carrying a v2 generation through helper submission and poll", async () => {
   await withTweakersHome(async () => {
     const sequence: string[] = [];
     const { deps } = makeDeps({
@@ -322,15 +337,18 @@ test("production mode keeps the chatgpt/tweakers command names while carrying a 
             receipt: { generationId: "mode-v2-generation" },
           } as unknown as EnvironmentCommandResult;
         }
-        if (action === "commit") {
-          sequence.push(`commit:${options.transaction}:${options.approvalAt}`);
+        if (action === "submit") {
+          sequence.push(`submit:${options.transaction}:${options.approvalAt}`);
+          return submittedEnvironmentHelperResult("mode-v2-generation");
+        }
+        if (action === "transaction") {
+          sequence.push(`transaction:${options.transaction ?? "none"}`);
           return {
-            kind: "environment-warm-commit",
+            kind: "environment-mode-v2-transaction",
             transactionId: "mode-v2-generation",
             phase: "ready",
-            sourceMainPid: 101,
-            targetMainPid: 202,
             error: null,
+            terminalAt: "2026-08-18T12:00:01.000Z",
           } as unknown as EnvironmentCommandResult;
         }
         throw new Error(`unexpected environment action ${action}`);
@@ -347,8 +365,62 @@ test("production mode keeps the chatgpt/tweakers command names while carrying a 
       "status",
       "prepare:chatgpt:stable",
       "confirm:chatgpt:/Applications/ChatGPT.app",
-      "commit:mode-v2-generation:2026-08-18T12:00:00.000Z",
+      "submit:mode-v2-generation:2026-08-18T12:00:00.000Z",
+      "transaction:none",
     ]);
+  });
+});
+
+test("production mode reports the exact terminal transaction failure after helper submission", async () => {
+  await withTweakersHome(async () => {
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      environmentCommand: async (action) => {
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "submit") return submittedEnvironmentHelperResult();
+        if (action === "transaction") {
+          return {
+            ...compatibilityEnvironmentResult("prepared"),
+            phase: "failed",
+            error: "restart proof failed",
+          } as unknown as EnvironmentCommandResult;
+        }
+        throw new Error(`unexpected environment action ${action}`);
+      },
+    });
+
+    await assert.rejects(
+      () => mode("chatgpt", {}, deps),
+      /mode-compatibility-1 ended in phase failed: restart proof failed/,
+    );
+  });
+});
+
+test("production mode leaves a submitted helper in flight after its bounded exact-transaction poll", async () => {
+  await withTweakersHome(async () => {
+    let polls = 0;
+    const waits: number[] = [];
+    const { deps } = makeDeps({
+      legacyModeEngineForTests: false,
+      waitForEnvironmentTransaction: async (delayMs) => {
+        waits.push(delayMs);
+      },
+      environmentCommand: async (action) => {
+        if (action === "status") return compatibilityEnvironmentResult("status");
+        if (action === "prepare") return compatibilityEnvironmentResult("prepared");
+        if (action === "submit") return submittedEnvironmentHelperResult();
+        if (action === "transaction") {
+          polls += 1;
+          return compatibilityEnvironmentResult("prepared");
+        }
+        throw new Error(`unexpected environment action ${action}`);
+      },
+    });
+
+    await mode("chatgpt", {}, deps);
+    assert.equal(polls, 12);
+    assert.deepEqual(waits, Array(11).fill(250));
   });
 });
 

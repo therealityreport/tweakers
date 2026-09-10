@@ -16,7 +16,7 @@ test("watcher registry keeps repair, reaper, and guard authority distinct", () =
     tweakersRoot: "/Users/test/Library/Application Support/codex-plusplus",
     repair: healthyProbe("2026-07-23T20:30:00.000Z", 1, "v1"),
     reaper: healthyProbe("2026-07-23T20:59:30.000Z", 2, "v2"),
-    guard: healthyProbe("2026-07-23T20:59:30.000Z", 1, "v1"),
+    guard: healthyProbe("2026-07-23T20:59:30.000Z", 3, "mcp-guard-status.v3"),
   });
 
   assert.deepEqual(watchers.map(({ id, authority, cadenceSeconds }) => ({
@@ -36,7 +36,7 @@ test("watcher registry keeps repair, reaper, and guard authority distinct", () =
     },
     {
       id: "mcp-pressure-guard",
-      authority: "notification-only",
+      authority: "observation-and-notification-only",
       cadenceSeconds: 60,
     },
   ]);
@@ -154,6 +154,51 @@ test("declared status schemas reject missing or malformed schema evidence", () =
   assert.equal(guard?.status, "error");
 });
 
+test("enabled Guard requires a fresh v3 heartbeat and legacy heartbeat stays display-only", () => {
+  const watchers = buildWatcherRegistry({
+    checkedAt: CHECKED_AT,
+    platformKind: "darwin",
+    homeDirectory: "/Users/test",
+    tweakersRoot: "/Users/test/tweakers",
+    repair: healthyProbe("2026-07-23T20:30:00.000Z", 1, "v1"),
+    reaper: healthyProbe("2026-07-23T20:59:30.000Z", 2, "v2"),
+    guard: {
+      ...healthyProbe("2026-07-23T20:59:30.000Z", 1, "notification-only-v2"),
+      legacyStatusSchemaVersion: 1,
+    },
+  });
+  const guard = watchers.find((watcher) => watcher.id === "mcp-pressure-guard");
+  assert.equal(guard?.status, "error");
+  assert.equal(guard?.freshness, "unsupported");
+  assert.equal(guard?.legacyStatusSchemaVersion, 1);
+});
+
+test("disabled and unloaded Guard is intentionally disabled, while inconsistent pairs fail closed", () => {
+  const input = {
+    checkedAt: CHECKED_AT,
+    platformKind: "darwin",
+    homeDirectory: "/Users/test",
+    tweakersRoot: "/Users/test/tweakers",
+    repair: healthyProbe("2026-07-23T20:30:00.000Z", 1, "v1"),
+    reaper: healthyProbe("2026-07-23T20:59:30.000Z", 2, "v2"),
+  };
+  const intentionallyDisabled = buildWatcherRegistry({
+    ...input,
+    guard: { ...healthyProbe("2026-07-23T20:59:30.000Z", 3, "mcp-guard-status.v3"), loaded: false, disabled: true },
+  }).find((watcher) => watcher.id === "mcp-pressure-guard");
+  assert.equal(intentionallyDisabled?.status, "ok");
+  assert.equal(intentionallyDisabled?.freshness, "intentionally_disabled");
+  assert.equal(intentionallyDisabled?.lifecycleDisposition, "intentionally_disabled");
+  assert.equal(intentionallyDisabled?.recommendedAction, null);
+
+  const inconsistent = buildWatcherRegistry({
+    ...input,
+    guard: { ...healthyProbe("2026-07-23T20:59:30.000Z", 3, "mcp-guard-status.v3"), loaded: true, disabled: true },
+  }).find((watcher) => watcher.id === "mcp-pressure-guard");
+  assert.equal(inconsistent?.status, "error");
+  assert.equal(inconsistent?.lifecycleDisposition, "inconsistent");
+});
+
 test("watcher registry contains no process arguments or cleanup eligibility field", () => {
   const watchers = buildWatcherRegistry({
     checkedAt: CHECKED_AT,
@@ -162,7 +207,7 @@ test("watcher registry contains no process arguments or cleanup eligibility fiel
     tweakersRoot: "/Users/test/tweakers",
     repair: healthyProbe("2026-07-23T20:30:00.000Z", 1, "v1"),
     reaper: healthyProbe("2026-07-23T20:59:30.000Z", 1, "v1"),
-    guard: healthyProbe("2026-07-23T20:59:30.000Z", 1, "v1"),
+    guard: healthyProbe("2026-07-23T20:59:30.000Z", 3, "mcp-guard-status.v3"),
   });
   const serialized = JSON.stringify(watchers);
 
@@ -185,6 +230,6 @@ function healthyProbe(
     policyVersion,
     deferredReason: null,
     error: null,
-    supportedStatusSchemas: statusSchemaVersion === 2 ? [1, 2] : [1],
+    supportedStatusSchemas: statusSchemaVersion === 2 ? [1, 2] : statusSchemaVersion === 3 ? [3] : [1],
   };
 }

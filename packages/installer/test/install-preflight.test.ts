@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   assertCodexNotRunning,
+  assertOrdinaryInstallTargetNotDerived,
   copyCandidatePreimage,
   installMayRunWhileChatgptMode,
   prepareCodexForPatching,
@@ -18,6 +19,7 @@ import {
 } from "../src/commands/install";
 import type { OpenReport } from "../src/commands/debug";
 import type { CodexInstall } from "../src/platform";
+import { writePlist } from "../src/plist";
 
 test("ChatGPT mode admits only an explicit transition or receipt-bound prebuilt transaction", () => {
   assert.equal(installMayRunWhileChatgptMode({}), false);
@@ -32,6 +34,114 @@ test("ChatGPT mode admits only an explicit transition or receipt-bound prebuilt 
     prebuiltCombinedCandidate: {} as never,
     requirePreparedCandidate: true,
   }), true);
+});
+
+test("generic install paths reject the derived Tweakers app", () => {
+  assert.doesNotThrow(() => assertOrdinaryInstallTargetNotDerived({
+    appRoot: "/Applications/ChatGPT.app",
+    appName: "ChatGPT",
+    bundleId: "com.openai.codex",
+    platform: "darwin",
+  }));
+  assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+    appRoot: "/Applications/Renamed Tweakers.app",
+    appName: "Renamed Tweakers",
+    bundleId: "com.therealityreport.tweakers",
+    platform: "darwin",
+  }), /generic install\/update path/);
+  assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+    appRoot: "/Applications/Tweakers.app",
+    appName: "ChatGPT",
+    bundleId: "com.openai.codex",
+    platform: "darwin",
+  }), /refresh-variant/);
+  assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+    appRoot: "/Applications/tWeAkErS.ApP",
+    appName: "ChatGPT",
+    bundleId: "com.openai.codex",
+    platform: "darwin",
+  }, { knownDerivedAppRoots: [] }), /refresh-variant/);
+});
+
+test("generic install guard rejects physical aliases and derived plist markers", () => {
+  withTempDir((root) => {
+    const renamedDerived = join(root, "Renamed Desktop.app");
+    const alias = join(root, "ChatGPT.app");
+    writeGuardApp(renamedDerived, { derivedMarker: false });
+    symlinkSync(renamedDerived, alias);
+
+    assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+      appRoot: alias,
+      appName: "ChatGPT",
+      bundleId: "com.openai.codex",
+      platform: "darwin",
+    }, {
+      knownDerivedAppRoots: [renamedDerived],
+      requireReadableMetadata: true,
+    }), /exact physical path/);
+
+    const markedDerived = join(root, "Desktop Copy.app");
+    writeGuardApp(markedDerived, { derivedMarker: true });
+    assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+      appRoot: markedDerived,
+      appName: "ChatGPT",
+      bundleId: "com.openai.codex",
+      platform: "darwin",
+    }, {
+      knownDerivedAppRoots: [],
+      requireReadableMetadata: true,
+    }), /refresh-variant/);
+  });
+});
+
+test("generic install guard rejects an ordinary app reached through a symlink alias", () => {
+  withTempDir((root) => {
+    const ordinary = join(root, "Ordinary.app");
+    const alias = join(root, "ChatGPT.app");
+    writeGuardApp(ordinary, { derivedMarker: false });
+    symlinkSync(ordinary, alias);
+
+    assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+      appRoot: alias,
+      appName: "ChatGPT",
+      bundleId: "com.openai.codex",
+      platform: "darwin",
+    }, {
+      knownDerivedAppRoots: [],
+      requireReadableMetadata: true,
+    }), /exact physical path/);
+  });
+});
+
+test("generic install guard binds mutation rechecks to the same physical app directory", () => {
+  withTempDir((root) => {
+    const appRoot = join(root, "ChatGPT.app");
+    const movedRoot = join(root, "Original ChatGPT.app");
+    writeGuardApp(appRoot, { derivedMarker: false });
+    const expected = assertOrdinaryInstallTargetNotDerived({
+      appRoot,
+      appName: "ChatGPT",
+      bundleId: "com.openai.codex",
+      platform: "darwin",
+    }, {
+      knownDerivedAppRoots: [],
+      requireReadableMetadata: true,
+    });
+    assert.ok(expected);
+
+    renameSync(appRoot, movedRoot);
+    writeGuardApp(appRoot, { derivedMarker: false });
+    assert.throws(() => assertOrdinaryInstallTargetNotDerived({
+      appRoot,
+      appName: "ChatGPT",
+      bundleId: "com.openai.codex",
+      platform: "darwin",
+    }, {
+      expectedPhysicalTarget: expected,
+      knownDerivedAppRoots: [],
+      requireReadableMetadata: true,
+    }), /physical target changed/);
+  });
 });
 
 test("candidate preimage copies preserve private directory permissions", () => {
@@ -402,12 +512,23 @@ test("install preflight never quits or prompts a running macOS Codex", () => {
 });
 
 function withTempDir(fn: (root: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), "tweaker-install-preflight-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweaker-install-preflight-")));
   try {
     fn(root);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+function writeGuardApp(appRoot: string, options: { derivedMarker: boolean }): void {
+  const contents = join(appRoot, "Contents");
+  mkdirSync(contents, { recursive: true });
+  writePlist(join(contents, "Info.plist"), {
+    CFBundleIdentifier: "com.openai.codex",
+    CFBundleDisplayName: "ChatGPT",
+    CFBundleName: "ChatGPT",
+    LSEnvironment: options.derivedMarker ? { TWEAKERS_DERIVED_VARIANT: "1" } : {},
+  });
 }
 
 function fakeCodex(): CodexInstall {

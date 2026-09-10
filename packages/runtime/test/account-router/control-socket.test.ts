@@ -14,6 +14,7 @@ import {
 import type { RedactedControlStatus } from "../../src/account-router/types";
 
 const accountA = `ar_${"A".repeat(43)}` as const;
+const accountB = `ar_${"B".repeat(43)}` as const;
 const secret = Buffer.alloc(32, 7);
 
 function status(): RedactedControlStatus {
@@ -25,6 +26,22 @@ function status(): RedactedControlStatus {
     accounts: [{ opaqueAccountId: accountA, label: "Account A", eligibility: "eligible", normalizedSpend: 0, assignedThreadCount: 0 }],
     restartRequired: false,
     degradedReason: null,
+  };
+}
+
+function quotaStatus(): RedactedControlStatus {
+  return {
+    schemaVersion: 2,
+    active: { mode: "quota_aware", policy: "quota_aware_v1", generation: 2, fingerprint: `sha256:${"a".repeat(64)}` },
+    pending: { mode: "manual", policy: null, generation: 3, fingerprint: `sha256:${"b".repeat(64)}` },
+    protocolState: "supported",
+    accounts: [
+      { opaqueAccountId: accountA, label: "Account 1", eligibility: "eligible", plan: "Pro", identifierMasked: "••••••••", weekly: { remainingPercent: 70, resetAt: "2026-09-03T12:00:00.000Z", freshness: "fresh" }, shortWindowPressure: 20, assignedThreadCount: 2 },
+      { opaqueAccountId: accountB, label: "Account 2", eligibility: "unhealthy", plan: null, identifierMasked: "••••••••", weekly: { remainingPercent: null, resetAt: null, freshness: "unknown" }, shortWindowPressure: null, assignedThreadCount: 1 },
+    ],
+    poolRemainingPercent: null,
+    restartRequired: true,
+    degradedReason: "quota_unknown",
   };
 }
 
@@ -63,6 +80,19 @@ test("owner-private control socket authenticates and returns only redacted statu
     await control.close();
   }
   assert.equal(existsSync(control.path), false);
+});
+
+test("owner-private control socket carries the nullable v2 active-versus-pending truth without leaking identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "account-router-control-v2-"));
+  const control = await startRouterControlSocket({ root, secret, status: quotaStatus });
+  try {
+    const response = JSON.parse(await exchange(control.path, frame("v2"))) as { status: RedactedControlStatus };
+    assert.deepEqual(response.status, quotaStatus());
+    assert.equal(JSON.stringify(response).includes("@"), false);
+    assert.equal(JSON.stringify(response).includes("provider"), false);
+  } finally {
+    await control.close();
+  }
 });
 
 test("control socket rejects wrong capability, malformed and replayed pipelined frames without an oracle", async () => {

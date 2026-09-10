@@ -17,6 +17,7 @@ import test from "node:test";
 import {
   MCP_CANDIDATE_CODEX_HOME_ENV,
   MCP_CANDIDATE_RECONCILIATION_ENV,
+  MCP_DERIVED_VARIANT_ENV,
   readMcpSyncState,
   reconcileMcpConfig,
   resolveMcpRuntimePaths,
@@ -47,6 +48,87 @@ test("ordinary MCP paths preserve ~/.codex behavior and ignore CODEX_HOME withou
   });
 });
 
+test("derived variants use an isolated CODEX_HOME and receipt path", () => {
+  withTempDir((root) => {
+    const homeDirectory = join(root, "ordinary-home");
+    const realCodexHome = join(homeDirectory, ".codex");
+    const userRoot = join(root, "derived-user");
+    const derivedCodexHome = join(userRoot, "codex-home");
+    mkdirSync(realCodexHome, { recursive: true });
+    mkdirSync(derivedCodexHome, { recursive: true });
+
+    const paths = resolveMcpRuntimePaths({
+      userRoot,
+      homeDirectory,
+      env: {
+        [MCP_DERIVED_VARIANT_ENV]: "1",
+        [MCP_CANDIDATE_CODEX_HOME_ENV]: derivedCodexHome,
+      },
+    });
+
+    assert.deepEqual(paths, {
+      codexHome: derivedCodexHome,
+      configPath: join(derivedCodexHome, "config.toml"),
+      statePath: join(userRoot, "mcp-sync-state.json"),
+      candidateIsolated: false,
+    });
+  });
+});
+
+test("derived variants fail closed for invalid or shared MCP paths", () => {
+  withTempDir((root) => {
+    const homeDirectory = join(root, "ordinary-home");
+    const realCodexHome = join(homeDirectory, ".codex");
+    const userRoot = join(root, "derived-user");
+    const derivedCodexHome = join(userRoot, "codex-home");
+    mkdirSync(realCodexHome, { recursive: true });
+    mkdirSync(userRoot);
+    const resolveDerived = (candidateCodexHome?: string, overrides: Record<string, string | undefined> = {}) =>
+      resolveMcpRuntimePaths({
+        userRoot,
+        homeDirectory,
+        env: {
+          [MCP_DERIVED_VARIANT_ENV]: "1",
+          ...(candidateCodexHome === undefined
+            ? {}
+            : { [MCP_CANDIDATE_CODEX_HOME_ENV]: candidateCodexHome }),
+          ...overrides,
+        },
+      });
+
+    assert.throws(() => resolveDerived(), /CODEX_HOME is required/);
+    assert.throws(() => resolveDerived("relative/codex-home"), /normalized absolute path/);
+    assert.throws(() => resolveDerived(`${userRoot}/nested/../codex-home`), /normalized absolute path/);
+    assert.throws(() => resolveDerived(join(root, "outside-derived-root")), /contained under/);
+
+    const symlinkedHome = join(userRoot, "symlinked-home");
+    symlinkSync(join(root, "somewhere-else"), symlinkedHome);
+    assert.throws(() => resolveDerived(symlinkedHome), /symbolic-link/);
+    rmSync(symlinkedHome);
+
+    const sharedHome = join(userRoot, "shared-home");
+    mkdirSync(sharedHome);
+    const sharedOrdinaryHome = join(sharedHome, ".codex");
+    mkdirSync(sharedOrdinaryHome);
+    assert.throws(() => resolveMcpRuntimePaths({
+      userRoot,
+      homeDirectory: sharedHome,
+      env: {
+        [MCP_DERIVED_VARIANT_ENV]: "1",
+        [MCP_CANDIDATE_CODEX_HOME_ENV]: sharedHome,
+      },
+    }), /real ~\/\.codex/);
+
+    mkdirSync(derivedCodexHome);
+    mkdirSync(join(derivedCodexHome, "config.toml"));
+    assert.throws(() => resolveDerived(derivedCodexHome), /Derived Codex config.*regular file/);
+    rmSync(join(derivedCodexHome, "config.toml"), { recursive: true, force: true });
+
+    mkdirSync(join(userRoot, "mcp-sync-state.json"));
+    assert.throws(() => resolveDerived(derivedCodexHome), /Derived MCP receipt.*regular file/);
+  });
+});
+
 test("opt-in candidate reconciliation migrates only its contained Codex config", () => {
   withTempDir((root) => {
     const homeDirectory = join(root, "ordinary-home");
@@ -64,6 +146,7 @@ test("opt-in candidate reconciliation migrates only its contained Codex config",
       homeDirectory,
       env: {
         [MCP_CANDIDATE_RECONCILIATION_ENV]: "1",
+        [MCP_DERIVED_VARIANT_ENV]: "1",
         [MCP_CANDIDATE_CODEX_HOME_ENV]: candidateCodexHome,
       },
     });
@@ -219,7 +302,7 @@ test("main routes startup, enable, reload, config-watch, manual repair, and clos
   assert.match(MAIN_SOURCE, /nextReloadMcpTrigger = "tweak-reload"/);
   assert.match(MAIN_SOURCE, /reconcileNow\(mcpTrigger\)/);
   assert.match(MAIN_SOURCE, /reconcileNow\("manual-repair"\)/);
-  assert.match(MAIN_SOURCE, /const mcpReconciler = healthCheckOnly \? null : createMcpReconciler/);
+  assert.match(MAIN_SOURCE, /const mcpReconciler = healthCheckOnly \|\| derivedVariant \? null : createMcpReconciler/);
   assert.match(MAIN_SOURCE, /mcpReconciler\?\.close\(\)/);
   assert.doesNotMatch(MAIN_SOURCE, /syncManagedMcpServers\(/);
 });

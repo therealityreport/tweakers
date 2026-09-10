@@ -74,7 +74,7 @@ function infoPlist() {
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>Tweakers Switcher</string>
+  <string>Tweakers</string>
   <key>CFBundleExecutable</key>
   <string>Tweakers Switcher</string>
   <key>CFBundleIdentifier</key>
@@ -82,7 +82,7 @@ function infoPlist() {
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Tweakers Switcher</string>
+  <string>Tweakers</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

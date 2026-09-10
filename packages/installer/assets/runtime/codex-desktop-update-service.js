@@ -91,7 +91,7 @@ async function runCheck(dependencies) {
         return resultForFailure("error", target.profile, safeError(error));
     }
     // A refresh failure must not hide a last-known verified newer build. The
-    // durable Update and Reload transaction revalidates before changing apps.
+    // durable official update transaction revalidates before changing apps.
     const status = metadata.updateAvailable
         ? "update-available"
         : metadata.stale
@@ -108,6 +108,7 @@ async function runCheck(dependencies) {
         checkedAt: metadata.checkedAt,
         reason: metadata.error,
         retryRequested: false,
+        officialUpdateRequested: false,
         updateAndReloadRequested: false,
     };
 }
@@ -126,8 +127,8 @@ async function presentResult(dependencies, initial) {
     }
     if (initial.status === "update-available" && response === 0) {
         try {
-            await dependencies.startUpdateAndReload();
-            return { ...initial, updateAndReloadRequested: true };
+            await dependencies.startOfficialUpdate();
+            return { ...initial, officialUpdateRequested: true, updateAndReloadRequested: true };
         }
         catch (error) {
             return presentResult(dependencies, {
@@ -150,6 +151,7 @@ function resultForFailure(status, profile, reason) {
         checkedAt: new Date().toISOString(),
         reason,
         retryRequested: false,
+        officialUpdateRequested: false,
         updateAndReloadRequested: false,
     };
 }
@@ -163,7 +165,7 @@ function dialogFor(result) {
             title: "ChatGPT Update Available",
             message: `ChatGPT ${latest} is available.`,
             detail: `Installed: ${installed}\nRelease profile: ${profile}`,
-            buttons: ["Update and Reload", "Later"],
+            buttons: ["Update ChatGPT", "Later"],
             defaultId: 0,
             cancelId: 1,
             noLink: true,

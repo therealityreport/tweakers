@@ -45,6 +45,42 @@ test("main promotion responder maps the exact eight schema-v2 surfaces from cand
   assert.match(isolation, /candidateRequested && !MCP_RUNTIME_PATHS\.candidateIsolated/);
 });
 
+test("derived runtime health is bound to the exact Tweakers bundle and never normalizes a non-primary window", () => {
+  const exactProcess = sourceBlock("function isExactIndependentTweakersProcess", "/**\n * Unlike the general helper");
+  assert.match(exactProcess, /INDEPENDENT_TWEAKERS_APP_ROOT/);
+  assert.match(exactProcess, /INDEPENDENT_TWEAKERS_BUNDLE_ID/);
+  assert.match(exactProcess, /!healthCheckOnly/);
+
+  const exactPrimary = sourceBlock("function exactIndependentTweakersPrimaryWindow", "function finiteMetric");
+  assert.match(exactPrimary, /getPrimaryWindow/);
+  assert.doesNotMatch(exactPrimary, /getFocusedWindow|\.find\(/);
+
+  const capture = sourceBlock("async function captureIndependentTweakersLiveHealth", "function requestRuntimeReadyBrokerConnection");
+  assert.match(capture, /independent-live-health/);
+  assert.match(capture, /appearance: \{ status: "not_observed"/);
+  assert.match(capture, /setZoomLevel\(0\)/);
+  assert.match(capture, /setZoomFactor\(1\)/);
+  assert.match(capture, /nativeZoomNeedsNormalization\(before\)/);
+  assert.doesNotMatch(capture, /setZoomLevel\([^0]/);
+  assert.doesNotMatch(capture, /setZoomFactor\([^1]/);
+
+  const receipt = sourceBlock("function tryWriteRuntimeReadyReceipt", "function currentProcessStartToken");
+  assert.match(receipt, /schemaVersion: 5/);
+  assert.match(receipt, /brokerAuthorityExpectation: brokerAuthority/);
+  assert.match(receipt, /sameRuntimeReadyBrokerAuthorityExpectation/);
+  assert.match(receipt, /scheduleIndependentTweakersLiveHealthCapture/);
+  assert.match(receipt, /runtimeReadyAppearanceBinding\(independentTweakersLiveHealth\.appearance\)/);
+  assert.match(receipt, /appearance\.windowId !== primary\.id/);
+  assert.match(receipt, /sameRuntimeReadyAppearanceBinding\(appearance, expectation\.appearanceExpectation\)/);
+  assert.match(receipt, /primaryIndependentTweakersNativeZoomAtActualSize\(primary\)/);
+  assert.match(receipt, /appearance,/);
+
+  const healthEvent = sourceBlock("function publishIndependentTweakersLiveHealth", "function scheduleIndependentTweakersLiveHealthCapture");
+  assert.match(healthEvent, /mainFrame\.send/);
+  assert.match(healthEvent, /independentTweakersLiveHealthProjection\(health\)/);
+  assert.doesNotMatch(healthEvent, /webContents\.send/);
+});
+
 test("main responder proves candidate identity, real renderer lifecycle, broker, schema, MCP receipt, and contained auth", () => {
   const schemeRegistration = sourceBlock("const healthCheckOnly =", "// Defense in depth for one-shot macOS health processes.");
   assert.match(schemeRegistration, /if \(healthCheckOnly && !healthOriginalMain\)/);
@@ -57,7 +93,7 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
     "health protocol privilege registration must happen before app readiness",
   );
 
-  const userQuestions = sourceBlock("function promotionUserQuestionsHealth", "const desktopUpdateStartupReconciler");
+  const userQuestions = sourceBlock("function promotionUserQuestionsHealth", "async function runPromotionRendererProof");
   assert.match(userQuestions, /USER_QUESTIONS_TWEAK_ID/);
   assert.match(userQuestions, /fingerprintUserQuestionsPath\(root\)/);
   // The probe must run the EXACT shared predicates the canonical-source
@@ -70,7 +106,7 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
   assert.match(userQuestions, /rendererStorageSelfTest: HealthValue/);
   assert.doesNotMatch(userQuestions, /new Map<string, string>/);
 
-  const renderer = sourceBlock("async function runPromotionRendererProof", "const desktopUpdateStartupReconciler");
+  const renderer = sourceBlock("async function runPromotionRendererProof", "function createPromotionOriginalMainProbe");
   assert.match(renderer, /new BrowserWindow\(\{/);
   assert.match(renderer, /show: false/);
   assert.match(renderer, /preload: PRELOAD_PATH/);
@@ -234,13 +270,15 @@ test("main responder proves candidate identity, real renderer lifecycle, broker,
 // captures spawn — before the loader requires OpenAI's main entry.
 test("a health process is blinded to OpenAI's dialogs before its main entry loads", () => {
   const seam = sourceBlock("const healthCheckOnly = process.env.TWEAKERS_HEALTH_CHECK_ONLY", "const PRELOAD_PATH");
-  assert.match(seam, /const codexAppServerParent = installCodexAppServerParent\(\);/);
+  assert.match(seam, /const codexAppServerParent = installCodexAppServerParent\(\{/);
+  assert.match(seam, /secondaryVariant: derivedVariant/);
+  assert.match(seam, /secondaryVariantSharedSqliteHome: derivedVariant[\s\S]*?process\.env\.CODEX_SQLITE_HOME/);
   assert.match(seam, /applyHealthProbeDialogSuppression\(\{[\s\S]*?dialog,[\s\S]*?healthCheckOnly,[\s\S]*?onSuppressed:/);
   assert.match(seam, /health process suppressed a modal dialog/);
   // Ordering is the whole point: suppression must precede the loader's require
   // of OpenAI's main, which happens after this module finishes evaluating.
   assert.ok(
-    seam.indexOf("installCodexAppServerParent()") < seam.indexOf("applyHealthProbeDialogSuppression"),
+    seam.indexOf("installCodexAppServerParent({") < seam.indexOf("applyHealthProbeDialogSuppression"),
     "dialog suppression belongs in the same pre-bootstrap seam as the app-server parent",
   );
   assert.match(mainSource, /const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;/);

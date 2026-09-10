@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -11,6 +11,8 @@ interface LoaderResult {
   originalLoaded: boolean;
   liveRuntimeLoaded: boolean;
   healthRuntimeLoaded: boolean;
+  recovery: { title: string; message: string } | null;
+  overlayNotice: { title: string; message: string; detail: string } | null;
 }
 
 function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
@@ -20,13 +22,35 @@ function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
     const liveUser = join(root, "live-user");
     const healthUser = join(root, "health-user");
     mkdirSync(app, { recursive: true });
+    mkdirSync(join(app, "node_modules", "electron"), { recursive: true });
     mkdirSync(join(liveUser, "runtime"), { recursive: true });
     mkdirSync(join(healthUser, "runtime"), { recursive: true });
     cpSync(resolve("packages/loader/loader.cjs"), join(app, "loader.cjs"));
     writeFileSync(join(app, "package.json"), JSON.stringify({
+      productName: environment.TWEAKERS_TEST_PRODUCT_NAME ?? "ChatGPT",
       __tweaker: { originalMain: "original.cjs", userRoot: liveUser },
     }));
     writeFileSync(join(app, "original.cjs"), `require("node:fs").writeFileSync(${JSON.stringify(join(root, "original-loaded"))}, "yes")`);
+    writeFileSync(join(app, "node_modules", "electron", "index.js"), `
+      const fs = require("node:fs");
+      module.exports = {
+        app: {
+          setPath() {},
+          isReady() { return false; },
+          whenReady() { return Promise.resolve(); },
+          exit(code) { process.exitCode = code; },
+        },
+        dialog: {
+          showErrorBox(title, message) {
+            fs.writeFileSync(${JSON.stringify(join(root, "recovery.json"))}, JSON.stringify({ title, message }));
+          },
+          showMessageBox(options) {
+            fs.writeFileSync(${JSON.stringify(join(root, "overlay-notice.json"))}, JSON.stringify(options));
+            return Promise.resolve({ response: 0 });
+          },
+        },
+      };
+    `);
     writeFileSync(join(liveUser, "runtime", "main.js"), `
       if (process.env.TWEAKERS_TEST_THROW_LIVE_RUNTIME === "1") throw new Error("live runtime failed");
       require("node:fs").writeFileSync(${JSON.stringify(join(root, "live-runtime-loaded"))}, "yes");
@@ -51,12 +75,20 @@ function runLoader(environment: NodeJS.ProcessEnv): LoaderResult {
       env.TWEAKERS_HEALTH_USER_ROOT = linkedHealthUser;
     }
     const result = spawnSync(process.execPath, [join(app, "loader.cjs")], { env });
+    const recoveryPath = join(root, "recovery.json");
+    const overlayNoticePath = join(root, "overlay-notice.json");
     return {
       status: result.status,
       stderr: result.stderr.toString(),
       originalLoaded: existsSync(join(root, "original-loaded")),
       liveRuntimeLoaded: existsSync(join(root, "live-runtime-loaded")),
       healthRuntimeLoaded: existsSync(join(root, "health-runtime-loaded")),
+      recovery: existsSync(recoveryPath)
+        ? JSON.parse(readFileSync(recoveryPath, "utf8")) as { title: string; message: string }
+        : null,
+      overlayNotice: existsSync(overlayNoticePath)
+        ? JSON.parse(readFileSync(overlayNoticePath, "utf8")) as { title: string; message: string; detail: string }
+        : null,
     };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -107,12 +139,31 @@ test("paired health mode does not start original main when the contained runtime
   assert.equal(result.originalLoaded, false);
 });
 
-test("normal mode still starts original main when the live runtime throws", () => {
+test("normal ChatGPT mode still starts original main when the live runtime throws", () => {
   const result = runLoader({ TWEAKERS_TEST_THROW_LIVE_RUNTIME: "1" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.liveRuntimeLoaded, false);
   assert.equal(result.healthRuntimeLoaded, false);
   assert.equal(result.originalLoaded, true);
+  assert.equal(result.recovery, null);
+  assert.equal(result.overlayNotice?.title, "Tweakers overlay unavailable");
+  assert.match(result.overlayNotice?.message ?? "", /without Tweakers customizations/);
+  assert.doesNotMatch(result.overlayNotice?.detail ?? "", /live runtime failed/);
+});
+
+test("independent Tweakers mode fails closed when the live runtime throws", () => {
+  const result = runLoader({
+    TWEAKERS_TEST_PRODUCT_NAME: "Tweakers",
+    TWEAKERS_TEST_THROW_LIVE_RUNTIME: "1",
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.liveRuntimeLoaded, false);
+  assert.equal(result.originalLoaded, false);
+  assert.match(result.stderr, /independent Tweakers launch refused/);
+  assert.deepEqual(result.recovery?.title, "Tweakers failed to start");
+  assert.match(result.recovery?.message ?? "", /ordinary ChatGPT interface was not opened/);
+  assert.doesNotMatch(result.recovery?.message ?? "", /live runtime failed/);
+  assert.equal(result.overlayNotice, null);
 });
 
 test("run-original flag without health mode fails closed", () => {

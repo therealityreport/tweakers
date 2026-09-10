@@ -5,7 +5,12 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { verifyRelease, verifyReleaseArchiveAssets, verifyReleaseAssets } from "./verify-release.mjs";
+import {
+  normalizeManagerBundleFingerprints,
+  verifyRelease,
+  verifyReleaseArchiveAssets,
+  verifyReleaseAssets,
+} from "./verify-release.mjs";
 
 test("release verification requires matching package versions, tag, and changelog", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-release-"));
@@ -83,6 +88,26 @@ test("tagged archive verification binds every committed manager artifact byte", 
     writeFileSync(join(root, "SHA256SUMS"), `${untaggedDigest}  ${tarball}\n`);
     assert.throws(() => verifyReleaseArchiveAssets(root, tag), /not a tagged Tweakers archive/);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("manager bundle normalization ignores only its two runner-specific fingerprints", () => {
+  const runtime = "a".repeat(64);
+  const managed = "b".repeat(64);
+  const bundle = [
+    `const runtime = "${runtime}";`,
+    `const managed = "${managed}";`,
+    `//# TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1=${runtime}`,
+    `//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=${managed}`,
+    "",
+  ].join("\n");
+  const normalized = normalizeManagerBundleFingerprints(bundle);
+  assert.doesNotMatch(normalized, /a{64}|b{64}/);
+  assert.match(normalized, /const runtime = "<TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1>"/);
+  assert.match(normalized, /const managed = "<TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1>"/);
+  assert.throws(
+    () => normalizeManagerBundleFingerprints(bundle.replace(/^const runtime.*\n/m, "").replace(/^\/\/# TWEAKERS_MANAGER_RUNTIME.*\n/m, "")),
+    /exactly one valid TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1 trailer/,
+  );
 });
 
 test("root AGENTS policy contains all feature routes and live synchronization gate", () => {

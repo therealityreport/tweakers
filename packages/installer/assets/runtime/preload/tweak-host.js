@@ -20,11 +20,20 @@ const electron_1 = require("electron");
 const settings_injector_1 = require("./settings-injector");
 const react_hook_1 = require("./react-hook");
 const host_surfaces_1 = require("./host-surfaces");
+const accounts_native_1 = require("./accounts-native");
 const tweak_lifecycle_1 = require("../tweak-lifecycle");
 const renderer_storage_1 = require("../renderer-storage");
 const loaded = new Map();
 let cachedPaths = null;
 async function startTweakHost() {
+    // Revalidate at startup and re-enable even when Accounts was disabled when
+    // this payload was prepared. This never initializes an unreviewed wrapper.
+    try {
+        accounts_native_1.accountsNativeBridge.setCompatibility(electron_1.ipcRenderer.sendSync("tweaker:accounts-native-compatibility"));
+    }
+    catch {
+        accounts_native_1.accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts compatibility could not be checked.", hookSetSha256: "" });
+    }
     const tweaks = (await electron_1.ipcRenderer.invoke("tweaker:list-tweaks"));
     const paths = (await electron_1.ipcRenderer.invoke("tweaker:user-paths"));
     cachedPaths = paths;
@@ -46,6 +55,10 @@ async function startTweakHost() {
         }
         if (!t.enabled) {
             sendLifecycle(t.manifest.id, t.status === "quarantined" ? "quarantined" : "disabled");
+            continue;
+        }
+        if (t.manifest.id === "co.tweakers.account-switcher" && !accounts_native_1.accountsNativeApi.status().compatible) {
+            sendLifecycle(t.manifest.id, "failed", "Accounts is unavailable in this desktop build. Refresh Tweakers to restore the native account screens.");
             continue;
         }
         sendLifecycle(t.manifest.id, "starting");
@@ -168,6 +181,7 @@ function makeRendererApi(manifest, paths) {
     return {
         manifest,
         process: "renderer",
+        accountsNative: accounts_native_1.accountsNativeApi,
         log: {
             debug: (...a) => log("debug", ...a),
             info: (...a) => log("info", ...a),

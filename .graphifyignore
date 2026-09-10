@@ -1,0 +1,38 @@
+
+# codex-project-knowledge:structural-corpus:start
+# Structural source only; preserve original documents and recoverable artifacts.
+**/*.md
+**/*.mdx
+**/*.rst
+.plan-grader/
+.planning/
+.full-review/
+plans/
+reviews/
+work/
+outputs/
+tmp/
+.tmp*/
+test-results/
+graphify-out/
+.claude/
+.codex/
+.agents/
+packages/installer/assets/runtime/
+packages/installer/assets/managed-runtime/
+packages/installer/assets/mcp-lifecycle/
+packages/installer/assets/manager-launcher/
+packages/installer/assets/loader.cjs
+advisor-plans/
+.tweaker-*/
+main-*.js
+app-window-*.js
+appearance-settings-*.js
+rhoslc-lookimages.json
+rhoslc-saltlake-aug.json
+store/index.json
+docs/releases/
+# codex-project-knowledge:structural-corpus:end
+
+# Concurrent test working directories, distinct from maintained source.
+.tweakers-*/

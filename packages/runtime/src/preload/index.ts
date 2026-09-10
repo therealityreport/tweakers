@@ -9,7 +9,8 @@
  *      hot-reload tweaks without dropping the page.
  */
 
-import { ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer } from "electron";
+import { accountsNativeBridge, accountsNativeTransport } from "./accounts-native";
 import { installReactHook } from "./react-hook";
 import { startSettingsInjector } from "./settings-injector";
 import { startTweakHost, teardownTweakHost } from "./tweak-host";
@@ -86,6 +87,15 @@ function safeStringify(v: unknown): string {
 }
 
 fileLog("preload entry", { url: location.href });
+
+// React values stay in the page. This transport exposes only the reviewed
+// account data operations and a receipt-bound initialization handshake.
+try {
+  accountsNativeBridge.setCompatibility(ipcRenderer.sendSync("tweaker:accounts-native-compatibility"));
+  contextBridge.exposeInMainWorld("__tweakersAccountsTransportV1", accountsNativeTransport);
+} catch {
+  accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts native initialization failed.", hookSetSha256: "" });
+}
 
 const promotionAttempt = promotionRendererAuthorizationAttempt(location.href);
 let promotionNonce: string | null = null;

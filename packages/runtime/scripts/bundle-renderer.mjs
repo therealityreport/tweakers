@@ -54,4 +54,18 @@ await build({
   // handles missing fsevents internally — this is just future-proofing.)
 });
 
-console.log("[bundle] preload + promotion health preload + main bundled");
+// The standalone broker and installer load this module outside main.js.
+// Include its TOML parser so sealed runtimes need no ambient node_modules.
+await build({
+  entryPoints: [resolve(root, "src/account-router/account-continuity.ts")],
+  bundle: true,
+  outfile: resolve(root, "dist/account-router/account-continuity.js"),
+  platform: "node",
+  target: "node20",
+  format: "cjs",
+  sourcemap: true,
+  minify: false,
+  logLevel: "info",
+});
+
+console.log("[bundle] preload + promotion health preload + main + account continuity bundled");

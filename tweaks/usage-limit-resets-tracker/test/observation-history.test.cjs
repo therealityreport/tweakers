@@ -5,6 +5,7 @@ const test = require("node:test");
 const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
 const flat = source.replace(/\s+/g, " ");
 const helpers = require(path.join(__dirname, "..", "index.js")).__test;
+const brokerAccountId = (seed) => `account_${String(seed).replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 43).padEnd(43, "A")}`;
 test("reset detection requires an observed limit transition", () => {
   assert.match(flat, /(?:previous|prior|last).*limit/i);
   assert.match(flat, /(?:transition|changed|decreas|increase|reset)/i);
@@ -23,6 +24,77 @@ test("history is bounded and clearable without exposing secrets", () => {
 test("unknown stored schema has an explicit Unknown display state", () => {
   assert.equal(helpers.usageDisplayState({ unknownSchema: true, state: { limits: {} } }), "Unknown");
   assert.match(source, /Unknown usage history schema/);
+});
+
+test("Accounts context is bounded, selected by opaque ID, and never retains account identity or secrets", () => {
+  const primaryAccountId = brokerAccountId("primary");
+  const context = helpers.normalizeAccountsContext({
+    version: 1,
+    selectedAccountId: primaryAccountId,
+    accounts: [{
+      accountId: primaryAccountId,
+      label: "Primary",
+      email: "private@example.test",
+      plan: "Pro",
+      access_token: "must-not-be-retained",
+      enabled: true,
+      quota: { remainingPercent: 42, resetAt: "2026-09-03T12:00:00.000Z", resetCredits: 2 },
+    }],
+  });
+  assert.deepEqual(context, {
+    selectedAccountId: primaryAccountId,
+    accounts: [{
+      accountId: primaryAccountId,
+      label: "Primary",
+      enabled: true,
+      quota: { remainingPercent: 42, resetAt: "2026-09-03T12:00:00.000Z", depleted: false, resetCredits: 2 },
+    }],
+  });
+  assert.equal(JSON.stringify(context).includes("private@example.test"), false);
+  assert.equal(JSON.stringify(context).includes("access_token"), false);
+  assert.equal(helpers.normalizeAccountsContext({
+    version: 1,
+    accounts: [
+      { accountId: primaryAccountId, label: "Primary", quota: { remainingPercent: 1 } },
+      { accountId: primaryAccountId, label: "Duplicate", quota: { remainingPercent: 2 } },
+    ],
+  }), null);
+  assert.equal(helpers.normalizeAccountsContext({
+    version: 1,
+    accounts: [{ accountId: brokerAccountId("unsafe-label"), label: "private@example.test", quota: { remainingPercent: 1 } }],
+  }), null);
+  assert.equal(helpers.normalizeAccountsContext({
+    version: 1,
+    accounts: [{ accountId: "chatgpt-provider-account-12345678", label: "Primary", quota: { remainingPercent: 1 } }],
+  }), null);
+});
+
+test("Accounts context retains more than 64 validated subscriptions when the complete payload stays byte-bounded", () => {
+  const accounts = Array.from({ length: 65 }, (_unused, index) => ({
+    accountId: brokerAccountId(String(index).padStart(16, "0")),
+    label: `Subscription ${index + 1}`,
+    enabled: index % 2 === 0,
+    quota: { remainingPercent: 100 - (index % 100), resetAt: null, resetCredits: 0 },
+  }));
+  const context = helpers.normalizeAccountsContext({
+    version: 1,
+    selectedAccountId: accounts[64].accountId,
+    accounts,
+  });
+  assert.ok(context);
+  assert.equal(context.accounts.length, 65);
+  assert.equal(context.selectedAccountId, accounts[64].accountId);
+});
+
+test("native Usage selector mounts only when one typed Usage surface is unambiguous", () => {
+  const root = { isConnected: true, append() {}, contains(child) { return child === nested; } };
+  const nested = { isConnected: true, append() {}, closest() { return root; } };
+  assert.equal(helpers.nativeUsageSelectorTarget([{ kind: "usage", confidence: "high", element: nested }]), root);
+  const second = { isConnected: true, append() {}, contains() { return false; } };
+  assert.equal(helpers.nativeUsageSelectorTarget([
+    { kind: "usage", confidence: "high", element: nested },
+    { kind: "usage", confidence: "high", element: second },
+  ]), null);
 });
 
 // Loop fix: an observation that only advances observedAt (same counters) must

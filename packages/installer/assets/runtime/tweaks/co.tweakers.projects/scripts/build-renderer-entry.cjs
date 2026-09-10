@@ -17,6 +17,7 @@ const MODULE_FILES = Object.freeze([
   "lib/policy.js",
   "lib/inventory.js",
   "lib/service.js",
+  "lib/native-project-menu.js",
   "lib/sidebar.js",
   "lib/settings.js",
   "lib/entry.js",

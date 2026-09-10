@@ -53,7 +53,6 @@ import {
 import {
   ConfigCardUpdateCoordinator,
   createEnvironmentConfigController,
-  desktopUpdateStatusPresentation,
   restoreEnvironmentFocus,
   preparedEnvironmentReceiptNeedsFreshV2Preparation,
   type EnvironmentConfirmationDecision,
@@ -134,6 +133,31 @@ interface TweakerConfig {
   updateCheck: TweakerUpdateCheck | null;
   selfUpdate: SelfUpdateState | null;
   installationSource: InstallationSource;
+}
+
+interface IndependentManagerStatusProjection {
+  deploymentKind: "injected" | "independent";
+  manager: {
+    available: boolean;
+    reason: string | null;
+    actions: Array<{ actionId: string; available: boolean; reason: string }>;
+    status: {
+      environment?: {
+        officialApp?: {
+          state?: string;
+          bundleId?: string | null;
+          version?: string | null;
+          build?: string | null;
+          problem?: string | null;
+        };
+        selection?: { experience?: string | null; releaseProfile?: string | null };
+        modeCache?: { state?: string; generationId?: string | null; problem?: string | null };
+      };
+      chatgptAppUpdate?: { state?: string; phase?: string | null; error?: string | null };
+      tweakersPatch?: { state?: string; installedVersion?: string | null; officialVersion?: string | null; problem?: string | null };
+      coordinator?: { state?: string; problem?: string | null };
+    } | null;
+  };
 }
 
 interface TweakerUpdateCheck {
@@ -244,6 +268,16 @@ interface EnvironmentModeCacheStatus {
   } | null;
 }
 
+interface IndependentTweakersLiveHealthProjection {
+  appearance: {
+    status: "normal" | "needs_attention" | "not_observed";
+    normalized: boolean;
+    before: unknown | null;
+    after: unknown | null;
+  };
+  observedAt: string;
+}
+
 interface EnvironmentHelperSubmission {
   kind?: "environment-commit-helper";
   transactionId: string;
@@ -312,37 +346,6 @@ interface McpSyncState {
   }>;
   restartRequired?: boolean;
   error?: string;
-}
-
-interface DesktopUpdateCheckResult {
-  status?: "update-available" | "current" | "stale" | "unavailable" | "error";
-  profile?: "stable" | "alpha" | null;
-  installed?: { marketingVersion?: string | null; build?: string | null };
-  latest?: { marketingVersion?: string | null; build?: string | null };
-  reason?: string | null;
-  checkedAt?: string;
-  updateAndReloadRequested?: boolean;
-  nativeUpdateControlActive?: boolean;
-  javaScriptUpdaterManagerAvailable?: boolean;
-  javaScriptUpdaterManagerReason?: string | null;
-  setupRequired?: "register-beta" | "launch-beta" | null;
-}
-
-interface DesktopUpdateTransactionState {
-  schemaVersion?: 1;
-  kind?: "desktop-update";
-  transactionId: string | null;
-  phase: string;
-  ownerPid?: number;
-  safeOfficialMode?: boolean;
-  resumable?: boolean;
-  nativeUpdateHandoffAt?: string | null;
-  refreshSource?: "development" | "stable" | null;
-  error?: string | null;
-  updatedAt?: string;
-  terminalAt?: string | null;
-  /** Output-only annotation from the CLI: liveness of the recorded owner PID. */
-  ownerAlive?: boolean | null;
 }
 
 type CodexUiReload = (mode?: "operation-start" | "operation-stop") => void;
@@ -457,6 +460,8 @@ interface InjectorState {
   settingsSurfaceHideTimer: ReturnType<typeof setTimeout> | null;
   /** Last tryInject sidebar probe outcome so repeated misses log once per transition. */
   sidebarProbeStatus: "found" | "missing" | "rejected" | null;
+  /** One-shot proof that the verified native Settings sidebar contains Tweakers. */
+  runtimeReadyMountPublished: boolean;
   tweakStore: TweakStoreRegistryView | null;
   tweakStorePromise: Promise<TweakStoreRegistryView> | null;
   tweakStoreError: unknown;
@@ -500,6 +505,7 @@ const state: InjectorState = {
   settingsSurfaceVisible: false,
   settingsSurfaceHideTimer: null,
   sidebarProbeStatus: null,
+  runtimeReadyMountPublished: false,
   tweakStore: null,
   tweakStorePromise: null,
   tweakStoreError: null,
@@ -525,6 +531,12 @@ function safeStringify(v: unknown): string {
   } catch {
     return String(v);
   }
+}
+
+function publishRuntimeReadySettingsMount(): void {
+  if (state.runtimeReadyMountPublished) return;
+  state.runtimeReadyMountPublished = true;
+  ipcRenderer.send("tweaker:settings-mounted", { version: 1 });
 }
 
 // ───────────────────────────────────────────────────────────── public API ──
@@ -998,6 +1010,7 @@ function tryInject(): SettingsProbeOutcome {
     // General doesn't reappear as selected.
     if (state.activePage !== null) syncCodexNativeNavActive(true);
     activatePendingRegisteredPageOpen();
+    publishRuntimeReadySettingsMount();
     return "found";
   }
 
@@ -1031,6 +1044,7 @@ function tryInject(): SettingsProbeOutcome {
     refreshSidebarTweakerUpdateButton();
     if (state.activePage !== null) syncCodexNativeNavActive(true);
     activatePendingRegisteredPageOpen();
+    publishRuntimeReadySettingsMount();
     return "found";
   }
 
@@ -1067,6 +1081,7 @@ function tryInject(): SettingsProbeOutcome {
   noteNavGroupInjection(outer);
   syncPagesGroup();
   activatePendingRegisteredPageOpen();
+  publishRuntimeReadySettingsMount();
   return "found";
 }
 
@@ -1461,20 +1476,49 @@ function constrainSidebarIconSvg(icon: Element | null | undefined, size = 20): v
   (icon as Element).classList?.add("icon-sm", "inline-block", "shrink-0", "align-middle");
 }
 
+function nativeSidebarItemTemplate(): HTMLButtonElement | null {
+  const root = state.sidebarRoot;
+  if (!root) return null;
+  return root.querySelector<HTMLButtonElement>(
+    "button[data-settings-panel-slug]:not([aria-current='page'])",
+  ) ?? root.querySelector<HTMLButtonElement>("button[data-settings-panel-slug]");
+}
+
 function makeSidebarItem(label: string, iconSvg: string): HTMLButtonElement {
-  // Class string copied verbatim from Codex's sidebar buttons (General etc).
+  // Use a live Codex-owned row as the template so typography, height, padding,
+  // alignment, and future host changes stay identical to the surrounding
+  // Settings rows. The fallback mirrors the current native structure for the
+  // brief interval where Codex has not mounted a reusable row yet.
+  const template = nativeSidebarItemTemplate();
+  const templateInner = template?.firstElementChild as HTMLElement | null;
+  const templateChildren = templateInner ? Array.from(templateInner.children) : [];
+  const templateIconSlot = templateChildren.find((child) => child.querySelector("svg")) as HTMLElement | undefined;
+  const templateLabel = templateChildren.find((child) => !child.querySelector("svg")) as HTMLElement | undefined;
+
   const btn = document.createElement("button");
   btn.type = "button";
   btn.dataset.tweaker = `nav-${label.toLowerCase()}`;
   btn.setAttribute("aria-label", label);
-  btn.className =
-    "focus-visible:outline-token-border relative px-row-x py-row-y cursor-interaction shrink-0 items-center overflow-hidden rounded-lg text-left text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50 gap-2 flex w-full hover:bg-token-list-hover-background font-normal";
+  btn.className = template?.className ||
+    "sidebar-item focus-visible:outline-token-border relative h-[var(--height-token-row)] px-[var(--padding-row-cell-x,var(--padding-row-x))] py-row-y cursor-interaction shrink-0 items-center overflow-hidden text-start text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50 gap-2 flex w-full hover:bg-token-list-hover-background font-normal";
+  btn.classList.remove("bg-token-list-hover-background");
+  btn.classList.add("hover:bg-token-list-hover-background", "font-normal");
 
   const inner = document.createElement("div");
-  inner.className =
+  inner.className = templateInner?.className ||
     "flex min-w-0 items-center text-base gap-2 flex-1 text-token-foreground";
-  inner.innerHTML = `${iconSvg}<span class="truncate">${label}</span>`;
-  constrainSidebarIconSvg(inner.querySelector("svg"));
+  inner.classList.remove("text-token-list-active-selection-foreground");
+  inner.classList.add("text-token-foreground");
+
+  const iconSlot = document.createElement("span");
+  iconSlot.className = templateIconSlot?.className || "flex w-4 shrink-0 items-center justify-center";
+  iconSlot.innerHTML = iconSvg;
+  constrainSidebarIconSvg(iconSlot.querySelector("svg"));
+
+  const text = document.createElement("span");
+  text.className = templateLabel?.className || "text-fade-truncate";
+  text.textContent = label;
+  inner.append(iconSlot, text);
   btn.appendChild(inner);
   return btn;
 }
@@ -1791,8 +1835,121 @@ function renderConfigPage(
 ): () => void {
   const cleanups: Array<() => void> = [];
   const cardUpdates = new ConfigCardUpdateCoordinator<unknown>();
+  let disposed = false;
+  void ipcRenderer.invoke("tweaker:get-independent-manager-status")
+    .then((value) => {
+      if (disposed || !sectionsWrap.isConnected) return;
+      const projection = value as IndependentManagerStatusProjection;
+      if (projection?.deploymentKind === "independent") {
+        renderIndependentSettingsSurface(sectionsWrap, cardUpdates, projection, subtitle, cleanups);
+        return;
+      }
+      renderInjectedSettingsSurface(sectionsWrap, cardUpdates, subtitle, cleanups);
+    })
+    .catch(() => {
+      if (disposed || !sectionsWrap.isConnected) return;
+      // Failure to establish the deployment authority is treated as an
+      // independent manager outage. Never reveal the legacy writer controls.
+      renderIndependentSettingsSurface(sectionsWrap, cardUpdates, {
+        deploymentKind: "independent",
+        manager: {
+          available: false,
+          reason: "The verified global Tweakers manager is unavailable. This app is read-only until manager authority is restored.",
+          actions: [],
+          status: null,
+        },
+      }, subtitle, cleanups);
+    });
+  return () => {
+    disposed = true;
+    for (const cleanup of cleanups.splice(0)) {
+      try { cleanup(); } catch {}
+    }
+  };
+}
+
+function renderIndependentSettingsSurface(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+  projection: IndependentManagerStatusProjection,
+  subtitle: HTMLElement | undefined,
+  cleanups: Array<() => void>,
+): void {
+  if (subtitle) {
+    subtitle.textContent = projection.manager.available
+      ? "Independent Tweakers is managed by the global Tweakers manager."
+      : "Independent Tweakers is read-only because its global manager is unavailable.";
+  }
+  renderIndependentAppearanceHealthSection(sectionsWrap, cleanups);
+  renderIndependentManagerStatusSection(sectionsWrap, projection);
+  if (projection.manager.available) {
+    cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "independent", projection));
+  } else {
+    renderIndependentRefreshUnavailableSection(sectionsWrap, projection.manager.reason);
+  }
+}
+
+function renderIndependentAppearanceHealthSection(
+  sectionsWrap: HTMLElement,
+  cleanups: Array<() => void>,
+): void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Appearance"));
+  const card = roundedCard();
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+
+  const render = (health: IndependentTweakersLiveHealthProjection | null): void => {
+    if (!card.isConnected) return;
+    const status = health?.appearance.status ?? "not_observed";
+    const presentation = status === "normal"
+      ? {
+        badge: "Normal",
+        tone: "ok" as const,
+        detail: "The owned primary Tweakers window is at native Actual Size.",
+      }
+      : status === "needs_attention"
+        ? {
+          badge: "Needs attention",
+          tone: "warn" as const,
+          detail: "Native or CSS scaling still needs a later Actual Size validation.",
+        }
+        : {
+          badge: "Not observed",
+          tone: "warn" as const,
+          detail: "The current process has not yet observed an owned primary Tweakers window.",
+        };
+    card.textContent = "";
+    const row = actionRow("Window appearance", presentation.detail);
+    row.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
+      statusBadge(presentation.tone, presentation.badge),
+    );
+    card.appendChild(row);
+    if (health?.observedAt) {
+      card.appendChild(rowSimple("Last observed", new Date(health.observedAt).toLocaleString()));
+    }
+  };
+
+  render(null);
+  void ipcRenderer.invoke("tweaker:get-independent-live-health")
+    .then((value) => render(value as IndependentTweakersLiveHealthProjection | null))
+    .catch(() => render(null));
+  const onChanged = (_event: Electron.IpcRendererEvent, value: unknown): void => {
+    render(value as IndependentTweakersLiveHealthProjection | null);
+  };
+  ipcRenderer.on("tweaker:independent-live-health-changed", onChanged);
+  cleanups.push(() => ipcRenderer.removeListener("tweaker:independent-live-health-changed", onChanged));
+}
+
+function renderInjectedSettingsSurface(
+  sectionsWrap: HTMLElement,
+  cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+  subtitle: HTMLElement | undefined,
+  cleanups: Array<() => void>,
+): void {
   cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
-  cleanups.push(renderDesktopUpdateSection(sectionsWrap, cardUpdates));
+  cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "injected"));
   cleanups.push(renderTweaksHealthSection(sectionsWrap, cardUpdates));
   cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
   cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
@@ -1802,17 +1959,13 @@ function renderConfigPage(
   section.appendChild(sectionTitle("Tweakers Updates"));
   const card = roundedCard();
   card.dataset.tweakerConfigCard = "true";
-  const loading = rowSimple("Loading update settings", "Checking current Tweakers configuration.");
-  card.appendChild(loading);
+  card.appendChild(rowSimple("Loading update settings", "Checking current Tweakers configuration."));
   section.appendChild(card);
   sectionsWrap.appendChild(section);
 
-  void ipcRenderer
-    .invoke("tweaker:get-config")
+  void ipcRenderer.invoke("tweaker:get-config")
     .then((config) => {
-      if (subtitle) {
-        subtitle.textContent = `You have Tweakers ${(config as TweakerConfig).version} installed.`;
-      }
+      if (subtitle) subtitle.textContent = `You have Tweakers ${(config as TweakerConfig).version} installed.`;
       card.textContent = "";
       renderTweakerConfig(card, config as TweakerConfig);
     })
@@ -1823,20 +1976,80 @@ function renderConfigPage(
     });
 
   renderAdvancedRuntimeSection(sectionsWrap);
-
   const maintenance = document.createElement("section");
   maintenance.className = "flex flex-col gap-2";
   maintenance.appendChild(sectionTitle("Maintenance"));
   const maintenanceCard = roundedCard();
-  maintenanceCard.appendChild(uninstallRow());
-  maintenanceCard.appendChild(reportBugRow());
+  maintenanceCard.append(uninstallRow(), reportBugRow());
   maintenance.appendChild(maintenanceCard);
   sectionsWrap.appendChild(maintenance);
-  return () => {
-    for (const cleanup of cleanups.splice(0)) {
-      try { cleanup(); } catch {}
+}
+
+function renderIndependentManagerStatusSection(
+  sectionsWrap: HTMLElement,
+  projection: IndependentManagerStatusProjection,
+): void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Independent Tweakers"));
+  const card = roundedCard();
+  const manager = projection.manager;
+  const managerRow = actionRow(
+    "Global manager",
+    manager.available
+      ? "Verified manager authority is providing this read-only environment and maintenance status."
+      : manager.reason ?? "The verified global Tweakers manager is unavailable. This app is read-only.",
+  );
+  managerRow.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.appendChild(
+    statusBadge(manager.available ? "ok" : "warn", manager.available ? "Available" : "Unavailable"),
+  );
+  card.appendChild(managerRow);
+  if (manager.available && manager.status) {
+    const environment = manager.status.environment;
+    const official = environment?.officialApp;
+    const officialDetail = official?.state === "valid"
+      ? `Verified ${official.bundleId === "com.openai.codex.beta" ? "OpenAI Alpha" : "ChatGPT"}${official.version ? ` v${official.version}` : ""}${official.build ? ` (${official.build})` : ""}.`
+      : official?.problem ?? "The manager has no verified official ChatGPT app.";
+    card.appendChild(rowSimple("Official ChatGPT", officialDetail));
+    const selection = environment?.selection;
+    if (selection?.experience || selection?.releaseProfile) {
+      card.appendChild(rowSimple(
+        "Environment",
+        `${selection.experience ?? "Unknown app"} · ${selection.releaseProfile ?? "Unknown release"} (manager read-only).`,
+      ));
     }
-  };
+    const patch = manager.status.tweakersPatch;
+    if (patch) {
+      card.appendChild(rowSimple(
+        "Tweakers reapplication",
+        patch.state === "source-changes-available"
+          ? "A manager-verified Tweakers reapplication may be available after the official update."
+          : patch.problem ?? "No manager-verified Tweakers reapplication is currently needed.",
+      ));
+    }
+    const coordinator = manager.status.coordinator;
+    if (coordinator?.state && coordinator.state !== "idle") {
+      card.appendChild(rowSimple("Manager coordination", coordinator.problem ?? `Manager state: ${coordinator.state}.`));
+    }
+  }
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
+}
+
+function renderIndependentRefreshUnavailableSection(
+  sectionsWrap: HTMLElement,
+  reason: string | null,
+): void {
+  const section = document.createElement("section");
+  section.className = "flex flex-col gap-2";
+  section.appendChild(sectionTitle("Tweakers App Update"));
+  const card = roundedCard();
+  card.appendChild(rowSimple(
+    "Tweakers reapplication unavailable",
+    reason ?? "The verified global Tweakers manager is unavailable. This surface is read-only; no Tweakers reapplication control is exposed.",
+  ));
+  section.appendChild(card);
+  sectionsWrap.appendChild(section);
 }
 
 /**
@@ -2797,289 +3010,95 @@ function openEnvironmentConfirmModal(
   return decision;
 }
 
-function renderDesktopUpdateSection(
+function renderTweakersRuntimeRefreshSection(
   sectionsWrap: HTMLElement,
   cardUpdates: ConfigCardUpdateCoordinator<unknown>,
+  deploymentKind: "injected" | "independent",
+  projection?: IndependentManagerStatusProjection,
 ): () => void {
   const section = document.createElement("section");
   section.className = "flex flex-col gap-2";
-  section.appendChild(sectionTitle("Desktop Update"));
+  section.appendChild(sectionTitle(deploymentKind === "independent" ? "Tweakers App Update" : "Tweaker Mode Runtime"));
   const card = roundedCard();
-  card.dataset.tweakerDesktopUpdateCard = "true";
-  card.appendChild(rowSimple("Loading desktop update", "Checking the signed Codex appcast."));
+  card.dataset.tweakerRuntimeRefreshCard = deploymentKind;
   section.appendChild(card);
   sectionsWrap.appendChild(section);
 
-  let current: DesktopUpdateCheckResult | null = null;
-  let transaction: DesktopUpdateTransactionState | null = null;
+  const actionId = deploymentKind === "independent" ? "refresh.independent" : "refresh.injected";
+  const managerAction = projection?.manager.actions.find((action) => action.actionId === actionId) ?? null;
   let busy = false;
-  let polling: ReturnType<typeof setTimeout> | null = null;
-  let transactionPollFailures = 0;
-  let awaitingTransactionReceiptUntil = 0;
-  let initialResultSuperseded = false;
-  let transactionFetchFailed = false;
+  let detail: string | null = null;
 
-  const transactionIsNonTerminal = (): boolean => {
-    if (!transaction?.transactionId) {
-      return transaction?.phase === "preparing" && Date.now() < awaitingTransactionReceiptUntil;
-    }
-    return !["completed", "failed", "rolled_back"].includes(transaction.phase);
-  };
-  const scheduleTransactionPoll = (delayMs = 2_000): void => {
-    if (polling) clearTimeout(polling);
-    // A failed fetch must keep polling even with no known transaction: a
-    // stranded receipt would otherwise stay invisible until tab re-mount.
-    if (!card.isConnected
-      || (!transactionIsNonTerminal()
-        && transaction?.resumable !== true
-        && !transactionFetchFailed)) return;
-    polling = setTimeout(() => {
-      polling = null;
-      void loadTransaction();
-    }, delayMs);
-  };
-  const loadTransaction = async (): Promise<void> => {
-    const update = cardUpdates.begin("desktop-update-transaction");
-    try {
-      const value = await ipcRenderer.invoke("tweaker:get-codex-desktop-update-transaction");
-      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
-      transactionFetchFailed = false;
-      const observed = normalizeDesktopUpdateTransaction(value);
-      if (observed?.phase === "idle"
-        && observed.transactionId === null
-        && transaction?.phase === "preparing"
-        && transaction.transactionId === null) {
-        if (Date.now() >= awaitingTransactionReceiptUntil) {
-          transaction = {
-            transactionId: null,
-            phase: "failed",
-            error: "The desktop updater did not create a transaction receipt.",
-          };
-        }
-      } else {
-        const idleWithoutReceipt = observed?.phase === "idle" && observed.transactionId === null;
-        transaction = idleWithoutReceipt ? null : observed;
-        if (transaction?.transactionId) awaitingTransactionReceiptUntil = 0;
-      }
-      transactionPollFailures = 0;
-      draw();
-      scheduleTransactionPoll();
-    } catch (error) {
-      if (!cardUpdates.isCurrent(update) || !card.isConnected) return;
-      transactionFetchFailed = true;
-      // With no known transaction, keep it null: fabricating a phantom
-      // "preparing" row both misinforms and used to satisfy no poll gate,
-      // permanently hiding any real stranded receipt on disk.
-      if (transaction) {
-        transaction = {
-          ...transaction,
-          error: safeUiError(error),
-        };
-      }
-      draw();
-      transactionPollFailures += 1;
-      const backoff = Math.min(30_000, 1_000 * (2 ** Math.min(transactionPollFailures - 1, 5)));
-      const jitter = Math.floor(backoff * 0.25 * Math.random());
-      scheduleTransactionPoll(backoff + jitter);
-    }
-  };
   const draw = (): void => {
     card.textContent = "";
-    const result = current;
-    const installed = result?.installed?.marketingVersion ?? "Unavailable";
-    const latest = result?.latest?.marketingVersion ?? "Unavailable";
-    const status = desktopUpdateStatusPresentation(result?.status);
-    const row = actionRow("ChatGPT Desktop", `Installed ${installed} · Latest ${latest}${result?.reason ? ` · ${result.reason}` : ""}`);
-    const left = row.firstElementChild as HTMLElement | null;
-    left?.prepend(statusBadge(status.tone, status.label));
+    const patch = projection?.manager.status?.tweakersPatch;
+    const independentlyAvailable = deploymentKind !== "independent" || managerAction?.available === true;
+    const summary = deploymentKind === "independent"
+      ? patch?.state === "source-changes-available"
+        ? "A verified source change is ready to rebuild only this independent Tweakers app."
+        : patch?.state === "current"
+          ? "Reapply this independent Tweakers app from its manager-verified official source."
+          : managerAction?.reason ?? patch?.problem ?? "A manager-verified official source is required before Tweakers can be rebuilt."
+      : "Refreshes the separately selected ChatGPT Tweaker mode from its manager-verified source.";
+    const row = actionRow(
+      deploymentKind === "independent" ? "Independent Tweakers" : "ChatGPT Tweaker mode",
+      detail ?? summary,
+    );
     const actions = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
-    const check = compactButton("Check for Updates…", () => {
-      if (busy) return;
-      busy = true;
-      check.disabled = true;
-      void ipcRenderer.invoke("tweaker:check-codex-desktop-update")
-        .then((value) => {
-          const result = value as DesktopUpdateCheckResult;
-          acceptDesktopUpdateResult(result);
-          if (result.updateAndReloadRequested) {
-            awaitingTransactionReceiptUntil = Date.now() + 10_000;
-            transaction = { transactionId: null, phase: "preparing" };
-            void loadTransaction();
-          }
-        })
-        .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
-        .finally(() => { busy = false; draw(); });
-    });
-    check.disabled = busy || !!result?.setupRequired;
-    actions?.appendChild(check);
-    const update = compactButton("Update and Reload", () => {
-      if (busy) return;
-      busy = true;
-      update.disabled = true;
-      void ipcRenderer.invoke("tweaker:start-codex-desktop-update")
-        .then(() => {
-          awaitingTransactionReceiptUntil = Date.now() + 10_000;
-          transaction = { transactionId: null, phase: "preparing" };
-          void loadTransaction();
-        })
-        .catch((error) => { current = { status: "error", reason: safeUiError(error) }; })
-        .finally(() => { busy = false; draw(); });
-    });
-    // Gate on non-terminal (not "active"): a stranded dead-owner receipt still
-    // blocks start() on disk, so the button must stay disabled until recovery.
-    update.disabled = busy
-      || result?.status !== "update-available"
-      || transactionIsNonTerminal()
-      || transaction?.resumable === true;
-    actions?.appendChild(update);
+    const button = compactButton(
+      deploymentKind === "independent" ? "Rebuild Tweakers App" : "Refresh Tweaker Mode",
+      () => {
+        if (busy) return;
+        busy = true;
+        detail = "The global Tweakers manager is preparing the selected refresh.";
+        draw();
+        const update = cardUpdates.begin(`tweakers-runtime-${deploymentKind}`);
+        void ipcRenderer.invoke("tweaker:reapply-tweakers")
+          .then((value) => {
+            if (!cardUpdates.complete(update, value)) return;
+            const result = value as { detail?: unknown; reason?: unknown; blocked?: unknown };
+            detail = typeof result.detail === "string"
+              ? result.detail
+              : typeof result.reason === "string"
+                ? result.reason
+                : result.blocked === true
+                  ? "The manager blocked this refresh until its exact prerequisite is complete."
+                  : "The global Tweakers manager accepted the refresh request.";
+          })
+          .catch((error) => {
+            if (cardUpdates.complete(update, error)) detail = safeUiError(error);
+          })
+          .finally(() => {
+            busy = false;
+            draw();
+          });
+      },
+    );
+    button.disabled = busy || !independentlyAvailable;
+    actions?.appendChild(button);
+    row.querySelector<HTMLElement>("[data-tweaker-row-actions]")?.prepend(
+      statusBadge(
+        independentlyAvailable ? "ok" : "warn",
+        independentlyAvailable ? "Manager ready" : "Blocked",
+      ),
+    );
     card.appendChild(row);
-    if (result?.setupRequired) {
-      const setupLabel = result.setupRequired === "register-beta"
-        ? "Register OpenAI Beta"
-        : "Launch OpenAI Beta once";
+    card.appendChild(rowSimple(
+      "ChatGPT updater",
+      "ChatGPT remains on its own native updater. This control only refreshes Tweakers or the separately selected Tweaker mode.",
+    ));
+    if (patch?.installedVersion || patch?.officialVersion) {
       card.appendChild(rowSimple(
-        `Alpha update setup · ${setupLabel}`,
-        result.reason ?? "Alpha update checks stay disabled until Tweakers captures the registered Beta app's own feed.",
+        "Source comparison",
+        `Tweakers ${patch.installedVersion ?? "unknown"} · Official ChatGPT ${patch.officialVersion ?? "unknown"}.`,
       ));
     }
-    if (result?.checkedAt) card.appendChild(rowSimple("Last checked", new Date(result.checkedAt).toLocaleString()));
-    if (transaction) card.appendChild(desktopUpdateTransactionRow(transaction, {
-      busy,
-      onResume: () => {
-        if (busy) return;
-        busy = true;
-        draw();
-        void ipcRenderer.invoke("tweaker:resume-codex-desktop-update")
-          .then(() => {
-            transaction = transaction ? { ...transaction, phase: "awaiting_native_update", resumable: false } : transaction;
-            scheduleTransactionPoll();
-          })
-          .catch((error) => {
-            if (transaction) transaction = { ...transaction, error: safeUiError(error) };
-          })
-          .finally(() => { busy = false; draw(); });
-      },
-      onCancel: () => {
-        if (busy) return;
-        busy = true;
-        draw();
-        void ipcRenderer.invoke("tweaker:cancel-codex-desktop-update")
-          .then((value) => { transaction = normalizeDesktopUpdateTransaction(value) ?? transaction; })
-          .catch((error) => {
-            if (transaction) transaction = { ...transaction, error: safeUiError(error) };
-          })
-          .finally(() => { busy = false; draw(); });
-      },
-    }));
   };
+
   draw();
-  const acceptDesktopUpdateResult = (value: DesktopUpdateCheckResult): void => {
-    const currentTime = current?.checkedAt ? Date.parse(current.checkedAt) : Number.NaN;
-    const nextTime = value.checkedAt ? Date.parse(value.checkedAt) : Number.NaN;
-    if (Number.isFinite(currentTime) && (!Number.isFinite(nextTime) || nextTime < currentTime)) return;
-    current = value;
-    draw();
-  };
-  const onDesktopUpdateChanged = (_event: unknown, value: unknown): void => {
-    if (!card.isConnected) {
-      ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-      return;
-    }
-    initialResultSuperseded = true;
-    acceptDesktopUpdateResult(value as DesktopUpdateCheckResult);
-  };
-  ipcRenderer.on("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-  const currentUpdate = cardUpdates.begin("desktop-update-result");
-  void ipcRenderer.invoke("tweaker:get-codex-desktop-update")
-    .then((value) => {
-      if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected || initialResultSuperseded) return;
-      if (value && typeof value === "object") {
-        acceptDesktopUpdateResult(value as DesktopUpdateCheckResult);
-      } else {
-        current = { status: "unavailable", reason: "Update status has not been checked yet." };
-        draw();
-      }
-    })
-    .catch((error) => {
-      if (!cardUpdates.isCurrent(currentUpdate) || !card.isConnected) return;
-      current = { status: "error", reason: safeUiError(error) };
-      draw();
-    });
-  void loadTransaction();
   return () => {
-    cardUpdates.invalidate("desktop-update-result");
-    cardUpdates.invalidate("desktop-update-transaction");
-    ipcRenderer.removeListener("tweaker:codex-desktop-update-changed", onDesktopUpdateChanged);
-    if (polling) clearTimeout(polling);
-    polling = null;
+    cardUpdates.invalidate(`tweakers-runtime-${deploymentKind}`);
   };
-}
-
-function normalizeDesktopUpdateTransaction(value: unknown): DesktopUpdateTransactionState | null {
-  if (!value || typeof value !== "object") return null;
-  const candidate = value as Partial<DesktopUpdateTransactionState>;
-  if (candidate.transactionId !== null && typeof candidate.transactionId !== "string") return null;
-  if (typeof candidate.phase !== "string") return null;
-  return {
-    ...candidate,
-    transactionId: candidate.transactionId ?? null,
-    phase: candidate.phase,
-  };
-}
-
-function desktopUpdateTransactionRow(
-  transaction: DesktopUpdateTransactionState,
-  actions: { busy: boolean; onResume: () => void; onCancel: () => void },
-): HTMLElement {
-  const phase = humanizeCodexPhase(transaction.phase);
-  const nonTerminal = !["completed", "failed", "rolled_back"].includes(transaction.phase);
-  // ownerAlive === false on a non-terminal receipt means the coordinator died
-  // mid-flight: the receipt is stranded, not progressing.
-  const ownerExited = nonTerminal && transaction.ownerAlive === false;
-  const detail = [
-    ownerExited ? "Owner process exited — recovery required." : null,
-    transaction.transactionId ? `Transaction ${transaction.transactionId}` : null,
-    transaction.safeOfficialMode ? "Official ChatGPT is active" : null,
-    transaction.refreshSource ? `${transaction.refreshSource} Tweakers refresh` : null,
-    typeof transaction.terminalAt === "string"
-      ? `Terminal at ${new Date(transaction.terminalAt).toLocaleString()}`
-      : transaction.updatedAt
-        ? `Last update at ${new Date(transaction.updatedAt).toLocaleString()}`
-        : null,
-    transaction.error ?? null,
-  ].filter(Boolean).join(" · ") || "Waiting for the durable updater receipt.";
-  const row = actionRow("Update and Reload", detail);
-  row.setAttribute("role", "status");
-  row.setAttribute("aria-live", "polite");
-  const left = row.firstElementChild as HTMLElement | null;
-  const tone = transaction.phase === "completed"
-    ? "ok"
-    : ownerExited || (transaction.phase === "failed" && !transaction.resumable)
-      ? "error"
-      : "warn";
-  left?.prepend(statusBadge(tone, phase));
-  const controls = row.querySelector<HTMLElement>("[data-tweaker-row-actions]");
-  const canResume = transaction.resumable === true
-    && (transaction.phase === "failed" || transaction.phase === "rolled_back");
-  // cancelUnlocked handles exited owners for these stranded phases via
-  // recoverExitedOwner, so a dead-owner receipt gets a safe-recovery Cancel.
-  const deadOwnerRecoverable = ownerExited
-    && ["switching_to_chatgpt", "returning_to_tweakers", "refreshing_runtime", "verifying", "preparing"]
-      .includes(transaction.phase);
-  const canCancel = transaction.phase === "awaiting_native_update"
-    || (transaction.resumable === true && ["failed", "rolled_back"].includes(transaction.phase))
-    || deadOwnerRecoverable;
-  if (canResume) {
-    const resume = compactButton("Resume", actions.onResume);
-    resume.disabled = actions.busy;
-    controls?.appendChild(resume);
-  }
-  if (canCancel) {
-    const cancel = compactButton("Cancel", actions.onCancel);
-    cancel.disabled = actions.busy;
-    controls?.appendChild(cancel);
-  }
-  return row;
 }
 
 function renderTweaksHealthSection(

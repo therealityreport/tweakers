@@ -11,24 +11,23 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, lstatSync, mkdtempSync, openSync, readSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, platform, tmpdir } from "node:os";
 import { readPlist, writePlist, type Plist } from "./plist.js";
 
 export const DEFAULT_LOCAL_SIGNING_IDENTITY = "Tweakers Local Signing";
+export const OPENAI_DEVELOPER_ID_TEAM_IDENTIFIER = "2DC432GLL2";
 
 export type SigningMode = "local-identity" | "adhoc";
 
 export type SigningPosture = "strict" | "contained";
 
 /**
- * strict  = Library Validation ON: omit disable-library-validation and do NOT
- *           add a trusted root. Relies on the pinned Designated Requirement.
- * contained = working fallback: keep disable-library-validation and add the
- *           cert as trusted, but ONLY inside a dedicated non-login keychain.
- * Default is "contained" until guarded real run #4 proves strict signing on a
- * live app. Set TWEAKERS_SIGNING_MODE=strict only for that guarded rollout.
+ * strict = preserve the source's reviewed portable entitlements exactly.
+ * contained = use the dedicated non-login keychain and add the one reviewed
+ *              library-validation exception required by a no-Team-ID local
+ *              identity to load its own re-signed Electron framework.
  */
 export function resolveSigningPosture(
   explicit?: SigningPosture,
@@ -67,6 +66,12 @@ export interface SecurityCommandResult {
   stderr: string;
 }
 
+export interface OpenAIDeveloperIdSourceTrustEvidence {
+  signature: SignatureInfo;
+  strictVerification: Pick<SecurityCommandResult, "status" | "stdout" | "stderr"> | { ok: boolean; output: string };
+  gatekeeper: Pick<SecurityCommandResult, "status" | "stdout" | "stderr"> | { ok: boolean; output: string };
+}
+
 export type SecurityCommandRunner = (command: string, args: string[]) => SecurityCommandResult;
 
 export interface UserKeychainPreferenceOptions {
@@ -98,9 +103,12 @@ const LOCKED_KEYCHAIN_SIGNING_ERROR =
 const MACHO_MAGICS = new Set([
   0xfeedface, // 32-bit
   0xfeedfacf, // 64-bit
-  0xcafebabe, // fat
   0xcffaedfe, // 64-bit LE
   0xcefaedfe, // 32-bit LE
+  0xcafebabe, // FAT_MAGIC
+  0xbebafeca, // FAT_CIGAM
+  0xcafebabf, // FAT_MAGIC_64
+  0xbfbafeca, // FAT_CIGAM_64
 ]);
 
 export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): CodeSigningResult | null {
@@ -113,46 +121,87 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
     : null;
   const signingIdentity = localIdentity?.hash ?? "-";
   const keychainArgs = codeSigningKeychainArgs(localIdentity);
+  const expectedEntitlementsByTarget = new Map<string, Plist>();
   const portableSignature = localIdentity
     ? preparePortableSignature(appRoot, localIdentity.hash, posture)
     : null;
+  if (portableSignature) expectedEntitlementsByTarget.set(appRoot, portableSignature.expectedEntitlements);
 
-  // Step 1: pre-sign every nested Mach-O inside-out with one identity before
-  // the bundle-level pass re-signs the wrappers.
-  for (const root of codeSigningWalkRoots(appRoot)) {
-    walkAndSign(root, signingIdentity, keychainArgs);
+  // Step 1: pre-sign every nested Mach-O and code bundle inside-out with one
+  // identity. Current desktop builds carry signed executables well beyond
+  // Frameworks/app.asar.unpacked (notably Computer Use under Resources), so a
+  // partial walk would leave OpenAI team-bound code inside the derived app.
+  const nestedEntitlementsRoot = mkdtempSync(join(tmpdir(), "tweakers-nested-entitlements-"));
+  const entitlementSequence = { value: 0 };
+  try {
+    for (const root of codeSigningWalkRoots(appRoot)) {
+      walkAndSign(
+        root,
+        signingIdentity,
+        keychainArgs,
+        posture,
+        nestedEntitlementsRoot,
+        entitlementSequence,
+        expectedEntitlementsByTarget,
+      );
+    }
+    signNestedBundles(
+      appRoot,
+      signingIdentity,
+      keychainArgs,
+      posture,
+      nestedEntitlementsRoot,
+      entitlementSequence,
+      expectedEntitlementsByTarget,
+    );
+  } finally {
+    rmSync(nestedEntitlementsRoot, { recursive: true, force: true });
   }
 
-  // Step 2: sign the bundle itself with --deep (covers Frameworks, Helpers).
+  // Step 2: sign the outer bundle only after its nested code. `--deep` can
+  // overwrite a deliberate child signature and obscure an unsafe entitlement,
+  // so the final outer signing pass never delegates child traversal to
+  // codesign.
   try {
-    execFileSync(
-      "codesign",
-      ["--force", "--deep", "--sign", signingIdentity, ...keychainArgs, appRoot],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
-
-    if (portableSignature) {
-      execFileSync(
-        "codesign",
-        [
-          "--force",
-          "--sign",
-          signingIdentity,
-          "--options",
-          "runtime",
+    const args = [
+      "--force",
+      "--sign",
+      signingIdentity,
+      ...keychainArgs,
+      "--preserve-metadata=flags",
+      ...(portableSignature
+        ? [
           "--entitlements",
           portableSignature.entitlementsPath,
-          "--requirements",
-          `=${portableSignature.requirement}`,
-          ...keychainArgs,
-          appRoot,
-        ],
-        { stdio: ["ignore", "ignore", "pipe"] },
+          ...(portableSignature.requirement === null
+            ? []
+            : ["--requirements", `=${portableSignature.requirement}`]),
+        ]
+        : []),
+      appRoot,
+    ];
+    execFileSync(
+      "codesign",
+      args,
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    // macOS applies an app bundle's final process entitlement set to its
+    // declared CFBundleExecutable. A pre-Electron Tweakers wrapper is that
+    // executable, so its earlier child-only contained expectation is no
+    // longer authoritative after this final pass. Record the exact final
+    // outer set instead of weakening the audit or re-signing the wrapper
+    // afterwards (which would invalidate the outer bundle seal).
+    if (portableSignature) {
+      expectedEntitlementsByTarget.set(
+        declaredAppExecutablePath(appRoot),
+        portableSignature.expectedEntitlements,
       );
     }
   } finally {
     if (portableSignature) rmSync(portableSignature.tempRoot, { recursive: true, force: true });
   }
+
+  if (localIdentity) auditLocallySignedApp(appRoot, localIdentity.name, expectedEntitlementsByTarget);
 
   return localIdentity
     ? {
@@ -168,76 +217,329 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
  * These are bound either to the original Apple Team ID or to that team's
  * provisioning profile. They cannot be carried over to a locally signed app.
  */
-const NON_PORTABLE_ENTITLEMENTS = [
+const NON_PORTABLE_ENTITLEMENTS = new Set([
   "com.apple.application-identifier",
   "com.apple.developer.team-identifier",
   "com.apple.security.application-groups",
   "keychain-access-groups",
   "com.apple.developer.aps-environment",
-];
+]);
+
+/**
+ * These entitlement keys have no embedded Team ID, application identifier,
+ * keychain group, or provisioning-profile binding. Keep this list narrow: a
+ * newly observed key must be reviewed rather than carried into the locally
+ * signed derived app by default.
+ */
+export const PORTABLE_ENTITLEMENT_KEYS = new Set([
+  "com.apple.security.app-sandbox",
+  "com.apple.security.automation.apple-events",
+  "com.apple.security.cs.allow-dyld-environment-variables",
+  "com.apple.security.cs.allow-jit",
+  "com.apple.security.cs.allow-unsigned-executable-memory",
+  "com.apple.security.cs.disable-executable-page-protection",
+  "com.apple.security.cs.disable-library-validation",
+  "com.apple.security.device.audio-input",
+  "com.apple.security.device.camera",
+  "com.apple.security.files.user-selected.read-write",
+  "com.apple.security.get-task-allow",
+  "com.apple.security.network.client",
+  "com.apple.security.personal-information.addressbook",
+  "com.apple.security.personal-information.calendars",
+]);
 
 function preparePortableSignature(appRoot: string, identityHash: string, posture: SigningPosture): {
   tempRoot: string;
   entitlementsPath: string;
-  requirement: string;
-} | null {
+  requirement: string | null;
+  expectedEntitlements: Plist;
+} {
   const info = readPlist(join(appRoot, "Contents", "Info.plist"));
   const identifier = String(info.CFBundleIdentifier ?? "");
-  const requirementResult = spawnSync("codesign", ["-d", "-r-", appRoot], {
+  const signatureSource = portableOuterSignatureSource(appRoot, info);
+  const requirementResult = spawnSync("codesign", ["-d", "-r-", signatureSource], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   const originalRequirement = `${requirementResult.stdout ?? ""}${requirementResult.stderr ?? ""}`
     .split(/\r?\n/)
     .find((line) => line.startsWith("designated => "));
-  if (!originalRequirement || !/^[A-Za-z0-9.-]+$/.test(identifier)) return null;
-
-  const entitlementsResult = spawnSync("codesign", ["-d", "--entitlements", ":-", appRoot], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
   // codesign still emits intact embedded entitlements after app.asar changes invalidate the seal.
-  if (!entitlementsResult.stdout.trim()) return null;
+  const sourceEntitlements = readEmbeddedEntitlements(signatureSource) ?? {};
+  const expectedEntitlements = portableEntitlements(sourceEntitlements, posture);
 
   const tempRoot = mkdtempSync(join(tmpdir(), "tweakers-entitlements-"));
   const entitlementsPath = join(tempRoot, "portable.plist");
-  const originalPath = join(tempRoot, "original.plist");
-  writeFileSync(originalPath, entitlementsResult.stdout);
-  const entitlements = portableEntitlements(readPlist(originalPath), posture);
-  writePlist(entitlementsPath, entitlements);
+  writePlist(entitlementsPath, expectedEntitlements);
   return {
     tempRoot,
     entitlementsPath,
-    requirement: stableDesignatedRequirement(originalRequirement, identifier, identityHash),
+    requirement: originalRequirement && /^[A-Za-z0-9.-]+$/.test(identifier)
+      ? stableDesignatedRequirement(originalRequirement, identifier, identityHash)
+      : null,
+    expectedEntitlements,
   };
 }
 
 /**
- * Removes entitlements that require Apple's original Team ID or provisioning
- * profile. Strict signing keeps Library Validation enabled by omitting its
- * disable entitlement; contained fallback signing restores that entitlement
- * for launch compatibility.
+ * A derived Tweakers bundle can place a tiny pre-Electron launcher at the
+ * declared executable path. The preserved upstream executable remains the
+ * authority for the outer process's original requirement and entitlements.
+ * A present but malformed marker must never fall back to the wrapper.
  */
-export function portableEntitlements(entitlements: Plist, posture: SigningPosture = "strict"): Plist {
-  const portable = { ...entitlements };
-  for (const key of NON_PORTABLE_ENTITLEMENTS) delete portable[key];
-  delete portable["com.apple.security.cs.disable-library-validation"];
-  if (posture === "contained") {
-    portable["com.apple.security.cs.disable-library-validation"] = true;
+function portableOuterSignatureSource(appRoot: string, info: Plist): string {
+  const marker = info.TweakersOriginalExecutable;
+  if (marker === undefined) return appRoot;
+  if (typeof marker !== "string" || marker.length === 0 || marker.includes("/") || marker === "." || marker === "..") {
+    throw new Error("Tweakers preserved executable marker is unsafe.");
+  }
+  const source = join(appRoot, "Contents", "MacOS", marker);
+  if (!existsSync(source)) throw new Error(`Tweakers preserved executable is missing: ${source}`);
+  const stat = lstatSync(source);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0) {
+    throw new Error(`Tweakers preserved executable is not a safe executable file: ${source}`);
+  }
+  return source;
+}
+
+/** Resolve the exact process binary that macOS re-signs with outer app entitlements. */
+function declaredAppExecutablePath(appRoot: string): string {
+  const info = readPlist(join(appRoot, "Contents", "Info.plist"));
+  const executable = info.CFBundleExecutable;
+  if (typeof executable !== "string" || executable.length === 0 || executable.includes("/")
+      || executable === "." || executable === "..") {
+    throw new Error("Tweakers declared executable is unsafe.");
+  }
+  const path = join(appRoot, "Contents", "MacOS", executable);
+  if (!existsSync(path)) throw new Error(`Tweakers declared executable is missing: ${path}`);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0) {
+    throw new Error(`Tweakers declared executable is not a safe executable file: ${path}`);
+  }
+  return path;
+}
+
+/**
+ * Preserve only reviewed portable entitlements. Known OpenAI team,
+ * application, keychain, and provisioning-bound keys are excluded from the
+ * derived signature; an unknown key still fails closed rather than crossing
+ * the source boundary unreviewed.
+ */
+export function portableEntitlements(entitlements: Plist, _posture: SigningPosture = "strict"): Plist {
+  return portableProcessEntitlements(entitlements, _posture);
+}
+
+/**
+ * Nested Electron helper processes use the same narrow contained-signing
+ * exception as the outer app. Loadable libraries themselves receive no
+ * process entitlements; portableEntitlementsForCode enforces that boundary.
+ */
+export function portableNestedEntitlements(
+  entitlements: Plist,
+  _posture: SigningPosture = "strict",
+): Plist {
+  return portableProcessEntitlements(entitlements, _posture);
+}
+
+/**
+ * Audit an already-signed target. Team-bound keys are invalid here because
+ * filtering is allowed only before signing; the final signature must contain
+ * the returned portable set exactly.
+ */
+export function assertPortableEntitlements(entitlements: Plist): Plist {
+  const portable: Plist = {};
+  for (const [key, value] of Object.entries(entitlements)) {
+    if (NON_PORTABLE_ENTITLEMENTS.has(key)) {
+      throw new Error(`Non-portable team, application, keychain, or provisioning entitlement: ${key}`);
+    }
+    if (!PORTABLE_ENTITLEMENT_KEYS.has(key)) {
+      throw new Error(`Unreviewed non-portable entitlement: ${key}`);
+    }
+    if (typeof value !== "boolean") {
+      throw new Error(`Portable entitlement must be a boolean: ${key}`);
+    }
+    portable[key] = value;
   }
   return portable;
 }
 
+function filterPortableEntitlements(entitlements: Plist): Plist {
+  const portable: Plist = {};
+  for (const [key, value] of Object.entries(entitlements)) {
+    if (NON_PORTABLE_ENTITLEMENTS.has(key)) continue;
+    if (!PORTABLE_ENTITLEMENT_KEYS.has(key)) {
+      throw new Error(`Unreviewed non-portable entitlement: ${key}`);
+    }
+    if (typeof value !== "boolean") {
+      throw new Error(`Portable entitlement must be a boolean: ${key}`);
+    }
+    portable[key] = value;
+  }
+  return portable;
+}
+
+function portableProcessEntitlements(entitlements: Plist, posture: SigningPosture): Plist {
+  const portable = filterPortableEntitlements(entitlements);
+  if (posture !== "contained") return portable;
+
+  const libraryValidation = portable["com.apple.security.cs.disable-library-validation"];
+  if (libraryValidation !== undefined && libraryValidation !== true) {
+    throw new Error("Contained local signing cannot override an explicit false library-validation entitlement.");
+  }
+  portable["com.apple.security.cs.disable-library-validation"] = true;
+  return portable;
+}
+
 export function codeSigningWalkRoots(appRoot: string): string[] {
-  const resources = join(appRoot, "Contents", "Resources");
-  return [
-    join(appRoot, "Contents", "Frameworks"),
-    join(resources, "app.asar.unpacked"),
-    // The Tweakers native host is a loose Mach-O staged outside Electron's
-    // normal nested-code locations. `codesign --deep` does not reliably find
-    // it, so include its directory in the explicit inside-out signing walk.
-    join(resources, "tweakers", "native"),
-  ];
+  return [join(appRoot, "Contents")];
+}
+
+const CODE_BUNDLE_SUFFIXES = [".app", ".xpc", ".framework", ".bundle", ".plugin", ".docktileplugin"];
+
+/** `.dSYM` DWARF payloads may begin with a Mach-O magic but are debug data, not signable runtime code. */
+export function isCodeSigningTraversalDirectory(name: string): boolean {
+  return !name.endsWith(".dSYM");
+}
+
+/** SwiftPM also emits resource-only `.bundle` directories with no executable or signature. */
+export function isNestedCodeBundle(path: string): boolean {
+  if (!path.endsWith(".bundle")) {
+    return CODE_BUNDLE_SUFFIXES.some((suffix) => path.endsWith(suffix));
+  }
+  for (const infoPath of [join(path, "Contents", "Info.plist"), join(path, "Resources", "Info.plist"), join(path, "Info.plist")]) {
+    if (!existsSync(infoPath)) continue;
+    try {
+      const executable = readPlist(infoPath).CFBundleExecutable;
+      return typeof executable === "string" && executable.length > 0;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** Only MH_EXECUTE processes carry enforceable process entitlements after local signing. */
+export function machOAcceptsProcessEntitlements(path: string): boolean {
+  const inspected = spawnSync("file", ["-b", path], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (inspected.status !== 0 || inspected.error) {
+    throw new Error(`Failed to inspect Mach-O file type for ${path}: ${String(inspected.stderr ?? inspected.error?.message ?? "unknown error").trim()}`);
+  }
+  const description = String(inspected.stdout ?? "").trim().toLowerCase();
+  if (!description.includes("mach-o")) throw new Error(`Mach-O file type was not reported for ${path}: ${description}`);
+  const loadable = description.includes("bundle") || description.includes("dynamically linked shared library");
+  const executable = description.includes("executable");
+  if (!loadable && !executable) throw new Error(`Unsupported Mach-O file type for ${path}: ${description}`);
+  return executable && !loadable;
+}
+
+/**
+ * Enumerate every nested code wrapper below `Contents`, deepest first. This
+ * excludes SwiftPM resource-only `.bundle` wrappers: they have no executable
+ * or source signature and are data belonging to their enclosing code object.
+ */
+function collectNestedCodeBundles(appRoot: string): string[] {
+  const bundles: string[] = [];
+  const visit = (directory: string): void => {
+    let entries: string[];
+    try { entries = readdirSync(directory); } catch { return; }
+    for (const name of entries) {
+      const path = join(directory, name);
+      let stat;
+      try { stat = lstatSync(path); } catch { continue; }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) continue;
+      if (!isCodeSigningTraversalDirectory(name)) continue;
+      visit(path);
+      if (isNestedCodeBundle(path)) bundles.push(path);
+    }
+  };
+  visit(join(appRoot, "Contents"));
+  return bundles.sort((left, right) => right.split("/").length - left.split("/").length || left.localeCompare(right));
+}
+
+function collectMachOFiles(root: string): string[] {
+  const files: string[] = [];
+  const visit = (directory: string): void => {
+    let entries: string[];
+    try { entries = readdirSync(directory); } catch { return; }
+    for (const name of entries) {
+      const path = join(directory, name);
+      let stat;
+      try { stat = lstatSync(path); } catch { continue; }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory() && isCodeSigningTraversalDirectory(name)) visit(path);
+      else if (stat.isFile() && isMachO(path)) files.push(path);
+    }
+  };
+  visit(root);
+  return files.sort();
+}
+
+/**
+ * Final local-only audit. Each nested wrapper and Mach-O must pass strict
+ * verification, identify as the selected local certificate, and carry no
+ * entitlement outside the portable allowlist.
+ */
+function auditLocallySignedApp(
+  appRoot: string,
+  identityName: string,
+  expectedEntitlementsByTarget: ReadonlyMap<string, Plist>,
+): void {
+  const targets = new Set([
+    ...collectMachOFiles(join(appRoot, "Contents")),
+    ...collectNestedCodeBundles(appRoot),
+    appRoot,
+  ]);
+  const failures: string[] = [];
+  for (const target of [...targets].sort()) {
+    const strict = verifySignature(target);
+    if (!strict.ok) {
+      failures.push(`${target}: strict signature verification failed: ${strict.output}`);
+      continue;
+    }
+    const signature = signatureInfo(target);
+    if (!isLocallySignedWithIdentity(signature, identityName)) {
+      failures.push(`${target}: not signed by local identity ${identityName}`);
+      continue;
+    }
+    try {
+      const expected = expectedEntitlementsByTarget.get(target);
+      if (expected === undefined) {
+        throw new Error("missing source-derived entitlement expectation");
+      }
+      const actual = assertPortableEntitlements(readEmbeddedEntitlements(target) ?? {});
+      assertExactPortableEntitlements(expected, actual);
+    } catch (error) {
+      failures.push(`${target}: ${signingErrorMessage(error)}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Tweakers local signing audit failed for ${failures.length} target${failures.length === 1 ? "" : "s"}:\n${failures.map((failure) => `  ${failure}`).join("\n")}`);
+  }
+}
+
+/** A local certificate has no Apple TeamIdentifier; Authority is its binding. */
+export function isLocallySignedWithIdentity(signature: SignatureInfo, identityName: string): boolean {
+  return signature.ok && !signature.adHoc && signature.authority.includes(identityName);
+}
+
+/** Compare semantic entitlement dictionaries after both have passed the allowlist. */
+export function assertExactPortableEntitlements(expected: Plist, actual: Plist): void {
+  const expectedPortable = assertPortableEntitlements(expected);
+  const actualPortable = assertPortableEntitlements(actual);
+  const expectedCanonical = canonicalPortableEntitlements(expectedPortable);
+  const actualCanonical = canonicalPortableEntitlements(actualPortable);
+  if (expectedCanonical !== actualCanonical) {
+    throw new Error(`Final portable entitlements did not match the source-derived expected set (expected ${expectedCanonical}, actual ${actualCanonical})`);
+  }
+}
+
+function canonicalPortableEntitlements(entitlements: Plist): string {
+  return JSON.stringify(Object.fromEntries(
+    Object.entries(entitlements).sort(([left], [right]) => left.localeCompare(right)),
+  ));
 }
 
 export function stableDesignatedRequirement(
@@ -275,6 +577,125 @@ export function prepareCodeSigning(opts: CodeSigningOptions = {}): PreparedSigni
 
   requireExecutable("openssl", "macOS openssl is required to create Tweakers's local signing identity.");
   return createLocalSigningIdentity(identityName, posture);
+}
+
+/**
+ * Select an already-provisioned local signing identity without ever creating,
+ * importing, trusting, unlocking, or changing keychain state. Candidate-only
+ * preparation uses this narrow reader so its private package is the first
+ * mutable filesystem location in that flow.
+ */
+export function findExistingPreparedSigningIdentity(
+  opts: Pick<CodeSigningOptions, "identityName" | "signingPosture"> = {},
+): PreparedSigningIdentity {
+  if (platform() !== "darwin") {
+    throw new Error("An existing Tweakers Local Signing identity is available only on macOS.");
+  }
+  requireExecutable("codesign", "macOS codesign is required to sign a candidate receipt bundle.");
+  requireExecutable("security", "macOS security is required to find Tweakers's existing local signing identity.");
+
+  const identityName = opts.identityName ?? DEFAULT_LOCAL_SIGNING_IDENTITY;
+  const posture = resolveSigningPosture(opts.signingPosture);
+  if (posture === "contained") {
+    const keychainPath = containedSigningKeychainPath();
+    if (existsSync(keychainPath)) {
+      const contained = findCodeSigningIdentities(identityName, keychainPath);
+      if (contained.length === 1) return { ...contained[0]!, created: false, keychainPath };
+      if (contained.length > 1) {
+        throw new Error(`Tweakers Local Signing identity is ambiguous in the configured contained keychain: ${identityName}`);
+      }
+    }
+  }
+  const identities = findCodeSigningIdentities(identityName);
+  if (identities.length === 0) {
+    throw new Error(`An existing Tweakers Local Signing identity is required for candidate-only preparation: ${identityName}`);
+  }
+  if (identities.length !== 1) {
+    throw new Error(`Tweakers Local Signing identity is ambiguous in the configured signing posture: ${identityName}`);
+  }
+  return { ...identities[0]!, created: false };
+}
+
+export const CANDIDATE_RECEIPT_BUNDLE_IDENTIFIER = "co.tweakers.candidate-receipt";
+export const CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS = 15_000;
+
+function normalizedCertificateLeafHash(value: string, label: string): string {
+  if (!/^[A-Fa-f0-9]{40}$/.test(value)) throw new Error(`${label} is not an exact SHA-1 certificate leaf hash.`);
+  return value.toUpperCase();
+}
+
+/** Parse the only certificate fact that can satisfy an external leaf-hash pin. */
+export function parseCertificateLeafHashRequirement(output: string): string | null {
+  const match = /certificate\s+leaf\s*=\s*H"([A-Fa-f0-9]{40})"/i.exec(output);
+  return match ? match[1]!.toUpperCase() : null;
+}
+
+/** Read the signed designated requirement; this never selects an identity. */
+export function codeSigningCertificateLeafHash(path: string): string {
+  const result = spawnSync("codesign", ["-d", "-r-", path], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`Unable to read code-signing designated requirement: ${String(result.stderr ?? result.error ?? "codesign failed").trim()}`);
+  }
+  const leaf = parseCertificateLeafHashRequirement(`${result.stdout ?? ""}${result.stderr ?? ""}`);
+  if (!leaf) throw new Error("Code-signing designated requirement does not pin an exact certificate leaf hash.");
+  return leaf;
+}
+
+/**
+ * Sign a resource-only receipt bundle with an externally prepared identity.
+ * No CMS, certificate-name lookup, or ordinary colocated digest participates
+ * in this authenticity boundary.
+ */
+export function signCandidateReceiptResourceBundle(
+  bundlePath: string,
+  preparedIdentity: PreparedSigningIdentity,
+  bundleIdentifier = CANDIDATE_RECEIPT_BUNDLE_IDENTIFIER,
+): void {
+  if (preparedIdentity.created || preparedIdentity.name !== DEFAULT_LOCAL_SIGNING_IDENTITY) {
+    throw new Error("Candidate receipt signing requires one preexisting Tweakers Local Signing identity.");
+  }
+  const hash = normalizedCertificateLeafHash(preparedIdentity.hash, "Prepared signing identity hash");
+  if (!/^[A-Za-z0-9.-]+$/.test(bundleIdentifier)) throw new Error("Candidate receipt bundle identifier is invalid.");
+  const result = spawnSync("codesign", [
+    "--force",
+    "--sign",
+    hash,
+    ...codeSigningKeychainArgs(preparedIdentity),
+    "--requirements",
+    `=designated => identifier "${bundleIdentifier}" and certificate leaf = H"${hash}"`,
+    bundlePath,
+  ], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0) {
+    const reason = String(result.stderr ?? result.error ?? "codesign failed").trim();
+    const timeout = result.error && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT";
+    throw new Error(`Candidate receipt resource bundle signing ${timeout ? "timed out" : "failed"}: ${reason}`);
+  }
+  verifyCandidateReceiptResourceBundle(bundlePath, hash);
+}
+
+/** Strictly validate a receipt bundle against a caller-owned leaf-hash pin. */
+export function verifyCandidateReceiptResourceBundle(bundlePath: string, expectedSigningIdentityHash: string): void {
+  const expected = normalizedCertificateLeafHash(expectedSigningIdentityHash, "Expected signing identity hash");
+  const result = spawnSync("codesign", ["--verify", "--strict", bundlePath], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`Candidate receipt resource bundle failed strict verification: ${String(result.stderr ?? result.error ?? "codesign failed").trim()}`);
+  }
+  const observed = codeSigningCertificateLeafHash(bundlePath);
+  if (observed !== expected) {
+    throw new Error("Candidate receipt resource bundle certificate leaf hash does not match the external expected signing identity hash.");
+  }
 }
 
 export function removeLocalSigningIdentity(opts: RemoveLocalSigningIdentityOptions = {}): void {
@@ -368,9 +789,27 @@ export function signingAvailable(opts: { identityName?: string } = {}): boolean 
   }
 }
 
-function walkAndSign(root: string, signingIdentity: string, keychainArgs: string[]): void {
+function walkAndSign(
+  root: string,
+  signingIdentity: string,
+  keychainArgs: string[],
+  posture: SigningPosture,
+  entitlementsRoot: string,
+  entitlementSequence: { value: number },
+  expectedEntitlementsByTarget: Map<string, Plist>,
+): void {
   const failures: string[] = [];
-  walkAndSignInto(root, root, signingIdentity, keychainArgs, failures);
+  walkAndSignInto(
+    root,
+    root,
+    signingIdentity,
+    keychainArgs,
+    posture,
+    entitlementsRoot,
+    entitlementSequence,
+    expectedEntitlementsByTarget,
+    failures,
+  );
   if (failures.length > 0) {
     throw new Error(
       `Failed to sign ${failures.length} Mach-O file${failures.length === 1 ? "" : "s"} under ${root}:\n${failures.map((failure) => `  ${failure}`).join("\n")}`,
@@ -383,6 +822,10 @@ function walkAndSignInto(
   current: string,
   signingIdentity: string,
   keychainArgs: string[],
+  posture: SigningPosture,
+  entitlementsRoot: string,
+  entitlementSequence: { value: number },
+  expectedEntitlementsByTarget: Map<string, Plist>,
   failures: string[],
 ): void {
   let entries: string[];
@@ -402,12 +845,30 @@ function walkAndSignInto(
     }
     if (st.isSymbolicLink()) continue;
     if (st.isDirectory()) {
-      walkAndSignInto(root, full, signingIdentity, keychainArgs, failures);
+      if (!isCodeSigningTraversalDirectory(name)) continue;
+      walkAndSignInto(
+        root,
+        full,
+        signingIdentity,
+        keychainArgs,
+        posture,
+        entitlementsRoot,
+        entitlementSequence,
+        expectedEntitlementsByTarget,
+        failures,
+      );
       continue;
     }
     if (!st.isFile()) continue;
     if (!isMachO(full)) continue;
     try {
+      const entitlements = portableEntitlementsForCode(
+        full,
+        posture,
+        entitlementsRoot,
+        entitlementSequence,
+        expectedEntitlementsByTarget,
+      );
       execFileSync(
         "codesign",
         [
@@ -415,7 +876,8 @@ function walkAndSignInto(
           "--sign",
           signingIdentity,
           ...keychainArgs,
-          "--preserve-metadata=entitlements,flags",
+          "--preserve-metadata=flags",
+          ...(entitlements ? ["--entitlements", entitlements] : []),
           full,
         ],
         { stdio: ["ignore", "ignore", "pipe"] },
@@ -424,6 +886,99 @@ function walkAndSignInto(
       failures.push(`${full}: ${signingErrorMessage(e)}`);
     }
   }
+}
+
+function signNestedBundles(
+  appRoot: string,
+  signingIdentity: string,
+  keychainArgs: string[],
+  posture: SigningPosture,
+  entitlementsRoot: string,
+  entitlementSequence: { value: number },
+  expectedEntitlementsByTarget: Map<string, Plist>,
+): void {
+  const failures: string[] = [];
+  for (const bundle of collectNestedCodeBundles(appRoot)) {
+    try {
+      const entitlements = portableEntitlementsForCode(
+        bundle,
+        posture,
+        entitlementsRoot,
+        entitlementSequence,
+        expectedEntitlementsByTarget,
+      );
+      execFileSync("codesign", [
+        "--force", "--sign", signingIdentity, ...keychainArgs, "--preserve-metadata=flags",
+        ...(entitlements ? ["--entitlements", entitlements] : []), bundle,
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+    } catch (error) {
+      failures.push(`${bundle}: ${signingErrorMessage(error)}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Failed to sign ${failures.length} nested code bundle${failures.length === 1 ? "" : "s"}:\n${failures.map((failure) => `  ${failure}`).join("\n")}`);
+  }
+}
+
+function portableEntitlementsForCode(
+  code: string,
+  posture: SigningPosture,
+  root: string,
+  sequence: { value: number },
+  expectedEntitlementsByTarget: Map<string, Plist>,
+): string {
+  const sourceEntitlements = readEmbeddedEntitlements(code) ?? {};
+  // codesign intentionally omits process entitlements from MH_DYLIB and
+  // MH_BUNDLE outputs. Their effective permissions belong to the executable
+  // process that loads them, so expecting the source's blanket metadata here
+  // would make a valid locally signed candidate fail its exact audit.
+  const stat = lstatSync(code);
+  const acceptsProcessEntitlements = stat.isFile() && isMachO(code)
+    ? machOAcceptsProcessEntitlements(code)
+    : stat.isDirectory() && (code.endsWith(".app") || code.endsWith(".xpc"));
+  const entitlements = acceptsProcessEntitlements
+    ? portableNestedEntitlements(sourceEntitlements, posture)
+    : {};
+  expectedEntitlementsByTarget.set(code, entitlements);
+  const id = sequence.value++;
+  const portable = join(root, `${id}.portable.plist`);
+  writePlist(portable, entitlements);
+  return portable;
+}
+
+function readEmbeddedEntitlements(code: string): Plist | null {
+  const extracted = spawnSync("codesign", ["-d", "--entitlements", ":-", code], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const xml = parseEmbeddedEntitlementsExtraction(extracted, code);
+  if (xml === null) return null;
+  const tempRoot = mkdtempSync(join(tmpdir(), "tweakers-read-entitlements-"));
+  const path = join(tempRoot, "embedded.plist");
+  try {
+    writeFileSync(path, xml);
+    return readPlist(path);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+export function parseEmbeddedEntitlementsExtraction(
+  result: { status: number | null; stdout?: unknown; stderr?: unknown; error?: unknown },
+  code: string,
+): string | null {
+  const stdout = String(result.stdout ?? "").trim();
+  const stderr = String(result.stderr ?? "").trim();
+  const error = result.error instanceof Error ? result.error.message : String(result.error ?? "").trim();
+  if (result.status !== 0 || error) {
+    const detail = [stderr, stdout, error].filter(Boolean).join("\n");
+    throw new Error(`Failed to extract embedded entitlements from ${code}${detail ? `: ${detail}` : ""}`);
+  }
+  if (!stdout) return null;
+  if (!stdout.startsWith("<?xml") && !stdout.startsWith("<plist")) {
+    throw new Error(`Embedded entitlement extraction returned non-plist output for ${code}`);
+  }
+  return stdout;
 }
 
 export function isInsideCodeSigningRoot(root: string, candidate: string): boolean {
@@ -446,6 +1001,13 @@ function findCodeSigningIdentity(
   identityName: string,
   keychainPath?: string,
 ): Omit<PreparedSigningIdentity, "created"> | null {
+  return findCodeSigningIdentities(identityName, keychainPath)[0] ?? null;
+}
+
+function findCodeSigningIdentities(
+  identityName: string,
+  keychainPath?: string,
+): Array<Omit<PreparedSigningIdentity, "created">> {
   const args = ["find-identity", "-v", "-p", "codesigning"];
   if (keychainPath) args.push(keychainPath);
   const result = spawnSync("security", args, {
@@ -453,8 +1015,9 @@ function findCodeSigningIdentity(
     stdio: ["ignore", "pipe", "pipe"],
   });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  const identity = parseCodeSigningIdentities(output).find((candidate) => candidate.name === identityName);
-  return identity ? { ...identity, ...(keychainPath ? { keychainPath } : {}) } : null;
+  return parseCodeSigningIdentities(output)
+    .filter((candidate) => candidate.name === identityName)
+    .map((candidate) => ({ ...candidate, ...(keychainPath ? { keychainPath } : {}) }));
 }
 
 function createLocalSigningIdentity(identityName: string, posture: SigningPosture): PreparedSigningIdentity {
@@ -793,14 +1356,21 @@ export function parseCodeSigningIdentities(output: string): Array<{ hash: string
 }
 
 function isMachO(path: string): boolean {
+  let descriptor: number | null = null;
   try {
-    const fd = readFileSync(path, { flag: "r" }).subarray(0, 4);
-    if (fd.length < 4) return false;
-    const magic = fd.readUInt32BE(0);
-    return MACHO_MAGICS.has(magic);
+    descriptor = openSync(path, "r");
+    const header = Buffer.alloc(4);
+    if (readSync(descriptor, header, 0, header.length, 0) !== header.length) return false;
+    return isMachOMagic(header.readUInt32BE(0));
   } catch {
     return false;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
   }
+}
+
+export function isMachOMagic(magic: number): boolean {
+  return MACHO_MAGICS.has(magic >>> 0);
 }
 
 export function verifySignature(appRoot: string): { ok: boolean; output: string } {
@@ -825,6 +1395,39 @@ export interface SignatureInfo {
   output: string;
 }
 
+/**
+ * The source boundary for a derived Tweakers bundle. A syntactically valid
+ * signature is insufficient: the source must be strict-valid, Gatekeeper
+ * accepted, and attributable to OpenAI's Developer ID certificate for its
+ * fixed team identifier.
+ */
+export function assertOpenAIDeveloperIdSourceTrust(evidence: OpenAIDeveloperIdSourceTrustEvidence): void {
+  const signature = evidence.signature;
+  const strictVerification = signingCheckSucceeded(evidence.strictVerification);
+  const gatekeeper = signingCheckSucceeded(evidence.gatekeeper);
+  const hasOpenAIDeveloperIdAuthority = signature.authority.some((authority) =>
+    /^Developer ID Application: OpenAI\b/.test(authority)
+      && authority.includes(`(${OPENAI_DEVELOPER_ID_TEAM_IDENTIFIER})`),
+  );
+
+  if (!signature.ok
+    || signature.adHoc
+    || signature.teamIdentifier !== OPENAI_DEVELOPER_ID_TEAM_IDENTIFIER
+    || !hasOpenAIDeveloperIdAuthority
+    || !strictVerification
+    || !gatekeeper) {
+    throw new Error(
+      `Refusing non-official source. Expected a strict-valid, Gatekeeper-accepted OpenAI Developer ID signature with team ${OPENAI_DEVELOPER_ID_TEAM_IDENTIFIER}.`,
+    );
+  }
+}
+
+function signingCheckSucceeded(
+  check: Pick<SecurityCommandResult, "status"> | { ok: boolean },
+): boolean {
+  return "ok" in check ? check.ok === true : check.status === 0;
+}
+
 export function signatureInfo(appRoot: string): SignatureInfo {
   if (platform() !== "darwin") {
     return { ok: true, adHoc: false, teamIdentifier: null, authority: [], output: "(not macOS)" };
@@ -843,7 +1446,11 @@ function parseSignatureInfo(output: string): SignatureInfo {
   const authority = [...output.matchAll(/^Authority=(.*)$/gm)].map((m) => m[1].trim());
   return {
     ok: true,
-    adHoc: /Signature=adhoc/.test(output) || team === "not set",
+    // A local certificate has no Apple TeamIdentifier, but is not ad hoc. The
+    // two states must remain distinct so the local signing audit can require
+    // its named Authority while the OpenAI source gate separately requires
+    // the fixed Apple TeamIdentifier.
+    adHoc: /Signature=adhoc/.test(output),
     teamIdentifier: team === "not set" ? null : team,
     authority,
     output,

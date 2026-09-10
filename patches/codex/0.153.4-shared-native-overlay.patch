@@ -1,0 +1,3175 @@
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 0b4fe17..3f8c2ae 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -468,10 +468,18 @@ pub async fn run_main_with_transport_options(
+     auth: AppServerWebsocketAuthSettings,
+     runtime_options: AppServerRuntimeOptions,
+ ) -> IoResult<()> {
+-    let loader_overrides = loader_overrides_with_test_user_config_file(
++    let mut loader_overrides = loader_overrides_with_test_user_config_file(
+         loader_overrides,
+         test_user_config_file_from_env(),
+     )?;
++    let shared_roots = codex_config::TweakersSharedRoots::from_paths(
++        std::env::var_os("TWEAKERS_NATIVE_BASE_ROOT").map(std::path::PathBuf::from),
++        std::env::var_os("TWEAKERS_OVERLAY_ROOT").map(std::path::PathBuf::from),
++    )?;
++    if shared_roots.is_some() {
++        loader_overrides.tweakers_shared_roots = shared_roots;
++    }
++
+     let (transport_event_tx, mut transport_event_rx) =
+         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 8e78c92..b66b77f 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -344,9 +344,13 @@ impl MessageProcessor {
+                         queue_service: queue_service.clone(),
+                     },
+                 ),
+-                Arc::new(CodexHomeUserInstructionsProvider::new(
+-                    config.codex_home.clone(),
+-                )),
++                Arc::new(match &config.tweakers_shared_roots {
++                    Some(roots) => CodexHomeUserInstructionsProvider::with_shared_roots(
++                        roots.native_base_root.clone(),
++                        roots.overlay_root.clone(),
++                    ),
++                    None => CodexHomeUserInstructionsProvider::new(config.codex_home.clone()),
++                }),
+                 Some(analytics_events_client.clone()),
+                 Arc::clone(&thread_store),
+                 codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
+diff --git a/codex-rs/app-server/src/request_processors/catalog_processor.rs b/codex-rs/app-server/src/request_processors/catalog_processor.rs
+index 0b2178e..87ebcc3 100644
+--- a/codex-rs/app-server/src/request_processors/catalog_processor.rs
++++ b/codex-rs/app-server/src/request_processors/catalog_processor.rs
+@@ -474,6 +474,8 @@ impl CatalogRequestProcessor {
+         params: SkillsListParams,
+     ) -> Result<SkillsListResponse, JSONRPCErrorError> {
+         let SkillsListParams { cwds, force_reload } = params;
++        // Another account backend can edit shared skills without notifying this process.
++        let force_reload = force_reload || self.config.tweakers_shared_roots.is_some();
+         let cwds = if cwds.is_empty() {
+             vec![self.config.cwd.to_path_buf()]
+         } else {
+@@ -659,7 +661,10 @@ impl CatalogRequestProcessor {
+             }
+         };
+         let edits = vec![edit];
+-        ConfigEditsBuilder::new(&self.config.codex_home)
++        let config_path = self.config_manager.user_config_path().map_err(|err| {
++            internal_error(format!("failed to resolve skill settings path: {err}"))
++        })?;
++        ConfigEditsBuilder::for_config_path(config_path.as_path())
+             .with_edits(edits)
+             .apply()
+             .await
+diff --git a/codex-rs/app-server/src/request_processors/marketplace_processor.rs b/codex-rs/app-server/src/request_processors/marketplace_processor.rs
+index 31ff3c8..1904ba9 100644
+--- a/codex-rs/app-server/src/request_processors/marketplace_processor.rs
++++ b/codex-rs/app-server/src/request_processors/marketplace_processor.rs
+@@ -3,19 +3,17 @@ use crate::plugin_config_reload;
+ 
+ #[derive(Clone)]
+ pub(crate) struct MarketplaceRequestProcessor {
+-    config: Arc<Config>,
+     config_manager: ConfigManager,
+     thread_manager: Arc<ThreadManager>,
+ }
+ 
+ impl MarketplaceRequestProcessor {
+     pub(crate) fn new(
+-        config: Arc<Config>,
++        _config: Arc<Config>,
+         config_manager: ConfigManager,
+         thread_manager: Arc<ThreadManager>,
+     ) -> Self {
+         Self {
+-            config,
+             config_manager,
+             thread_manager,
+         }
+@@ -54,7 +52,10 @@ impl MarketplaceRequestProcessor {
+     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+         remove_marketplace(
+-            config.codex_home.to_path_buf(),
++            config.tweakers_shared_roots.as_ref().map_or_else(
++                || config.codex_home.to_path_buf(),
++                |roots| roots.overlay_root.to_path_buf(),
++            ),
+             config.config_layer_stack,
+             CoreMarketplaceRemoveRequest {
+                 marketplace_name: params.marketplace_name,
+@@ -119,8 +120,39 @@ impl MarketplaceRequestProcessor {
+         params: MarketplaceAddParams,
+     ) -> Result<MarketplaceAddResponse, JSONRPCErrorError> {
+         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
++        if let Some(roots) = &config.tweakers_shared_roots {
++            if std::fs::canonicalize(roots.overlay_root.as_path())
++                .map_err(|err| invalid_request(err.to_string()))?
++                != roots.overlay_root.as_path()
++            {
++                return Err(invalid_request(
++                    "Tweakers overlay root changed after launch",
++                ));
++            }
++            for relative in [
++                "config.toml",
++                ".tmp",
++                ".tmp/marketplaces",
++                ".tmp/marketplaces/.staging",
++            ] {
++                let path = roots.overlay_root.join(relative);
++                match std::fs::symlink_metadata(path.as_path()) {
++                    Ok(metadata) if metadata.file_type().is_symlink() => {
++                        return Err(invalid_request(
++                            "Tweakers marketplace write path contains a symlink",
++                        ));
++                    }
++                    Ok(_) => {}
++                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++                    Err(err) => return Err(invalid_request(err.to_string())),
++                }
++            }
++        }
+         add_marketplace_to_codex_home(
+-            self.config.codex_home.to_path_buf(),
++            config.tweakers_shared_roots.as_ref().map_or_else(
++                || config.codex_home.to_path_buf(),
++                |roots| roots.overlay_root.to_path_buf(),
++            ),
+             config.config_layer_stack.requirements().clone(),
+             MarketplaceAddRequest {
+                 source: params.source,
+diff --git a/codex-rs/app-server/src/request_processors/plugins.rs b/codex-rs/app-server/src/request_processors/plugins.rs
+index bf3afd7..755a3fc 100644
+--- a/codex-rs/app-server/src/request_processors/plugins.rs
++++ b/codex-rs/app-server/src/request_processors/plugins.rs
+@@ -687,7 +687,11 @@ impl PluginRequestProcessor {
+             .map(|outcome| outcome.marketplace)
+             {
+                 Ok(Some(remote_marketplace)) => {
+-                    data.push(remote_marketplace_to_info(remote_marketplace));
++                    data.push(shared_remote_marketplace_to_info(
++                        remote_marketplace,
++                        self.thread_manager.plugins_manager().as_ref(),
++                        &config.plugins_config_input(),
++                    ));
+                 }
+                 Ok(None) => {}
+                 Err(RemotePluginCatalogError::UnsupportedAuthMode) => {}
+@@ -734,11 +738,13 @@ impl PluginRequestProcessor {
+             {
+                 Ok(outcome) => {
+                     remote_catalog_cache_refresh_scopes = outcome.catalog_cache_refresh_scopes;
+-                    for remote_marketplace in outcome
+-                        .marketplaces
+-                        .into_iter()
+-                        .map(remote_marketplace_to_info)
+-                    {
++                    for remote_marketplace in outcome.marketplaces.into_iter().map(|marketplace| {
++                        shared_remote_marketplace_to_info(
++                            marketplace,
++                            self.thread_manager.plugins_manager().as_ref(),
++                            &config.plugins_config_input(),
++                        )
++                    }) {
+                         data.push(remote_marketplace);
+                     }
+                 }
+@@ -983,7 +989,13 @@ impl PluginRequestProcessor {
+         match remote_marketplaces {
+             Ok(remote_marketplaces) => remote_marketplaces
+                 .into_iter()
+-                .map(remote_marketplace_to_info)
++                .map(|marketplace| {
++                    shared_remote_marketplace_to_info(
++                        marketplace,
++                        plugins_manager.as_ref(),
++                        plugins_input,
++                    )
++                })
+                 .collect(),
+             Err(
+                 RemotePluginCatalogError::AuthRequired
+@@ -1161,7 +1173,7 @@ impl PluginRequestProcessor {
+                 }
+                 let remote_plugin_service_config = remote_plugin_service_config(&config);
+                 validate_remote_plugin_id(&plugin_name)?;
+-                let remote_detail = codex_core_plugins::remote::fetch_remote_plugin_detail(
++                let mut remote_detail = codex_core_plugins::remote::fetch_remote_plugin_detail(
+                     &remote_plugin_service_config,
+                     auth.as_ref(),
+                     &remote_marketplace_name,
+@@ -1189,6 +1201,12 @@ impl PluginRequestProcessor {
+                     &app_category_by_id,
+                 )
+                 .await;
++                self.thread_manager
++                    .plugins_manager()
++                    .apply_shared_plugin_state(
++                        &config.plugins_config_input(),
++                        &mut remote_detail.summary,
++                    );
+                 remote_plugin_detail_to_info(remote_detail, app_summaries)
+             }
+         };
+@@ -2133,6 +2151,17 @@ fn plugin_app_category_by_id_from_value(value: &serde_json::Value) -> HashMap<St
+         .collect()
+ }
+ 
++fn shared_remote_marketplace_to_info(
++    mut marketplace: RemoteMarketplace,
++    manager: &codex_core_plugins::PluginsManager,
++    input: &codex_core_plugins::PluginsConfigInput,
++) -> PluginMarketplaceEntry {
++    for summary in &mut marketplace.plugins {
++        manager.apply_shared_plugin_state(input, summary);
++    }
++    remote_marketplace_to_info(marketplace)
++}
++
+ fn remote_marketplace_to_info(marketplace: RemoteMarketplace) -> PluginMarketplaceEntry {
+     PluginMarketplaceEntry {
+         name: marketplace.name,
+diff --git a/codex-rs/codex-home/src/instructions/mod.rs b/codex-rs/codex-home/src/instructions/mod.rs
+index 16f8a06..bfe590b 100644
+--- a/codex-rs/codex-home/src/instructions/mod.rs
++++ b/codex-rs/codex-home/src/instructions/mod.rs
+@@ -13,15 +13,51 @@ const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
+ #[derive(Clone, Debug)]
+ pub struct CodexHomeUserInstructionsProvider {
+     codex_home: AbsolutePathBuf,
++    overlay_root: Option<AbsolutePathBuf>,
+ }
+ 
+ impl CodexHomeUserInstructionsProvider {
+     /// Creates a provider rooted at the supplied absolute Codex home directory.
+     pub fn new(codex_home: AbsolutePathBuf) -> Self {
+-        Self { codex_home }
++        Self {
++            codex_home,
++            overlay_root: None,
++        }
++    }
++
++    /// Load native and Tweakers instructions directly from their respective roots.
++    pub fn with_shared_roots(
++        native_base_root: AbsolutePathBuf,
++        overlay_root: AbsolutePathBuf,
++    ) -> Self {
++        Self {
++            codex_home: native_base_root,
++            overlay_root: Some(overlay_root),
++        }
+     }
+ 
+     async fn load_from_codex_home(&self) -> LoadedUserInstructions {
++        let mut loaded = self.load_single_root().await;
++        if let Some(overlay_root) = &self.overlay_root {
++            let overlay = Self::new(overlay_root.clone()).load_single_root().await;
++            loaded.warnings.extend(overlay.warnings);
++            if let Some(addition) = overlay.instructions {
++                if let Some(base) = &mut loaded.instructions {
++                    base.text.push_str(&format!(
++                        "\n\n# Tweakers instructions from {}\n\n{}",
++                        addition.source.display(),
++                        addition.text,
++                    ));
++                    base.additional_sources.push(addition.source);
++                } else {
++                    loaded.instructions = Some(addition);
++                }
++            }
++        }
++        loaded
++    }
++
++    async fn load_single_root(&self) -> LoadedUserInstructions {
+         let mut warnings = Vec::new();
+         for candidate in [LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME] {
+             let path = self.codex_home.join(candidate);
+@@ -55,6 +91,7 @@ impl CodexHomeUserInstructionsProvider {
+                     instructions: Some(Instructions {
+                         text: trimmed.to_string(),
+                         source: path,
++                        additional_sources: Vec::new(),
+                     }),
+                     warnings,
+                 };
+diff --git a/codex-rs/codex-home/src/instructions/tests.rs b/codex-rs/codex-home/src/instructions/tests.rs
+index 478681b..c9b972d 100644
+--- a/codex-rs/codex-home/src/instructions/tests.rs
++++ b/codex-rs/codex-home/src/instructions/tests.rs
+@@ -26,6 +26,7 @@ fn expected(
+ ) -> LoadedUserInstructions {
+     LoadedUserInstructions {
+         instructions: Some(Instructions {
++            additional_sources: Vec::new(),
+             text: text.to_string(),
+             source: AbsolutePathBuf::try_from(home.path().join(filename))
+                 .expect("absolute source path"),
+@@ -145,3 +146,48 @@ async fn invalid_utf8_is_lossy() {
+         )
+     );
+ }
++
++#[tokio::test]
++async fn shared_instructions_keep_both_original_sources_and_overlay_precedence() {
++    let base = TempDir::new().expect("base");
++    let overlay = TempDir::new().expect("overlay");
++    let base_path = base.path().join(DEFAULT_AGENTS_MD_FILENAME);
++    let overlay_path = overlay.path().join(LOCAL_AGENTS_MD_FILENAME);
++    fs::write(&base_path, "Native guidance").expect("base instructions");
++    fs::write(
++        overlay.path().join(DEFAULT_AGENTS_MD_FILENAME),
++        "Unused overlay default",
++    )
++    .expect("overlay default");
++    fs::write(&overlay_path, "Tweakers guidance").expect("overlay override");
++    let loaded = CodexHomeUserInstructionsProvider::with_shared_roots(
++        AbsolutePathBuf::try_from(base.path().to_path_buf()).expect("base root"),
++        AbsolutePathBuf::try_from(overlay.path().to_path_buf()).expect("overlay root"),
++    )
++    .load_user_instructions()
++    .await;
++    assert_eq!(
++        loaded,
++        LoadedUserInstructions {
++            instructions: Some(Instructions {
++                text: format!(
++                    "Native guidance\n\n# Tweakers instructions from {}\n\nTweakers guidance",
++                    overlay_path.display()
++                ),
++                source: AbsolutePathBuf::try_from(base_path.clone()).expect("base path"),
++                additional_sources: vec![
++                    AbsolutePathBuf::try_from(overlay_path.clone()).expect("overlay path")
++                ],
++            }),
++            warnings: Vec::new(),
++        }
++    );
++    assert_eq!(
++        fs::read_to_string(base_path).expect("base unchanged"),
++        "Native guidance"
++    );
++    assert_eq!(
++        fs::read_to_string(overlay_path).expect("overlay unchanged"),
++        "Tweakers guidance"
++    );
++}
+diff --git a/codex-rs/config/src/lib.rs b/codex-rs/config/src/lib.rs
+index 5cbf501..9d64c50 100644
+--- a/codex-rs/config/src/lib.rs
++++ b/codex-rs/config/src/lib.rs
+@@ -188,6 +188,7 @@ pub use state::ConfigLayerEntry;
+ pub use state::ConfigLayerStack;
+ pub use state::ConfigLoadOptions;
+ pub use state::LoaderOverrides;
++pub use state::TweakersSharedRoots;
+ pub use strict_config::config_error_from_ignored_toml_fields;
+ pub use thread_config::NoopThreadConfigLoader;
+ pub use thread_config::RemoteThreadConfigLoader;
+diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
+index 48ea0d3..c926b24 100644
+--- a/codex-rs/config/src/loader/mod.rs
++++ b/codex-rs/config/src/loader/mod.rs
+@@ -315,7 +315,10 @@ pub async fn load_config_layers_state(
+     // profile config as a second user layer on top so the profile only needs to
+     // contain overrides.
+     let active_user_file = overrides.user_config_path(codex_home)?;
+-    let base_user_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home);
++    let base_user_file = match &overrides.tweakers_shared_roots {
++        Some(roots) => roots.native_base_root.join(CONFIG_TOML_FILE),
++        None => AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home),
++    };
+     let base_user_layer = load_user_config_layer(
+         fs,
+         &base_user_file,
+@@ -516,6 +519,7 @@ pub async fn load_config_layers_state(
+         config_requirements_toml.clone().try_into()?,
+         config_requirements_toml.into_toml(),
+     )?
++    .with_tweakers_shared_roots(overrides.tweakers_shared_roots.clone())
+     .with_user_and_project_exec_policy_rules_ignored(ignore_user_and_project_exec_policy_rules);
+     Ok(match startup_warnings {
+         Some(startup_warnings) => config_layer_stack.with_startup_warnings(startup_warnings),
+@@ -1926,6 +1930,94 @@ mod unit_tests {
+     use std::path::Path;
+     use tempfile::tempdir;
+ 
++    #[tokio::test]
++    async fn tweakers_layers_preserve_origins_and_leave_account_config_unused() -> anyhow::Result<()>
++    {
++        let tmp = tempdir()?;
++        let root = std::fs::canonicalize(tmp.path())?;
++        let base = root.join("base");
++        let overlay = root.join("overlay");
++        let account = root.join("account");
++        for directory in [&base, &overlay, &account] {
++            std::fs::create_dir(directory)?;
++        }
++        let base_text = "model = 'base-model'\nmodel_instructions_file = './instructions.md'\n";
++        std::fs::write(base.join(CONFIG_TOML_FILE), base_text)?;
++        std::fs::write(overlay.join(CONFIG_TOML_FILE), "model = 'overlay-model'\n")?;
++        std::fs::write(account.join(CONFIG_TOML_FILE), "model = 'account-model'\n")?;
++        let roots =
++            crate::TweakersSharedRoots::from_paths(Some(base.clone()), Some(overlay.clone()))?;
++        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
++        overrides.tweakers_shared_roots = roots;
++        assert_eq!(
++            overrides.user_config_path(&account)?.as_path(),
++            overlay.join(CONFIG_TOML_FILE)
++        );
++        let layers = load_config_layers_state(
++            &super::tests::TestFileSystem,
++            &account,
++            /*cwd*/ None,
++            &[],
++            overrides.clone(),
++            &crate::NoopThreadConfigLoader,
++        )
++        .await?;
++        let user_files: Vec<_> = layers
++            .all_layers_low_to_high()
++            .filter_map(|layer| match &layer.name {
++                ConfigLayerSource::User { file, .. } => Some(file.as_path().to_path_buf()),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            user_files,
++            vec![base.join(CONFIG_TOML_FILE), overlay.join(CONFIG_TOML_FILE)]
++        );
++        assert_eq!(
++            layers.effective_config()["model"].as_str(),
++            Some("overlay-model")
++        );
++        assert_eq!(
++            layers.effective_config()["model_instructions_file"].as_str(),
++            Some(base.join("instructions.md").to_string_lossy().as_ref())
++        );
++        assert_eq!(
++            std::fs::read_to_string(base.join(CONFIG_TOML_FILE))?,
++            base_text
++        );
++        // A different account's write must be visible on the next load.
++        std::fs::write(
++            overlay.join(CONFIG_TOML_FILE),
++            "model = 'other-account-model'\n",
++        )?;
++        let reloaded = load_config_layers_state(
++            &super::tests::TestFileSystem,
++            &account,
++            /*cwd*/ None,
++            &[],
++            overrides,
++            &crate::NoopThreadConfigLoader,
++        )
++        .await?;
++        assert_eq!(
++            reloaded.effective_config()["model"].as_str(),
++            Some("other-account-model")
++        );
++        let base_file = AbsolutePathBuf::from_absolute_path(base.join(CONFIG_TOML_FILE))?;
++        let reloaded = reloaded.with_user_config(&base_file, toml::from_str(base_text)?)?;
++        assert_eq!(
++            reloaded.effective_config()["model"].as_str(),
++            Some("other-account-model")
++        );
++        assert_eq!(
++            reloaded.effective_config()["model_instructions_file"].as_str(),
++            Some(base.join("instructions.md").to_string_lossy().as_ref())
++        );
++        assert!(crate::TweakersSharedRoots::from_paths(Some(base.clone()), None).is_err());
++        assert!(crate::TweakersSharedRoots::from_paths(Some(base.clone()), Some(base)).is_err());
++        Ok(())
++    }
++
+     #[test]
+     fn ensure_resolve_relative_paths_in_config_toml_preserves_all_fields() -> anyhow::Result<()> {
+         let tmp = tempdir()?;
+diff --git a/codex-rs/config/src/state.rs b/codex-rs/config/src/state.rs
+index ea02833..0ff7422 100644
+--- a/codex-rs/config/src/state.rs
++++ b/codex-rs/config/src/state.rs
+@@ -38,9 +38,50 @@ impl From<LoaderOverrides> for ConfigLoadOptions {
+     }
+ }
+ 
++/// Explicit shared configuration roots for a Tweakers app-server launch.
++/// History, authentication, and private runtime data retain their original home.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TweakersSharedRoots {
++    pub native_base_root: AbsolutePathBuf,
++    pub overlay_root: AbsolutePathBuf,
++}
++
++impl TweakersSharedRoots {
++    /// Validate the paired private launch settings without changing process state.
++    pub fn from_paths(
++        native_base_root: Option<PathBuf>,
++        overlay_root: Option<PathBuf>,
++    ) -> std::io::Result<Option<Self>> {
++        let invalid = || {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "Tweakers shared roots require two absolute, canonical, existing, disjoint directories",
++            )
++        };
++        let (base, overlay) = match (native_base_root, overlay_root) {
++            (None, None) => return Ok(None),
++            (Some(base), Some(overlay)) => (base, overlay),
++            _ => return Err(invalid()),
++        };
++        for path in [&base, &overlay] {
++            if !path.is_absolute() || !path.is_dir() || std::fs::canonicalize(path)? != *path {
++                return Err(invalid());
++            }
++        }
++        if base.starts_with(&overlay) || overlay.starts_with(&base) {
++            return Err(invalid());
++        }
++        Ok(Some(Self {
++            native_base_root: AbsolutePathBuf::from_absolute_path(base)?,
++            overlay_root: AbsolutePathBuf::from_absolute_path(overlay)?,
++        }))
++    }
++}
++
+ /// LoaderOverrides overrides managed configuration inputs (primarily for tests).
+ #[derive(Debug, Default, Clone)]
+ pub struct LoaderOverrides {
++    pub tweakers_shared_roots: Option<TweakersSharedRoots>,
+     /// Optional configuration file supplied with the installed Codex package.
+     pub packaged_defaults_path: Option<AbsolutePathBuf>,
+     pub user_config_path: Option<AbsolutePathBuf>,
+@@ -68,6 +109,7 @@ impl LoaderOverrides {
+     pub fn without_managed_config_for_tests() -> Self {
+         let base = std::env::temp_dir().join("codex-config-tests");
+         Self {
++            tweakers_shared_roots: None,
+             packaged_defaults_path: None,
+             user_config_path: None,
+             user_config_profile: None,
+@@ -102,6 +144,28 @@ impl LoaderOverrides {
+     }
+ 
+     pub fn user_config_path(&self, codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
++        if let Some(roots) = &self.tweakers_shared_roots {
++            let path = roots.overlay_root.join(CONFIG_TOML_FILE);
++            if std::fs::canonicalize(roots.overlay_root.as_path())? != roots.overlay_root.as_path()
++            {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "Tweakers overlay root changed after launch",
++                ));
++            }
++            match std::fs::symlink_metadata(path.as_path()) {
++                Ok(metadata) if !metadata.file_type().is_file() => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::InvalidInput,
++                        "Tweakers overlay config must be a regular file",
++                    ));
++                }
++                Ok(_) => {}
++                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++                Err(err) => return Err(err),
++            }
++            return Ok(path);
++        }
+         match self.user_config_path.as_ref() {
+             Some(path) => Ok(path.clone()),
+             None => Ok(AbsolutePathBuf::resolve_path_against_base(
+@@ -245,6 +309,7 @@ impl ConfigLayerEntry {
+ 
+ #[derive(Debug, Clone, Default, PartialEq)]
+ pub struct ConfigLayerStack {
++    tweakers_shared_roots: Option<TweakersSharedRoots>,
+     /// Layers are listed from lowest precedence (base) to highest (top), so
+     /// later entries in the Vec override earlier ones.
+     layers: Vec<ConfigLayerEntry>,
+@@ -269,6 +334,15 @@ pub struct ConfigLayerStack {
+ }
+ 
+ impl ConfigLayerStack {
++    pub fn with_tweakers_shared_roots(mut self, roots: Option<TweakersSharedRoots>) -> Self {
++        self.tweakers_shared_roots = roots;
++        self
++    }
++
++    pub fn tweakers_shared_roots(&self) -> Option<&TweakersSharedRoots> {
++        self.tweakers_shared_roots.as_ref()
++    }
++
+     pub fn new(
+         layers: Vec<ConfigLayerEntry>,
+         requirements: ConfigRequirements,
+@@ -277,6 +351,7 @@ impl ConfigLayerStack {
+         validate_enabled_config_layers(&layers)?;
+         verify_layer_ordering(&layers)?;
+         Ok(Self {
++            tweakers_shared_roots: None,
+             layers,
+             requirements,
+             requirements_toml,
+@@ -379,6 +454,17 @@ impl ConfigLayerStack {
+         profile: Option<&ProfileV2Name>,
+         user_config: TomlValue,
+     ) -> std::io::Result<Self> {
++        let user_config = if self.tweakers_shared_roots.is_some() {
++            let base_dir = config_toml.parent().ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "shared user config has no parent directory",
++                )
++            })?;
++            crate::loader::resolve_relative_paths_in_config_toml(user_config, base_dir.as_path())?
++        } else {
++            user_config
++        };
+         let user_layer = ConfigLayerEntry::new(
+             ConfigLayerSource::User {
+                 file: config_toml.clone(),
+@@ -389,22 +475,27 @@ impl ConfigLayerStack {
+         validate_enabled_config_layers(std::slice::from_ref(&user_layer))?;
+ 
+         let mut layers = self.layers.clone();
+-        if let Some(index) = layers.iter().position(|layer| {
++        let prior_index = layers.iter().position(|layer| {
+             matches!(
+                 &layer.name,
+                 ConfigLayerSource::User { file, .. } if file == config_toml
+             )
+-        }) {
++        });
++        if let Some(index) = prior_index {
+             layers.remove(index);
+         }
+-        match layers
+-            .iter()
+-            .position(|layer| layer.name.precedence() > user_layer.name.precedence())
+-        {
++        // Equal-precedence shared base and overlay layers must retain their order.
++        let shared_index = self.tweakers_shared_roots.as_ref().and(prior_index);
++        match shared_index.or_else(|| {
++            layers
++                .iter()
++                .position(|layer| layer.name.precedence() > user_layer.name.precedence())
++        }) {
+             Some(index) => layers.insert(index, user_layer),
+             None => layers.push(user_layer),
+         }
+         Ok(Self {
++            tweakers_shared_roots: self.tweakers_shared_roots.clone(),
+             layers,
+             requirements: self.requirements.clone(),
+             requirements_toml: self.requirements_toml.clone(),
+@@ -439,6 +530,7 @@ impl ConfigLayerStack {
+             }
+         }
+         Self {
++            tweakers_shared_roots: other.tweakers_shared_roots.clone(),
+             layers,
+             requirements: self.requirements.clone(),
+             requirements_toml: self.requirements_toml.clone(),
+diff --git a/codex-rs/core-plugins/src/installed_marketplaces.rs b/codex-rs/core-plugins/src/installed_marketplaces.rs
+index f84290b..28f4be9 100644
+--- a/codex-rs/core-plugins/src/installed_marketplaces.rs
++++ b/codex-rs/core-plugins/src/installed_marketplaces.rs
+@@ -11,6 +11,19 @@ use crate::marketplace_policy::policy_filtered_plugin_config;
+ 
+ pub const INSTALLED_MARKETPLACES_DIR: &str = ".tmp/marketplaces";
+ 
++pub(crate) fn marketplace_removal_path(overlay_home: &Path, name: &str) -> PathBuf {
++    overlay_home
++        .join("plugins/tweakers-removed-marketplaces")
++        .join(name)
++}
++
++pub(crate) fn shared_marketplace_is_removed(stack: &ConfigLayerStack, name: &str) -> bool {
++    stack.tweakers_shared_roots().is_some_and(|roots| {
++        let path = marketplace_removal_path(roots.overlay_root.as_path(), name);
++        !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
++    })
++}
++
+ pub fn marketplace_install_root(codex_home: &Path) -> PathBuf {
+     codex_home.join(INSTALLED_MARKETPLACES_DIR)
+ }
+@@ -30,7 +43,6 @@ pub fn installed_marketplace_roots_from_layer_stack(
+         warn!("invalid marketplaces config: expected table");
+         return Vec::new();
+     };
+-    let default_install_root = marketplace_install_root(codex_home);
+     let mut roots = marketplaces
+         .iter()
+         .filter_map(|(marketplace_name, marketplace)| {
+@@ -49,10 +61,11 @@ pub fn installed_marketplace_roots_from_layer_stack(
+                 );
+                 return None;
+             }
+-            let path = resolve_configured_marketplace_root(
++            let path = resolve_configured_marketplace_root_from_stack(
++                config_layer_stack,
++                codex_home,
+                 marketplace_name,
+                 marketplace,
+-                &default_install_root,
+             )?;
+             find_marketplace_manifest_path(&path).map(|_| path)
+         })
+@@ -62,6 +75,36 @@ pub fn installed_marketplace_roots_from_layer_stack(
+     roots
+ }
+ 
++pub(crate) fn resolve_configured_marketplace_root_from_stack(
++    config_layer_stack: &ConfigLayerStack,
++    codex_home: &Path,
++    marketplace_name: &str,
++    marketplace: &toml::Value,
++) -> Option<PathBuf> {
++    let Some(shared) = config_layer_stack.tweakers_shared_roots() else {
++        return resolve_configured_marketplace_root(
++            marketplace_name,
++            marketplace,
++            &marketplace_install_root(codex_home),
++        );
++    };
++    let overlay = resolve_configured_marketplace_root(
++        marketplace_name,
++        marketplace,
++        &marketplace_install_root(shared.overlay_root.as_path()),
++    )?;
++    if marketplace.get("source_type").and_then(toml::Value::as_str) == Some("local")
++        || find_marketplace_manifest_path(&overlay).is_some()
++    {
++        return Some(overlay);
++    }
++    resolve_configured_marketplace_root(
++        marketplace_name,
++        marketplace,
++        &marketplace_install_root(shared.native_base_root.as_path()),
++    )
++}
++
+ pub fn resolve_configured_marketplace_root(
+     marketplace_name: &str,
+     marketplace: &toml::Value,
+diff --git a/codex-rs/core-plugins/src/loader.rs b/codex-rs/core-plugins/src/loader.rs
+index 1ccd600..87f279c 100644
+--- a/codex-rs/core-plugins/src/loader.rs
++++ b/codex-rs/core-plugins/src/loader.rs
+@@ -273,6 +273,9 @@ fn merge_configured_plugins_with_remote_installed(
+     }
+ 
+     for (plugin_key, plugin_config) in extra_plugins {
++        if store.shared_roots().is_some() && configured_plugins.contains_key(&plugin_key) {
++            continue;
++        }
+         let remote_curated_plugin_name = installed_plugin_name_for_marketplace(
+             &plugin_key,
+             REMOTE_GLOBAL_MARKETPLACE_NAME,
+@@ -380,8 +383,22 @@ pub fn refresh_curated_plugin_cache(
+     plugin_version: &str,
+     configured_curated_plugin_ids: &[PluginId],
+ ) -> Result<bool, String> {
+-    let cache_plugin_version = curated_plugin_cache_version(plugin_version);
+     let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
++    refresh_curated_plugin_cache_with_store(
++        codex_home,
++        plugin_version,
++        configured_curated_plugin_ids,
++        &store,
++    )
++}
++
++pub(crate) fn refresh_curated_plugin_cache_with_store(
++    codex_home: &Path,
++    plugin_version: &str,
++    configured_curated_plugin_ids: &[PluginId],
++    store: &PluginStore,
++) -> Result<bool, String> {
++    let cache_plugin_version = curated_plugin_cache_version(plugin_version);
+     let curated_marketplace_paths = curated_marketplace_paths_for_cache_refresh(codex_home)?;
+     let mut loaded_marketplace_names = HashSet::<String>::new();
+     let mut marketplace_plugin_keys = HashSet::<String>::new();
+@@ -421,6 +438,9 @@ pub fn refresh_curated_plugin_cache(
+ 
+     let mut cache_refreshed = false;
+     for plugin_id in configured_curated_plugin_ids {
++        if store.skip_automatic_refresh(plugin_id) {
++            continue;
++        }
+         let plugin_key = plugin_id.as_key();
+         if !marketplace_plugin_keys.contains(&plugin_key) {
+             if !loaded_marketplace_names.contains(&plugin_id.marketplace_name) {
+@@ -512,11 +532,29 @@ pub(crate) fn refresh_non_curated_plugin_cache(
+     ))
+ }
+ 
++#[cfg(test)]
+ pub(crate) fn refresh_non_curated_plugin_cache_detailed(
+     codex_home: &Path,
+     additional_roots: &[AbsolutePathBuf],
+     configured_plugin_keys: &[String],
+     git_mode: PluginGitMode,
++) -> Result<NonCuratedCacheRefreshOutcome, String> {
++    let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
++    refresh_non_curated_plugin_cache_detailed_with_store(
++        codex_home,
++        additional_roots,
++        configured_plugin_keys,
++        git_mode,
++        &store,
++    )
++}
++
++pub(crate) fn refresh_non_curated_plugin_cache_detailed_with_store(
++    codex_home: &Path,
++    additional_roots: &[AbsolutePathBuf],
++    configured_plugin_keys: &[String],
++    git_mode: PluginGitMode,
++    store: &PluginStore,
+ ) -> Result<NonCuratedCacheRefreshOutcome, String> {
+     refresh_non_curated_plugin_cache_with_mode(
+         codex_home,
+@@ -524,6 +562,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_detailed(
+         configured_plugin_keys,
+         NonCuratedCacheRefreshMode::IfVersionChanged,
+         git_mode,
++        store,
+     )
+ }
+ 
+@@ -541,11 +580,29 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall(
+     ))
+ }
+ 
++#[cfg(test)]
+ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
+     codex_home: &Path,
+     additional_roots: &[AbsolutePathBuf],
+     configured_plugin_keys: &[String],
+     git_mode: PluginGitMode,
++) -> Result<NonCuratedCacheRefreshOutcome, String> {
++    let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
++    refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store(
++        codex_home,
++        additional_roots,
++        configured_plugin_keys,
++        git_mode,
++        &store,
++    )
++}
++
++pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store(
++    codex_home: &Path,
++    additional_roots: &[AbsolutePathBuf],
++    configured_plugin_keys: &[String],
++    git_mode: PluginGitMode,
++    store: &PluginStore,
+ ) -> Result<NonCuratedCacheRefreshOutcome, String> {
+     refresh_non_curated_plugin_cache_with_mode(
+         codex_home,
+@@ -553,6 +610,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
+         configured_plugin_keys,
+         NonCuratedCacheRefreshMode::ForceReinstall,
+         git_mode,
++        store,
+     )
+ }
+ 
+@@ -562,6 +620,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
+     configured_plugin_keys: &[String],
+     mode: NonCuratedCacheRefreshMode,
+     git_mode: PluginGitMode,
++    store: &PluginStore,
+ ) -> Result<NonCuratedCacheRefreshOutcome, String> {
+     let mut configured_non_curated_plugin_ids = configured_plugin_keys
+         .iter()
+@@ -592,7 +651,6 @@ fn refresh_non_curated_plugin_cache_with_mode(
+         .map(PluginId::as_key)
+         .collect::<HashSet<_>>();
+ 
+-    let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
+     let marketplace_outcome = list_marketplaces_with_home(additional_roots, /*home_dir*/ None)
+         .map_err(|err| format!("failed to discover marketplaces for cache refresh: {err}"))?;
+     let mut plugin_sources = HashMap::<String, (MarketplacePluginSource, Option<String>)>::new();
+@@ -651,6 +709,9 @@ fn refresh_non_curated_plugin_cache_with_mode(
+     let mut cache_refreshed = false;
+     let mut refresh_errors = Vec::new();
+     for plugin_id in configured_non_curated_plugin_ids {
++        if store.skip_automatic_refresh(&plugin_id) {
++            continue;
++        }
+         let plugin_key = plugin_id.as_key();
+         let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
+         else {
+@@ -662,6 +723,12 @@ fn refresh_non_curated_plugin_cache_with_mode(
+             continue;
+         };
+         let refresh_result = (|| -> Result<bool, String> {
++            if store.shared_roots().is_some() {
++                crate::store::ensure_unlinked_path(
++                    &codex_home.join("plugins/.marketplace-plugin-source-staging"),
++                )
++                .map_err(|error| error.to_string())?;
++            }
+             let materialized =
+                 materialize_marketplace_plugin_source_with_mode(codex_home, &source, git_mode)
+                     .map_err(|err| {
+diff --git a/codex-rs/core-plugins/src/manager.rs b/codex-rs/core-plugins/src/manager.rs
+index 112eeb0..63c2b60 100644
+--- a/codex-rs/core-plugins/src/manager.rs
++++ b/codex-rs/core-plugins/src/manager.rs
+@@ -1,3 +1,5 @@
++use crate::OPENAI_API_CURATED_MARKETPLACE_NAME;
++use crate::OPENAI_CURATED_MARKETPLACE_NAME;
+ #[path = "bundled_plugin_exclusions.rs"]
+ mod bundled_plugin_exclusions;
+ #[path = "remote_mutations.rs"]
+@@ -34,9 +36,11 @@ use crate::loader::log_plugin_load_errors;
+ use crate::loader::materialize_marketplace_plugin_source;
+ use crate::loader::plugin_capability_summary_from_root;
+ use crate::loader::plugin_is_eligible_for_target_marketplace;
++#[cfg(test)]
+ use crate::loader::refresh_curated_plugin_cache;
+-use crate::loader::refresh_non_curated_plugin_cache_detailed;
+-use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
++use crate::loader::refresh_curated_plugin_cache_with_store;
++use crate::loader::refresh_non_curated_plugin_cache_detailed_with_store;
++use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store;
+ use crate::loader::remote_installed_plugins_to_config;
+ use crate::manifest::PluginManifestFormat;
+ use crate::manifest::PluginManifestInterface;
+@@ -93,6 +97,7 @@ use codex_analytics::AnalyticsEventsClient;
+ use codex_analytics::PluginInstallSource;
+ use codex_config::ConfigLayerStack;
+ use codex_config::SkillConfigRules;
++use codex_config::TweakersSharedRoots;
+ use codex_config::clear_user_plugin;
+ use codex_config::set_user_plugin_enabled;
+ use codex_config::skill_config_rules_from_stack;
+@@ -523,6 +528,7 @@ impl From<PluginDetail> for PluginCapabilitySummary {
+ 
+ pub struct PluginsManager {
+     codex_home: PathBuf,
++    shared_roots: Option<TweakersSharedRoots>,
+     store: PluginStore,
+     featured_plugin_ids_cache: RwLock<Option<CachedFeaturedPluginIds>>,
+     recommended_plugins_cache: RwLock<HashMap<RecommendedPluginsCacheKey, RecommendedPluginsMode>>,
+@@ -590,11 +596,10 @@ impl PluginLoadCacheKey {
+         auth_identity: RemoteInstalledPluginsAuthIdentity,
+         excluded_plugin_ids: BTreeSet<String>,
+     ) -> Self {
++        let configured_plugins =
++            configured_plugins_from_stack(&config.config_layer_stack, codex_home);
+         Self {
+-            configured_plugins: configured_plugins_from_stack(
+-                &config.config_layer_stack,
+-                codex_home,
+-            ),
++            configured_plugins,
+             skill_config_rules: skill_config_rules_from_stack(&config.config_layer_stack),
+             remote_global_catalog_active,
+             // Local curated loads are auth-independent; only remote snapshots vary by account.
+@@ -626,11 +631,42 @@ impl PluginsManager {
+         )
+     }
+ 
++    pub fn new_with_shared_roots(
++        codex_home: PathBuf,
++        auth_manager: Arc<AuthManager>,
++        skill_root_loader: Arc<dyn SkillRootLoader<PluginSkillRoot>>,
++        shared_roots: Option<&TweakersSharedRoots>,
++    ) -> Self {
++        Self::new_with_options_and_shared_roots(
++            codex_home,
++            Some(Product::Codex),
++            auth_manager,
++            skill_root_loader,
++            shared_roots,
++        )
++    }
++
+     pub fn new_with_options(
+         codex_home: PathBuf,
+         restriction_product: Option<Product>,
+         auth_manager: Arc<AuthManager>,
+         skill_root_loader: Arc<dyn SkillRootLoader<PluginSkillRoot>>,
++    ) -> Self {
++        Self::new_with_options_and_shared_roots(
++            codex_home,
++            restriction_product,
++            auth_manager,
++            skill_root_loader,
++            /*shared_roots*/ None,
++        )
++    }
++
++    pub fn new_with_options_and_shared_roots(
++        codex_home: PathBuf,
++        restriction_product: Option<Product>,
++        auth_manager: Arc<AuthManager>,
++        skill_root_loader: Arc<dyn SkillRootLoader<PluginSkillRoot>>,
++        shared_roots: Option<&TweakersSharedRoots>,
+     ) -> Self {
+         // Product restrictions are enforced at marketplace admission time for a given CODEX_HOME:
+         // listing, install, and curated refresh all consult this restriction context before new
+@@ -640,10 +676,16 @@ impl PluginsManager {
+         //
+         // This assumes a single CODEX_HOME is only used by one product.
+         let remote_installed_plugin_bundle_sync_gate =
+-            crate::remote::remote_installed_plugin_bundle_sync_gate(&codex_home);
++            crate::remote::remote_installed_plugin_bundle_sync_gate(
++                shared_roots
++                    .map(|roots| roots.overlay_root.as_path())
++                    .unwrap_or(codex_home.as_path()),
++            );
+         Self {
+             codex_home: codex_home.clone(),
+-            store: PluginStore::new(codex_home),
++            shared_roots: shared_roots.cloned(),
++            store: PluginStore::try_new_with_shared_roots(codex_home, shared_roots)
++                .unwrap_or_else(|error| panic!("plugin cache roots should be absolute: {error}")),
+             featured_plugin_ids_cache: RwLock::new(None),
+             recommended_plugins_cache: RwLock::new(HashMap::new()),
+             recommended_plugins_refreshes: RwLock::new(HashMap::new()),
+@@ -685,6 +727,45 @@ impl PluginsManager {
+         self.auth_manager.get_api_auth_mode()
+     }
+ 
++    fn write_home(&self) -> &Path {
++        self.shared_roots
++            .as_ref()
++            .map(|roots| roots.overlay_root.as_path())
++            .unwrap_or(self.codex_home.as_path())
++    }
++
++    fn validate_shared_config_write(&self) -> Result<(), PluginStoreError> {
++        if self.shared_roots.is_some() {
++            crate::store::ensure_unlinked_path(
++                &self.write_home().join(codex_config::CONFIG_TOML_FILE),
++            )?;
++        }
++        Ok(())
++    }
++
++    /// Present local shared installations without changing remote account state.
++    pub fn apply_shared_plugin_state(
++        &self,
++        config: &PluginsConfigInput,
++        summary: &mut crate::remote::RemotePluginSummary,
++    ) {
++        if self.shared_roots.is_none() {
++            return;
++        }
++        let Ok(plugin_id) = PluginId::parse(&summary.id) else {
++            return;
++        };
++        summary.local_version = self.store.active_plugin_version(&plugin_id);
++        summary.installed = summary.local_version.is_some();
++        summary.installed_at = None;
++        let configured =
++            configured_plugins_from_stack(&config.config_layer_stack, self.codex_home.as_path());
++        summary.enabled = summary.installed
++            && configured
++                .get(&summary.id)
++                .is_none_or(|plugin| plugin.enabled);
++    }
++
+     fn remote_global_catalog_active(&self, config: &PluginsConfigInput) -> bool {
+         config.remote_plugin_enabled && self.auth_mode().is_some_and(AuthMode::uses_codex_backend)
+     }
+@@ -696,6 +777,7 @@ impl PluginsManager {
+         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+     ) {
+         if config.plugins_enabled
++            && self.shared_roots.is_none()
+             && !self.remote_global_catalog_active(config)
+             && MarketplacePolicy::from_requirements(config.config_layer_stack.requirements())
+                 .validate_git_source(OPENAI_PLUGINS_GIT_URL, /*ref_name*/ None)
+@@ -731,7 +813,7 @@ impl PluginsManager {
+         &self,
+         config: &PluginsConfigInput,
+     ) -> Option<SkillRootSnapshots<PluginSkillRoot>> {
+-        if !config.plugins_enabled {
++        if !config.plugins_enabled || self.shared_roots.is_some() {
+             return None;
+         }
+         let auth = self.auth_manager.auth_cached();
+@@ -965,6 +1047,11 @@ impl PluginsManager {
+     }
+ 
+     fn cached_loaded_plugins(&self, key: &PluginLoadCacheKey) -> Option<Vec<LoadedPlugin>> {
++        // Both roots can change in another process, including edits inside an existing package.
++        // Reload shared packages on each read rather than relying on process-local invalidation.
++        if self.shared_roots.is_some() {
++            return None;
++        }
+         self.loaded_plugins_cache
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+@@ -986,6 +1073,9 @@ impl PluginsManager {
+         plugins: Vec<LoadedPlugin>,
+         plugin_skill_snapshots: SkillRootSnapshots<PluginSkillRoot>,
+     ) {
++        if self.shared_roots.is_some() {
++            return;
++        }
+         let mut cache = match self.loaded_plugins_cache.lock() {
+             Ok(cache) => cache,
+             Err(err) => err.into_inner(),
+@@ -1636,13 +1726,15 @@ impl PluginsManager {
+             .flat_map(HashMap::keys)
+             .cloned()
+             .collect::<Vec<_>>();
+-        let result = crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot(
+-            self.codex_home.clone(),
+-            &remote_plugin_service_config(config),
+-            auth,
+-            &previous_plugin_ids,
+-        )
+-        .await?;
++        let result =
++            crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot_and_store(
++                self.write_home().to_path_buf(),
++                &remote_plugin_service_config(config),
++                auth,
++                &previous_plugin_ids,
++                self.store.clone(),
++            )
++            .await?;
+         let mut outcome = result.outcome;
+         // The generation fence keeps this comparison on the snapshot replaced by this pass.
+         // In a known snapshot, absence means inactive: cached reinstalls need the same hints
+@@ -2056,6 +2148,9 @@ impl PluginsManager {
+         request: PluginInstallRequest,
+     ) -> Result<PluginInstallOutcome, PluginInstallError> {
+         let resolved = self.resolve_installable_plugin(config, &request)?;
++        if self.shared_roots.is_some() {
++            return self.install_resolved_plugin(resolved).await;
++        }
+         let plugin_id = resolved.plugin_id.as_key();
+         // This only forwards the backend mutation before the local install flow.
+         if let Err(err) = crate::remote_legacy::enable_remote_plugin(
+@@ -2177,10 +2272,23 @@ impl PluginsManager {
+         &self,
+         resolved: ResolvedMarketplacePlugin,
+     ) -> Result<PluginInstallOutcome, PluginInstallError> {
++        self.validate_shared_config_write()?;
++        if self.shared_roots.is_some() {
++            crate::store::ensure_unlinked_path(
++                &self
++                    .write_home()
++                    .join("plugins/.marketplace-plugin-source-staging"),
++            )?;
++        }
+         let auth_policy = resolved.policy.authentication;
+         let plugin_version =
+             if is_openai_curated_marketplace_name(&resolved.plugin_id.marketplace_name) {
+-                let curated_plugin_version = read_curated_plugins_sha(self.codex_home.as_path())
++                let curated_plugin_version = read_curated_plugins_sha(self.write_home())
++                    .or_else(|| {
++                        self.shared_roots.as_ref().and_then(|roots| {
++                            read_curated_plugins_sha(roots.native_base_root.as_path())
++                        })
++                    })
+                     .ok_or_else(|| {
+                         PluginStoreError::Invalid(
+                             "local curated marketplace sha is not available".to_string(),
+@@ -2191,7 +2299,7 @@ impl PluginsManager {
+                 None
+             };
+         let store = self.store.clone();
+-        let codex_home = self.codex_home.clone();
++        let codex_home = self.write_home().to_path_buf();
+         let manifest_fallback_contents = resolved
+             .manifest_fallback
+             .contents_if_has_metadata()
+@@ -2224,7 +2332,7 @@ impl PluginsManager {
+         .map_err(PluginInstallError::join)??;
+ 
+         set_user_plugin_enabled(
+-            &self.codex_home,
++            self.write_home(),
+             result.plugin_id.as_key(),
+             /*enabled*/ true,
+         )
+@@ -2264,6 +2372,9 @@ impl PluginsManager {
+         // TODO: Remove this legacy remote-sync path once remote plugins have
+         // their own manager and installed-state API.
+         let plugin_id = PluginId::parse(&plugin_id)?;
++        if self.shared_roots.is_some() {
++            return self.uninstall_plugin_id(plugin_id).await;
++        }
+         let plugin_key = plugin_id.as_key();
+         // This only forwards the backend mutation before the local uninstall flow.
+         crate::remote_legacy::uninstall_remote_plugin(
+@@ -2277,6 +2388,7 @@ impl PluginsManager {
+     }
+ 
+     async fn uninstall_plugin_id(&self, plugin_id: PluginId) -> Result<(), PluginUninstallError> {
++        self.validate_shared_config_write()?;
+         let plugin_telemetry = if self.store.active_plugin_root(&plugin_id).is_some() {
+             Some(
+                 self.telemetry_metadata_for_installed_plugin(&plugin_id)
+@@ -2291,9 +2403,19 @@ impl PluginsManager {
+             .await
+             .map_err(PluginUninstallError::join)??;
+ 
+-        clear_user_plugin(&self.codex_home, plugin_id.as_key())
++        if self.shared_roots.is_some() {
++            set_user_plugin_enabled(
++                self.write_home(),
++                plugin_id.as_key(),
++                /*enabled*/ false,
++            )
+             .await
+             .map_err(anyhow::Error::from)?;
++        } else {
++            clear_user_plugin(&self.codex_home, plugin_id.as_key())
++                .await
++                .map_err(anyhow::Error::from)?;
++        }
+ 
+         let analytics_events_client = match self.analytics_events_client.read() {
+             Ok(client) => client.clone(),
+@@ -2882,7 +3004,7 @@ impl PluginsManager {
+         reload_config: &ConfigLayerReload,
+     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
+         let mut outcome = upgrade_configured_git_marketplaces_with_mode(
+-            self.codex_home.as_path(),
++            self.write_home(),
+             &config.config_layer_stack,
+             marketplace_name,
+             mode,
+@@ -2903,11 +3025,12 @@ impl PluginsManager {
+             .into_keys()
+             .collect::<Vec<_>>();
+             configured_plugin_keys.sort_unstable();
+-            match refresh_non_curated_plugin_cache_force_reinstall_detailed(
+-                self.codex_home.as_path(),
++            match refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store(
++                self.write_home(),
+                 &outcome.upgraded_roots,
+                 &configured_plugin_keys,
+                 mode,
++                &self.store,
+             ) {
+                 Ok(refresh_outcome) => {
+                     self.clear_caches_after_marketplace_source_refresh(
+@@ -3237,10 +3360,11 @@ impl PluginsManager {
+                     Ok(curated_plugin_version) => {
+                         let configured_curated_plugin_ids =
+                             configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
+-                        match refresh_curated_plugin_cache(
++                        match refresh_curated_plugin_cache_with_store(
+                             codex_home.as_path(),
+                             &curated_plugin_version,
+                             &configured_curated_plugin_ids,
++                            &manager.store,
+                         ) {
+                             Ok(cache_refreshed) => {
+                                 manager.clear_caches_after_marketplace_source_refresh(
+@@ -3420,19 +3544,21 @@ impl PluginsManager {
+ 
+             let refresh_result = match request.mode {
+                 NonCuratedCacheRefreshMode::IfVersionChanged => {
+-                    refresh_non_curated_plugin_cache_detailed(
+-                        self.codex_home.as_path(),
++                    refresh_non_curated_plugin_cache_detailed_with_store(
++                        self.write_home(),
+                         &request.roots,
+                         &request.configured_plugin_keys,
+                         request.git_mode,
++                        &self.store,
+                     )
+                 }
+                 NonCuratedCacheRefreshMode::ForceReinstall => {
+-                    refresh_non_curated_plugin_cache_force_reinstall_detailed(
+-                        self.codex_home.as_path(),
++                    refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store(
++                        self.write_home(),
+                         &request.roots,
+                         &request.configured_plugin_keys,
+                         request.git_mode,
++                        &self.store,
+                     )
+                 }
+             };
+@@ -3518,18 +3644,39 @@ impl PluginsManager {
+             self.codex_home.as_path(),
+         ));
+         let curated_marketplace_path = if include_openai_curated {
+-            match target_curated_marketplace(self.auth_mode()) {
++            let homes = self.shared_roots.as_ref().map_or_else(
++                || vec![self.codex_home.as_path()],
++                |roots| {
++                    vec![
++                        roots.overlay_root.as_path(),
++                        roots.native_base_root.as_path(),
++                    ]
++                },
++            );
++            let target = target_curated_marketplace(self.auth_mode());
++            let marketplace_name = match target {
+                 TargetCuratedMarketplace::OpenAi | TargetCuratedMarketplace::OpenAiWithRemote => {
+-                    let curated_repo_root = curated_plugins_repo_path(self.codex_home.as_path());
+-                    curated_repo_root.is_dir().then_some(curated_repo_root)
+-                }
+-                TargetCuratedMarketplace::OpenAiApi => {
+-                    let api_marketplace_path =
+-                        curated_plugins_api_marketplace_path(self.codex_home.as_path());
+-                    api_marketplace_path
+-                        .is_file()
+-                        .then_some(api_marketplace_path)
++                    OPENAI_CURATED_MARKETPLACE_NAME
+                 }
++                TargetCuratedMarketplace::OpenAiApi => OPENAI_API_CURATED_MARKETPLACE_NAME,
++            };
++            if crate::installed_marketplaces::shared_marketplace_is_removed(
++                &config.config_layer_stack,
++                marketplace_name,
++            ) {
++                None
++            } else {
++                homes.into_iter().find_map(|home| match target {
++                    TargetCuratedMarketplace::OpenAi
++                    | TargetCuratedMarketplace::OpenAiWithRemote => {
++                        let path = curated_plugins_repo_path(home);
++                        path.is_dir().then_some(path)
++                    }
++                    TargetCuratedMarketplace::OpenAiApi => {
++                        let path = curated_plugins_api_marketplace_path(home);
++                        path.is_file().then_some(path)
++                    }
++                })
+             }
+         } else {
+             None
+diff --git a/codex-rs/core-plugins/src/manager_tests.rs b/codex-rs/core-plugins/src/manager_tests.rs
+index e7963d4..64ef165 100644
+--- a/codex-rs/core-plugins/src/manager_tests.rs
++++ b/codex-rs/core-plugins/src/manager_tests.rs
+@@ -3019,6 +3019,127 @@ enabled = false"#,
+     );
+ }
+ 
++#[tokio::test]
++async fn shared_plugin_reads_observe_in_place_edits_and_other_account_mutations() {
++    let tmp = TempDir::new().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    let roots = TweakersSharedRoots {
++        native_base_root: base.clone().abs(),
++        overlay_root: overlay.clone().abs(),
++    };
++    let plugin_root = base.join("plugins/cache/test/sample/local");
++    write_plugin(&base.join("plugins/cache/test"), "sample/local", "sample");
++    let config = PluginsConfigInput::new(
++        ConfigLayerStack::new(
++            vec![ConfigLayerEntry::new(
++                ConfigLayerSource::User {
++                    file: base.join(CONFIG_TOML_FILE).abs(),
++                    profile: None,
++                },
++                toml::from_str(&plugin_config_toml(
++                    /*enabled*/ true, /*plugins_feature_enabled*/ true,
++                ))
++                .unwrap(),
++            )],
++            ConfigRequirements::default(),
++            ConfigRequirementsToml::default(),
++        )
++        .unwrap()
++        .with_tweakers_shared_roots(Some(roots.clone())),
++        String::new(),
++        /*plugins_enabled*/ true,
++        /*remote_plugin_enabled*/ false,
++        String::new(),
++        test_http_client_factory(),
++    );
++    let managers = ["account-a", "account-b"].map(|account| {
++        PluginsManager::new_with_shared_roots(
++            root.join(account),
++            test_auth_manager(/*auth_mode*/ None),
++            test_skill_root_loader(),
++            Some(&roots),
++        )
++    });
++    for manager in &managers {
++        assert!(manager.plugins_for_config(&config).await.plugins()[0].has_enabled_skills);
++    }
++    // Neither edit changes the package root directory's mtime.
++    write_file(
++        &plugin_root.join(".mcp.json"),
++        r#"{"mcpServers":{"sample":{"url":"https://sample.example/mcp"}}}"#,
++    );
++    fs::remove_file(plugin_root.join("skills/SKILL.md")).unwrap();
++    for manager in &managers {
++        let loaded = manager.plugins_for_config(&config).await;
++        assert!(!loaded.plugins()[0].has_enabled_skills);
++        assert_eq!(loaded.effective_mcp_servers().len(), 1);
++        assert!(manager.plugin_skill_snapshots_for_config(&config).is_none());
++    }
++    let source = root.join("source");
++    write_plugin(&source, "sample", "sample");
++    let id = PluginId::parse("sample@test").unwrap();
++    managers[0]
++        .store
++        .install(source.join("sample").abs(), id.clone())
++        .unwrap();
++    let loaded = managers[1].plugins_for_config(&config).await;
++    assert_eq!(
++        loaded.plugins()[0].root,
++        overlay.join("plugins/cache/test/sample/local").abs()
++    );
++    assert!(loaded.plugins()[0].has_enabled_skills);
++    assert!(loaded.effective_mcp_servers().is_empty());
++    managers[0].uninstall_plugin_id(id).await.unwrap();
++    assert!(
++        managers[1]
++            .plugins_for_config(&config)
++            .await
++            .capability_summaries()
++            .is_empty()
++    );
++    assert!(plugin_root.join(".codex-plugin/plugin.json").is_file());
++}
++
++#[cfg(unix)]
++#[tokio::test]
++async fn shared_plugin_uninstall_rejects_config_symlink_before_package_mutation() {
++    let tmp = TempDir::new().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    fs::create_dir_all(&overlay).unwrap();
++    write_file(&base.join(CONFIG_TOML_FILE), "# native config\n");
++    std::os::unix::fs::symlink(base.join(CONFIG_TOML_FILE), overlay.join(CONFIG_TOML_FILE))
++        .unwrap();
++    let roots = TweakersSharedRoots {
++        native_base_root: base.clone().abs(),
++        overlay_root: overlay.clone().abs(),
++    };
++    let manager = PluginsManager::new_with_shared_roots(
++        root.join("account"),
++        test_auth_manager(/*auth_mode*/ None),
++        test_skill_root_loader(),
++        Some(&roots),
++    );
++    write_plugin(
++        &overlay.join("plugins/cache/test"),
++        "sample/local",
++        "sample",
++    );
++    let id = PluginId::parse("sample@test").unwrap();
++    assert!(manager.uninstall_plugin_id(id.clone()).await.is_err());
++    assert_eq!(
++        manager.store.active_plugin_root(&id),
++        Some(overlay.join("plugins/cache/test/sample/local").abs())
++    );
++    assert_eq!(
++        fs::read_to_string(base.join(CONFIG_TOML_FILE)).unwrap(),
++        "# native config\n"
++    );
++}
++
+ #[tokio::test]
+ async fn skill_roots_resolve_remote_plugin_identity_from_authoritative_source() {
+     let mut duplicate_plugin = remote_installed_plugin("sample");
+diff --git a/codex-rs/core-plugins/src/marketplace_add/metadata.rs b/codex-rs/core-plugins/src/marketplace_add/metadata.rs
+index 07813ce..a1ee5fa 100644
+--- a/codex-rs/core-plugins/src/marketplace_add/metadata.rs
++++ b/codex-rs/core-plugins/src/marketplace_add/metadata.rs
+@@ -44,7 +44,19 @@ pub(super) fn record_added_marketplace_entry(
+         MarketplaceAddError::Internal(format!(
+             "failed to add marketplace '{marketplace_name}' to user config.toml: {err}"
+         ))
+-    })
++    })?;
++    let marker =
++        crate::installed_marketplaces::marketplace_removal_path(codex_home, marketplace_name);
++    if marker.exists() {
++        crate::store::ensure_unlinked_path(&marker)
++            .map_err(|error| MarketplaceAddError::Internal(error.to_string()))?;
++        fs::remove_file(marker).map_err(|error| {
++            MarketplaceAddError::Internal(format!(
++                "failed to clear local marketplace removal: {error}"
++            ))
++        })?;
++    }
++    Ok(())
+ }
+ 
+ pub(super) fn installed_marketplace_root_for_source(
+diff --git a/codex-rs/core-plugins/src/marketplace_policy.rs b/codex-rs/core-plugins/src/marketplace_policy.rs
+index d590755..cef7161 100644
+--- a/codex-rs/core-plugins/src/marketplace_policy.rs
++++ b/codex-rs/core-plugins/src/marketplace_policy.rs
+@@ -3,8 +3,6 @@ use crate::OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME;
+ use crate::OPENAI_BUNDLED_MARKETPLACE_NAME;
+ use crate::OPENAI_CURATED_MARKETPLACE_NAME;
+ use crate::OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME;
+-use crate::installed_marketplaces::marketplace_install_root;
+-use crate::installed_marketplaces::resolve_configured_marketplace_root;
+ use crate::is_openai_curated_marketplace_name;
+ use crate::marketplace::marketplace_root_dir;
+ use crate::marketplace_add::MarketplaceSource;
+@@ -18,6 +16,7 @@ use codex_config::ConfigRequirements;
+ use codex_config::MarketplaceAllowedSourceKind;
+ use codex_config::MarketplaceAllowedSourceToml;
+ use codex_config::RequirementSource;
++use codex_config::TweakersSharedRoots;
+ use codex_config::types::MarketplaceConfig;
+ use codex_config::types::MarketplaceSourceType;
+ use codex_config::types::PluginConfig;
+@@ -110,7 +109,25 @@ impl MarketplacePolicy {
+         marketplace_name: &str,
+     ) -> Result<(), String> {
+         let root = marketplace_root_dir(marketplace_path).map_err(|err| err.to_string())?;
+-        if let Some(expected_name) = managed_marketplace_name(codex_home, marketplace_path, &root) {
++        let shared_roots = config_layer_stack.tweakers_shared_roots();
++        let managed_name =
++            managed_marketplace_name(codex_home, marketplace_path, &root).or_else(|| {
++                shared_roots.and_then(|roots| {
++                    managed_marketplace_name(
++                        roots.native_base_root.as_path(),
++                        marketplace_path,
++                        &root,
++                    )
++                    .or_else(|| {
++                        managed_marketplace_name(
++                            roots.overlay_root.as_path(),
++                            marketplace_path,
++                            &root,
++                        )
++                    })
++                })
++            });
++        if let Some(expected_name) = managed_name {
+             if is_openai_curated_marketplace_name(expected_name) {
+                 self.validate_git_source(OPENAI_PLUGINS_GIT_URL, /*ref_name*/ None)?;
+             }
+@@ -137,14 +154,16 @@ impl MarketplacePolicy {
+             })?;
+         self.validate_configured_marketplace(marketplace_name, marketplace)?;
+ 
+-        let configured_root = resolve_configured_marketplace_root(
+-            marketplace_name,
+-            marketplace,
+-            &marketplace_install_root(codex_home),
+-        )
+-        .ok_or_else(|| {
+-            format!("configured marketplace `{marketplace_name}` does not have a usable root")
+-        })?;
++        let configured_root =
++            crate::installed_marketplaces::resolve_configured_marketplace_root_from_stack(
++                config_layer_stack,
++                codex_home,
++                marketplace_name,
++                marketplace,
++            )
++            .ok_or_else(|| {
++                format!("configured marketplace `{marketplace_name}` does not have a usable root")
++            })?;
+         if !paths_match_after_normalization(&configured_root, root.as_path()) {
+             return Err(format!(
+                 "marketplace path `{}` does not match configured marketplace `{marketplace_name}`",
+@@ -212,12 +231,24 @@ pub(crate) fn policy_filtered_plugin_config(
+     codex_home: &Path,
+ ) -> Option<toml::Value> {
+     let mut effective_config = config_layer_stack.effective_config();
++    if let Some(marketplaces) = effective_config
++        .get_mut("marketplaces")
++        .and_then(toml::Value::as_table_mut)
++    {
++        marketplaces.retain(|name, _| {
++            !crate::installed_marketplaces::shared_marketplace_is_removed(config_layer_stack, name)
++        });
++    }
+     if effective_config.get("plugins").is_none() && effective_config.get("marketplaces").is_none() {
+         return None;
+     }
+     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
+-    let allowed_marketplace_names =
+-        allowed_configured_marketplace_names_with_policy(&effective_config, &policy, codex_home);
++    let allowed_marketplace_names = allowed_configured_marketplace_names_with_policy_and_roots(
++        &effective_config,
++        &policy,
++        codex_home,
++        config_layer_stack.tweakers_shared_roots(),
++    );
+     let configured_marketplace_names = effective_config
+         .get("marketplaces")
+         .and_then(toml::Value::as_table)
+@@ -258,15 +289,29 @@ pub fn allowed_configured_marketplace_names(
+     config_layer_stack: &ConfigLayerStack,
+     codex_home: &Path,
+ ) -> HashSet<String> {
+-    let effective_config = config_layer_stack.effective_config();
++    let mut effective_config = config_layer_stack.effective_config();
++    if let Some(marketplaces) = effective_config
++        .get_mut("marketplaces")
++        .and_then(toml::Value::as_table_mut)
++    {
++        marketplaces.retain(|name, _| {
++            !crate::installed_marketplaces::shared_marketplace_is_removed(config_layer_stack, name)
++        });
++    }
+     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
+-    allowed_configured_marketplace_names_with_policy(&effective_config, &policy, codex_home)
++    allowed_configured_marketplace_names_with_policy_and_roots(
++        &effective_config,
++        &policy,
++        codex_home,
++        config_layer_stack.tweakers_shared_roots(),
++    )
+ }
+ 
+-fn allowed_configured_marketplace_names_with_policy(
++fn allowed_configured_marketplace_names_with_policy_and_roots(
+     effective_config: &toml::Value,
+     policy: &MarketplacePolicy,
+     codex_home: &Path,
++    shared_roots: Option<&TweakersSharedRoots>,
+ ) -> HashSet<String> {
+     let Some(marketplaces) = effective_config
+         .get("marketplaces")
+@@ -277,7 +322,22 @@ fn allowed_configured_marketplace_names_with_policy(
+     marketplaces
+         .iter()
+         .filter_map(|(marketplace_name, marketplace)| {
+-            let allowed = match managed_marketplace_config_name(codex_home, marketplace) {
++            let managed_name =
++                managed_marketplace_config_name(codex_home, marketplace).or_else(|| {
++                    shared_roots.and_then(|roots| {
++                        managed_marketplace_config_name(
++                            roots.native_base_root.as_path(),
++                            marketplace,
++                        )
++                        .or_else(|| {
++                            managed_marketplace_config_name(
++                                roots.overlay_root.as_path(),
++                                marketplace,
++                            )
++                        })
++                    })
++                });
++            let allowed = match managed_name {
+                 Some(expected_name) => expected_name == marketplace_name,
+                 None if is_reserved_marketplace_name(marketplace_name) => false,
+                 None if !policy.is_restricted() => true,
+diff --git a/codex-rs/core-plugins/src/marketplace_policy_tests.rs b/codex-rs/core-plugins/src/marketplace_policy_tests.rs
+index a2bef00..bd3093a 100644
+--- a/codex-rs/core-plugins/src/marketplace_policy_tests.rs
++++ b/codex-rs/core-plugins/src/marketplace_policy_tests.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::installed_marketplaces::marketplace_install_root;
+ use crate::marketplace_upgrade::upgrade_configured_git_marketplaces;
+ use codex_config::ConfigLayerEntry;
+ use codex_config::ConfigLayerSource;
+@@ -826,3 +827,42 @@ restrict_to_allowed_sources = true
+         assert!(err.contains(expected_error), "{err}");
+     }
+ }
++
++#[test]
++fn shared_marketplace_admission_uses_base_and_overlay_without_trusting_other_roots() {
++    let tmp = TempDir::new().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    let account = root.join("account");
++    for directory in [&base, &overlay, &account] {
++        fs::create_dir_all(directory).unwrap();
++    }
++    let shared = TweakersSharedRoots {
++        native_base_root: AbsolutePathBuf::try_from(base.clone()).unwrap(),
++        overlay_root: AbsolutePathBuf::try_from(overlay.clone()).unwrap(),
++    };
++    for (home, allowed) in [
++        (&base, true),
++        (&overlay, true),
++        (&root.join("unrelated"), false),
++    ] {
++        let marketplace = home.join(".tmp/bundled-marketplaces/openai-bundled");
++        let content = format!(
++            "[marketplaces.openai-bundled]\nsource_type='local'\nsource='{}'\n[plugins.\"sample@openai-bundled\"]\nenabled=true\n",
++            marketplace.display()
++        );
++        let stack = config_layer_stack_with_user_config(
++            "[marketplaces]\nrestrict_to_allowed_sources=false\n",
++            Some((
++                &content,
++                AbsolutePathBuf::try_from(overlay.join("config.toml")).unwrap(),
++            )),
++        )
++        .with_tweakers_shared_roots(Some(shared.clone()));
++        assert_eq!(
++            configured_plugins_from_stack(&stack, &account).contains_key("sample@openai-bundled"),
++            allowed
++        );
++    }
++}
+diff --git a/codex-rs/core-plugins/src/marketplace_remove.rs b/codex-rs/core-plugins/src/marketplace_remove.rs
+index 997f114..0c65fcd 100644
+--- a/codex-rs/core-plugins/src/marketplace_remove.rs
++++ b/codex-rs/core-plugins/src/marketplace_remove.rs
+@@ -55,6 +55,50 @@ fn remove_marketplace_sync(
+     validate_plugin_segment(&marketplace_name, "marketplace name")
+         .map_err(MarketplaceRemoveError::InvalidRequest)?;
+ 
++    if let Some(shared) = config_layer_stack.tweakers_shared_roots() {
++        let effective = config_layer_stack.effective_config();
++        let configured = effective
++            .get("marketplaces")
++            .and_then(toml::Value::as_table)
++            .is_some_and(|entries| entries.contains_key(&marketplace_name));
++        if !configured
++            || crate::installed_marketplaces::shared_marketplace_is_removed(
++                config_layer_stack,
++                &marketplace_name,
++            )
++        {
++            return Err(MarketplaceRemoveError::InvalidRequest(format!(
++                "marketplace `{marketplace_name}` is not configured"
++            )));
++        }
++        let overlay = shared.overlay_root.as_path();
++        crate::store::ensure_unlinked_path(&overlay.join(CONFIG_TOML_FILE))
++            .map_err(|error| MarketplaceRemoveError::Internal(error.to_string()))?;
++        let marker =
++            crate::installed_marketplaces::marketplace_removal_path(overlay, &marketplace_name);
++        let destination = marketplace_install_root(overlay).join(&marketplace_name);
++        for path in [&marker, &destination] {
++            crate::store::ensure_unlinked_path(path)
++                .map_err(|error| MarketplaceRemoveError::Internal(error.to_string()))?;
++        }
++        fs::create_dir_all(marker.parent().ok_or_else(|| {
++            MarketplaceRemoveError::Internal("removal marker has no parent".to_string())
++        })?)
++        .and_then(|()| fs::write(&marker, b"removed\n"))
++        .map_err(|error| {
++            MarketplaceRemoveError::Internal(format!(
++                "failed to record local marketplace removal: {error}"
++            ))
++        })?;
++        remove_user_marketplace_config(overlay, &marketplace_name)
++            .map_err(|error| MarketplaceRemoveError::Internal(error.to_string()))?;
++        let removed_installed_root = remove_marketplace_root(&destination)?;
++        return Ok(MarketplaceRemoveOutcome {
++            marketplace_name,
++            removed_installed_root,
++        });
++    }
++
+     // Removing a user override must not delete a snapshot still referenced by
+     // another enabled layer, including a lower-precedence layer it shadows.
+     let user_config_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home);
+diff --git a/codex-rs/core-plugins/src/marketplace_upgrade.rs b/codex-rs/core-plugins/src/marketplace_upgrade.rs
+index 9bb0678..8511876 100644
+--- a/codex-rs/core-plugins/src/marketplace_upgrade.rs
++++ b/codex-rs/core-plugins/src/marketplace_upgrade.rs
+@@ -93,11 +93,28 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
+     mode: PluginGitMode,
+     reload_config: &ConfigLayerReload,
+ ) -> ConfiguredMarketplaceUpgradeOutcome {
++    let codex_home = config_layer_stack
++        .tweakers_shared_roots()
++        .map(|roots| roots.overlay_root.as_path())
++        .unwrap_or(codex_home);
+     let loaded = load_configured_git_marketplaces(config_layer_stack);
+     let marketplaces = loaded
+         .marketplaces
+         .into_iter()
+         .filter(|marketplace| marketplace_name.is_none_or(|name| marketplace.name.as_str() == name))
++        .filter(|marketplace| {
++            !crate::installed_marketplaces::shared_marketplace_is_removed(
++                config_layer_stack,
++                &marketplace.name,
++            )
++        })
++        .filter(|marketplace| {
++            config_layer_stack.tweakers_shared_roots().is_none()
++                || !matches!(mode, PluginGitMode::Automatic)
++                || marketplace_install_root(codex_home)
++                    .join(&marketplace.name)
++                    .is_dir()
++        })
+         .collect::<Vec<_>>();
+     let mut errors = loaded
+         .errors
+@@ -119,6 +136,18 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
+     let mut upgraded_roots = Vec::new();
+     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
+     for marketplace in marketplaces {
++        if config_layer_stack.tweakers_shared_roots().is_some()
++            && let Err(error) = crate::store::ensure_unlinked_path(
++                &install_root.join(&marketplace.name),
++            )
++            .and_then(|()| crate::store::ensure_unlinked_path(&install_root.join(".staging")))
++        {
++            errors.push(ConfiguredMarketplaceUpgradeError {
++                marketplace_name: marketplace.name,
++                message: error.to_string(),
++            });
++            continue;
++        }
+         let normalized_source =
+             match validate_marketplace_name_for_add(/*expected_name*/ None, &marketplace.name)
+                 .and_then(|()| {
+diff --git a/codex-rs/core-plugins/src/remote.rs b/codex-rs/core-plugins/src/remote.rs
+index 18cd4ff..922cd86 100644
+--- a/codex-rs/core-plugins/src/remote.rs
++++ b/codex-rs/core-plugins/src/remote.rs
+@@ -65,7 +65,7 @@ pub use remote_installed_plugin_sync::RemotePluginMaterialization;
+ pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_flight;
+ pub(crate) use remote_installed_plugin_sync::remote_installed_plugin_bundle_sync_gate;
+ pub use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once;
+-pub(crate) use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot;
++pub(crate) use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot_and_store;
+ pub use search::RemotePluginSearchPage;
+ pub use search::RemotePluginSearchRequest;
+ pub use search::search_remote_plugins;
+diff --git a/codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs b/codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs
+index 380271b..b23f7a7 100644
+--- a/codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs
++++ b/codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs
+@@ -133,6 +133,24 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
+     config: &RemotePluginServiceConfig,
+     auth: Option<&CodexAuth>,
+     previous_plugin_ids: &[PluginId],
++) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
++    let store = PluginStore::try_new(codex_home.clone())?;
++    sync_remote_installed_plugin_bundles_once_with_snapshot_and_store(
++        codex_home,
++        config,
++        auth,
++        previous_plugin_ids,
++        store,
++    )
++    .await
++}
++
++pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_store(
++    codex_home: PathBuf,
++    config: &RemotePluginServiceConfig,
++    auth: Option<&CodexAuth>,
++    previous_plugin_ids: &[PluginId],
++    store: PluginStore,
+ ) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
+     let auth = ensure_chatgpt_auth(auth)?;
+     let authenticated_account_id = auth.get_account_id();
+@@ -162,7 +180,6 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
+         })?;
+         validated_installed_plugins.push((installed_plugin, cached_plugin, plugin_id));
+     }
+-    let store = PluginStore::try_new(codex_home.clone())?;
+     let installed_plugin_ids = validated_installed_plugins
+         .iter()
+         .map(|(_, _, plugin_id)| plugin_id.as_key())
+@@ -224,6 +241,10 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
+             .entry(marketplace_name.clone())
+             .or_default()
+             .insert(plugin.name.clone());
++        if store.skip_automatic_refresh(&plugin_id) {
++            installed_plugins.push(cached_plugin);
++            continue;
++        }
+         let release_version = plugin
+             .release
+             .version
+@@ -275,10 +296,11 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
+         // by the new version. Unchanged bundles never reach this metadata-loading path.
+         let mut capabilities = RemotePluginCapabilities::default();
+         capabilities.include_active_bundle(&store, &plugin_id).await;
+-        match crate::remote_bundle::download_and_install_remote_plugin_bundle(
++        match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_store(
+             config,
+             codex_home.clone(),
+             bundle,
++            store.clone(),
+         )
+         .await
+         {
+@@ -394,6 +416,10 @@ async fn remove_stale_remote_plugin_caches(
+     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
+     removed_plugins: &mut Vec<RemotePluginChange>,
+ ) -> Result<(), String> {
++    // Remote state belongs to one account; it cannot delete shared local installs.
++    if store.shared_roots().is_some() {
++        return Ok(());
++    }
+     let codex_home = store.codex_home().as_path();
+     for marketplace_name in [
+         REMOTE_GLOBAL_MARKETPLACE_NAME,
+diff --git a/codex-rs/core-plugins/src/remote_bundle.rs b/codex-rs/core-plugins/src/remote_bundle.rs
+index 8a3c1f4..dd09f50 100644
+--- a/codex-rs/core-plugins/src/remote_bundle.rs
++++ b/codex-rs/core-plugins/src/remote_bundle.rs
+@@ -258,6 +258,16 @@ pub async fn download_and_install_remote_plugin_bundle(
+     config: &RemotePluginServiceConfig,
+     codex_home: PathBuf,
+     bundle: ValidatedRemotePluginBundle,
++) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
++    let store = PluginStore::try_new(codex_home.clone())?;
++    download_and_install_remote_plugin_bundle_with_store(config, codex_home, bundle, store).await
++}
++
++pub(crate) async fn download_and_install_remote_plugin_bundle_with_store(
++    config: &RemotePluginServiceConfig,
++    codex_home: PathBuf,
++    bundle: ValidatedRemotePluginBundle,
++    store: PluginStore,
+ ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+     let bundle_bytes = download_remote_plugin_bundle_with_limit(
+         config,
+@@ -266,7 +276,7 @@ pub async fn download_and_install_remote_plugin_bundle(
+     )
+     .await?;
+     tokio::task::spawn_blocking(move || {
+-        install_remote_plugin_bundle(codex_home, bundle, bundle_bytes)
++        install_remote_plugin_bundle_with_store(codex_home, bundle, bundle_bytes, store)
+     })
+     .await
+     .map_err(|err| {
+@@ -406,10 +416,21 @@ fn enforce_download_size_limit(
+     Ok(())
+ }
+ 
++#[cfg(test)]
+ fn install_remote_plugin_bundle(
+     codex_home: PathBuf,
+     bundle: ValidatedRemotePluginBundle,
+     bundle_bytes: Vec<u8>,
++) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
++    let store = PluginStore::try_new(codex_home.clone())?;
++    install_remote_plugin_bundle_with_store(codex_home, bundle, bundle_bytes, store)
++}
++
++fn install_remote_plugin_bundle_with_store(
++    codex_home: PathBuf,
++    bundle: ValidatedRemotePluginBundle,
++    bundle_bytes: Vec<u8>,
++    store: PluginStore,
+ ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+     let staging_root = codex_home.join(REMOTE_PLUGIN_INSTALL_STAGING_DIR);
+     fs::create_dir_all(&staging_root).map_err(|source| {
+@@ -437,7 +458,6 @@ fn install_remote_plugin_bundle(
+         ))
+     })?;
+ 
+-    let store = PluginStore::try_new(codex_home)?;
+     let remote_plugin_id = bundle.remote_plugin_id;
+     let result = store
+         .install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
+diff --git a/codex-rs/core-plugins/src/remote_mutations.rs b/codex-rs/core-plugins/src/remote_mutations.rs
+index 5e07d6f..9391a7d 100644
+--- a/codex-rs/core-plugins/src/remote_mutations.rs
++++ b/codex-rs/core-plugins/src/remote_mutations.rs
+@@ -106,8 +106,10 @@ impl PluginsManager {
+         }
+         remote::validate_remote_plugin_id(&remote_plugin_id)
+             .map_err(|err| unresolved(Error::InvalidRequest(err.message)))?;
++        self.validate_shared_config_write()
++            .map_err(|error| unresolved(Error::Internal(error.to_string())))?;
+         let service = config.remote_plugin_service_config();
+-        let detail = remote::fetch_remote_plugin_detail_with_download_urls(
++        let mut detail = remote::fetch_remote_plugin_detail_with_download_urls(
+             &service,
+             auth,
+             &marketplace_name,
+@@ -155,47 +157,76 @@ impl PluginsManager {
+                 })
+             })?;
+         let cache_mutation = remote::mark_remote_plugin_cache_mutation_in_flight(
+-            &self.codex_home,
++            self.write_home(),
+             &detail.marketplace_name,
+             &detail.summary.name,
+         );
+         // Materialize first: a failed download must never leave a backend installation behind.
+-        let installed = remote_bundle::download_and_install_remote_plugin_bundle(
++        let installed = remote_bundle::download_and_install_remote_plugin_bundle_with_store(
+             &service,
+-            self.codex_home.clone(),
++            self.write_home().to_path_buf(),
+             bundle,
++            self.store.clone(),
+         )
+         .await
+         .map_err(|err| resolved(Error::Bundle(err)))?;
+-        let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
+-            remote::install_remote_plugin_with_install_attempt_id(
+-                &service,
+-                auth,
+-                &detail.marketplace_name,
+-                &remote_plugin_id,
+-                install_attempt_id,
++        let app_ids_needing_auth = if self.shared_roots.is_some() {
++            codex_config::set_user_plugin_enabled(
++                self.write_home(),
++                plugin_id.as_key(),
++                /*enabled*/ true,
+             )
+             .await
++            .map_err(|error| {
++                resolved(Error::Internal(format!(
++                    "write local plugin enablement: {error}"
++                )))
++            })?;
++            self.clear_caches_after_marketplace_source_refresh(
++                /*installed_plugin_cache_refreshed*/ true,
++                on_effective_plugins_changed.as_ref(),
++            );
++            // The provider install endpoint supplies this optional hint. Local-only
++            // installs preserve ordinary on-use authorization instead of mutating it.
++            None
+         } else {
+-            remote::install_remote_plugin(
+-                &service,
+-                auth,
+-                &detail.marketplace_name,
+-                &remote_plugin_id,
+-            )
+-            .await
++            let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
++                remote::install_remote_plugin_with_install_attempt_id(
++                    &service,
++                    auth,
++                    &detail.marketplace_name,
++                    &remote_plugin_id,
++                    install_attempt_id,
++                )
++                .await
++            } else {
++                remote::install_remote_plugin(
++                    &service,
++                    auth,
++                    &detail.marketplace_name,
++                    &remote_plugin_id,
++                )
++                .await
++            }
++            .map_err(|source| {
++                resolved(Error::Catalog {
++                    context: "install remote plugin",
++                    source,
++                })
++            })?;
++            self.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
++                config,
++                auth.cloned(),
++                on_effective_plugins_changed,
++            );
++            install_result.app_ids_needing_auth
++        };
++        if self.shared_roots.is_some() {
++            detail.summary.installed = true;
++            detail.summary.enabled = true;
++            detail.summary.local_version = Some(installed.plugin_version.clone());
++            detail.summary.installed_at = None;
+         }
+-        .map_err(|source| {
+-            resolved(Error::Catalog {
+-                context: "install remote plugin",
+-                source,
+-            })
+-        })?;
+-        self.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+-            config,
+-            auth.cloned(),
+-            on_effective_plugins_changed,
+-        );
+         Ok(RemotePluginInstallOutcome {
+             installed: PluginInstallOutcome {
+                 plugin_id: installed.plugin_id,
+@@ -207,7 +238,7 @@ impl PluginsManager {
+                 },
+             },
+             detail,
+-            app_ids_needing_auth: install_result.app_ids_needing_auth,
++            app_ids_needing_auth,
+             _cache_mutation: cache_mutation,
+         })
+     }
+@@ -266,10 +297,26 @@ impl PluginsManager {
+                 })
+             })?;
+         let _cache_mutation = remote::mark_remote_plugin_cache_mutation_in_flight(
+-            &self.codex_home,
++            self.write_home(),
+             &plugin_id.marketplace_name,
+             &plugin_id.plugin_name,
+         );
++        if self.shared_roots.is_some() {
++            self.uninstall_plugin_id(plugin_id.clone())
++                .await
++                .map_err(|error| {
++                    resolved(Error::Internal(format!("remove local plugin: {error}")))
++                })?;
++            self.clear_caches_after_marketplace_source_refresh(
++                /*installed_plugin_cache_refreshed*/ true,
++                on_effective_plugins_changed.as_ref(),
++            );
++            return Ok(RemotePluginUninstallOutcome {
++                telemetry,
++                effective_plugins_changed: true,
++                cache_removal_error: None,
++            });
++        }
+         let cache_removal_error =
+             match remote::uninstall_remote_plugin(&service, auth, self.codex_home.clone(), target)
+                 .await
+diff --git a/codex-rs/core-plugins/src/remote_mutations_tests.rs b/codex-rs/core-plugins/src/remote_mutations_tests.rs
+index 727001d..7378fa3 100644
+--- a/codex-rs/core-plugins/src/remote_mutations_tests.rs
++++ b/codex-rs/core-plugins/src/remote_mutations_tests.rs
+@@ -109,3 +109,68 @@ async fn uninstall_serializes_backend_mutations_and_preserves_cache_on_failure()
+         }
+     }
+ }
++
++#[tokio::test]
++async fn shared_remote_uninstall_masks_local_package_without_provider_mutation() {
++    let fixture = TempDir::new().unwrap();
++    let root = std::fs::canonicalize(fixture.path()).unwrap();
++    let account = root.join("account");
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    for directory in [&account, &base, &overlay] {
++        std::fs::create_dir_all(directory).unwrap();
++    }
++    let roots = codex_config::TweakersSharedRoots {
++        native_base_root: codex_utils_absolute_path::AbsolutePathBuf::try_from(base.clone())
++            .unwrap(),
++        overlay_root: codex_utils_absolute_path::AbsolutePathBuf::try_from(overlay.clone())
++            .unwrap(),
++    };
++    let server = MockServer::start().await;
++    let mut config = load_plugins_config(&account, &account).await;
++    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
++    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
++    let auth = auth_manager.auth().await;
++    let mut manager = test_plugins_manager_with_auth_manager(
++        account.clone(),
++        /*restriction_product*/ None,
++        auth_manager,
++    );
++    manager.store =
++        crate::store::PluginStore::try_new_with_shared_roots(account, Some(&roots)).unwrap();
++    manager.shared_roots = Some(roots);
++    let manager = Arc::new(manager);
++    let remote_id = "b1234567-89ab-4cde-8f01-234567890abc";
++    let plugin_id = PluginId::new(
++        "sample".to_string(),
++        REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
++    )
++    .unwrap();
++    let native_manifest = base
++        .join("plugins/cache")
++        .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
++        .join("sample/1.0.0/.codex-plugin/plugin.json");
++    write_file(&native_manifest, r#"{"name":"sample","version":"1.0.0"}"#);
++    Mock::given(method("GET")).and(path(format!("/backend-api/ps/plugins/{remote_id}")))
++        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":remote_id,"name":"sample","scope":"GLOBAL","installation_policy":"AVAILABLE","authentication_policy":"ON_USE","release":{"display_name":"Sample","description":"Sample plugin","interface":{}}})))
++        .expect(1).mount(&server).await;
++    Mock::given(method("POST"))
++        .respond_with(ResponseTemplate::new(500))
++        .expect(0)
++        .mount(&server)
++        .await;
++    let outcome = manager
++        .uninstall_remote_plugin(
++            &config,
++            auth.as_ref(),
++            remote_id,
++            /*on_effective_plugins_changed*/ None,
++        )
++        .await
++        .unwrap();
++    assert!(outcome.effective_plugins_changed);
++    assert!(native_manifest.exists());
++    assert!(!manager.store.is_installed(&plugin_id));
++    let overlay_config = std::fs::read_to_string(overlay.join("config.toml")).unwrap();
++    assert!(overlay_config.contains("enabled = false"));
++}
+diff --git a/codex-rs/core-plugins/src/script_attribution.rs b/codex-rs/core-plugins/src/script_attribution.rs
+index 97e752d..f79cfde 100644
+--- a/codex-rs/core-plugins/src/script_attribution.rs
++++ b/codex-rs/core-plugins/src/script_attribution.rs
+@@ -16,6 +16,7 @@ use crate::startup_sync::read_curated_plugins_sha;
+ use crate::store::DEFAULT_PLUGIN_VERSION;
+ use crate::store::PluginStore;
+ use crate::store::plugin_version_for_source;
++use codex_config::TweakersSharedRoots;
+ use codex_exec_server::ExecutorFileSystem;
+ use codex_exec_server::GetMetadataOptions;
+ use codex_exec_server::ReadFileOptions;
+@@ -65,8 +66,22 @@ pub struct TrustedPluginRoots {
+ 
+ impl TrustedPluginRoots {
+     pub fn from_plugin_load_outcome(loaded_plugins: &PluginLoadOutcome, codex_home: &Path) -> Self {
++        Self::from_plugin_load_outcome_with_shared_roots(
++            loaded_plugins,
++            codex_home,
++            /*shared_roots*/ None,
++        )
++    }
++
++    pub fn from_plugin_load_outcome_with_shared_roots(
++        loaded_plugins: &PluginLoadOutcome,
++        codex_home: &Path,
++        shared_roots: Option<&TweakersSharedRoots>,
++    ) -> Self {
+         let primary_runtime_marketplace_root = primary_runtime_marketplace_root();
+-        let Ok(store) = PluginStore::try_new(codex_home.to_path_buf()) else {
++        let Ok(store) =
++            PluginStore::try_new_with_shared_roots(codex_home.to_path_buf(), shared_roots)
++        else {
+             return Self::default();
+         };
+         let mut seen = HashSet::new();
+@@ -112,12 +127,33 @@ impl TrustedPluginRoots {
+                 {
+                     return None;
+                 }
+-                Some(store.plugin_root(plugin_id, &active_version))
++                store.active_plugin_root(plugin_id)
+             }
+             OPENAI_CURATED_MARKETPLACE_NAME | OPENAI_API_CURATED_MARKETPLACE_NAME => {
++                let codex_home = store.inherited_codex_home(plugin_id).unwrap_or_else(|| {
++                    store
++                        .shared_roots()
++                        .map(|roots| {
++                            if read_curated_plugins_sha(roots.overlay_root.as_path()).is_some() {
++                                roots.overlay_root.as_path()
++                            } else {
++                                roots.native_base_root.as_path()
++                            }
++                        })
++                        .unwrap_or(codex_home)
++                });
+                 let curated_sha = read_curated_plugins_sha(codex_home)?;
+-                let expected_root =
+-                    store.plugin_root(plugin_id, &curated_plugin_cache_version(&curated_sha));
++                let expected_version = curated_plugin_cache_version(&curated_sha);
++                let expected_root = if store.shared_roots().is_some() {
++                    if store.active_plugin_version(plugin_id).as_deref()
++                        != Some(expected_version.as_str())
++                    {
++                        return None;
++                    }
++                    store.active_plugin_root(plugin_id)?
++                } else {
++                    store.plugin_root(plugin_id, &expected_version)
++                };
+                 let marketplace_path = match plugin_id.marketplace_name.as_str() {
+                     OPENAI_CURATED_MARKETPLACE_NAME => curated_plugins_repo_path(codex_home)
+                         .join(".agents/plugins/marketplace.json"),
+@@ -150,7 +186,14 @@ impl TrustedPluginRoots {
+                     return None;
+                 }
+                 let plugin_version = plugin_version_for_source(source_root.as_path()).ok()?;
+-                Some(store.plugin_root(plugin_id, &plugin_version))
++                if store.shared_roots().is_some() {
++                    (store.active_plugin_version(plugin_id).as_deref()
++                        == Some(plugin_version.as_str()))
++                    .then(|| store.active_plugin_root(plugin_id))
++                    .flatten()
++                } else {
++                    Some(store.plugin_root(plugin_id, &plugin_version))
++                }
+             }
+             _ => None,
+         }
+diff --git a/codex-rs/core-plugins/src/store.rs b/codex-rs/core-plugins/src/store.rs
+index 4f37bbe..b01c108 100644
+--- a/codex-rs/core-plugins/src/store.rs
++++ b/codex-rs/core-plugins/src/store.rs
+@@ -3,6 +3,7 @@ use crate::manifest::PluginManifest;
+ use crate::manifest::PluginManifestFormat;
+ use crate::manifest::load_plugin_manifest;
+ use crate::manifest::parse_plugin_manifest;
++use codex_config::TweakersSharedRoots;
+ use codex_plugin::PluginId;
+ use codex_plugin::validate_plugin_segment;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -48,6 +49,7 @@ pub struct PluginStore {
+     codex_home: AbsolutePathBuf,
+     root: AbsolutePathBuf,
+     data_root: AbsolutePathBuf,
++    shared_roots: Option<TweakersSharedRoots>,
+ }
+ 
+ pub(crate) struct ActivePluginInstallation {
+@@ -105,8 +107,20 @@ impl PluginStore {
+     }
+ 
+     pub fn try_new(codex_home: PathBuf) -> Result<Self, PluginStoreError> {
+-        let root = AbsolutePathBuf::from_absolute_path_checked(codex_home.join(PLUGINS_CACHE_DIR))
+-            .map_err(|err| PluginStoreError::io("failed to resolve plugin cache root", err))?;
++        Self::try_new_with_shared_roots(codex_home, /*shared_roots*/ None)
++    }
++
++    /// Keeps package writes in the Tweakers overlay and account data in CODEX_HOME.
++    pub fn try_new_with_shared_roots(
++        codex_home: PathBuf,
++        shared_roots: Option<&TweakersSharedRoots>,
++    ) -> Result<Self, PluginStoreError> {
++        let package_home = shared_roots
++            .map(|roots| roots.overlay_root.as_path())
++            .unwrap_or(codex_home.as_path());
++        let root =
++            AbsolutePathBuf::from_absolute_path_checked(package_home.join(PLUGINS_CACHE_DIR))
++                .map_err(|err| PluginStoreError::io("failed to resolve plugin cache root", err))?;
+         let data_root =
+             AbsolutePathBuf::from_absolute_path_checked(codex_home.join(PLUGINS_DATA_DIR))
+                 .map_err(|err| PluginStoreError::io("failed to resolve plugin data root", err))?;
+@@ -117,6 +131,7 @@ impl PluginStore {
+             codex_home,
+             root,
+             data_root,
++            shared_roots: shared_roots.cloned(),
+         })
+     }
+ 
+@@ -124,6 +139,10 @@ impl PluginStore {
+         &self.root
+     }
+ 
++    pub(crate) fn shared_roots(&self) -> Option<&TweakersSharedRoots> {
++        self.shared_roots.as_ref()
++    }
++
+     pub(crate) fn codex_home(&self) -> &AbsolutePathBuf {
+         &self.codex_home
+     }
+@@ -167,31 +186,62 @@ impl PluginStore {
+     }
+ 
+     pub fn active_plugin_version(&self, plugin_id: &PluginId) -> Option<String> {
+-        let mut discovered_versions = fs::read_dir(self.plugin_base_root(plugin_id).as_path())
+-            .ok()?
+-            .filter_map(Result::ok)
+-            .filter_map(|entry| {
+-                entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
+-                entry.file_name().into_string().ok()
+-            })
+-            .filter(|version| validate_plugin_version_segment(version).is_ok())
+-            .collect::<Vec<_>>();
+-        discovered_versions.sort_unstable_by(|left, right| compare_plugin_versions(left, right));
+-        if discovered_versions.is_empty() {
+-            None
+-        } else if discovered_versions
+-            .iter()
+-            .any(|version| version == DEFAULT_PLUGIN_VERSION)
+-        {
+-            Some(DEFAULT_PLUGIN_VERSION.to_string())
+-        } else {
+-            discovered_versions.pop()
+-        }
++        self.active_plugin_root(plugin_id)?
++            .as_path()
++            .file_name()?
++            .to_str()
++            .map(str::to_owned)
+     }
+ 
+     pub fn active_plugin_root(&self, plugin_id: &PluginId) -> Option<AbsolutePathBuf> {
+-        self.active_plugin_version(plugin_id)
+-            .map(|plugin_version| self.plugin_root(plugin_id, &plugin_version))
++        if self.is_tombstoned(plugin_id) {
++            return None;
++        }
++        let local = self.plugin_base_root(plugin_id);
++        if self.shared_roots.is_some() && ensure_unlinked_path(local.as_path()).is_err() {
++            return None;
++        }
++        if let Some(version) = active_version_in(local.as_path()) {
++            return Some(local.join(version));
++        }
++        let roots = self.shared_roots.as_ref()?;
++        let inherited = roots
++            .native_base_root
++            .join(PLUGINS_CACHE_DIR)
++            .join(&plugin_id.marketplace_name)
++            .join(&plugin_id.plugin_name);
++        active_version_in(inherited.as_path()).map(|version| inherited.join(version))
++    }
++
++    pub(crate) fn inherited_codex_home(&self, plugin_id: &PluginId) -> Option<&Path> {
++        let roots = self.shared_roots.as_ref()?;
++        let active = self.active_plugin_root(plugin_id)?;
++        active
++            .as_path()
++            .starts_with(roots.native_base_root.as_path())
++            .then_some(roots.native_base_root.as_path())
++    }
++
++    /// Background refresh must not turn inherited packages into overlay copies.
++    pub(crate) fn skip_automatic_refresh(&self, plugin_id: &PluginId) -> bool {
++        self.is_tombstoned(plugin_id) || self.inherited_codex_home(plugin_id).is_some()
++    }
++
++    fn tombstone_path(&self, plugin_id: &PluginId) -> Option<AbsolutePathBuf> {
++        let roots = self.shared_roots.as_ref()?;
++        let digest = Sha256::digest(plugin_id.as_key().as_bytes());
++        Some(
++            roots
++                .overlay_root
++                .join("plugins/tweakers-removed")
++                .join(format!("{digest:x}")),
++        )
++    }
++
++    fn is_tombstoned(&self, plugin_id: &PluginId) -> bool {
++        self.tombstone_path(plugin_id).is_some_and(|path| {
++            !matches!(fs::symlink_metadata(path.as_path()), Err(error) if error.kind() == io::ErrorKind::NotFound)
++        })
+     }
+ 
+     pub(crate) fn active_plugin_installation(
+@@ -239,6 +289,17 @@ impl PluginStore {
+             ));
+         }
+         let path = self.remote_plugin_install_metadata_path(plugin_id);
++        if self.shared_roots.is_some() {
++            ensure_unlinked_path(path.as_path())?;
++            if let Some(parent) = path.as_path().parent() {
++                fs::create_dir_all(parent).map_err(|error| {
++                    PluginStoreError::io(
++                        "failed to create private plugin metadata directory",
++                        error,
++                    )
++                })?;
++            }
++        }
+         let parent = path.as_path().parent().ok_or_else(|| {
+             PluginStoreError::Invalid(format!(
+                 "remote plugin install metadata path has no parent: {}",
+@@ -361,6 +422,9 @@ impl PluginStore {
+         }
+         validate_plugin_version_segment(&plugin_version).map_err(PluginStoreError::Invalid)?;
+         let installed_path = self.plugin_root(&plugin_id, &plugin_version);
++        if self.shared_roots.is_some() {
++            ensure_unlinked_path(self.plugin_base_root(&plugin_id).as_path())?;
++        }
+         replace_plugin_root_atomically(
+             source_path.as_path(),
+             self.plugin_base_root(&plugin_id).as_path(),
+@@ -368,6 +432,19 @@ impl PluginStore {
+             manifest,
+         )?;
+         self.remove_remote_plugin_install_metadata(&plugin_id)?;
++        if let Some(tombstone) = self.tombstone_path(&plugin_id) {
++            ensure_unlinked_path(tombstone.as_path())?;
++            match fs::remove_file(tombstone.as_path()) {
++                Ok(()) => {}
++                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++                Err(error) => {
++                    return Err(PluginStoreError::io(
++                        "failed to clear plugin removal",
++                        error,
++                    ));
++                }
++            }
++        }
+ 
+         Ok(PluginInstallResult {
+             plugin_id,
+@@ -377,12 +454,44 @@ impl PluginStore {
+     }
+ 
+     pub fn uninstall(&self, plugin_id: &PluginId) -> Result<(), PluginStoreError> {
++        if let Some(tombstone) = self.tombstone_path(plugin_id) {
++            ensure_unlinked_path(tombstone.as_path())?;
++            ensure_unlinked_path(self.plugin_base_root(plugin_id).as_path())?;
++            let parent = tombstone
++                .as_path()
++                .parent()
++                .ok_or_else(|| PluginStoreError::Invalid("tombstone has no parent".to_string()))?;
++            fs::create_dir_all(parent).map_err(|error| {
++                PluginStoreError::io("failed to create plugin removal directory", error)
++            })?;
++            let mut temporary = tempfile::NamedTempFile::new_in(parent)
++                .map_err(|error| PluginStoreError::io("failed to stage plugin removal", error))?;
++            temporary
++                .write_all(b"removed\n")
++                .map_err(|error| PluginStoreError::io("failed to write plugin removal", error))?;
++            temporary
++                .as_file()
++                .sync_all()
++                .map_err(|error| PluginStoreError::io("failed to sync plugin removal", error))?;
++            temporary.persist(tombstone.as_path()).map_err(|error| {
++                PluginStoreError::io("failed to persist plugin removal", error.error)
++            })?;
++            self.remove_remote_plugin_install_metadata(plugin_id)?;
++        }
+         remove_existing_target(self.plugin_base_root(plugin_id).as_path())
+     }
+ 
+     fn remote_plugin_install_metadata_path(&self, plugin_id: &PluginId) -> AbsolutePathBuf {
+-        self.plugin_base_root(plugin_id)
+-            .join(REMOTE_PLUGIN_INSTALL_METADATA_FILE)
++        if self.shared_roots.is_some() {
++            self.codex_home
++                .join("plugins/tweakers-install-metadata")
++                .join(&plugin_id.marketplace_name)
++                .join(&plugin_id.plugin_name)
++                .join(REMOTE_PLUGIN_INSTALL_METADATA_FILE)
++        } else {
++            self.plugin_base_root(plugin_id)
++                .join(REMOTE_PLUGIN_INSTALL_METADATA_FILE)
++        }
+     }
+ 
+     fn remove_remote_plugin_install_metadata(
+@@ -390,6 +499,9 @@ impl PluginStore {
+         plugin_id: &PluginId,
+     ) -> Result<(), PluginStoreError> {
+         let path = self.remote_plugin_install_metadata_path(plugin_id);
++        if self.shared_roots.is_some() {
++            ensure_unlinked_path(path.as_path())?;
++        }
+         match fs::remove_file(path.as_path()) {
+             Ok(()) => Ok(()),
+             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+@@ -401,6 +513,49 @@ impl PluginStore {
+     }
+ }
+ 
++fn active_version_in(root: &Path) -> Option<String> {
++    let mut versions = fs::read_dir(root)
++        .ok()?
++        .filter_map(Result::ok)
++        .filter_map(|entry| {
++            entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
++            entry.file_name().into_string().ok()
++        })
++        .filter(|version| validate_plugin_version_segment(version).is_ok())
++        .collect::<Vec<_>>();
++    versions.sort_unstable_by(|left, right| compare_plugin_versions(left, right));
++    if versions
++        .iter()
++        .any(|version| version == DEFAULT_PLUGIN_VERSION)
++    {
++        Some(DEFAULT_PLUGIN_VERSION.to_string())
++    } else {
++        versions.pop()
++    }
++}
++
++// Overlay cache ancestors cannot redirect a native writer into the base tree.
++pub(crate) fn ensure_unlinked_path(path: &Path) -> Result<(), PluginStoreError> {
++    for ancestor in path.ancestors() {
++        match fs::symlink_metadata(ancestor) {
++            Ok(metadata) if metadata.file_type().is_symlink() => {
++                return Err(PluginStoreError::Invalid(
++                    "shared plugin write path contains a symlink".to_string(),
++                ));
++            }
++            Ok(_) => {}
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => {
++                return Err(PluginStoreError::io(
++                    "failed to inspect shared plugin write path",
++                    error,
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
+ #[derive(Debug, thiserror::Error)]
+ pub enum PluginStoreError {
+     #[error("{context}: {source}")]
+diff --git a/codex-rs/core-plugins/src/store_tests.rs b/codex-rs/core-plugins/src/store_tests.rs
+index 4a3d76e..632c8bf 100644
+--- a/codex-rs/core-plugins/src/store_tests.rs
++++ b/codex-rs/core-plugins/src/store_tests.rs
+@@ -747,3 +747,190 @@ fn install_rejects_manifest_names_that_do_not_match_marketplace_plugin_name() {
+         "plugin.json name `manifest-name` does not match marketplace plugin name `different-name`"
+     );
+ }
++
++#[test]
++fn shared_plugin_overlay_reads_base_and_keeps_mutations_shared_but_metadata_private() {
++    let tmp = tempdir().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    let account_a = root.join("account-a");
++    let account_b = root.join("account-b");
++    for directory in [&base, &overlay, &account_a, &account_b] {
++        fs::create_dir_all(directory).unwrap();
++    }
++    let roots = TweakersSharedRoots {
++        native_base_root: AbsolutePathBuf::try_from(base.clone()).unwrap(),
++        overlay_root: AbsolutePathBuf::try_from(overlay.clone()).unwrap(),
++    };
++    let plugin_id = PluginId::parse("sample@debug").unwrap();
++    write_plugin_with_version(
++        &base.join("plugins/cache/debug/sample"),
++        "1.0.0",
++        "sample",
++        Some("1.0.0"),
++    );
++    let native = PluginStore::new(base);
++    native
++        .write_remote_plugin_id(&plugin_id, "native-private-id")
++        .unwrap();
++    let first = PluginStore::try_new_with_shared_roots(account_a.clone(), Some(&roots)).unwrap();
++    let second = PluginStore::try_new_with_shared_roots(account_b, Some(&roots)).unwrap();
++    let inherited = native.active_plugin_root(&plugin_id).unwrap();
++    let original_manifest = fs::read(inherited.join(".codex-plugin/plugin.json")).unwrap();
++    assert_eq!(
++        first.active_plugin_root(&plugin_id),
++        Some(inherited.clone())
++    );
++    assert_eq!(
++        second.active_plugin_root(&plugin_id),
++        Some(inherited.clone())
++    );
++    assert_eq!(first.remote_plugin_id(&plugin_id).unwrap(), None);
++    assert!(!overlay.join("plugins/cache").exists());
++    assert_eq!(
++        first.plugin_data_root(&plugin_id),
++        AbsolutePathBuf::try_from(account_a.join("plugins/data/sample-debug")).unwrap()
++    );
++
++    first.uninstall(&plugin_id).unwrap();
++    assert_eq!(first.active_plugin_root(&plugin_id), None);
++    assert_eq!(second.active_plugin_root(&plugin_id), None);
++    assert_eq!(
++        native.active_plugin_root(&plugin_id),
++        Some(inherited.clone())
++    );
++
++    write_plugin_with_version(&root, "source", "sample", Some("2.0.0"));
++    let installed = first
++        .install(
++            AbsolutePathBuf::try_from(root.join("source")).unwrap(),
++            plugin_id.clone(),
++        )
++        .unwrap();
++    assert_eq!(
++        first.active_plugin_root(&plugin_id),
++        Some(installed.installed_path.clone())
++    );
++    assert_eq!(
++        second.active_plugin_root(&plugin_id),
++        Some(installed.installed_path.clone())
++    );
++    assert!(installed.installed_path.as_path().starts_with(&overlay));
++    first
++        .write_remote_plugin_id(&plugin_id, "account-a-id")
++        .unwrap();
++    assert_eq!(
++        first.remote_plugin_id(&plugin_id).unwrap(),
++        Some("account-a-id".to_string())
++    );
++    assert_eq!(second.remote_plugin_id(&plugin_id).unwrap(), None);
++    assert_eq!(
++        native.remote_plugin_id(&plugin_id).unwrap(),
++        Some("native-private-id".to_string())
++    );
++    assert_eq!(
++        fs::read(inherited.join(".codex-plugin/plugin.json")).unwrap(),
++        original_manifest
++    );
++}
++
++#[test]
++fn shared_plugin_background_refresh_does_not_materialize_inherited_package_or_tombstone() {
++    let tmp = tempdir().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    let account = root.join("account");
++    let repository = root.join("repository");
++    for directory in [
++        &base,
++        &overlay,
++        &account,
++        &repository.join(".git"),
++        &repository.join(".agents/plugins"),
++    ] {
++        fs::create_dir_all(directory).unwrap();
++    }
++    write_plugin_with_version(
++        &base.join("plugins/cache/debug/sample"),
++        "1.0.0",
++        "sample",
++        Some("1.0.0"),
++    );
++    write_plugin_with_version(&repository, "sample", "sample", Some("2.0.0"));
++    fs::write(repository.join(".agents/plugins/marketplace.json"), r#"{"name":"debug","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#).unwrap();
++    let roots = TweakersSharedRoots {
++        native_base_root: AbsolutePathBuf::try_from(base.clone()).unwrap(),
++        overlay_root: AbsolutePathBuf::try_from(overlay.clone()).unwrap(),
++    };
++    let store = PluginStore::try_new_with_shared_roots(account, Some(&roots)).unwrap();
++    let plugin_id = PluginId::parse("sample@debug").unwrap();
++    for removed in [false, true] {
++        if removed {
++            store.uninstall(&plugin_id).unwrap();
++        }
++        let result =
++            crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed_with_store(
++                &overlay,
++                &[AbsolutePathBuf::try_from(repository.clone()).unwrap()],
++                &[plugin_id.as_key()],
++                crate::PluginGitMode::Automatic,
++                &store,
++            )
++            .unwrap();
++        assert!(!result.cache_refreshed);
++        assert!(result.errors.is_empty());
++        assert!(!overlay.join("plugins/cache/debug/sample").exists());
++        assert!(
++            base.join("plugins/cache/debug/sample/1.0.0/.codex-plugin/plugin.json")
++                .exists()
++        );
++    }
++}
++
++#[cfg(unix)]
++#[test]
++fn shared_plugin_writes_reject_overlay_symlink_to_base() {
++    let tmp = tempdir().unwrap();
++    let root = fs::canonicalize(tmp.path()).unwrap();
++    let base = root.join("base");
++    let overlay = root.join("overlay");
++    let account = root.join("account");
++    for directory in [&base, &overlay, &account] {
++        fs::create_dir_all(directory).unwrap();
++    }
++    write_plugin_with_version(
++        &base.join("plugins/cache/debug/sample"),
++        "1.0.0",
++        "sample",
++        Some("1.0.0"),
++    );
++    write_plugin_with_version(&root, "source", "sample", Some("2.0.0"));
++    fs::create_dir_all(overlay.join("plugins/cache/debug")).unwrap();
++    std::os::unix::fs::symlink(
++        base.join("plugins/cache/debug/sample"),
++        overlay.join("plugins/cache/debug/sample"),
++    )
++    .unwrap();
++    let roots = TweakersSharedRoots {
++        native_base_root: AbsolutePathBuf::try_from(base.clone()).unwrap(),
++        overlay_root: AbsolutePathBuf::try_from(overlay).unwrap(),
++    };
++    let store = PluginStore::try_new_with_shared_roots(account, Some(&roots)).unwrap();
++    let plugin_id = PluginId::parse("sample@debug").unwrap();
++    assert!(
++        store
++            .install(
++                AbsolutePathBuf::try_from(root.join("source")).unwrap(),
++                plugin_id.clone()
++            )
++            .is_err()
++    );
++    assert!(store.uninstall(&plugin_id).is_err());
++    assert!(
++        base.join("plugins/cache/debug/sample/1.0.0/.codex-plugin/plugin.json")
++            .exists()
++    );
++    assert!(!base.join("plugins/cache/debug/sample/2.0.0").exists());
++}
+diff --git a/codex-rs/core/src/agents_md.rs b/codex-rs/core/src/agents_md.rs
+index 644407d..dc8283b 100644
+--- a/codex-rs/core/src/agents_md.rs
++++ b/codex-rs/core/src/agents_md.rs
+@@ -301,6 +301,7 @@ impl LoadedAgentsMd {
+             user_instructions: Some(Instructions {
+                 text: contents,
+                 source: path,
++                additional_sources: Vec::new(),
+             }),
+             entries: Vec::new(),
+         }
+@@ -441,7 +442,11 @@ impl LoadedAgentsMd {
+     pub fn sources(&self) -> impl Iterator<Item = PathUri> + '_ {
+         self.user_instructions
+             .iter()
+-            .map(|instructions| PathUri::from_abs_path(&instructions.source))
++            .flat_map(|instructions| {
++                std::iter::once(&instructions.source)
++                    .chain(&instructions.additional_sources)
++                    .map(PathUri::from_abs_path)
++            })
+             .chain(
+                 self.entries
+                     .iter()
+diff --git a/codex-rs/core/src/agents_md_tests.rs b/codex-rs/core/src/agents_md_tests.rs
+index bfa1f87..95da960 100644
+--- a/codex-rs/core/src/agents_md_tests.rs
++++ b/codex-rs/core/src/agents_md_tests.rs
+@@ -508,6 +508,7 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
+     config.project_doc_max_bytes = limit;
+ 
+     let user_instructions = instructions.map(|text| Instructions {
++        additional_sources: Vec::new(),
+         text: text.to_owned(),
+         source: config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
+     });
+@@ -557,6 +558,7 @@ async fn make_config_with_project_root_markers(
+     config.cwd = root.abs();
+     config.project_doc_max_bytes = limit;
+     let user_instructions = instructions.map(|text| Instructions {
++        additional_sources: Vec::new(),
+         text: text.to_owned(),
+         source: config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
+     });
+@@ -1512,6 +1514,7 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
+ 
+     let expected = LoadedAgentsMd {
+         user_instructions: Some(Instructions {
++            additional_sources: Vec::new(),
+             text: "global doc".to_string(),
+             source: global_agents.clone(),
+         }),
+diff --git a/codex-rs/core/src/config/edit.rs b/codex-rs/core/src/config/edit.rs
+index 5244701..47b8898 100644
+--- a/codex-rs/core/src/config/edit.rs
++++ b/codex-rs/core/src/config/edit.rs
+@@ -787,6 +787,7 @@ fn apply_blocking_to_resolved_file(
+ #[derive(Default)]
+ pub struct ConfigEditsBuilder {
+     config_path: PathBuf,
++    shared_roots: Option<codex_config::TweakersSharedRoots>,
+     edits: Vec<ConfigEdit>,
+ }
+ 
+@@ -801,12 +802,15 @@ impl ConfigEditsBuilder {
+             .get_user_config_file()
+             .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
+             .unwrap_or_else(|| config.codex_home.join(CONFIG_TOML_FILE).to_path_buf());
+-        Self::for_config_path(&config_path)
++        let mut builder = Self::for_config_path(&config_path);
++        builder.shared_roots = config.tweakers_shared_roots.clone();
++        builder
+     }
+ 
+     pub fn for_config_path(config_path: &Path) -> Self {
+         Self {
+             config_path: config_path.to_path_buf(),
++            shared_roots: None,
+             edits: Vec::new(),
+         }
+     }
+@@ -987,16 +991,25 @@ impl ConfigEditsBuilder {
+ 
+     /// Apply edits on a blocking thread.
+     pub fn apply_blocking(self) -> anyhow::Result<()> {
++        if let Some(roots) = &self.shared_roots {
++            let expected = codex_config::LoaderOverrides {
++                tweakers_shared_roots: Some(roots.clone()),
++                ..Default::default()
++            }
++            .user_config_path(roots.overlay_root.as_path())?;
++            anyhow::ensure!(
++                expected.as_path() == self.config_path,
++                "Tweakers config write escaped overlay"
++            );
++        }
+         apply_blocking_to_resolved_file(&self.config_path, &self.edits)
+     }
+ 
+     /// Apply edits asynchronously via a blocking offload.
+     pub async fn apply(self) -> anyhow::Result<()> {
+-        task::spawn_blocking(move || {
+-            apply_blocking_to_resolved_file(&self.config_path, &self.edits)
+-        })
+-        .await
+-        .context("config persistence task panicked")?
++        task::spawn_blocking(move || self.apply_blocking())
++            .await
++            .context("config persistence task panicked")?
+     }
+ }
+ 
+diff --git a/codex-rs/core/src/config/edit_tests.rs b/codex-rs/core/src/config/edit_tests.rs
+index 19434c3..0fc0b7f 100644
+--- a/codex-rs/core/src/config/edit_tests.rs
++++ b/codex-rs/core/src/config/edit_tests.rs
+@@ -1653,3 +1653,42 @@ fn replace_mcp_servers_blocking_clears_table_when_empty() {
+     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+     assert!(!contents.contains("mcp_servers"));
+ }
++
++#[cfg(unix)]
++#[test]
++fn tweakers_shared_edits_write_overlay_and_reject_linked_config() {
++    let tmp = tempdir().expect("tmpdir");
++    let base = tmp.path().join("base");
++    let overlay = tmp.path().join("overlay");
++    std::fs::create_dir_all(&base).unwrap();
++    std::fs::create_dir_all(&overlay).unwrap();
++    let base = std::fs::canonicalize(base).unwrap();
++    let overlay = std::fs::canonicalize(overlay).unwrap();
++    let original = "model = \"base-model\"\n";
++    std::fs::write(base.join(CONFIG_TOML_FILE), original).unwrap();
++    let roots =
++        codex_config::TweakersSharedRoots::from_paths(Some(base.clone()), Some(overlay.clone()))
++            .unwrap()
++            .unwrap();
++    let mut builder = ConfigEditsBuilder::new(&overlay).set_model(Some("overlay-model"), None);
++    builder.shared_roots = Some(roots.clone());
++    builder.apply_blocking().unwrap();
++    assert!(
++        std::fs::read_to_string(overlay.join(CONFIG_TOML_FILE))
++            .unwrap()
++            .contains("overlay-model")
++    );
++    assert_eq!(
++        std::fs::read_to_string(base.join(CONFIG_TOML_FILE)).unwrap(),
++        original
++    );
++    std::fs::remove_file(overlay.join(CONFIG_TOML_FILE)).unwrap();
++    symlink(base.join(CONFIG_TOML_FILE), overlay.join(CONFIG_TOML_FILE)).unwrap();
++    let mut builder = ConfigEditsBuilder::new(&overlay).set_model(Some("unsafe"), None);
++    builder.shared_roots = Some(roots);
++    assert!(builder.apply_blocking().is_err());
++    assert_eq!(
++        std::fs::read_to_string(base.join(CONFIG_TOML_FILE)).unwrap(),
++        original
++    );
++}
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index dca329a..bf5436c 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -605,6 +605,8 @@ pub enum ThreadStoreConfig {
+ /// Application configuration loaded from disk and merged with overrides.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Config {
++    /// Opt-in shared settings/capabilities; never a replacement for codex_home.
++    pub tweakers_shared_roots: Option<codex_config::TweakersSharedRoots>,
+     /// Provenance for how this [`Config`] was derived (merged layers + enforced
+     /// requirements).
+     pub config_layer_stack: ConfigLayerStack,
+@@ -1438,6 +1440,7 @@ impl ConfigBuilder {
+         let cli_overrides = cli_overrides.unwrap_or_default();
+         let mut harness_overrides = harness_overrides.unwrap_or_default();
+         let loader_overrides = loader_overrides.unwrap_or_default();
++        let tweakers_shared_roots = loader_overrides.tweakers_shared_roots.clone();
+         let cwd_override = harness_overrides.cwd.as_deref().or(fallback_cwd.as_deref());
+         let cwd = match cwd_override {
+             Some(path) => AbsolutePathBuf::relative_to_current_dir(path)?,
+@@ -1483,14 +1486,16 @@ impl ConfigBuilder {
+                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+             }
+         };
+-        Config::load_config_with_layer_stack(
++        let mut config = Config::load_config_with_layer_stack(
+             LOCAL_FS.as_ref(),
+             config_toml,
+             harness_overrides,
+             codex_home,
+             config_layer_stack,
+         )
+-        .await
++        .await?;
++        config.tweakers_shared_roots = tweakers_shared_roots;
++        Ok(config)
+     }
+ 
+     #[cfg(test)]
+@@ -1829,6 +1834,7 @@ impl Config {
+                 .requirements_toml()
+                 .clone(),
+         )?
++        .with_tweakers_shared_roots(refreshed_config.tweakers_shared_roots.clone())
+         .with_user_and_project_exec_policy_rules_ignored(
+             refreshed_config
+                 .config_layer_stack
+@@ -4130,6 +4136,7 @@ impl Config {
+         .map_err(std::io::Error::from)?;
+         let otel = otel::resolve_config(cfg.otel.unwrap_or_default(), &mut startup_warnings);
+         let config = Self {
++            tweakers_shared_roots: config_layer_stack.tweakers_shared_roots().cloned(),
+             model,
+             service_tier,
+             review_model,
+diff --git a/codex-rs/core/src/mcp_skill_dependencies.rs b/codex-rs/core/src/mcp_skill_dependencies.rs
+index 1d4f8fc..a66fcc3 100644
+--- a/codex-rs/core/src/mcp_skill_dependencies.rs
++++ b/codex-rs/core/src/mcp_skill_dependencies.rs
+@@ -123,7 +123,10 @@ async fn maybe_install_mcp_dependencies(
+     }
+ 
+     let config = turn_context.config.as_ref();
+-    let codex_home = config.codex_home.clone();
++    let codex_home = config.tweakers_shared_roots.as_ref().map_or_else(
++        || config.codex_home.clone(),
++        |roots| roots.overlay_root.clone(),
++    );
+     let mut servers = match load_global_mcp_servers(&codex_home).await {
+         Ok(servers) => servers,
+         Err(err) => {
+@@ -145,7 +148,7 @@ async fn maybe_install_mcp_dependencies(
+         return;
+     }
+ 
+-    if let Err(err) = ConfigEditsBuilder::new(&codex_home)
++    if let Err(err) = ConfigEditsBuilder::for_config(config)
+         .replace_mcp_servers(&servers)
+         .apply()
+         .await
+diff --git a/codex-rs/core/src/plugins/mod.rs b/codex-rs/core/src/plugins/mod.rs
+index ca0e71c..c6b6f36 100644
+--- a/codex-rs/core/src/plugins/mod.rs
++++ b/codex-rs/core/src/plugins/mod.rs
+@@ -37,9 +37,10 @@ pub fn plugins_manager_for_config(
+         config.codex_home.clone(),
+         /*bundled_skills_enabled*/ false,
+     ));
+-    PluginsManager::new(
++    PluginsManager::new_with_shared_roots(
+         config.codex_home.to_path_buf(),
+         auth_manager,
+         skill_root_loader,
++        config.tweakers_shared_roots.as_ref(),
+     )
+ }
+diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
+index e5a371e..4f1a61d 100644
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -959,9 +959,10 @@ impl Session {
+             .plugins_manager
+             .plugins_for_config(&plugins_input)
+             .await;
+-        let trusted_plugin_roots = TrustedPluginRoots::from_plugin_load_outcome(
++        let trusted_plugin_roots = TrustedPluginRoots::from_plugin_load_outcome_with_shared_roots(
+             &plugin_outcome,
+             per_turn_config.codex_home.as_path(),
++            per_turn_config.tweakers_shared_roots.as_ref(),
+         );
+         let skills_snapshot = if per_turn_config
+             .features
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index cfa6196..eb437ae 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -449,11 +449,12 @@ impl ThreadManager {
+             config.bundled_skills_enabled(),
+             restriction_product,
+         ));
+-        let plugins_manager = Arc::new(PluginsManager::new_with_options(
++        let plugins_manager = Arc::new(PluginsManager::new_with_options_and_shared_roots(
+             codex_home.to_path_buf(),
+             restriction_product,
+             Arc::clone(&auth_manager),
+             skills_service.clone(),
++            config.tweakers_shared_roots.as_ref(),
+         ));
+         let mcp_manager = Arc::new(McpManager::new_with_extensions(
+             Arc::clone(&plugins_manager),
+diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
+index 74cdb32..263480c 100644
+--- a/codex-rs/core/src/thread_manager_tests.rs
++++ b/codex-rs/core/src/thread_manager_tests.rs
+@@ -1000,6 +1000,7 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
+     .expect("managed requirements stack");
+ 
+     let parent_instructions = codex_extension_api::Instructions {
++        additional_sources: Vec::new(),
+         text: "parent user instructions must not be inherited".to_string(),
+         source: config.codex_home.join("AGENTS.md"),
+     };
+diff --git a/codex-rs/core/src/tools/handlers/request_plugin_install.rs b/codex-rs/core/src/tools/handlers/request_plugin_install.rs
+index ede1da3..b785567 100644
+--- a/codex-rs/core/src/tools/handlers/request_plugin_install.rs
++++ b/codex-rs/core/src/tools/handlers/request_plugin_install.rs
+@@ -339,7 +339,9 @@ async fn maybe_persist_disabled_install_request(
+         return;
+     }
+ 
+-    if let Err(err) = persist_disabled_install_request(&turn.config.codex_home, tool).await {
++    if let Err(err) =
++        persist_disabled_install_request(ConfigEditsBuilder::for_config(&turn.config), tool).await
++    {
+         warn!(
+             error = %err,
+             tool_id = tool.id(),
+@@ -368,10 +370,10 @@ fn request_plugin_install_response_requests_persistent_disable(
+ }
+ 
+ async fn persist_disabled_install_request(
+-    codex_home: &codex_utils_absolute_path::AbsolutePathBuf,
++    builder: ConfigEditsBuilder,
+     tool: &DiscoverableTool,
+ ) -> anyhow::Result<()> {
+-    ConfigEditsBuilder::new(codex_home)
++    builder
+         .with_edits([ConfigEdit::AddToolSuggestDisabledTool(
+             disabled_install_request(tool),
+         )])
+diff --git a/codex-rs/core/src/tools/handlers/request_plugin_install_tests.rs b/codex-rs/core/src/tools/handlers/request_plugin_install_tests.rs
+index 631d075..57901e1 100644
+--- a/codex-rs/core/src/tools/handlers/request_plugin_install_tests.rs
++++ b/codex-rs/core/src/tools/handlers/request_plugin_install_tests.rs
+@@ -16,7 +16,6 @@ use codex_login::test_support::auth_manager_from_optional_auth;
+ use codex_rmcp_client::ElicitationResponse;
+ use codex_tools::DiscoverablePluginInfo;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+-use core_test_support::PathExt;
+ use pretty_assertions::assert_eq;
+ use rmcp::model::ElicitationAction;
+ use serde_json::json;
+@@ -142,7 +141,7 @@ async fn persist_disabled_install_request_writes_connector_config() {
+     let codex_home = tempdir().expect("tempdir should succeed");
+     let tool = connector_tool("connector_calendar", "Google Calendar");
+ 
+-    persist_disabled_install_request(&codex_home.path().abs(), &tool)
++    persist_disabled_install_request(ConfigEditsBuilder::new(codex_home.path()), &tool)
+         .await
+         .expect("persist connector disable");
+ 
+@@ -171,7 +170,7 @@ async fn persist_disabled_install_request_writes_plugin_config() {
+         app_connector_ids: Vec::new(),
+     }));
+ 
+-    persist_disabled_install_request(&codex_home.path().abs(), &tool)
++    persist_disabled_install_request(ConfigEditsBuilder::new(codex_home.path()), &tool)
+         .await
+         .expect("persist plugin disable");
+ 
+@@ -218,7 +217,7 @@ id = "slack@openai-curated"
+     )
+     .expect("write config");
+ 
+-    persist_disabled_install_request(&codex_home.path().abs(), &tool)
++    persist_disabled_install_request(ConfigEditsBuilder::new(codex_home.path()), &tool)
+         .await
+         .expect("persist connector disable");
+ 
+diff --git a/codex-rs/ext/extension-api/src/user_instructions.rs b/codex-rs/ext/extension-api/src/user_instructions.rs
+index 67b5e07..4387c32 100644
+--- a/codex-rs/ext/extension-api/src/user_instructions.rs
++++ b/codex-rs/ext/extension-api/src/user_instructions.rs
+@@ -16,6 +16,8 @@ pub struct Instructions {
+     pub text: String,
+     /// Absolute filesystem path reported through `instructionSources`.
+     pub source: AbsolutePathBuf,
++    /// Further original files contributing to layered host instructions.
++    pub additional_sources: Vec<AbsolutePathBuf>,
+ }
+ 
+ /// Result of loading host-provided user instructions.
