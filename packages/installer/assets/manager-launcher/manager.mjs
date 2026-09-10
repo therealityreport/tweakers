@@ -36715,20 +36715,32 @@ function assertLifecycleReceiptsIdle(userRoot2, allowance = {}) {
       );
     }
   }
-  const desktop = readDesktopUpdateReceipt(join41(userRoot2, "transactions", "desktop-update.json"));
-  if (desktop) {
+  const checkDesktopReceipt = (desktop, source, allowedTransactionId, contextMayOwn) => {
+    if (!desktop) return;
     const detail = desktopReceiptBlocksLifecycle(desktop);
     const desktopRollbackFailed = desktop.phase === "failed" && /\brollback failed\b/i.test(desktop.error ?? "");
     const unsafeDesktopFailure = desktop.phase === "failed" && (desktop.safeOfficialMode !== true || desktopRollbackFailed);
-    const contextOwns = context?.startsWith("desktop update") === true;
+    const contextOwns = contextMayOwn && context?.startsWith("desktop update") === true;
     const ownsCoupledEnvironment = allowance.environmentRecovery === true && allowance.environmentTransactionId !== void 0 && desktop.environmentTransactionId === allowance.environmentTransactionId && environment !== null && environment.transactionId === allowance.environmentTransactionId && environmentDetail !== null;
-    if (detail !== null && desktop.transactionId !== allowance.desktopTransactionId && !contextOwns && !ownsCoupledEnvironment) {
+    if (detail !== null && desktop.transactionId !== allowedTransactionId && !contextOwns && !ownsCoupledEnvironment) {
       const instruction = unsafeDesktopFailure ? "recover it explicitly before another lifecycle operation" : "resume or cancel it before another lifecycle operation";
       throw new Error(
-        `Desktop update ${desktop.transactionId} is ${detail}; ${instruction}`
+        `${source} ${desktop.transactionId} is ${detail}; ${instruction}`
       );
     }
-  }
+  };
+  checkDesktopReceipt(
+    readDesktopUpdateReceipt(join41(userRoot2, "transactions", "desktop-update.json")),
+    "Desktop update",
+    allowance.desktopTransactionId,
+    true
+  );
+  checkDesktopReceipt(
+    readDesktopUpdateReceipt(join41(userRoot2, "transactions", "chatgpt-app-update.json")),
+    "Official ChatGPT update",
+    allowance.officialUpdateTransactionId,
+    false
+  );
 }
 var init_lifecycle_lock = __esm({
   "src/lifecycle-lock.ts"() {

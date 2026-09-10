@@ -48,6 +48,8 @@ jobs:
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json'
           git diff --exit-code -- \
             packages/native-host/assets/'Tweakers Manager Launcher' \
-            packages/installer/assets/manager-launcher
+            packages/installer/assets/manager-launcher \
+            ':(exclude)packages/installer/assets/manager-launcher/manager.mjs'
+          node scripts/verify-release.mjs --generated-manager-bundle
       - name: Verify canonical tweak catalog remains synchronized
         run: npm run sync:tweaks -- --check
