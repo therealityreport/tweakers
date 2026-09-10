@@ -35,14 +35,16 @@ jobs:
         run: node scripts/verify-release.mjs --manager-artifacts
       - name: Verify deterministic generated files are committed
         run: |
-          # The native host is compiled and ad-hoc signed with the runner's
-          # Xcode SDK and Node headers, so its Mach-O bytes are environment-specific.
-          # The runtime fingerprint intentionally covers those exact bytes and
-          # therefore changes with the same runner-specific native artifact.
+          # Native support binaries are compiled and ad-hoc signed with the
+          # runner's Xcode SDK and Node headers, so their Mach-O bytes are
+          # environment-specific. The runtime fingerprint intentionally covers
+          # those exact bytes and changes with the same runner-specific inputs.
           git diff --exit-code -- \
             store/index.json \
             packages/installer/assets/runtime \
             ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
+            ':(exclude)packages/installer/assets/runtime/.manager-support/app-launcher/Tweakers App Launcher' \
+            ':(exclude)packages/installer/assets/runtime/.manager-support/swap-helper/Tweakers Swap Helper.app/Contents/MacOS/Tweakers Swap Helper' \
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json'
           git diff --exit-code -- \
             packages/native-host/assets/'Tweakers Manager Launcher' \
