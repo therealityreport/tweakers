@@ -84,6 +84,8 @@ export interface CodexSparkleBridgeOptions {
   suppressNativeSideEffects?: boolean;
   /** Runs the bounded Tweakers-owned manual update check without invoking raw Sparkle/XPC. */
   requestManualCheck?: () => void | Promise<void>;
+  /** Consume an existing native availability signal; never schedules discovery. */
+  onUpdateAvailable?: () => void;
   /** Runs the bounded metadata-only check used by OpenAI's startup/interval timer. */
   requestBackgroundCheck?: () => void | Promise<void>;
   /** Starts Tweakers' durable desktop-update transaction from OpenAI's native Update control. */
@@ -208,7 +210,9 @@ export class CodexSparkleBridge {
       if (this.state.installProgressPercent !== null) this.state.lifecycle = "installing";
     });
     this.wrapSink(addon, "setUpdateReadySink", (value) => {
+      const previouslyReady = this.state.ready;
       this.state.ready = value === true;
+      if (this.state.ready && !previouslyReady) this.options.onUpdateAvailable?.();
       if (this.state.ready) this.state.lifecycle = "ready";
       else if (this.state.lifecycle === "ready") this.state.lifecycle = "idle";
       this.refreshActionability();

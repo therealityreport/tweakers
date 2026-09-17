@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -29,6 +30,7 @@ import {
   signatureInfo,
   signCandidateReceiptResourceBundle,
   signCodexApp,
+  restoreVerifiedSignedBackend,
   stableDesignatedRequirement,
   verifyCandidateReceiptResourceBundle,
   verifySignature,
@@ -695,4 +697,28 @@ test("contained signing identity is passed to codesign with an explicit keychain
     "/tmp/contained.keychain-db",
   ]);
   assert.deepEqual(codeSigningKeychainArgs(undefined), []);
+});
+
+
+test("baseline maintenance preserves exact signed backend bytes through outer signing", (t) => {
+  const identity = findDisposableSigningIdentity(t);
+  if (!identity) return;
+  const root = mkdtempSync(join(tmpdir(), "tweakers-retained-backend-"));
+  try {
+    const app = join(root, "Audit.app"), source = join(root, "retained-codex"), target = join(app, "Contents", "Resources", "codex");
+    mkdirSync(join(app, "Contents", "MacOS"), { recursive: true });
+    mkdirSync(join(app, "Contents", "Resources"));
+    copyFileSync("/usr/bin/true", join(app, "Contents", "MacOS", "Audit"));
+    copyFileSync("/usr/bin/true", source);
+    assert.equal(spawnSync("codesign", ["--force", "--sign", identity.hash, "--identifier", "co.tweakers.retained-backend", source]).status, 0);
+    copyFileSync(source, target);
+    writePlist(join(app, "Contents", "Info.plist"), { CFBundleIdentifier: "co.tweakers.maintenance-test", CFBundleExecutable: "Audit", CFBundlePackageType: "APPL" });
+    assert.equal(spawnSync("codesign", ["--force", "--sign", identity.hash, app]).status, 0);
+    const bytes = readFileSync(source), sha256 = createHash("sha256").update(bytes).digest("hex");
+    assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256: "0".repeat(64) }, identity.hash), /signature or bytes changed/);
+    assert.throws(() => restoreVerifiedSignedBackend(app, { sourcePath: source, sha256 }, "0".repeat(40)), /signature or bytes changed/);
+    signCodexApp(app, { preparedIdentity: { ...identity, created: false }, signingPosture: "strict", retainedSignedBackend: { sourcePath: source, sha256 } });
+    assert.deepEqual(readFileSync(target), bytes);
+    assert.equal(verifySignature(app).ok, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

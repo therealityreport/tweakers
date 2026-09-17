@@ -200,3 +200,36 @@ test("Accounts native bridge binds one OAuth callback to its original account", 
   await assert.rejects(callback(revoked.captured, revoked.redirect), /stale-native-selection/);
   bridge.dispose();
 });
+
+
+test("Accounts startup waits for the verified asynchronous renderer wrapper", async () => {
+  const bridge = createAccountsNativeBridge();
+  const hash = "e".repeat(64);
+  bridge.setCompatibility({ compatible: true, hookSetSha256: hash });
+  assert.equal(bridge.api.status().reason, "native-wrapper-uninitialized");
+  let settled = false;
+  const ready = bridge.waitForInitialization(1000).then((status) => { settled = true; return status; });
+  await Promise.resolve();
+  assert.equal(settled, false, "DOMContentLoaded must not turn a pending wrapper into a failure");
+  assert.equal(bridge.transport.initialize({ version: 1, hookSetSha256: hash }), true);
+  assert.equal((await ready).compatible, true);
+  bridge.dispose();
+});
+
+test("Accounts initialization wait preserves rejection, timeout, and teardown", async () => {
+  const hash = "e".repeat(64);
+  for (const outcome of ["mismatch", "timeout", "dispose", "ownership"] as const) {
+    const bridge = createAccountsNativeBridge();
+    bridge.setCompatibility({ compatible: true, hookSetSha256: hash });
+    const ready = bridge.waitForInitialization(outcome === "timeout" ? 1 : 1000);
+    if (outcome === "mismatch") assert.equal(bridge.transport.initialize({ version: 1, hookSetSha256: "f".repeat(64) }), false);
+    if (outcome === "dispose") bridge.dispose();
+    if (outcome === "ownership") bridge.setCompatibility({ compatible: false, reason: "Accounts is unavailable in this window." });
+    const status = await ready;
+    assert.equal(status.compatible, false);
+    assert.equal(status.reason, outcome === "mismatch" ? "native-wrapper-initialization-rejected"
+      : outcome === "timeout" ? "native-wrapper-uninitialized" : outcome === "dispose" ? "disposed"
+      : "Accounts is unavailable in this window.");
+    bridge.dispose();
+  }
+});

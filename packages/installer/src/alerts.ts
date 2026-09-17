@@ -691,7 +691,7 @@ function showAlert(opts: AlertOptions): string | null {
   return runAlertScript(alertScript(opts), opts);
 }
 
-function showNotification(opts: Pick<AlertOptions, "title" | "message">): void {
+export function showNotification(opts: Pick<AlertOptions, "title" | "message">): void {
   try {
     alertExecFileSync(
       "osascript",

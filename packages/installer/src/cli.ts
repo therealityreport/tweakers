@@ -396,6 +396,9 @@ prog
   .describe("Diagnose common issues (signature, fuses, asar integrity, perms)")
   .option("--deep", "Verify lifecycle asset bytes, modes, and action receipts")
   .option("--json", "Print exactly one machine-readable JSON value")
+  .option("--target", "Diagnostic target: legacy or independent", "legacy")
+  .option("--ui", "Open the standalone independent Doctor")
+  .option("--scan-updates", "Start independent update evidence and review")
   .action(wrap(doctor));
 
 prog

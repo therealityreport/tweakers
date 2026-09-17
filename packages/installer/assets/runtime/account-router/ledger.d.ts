@@ -14,6 +14,13 @@ export interface KnownThreadBinding {
     threadId: string;
     owner: OpaqueAccountId;
 }
+export interface DoctorReviewLeaseReservation {
+    reservationId: string;
+    opaqueAccountId: OpaqueAccountId;
+    estimatedCost: number;
+    state: Reservation["state"];
+    requestDigest: `hmac-sha256:${string}`;
+}
 /**
  * The ledger is deliberately local: it allocates request work fairly without
  * claiming to know provider-side quota consumption. Every debit is durable
@@ -38,6 +45,13 @@ export declare class AccountLedger {
      */
     selectQuotaAware(observations: ReadonlyMap<OpaqueAccountId, AccountQuotaObservation>): AccountSelection | null;
     reserve(opaqueAccountId: OpaqueAccountId, estimatedCost: number): Reservation;
+    /** Atomically create or recover the one reservation bound to a Doctor request. */
+    reserveDoctorReview(opaqueAccountId: OpaqueAccountId, estimatedCost: number, requestDigest: `hmac-sha256:${string}`): DoctorReviewLeaseReservation;
+    doctorReviewReservation(requestDigest: `hmac-sha256:${string}`): DoctorReviewLeaseReservation | null;
+    markDoctorReviewDispatched(reservationId: string): void;
+    settleDoctorReview(reservationId: string, outcome: "pre_dispatch" | "completed" | "ambiguous", usage?: TokenUsage): void;
+    /** A restart releases proved-unwritten work and strands every marked dispatch. */
+    recoverDoctorReviewReservations(): void;
     releasePreDispatch(reservationId: string): void;
     strandAmbiguous(reservationId: string): void;
     reconcile(reservationId: string, usage: TokenUsage | null, model?: string): void;

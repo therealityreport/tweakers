@@ -3,6 +3,13 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, normalize, sep } from "node:path";
+import {
+  isDoctorReportV1,
+  isTweakersManagerSection,
+  type DoctorActionRequestV1,
+  type DoctorReportV1,
+  type TweakersManagerSection,
+} from "@therealityreport/tweakers-sdk";
 
 const MANAGER_ID = "com.thomashulihan.tweakers";
 const MANAGER_REQUIREMENT = 'identifier "com.therealityreport.tweakers.manager-launcher" and certificate leaf = H"631275551276127985a524acf1f469bf5164d50d"';
@@ -67,8 +74,8 @@ export function createTweakersManagerClient(overrides: Partial<TweakersManagerCl
     execute: overrides.execute ?? ((executable, args, input) => execFileSync(executable, [...args], {
       encoding: "utf8",
       ...(input === undefined ? {} : { input }),
-      timeout: STATUS_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
+      timeout: args[0] === "doctor-action" ? 120_000 : STATUS_TIMEOUT_MS,
+      maxBuffer: args[0]?.startsWith("doctor-") ? 32 * 1024 * 1024 : 1024 * 1024,
     })),
     spawnDetached: overrides.spawnDetached ?? ((executable, args) => {
       const child = spawn(executable, [...args], { detached: true, stdio: "ignore" });
@@ -169,13 +176,40 @@ export function createTweakersManagerClient(overrides: Partial<TweakersManagerCl
     return startPreparedAction(executable, "official-source.register", registration.stateToken);
   };
 
+  const doctorRequest = (command: "doctor-status" | "doctor-action", input?: DoctorActionRequestV1): DoctorReportV1 => {
+    const requestId = deps.createId();
+    const response = JSON.parse(deps.execute(verifiedManagerExecutable(deps), [command, "--request-id", requestId, "--json"], input ? JSON.stringify(input) : undefined));
+    if (response.requestId !== requestId || !isDoctorReportV1(response)) throw new Error("Tweakers Doctor returned an invalid report");
+    return response;
+  };
+  const openManager = (section: TweakersManagerSection = "overview") => {
+    // Keep this runtime boundary strict even though callers are typed: the
+    // detached process is a fixed protocol and must never receive arbitrary UI text.
+    if (!isTweakersManagerSection(section)) throw new Error("Invalid Tweakers Manager section");
+    deps.spawnDetached(verifiedManagerExecutable(deps), [
+      "manager-open", "--request-id", deps.createId(), "--section", section, "--json",
+    ]);
+  };
+  // Existing callers that specifically need the legacy Doctor launch remain
+  // supported while new UI entry points use the unified Manager protocol.
+  const openDoctor = () => deps.spawnDetached(verifiedManagerExecutable(deps), ["doctor-open", "--request-id", deps.createId(), "--json"]);
+
   return {
     readStatus,
     startAction,
     readOfficialSourceRegistration,
     startOfficialSourceRegistration,
+    readDoctor: () => doctorRequest("doctor-status"),
+    doctorAction: (input: DoctorActionRequestV1) => doctorRequest("doctor-action", input),
+    openManager,
+    openDoctor,
   };
 }
+
+export function readTweakersDoctor(): DoctorReportV1 { return createTweakersManagerClient().readDoctor(); }
+export function runTweakersDoctorAction(input: DoctorActionRequestV1): DoctorReportV1 { return createTweakersManagerClient().doctorAction(input); }
+export function openTweakersManager(section: TweakersManagerSection = "overview"): void { createTweakersManagerClient().openManager(section); }
+export function openTweakersDoctor(): void { createTweakersManagerClient().openDoctor(); }
 
 export function readTweakersManagerStatus(): TweakersManagerStatus {
   return createTweakersManagerClient().readStatus();

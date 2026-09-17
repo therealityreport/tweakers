@@ -93,7 +93,10 @@ class CodexSparkleBridge {
                 this.state.lifecycle = "installing";
         });
         this.wrapSink(addon, "setUpdateReadySink", (value) => {
+            const previouslyReady = this.state.ready;
             this.state.ready = value === true;
+            if (this.state.ready && !previouslyReady)
+                this.options.onUpdateAvailable?.();
             if (this.state.ready)
                 this.state.lifecycle = "ready";
             else if (this.state.lifecycle === "ready")

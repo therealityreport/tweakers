@@ -250,13 +250,22 @@ function validateEligibility(value, configured) {
 function validateReservation(value, configured, epoch) {
     if (!(0, types_1.isPlainRecord)(value))
         return false;
-    const allowed = new Set(["reservationId", "opaqueAccountId", "estimatedCost", "state", "epoch"]);
+    const allowed = new Set(["reservationId", "opaqueAccountId", "estimatedCost", "state", "epoch", "purpose", "requestDigest", "settledUsage"]);
+    const doctorReview = value.purpose === "doctor_review" && typeof value.requestDigest === "string"
+        && /^hmac-sha256:[A-Za-z0-9_-]{43}$/.test(value.requestDigest);
+    const ordinary = value.purpose === undefined && value.requestDigest === undefined;
     return Object.keys(value).every((key) => allowed.has(key))
         && typeof value.reservationId === "string" && /^rs_[A-Za-z0-9_-]{16,64}$/.test(value.reservationId)
         && (0, types_1.isOpaqueAccountId)(value.opaqueAccountId) && configured.has(value.opaqueAccountId)
         && typeof value.estimatedCost === "number" && Number.isInteger(value.estimatedCost)
-        && value.estimatedCost >= 1 && value.estimatedCost <= 32_768
-        && (value.state === "reserved" || value.state === "released_pre_dispatch" || value.state === "stranded_ambiguous" || value.state === "reconciled")
+        && value.estimatedCost >= 1 && value.estimatedCost <= (doctorReview ? 1_000_000 : 32_768)
+        && (ordinary || doctorReview)
+        && (value.settledUsage === undefined || doctorReview && value.state === "reconciled" && (0, types_1.isPlainRecord)(value.settledUsage)
+            && Object.keys(value.settledUsage).sort().join("\0") === "inputTokens\0outputTokens"
+            && Number.isSafeInteger(value.settledUsage.inputTokens) && Number(value.settledUsage.inputTokens) >= 0
+            && Number.isSafeInteger(value.settledUsage.outputTokens) && Number(value.settledUsage.outputTokens) >= 0)
+        && (value.state === "reserved" || value.state === "dispatched" || value.state === "released_pre_dispatch" || value.state === "stranded_ambiguous" || value.state === "reconciled")
+        && (value.state !== "dispatched" || doctorReview)
         && typeof value.epoch === "number" && Number.isInteger(value.epoch) && value.epoch >= 1 && value.epoch <= epoch;
 }
 function validateCorrelation(value, configured) {

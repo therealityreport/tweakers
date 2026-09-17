@@ -28,8 +28,14 @@ import { patchCodexModelSelectionSource } from "../src/codex-model-selection";
 import { patchCodexWindowServicesSource } from "../src/codex-window-services";
 import { RendererPatchDeclined } from "../src/renderer-patch-outcome";
 
-const LIVE_ASAR = "/Applications/ChatGPT.app/Contents/Resources/app.asar";
+// An explicit retained source lets maintenance verify the installed baseline after native Codex updates.
+const LIVE_ASAR = process.env.TWEAKERS_TEST_RENDERER_ASAR ?? "/Applications/ChatGPT.app/Contents/Resources/app.asar";
 const available = existsSync(LIVE_ASAR);
+const liveAccountsRecipe = !available ? "unavailable"
+  : listPackage(LIVE_ASAR).includes("/webview/assets/app-initial-4d7ea7f81c2d.js") ? "9275"
+    : listPackage(LIVE_ASAR).includes("/webview/assets/app-initial-9b95fa538c62.js") ? "8881"
+    : listPackage(LIVE_ASAR).includes("/webview/assets/app-initial-1b87ae739476.js") ? "8378" : "unknown";
+const legacyAccountsAvailable = available && liveAccountsRecipe === "8378";
 
 function rendererSources(pattern = /^[/\\]webview[/\\]assets[/\\]app-initial-[^/\\]*\.js$/): Array<{ path: string; source: string }> {
   return listPackage(LIVE_ASAR)
@@ -115,13 +121,13 @@ test("Accounts patches the actual native screens atomically and its receipt veri
     const syntax = spawnSync(process.execPath, ["--check", "--input-type=module"], { input: patched.sources.get(asset.path)!, encoding: "utf8", maxBuffer: 1024 * 1024 });
     assert.equal(syntax.status, 0, `${asset.path}: ${syntax.stderr}`);
   }
-  const nativeMain = patched.sources.get(ACCOUNTS_NATIVE_MAIN_PATH)!;
-  const writeStart = nativeMain.indexOf("async runProjectWrite(e,t,n)");
-  const writeEnd = nativeMain.indexOf("async writeAppServerProject(", writeStart);
-  const writeHandler = nativeMain.slice(writeStart, writeEnd);
-  assert.ok(writeStart >= 0 && writeEnd > writeStart);
-  assert.ok(writeHandler.includes("async()=>{r.throwIfAborted(),await __twAccountsDesktopProjects.ensureWrite(this),r.throwIfAborted(),this.projectSupport"), "queued native project writes must verify the current projection inside their serialized callback");
-  assert.ok(writeHandler.indexOf("await __twAccountsDesktopProjects.ensureWrite(this)") < writeHandler.indexOf("await t(r)"), "native project writes must verify the current projection before their first RPC");
+  const mainPath = patched.record.assets.find(asset => /^\.vite\/build\/main-[^/]+\.js$/.test(asset.path))?.path;
+  assert.ok(mainPath, "the selected Accounts recipe must identify its main-process carrier");
+  const nativeMain = patched.sources.get(mainPath)!;
+  const ensureWrite = nativeMain.indexOf("await __twAccountsDesktopProjects.ensureWrite(this)");
+  const firstProjectRpc = nativeMain.indexOf("await t(r)", ensureWrite);
+  assert.ok(ensureWrite >= 0, "queued native project writes must verify the current projection inside their serialized callback");
+  assert.ok(firstProjectRpc > ensureWrite, "native project writes must verify the current projection before their first RPC");
   const hash = (source: string) => createHash("sha256").update(source).digest("hex");
   assert.equal(validateAccountsNativeCompatibility(patched.record, (path) => patched.sources.get(path)!, hash).compatible, true);
   const again = patchCodexAccountsNativeSources(patched.sources, patched.record);
@@ -130,9 +136,9 @@ test("Accounts patches the actual native screens atomically and its receipt veri
 
   // Exercise the installer's actual patch order as well as pristine native bytes.
   const prepared = new Map(sources);
-  const windowServices = patchCodexWindowServicesSource(prepared.get(ACCOUNTS_NATIVE_MAIN_PATH)!);
+  const windowServices = patchCodexWindowServicesSource(prepared.get(mainPath)!);
   assert.equal(windowServices?.changed, true);
-  prepared.set(ACCOUNTS_NATIVE_MAIN_PATH, windowServices!.source);
+  prepared.set(mainPath, windowServices!.source);
   for (const [assetPath, source] of prepared) {
     if (!assetPath.startsWith("webview/")) continue;
     const model = patchCodexModelSelectionSource(source);
@@ -156,7 +162,9 @@ test("Accounts patches the actual native screens atomically and its receipt veri
   assert.equal(validateAccountsNativeCompatibility({ ...patched.record, assets: patched.record.assets.slice(1) }, (path) => patched.sources.get(path)!, hash).compatible, false);
 
   const duplicate = new Map(sources);
-  duplicate.set("webview/assets/app-primary-ffffffffffff.js", sources.get("webview/assets/app-primary-e25aaf15dbaf.js")!);
+  const primaryPath = patched.record.assets.find(entry => /^webview\/assets\/app-primary-[^/]+\.js$/.test(entry.path))?.path;
+  assert.ok(primaryPath, "the selected Accounts recipe must identify its primary renderer carrier");
+  duplicate.set("webview/assets/app-primary-ffffffffffff.js", sources.get(primaryPath)!);
   const refused = patchCodexAccountsNativeSources(duplicate);
   assert.equal(refused.record.status, "unavailable");
   assert.equal(refused.changed, false);
@@ -166,7 +174,7 @@ test("Accounts patches the actual native screens atomically and its receipt veri
   assert.equal(patchCodexAccountsNativeSources(drift).record.status, "unavailable");
 });
 
-test("native browser helpers receive the selected account home through the actual native sync functions", { skip: !available }, async () => {
+test("build 8378 native browser helpers receive the selected account home through the actual native sync functions", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -294,7 +302,7 @@ test("native desktop projects expose unavailable startup and discard late replie
   assert.deepEqual(Object.keys(store.get("local-projects")), ["b"], "a replacement connection refreshes the retained projection");
 });
 
-test("actual native queued project writes reverify inside the serialized callback", { skip: !available }, async () => {
+test("build 8378 actual native queued project writes reverify inside the serialized callback", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -357,6 +365,57 @@ test("native Accounts retains fallback behavior when disabled and rejects stale 
   assert.equal(slot.type(slot.props), original, "disable restores the exact original native element");
 });
 
+test("shared plugin catalog and mutations use native services without account availability", async () => {
+  let generation = 1;
+  let nativeCalls = 0;
+  const page: any = { __tweakersAccountsTransportV1: {
+    initialize: () => true, status: () => ({ compatible: true, enabled: true }),
+    snapshot: () => ({ accountId: null, generation }),
+    request: () => { throw new Error("account_unavailable"); },
+  } };
+  runInNewContext(nativeBootstrapSource("a".repeat(64)), page);
+  const bridge = page.__tweakersAccountsNativeV1;
+  const fallback = () => { nativeCalls++; return { native: true }; };
+  const captured = bridge.capture("plugins");
+  assert.equal(captured, undefined);
+  const options = { queryKey: ["plugins", "list"], queryFn: fallback };
+  assert.equal(bridge.options(options), options);
+  assert.equal(bridge.configOptions("plugins", options), options);
+  assert.equal(bridge.scopedQuery(options, captured), options);
+  assert.equal(bridge.filter(options), options);
+  assert.equal(bridge.render("plugins", options, {}), options);
+  assert.equal(bridge.key("plugins"), "native");
+  const mutation = { mutationFn: fallback, onSuccess: fallback };
+  assert.equal(bridge.mutation("plugins", mutation), mutation);
+  const finalized: string[] = [];
+  const cleanup = bridge.mutation("plugins", {
+    meta: { accountsFinalize: () => finalized.push("unlock") },
+    onSettled: () => finalized.push("native-settled"),
+  });
+  cleanup.onSettled(undefined, new Error("native failure"), {}, {});
+  assert.deepEqual(finalized, ["unlock", "native-settled"]);
+  const handle = { mutateAsync: fallback };
+  assert.equal(bridge.mutationHandle("plugins", handle), handle);
+  const client = { safeGet: fallback, safePost: fallback };
+  const queued = bridge.http(client, "safeGet", captured);
+  generation++;
+  assert.equal(bridge.isCurrent(captured), true);
+  assert.doesNotThrow(() => bridge.ensure(captured));
+  assert.equal(bridge.rollbackScope(captured), undefined);
+  assert.equal(bridge.mutationScope("plugins", {}), undefined);
+  await queued("/ps/plugins/installed");
+  await bridge.http(client, "safePost", captured)("/apps/content");
+  await bridge.http(client, "safePost", captured)("/aip/connectors/links/list_accessible");
+  await bridge.http(client, "safePost", captured)("/ps/plugins/{plugin_id}/enable");
+  await bridge.rpc("plugin/list", {}, fallback);
+  await bridge.rpc("config/batchWrite", { edits: [{keyPath: "plugins.example.enabled"}] }, fallback);
+  await bridge.configRead(captured, fallback);
+  await bridge.capturedRpc(captured, "plugin/install", {}, fallback);
+  assert.equal(nativeCalls, 8);
+  // Other subscription-bound surfaces still fail closed.
+  await assert.rejects(bridge.rpc("app/list", {}, fallback), /account_unavailable/);
+});
+
 test("native query adapters separate account caches and cancel an obsolete query before dispatch", async () => {
   let generation = 1;
   let reads = 0;
@@ -385,7 +444,7 @@ test("native query adapters separate account caches and cancel an obsolete query
   assert.equal(page.__tweakersAccountsNativeV1.query(unrelated, react), unrelated);
   let dependencyReads = 0;
   const epoch = page.__tweakersAccountsNativeV1.signalEpoch((initial: number) => ({ initial }));
-  const signal = page.__tweakersAccountsNativeV1.signalOptions({ ...original, queryKey: ["plugins", "list"] }, (actual: unknown) => {
+  const signal = page.__tweakersAccountsNativeV1.signalOptions({ ...original, queryKey: ["apps", "list"] }, (actual: unknown) => {
     assert.equal(actual, epoch);
     dependencyReads++;
   }, epoch);
@@ -415,10 +474,10 @@ test("native HTTP and configuration flows retain their captured subscription", a
   const queued = bridge.http(client, "safePost");
   accountId = "account_b";
   generation++;
-  await assert.rejects(queued("/ps/plugins/{plugin_id}/install", { parameters: { path: { plugin_id: "example" } } }), { name: "AbortError" });
+  await assert.rejects(queued("/aip/connectors/links/noauth", { requestBody: { connector_id: "example" } }), { name: "AbortError" });
   assert.equal(calls.length, 0);
   await bridge.http(client, "safePost")("/aip/connectors/links/oauth", { requestBody: { connector_id: "example" } });
-  const captured = bridge.capture("plugins");
+  const captured = bridge.capture("apps");
   accountId = "account_c";
   generation++;
   await bridge.http(client, "safePost")("/aip/connectors/links/oauth/callback", { requestBody: { full_redirect_url: "codex://callback?state=scoped-state" } });
@@ -428,15 +487,15 @@ test("native HTTP and configuration flows retain their captured subscription", a
   assert.equal(calls.length, 2);
   const original = { queryKey: ["config", "user"], queryFn: () => "native" };
   assert.equal(bridge.configOptions(undefined, original), original, "general config consumers remain native");
-  const selected = bridge.configOptions("plugins", original, true);
-  assert.equal(selected.meta.tweakersAccountsSurface, "plugins");
+  const selected = bridge.configOptions("apps", original, true);
+  assert.equal(selected.meta.tweakersAccountsSurface, "apps");
   assert.equal((await selected.queryFn()).readSucceeded, true);
-  assert.equal(calls[2].surface, "plugins");
+  assert.equal(calls[2].surface, "apps");
   assert.equal(calls[2].method, "config/read");
 });
 
 test("native mutation clicks retain their account before callbacks await and suppress obsolete cache writes", async () => {
-  for (const surface of ["apps", "plugins", "mcp"]) {
+  for (const surface of ["apps", "mcp"]) {
     let generation = 1;
     let release: () => void = () => {};
     let writes = 0;
@@ -479,7 +538,7 @@ test("native mutation clicks retain their account before callbacks await and sup
   }
 });
 
-test("actual native uninstall flows reject a changed account after bundled setup and still release operation locks", { skip: !available }, async () => {
+test("build 8378 actual native uninstall flows reach native dispatch across pool changes and release locks on native failure", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -490,6 +549,7 @@ test("actual native uninstall flows reject a changed account after bundled setup
     let cleanup = 0;
     let writes = 0;
     let requests = 0;
+    let nativeCalls = 0;
     let entered = () => {};
     const started = new Promise<void>((resolve) => { entered = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -500,6 +560,7 @@ test("actual native uninstall flows reject a changed account after bundled setup
         snapshot: () => ({ accountId: generation === 1 ? "account_a" : "account_b", generation }),
         request: () => { requests++; return {}; },
       },
+      zDi: () => { nativeCalls++; throw new Error("native uninstall fixture"); }, qU: () => Promise.resolve(), XDi: () => {},
       aOi: { c: (size: number) => new Array(size) }, jz: () => false,
       Q: {}, EFr: {}, HR: {}, db: () => scope, sb: () => ({}), fb: () => ({}),
       eD: () => () => { writes++; }, Xo: () => ({}), vE: () => false, TU: () => ["apps"],
@@ -507,9 +568,10 @@ test("actual native uninstall flows reject a changed account after bundled setup
       bEi: () => "operation-a", xEi: () => { cleanup++; }, KU: () => { writes++; },
       yb: (options: any) => ({ mutateAsync: async (variables: unknown) => {
         const context = await options.onMutate?.(variables);
+        let failure: unknown = null;
         try { const value = await options.mutationFn(variables); await options.onSuccess?.(value, variables, context); return value; }
-        catch (error) { await options.onError?.(error, variables, context); throw error; }
-        finally { await options.onSettled?.(undefined, null, variables, context); }
+        catch (error) { failure = error; throw error; }
+        finally { await options.onSettled?.(undefined, failure, variables, context); }
       } }),
     };
     runInNewContext(nativeBootstrapSource("a".repeat(64)), page);
@@ -522,14 +584,15 @@ test("actual native uninstall flows reject a changed account after bundled setup
     await started;
     generation++;
     release();
-    await assert.rejects(pending, { name: "AbortError" });
+    await assert.rejects(pending, /native uninstall fixture/);
+    assert.equal(nativeCalls, 1);
     assert.equal(requests, 0, `${kind}: dispatch must not select the replacement account`);
-    assert.equal(writes, 0, `${kind}: stale cache and refresh callbacks must not run`);
-    assert.equal(cleanup, 1, `${kind}: operation cleanup survives stale-account rejection`);
+    assert.equal(writes, 0, `${kind}: failed native dispatch must not update cache`);
+    assert.equal(cleanup, 1, `${kind}: operation cleanup survives native rejection`);
   }
 });
 
-test("actual native usage redemption captures the click before queued execution and preserves disabled behavior", { skip: !available }, async () => {
+test("build 8378 actual native usage redemption captures the click before queued execution and preserves disabled behavior", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -566,7 +629,7 @@ test("actual native usage redemption captures the click before queued execution 
   assert.equal(nativeCalls, 1);
 });
 
-test("plugin rollback provenance stays data-only and refuses missing or obsolete install bindings", () => {
+test("scoped rollback provenance rejects obsolete captures while native plugin ownership stays unscoped", () => {
   let generation = 1;
   let enabled = true;
   const page: any = { __tweakersAccountsTransportV1: {
@@ -575,9 +638,9 @@ test("plugin rollback provenance stays data-only and refuses missing or obsolete
   } };
   runInNewContext(nativeBootstrapSource("a".repeat(64)), page);
   const bridge = page.__tweakersAccountsNativeV1;
-  const enrolled = JSON.parse(JSON.stringify(bridge.capture("plugins")));
+  const enrolled = JSON.parse(JSON.stringify(bridge.capture("apps")));
   assert.equal(bridge.rollbackScope(enrolled).accountId, "account_a");
-  assert.throws(() => bridge.rollbackScope(undefined), /original install account could not be verified/);
+  assert.equal(bridge.rollbackScope(bridge.capture("plugins")), undefined);
   generation++;
   assert.throws(() => bridge.rollbackScope(enrolled), { name: "AbortError" });
   assert.throws(() => bridge.rollbackScope(null), /original install account could not be verified/);
@@ -585,7 +648,7 @@ test("plugin rollback provenance stays data-only and refuses missing or obsolete
   assert.equal(bridge.rollbackScope(null), null);
 });
 
-test("actual native install handle binds before dispatch and suppresses followups after a stale RPC", { skip: !available }, async () => {
+test("build 8378 actual native install handle preserves shared native ownership across pool changes", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -608,6 +671,7 @@ test("actual native install handle binds before dispatch and suppresses followup
       },
       performance, d: () => true, Ez: () => ({ pluginName: "example" }), i: {}, t: "local", l: false,
       Kw: { CODEX_PLUGIN_INSTALL_OUTCOME_FAILED: "failed", CODEX_PLUGIN_INSTALL_OUTCOME_SUCCEEDED: "succeeded" },
+      RDi: async () => { requests.push({ native: true }); if (phase === "requested") { entered(); await gate; } return {}; },
       gEi: () => { followups++; },
       yb: (options: any) => ({ mutateAsync: async (variables: unknown) => {
         if (phase === "queued") { entered(); await gate; }
@@ -622,14 +686,13 @@ test("actual native install handle binds before dispatch and suppresses followup
     await started;
     generation++;
     release();
-    await assert.rejects(pending, { name: "AbortError" });
-    assert.equal(requests.length, phase === "queued" ? 0 : 1);
-    if (requests.length) assert.equal(requests[0].selection.accountId, "account_a");
-    assert.equal(followups, 0);
+    await pending;
+    assert.deepEqual(requests, [{ native: true }]);
+    assert.equal(followups, 1);
   }
 });
 
-test("actual native OAuth rollback enrolls the install account and refuses stale or missing provenance", { skip: !available }, async () => {
+test("build 8378 actual native OAuth rollback preserves shared native plugin ownership", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -655,18 +718,18 @@ test("actual native OAuth rollback enrolls the install account and refuses stale
   runInNewContext(source.slice(rollback, source.indexOf("function V5(", rollback)), page);
   page.Cys(scope, { appId: "app-a", hostId: "local", oauthState: "oauth-a", requestId: "request-a", plugin: { plugin: { id: "plugin-a", name: "example", authPolicy: "ON_INSTALL", installed: false } } });
   const enrolled = JSON.parse(JSON.stringify(records["oauth-a"]));
-  assert.equal(enrolled.accountsCapture.accountId, "account_a");
+  assert.equal(enrolled.accountsCapture, undefined);
   generation++;
-  await assert.rejects(page.jys(scope, enrolled, {}), { name: "AbortError" });
-  assert.equal(requests, 0);
+  await page.jys(scope, enrolled, {});
+  assert.equal(requests, 1);
   assert.equal(page.Lys.size, 0, "rollback lock is released on a provenance failure");
   delete enrolled.accountsCapture;
-  await assert.rejects(page.jys(scope, enrolled, {}), /original install account could not be verified/);
-  assert.equal(requests, 0);
+  await page.jys(scope, enrolled, {});
+  assert.equal(requests, 2);
   assert.equal(page.Lys.size, 0);
 });
 
-test("actual browser followups use captured transport and never the native account helper", { skip: !available }, async () => {
+test("build 8378 actual browser followups use native shared plugin helpers", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -692,18 +755,18 @@ test("actual browser followups use captured transport and never the native accou
   const args = { hostId: "local", marketplacePath: "/fixture/marketplace", marketplaceName: "fixture", pluginName: "browser", accountsCapture: captured };
   await page.gEi(args);
   await page._Ei(args);
-  assert.deepEqual(calls.map((call) => call.method), ["browser.install", "browser.uninstall"]);
-  assert.equal(calls.every((call) => call.selection.accountId === "account_a"), true);
-  assert.equal(nativeCalls, 0);
+  assert.equal(calls.length, 0);
+  assert.equal(nativeCalls, 2);
   generation++;
-  await assert.rejects(page._Ei(args), { name: "AbortError" });
-  assert.equal(calls.length, 2);
+  await page._Ei(args);
+  assert.equal(calls.length, 0);
+  assert.equal(nativeCalls, 3);
   enabled = false;
   await page.gEi({ ...args, accountsCapture: null });
-  assert.equal(nativeCalls, 1);
+  assert.equal(nativeCalls, 4);
 });
 
-test("actual plugin utility configuration binds every step and stops after an obsolete lookup or write", { skip: !available }, async () => {
+test("build 8378 actual plugin utility configuration keeps native plugin operations independent of pooled selection", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -763,14 +826,14 @@ test("actual plugin utility configuration binds every step and stops after an ob
       await started;
       generation++;
       release();
-      await assert.rejects(pending, { name: "AbortError" });
-      assert.deepEqual(calls.map((call) => call.method), phase === "lookup" ? ["plugin/list"] : phase === "list" ? ["plugin/list", "config/read"] : ["plugin/list", "plugin/install", "browser.install", "plugin/list", "config/batchWrite"]);
+      await pending;
+      assert.deepEqual(calls.map((call) => call.method), phase === "list" ? ["plugin/list", "config/read"] : ["plugin/list", "plugin/install", "browser.install", "plugin/list", "config/batchWrite", "plugin/list", "browser.sync"]);
     }
-    assert.equal(calls.every((call) => phase === "disabled" ? call.native : !call.native && call.selection.accountId === "account_a"), true, phase);
+    assert.equal(calls.every((call) => call.native), true, phase);
   }
 });
 
-test("actual native removal preserves validated browser consumers without reinstalling or stopping hosts", { skip: !available }, async () => {
+test("build 8378 actual native removal preserves validated browser consumers without reinstalling or stopping hosts", { skip: !legacyAccountsAvailable }, async () => {
   const sources = new Map(rendererSources(/^[/\\](?:webview[/\\]assets[/\\](?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-[^/\\]*|\.vite[/\\]build[/\\](?:main|src)-[^/\\]*)\.js$/).map(({ path, source }) => [path, source]));
   const patched = patchCodexAccountsNativeSources(sources);
   assert.equal(patched.record.status, "compatible", patched.record.reason);
@@ -876,4 +939,130 @@ test("actual native removal preserves validated browser consumers without reinst
       assert.equal(await fs.readFile(untouchedConfig, "utf8"), "original consumer config\n");
     }
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+// Supply a frozen signed candidate explicitly; the installed app is not a moving
+// fixture for a new build's acceptance. Existing 8378 checks remain independent.
+test("reviewed Accounts recipe preserves native behavior and rejects stale account operations", {
+  skip: !available || !["8881", "9275"].includes(liveAccountsRecipe),
+}, async () => {
+  const asar = process.env.TWEAKERS_TEST_ACCOUNTS_CANDIDATE_ASAR ?? LIVE_ASAR;
+  const sources = new Map(listPackage(asar)
+    .filter((entry) => /^\/(?:webview\/assets\/(?:app-initial|app-primary|profile|plugins-page|mcp-settings|local-conversation-thread)-|\.vite\/build\/(?:main|src)-).*\.js$/.test(entry))
+    .map((entry) => [entry.slice(1), extractFile(asar, entry.slice(1)).toString("utf8")]));
+  const patched = patchCodexAccountsNativeSources(sources);
+  assert.equal(patched.record.status, "compatible", patched.record.reason);
+  assert.equal(patched.record.build, liveAccountsRecipe === "9275" ? "26.908.70816" : "26.908.40834");
+  const hash = (source: string) => createHash("sha256").update(source).digest("hex");
+  assert.equal(validateAccountsNativeCompatibility(patched.record, p => patched.sources.get(p)!, hash).compatible, true);
+  assert.deepEqual(patchCodexAccountsNativeSources(patched.sources, patched.record).sources, patched.sources);
+  for (const asset of patched.record.assets) {
+    const drift = new Map(sources);
+    drift.set(asset.path, drift.get(asset.path)! + "\n");
+    const refused = patchCodexAccountsNativeSources(drift);
+    assert.equal(refused.changed, false, asset.path);
+    assert.equal(refused.record.status, "unavailable", asset.path);
+    assert.deepEqual(refused.sources, drift);
+    const missing = new Map(sources);
+    missing.delete(asset.path);
+    assert.equal(patchCodexAccountsNativeSources(missing).record.status, "unavailable", asset.path);
+  }
+  const duplicate = new Map(sources);
+  const primaryPath = liveAccountsRecipe === "9275"
+    ? "webview/assets/app-primary-4af6ed7f68d1.js"
+    : "webview/assets/app-primary-44ec287874b7.js";
+  duplicate.set("webview/assets/app-primary-ffffffffffff.js", sources.get(primaryPath)!);
+  assert.equal(patchCodexAccountsNativeSources(duplicate).record.status, "unavailable");
+  const composed = new Map(sources);
+  for (const [p, text] of composed) {
+    if (p === ".vite/build/main-DaMR-wdT.js") composed.set(p, patchCodexWindowServicesSource(text)!.source);
+    if (p.startsWith("webview/")) {
+      const model = patchCodexModelSelectionSource(text)?.source ?? text;
+      composed.set(p, patchCodexInactiveThreadRetentionSource(model)?.source ?? model);
+    }
+  }
+  const installed = patchCodexAccountsNativeSources(composed);
+  assert.equal(installed.record.status, "compatible", installed.record.reason);
+  for (const asset of installed.record.assets) {
+    const syntax = spawnSync(process.execPath, ["--check", "--input-type=module"], {
+      input: installed.sources.get(asset.path)!, encoding: "utf8", maxBuffer: 1024 * 1024,
+    });
+    assert.equal(syntax.status, 0, `${asset.path}: ${syntax.stderr}`);
+  }
+  const initialPath = liveAccountsRecipe === "9275"
+    ? "webview/assets/app-initial-4d7ea7f81c2d.js"
+    : "webview/assets/app-initial-9b95fa538c62.js";
+  const source = patched.sources.get(initialPath)!;
+  // Shared Plugins keep native install ownership across pool selection changes.
+  for (const phase of ["queued", "requested"]) {
+    let generation = 1, followups = 0;
+    let release = () => {}, entered = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const requests: any[] = [];
+    const page: any = {
+      __tweakersAccountsTransportV1: {
+        initialize: () => true, status: () => ({ compatible: true, enabled: true }),
+        snapshot: () => ({ accountId: generation === 1 ? "account_a" : "account_b", generation }),
+        request: async (surface: string, method: string, params: unknown, selection: unknown) => {
+          requests.push({ surface, method, params, selection }); entered(); await gate; return {};
+        },
+      },
+      performance, f: () => true, Y9o: () => false, mO: () => ({ pluginName: "example" }), i: {}, t: "local", u: false,
+      Iy: { CODEX_PLUGIN_INSTALL_OUTCOME_FAILED: "failed", CODEX_PLUGIN_INSTALL_OUTCOME_SUCCEEDED: "succeeded" },
+      S1r: async () => { requests.push({ native: true }); if (phase === "requested") { entered(); await gate; } return {}; },
+      e$r: () => { followups++; },
+      wm: (options: any) => ({ mutateAsync: async (variables: unknown) => {
+        if (phase === "queued") { entered(); await gate; }
+        return options.mutationFn(variables);
+      } }),
+    };
+    runInNewContext(nativeBootstrapSource("a".repeat(64)), page);
+    const start = source.indexOf("be=globalThis.__tweakersAccountsNativeV1.mutationHandle");
+    const end = source.indexOf(",xe=ve||be.isPending", start);
+    assert.ok(start >= 0 && end > start);
+    runInNewContext(`var ${source.slice(start, end)};`, page);
+    const pending = page.be.mutateAsync({ installAttemptId: "attempt-a", plugin: { plugin: { name: "example" } }, onRpcSettled: () => {} });
+    await started;
+    generation++;
+    release();
+    await pending;
+    assert.deepEqual(requests, [{ native: true }]);
+    assert.equal(followups, 1);
+  }
+  // A stale OAuth completion clears its original state, never the ownership
+  // boolean or a later account's pending connection.
+  const callbackStart = source.indexOf("if(k=!0,!globalThis.__tweakersAccountsNativeV1.oauthResultCurrent(e))");
+  const callbackEnd = source.indexOf("if(w())", callbackStart);
+  assert.ok(callbackStart >= 0 && callbackEnd > callbackStart);
+  const cleared: unknown[] = [];
+  const callbackPage: any = {
+    globalThis: { __tweakersAccountsNativeV1: { oauthResultCurrent: () => false } },
+    k: false, T: true, D: "old-oauth-state", S: "old-oauth-state",
+    R8: new Set(["old-oauth-state", "other-oauth-state"]),
+    e: { link: { connector_id: "app-a", name: "App A" } }, _: {},
+    l: (state: string) => cleared.push(state), o: (value: unknown) => cleared.push(value),
+  };
+  const callback = runInNewContext(`(function(){${source.slice(callbackStart, callbackEnd)}})()`, callbackPage);
+  assert.equal(callback.kind, "success");
+  assert.equal(callbackPage.R8.has("old-oauth-state"), false);
+  assert.equal(callbackPage.R8.has("other-oauth-state"), true);
+  assert.equal(cleared[0], "old-oauth-state");
+  assert.equal((cleared[1] as any).oauthState, "old-oauth-state");
+  // The new usage request must preserve its header options and cancellation.
+  let observed: any;
+  const usagePage: any = {
+    DS: { safeGet: async (_path: string, options: unknown) => { observed = options; return {}; } },
+    SS: "CODEX", zCa: { safeParse: () => ({ success: false }) }, WCa: { safeParse: () => ({ success: false }) },
+    VCa: { safeParse: () => ({ success: false }) }, UCa: { safeParse: () => ({ success: false }) },
+  };
+  runInNewContext(nativeBootstrapSource("a".repeat(64)), usagePage);
+  const usageStart = source.indexOf("async function LCa(");
+  const usageEnd = source.indexOf("var RCa,", usageStart);
+  runInNewContext(source.slice(usageStart, usageEnd).replace(/async $/, ""), usagePage);
+  const signal = new AbortController().signal;
+  await usagePage.LCa({ additionalHeaders: { "X-Example": "preserved" }, signal });
+  assert.equal(observed.signal, signal);
+  assert.equal(observed.additionalHeaders["X-Example"], "preserved");
+  assert.equal(observed.additionalHeaders["OAI-App-Brand"], "codex");
 });

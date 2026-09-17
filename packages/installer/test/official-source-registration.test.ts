@@ -154,6 +154,53 @@ test("official-source registration atomically publishes one immutable generation
   }
 });
 
+test("prepared-source registration preserves installed canonical evidence while selecting the downloaded source receipt", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-official-source-prepared-"));
+  try {
+    const before = seedCanonicalEnvironment(root);
+    const preparedSourcePath = join(root, "doctor", "jobs", OPERATION_ID, "upstream", "extracted", "ChatGPT.app");
+    const candidate: OfficialSourceObservation = {
+      ...fixtureObservation(),
+      appPath: preparedSourcePath,
+      physicalPath: preparedSourcePath,
+      version: "26.927.50000",
+      build: "9275",
+      appAsarHeaderHash: "d".repeat(64),
+      treeSeal: { sha256: "e".repeat(64), entries: 2, bytes: "42" },
+    };
+    const result = registerStableOfficialSource({
+      root,
+      operationId: OPERATION_ID,
+      expectedSourceDigest: observationDigest(candidate),
+      preparedSourcePath,
+      managerExecutable: MANAGER,
+    }, {
+      ...fixtureDeps(candidate),
+      publishEnvironment(): never {
+        throw new Error("prepared source must not publish candidate metadata as the installed environment");
+      },
+    });
+
+    const paths = officialSourcePaths(root);
+    const pointer = JSON.parse(readFileSync(paths.currentFile, "utf8")) as Record<string, unknown>;
+    const receipt = JSON.parse(readFileSync(join(paths.generationsRoot, GENERATION_ID, "receipt.json"), "utf8")) as Record<string, unknown>;
+    const receiptSource = receipt.source as Record<string, unknown>;
+
+    assert.equal(result.sourceDigest, observationDigest(candidate));
+    assert.equal(pointer.version, candidate.version);
+    assert.equal(pointer.build, candidate.build);
+    assert.equal(receiptSource.appPath, preparedSourcePath);
+    assert.equal(receiptSource.version, candidate.version);
+    assert.equal(receiptSource.build, candidate.build);
+    assert.deepEqual(readFileSync(paths.environmentRegistryFile), before.registryBytes,
+      "downloaded candidate metadata must not replace installed stable evidence");
+    assert.deepEqual(readFileSync(paths.environmentSelectionFile), before.selectionBytes,
+      "registering a downloaded source must not alter the installed selection");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("official-source registration rolls back the coupled environment publication when pointer publication cannot proceed", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-official-source-"));
   try {

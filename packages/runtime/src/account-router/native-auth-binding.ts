@@ -1,8 +1,9 @@
+import { matchesPersistentDirectoryIdentity, preparePersistentIdentityGeneration, journalAndPublishPersistentIdentityGeneration, PERSISTENT_IDENTITIES_JOURNAL } from "./persistent-directory-identity";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isPlainRecord, type OpaqueAccountId, type RouterConfig } from "./types";
-import { nativeHistoryAuthIdentityHmacV1, parseNativeHistorySourceV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceV1 } from "./native-history";
+import { nativeHistoryAuthIdentityHmacV1, parseNativeHistorySourceV1, readAndPreflightNativeHistorySourceStaticV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceV1 } from "./native-history";
 
 export const NATIVE_AUTH_BINDING_FILE_V1 = "native-auth-binding.v1.json";
 type Entry = { opaqueAccountId: OpaqueAccountId; authHome: string; authHomeIdentity: NativeHistoryDirectoryIdentityV1; authIdentityHmac: string };
@@ -62,6 +63,13 @@ export function readNativeExternalTokensV1(home: string, entry: Pick<Entry, "opa
 }
 /** Absence preserves legacy auth. Malformed or changed companions fail closed. */
 export function readNativeAuthBindingV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): { document: NativeAuthBindingV1; fingerprint: string } | null {
+  const binding = readNativeAuthBindingAuthorityV1(stateRoot, source, secret);
+  for (const entry of binding?.document.accounts ?? []) proveIdentity(entry.authHome, entry, secret);
+  return binding;
+}
+
+/** Recovery-only authority. Verifies signatures and paths, never claims credentials are valid. */
+export function readNativeAuthBindingAuthorityV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): { document: NativeAuthBindingV1; fingerprint: string } | null {
   const path = join(stateRoot, NATIVE_AUTH_BINDING_FILE_V1);
   try { lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; return fail(); }
   directory(stateRoot);
@@ -88,11 +96,10 @@ export function readNativeAuthBindingV1(stateRoot: string, source: NativeHistory
     const sourceBytes = readNativeAuthPrivateFileV1(join(stateRoot, "native-history-source.v1.json"), 64 * 1024);
     try { if (value.sourceFingerprint !== digest(sourceBytes)) return fail(); } finally { sourceBytes.fill(0); }
     for (const entry of entries) {
-      if (encode(entry.authHomeIdentity) !== encode(directory(entry.authHome))
+      if (!matchesPersistentDirectoryIdentity({ stateRoot, secret, path: entry.authHome, expected: entry.authHomeIdentity, authorityFile: NATIVE_AUTH_BINDING_FILE_V1, accountId: entry.opaqueAccountId })
         || source.accounts.some((a) => overlaps(entry.authHome, a.codexHome) || overlaps(entry.authHome, a.sqliteHome))
         || !authHomeLocationSafe(entry.authHome, stateRoot, entry.opaqueAccountId)
         || entries.some((other) => other !== entry && overlaps(other.authHome, entry.authHome))) return fail();
-      proveIdentity(entry.authHome, entry, secret);
     }
     return { document: { ...unsigned, signature: value.signature as string }, fingerprint: digest(bytes) };
   } catch { return fail(); } finally { bytes.fill(0); }
@@ -103,6 +110,7 @@ const prepared = new WeakMap<PreparedNativeAuthBindingV1, { stateRoot: string; c
 /** Offline-only preparation. No original credentials are read and no source document is rewritten. */
 export function prepareNativeAuthBindingV1(input: { stateRoot: string; config: RouterConfig; secret: Buffer; expectedSourceFingerprint: string; accounts: readonly { opaqueAccountId: OpaqueAccountId; authHome: string }[] }): PreparedNativeAuthBindingV1 {
   directory(input.stateRoot);
+  if (existsSync(join(input.stateRoot, PERSISTENT_IDENTITIES_JOURNAL))) return fail();
   try { lstatSync(join(input.stateRoot, NATIVE_AUTH_BINDING_FILE_V1)); return fail(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail(); }
   const bytes = readNativeAuthPrivateFileV1(join(input.stateRoot, "native-history-source.v1.json"), 64 * 1024);
   try {
@@ -113,7 +121,7 @@ export function prepareNativeAuthBindingV1(input: { stateRoot: string; config: R
       for (const [path, expected] of [[account.codexHome, account.codexHomeIdentity], [account.sqliteHome, account.sqliteHomeIdentity]] as const) {
         const stat = lstatSync(path);
         if (realpathSync(path) !== path || !stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0
-          || stat.dev !== expected.device || stat.ino !== expected.inode || stat.uid !== expected.uid || (stat.mode & 0o7777) !== expected.mode) return fail();
+          || !matchesPersistentDirectoryIdentity({ stateRoot: input.stateRoot, secret: input.secret, path, expected, authorityFile: "native-history-source.v1.json", accountId: account.opaqueAccountId })) return fail();
       }
     }
     const accounts = input.accounts.map((item) => {
@@ -142,5 +150,11 @@ export function publishPreparedNativeAuthBindingV1(value: PreparedNativeAuthBind
   const fd = openSync(temporary, constants.O_RDONLY | constants.O_NOFOLLOW); try { fsyncSync(fd); } finally { closeSync(fd); }
   try { linkSync(temporary, target); } finally { unlinkSync(temporary); }
   const rootFd = openSync(plan.stateRoot, constants.O_RDONLY); try { fsyncSync(rootFd); } finally { closeSync(rootFd); }
-  plan.secret.fill(0); rechecked.secret.fill(0); prepared.delete(fresh); prepared.delete(value);
+  try {
+    if (process.platform === "darwin") {
+      const proposal = preparePersistentIdentityGeneration({ stateRoot: plan.stateRoot, secret: plan.secret,
+        verify: () => readAndPreflightNativeHistorySourceStaticV1(plan.stateRoot, plan.config, plan.secret).state === "ready" });
+      journalAndPublishPersistentIdentityGeneration(plan.stateRoot, plan.secret, proposal);
+    }
+  } finally { plan.secret.fill(0); rechecked.secret.fill(0); prepared.delete(fresh); prepared.delete(value); }
 }

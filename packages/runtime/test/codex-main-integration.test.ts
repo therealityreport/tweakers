@@ -623,10 +623,25 @@ test("native Alpha chooser owns the path and invokes strict registration", () =>
   assert.doesNotMatch(chooser, /payload/);
 });
 
+test("Manager IPC uses the independent sender guard and an exact section allowlist", () => {
+  const managerOpen = extractHandlerBody(mainSource, "tweaker:manager-open");
+  const doctorOpen = extractHandlerBody(mainSource, "tweaker:doctor-open");
+  assert.match(managerOpen, /assertNoIpcArguments\(args, "manager-open"\)/);
+  assert.match(managerOpen, /isExactIndependentTweakersPrimaryMainFrame\(event\.sender, event\.senderFrame\)/);
+  assert.match(managerOpen, /section === undefined \? "overview" : section/);
+  assert.match(managerOpen, /isTweakersManagerSection\(selectedSection\)/);
+  assert.match(managerOpen, /openTweakersManager\(selectedSection\)/);
+  assert.match(doctorOpen, /openTweakersDoctor\(\)/);
+});
+
 test("official ChatGPT owns native Sparkle while health and independent processes use only the inert wrapper", () => {
   const configure = extractFunctionBody(mainSource, "configureCodexSparkleForProcess");
-  assert.match(configure, /if \(healthCheckOnly \|\| derivedVariant\) \{[\s\S]*?configureCodexSparkleBridge\(createHealthProbeCodexSparkleBridgeOptions\(\)\)/);
-  assert.doesNotMatch(configure, /requestManualCheck|requestBackgroundCheck|requestInstall|prepareForInstall|onFeedCaptured/);
+  assert.match(configure, /if \(healthCheckOnly\) \{[\s\S]*?configureCodexSparkleBridge\(createHealthProbeCodexSparkleBridgeOptions\(\)\)/);
+  assert.match(configure, /else if \(derivedVariant\)/);
+  assert.match(configure, /requestManualCheck: \(\) => \{ const report = readTweakersDoctor\(\); runTweakersDoctorAction\(\{ schemaVersion: 1, action: "scan", fingerprint: report\.fingerprint \}\); openTweakersManager\("updates"\); \}/);
+  assert.match(configure, /onUpdateAvailable: \(\) => \{ try \{ const report = readTweakersDoctor\(\); runTweakersDoctorAction\(\{ schemaVersion: 1, action: "scan", scanTrigger: "available_update", fingerprint: report\.fingerprint \}\); \}/);
+  assert.match(configure, /requestInstall: \(\) => openTweakersManager\("updates"\)/);
+  assert.doesNotMatch(configure, /requestBackgroundCheck|prepareForInstall|onFeedCaptured/);
   const hook = extractFunctionBody(mainSource, "installSparkleUpdateHook");
   assert.match(hook, /!healthCheckOnly && !derivedVariant/);
   assert.match(hook, /getCodexSparkleBridge\(\)\.wrapExports\(loaded\)/);

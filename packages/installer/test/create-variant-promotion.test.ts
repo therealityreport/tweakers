@@ -24,6 +24,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { readPlist, writePlist } from "../src/plist";
 import {
+  REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS,
   TWEAKERS_VARIANT_ACCOUNTS_BROKER_CONFIG,
   TWEAKERS_VARIANT_BUNDLE_ID,
   TWEAKERS_VARIANT_CODEX_HOME_CONFIG,
@@ -38,6 +39,7 @@ import {
 } from "../src/macos-variant";
 import {
   createTweakersVariant,
+  copyReviewedVariantArtifact,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION,
@@ -1339,6 +1341,10 @@ test("manager quiescence runs only after candidate validation and immediately be
       verifyResourceAsarIntegrity: () => {
         events.push("candidate-verified");
       },
+      bootstrapManagerEnvironment: (input) => {
+        events.push("official-environment-revalidated");
+        return fixture.deps.bootstrapManagerEnvironment!(input);
+      },
       beforePromotion: ({ target, candidate, userRoot }) => {
         assert.equal(target, fixture.target);
         assert.equal(candidate, join(dirname(fixture.target), ".Tweakers.app.candidate-late-quiesce.app"));
@@ -1353,6 +1359,7 @@ test("manager quiescence runs only after candidate validation and immediately be
 
     assert.ok(events.indexOf("candidate-install") < events.indexOf("quiesce"));
     assert.ok(events.indexOf("candidate-verified") < events.indexOf("quiesce"));
+    assert.ok(events.indexOf("official-environment-revalidated") < events.indexOf("quiesce"));
     assert.equal(events[events.indexOf("quiesce") + 1], "target-gate");
     assertNewActiveGeneration(fixture, "late-quiesce");
   } finally {
@@ -1614,6 +1621,40 @@ test("candidate-only packages a bound Tweakers identity without mutating product
       () => verifyTweakersVariantCandidateReceipt(output, candidateVerificationOptions(output, fixture)),
       /candidate runtime fingerprint changed/,
       "the receipt must fail closed if a staged payload changes",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("candidate-only seals a disabled Doctor titlebar choice and rejects staged config drift", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-variant-candidate-titlebar-disabled-")));
+  try {
+    const fixture = createFixture(root, "candidate-titlebar-disabled");
+    const output = join(root, "candidate-output");
+    await withoutVariantStatusOutput(() => createTweakersVariant({
+      source: fixture.source,
+      app: fixture.target,
+      userRoot: fixture.userRoot,
+      candidateOnly: true,
+      output,
+      doctorTitlebarEnabled: false,
+      doctorConfiguration: { display: {density: "compact"}, tweaks: Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map(id => [id, {enabled: true, savedPreference: "preserved"}])) },
+    }, fixture.deps));
+
+    assert.doesNotThrow(() => verifyTweakersVariantCandidateReceipt(output, candidateVerificationOptions(output, fixture)));
+    const configPath = join(output, "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { tweaks: Record<string, { enabled?: boolean }> };
+    assert.equal(config.tweaks["co.tweakers.titlebar-controls"]?.enabled, false);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).display, {density: "compact"});
+    assert.equal(JSON.parse(readFileSync(configPath, "utf8")).tweaks["co.tweakers.titlebar-controls"].savedPreference, "preserved");
+    assert.match(JSON.parse(readFileSync(join(output, "state.json"), "utf8")).doctorConfigurationSha256, /^[a-f0-9]{64}$/);
+
+    config.tweaks["co.tweakers.titlebar-controls"]!.enabled = true;
+    writeFileSync(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => verifyTweakersVariantCandidateReceipt(output, candidateVerificationOptions(output, fixture)),
+      /candidate config fingerprint changed/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -2210,4 +2251,23 @@ test("candidate-only rejects official-app aliases at preparation and receipt ver
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("reviewed artifact copy preserves nested private directory modes and relative symlinks", () => {
+  const root = mkdtempSync(join(tmpdir(), "reviewed-copy-"));
+  try {
+    const source = join(root, "runtime"), destination = join(root, "copied");
+    mkdirSync(join(source, "private", "empty"), { recursive: true });
+    chmodSync(source, 0o700); chmodSync(join(source, "private"), 0o700); chmodSync(join(source, "private", "empty"), 0o500);
+    writeFileSync(join(source, "private", "data"), "sealed bytes", { mode: 0o444 });
+    symlinkSync("private/data", join(source, "relative-link"));
+    const expected = fingerprintVariantGeneration(source);
+    copyReviewedVariantArtifact(source, destination, expected);
+    assert.deepEqual(fingerprintVariantGeneration(destination), expected);
+    assert.equal(readlinkSync(join(destination, "relative-link")), "private/data");
+    assert.deepEqual(fingerprintVariantGeneration(source), expected, "source remains unchanged");
+    chmodSync(join(source, "private", "data"), 0o600);
+    writeFileSync(join(source, "private", "data"), "tampered");
+    assert.throws(() => copyReviewedVariantArtifact(source, join(root, "tampered-copy"), expected), /Copied candidate artifact changed: runtime/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

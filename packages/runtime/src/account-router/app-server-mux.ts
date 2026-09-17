@@ -15,10 +15,10 @@ import {
   type HistoryAdoptionFailure,
 } from "./history-adoption";
 import { AccountRouterMux, type RouterChild, type RouterChildFactory } from "./mux";
-import { readAndPreflightNativeHistorySourceStaticV1 } from "./native-history";
+import { readAndPreflightNativeHistorySourceStaticV1, type NativeHistorySourceFailureV1 } from "./native-history";
 import { startRouterControlSocket, type RouterControlSocket } from "./control-socket";
 import { parseJsonRpcLine } from "./protocol";
-import { assertPrivateRegularFile, ensurePrivateDirectory, migrateIdleRouterStateV3, RouterStateStore, validateRouterState } from "./state-store";
+import { assertPrivateRegularFile, migrateIdleRouterStateV3, RouterStateStore, validateRouterState } from "./state-store";
 import type { JsonRpcMessage, OpaqueAccountId, RouterConfig, RouterConfigV2, RouterConfigV3, RouterState } from "./types";
 import { isPlainRecord } from "./types";
 
@@ -228,15 +228,16 @@ export function preflightRouterHomes(config: RouterConfig, stateRoot: string): b
 export function preflightRouterHomesDetail(
   config: RouterConfig,
   stateRoot: string,
-): { ok: true } | { ok: false; reason: HistoryAdoptionFailure | "startup_selfcheck_failed" } {
+): { ok: true } | { ok: false; reason: HistoryAdoptionFailure | NativeHistorySourceFailureV1 | "startup_selfcheck_failed" } {
   if (!isQuotaAwareRouterConfig(config)) return { ok: false, reason: "history_adoption_required" };
   const secret = readControlSecret(stateRoot);
-  if (!secret) return { ok: false, reason: "startup_selfcheck_failed" };
+  if (!secret) return { ok: false, reason: "authentication_binding_invalid" };
   let intentBytes: Buffer | null = null;
   let receiptBytes: Buffer | null = null;
   let ownersBytes: Buffer | null = null;
   try {
-    ensurePrivateDirectory(stateRoot);
+    assertPrivateDirectoryForSkills(stateRoot);
+    if (existsSync(join(stateRoot, "native-storage-identities-repair.v2.json"))) return { ok: false, reason: "identity_repair_incomplete" };
     // A signed in-place source is an explicit v3 alternative to the old
     // adopted-home receipt. This parent/bridge check is deliberately static:
     // it must not classify an already-running broker-owned child as a foreign
@@ -244,7 +245,7 @@ export function preflightRouterHomesDetail(
     if (config.schemaVersion === 3) {
       const native = readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret);
       if (native.state === "ready") return { ok: true };
-      if (native.state === "invalid") return { ok: false, reason: "startup_selfcheck_failed" };
+      if (native.state === "invalid") return { ok: false, reason: native.reason };
     }
     const state = stateAllowsBalancedStartup(config, stateRoot);
     if (!state) return { ok: false, reason: "startup_selfcheck_failed" };
@@ -270,7 +271,7 @@ export function preflightRouterHomesDetail(
         join(stateRoot, "accounts", account.opaqueAccountId, "sqlite-home"),
       ]) {
         if (!existsSync(directory)) return { ok: false, reason: "startup_selfcheck_failed" };
-        ensurePrivateDirectory(directory);
+        assertPrivateDirectoryForSkills(directory);
       }
       if (!validateIsolatedAccountHome(account.opaqueAccountId, stateRoot, secret)) return { ok: false, reason: "startup_selfcheck_failed" };
     }

@@ -12,7 +12,7 @@ import {
 } from "../src/commands/install";
 
 test("freshly copied bundled-derived backends receive a bounded macOS first-run allowance", () => {
-  assert.equal(BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS, 15_000);
+  assert.equal(BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS, 60_000);
 });
 
 function sha256(value: string): string {

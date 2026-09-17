@@ -152,6 +152,22 @@ export declare function signNativeHistoryExtensionsV1(unsigned: NativeHistoryExt
 export declare function parseNativeHistoryExtensionsV1(value: unknown, secret: Buffer): NativeHistoryExtensionsV1 | null;
 export declare function signNativeHistoryManagedEnrollmentReceiptV1(unsigned: NativeHistoryManagedEnrollmentReceiptUnsignedV1, secret: Buffer): NativeHistoryManagedEnrollmentReceiptV1;
 export declare function parseNativeHistoryManagedEnrollmentReceiptV1(value: unknown, secret: Buffer): NativeHistoryManagedEnrollmentReceiptV1 | null;
+/** Persisted by the enrollment journal before its first receipt publication. */
+export interface NativeEnrollmentIdentityIntentV2 {
+    version: 2;
+    account: NativeHistoryManagedAccountDraftV1;
+    issuedAt: string;
+    codexVolumeUuid: string;
+    sqliteVolumeUuid: string;
+    signature: string;
+}
+export declare function prepareNativeEnrollmentIdentityIntentV2(input: {
+    stateRoot: string;
+    secret: Buffer;
+    account: NativeHistoryManagedAccountDraftV1;
+    issuedAt: string;
+}): NativeEnrollmentIdentityIntentV2;
+export declare function verifyNativeEnrollmentIdentityIntentV2(stateRoot: string, secret: Buffer, value: unknown): NativeEnrollmentIdentityIntentV2;
 /**
  * Writes the one receipt needed by a newly materialized manager-local home.
  * Existing bytes are never overwritten unless they already prove the exact
@@ -162,6 +178,7 @@ export declare function writeNativeHistoryManagedEnrollmentReceiptV1(input: {
     secret: Buffer;
     account: NativeHistoryManagedAccountDraftV1;
     issuedAt: string;
+    identityIntent?: NativeEnrollmentIdentityIntentV2;
 }): {
     receipt: NativeHistoryManagedEnrollmentReceiptV1;
     enrollmentReceiptFingerprint: Sha256;

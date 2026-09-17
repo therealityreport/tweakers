@@ -35,6 +35,7 @@ jobs:
             store/index.json \
             packages/installer/assets/runtime \
             ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
+            ':(exclude)packages/installer/assets/runtime/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/app-launcher/Tweakers App Launcher' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/swap-helper/Tweakers Swap Helper.app/Contents/MacOS/Tweakers Swap Helper' \
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json' \

@@ -29,6 +29,7 @@ export interface CodexAppServerParentCleanupResult {
     failed: number;
 }
 export interface CodexAppServerParentInstallOptions {
+    onAuthenticationRecovery?: () => void;
     childProcess?: MutableChildProcessModule;
     resourcesPath?: string;
     platform?: NodeJS.Platform;
@@ -114,7 +115,7 @@ export declare function buildAccountRouterMuxArgs(entrypoint: string, configPath
 export declare function buildAccountsBrokerAppServerArgs(entrypoint: string, configPath: string, command: string, args: readonly string[]): string[];
 /** A V3 preflight failure is terminal, never permission to launch direct. */
 export declare const ACCOUNTS_BROKER_BLOCKED_SOURCE: string;
-export declare function buildAccountsBrokerBlockedArgs(): string[];
+export declare function buildAccountsBrokerBlockedArgs(reason?: string): string[];
 /**
  * A derived desktop has its own Codex configuration home, but OpenAI's main
  * process still supplies every enabled desktop plugin as a CLI override. Keep

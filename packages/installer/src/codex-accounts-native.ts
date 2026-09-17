@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ACCOUNTS_NATIVE_MAIN_PATHS, patchAccountsNativeMainSources } from "./codex-accounts-native-main.js";
+import { patchCodexAccountsNative8881Sources, patchCodexAccountsNative9275Sources } from "./codex-accounts-native-8881.js";
 import {
   ACCOUNTS_NATIVE_REQUIRED_HOOKS,
   validateAccountsNativeCompatibility,
@@ -50,6 +51,14 @@ export function patchCodexAccountsNativeSources(
   sources: SourceSet,
   previousRecord?: unknown,
 ): AccountsNativePatchResult {
+  // Select an explicit recipe, never infer compatibility from the installed
+  // version or accept new hashes without reviewing the corresponding hooks.
+  if (sources.has("webview/assets/app-initial-9b95fa538c62.js")) {
+    return patchCodexAccountsNative8881Sources(sources, previousRecord);
+  }
+  if (sources.has("webview/assets/app-initial-4d7ea7f81c2d.js")) {
+    return patchCodexAccountsNative9275Sources(sources, previousRecord);
+  }
   const result = new Map(sources);
   const hooks = [...ACCOUNTS_NATIVE_REQUIRED_HOOKS];
   const hookSetSha256 = digest(JSON.stringify(hooks));
@@ -369,7 +378,9 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
     return status() && next.accountId === captured.accountId && next.generation === captured.generation;
   };
   const stale = () => Object.assign(new Error("Account selection changed. Refresh this screen."), { name: "AbortError" });
-  const capture = (surface: string) => status() ? { surface, ...snapshot(surface) } : null;
+  // Plugins use the native shared catalog. Undefined denotes native ownership;
+  // null still denotes an unavailable account-scoped capture for other surfaces.
+  const capture = (surface: string) => surface === "plugins" ? undefined : status() ? { surface, ...snapshot(surface) } : null;
   const requestCaptured = async (surface: string, method: string, params: unknown, captured: any, allowSelectionChange = false) => {
     if (!captured || !status() || (!allowSelectionChange && !current(surface, captured))) throw stale();
     try {
@@ -382,17 +393,17 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
     }
   };
   const request = async (surface: string, method: string, params: unknown, fallback: () => unknown) => {
-    if (!status()) return fallback();
+    if (surface === "plugins" || !status()) return fallback();
     const captured = snapshot(surface);
     return requestCaptured(surface, method, params, captured);
   };
   const scopeForMethod = (method: string, params?: any) => {
     if (/^app\/(list|installed|read)$/.test(method)) return "apps";
-    if (/^plugin\/(list|read|install|uninstall|share|enable|disable)$/.test(method)) return "plugins";
+    if (/^plugin\/(list|read|install|uninstall|share|enable|disable)$/.test(method)) return null;
     if (/^(mcpServerStatus\/list|mcpServer\/oauth\/login)$/.test(method)) return "mcp";
     if (method === "config/value/write" || method === "config/batchWrite") {
       const keys = method === "config/value/write" ? [params?.keyPath] : params?.edits?.map((edit: any) => edit?.keyPath);
-      if (Array.isArray(keys) && keys.length) for (const [prefix, surface] of [["apps.", "apps"], ["plugins.", "plugins"], ["mcp_servers.", "mcp"]]) {
+      if (Array.isArray(keys) && keys.length) for (const [prefix, surface] of [["apps.", "apps"], ["mcp_servers.", "mcp"]]) {
         if (keys.every((key: unknown) => typeof key === "string" && key.startsWith(prefix))) return surface;
       }
     }
@@ -400,20 +411,22 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
   };
   const queryScope = (options: any): string | null => {
     const explicit = options?.meta?.tweakersAccountsSurface;
-    if (["apps", "plugins", "mcp"].includes(explicit)) return explicit;
+    if (explicit === "plugins") return null;
+    if (["apps", "mcp"].includes(explicit)) return explicit;
     const key = options?.queryKey;
     if (!Array.isArray(key)) return null;
     if (key[0] === "profile" && key[1] === "usage") return "profile";
     if (key[0] === "rate-limit-reset-credits") return "usage";
     if (key[0] === "rate-limit-status") return "usage";
     if (key[0] === "apps") return "apps";
-    if (key[0] === "plugins") return "plugins";
+    if (key[0] === "plugins") return null;
     if (key[0] === "mcp") return "mcp";
     if (key[0] === "config" && key[1] === "mcp" && key[2] === "servers") return "mcp";
     if (key[0] === "mcp-settings" && key[1] === "app-connect") return "apps";
     return null;
   };
   const scopeQueryOptions = (options: any, surface: string) => {
+    if (surface === "plugins") return options;
     if (Array.isArray(options?.queryKey) && options.queryKey.at(-3) === "tweakers-accounts") return options;
     if (!status()) return options;
     const captured = snapshot(surface);
@@ -437,6 +450,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
   const oauthStates = new Map<string, { captured: any; expires: number }>();
   const mutationScopes = new WeakMap<object, any>();
   const mutationScope = (surface: string, variables: any) => {
+    if (surface === "plugins") return undefined;
     if (!variables || typeof variables !== "object" || !mutationScopes.has(variables)) throw stale();
     const captured = mutationScopes.get(variables);
     if (captured ? captured.surface !== surface || !current(surface, captured) : status()) throw stale();
@@ -468,6 +482,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
   }
   const bridge = {
     render(surface: string, original: unknown, context: any) {
+      if (surface === "plugins") return original;
       const react = context.react ?? nativeReact;
       if (!initialized || !react?.useState || !react?.useEffect || typeof context.jsx !== "function") return original;
       return context.jsx(NativeSlot, { surface, original, context: { ...context, react } });
@@ -480,6 +495,15 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return captured ? [...key, "tweakers-accounts", captured.accountId ?? "pooled", captured.generation] : key;
     },
     mutation(surface: string, options: any) {
+      if (surface === "plugins") {
+        if (typeof options.meta?.accountsFinalize !== "function") return options;
+        // The patch extracts native operation-lock cleanup into metadata. Keep
+        // that cleanup even though shared Plugins no longer use account guards.
+        return { ...options, onSettled: (...args: any[]) => {
+          options.meta.accountsFinalize(...args);
+          return options.onSettled?.(...args);
+        } };
+      }
       const guarded = { ...options };
       for (const name of ["mutationFn", "onMutate", "onSuccess", "onError", "onSettled"]) {
         const callback = options[name];
@@ -497,6 +521,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return guarded;
     },
     mutationHandle(surface: string, handle: any) {
+      if (surface === "plugins") return handle;
       const wrapped = { ...handle };
       for (const name of ["mutate", "mutateAsync"]) if (typeof handle[name] === "function") {
         wrapped[name] = (variables: any, options?: any) => {
@@ -508,11 +533,12 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return wrapped;
     },
     rollbackScope(token: any) {
+      if (token === undefined) return undefined;
       if ((token === undefined || token === null) && status()) throw Object.assign(new Error("The original install account could not be verified. Refresh Plugins and uninstall manually."), { accountsScoped: true });
       bridge.ensure(token);
       return token ?? null;
     },
-    isCurrent(captured: any) { return captured ? current(captured.surface, captured) : !status(); },
+    isCurrent(captured: any) { return captured === undefined || (captured ? current(captured.surface, captured) : !status()); },
     ensure(captured: any) { if (captured ? !current(captured.surface, captured) : captured === null && status()) throw stale(); },
     oauthResultCurrent(result: any) { const captured = result && typeof result === "object" ? oauthResults.get(result) : null; return !captured || current("apps", captured); },
     request,
@@ -541,7 +567,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return captured ? requestCaptured(captured.surface, method, params, captured) : fallback();
     },
     configOptions(surface: string, options: any, wrapped = false, cwd: string | null = null) {
-      if (!["apps", "plugins", "mcp"].includes(surface)) return options;
+      if (!["apps", "mcp"].includes(surface)) return options;
       const captured = capture(surface);
       return { ...options, meta: { ...options.meta, tweakersAccountsSurface: surface },
         ...(captured ? { queryFn: async () => {
@@ -567,6 +593,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       return async (path: string, options: any = {}) => {
         const verb = method === "safeGet" ? "GET" : method === "safePost" ? "POST" : "";
         const surface = httpSurface(verb, path);
+        if (explicitCapture && flowCapture === undefined) return client[method](path, options);
         if (explicitCapture && flowCapture === null) { bridge.ensure(flowCapture); return client[method](path, options); }
         if (!surface || (!flowCapture && !captured[surface])) return client[method](path, options);
         let selected = flowCapture ?? captured[surface];
@@ -600,7 +627,7 @@ function accountsNativeBootstrap(hookSetSha256: string): void {
       const surface = scopeForMethod(method, params);
       return surface ? request(surface, method, params ?? {}, fallback) : fallback();
     },
-    key(surface: string) { return status() ? JSON.stringify(snapshot(surface)) : "native"; },
+    key(surface: string) { return surface !== "plugins" && status() ? JSON.stringify(snapshot(surface)) : "native"; },
     project(surface: string, kind: string, input: unknown) {
       if (!status()) return input;
       try { return transport.project(surface, kind, input); } catch { return input; }

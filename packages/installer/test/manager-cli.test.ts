@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   parseTweakersManagerStatusArguments,
+  parseTweakersManagerArguments,
   runTweakersManagerCli,
 } from "../src/manager-cli";
 import { TweakersManagerActionAdapter } from "../src/manager-action-adapter";
@@ -14,6 +15,46 @@ const OPERATION_ID = "018f0d36-4c08-7a3e-9c1d-123456789abd";
 const STATE_TOKEN = `sha256:${"a".repeat(64)}` as const;
 const EXPIRES_AT = "2026-08-27T23:05:00.000Z";
 const EXECUTABLE = { state: "resolved" as const, path: "/fixed/Tweakers Manager Launcher", sha256: "b".repeat(64) };
+
+test("manager stdout waits for a backpressured UTF-8 response to finish", async (context) => {
+  const dependencies = {
+    executable: () => EXECUTABLE,
+    status: () => ({
+      protocolVersion: MANAGER_PROTOCOL_VERSION,
+      managerId: TWEAKERS_MANAGER_ID,
+      generatedAt: "2026-08-27T23:00:00.000Z",
+      stateToken: STATE_TOKEN,
+      status: { detail: "Doctor café 🦉 ".repeat(400) },
+      actions: [],
+    }) as never,
+  };
+  let expected = "";
+  await runTweakersManagerCli(["status", "--request-id", REQUEST_ID, "--json"], {
+    ...dependencies, write: (line) => { expected += line; },
+  });
+  const chunks: string[] = [];
+  let finish: ((error?: Error | null) => void) | undefined;
+  const mocked = context.mock.method(process.stdout, "write", ((data: string, encoding: string, callback: (error?: Error | null) => void) => {
+    assert.equal(encoding, "utf8");
+    chunks.push(data);
+    finish = callback;
+    return false;
+  }) as typeof process.stdout.write);
+  try {
+    let completed = false;
+    const result = runTweakersManagerCli(["status", "--request-id", REQUEST_ID, "--json"], dependencies)
+      .then((exit) => { completed = true; return exit; });
+    await Promise.resolve();
+    assert.equal(completed, false);
+    assert.ok(finish);
+    finish();
+    assert.equal(await result, 0);
+    assert.deepEqual(chunks, [expected]);
+    assert.equal(JSON.parse(chunks[0]).requestId, REQUEST_ID);
+  } finally {
+    mocked.mock.restore();
+  }
+});
 
 test("manager CLI emits exactly the status protocol envelope with a host request id", async () => {
   const writes: string[] = [];
@@ -336,3 +377,20 @@ function rejectingAdapter(): TweakersManagerActionAdapter {
     cancel: async () => assert.fail("invalid request must not cancel"),
   } as unknown as TweakersManagerActionAdapter;
 }
+
+ test("Doctor manager verbs accept only exact fixed argv", () => {
+  for (const section of ["overview", "updates", "doctor"]) {
+    assert.deepEqual(parseTweakersManagerArguments(["manager-open", "--request-id", REQUEST_ID, "--section", section, "--json"]),
+      { command: "manager-open", requestId: REQUEST_ID, section });
+  }
+  for (const args of [
+    ["manager-open", "--request-id", REQUEST_ID, "--json"],
+    ["manager-open", "--request-id", REQUEST_ID, "--section", "install", "--json"],
+    ["manager-open", "--request-id", REQUEST_ID, "--section", "overview", "--json", "extra"],
+    ["manager-open", "--request-id", "invalid", "--section", "overview", "--json"],
+  ]) assert.throws(() => parseTweakersManagerArguments(args));
+  for (const command of ["doctor-status", "doctor-open", "doctor-action", "doctor-run"]) {
+    assert.deepEqual(parseTweakersManagerArguments([command, "--request-id", REQUEST_ID, "--json"]), { command, requestId: REQUEST_ID });
+    for (const args of [[command], [command, "--request-id", REQUEST_ID, "--json", "--app", "/tmp/other.app"], [command, "--request-id", "invalid", "--json"]]) assert.throws(() => parseTweakersManagerArguments(args));
+  }
+});

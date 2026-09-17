@@ -27,6 +27,7 @@ test("missing and malformed manager authority fail closed before any action can 
   });
   assert.throws(() => missing.readStatus(), /unavailable or malformed/);
   assert.throws(() => missing.startAction("refresh.independent"), /unavailable or malformed/);
+  assert.throws(() => missing.openManager(), /unavailable or malformed/);
 
   const malformed = createTweakersManagerClient({
     homeDirectory: () => HOME,
@@ -36,6 +37,34 @@ test("missing and malformed manager authority fail closed before any action can 
   assert.throws(() => malformed.readStatus(), /incompatible or blocked/);
   assert.throws(() => malformed.startAction("refresh.independent"), /incompatible or blocked/);
   assert.equal(executions, 0);
+});
+
+test("Manager navigation is allowlisted and dispatches no maintenance request", () => {
+  const spawned: string[][] = [];
+  const client = createTweakersManagerClient({
+    homeDirectory: () => HOME,
+    readText: () => DESCRIPTOR,
+    createId: () => "018f0d36-4c08-7a3e-9c1d-123456789abc",
+    execute: (executable) => {
+      assert.equal(executable, "/usr/bin/codesign", "opening may verify authority but must not scan or execute maintenance");
+      return "";
+    },
+    spawnDetached: (executable, args) => {
+      assert.equal(executable, EXECUTABLE);
+      spawned.push([...args]);
+    },
+  });
+  client.openManager();
+  client.openManager("updates");
+  client.openManager("doctor");
+  client.openDoctor();
+  assert.deepEqual(spawned.map(args => [args[0], args[4]]), [
+    ["manager-open", "overview"], ["manager-open", "updates"], ["manager-open", "doctor"], ["doctor-open", undefined],
+  ]);
+  for (const section of [null, {}, "install", "overview --update"]) {
+    assert.throws(() => client.openManager(section as never), /Invalid Tweakers Manager section/);
+  }
+  assert.equal(spawned.length, 4);
 });
 
 test("an archived manager descriptor is rejected before status or action execution", () => {

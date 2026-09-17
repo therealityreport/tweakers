@@ -289,6 +289,14 @@ test("manager launcher enforces the fixed seal layout and runs only sealed fixed
     assert.equal(registrationOutput.path, null);
     assert.equal(registrationOutput.pgid, processGroup(process.pid));
 
+    for (const section of ["overview", "updates", "doctor"]) {
+      const args = ["manager-open", "--request-id", requestId, "--section", section, "--json"];
+      const opened = invoke(staged.launcher, args, environment);
+      assert.equal(opened.status, 0, opened.stderr);
+      assert.deepEqual(JSON.parse(opened.stdout).argv, args);
+      assert.equal(JSON.parse(opened.stdout).nodeOptions, null);
+    }
+
     const retiredRecovery = invoke(staged.launcher, ["desktop-update-recovery", "--request-id", requestId, "--json"], environment);
     assert.equal(retiredRecovery.status, 64, retiredRecovery.stderr);
     assert.equal(retiredRecovery.stdout, "");
@@ -357,6 +365,9 @@ test("manager launcher rejects malformed fixed-protocol argv before spawning Nod
   try {
     for (const args of [
       [],
+      ["manager-open", "--request-id", requestId, "--json"],
+      ["manager-open", "--request-id", requestId, "--section", "install", "--json"],
+      ["manager-open", "--request-id", requestId, "--section", "overview", "--json", "extra"],
       ["prepare", "--request-id", requestId, "--json"],
       ["execute", "--request-id", requestId, "--json"],
       ["cancel", "--request-id", requestId, "--json"],

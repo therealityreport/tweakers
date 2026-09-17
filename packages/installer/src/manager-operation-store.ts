@@ -472,3 +472,16 @@ function assertPhaseTimestamps(value: {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+/** Copy validation failed before any quiesce, promotion or runtime-ready work. */
+export function isCandidateCopyPrecutoverFailure(operation: TweakersManagerPreparedOperationV1 | null): boolean {
+  if (!operation || operation.actionId !== "refresh.independent" || operation.phase !== "recovery-required"
+    || !/^Copied candidate artifact changed(?:: (?:runtime|tweaks|state\.json|config\.json))?$/.test(operation.error ?? "")) return false;
+  const phases = operation.timing?.phases;
+  if (!phases || phases["patch-stage"]?.state !== "failed" || !phases["patch-stage"].startedAt || !phases["patch-stage"].completedAt) return false;
+  return MANAGER_REFRESH_TIMING_PHASES_V1.filter(key => key !== "patch-stage").every(key => {
+    const p = phases[key];
+    return !!p && p.startedAt === null && p.completedAt === null
+      && (key === "quiesce-promote" || key === "runtime-ready-wait" ? p.state === "skipped" : p.state === "unavailable" || p.state === "skipped");
+  });
+}

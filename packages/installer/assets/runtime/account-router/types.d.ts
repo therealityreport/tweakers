@@ -71,13 +71,22 @@ export interface CorrelationRecord {
     method: string;
     dispatchState: DispatchState;
 }
-export type ReservationState = "reserved" | "released_pre_dispatch" | "stranded_ambiguous" | "reconciled";
+export type ReservationState = "reserved" | "dispatched" | "released_pre_dispatch" | "stranded_ambiguous" | "reconciled";
 export interface Reservation {
     reservationId: string;
     opaqueAccountId: OpaqueAccountId;
     estimatedCost: number;
     state: ReservationState;
     epoch: number;
+    /** Manager-only execution purpose; absent for ordinary broker requests. */
+    purpose?: "doctor_review";
+    /** HMAC of the acquire request id. Never contains provider or request content. */
+    requestDigest?: `hmac-sha256:${string}`;
+    /** Exact terminal usage supports idempotent recovery after a lost settle acknowledgement. */
+    settledUsage?: {
+        inputTokens: number;
+        outputTokens: number;
+    };
 }
 export interface LedgerEntry {
     completedInputTokens: number;

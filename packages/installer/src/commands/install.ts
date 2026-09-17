@@ -1,3 +1,4 @@
+import { applyDoctorPatchRepairs, type DoctorPatchRepairV1 } from "../doctor-patch-repair.js";
 import kleur from "kleur";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -177,6 +178,7 @@ interface Opts {
   macAppIdentity?: MacAppIdentity;
   /** Internal only: patch/sign a disposable candidate without global side effects. */
   candidateContext?: {
+    doctorPatchRepairs?: DoctorPatchRepairV1[];
     paths: UserPaths;
     finalUserRoot: string;
     bundledDerivedBackend?: BundledDerivedBackendArtifact;
@@ -242,7 +244,9 @@ export function bundledDerivedBackendPath(appRoot: string): string {
   return join(appRoot, "Contents", "Resources", "codex");
 }
 
-export const BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS = 15_000;
+// A newly relocated signed backend can trigger a cold macOS trust scan.
+// Keep the probe bounded while allowing that first launch to finish.
+export const BUNDLED_DERIVED_VERSION_PROBE_TIMEOUT_MS = 60_000;
 
 /**
  * Copy a receipt-validated, desktop-bundled-derived backend into a disposable
@@ -343,6 +347,26 @@ export function stageNativeHostInsideApp(appRoot: string, runtimeRoot: string): 
   const destination = stagedNativeHostPath(appRoot);
   mkdirSync(dirname(destination), { recursive: true });
   copyFileSync(source, destination);
+  const doctor = join(runtimeRoot, "native", "Tweakers Doctor.app");
+  if (existsSync(doctor)) {
+    // Early launcher failures happen before the managed runtime can load.
+    // Keep the recovery app inside the candidate's final signature as well.
+    if (!lstatSync(doctor).isDirectory() || lstatSync(doctor).isSymbolicLink()) throw new Error("Packaged Doctor app is unsafe");
+    const copiedDoctor = join(dirname(destination), "Tweakers Doctor.app");
+    if (existsSync(copiedDoctor) && lstatSync(copiedDoctor).isSymbolicLink()) throw new Error("Candidate Doctor app is unsafe");
+    if (!realpathSync(dirname(destination)).startsWith(`${realpathSync(appRoot)}/`)) throw new Error("Candidate Doctor app escapes the app");
+    cpSync(doctor, copiedDoctor, { recursive: true, dereference: false });
+    // Published runtimes are sealed read-only. Only this candidate copy must
+    // allow codesign to replace code signatures and signature resources.
+    const prepareCopiedCode = (path: string): void => {
+      const status = lstatSync(path);
+      if (status.isSymbolicLink()) return;
+      if (!status.isDirectory() && !status.isFile()) throw new Error("Candidate Doctor contains an unsupported file type");
+      chmodSync(path, (status.mode & 0o777) | 0o200);
+      if (status.isDirectory()) for (const name of readdirSync(path)) prepareCopiedCode(join(path, name));
+    };
+    prepareCopiedCode(copiedDoctor);
+  }
   return destination;
 }
 
@@ -2157,6 +2181,8 @@ export interface BundledDerivedBackendArtifact {
   fingerprint: string;
   receiptPath: string;
   transactionId: string;
+  /** Preserve a verified installed signature for an unchanged baseline only. */
+  preserveSignature?: boolean;
 }
 
 /**
@@ -2425,6 +2451,7 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
         ? (opts.macAppIdentity?.accountsBrokerRoot
           ?? defaultTweakersAccountsBrokerRoot(targetUserHome()))
         : undefined,
+      opts.candidateContext?.doctorPatchRepairs,
     );
   const { headerHash: patchedAsarHash } = readHeaderHash(codex.asarPath);
   step.detail(`Patched app.asar (entry was ${kleur.dim(originalEntry)})`);
@@ -2476,6 +2503,10 @@ async function installCandidateInPlace(opts: Opts): Promise<void> {
     const signing = signCodexApp(codex.appRoot, {
       useLocalIdentity: localSigning,
       preparedIdentity: preparedSigning,
+      ...(opts.candidateContext?.bundledDerivedBackend?.preserveSignature ? { retainedSignedBackend: {
+        sourcePath: opts.candidateContext.bundledDerivedBackend.binaryPath,
+        sha256: opts.candidateContext.bundledDerivedBackend.fingerprint,
+      } } : {}),
     });
     resigned = true;
     signingMode = signing?.mode;
@@ -3907,6 +3938,7 @@ async function injectLoader(
   appUserDataRoot?: string,
   appDisplayName?: string,
   accountsBrokerRoot?: string,
+  doctorPatchRepairs: DoctorPatchRepairV1[] = [],
 ): Promise<{ originalMain: string; rendererPatches: RendererPatchOutcome[] }> {
   let originalMain = "";
   let rendererPatches: RendererPatchOutcome[] = [];
@@ -3922,6 +3954,7 @@ async function injectLoader(
     // Preserve the original entry across repairs while refreshing isolated paths.
     if (pkg["__tweaker"]) originalMain = String(pkg["__tweaker"].originalMain);
     if (pkg[LEGACY_ASAR_META_KEY]) originalMain = String(pkg[LEGACY_ASAR_META_KEY].originalMain);
+    applyDoctorPatchRepairs(dir, doctorPatchRepairs);
     const previousAccountsNative = pkg["__tweaker"]?.accountsNative;
     pkg["__tweaker"] = {
       originalMain,
@@ -3968,7 +4001,7 @@ async function injectLoader(
 
     const inactiveThreadRetentionPatch = runOptionalRendererPatch(
       "renderer.inactive-thread-retention",
-      () => patchCodexInactiveThreadRetentionInExtractedApp(dir),
+      () => patchCodexInactiveThreadRetentionInExtractedApp(dir, new Map(doctorPatchRepairs.map(r => [r.path, r.telemetryAnchor]))),
     );
     reportRendererPatch(step, inactiveThreadRetentionPatch, "Codex inactive-thread retention policy");
 

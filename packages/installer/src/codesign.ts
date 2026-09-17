@@ -10,8 +10,8 @@
  * uses the same identity before the bundle wrappers and main app are signed.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, lstatSync, mkdtempSync, openSync, readSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, copyFileSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, platform, tmpdir } from "node:os";
 import { readPlist, writePlist, type Plist } from "./plist.js";
@@ -50,6 +50,8 @@ export interface CodeSigningOptions {
   identityName?: string;
   preparedIdentity?: PreparedSigningIdentity | null;
   signingPosture?: SigningPosture;
+  /** Exact installed backend whose signed bytes must remain registered during baseline maintenance. */
+  retainedSignedBackend?: { sourcePath: string; sha256: string };
 }
 
 export interface PreparedSigningIdentity {
@@ -158,6 +160,11 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
     rmSync(nestedEntitlementsRoot, { recursive: true, force: true });
   }
 
+  if (opts.retainedSignedBackend) {
+    if (!localIdentity) throw new Error("Retaining an installed backend requires its exact local signing identity");
+    restoreVerifiedSignedBackend(appRoot, opts.retainedSignedBackend, localIdentity.hash);
+  }
+
   // Step 2: sign the outer bundle only after its nested code. `--deep` can
   // overwrite a deliberate child signature and obscure an unsafe entitlement,
   // so the final outer signing pass never delegates child traversal to
@@ -211,6 +218,20 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
         createdIdentity: localIdentity.created,
       }
     : { mode: "adhoc", identity: "-" };
+}
+
+/** Restore only certificate-pinned signed bytes before the outer bundle seal; never after signing. */
+export function restoreVerifiedSignedBackend(appRoot: string, binding: { sourcePath: string; sha256: string }, signingIdentityHash: string,
+  deps: { certificate?: typeof codeSigningCertificateLeafHash; verify?: typeof verifySignature; copy?: typeof copyFileSync } = {}): void {
+  const source = binding.sourcePath, target = join(appRoot, "Contents", "Resources", "codex");
+  if (!isAbsolute(source) || resolve(source) !== source || !/^[a-f0-9]{64}$/.test(binding.sha256)) throw new Error("Invalid retained backend binding");
+  const sourceStat = lstatSync(source), targetStat = lstatSync(target);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || !targetStat.isFile() || targetStat.isSymbolicLink()) throw new Error("Retained backend must use physical regular files");
+  const sha = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+  if (sha(source) !== binding.sha256 || (deps.certificate ?? codeSigningCertificateLeafHash)(source).toUpperCase() !== signingIdentityHash.toUpperCase()
+    || !(deps.verify ?? verifySignature)(source).ok) throw new Error("Retained backend signature or bytes changed");
+  (deps.copy ?? copyFileSync)(source, target);
+  if (sha(source) !== binding.sha256 || sha(target) !== binding.sha256 || !(deps.verify ?? verifySignature)(target).ok) throw new Error("Retained backend copy did not verify");
 }
 
 /**

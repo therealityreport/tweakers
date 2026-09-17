@@ -41,9 +41,7 @@ constexpr mode_t kManagedDirectoryMode = 0700;
 constexpr mode_t kLauncherMode = 0500;
 constexpr mode_t kReadOnlyFileMode = 0400;
 constexpr size_t kMaximumSealBytes = 4096;
-#if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
 constexpr size_t kMaximumPrepareInputBytes = 64 * 1024;
-#endif
 
 struct Seal {
   std::string generationId;
@@ -56,6 +54,8 @@ struct Seal {
 
 enum class InvocationKind {
   kStatus,
+  kDoctor,
+  kDoctorAction,
   kOfficialSourceRegistration,
   kPortableDesktop,
   kPrivateOffline,
@@ -420,6 +420,20 @@ bool ValidateInvocation(int argc, char *const argv[], InvocationKind *kind) {
       return true;
     }
   }
+  if (argc == 7 && std::strcmp(argv[1], "manager-open") == 0
+      && std::strcmp(argv[2], "--request-id") == 0 && IsCanonicalUuid(argv[3])
+      && std::strcmp(argv[4], "--section") == 0
+      && (std::strcmp(argv[5], "overview") == 0 || std::strcmp(argv[5], "updates") == 0 || std::strcmp(argv[5], "doctor") == 0)
+      && std::strcmp(argv[6], "--json") == 0) {
+    *kind = InvocationKind::kDoctor;
+    return true;
+  }
+  if (argc == 5 && (std::strcmp(argv[1], "doctor-status") == 0 || std::strcmp(argv[1], "doctor-action") == 0
+      || std::strcmp(argv[1], "doctor-open") == 0 || std::strcmp(argv[1], "doctor-run") == 0)
+      && std::strcmp(argv[2], "--request-id") == 0 && IsCanonicalUuid(argv[3]) && std::strcmp(argv[4], "--json") == 0) {
+    *kind = std::strcmp(argv[1], "doctor-action") == 0 ? InvocationKind::kDoctorAction : InvocationKind::kDoctor;
+    return true;
+  }
   if (argc == 5 && std::strcmp(argv[1], "status") == 0
       && std::strcmp(argv[2], "--request-id") == 0 && IsCanonicalUuid(argv[3])
       && std::strcmp(argv[4], "--json") == 0) {
@@ -513,7 +527,6 @@ bool ValidateGeneration(const std::string &launcher, Seal *seal, std::string *ma
   return true;
 }
 
-#if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
 bool ReadPrepareInput(std::string *input) {
   if (input == nullptr) return Fail("could not retain prepare input");
   input->clear();
@@ -532,7 +545,6 @@ bool ReadPrepareInput(std::string *input) {
     input->append(buffer.data(), length);
   }
 }
-#endif
 
 bool WriteAll(int fd, const std::string &input) {
   size_t offset = 0;
@@ -690,11 +702,13 @@ int main(int argc, char *argv[]) {
   if (!ValidateGeneration(launcher, &seal, &managerPath, &nodePath)) return 70;
   std::string prepareInput;
   const std::string *prepareInputPointer = nullptr;
+  bool needsInput = kind == InvocationKind::kDoctorAction;
 #if defined(TWEAKERS_MANAGER_EXPERIMENTAL_ACTIONS)
-  if (kind == InvocationKind::kPrepare) {
+  needsInput = needsInput || kind == InvocationKind::kPrepare;
+#endif
+  if (needsInput) {
     if (!ReadPrepareInput(&prepareInput)) return 64;
     prepareInputPointer = &prepareInput;
   }
-#endif
   return SpawnManager(nodePath, managerPath, argc, argv, prepareInputPointer);
 }

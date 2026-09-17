@@ -1,3 +1,4 @@
+import { type DoctorActionRequestV1, type DoctorReportV1, type TweakersManagerSection } from "@therealityreport/tweakers-sdk";
 declare const PUBLIC_STATUS_ACTION_IDS: readonly ["refresh.injected", "refresh.independent"];
 export type TweakersManagerPublicStatusActionId = typeof PUBLIC_STATUS_ACTION_IDS[number];
 type TweakersManagerPublicStartActionId = "refresh.injected" | "refresh.independent";
@@ -53,7 +54,15 @@ export declare function createTweakersManagerClient(overrides?: Partial<Tweakers
         started: true;
         operationId: string;
     };
+    readDoctor: () => DoctorReportV1;
+    doctorAction: (input: DoctorActionRequestV1) => DoctorReportV1;
+    openManager: (section?: TweakersManagerSection) => void;
+    openDoctor: () => void;
 };
+export declare function readTweakersDoctor(): DoctorReportV1;
+export declare function runTweakersDoctorAction(input: DoctorActionRequestV1): DoctorReportV1;
+export declare function openTweakersManager(section?: TweakersManagerSection): void;
+export declare function openTweakersDoctor(): void;
 export declare function readTweakersManagerStatus(): TweakersManagerStatus;
 export declare function startTweakersManagerAction(actionId: TweakersManagerPublicStartActionId): {
     started: true;

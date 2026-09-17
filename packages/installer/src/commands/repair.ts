@@ -135,6 +135,13 @@ export async function repairWithOutcome(
   opts: Opts = {},
   dependencies: RepairDependencies = {},
 ): Promise<RepairOutcome> {
+  // Independent installations use Doctor's read-only update review. The legacy
+  // watcher repair must never replace or interrupt native Codex on their behalf.
+  if (isWatcherRepair(opts) && existsSync(join(userPaths().root, "variants", "tweakers", "state.json")) && existsSync("/Applications/Tweakers.app")) {
+    // Repair is not update discovery. Only an explicit check or a consumed
+    // available-update signal may start independent Doctor analysis.
+    return { status: "deferred", reason: "independent-doctor-review" };
+  }
   const preliminaryPaths = userPaths();
   assertInstallerUpdateQuarantineClear(preliminaryPaths.root, "repair");
   const watcherRepair = isWatcherRepair(opts);

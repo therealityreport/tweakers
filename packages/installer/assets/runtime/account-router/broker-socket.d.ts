@@ -51,7 +51,7 @@ export interface AccountsBrokerSocket {
  */
 export interface AccountsBrokerSocketReservation {
     readonly path: string;
-    activate(options: Pick<AccountsBrokerSocketOptions, "broker" | "mapNativeTargets" | "resolveNativeBrowserContext" | "invokeNativeBrowserRequest">): AccountsBrokerSocket;
+    activate(options: Pick<AccountsBrokerSocketOptions, "broker" | "mapNativeTargets" | "resolveNativeBrowserContext" | "invokeNativeBrowserRequest" | "managerExecution">): AccountsBrokerSocket;
     close(): Promise<void>;
 }
 export interface AccountsBrokerSocketOptions {
@@ -64,7 +64,62 @@ export interface AccountsBrokerSocketOptions {
     mapNativeTargets?: (rendererRef: OpaqueRendererRef, request: NativeSharedHistoryMapRequestV1) => NativeSharedHistoryMapResultV1;
     resolveNativeBrowserContext?: (rendererRef: OpaqueRendererRef, opaqueAccountId: string) => Promise<NativeBrowserContextV1>;
     invokeNativeBrowserRequest?: (rendererRef: OpaqueRendererRef, opaqueAccountId: string, method: string, params: Record<string, unknown>) => Promise<unknown | null>;
+    managerExecution?: (request: DoctorExecutionLeaseRequestV1) => Promise<DoctorExecutionLeaseResultV1>;
 }
+export type DoctorExecutionLeaseUnavailableReason = "broker_unavailable" | "pool_depleted" | "quota_unavailable" | "binding_unavailable" | "request_replayed" | "invalid_request";
+export type DoctorExecutionLeaseAcquireResultV1 = {
+    status: "ready";
+    leaseId: string;
+    opaqueAccountId: string;
+    codexHome: string;
+} | {
+    status: "unavailable";
+    reason: DoctorExecutionLeaseUnavailableReason;
+};
+export type DoctorExecutionLeaseMarkResultV1 = {
+    status: "dispatched";
+    leaseId: string;
+} | {
+    status: "unavailable";
+    reason: DoctorExecutionLeaseUnavailableReason;
+};
+export type DoctorExecutionLeaseSettleResultV1 = {
+    status: "settled";
+    leaseId: string;
+    outcome: "pre_dispatch" | "completed" | "ambiguous";
+} | {
+    status: "unavailable";
+    reason: DoctorExecutionLeaseUnavailableReason;
+};
+export type DoctorExecutionLeaseRequestV1 = {
+    version: 1;
+    requestId: string;
+    action: "prepare_auth_recovery";
+} | {
+    version: 1;
+    requestId: string;
+    action: "acquire";
+    purpose: "doctor_review";
+    estimatedCost: number;
+} | {
+    version: 1;
+    requestId: string;
+    action: "mark_dispatched";
+    leaseId: string;
+} | {
+    version: 1;
+    requestId: string;
+    action: "settle";
+    leaseId: string;
+    outcome: "pre_dispatch" | "completed" | "ambiguous";
+    usage?: {
+        inputTokens: number;
+        outputTokens: number;
+    };
+};
+export type DoctorExecutionLeaseResultV1 = {
+    status: "recovery_ready";
+} | DoctorExecutionLeaseAcquireResultV1 | DoctorExecutionLeaseMarkResultV1 | DoctorExecutionLeaseSettleResultV1;
 export type NativeBrowserContextV1 = {
     version: 1;
     status: "unavailable";
@@ -114,6 +169,43 @@ export interface AccountsBrokerSocketClientOptions {
     appToolsRef: OpaqueAppToolsRef;
     socketFileName?: string;
     maxFrameBytes?: number;
+}
+export interface AccountsBrokerManagerClientOptions {
+    root: string;
+    secret: Buffer;
+    socketFileName?: string;
+    maxFrameBytes?: number;
+}
+/** Owner-private manager client. Each operation uses one authenticated frame and is never replayed by the transport. */
+export declare class AccountsBrokerManagerClientV1 {
+    private readonly root;
+    private readonly secret;
+    private readonly socketFileName;
+    private readonly maxFrameBytes;
+    private readonly sockets;
+    private closed;
+    constructor(options: AccountsBrokerManagerClientOptions);
+    prepareAuthenticationRecovery(requestId: string): Promise<boolean>;
+    acquireDoctorReviewLease(input: {
+        requestId: string;
+        purpose: "doctor_review";
+        estimatedCost: number;
+    }): Promise<DoctorExecutionLeaseAcquireResultV1>;
+    markDoctorReviewLeaseDispatched(input: {
+        requestId: string;
+        leaseId: string;
+    }): Promise<DoctorExecutionLeaseMarkResultV1>;
+    settleDoctorReviewLease(input: {
+        requestId: string;
+        leaseId: string;
+        outcome: "pre_dispatch" | "completed" | "ambiguous";
+        usage?: {
+            inputTokens: number;
+            outputTokens: number;
+        };
+    }): Promise<DoctorExecutionLeaseSettleResultV1>;
+    close(): Promise<void>;
+    private invoke;
 }
 /**
  * Main-process-only client.  It never retries a command after a connection

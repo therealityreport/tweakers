@@ -2,6 +2,8 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { constants, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { packagedRuntimeAssetsRoot } from "./commands/install.js";
 import { canonicalJson, isOpaqueAccountId, isCanonicalUtcTimestamp, ACCOUNT_ROUTER_HISTORY_ADOPTION_PROTOCOL_FINGERPRINT } from "./account-history-adoption.js";
 
 const CONFIG_FILE = "account-router-config.json";
@@ -27,6 +29,8 @@ export interface NativeHistorySetupDependencies {
   /** Test seam; production always performs the process census. */
   idle?: (roots: readonly string[], apps: readonly string[]) => boolean;
   now?: () => string;
+  /** Test seam for the packaged, pure-verified initial persistent identity publication. */
+  seedPersistentIdentities?: (stage: string) => void;
 }
 
 /** Test seam for the host-only writer census; normal setup uses the real host process table. */
@@ -72,6 +76,17 @@ export function setupNativeHistory(input: NativeHistorySetupInput, dependencies:
       privateWrite(join(stage, "control-secret.v1"), prepared.secret);
       privateWrite(join(stage, CONFIG_FILE), JSON.stringify(prepared.config) + "\n");
       privateWrite(join(stage, SOURCE_FILE), JSON.stringify(prepared.source) + "\n");
+      if (process.platform === "darwin") {
+        if (dependencies.seedPersistentIdentities) dependencies.seedPersistentIdentities(stage);
+        else {
+          const requireRuntime = createRequire(import.meta.url);
+          const identities = requireRuntime(join(packagedRuntimeAssetsRoot(), "account-router", "persistent-directory-identity.js"));
+          const history = requireRuntime(join(packagedRuntimeAssetsRoot(), "account-router", "native-history.js"));
+          const proposal = identities.preparePersistentIdentityGeneration({ stateRoot: stage, secret: prepared.secret,
+            verify: () => history.readAndPreflightNativeHistorySourceStaticV1(stage, prepared.config, prepared.secret).state === "ready" });
+          identities.publishPersistentIdentityGeneration(stage, prepared.secret, proposal);
+        }
+      }
       privateWrite(join(stage, "canonical-history.v1.json"), JSON.stringify({ version: 1, conversations: [] }) + "\n");
       privateWrite(join(stage, "native-history-setup.v1.json"), JSON.stringify({ version: 1, registrationFingerprint: prepared.fingerprint, mode: "in_place", createdAt: prepared.source.issuedAt }) + "\n");
       syncDirectory(stage);

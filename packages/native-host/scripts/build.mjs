@@ -9,10 +9,13 @@ const root = resolve(here, "..");
 const src = resolve(root, "src", "tweaker_native_host.mm");
 const managerLauncherSource = resolve(root, "src", "tweakers_manager_launcher.mm");
 const appLauncherSource = resolve(root, "src", "tweakers_app_launcher.mm");
+const doctorSource = resolve(root, "src", "tweakers_doctor.mm");
 const outDir = resolve(root, "dist");
 const out = resolve(outDir, "tweaker_native_host.node");
 const managerLauncherOutput = resolve(outDir, "Tweakers Manager Launcher");
 const appLauncherOutput = resolve(outDir, "Tweakers App Launcher");
+const doctorAppOutput = resolve(outDir, "Tweakers Doctor.app");
+const doctorIconSource = resolve(root, "..", "installer", "assets", "tweakers.icns");
 const managerLauncherAsset = resolve(root, "assets", "Tweakers Manager Launcher");
 const managerSigningPolicy = readManagerSigningPolicy(resolve(root, "manager-signing-policy.json"));
 const releaseManagerLauncher = process.argv.includes("--release-manager-launcher");
@@ -77,6 +80,40 @@ run("xcrun", [
 run("codesign", ["--force", "--sign", "-", appLauncherOutput], { stdio: "inherit" });
 run("codesign", ["--verify", "--strict", appLauncherOutput], { stdio: "inherit" });
 console.log(`[native-host] built ${appLauncherOutput}`);
+
+if (!existsSync(doctorIconSource)) throw new Error(`Tweakers Doctor icon is missing: ${doctorIconSource}`);
+const doctorCandidate = resolve(outDir, `.Tweakers Doctor.app.candidate-${process.pid}`);
+rmSync(doctorCandidate, { recursive: true, force: true });
+const doctorContents = resolve(doctorCandidate, "Contents");
+const doctorExecutable = resolve(doctorContents, "MacOS", "Tweakers Doctor");
+mkdirSync(dirname(doctorExecutable), { recursive: true });
+mkdirSync(resolve(doctorContents, "Resources"), { recursive: true });
+run("xcrun", ["clang++", "-std=c++20", "-fobjc-arc", "-ObjC++", "-mmacosx-version-min=13.0", "-isysroot", sdkPath,
+  "-framework", "AppKit", "-framework", "Foundation", doctorSource, "-o", doctorExecutable], { stdio: "inherit" });
+cpSync(doctorIconSource, resolve(doctorContents, "Resources", "tweakers.icns"));
+writeFileSync(resolve(doctorContents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>Tweakers Doctor</string>
+<key>CFBundleIdentifier</key><string>com.therealityreport.tweakers.doctor</string>
+<key>CFBundleName</key><string>Tweakers Manager</string>
+<key>CFBundleDisplayName</key><string>Tweakers Manager</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleIconFile</key><string>tweakers.icns</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSMultipleInstancesProhibited</key><true/>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+`);
+run("xattr", ["-cr", doctorCandidate], { stdio: "inherit" });
+run("codesign", ["--force", "--sign", "-", "--identifier", "com.therealityreport.tweakers.doctor", doctorCandidate], { stdio: "inherit" });
+run("codesign", ["--verify", "--deep", "--strict", doctorCandidate], { stdio: "inherit" });
+rmSync(doctorAppOutput, { recursive: true, force: true });
+renameSync(doctorCandidate, doctorAppOutput);
+rmSync(resolve(outDir, "Tweakers Doctor"), { force: true });
+console.log(`[native-host] built ${doctorAppOutput}`);
 
 run("xcrun", [
   "clang++",

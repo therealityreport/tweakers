@@ -67,7 +67,7 @@ export type NativeHistoryBaseSourcePreflightV1 = {
     source: NativeHistorySourceV1;
     sourceDocumentFingerprint: `sha256:${string}`;
 };
-export type NativeHistorySourceFailureV1 = "unsafe_state_root" | "unsafe_source_file" | "invalid_source" | "invalid_extensions" | "source_drift" | "writer_census_failed" | "foreign_writer";
+export type NativeHistorySourceFailureV1 = "unsafe_state_root" | "unsafe_source_file" | "invalid_source" | "authentication_binding_invalid" | "identity_repair_incomplete" | "invalid_extensions" | "source_drift" | "writer_census_failed" | "foreign_writer";
 export interface NativeHistoryWriterObservationV1 {
     ok: boolean;
     reason: "ready" | "source_drift" | "writer_census_failed" | "foreign_writer";
@@ -152,6 +152,8 @@ export declare function renderNativeHistoryContextV1(turns: readonly NativeHisto
     digest: `sha256:${string}`;
 } | null;
 /** Static native identity remains valid while unrelated apps read or write other threads. */
+/** The publishing writer may acquire a new fully validated binding; the old one remains stale. */
+export declare function refreshNativeHistoryBindingAfterIdentityPublication(binding: NativeHistorySourceBindingV1, expectedGeneration: string): NativeHistorySourceBindingV1;
 export declare function nativeHistoryBindingSafeV1(binding: NativeHistorySourceBindingV1): boolean;
 /** Only a competing writer to this exact conversation can block its dispatch. */
 export declare function observeNativeThreadWriterV1(binding: NativeHistorySourceBindingV1, threadId: string, ownedPids?: readonly number[], dependencies?: NativeHistoryWriterCensusDependenciesV1): {
@@ -163,3 +165,5 @@ export declare function observeNativeThreadWritersV1(binding: NativeHistorySourc
     state: "clear" | "conflict" | "unknown";
     foreignPids: readonly number[];
 }>>;
+/** Recovery-only signed source validation. Does not produce a runnable history binding. */
+export declare function readNativeHistoryRecoveryAuthorityV1(stateRoot: string, config: RouterConfig, secret: Buffer): NativeHistorySourceV1;

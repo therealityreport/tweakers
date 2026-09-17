@@ -110,6 +110,127 @@ class AccountLedger {
         });
         return reservation;
     }
+    /** Atomically create or recover the one reservation bound to a Doctor request. */
+    reserveDoctorReview(opaqueAccountId, estimatedCost, requestDigest) {
+        if (!Number.isSafeInteger(estimatedCost) || estimatedCost < 1 || estimatedCost > 1_000_000
+            || !/^hmac-sha256:[A-Za-z0-9_-]{43}$/.test(requestDigest))
+            throw new Error("invalid Doctor review reservation");
+        let result = null;
+        this.store.update((state) => {
+            const existing = state.reservations.find((candidate) => candidate.requestDigest === requestDigest);
+            if (existing) {
+                if (existing.purpose !== "doctor_review" || existing.opaqueAccountId !== opaqueAccountId || existing.estimatedCost !== estimatedCost) {
+                    throw new Error("Doctor review reservation correlation collision");
+                }
+                result = existing;
+                return;
+            }
+            const ledger = state.ledger[opaqueAccountId];
+            const configured = this.config.accounts.find((account) => account.opaqueAccountId === opaqueAccountId);
+            if (!ledger || !configured?.included) {
+                throw new Error("Doctor review account is unavailable");
+            }
+            if (!Number.isSafeInteger(ledger.reservedRequestCost + estimatedCost))
+                throw new Error("Doctor review reservation capacity exceeded");
+            const reservation = {
+                reservationId: `rs_${this.random(16).toString("base64url")}`,
+                opaqueAccountId,
+                estimatedCost,
+                state: "reserved",
+                epoch: state.epoch,
+                purpose: "doctor_review",
+                requestDigest,
+            };
+            ledger.reservedRequestCost += estimatedCost;
+            state.reservations.push(reservation);
+            result = reservation;
+        });
+        const reservation = result;
+        return { reservationId: reservation.reservationId, opaqueAccountId: reservation.opaqueAccountId,
+            estimatedCost: reservation.estimatedCost, state: reservation.state, requestDigest };
+    }
+    doctorReviewReservation(requestDigest) {
+        const reservation = this.store.snapshot().reservations.find((candidate) => candidate.purpose === "doctor_review"
+            && candidate.requestDigest === requestDigest);
+        return reservation ? { reservationId: reservation.reservationId, opaqueAccountId: reservation.opaqueAccountId,
+            estimatedCost: reservation.estimatedCost, state: reservation.state, requestDigest } : null;
+    }
+    markDoctorReviewDispatched(reservationId) {
+        this.store.update((state) => {
+            const reservation = state.reservations.find((candidate) => candidate.reservationId === reservationId && candidate.purpose === "doctor_review");
+            if (!reservation)
+                throw new Error("Doctor review reservation is unavailable");
+            if (reservation.state === "dispatched")
+                return;
+            if (reservation.state !== "reserved")
+                throw new Error("Doctor review reservation cannot be dispatched");
+            reservation.state = "dispatched";
+        });
+    }
+    settleDoctorReview(reservationId, outcome, usage) {
+        this.store.update((state) => {
+            const reservation = state.reservations.find((candidate) => candidate.reservationId === reservationId && candidate.purpose === "doctor_review");
+            if (!reservation)
+                throw new Error("Doctor review reservation is unavailable");
+            const ledger = state.ledger[reservation.opaqueAccountId];
+            if (!ledger)
+                throw new Error("Doctor review reservation owner is unavailable");
+            const terminal = reservation.state === "released_pre_dispatch" || reservation.state === "reconciled";
+            const target = outcome === "pre_dispatch" ? "released_pre_dispatch" : outcome === "completed" ? "reconciled" : "stranded_ambiguous";
+            if (terminal) {
+                if (reservation.state !== target || outcome === "completed"
+                    && (!usage || reservation.settledUsage?.inputTokens !== usage.inputTokens || reservation.settledUsage?.outputTokens !== usage.outputTokens)) {
+                    throw new Error("Doctor review reservation already has a different outcome");
+                }
+                return;
+            }
+            if (reservation.state === "stranded_ambiguous" && outcome === "ambiguous")
+                return;
+            if (outcome === "pre_dispatch") {
+                // The authenticated manager durably proves that it never invoked the
+                // CLI. This also resolves a lost mark acknowledgement recovered as a
+                // stranded lease without manufacturing provider usage.
+                if (reservation.state !== "reserved" && reservation.state !== "dispatched" && reservation.state !== "stranded_ambiguous") {
+                    throw new Error("Doctor review pre-dispatch release is unavailable");
+                }
+            }
+            else if (reservation.state !== "dispatched" && !(outcome === "completed" && reservation.state === "stranded_ambiguous")) {
+                throw new Error("Doctor review settlement requires a dispatch marker");
+            }
+            if (outcome === "completed") {
+                if (!usage || !isUsage(usage))
+                    throw new Error("Doctor review completion requires valid usage");
+                ledger.completedInputTokens += usage.inputTokens;
+                ledger.completedOutputTokens += usage.outputTokens;
+                reservation.settledUsage = { ...usage };
+            }
+            else if (usage !== undefined) {
+                throw new Error("Doctor review usage is valid only for completed work");
+            }
+            if (outcome !== "ambiguous")
+                ledger.reservedRequestCost = Math.max(0, ledger.reservedRequestCost - reservation.estimatedCost);
+            reservation.state = target;
+        });
+    }
+    /** A restart releases proved-unwritten work and strands every marked dispatch. */
+    recoverDoctorReviewReservations() {
+        this.store.update((state) => {
+            for (const reservation of state.reservations) {
+                if (reservation.purpose !== "doctor_review")
+                    continue;
+                const ledger = state.ledger[reservation.opaqueAccountId];
+                if (!ledger)
+                    throw new Error("Doctor review reservation owner is unavailable");
+                if (reservation.state === "reserved") {
+                    ledger.reservedRequestCost = Math.max(0, ledger.reservedRequestCost - reservation.estimatedCost);
+                    reservation.state = "released_pre_dispatch";
+                }
+                else if (reservation.state === "dispatched") {
+                    reservation.state = "stranded_ambiguous";
+                }
+            }
+        });
+    }
     releasePreDispatch(reservationId) {
         this.transitionReservation(reservationId, "released_pre_dispatch", (ledger, reservation) => {
             ledger.reservedRequestCost = Math.max(0, ledger.reservedRequestCost - reservation.estimatedCost);

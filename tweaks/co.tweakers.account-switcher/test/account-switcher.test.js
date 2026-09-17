@@ -937,6 +937,30 @@ test("native Usage projects the pooled remaining bar and hides single-account ex
   assert.equal(projected.model_picker_upsell, null);
   assert.equal(projected.rate_limit_warning, null);
 
+  const mixed = { profile: { accounts: [
+    { ...accounts[0], quota: { ...accounts[0].quota, remainingPercent: 0, depleted: true } },
+    { ...accounts[1], quota: { ...accounts[1].quota, remainingPercent: 80 } },
+  ] } };
+  const nativeLimitMessage = "You have reached your limit.";
+  const allPositiveMessage = _test.projectAccountsNativeValue({ profile: { accounts } }, "usage", "depleted-message", nativeLimitMessage);
+  assert.notEqual(allPositiveMessage, nativeLimitMessage, "a stale native warning must not override fresh positive pool capacity");
+  assert.match(allPositiveMessage, /Usage is still available across your enabled subscriptions/i);
+  assert.match(allPositiveMessage, /does not mean the subscription pool is exhausted/i);
+
+  const mixedMessage = _test.projectAccountsNativeValue(mixed, "usage", "depleted-message", nativeLimitMessage);
+  assert.notEqual(mixedMessage, nativeLimitMessage, "a single-account warning must not claim that the pool is depleted");
+  assert.match(mixedMessage, /Usage is still available across your enabled subscriptions/i);
+  assert.match(mixedMessage, /does not mean the subscription pool is exhausted/i);
+
+  const allDepleted = { profile: { accounts: accounts.map((account, index) => ({
+    ...account,
+    quota: { ...account.quota, remainingPercent: 0, depleted: true, resetAt: `2026-09-1${index + 5}T12:00:00.000Z` },
+  })) } };
+  assert.match(
+    _test.projectAccountsNativeValue(allDepleted, "usage", "depleted-message", nativeLimitMessage),
+    /All enabled subscriptions are depleted until/i,
+  );
+
   for (const unavailableQuota of [
     { ...accounts[1].quota, freshness: "unknown", remainingPercent: null },
     { ...accounts[1].quota, freshness: "stale", remainingPercent: 100 },
@@ -955,10 +979,74 @@ test("native Usage projects the pooled remaining bar and hides single-account ex
     assert.equal(incompleteProjection.rate_limit.primary_window.remainingPercent, 10,
       "unknown pooled capacity never replaces the selected account's numeric window");
     assert.match(
-      _test.projectAccountsNativeValue(incomplete, "usage", "depleted-message", "You have reached your limit."),
-      /Pooled usage is incomplete.*another enabled subscription/i,
+      _test.projectAccountsNativeValue(incomplete, "usage", "depleted-message", nativeLimitMessage),
+      /Pooled usage is incomplete because one or more enabled subscriptions have not reported fresh usage yet/i,
     );
   }
+
+  const noFreshQuota = { profile: { accounts: accounts.map((account, index) => ({
+    ...account,
+    quota: index === 0
+      ? { ...account.quota, freshness: "unknown", remainingPercent: null }
+      : { ...account.quota, freshness: "stale", remainingPercent: 80 },
+  })) } };
+  const noFreshMessage = _test.projectAccountsNativeValue(noFreshQuota, "usage", "depleted-message", nativeLimitMessage);
+  assert.notEqual(noFreshMessage, nativeLimitMessage, "unverified pooled depletion must not fall back to a global limit claim");
+  assert.match(noFreshMessage, /Pooled usage is incomplete.*not reported fresh usage/i);
+});
+
+test("the native reset modal keeps subscription billing facts while showing fresh pool availability", () => {
+  const title = { textContent: "You’re out of usage", children: [] };
+  const weekly = { textContent: "Weekly usage limit", children: [] };
+  const description = { textContent: "Pay $80 to reset your usage limits to 100% immediately.", children: [] };
+  const reset = { textContent: "Use available reset", children: [] };
+  const purchase = { textContent: "Pay $80 to reset", children: [] };
+  const dialog = {
+    dataset: {},
+    textContent: "You’re out of usage Weekly usage limit 0% left Use available reset Pay $80 to reset",
+    querySelectorAll(selector) {
+      if (selector === 'h1,h2,h3,[role="heading"]') return [title];
+      if (selector === "span,div,p") return [weekly];
+      if (selector === "span,p") return [description];
+      if (selector === "button") return [reset, purchase];
+      return [];
+    },
+  };
+  const root = { querySelectorAll: (selector) => selector === '[role="dialog"]' ? [dialog] : [] };
+  const accounts = [
+    { enabled: true, quota: { freshness: "fresh", remainingPercent: 0 } },
+    { enabled: true, quota: { freshness: "fresh", remainingPercent: 74 } },
+  ];
+  const state = { profile: { accounts }, nativeUsageResetProjections: new Map() };
+  assert.equal(_test.projectNativeUsageResetModal(state, root), 1);
+  assert.equal(title.textContent, "This subscription is out of usage");
+  assert.equal(weekly.textContent, "This subscription’s weekly usage limit");
+  assert.match(description.textContent, /Usage is still available across your enabled subscriptions/);
+  assert.match(description.textContent, /Pay \$80 to reset your usage limits/);
+  assert.equal(reset.textContent, "Use available reset");
+  assert.equal(purchase.textContent, "Pay $80 to reset");
+  assert.equal(dialog.dataset.tweakersPooledUsageReset, "true");
+  assert.equal(_test.projectNativeUsageResetModal(state, root), 0, "an observed modal is projected once");
+
+  state.profile.accounts = accounts.map((account) => ({
+    ...account, quota: { freshness: "stale", remainingPercent: account.quota.remainingPercent },
+  }));
+  assert.equal(_test.projectNativeUsageResetModal(state, root), 0);
+  assert.equal(title.textContent, "You’re out of usage", "stale pool state restores the native account-specific title");
+  assert.equal(weekly.textContent, "Weekly usage limit");
+  assert.equal(description.textContent, "Pay $80 to reset your usage limits to 100% immediately.");
+  assert.equal(dialog.dataset.tweakersPooledUsageReset, undefined);
+
+  const unavailableTitle = { textContent: "You’re out of usage", children: [] };
+  const unavailableDialog = { ...dialog, dataset: {}, querySelectorAll(selector) {
+    if (selector === 'h1,h2,h3,[role="heading"]') return [unavailableTitle];
+    return dialog.querySelectorAll(selector);
+  } };
+  const unavailableRoot = { querySelectorAll: () => [unavailableDialog] };
+  assert.equal(_test.projectNativeUsageResetModal({ profile: { accounts: accounts.map((account) => ({
+    ...account, quota: { freshness: "stale", remainingPercent: account.quota.remainingPercent },
+  })) } }, unavailableRoot), 0, "stale pool data never rewrites account-specific billing UI");
+  assert.equal(unavailableTitle.textContent, "You’re out of usage");
 });
 
 test("native Usage selection defaults to the current subscription for credit operations", () => {
@@ -2807,7 +2895,7 @@ test("renderer uses one high-confidence host account menu, cleans up on ambiguit
     react: {
       host: {
         observe(kinds, listener) {
-          assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "plugins-settings", "mcp-settings"]);
+          assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "mcp-settings"]);
           hostListener = listener;
           return () => { hostDisconnects += 1; };
         },
@@ -3703,7 +3791,7 @@ test("plugin service failures use an explicit cache-preserving message", () => {
   );
 });
 
-test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh events, and hot-reload cleanup", async (t) => {
+test("native Apps and MCP selectors preserve the native Plugins and Skills page and use exact host surfaces, refresh events, and hot-reload cleanup", async (t) => {
   const previousWindow = global.window;
   const previousDocument = global.document;
   const previousClearTimeout = global.clearTimeout;
@@ -3720,7 +3808,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
   let pageUnregisters = 0;
   let windowListenerRemovals = 0;
   let ipcEventListener = null;
-  let pluginStatus = "setup_required";
+  let pluginStatus = "connected";
   let pluginListUnavailableOnce = false;
   let mismatchNextPluginList = false;
   let mismatchNextPluginStatus = false;
@@ -3774,6 +3862,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     return node;
   }
 
+  let sharedCatalogHeading = null;
   const appsRoot = element("section", { root: true });
   const appsDuplicate = element("section", { root: true });
   const pluginsRoot = element("section", { root: true });
@@ -3783,6 +3872,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     documentElement: element("html", { root: true }),
     createElement: (tagName) => element(tagName),
     querySelectorAll(selector) {
+      if (selector === "h1,h2,[role='heading']") return sharedCatalogHeading ? [{ textContent: sharedCatalogHeading }] : [];
       if (selector === "[data-tweakers-account-switcher]") {
         return [...nodes].filter((node) => node.dataset.tweakersAccountSwitcher === "true" && node.parentElement);
       }
@@ -3878,13 +3968,12 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
         if (request.command === "quota.read") return brokerResponse(request, { accountId: request.params.accountId, quota: accounts[0].quota });
         if (request.command === "connection.list") {
           connectionRequests.push({ command: request.command, params: { ...request.params } });
-          if (request.params.surface === "plugins" && pluginListUnavailableOnce) {
+          if (request.params.surface === "apps" && pluginListUnavailableOnce) {
             pluginListUnavailableOnce = false;
             return { version: 1, requestId: request.requestId, ok: false, error: { code: "broker_unavailable", retryable: true } };
           }
-          const status = request.params.surface === "apps" ? "connected"
-            : request.params.surface === "plugins" ? pluginStatus : "setup_required";
-          const returnedAccountId = request.params.surface === "plugins" && mismatchNextPluginList
+          const status = request.params.surface === "apps" ? pluginStatus : "setup_required";
+          const returnedAccountId = request.params.surface === "apps" && mismatchNextPluginList
             ? (mismatchNextPluginList = false, accounts[0].accountId)
             : request.params.accountId;
           return brokerResponse(request, {
@@ -3894,7 +3983,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
         }
         if (request.command === "connection.status") {
           connectionRequests.push({ command: request.command, params: { ...request.params } });
-          const returnedAccountId = request.params.surface === "plugins" && mismatchNextPluginStatus
+          const returnedAccountId = request.params.surface === "apps" && mismatchNextPluginStatus
             ? (mismatchNextPluginStatus = false, accounts[0].accountId)
             : request.params.accountId;
           return brokerResponse(request, {
@@ -3919,7 +4008,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     },
     react: { host: {
       observe(kinds, listener) {
-        assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "plugins-settings", "mcp-settings"]);
+        assert.deepEqual(kinds, ["account-menu", "assistant-turns", "composer", "apps-settings", "mcp-settings"]);
         hostListeners.push(listener);
         return () => { hostDisconnects += 1; };
       },
@@ -3930,21 +4019,30 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
   };
 
   _test.startRenderer(api);
+  for (const heading of ["Skills", "Plugins"]) {
+    sharedCatalogHeading = heading;
+    const beforeRequests = connectionRequests.length;
+    hostListeners[0](snapshots());
+    await flush();
+    assert.equal(panelFor(appsRoot, "apps-settings"), null, "catalog Apps matches cannot inject subscription UI");
+    assert.equal(panelFor(mcpRoot, "mcp-settings"), null);
+    assert.equal(connectionRequests.length, beforeRequests, "catalog does not request account connection inventories");
+  }
+  sharedCatalogHeading = null;
   hostListeners[0](snapshots());
   await flush();
   const appsPanel = panelFor(appsRoot, "apps-settings");
   const pluginsPanel = panelFor(pluginsRoot, "plugins-settings");
   const mcpPanel = panelFor(mcpRoot, "mcp-settings");
   assert.ok(appsPanel);
-  assert.ok(pluginsPanel);
+  assert.equal(pluginsPanel, null);
+  assert.equal(connectionRequests.some(request => request.params.surface === "plugins"), false);
   assert.ok(mcpPanel);
   assert.equal(panelFor(genericSettingsRoot, "settings-rows"), null, "generic settings rows are never a compatibility target");
   assert.equal(optionsFor(appsPanel).length, 2);
-  assert.equal(optionsFor(pluginsPanel).length, 2);
   assert.equal(optionsFor(mcpPanel).length, 2);
   assert.match(text(appsPanel), /Connected/);
   assert.equal(buttonNamed(appsPanel, "Authorize"), false);
-  assert.equal(buttonNamed(pluginsPanel, "Authorize"), false);
   assert.equal(buttonNamed(mcpPanel, "Authorize"), true);
 
   const initialMcpSelector = find(mcpPanel, (node) => node.tagName === "select");
@@ -3966,11 +4064,11 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
   const selectedMcpPanel = panelFor(mcpRoot, "mcp-settings");
   assert.equal(find(selectedMcpPanel, (node) => node.tagName === "select").value, accounts[1].accountId);
 
-  const initialPluginSelector = find(pluginsPanel, (node) => node.tagName === "select");
+  const initialPluginSelector = find(appsPanel, (node) => node.tagName === "select");
   initialPluginSelector.value = accounts[1].accountId;
   initialPluginSelector.listeners.get("change")();
   await flush();
-  const selectedPluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  const selectedPluginsPanel = panelFor(appsRoot, "apps-settings");
   assert.equal(find(selectedPluginsPanel, (node) => node.tagName === "select").value, accounts[1].accountId);
 
   mismatchNextPluginStatus = true;
@@ -3983,10 +4081,10 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     version: 1,
     sequence: 1,
     type: "connection.updated",
-    payload: { accountId: accounts[1].accountId, connections: [connection("plugins", "setup_required", true)] },
+    payload: { accountId: accounts[1].accountId, connections: [connection("apps", "setup_required", true)] },
   });
   await flush();
-  assert.match(text(panelFor(pluginsRoot, "plugins-settings")), /Connection status is unavailable right now\./, "a list response for another account is discarded");
+  assert.match(text(panelFor(appsRoot, "apps-settings")), /Connection status is unavailable right now\./, "a list response for another account is discarded");
 
   hostListeners[0](snapshots([
     { kind: "apps-settings", confidence: "high", element: appsRoot },
@@ -3995,7 +4093,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
   await flush();
   assert.equal(panelFor(appsRoot, "apps-settings"), null);
   assert.equal(panelFor(appsDuplicate, "apps-settings"), null);
-  assert.ok(panelFor(pluginsRoot, "plugins-settings"));
+  assert.equal(panelFor(pluginsRoot, "plugins-settings"), null);
   assert.ok(panelFor(mcpRoot, "mcp-settings"));
 
   hostListeners[0](snapshots());
@@ -4005,10 +4103,10 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     version: 1,
     sequence: 2,
     type: "connection.updated",
-    payload: { accountId: accounts[0].accountId, connections: [connection("plugins", "connected", true)] },
+    payload: { accountId: accounts[0].accountId, connections: [connection("apps", "connected", true)] },
   });
   await flush();
-  const refreshedPluginsPanel = panelFor(pluginsRoot, "plugins-settings");
+  const refreshedPluginsPanel = panelFor(appsRoot, "apps-settings");
   assert.match(text(refreshedPluginsPanel), /Connected/);
   assert.equal(buttonNamed(refreshedPluginsPanel, "Authorize"), false);
 
@@ -4017,17 +4115,15 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
     version: 1,
     sequence: 3,
     type: "connection.updated",
-    payload: { accountId: accounts[0].accountId, connections: [connection("plugins", "unavailable", false)] },
+    payload: { accountId: accounts[0].accountId, connections: [connection("apps", "unavailable", false)] },
   });
   await flush();
-  const unavailablePluginsPanel = panelFor(pluginsRoot, "plugins-settings");
-  assert.match(text(unavailablePluginsPanel), /Plugin service unavailable/);
-  assert.match(text(unavailablePluginsPanel), /Cached plugins were not changed/);
+  const unavailablePluginsPanel = panelFor(appsRoot, "apps-settings");
+  assert.match(text(unavailablePluginsPanel), /not available/i);
   assert.equal(buttonNamed(unavailablePluginsPanel, "Retry"), true);
-  assert.ok(find(unavailablePluginsPanel, (node) => node.tagName === "a" && node.textContent === "Report issue"));
   find(unavailablePluginsPanel, (node) => node.tagName === "button" && node.textContent === "Retry").listeners.get("click")();
   await flush();
-  assert.match(text(panelFor(pluginsRoot, "plugins-settings")), /Connected/);
+  assert.match(text(panelFor(appsRoot, "apps-settings")), /Connected/);
 
   _test.startRenderer(api);
   assert.equal(panelFor(appsRoot, "apps-settings"), null);
@@ -4043,7 +4139,7 @@ test("native Apps, Plugins, and MCP selectors use exact host surfaces, refresh e
   hostListeners[1](snapshots());
   await flush();
   assert.equal(panelFor(appsRoot, "apps-settings") !== null, true);
-  assert.equal(panelFor(pluginsRoot, "plugins-settings") !== null, true);
+  assert.equal(panelFor(pluginsRoot, "plugins-settings"), null);
   assert.equal(panelFor(mcpRoot, "mcp-settings") !== null, true);
   tweak.stop();
   assert.equal(panelFor(appsRoot, "apps-settings"), null);

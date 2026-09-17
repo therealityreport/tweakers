@@ -103,6 +103,8 @@ export declare class AccountsBrokerOwnerV1 {
     private readonly nativeProjectStartTranslations;
     private canonicalHistory;
     private tokenBalance;
+    private executionLedger;
+    private managerExecutionTail;
     /** Null preserves the existing canonical-history route when no companion exists. */
     private nativeHistory;
     private nativeProjects;
@@ -218,11 +220,18 @@ export declare class AccountsBrokerOwnerV1 {
      */
     private deferForAutomaticCapacityRefresh;
     private refreshAutomaticCapacity;
+    /** Serialize the manager-only lease protocol with every durable state transition. */
+    private handleManagerExecution;
+    private performManagerExecution;
+    private doctorReviewRequestDigest;
+    /** Return only a currently verified native account-home binding. */
+    private doctorReviewCodexHome;
     /** Renderer-safe read projection; no provider ids, requests, or contents enter it. */
     private readBalance;
     /** Dispatch only proven account-local provider methods; unknown surfaces fail closed. */
     private dispatchDeviceAction;
     private createEnrollmentHelper;
+    private reconnectAuthHome;
     private reconnectHelper;
     /** The native base's current credentials select the inventory actor, independently of history/routing ownership. */
     private nativeInventoryBinding;

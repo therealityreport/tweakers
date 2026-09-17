@@ -80,7 +80,7 @@ test("publication references existing homes, emits valid v3 config, and copies n
   const result = setupNativeHistory({ ...f.input, apply: true }, { idle: () => true, now });
   assert.equal(result.state, "registered");
   assert.equal(existsSync(`${f.global}.native-setup-reservation`), true, "the publication reservation remains as the durable no-overwrite marker");
-  assert.deepEqual(readdirSync(f.global).sort(), ["account-router-config.json", "canonical-history.v1.json", "control-secret.v1", "native-history-setup.v1.json", "native-history-source.v1.json"]);
+  assert.deepEqual(readdirSync(f.global).sort(), ["account-router-config.json", "canonical-history.v1.json", "control-secret.v1", "native-history-setup.v1.json", "native-history-source.v1.json", ...(process.platform === "darwin" ? ["native-storage-identities", "native-storage-identities.v2.json"] : [])]);
   const config = JSON.parse(readFileSync(join(f.global, "account-router-config.json"), "utf8"));
   assert.ok(validateRouterConfig(config)); assert.equal(config.policy, "quota_aware_v2");
   const binding = JSON.parse(readFileSync(join(f.global, "native-history-source.v1.json"), "utf8"));

@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   MANAGER_PROTOCOL_VERSION,
+  MANAGER_REFRESH_TIMING_PHASES_V1,
   MANAGER_STATUS_SCHEMA_VERSION,
   TWEAKERS_MANAGER_ID,
   canonicalManagerJson,
@@ -27,7 +28,7 @@ import {
   type TweakersManagerStatusSnapshotV1,
   TWEAKERS_MANAGER_ACTION_IDS_V1,
 } from "./manager-contract.js";
-import { isManagerOperationId, parsePreparedOperation } from "./manager-operation-store.js";
+import { isCandidateCopyPrecutoverFailure, isManagerOperationId, parsePreparedOperation } from "./manager-operation-store.js";
 import { parseManagerStrictJsonObject } from "./manager-strict-json.js";
 import {
   readRegisteredOfficialSource,
@@ -1040,6 +1041,15 @@ function independentRefreshHasProvenRetryableFailure(
     || record.receiptRefs.length !== 1
     || !record.receiptRefs[0]?.startsWith("independent-tweakers-patch:")
     || record.error === null) return false;
+  if (isCandidateCopyPrecutoverFailure(record)) return true;
+  // The exact recovery preflight rejection occurs before candidate staging or
+  // cutover. Preserve the raw failure, but do not treat it as unfinished recovery.
+  if (record.error.startsWith("Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime.")) {
+    return !!record.timing && MANAGER_REFRESH_TIMING_PHASES_V1.every(key => {
+      const phase = record.timing!.phases[key];
+      return phase.state === "skipped" && phase.startedAt === null && phase.completedAt === null;
+    });
+  }
   if (record.error === "Independent Tweakers refresh failed and the rollback/reopen path was incomplete.") {
     return recoveredIndependentPromotionSetIsTerminal(record.operationId, managerRoot, readText, readDirectory);
   }

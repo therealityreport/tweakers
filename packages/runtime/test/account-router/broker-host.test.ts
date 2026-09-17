@@ -18,7 +18,7 @@ import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES, ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE, createBrokerStartupDiagnostics, AccountsBrokerOwnerV1, BrokerProcessChild, credentialStoreArgs, connectAccountsBrokerAppServerClient, type EnrollmentMaterializationFaultPointV1 } from "../../src/account-router/broker-host";
 import { createOpaqueAppToolsRef, createOpaqueRendererRef, type BrokerDesktopIdentityBindingV1 } from "../../src/account-router/broker";
-import { AccountsBrokerSocketClientV1, accountsBrokerSocketPath } from "../../src/account-router/broker-socket";
+import { AccountsBrokerManagerClientV1, AccountsBrokerSocketClientV1, accountsBrokerSocketPath } from "../../src/account-router/broker-socket";
 import { CanonicalHistoryStoreV1 } from "../../src/account-router/canonical-history";
 import { routerConfigFingerprint } from "../../src/account-router/config";
 import { nativeHistoryAccountSetFingerprintV1, nativeHistoryAuthIdentityHmacV1, signNativeHistorySourceV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceUnsignedV1 } from "../../src/account-router/native-history";
@@ -438,6 +438,80 @@ function enableNativeBalancedTokens(fixture: NativeFixture): void {
   fixture.config = { ...draft, fingerprint: routerConfigFingerprint(draft) };
   privateWrite(join(fixture.root, "account-router-config.json"), JSON.stringify(fixture.config));
 }
+
+test("Doctor review leases use fresh pooled capacity, stable correlation, and verified native homes", async () => {
+  const fixture = createNativeFixture();
+  enableNativeBalancedTokens(fixture);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const requestId = "123e4567-e89b-42d3-a456-426614174111";
+  let client: AccountsBrokerManagerClientV1 | null = null;
+  try {
+    await owner.start();
+    const internals = owner as unknown as {
+      broker: AccountsBrokerV1;
+      automaticAccountAuthenticated: Map<OpaqueAccountId, boolean>;
+      refreshAutomaticCapacity(account: OpaqueAccountId): Promise<void>;
+    };
+    for (const [index, accountId] of fixture.accounts.entries()) {
+      internals.automaticAccountAuthenticated.set(accountId, true);
+      assert.equal(internals.broker.updateQuota({ opaqueAccountId: accountId, freshness: "fresh", remainingPercent: index === 0 ? 0 : 80,
+        resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: index === 0 ? 100 : 0,
+        shortWindowResetAt: index === 0 ? Date.now() + 60_000 : null, resetCredits: 0, rateLimitReached: index === 0 }), true);
+    }
+    client = new AccountsBrokerManagerClientV1({ root: fixture.root, secret: fixture.secret });
+    const [first, duplicate] = await Promise.all([
+      client.acquireDoctorReviewLease({ requestId, purpose: "doctor_review", estimatedCost: 25_000 }),
+      client.acquireDoctorReviewLease({ requestId, purpose: "doctor_review", estimatedCost: 25_000 }),
+    ]);
+    assert.deepEqual(duplicate, first, "concurrent retries of one correlation reuse one lease");
+    assert.equal(first.status, "ready", JSON.stringify(first));
+    if (first.status !== "ready") return;
+    assert.equal(first.opaqueAccountId, fixture.accounts[1], "the depleted subscription is skipped for the positive-capacity subscription");
+    assert.equal(first.codexHome, join(fixture.homesRoot, "accounts", first.opaqueAccountId, "codex-home"),
+      "the returned home comes from the verified native binding");
+    assert.deepEqual(await client.settleDoctorReviewLease({ requestId, leaseId: first.leaseId, outcome: "pre_dispatch" }), {
+      status: "settled", leaseId: first.leaseId, outcome: "pre_dispatch",
+    });
+
+    for (const accountId of fixture.accounts) {
+      assert.equal(internals.broker.updateQuota({ opaqueAccountId: accountId, freshness: "fresh", remainingPercent: 80,
+        resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: 0,
+        shortWindowResetAt: null, resetCredits: 0, rateLimitReached: false }), true);
+    }
+    const equalFirst = await client.acquireDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174121", purpose: "doctor_review", estimatedCost: 10 });
+    assert.equal(equalFirst.status, "ready");
+    if (equalFirst.status !== "ready") return;
+    assert.deepEqual(await client.markDoctorReviewLeaseDispatched({ requestId: "123e4567-e89b-42d3-a456-426614174121", leaseId: equalFirst.leaseId }),
+      { status: "dispatched", leaseId: equalFirst.leaseId });
+    assert.deepEqual(await client.settleDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174121", leaseId: equalFirst.leaseId,
+      outcome: "completed", usage: { inputTokens: 5, outputTokens: 5 } }), { status: "settled", leaseId: equalFirst.leaseId, outcome: "completed" });
+    const equalSecond = await client.acquireDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174122", purpose: "doctor_review", estimatedCost: 10 });
+    assert.equal(equalSecond.status, "ready");
+    if (equalSecond.status !== "ready") return;
+    assert.notEqual(equalSecond.opaqueAccountId, equalFirst.opaqueAccountId, "equal-capacity sequential work chooses the less-spent subscription");
+    await client.settleDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174122", leaseId: equalSecond.leaseId, outcome: "pre_dispatch" });
+
+    for (const accountId of fixture.accounts) {
+      internals.automaticAccountAuthenticated.set(accountId, true);
+      assert.equal(internals.broker.updateQuota({ opaqueAccountId: accountId, freshness: "fresh", remainingPercent: 0,
+        resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: 100,
+        shortWindowResetAt: Date.now() + 60_000, resetCredits: 0, rateLimitReached: true }), true);
+    }
+    assert.deepEqual(await client.acquireDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174112", purpose: "doctor_review", estimatedCost: 1 }), {
+      status: "unavailable", reason: "pool_depleted",
+    });
+
+    for (const accountId of fixture.accounts) {
+      assert.equal(internals.broker.updateQuota({ opaqueAccountId: accountId, freshness: "stale", remainingPercent: 80,
+        resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: 0, resetCredits: 0 }), true);
+    }
+    internals.refreshAutomaticCapacity = async () => {};
+    assert.deepEqual(await client.acquireDoctorReviewLease({ requestId: "123e4567-e89b-42d3-a456-426614174113", purpose: "doctor_review", estimatedCost: 1 }), {
+      status: "unavailable", reason: "quota_unavailable",
+    });
+  } finally { await client?.close(); await owner.close(); }
+});
 
 interface NativeFixtureProgramOptions {
   sameIdTransfer?: boolean;
@@ -865,7 +939,9 @@ async function connectDesktop(
     clientInfo: { name: "fixture-desktop", version: "1" },
     capabilities: { experimentalApi: true, requestAttestation: true, extensions: { "test.extension": {} } },
   } });
-  await waitForMessage(messages, (message) => responseFor([message], "fixture-initialize") !== undefined, "desktop initialize response missing");
+  // Native fixtures cross real host writer censuses (each command can take 5s).
+  // Keep the ordinary in-process deadline short; allow native startup to finish.
+  await waitForMessage(messages, (message) => responseFor([message], "fixture-initialize") !== undefined, "desktop initialize response missing", "homesRoot" in fixture ? 15_000 : 3_000);
   bridge.send({ jsonrpc: "2.0", method: "initialized" });
   messages.splice(0, messages.length);
   return { messages, rendererRef, appToolsRef, send: bridge.send, close: bridge.close, whenClosed: bridge.whenClosed };
@@ -1974,9 +2050,15 @@ test("dynamic enrollment uses a temporary isolated home, canonical opaque id, an
     assert.equal(started.ok, true, JSON.stringify(started));
     const enrollment = started.ok ? started.result as { enrollmentRef: string } : null;
     assert.ok(enrollment?.enrollmentRef);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-    const completed = await control.invoke({ version: 1, requestId: "enroll-status", command: "enrollment.status", params: { enrollmentRef: enrollment!.enrollmentRef } });
+    let completed = await control.invoke({ version: 1, requestId: "enroll-status", command: "enrollment.status", params: { enrollmentRef: enrollment!.enrollmentRef } });
+    const completionDeadline = Date.now() + 15_000;
+    let completionPoll = 0;
+    while (completed.ok && (completed.result as { state: string }).state === "waiting" && Date.now() < completionDeadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      completed = await control.invoke({ version: 1, requestId: `enroll-status-${++completionPoll}`, command: "enrollment.status", params: { enrollmentRef: enrollment!.enrollmentRef } });
+    }
     assert.equal(completed.ok, true);
+    assert.equal(completed.ok ? (completed.result as { state: string }).state : null, "complete");
     const expected = opaque(fixture.secret, "enrolled-fixture-account");
     const profile = await control.invoke({ version: 1, requestId: "profile", command: "profile.read" });
     assert.equal(profile.ok, true);
@@ -1995,8 +2077,15 @@ test("dynamic enrollment uses a temporary isolated home, canonical opaque id, an
     const second = await control.invoke({ version: 1, requestId: "enroll-again", command: "enrollment.start" });
     assert.equal(second.ok, true);
     const secondEnrollment = second.ok ? second.result as { enrollmentRef: string } : null;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-    const duplicate = await control.invoke({ version: 1, requestId: "enroll-again-status", command: "enrollment.status", params: { enrollmentRef: secondEnrollment!.enrollmentRef } });
+    // Child authentication and materialization are asynchronous; an intermediate
+    // waiting result is valid. Observe completion before checking fail-closed behavior.
+    let duplicate = await control.invoke({ version: 1, requestId: "enroll-again-status", command: "enrollment.status", params: { enrollmentRef: secondEnrollment!.enrollmentRef } });
+    const duplicateDeadline = Date.now() + 15_000;
+    let duplicatePoll = 0;
+    while (duplicate.ok && (duplicate.result as { state: string }).state === "waiting" && Date.now() < duplicateDeadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      duplicate = await control.invoke({ version: 1, requestId: `enroll-again-status-${++duplicatePoll}`, command: "enrollment.status", params: { enrollmentRef: secondEnrollment!.enrollmentRef } });
+    }
     assert.equal(duplicate.ok, true, "the lifecycle query itself remains redacted and successful");
     assert.equal(duplicate.ok ? (duplicate.result as { state: string }).state : null, "failed", "duplicate materialization fails closed");
     const afterDuplicate = JSON.parse(readFileSync(join(fixture.root, "account-router-config.json"), "utf8")) as RouterConfigV3;
@@ -2194,7 +2283,7 @@ test("native source keeps provider ids, exact owners, and legacy project rows", 
     assert.deepEqual(read.result.thread.turns, []);
 
     tweaks.send({ jsonrpc: "2.0", id: "native-resume", method: "thread/resume", params: { threadId: "existing-a" } });
-    await waitForMessage(tweaks.messages, (message) => responseFor([message], "native-resume") !== undefined, "native resume response missing");
+    await waitForMessage(tweaks.messages, (message) => responseFor([message], "native-resume") !== undefined, "native resume response missing", 15_000);
     const resume = responseFor(tweaks.messages, "native-resume") as { result: { threadId: string; resumedBy: string } };
     assert.equal(resume.result.threadId, "existing-a");
     assert.equal(resume.result.resumedBy, fixture.accounts[0]);
@@ -2333,7 +2422,7 @@ for (const retirementOutcome of ["retired", "held", "unsupported"] as const) tes
     unsubscribe = control.subscribe((event) => events.push(event));
     origin.send({ jsonrpc: "2.0", id: "native-handoff", method: "turn/start", params: {
       threadId: "existing-a", input: [{ type: "text", text: "continue native safely" }] } });
-    const held = await waitForBrokerEvent(events, (event) => event.type === "continuation" && isPendingHandoff(event.payload), "native held continuation missing") as { payload: { handoffRef: string } };
+    const held = await waitForBrokerEvent(events, (event) => event.type === "continuation" && isPendingHandoff(event.payload), "native held continuation missing", 15_000) as { payload: { handoffRef: string } };
     assert.equal(responseFor(origin.messages, "native-handoff"), undefined);
     const confirmed = await control.invoke({ version: 1, requestId: "native-handoff-confirm", command: "handoff.confirm", params: { handoffRef: held.payload.handoffRef } });
     assert.equal(confirmed.ok, retirementOutcome === "retired");
@@ -2354,7 +2443,7 @@ for (const retirementOutcome of ["retired", "held", "unsupported"] as const) tes
       await (owner as any).recoverNativeSourceRetirements();
       assert.equal(pendingRetirement, false);
       origin.send({ jsonrpc: "2.0", id: "retired-thread-archive", method: "thread/archive", params: { threadId: "existing-a" } });
-      const archived = await waitForMessage(origin.messages, (message) => responseFor([message], "retired-thread-archive") !== undefined, "recovered retirement mutation response missing") as { result?: { archivedBy?: string } };
+      const archived = await waitForMessage(origin.messages, (message) => responseFor([message], "retired-thread-archive") !== undefined, "recovered retirement mutation response missing", 15_000) as { result?: { archivedBy?: string } };
       assert.equal(archived.result?.archivedBy, fixture.accounts[1]);
       assert.equal(origin.messages.some((message) => "method" in message && message.method === "app-tools/request"), false, "recovery never replays the ambiguous continuation");
       return;
@@ -2425,7 +2514,7 @@ for (const warmupOutcome of ["unexpected", "timeout"] as const) test(`native han
     try {
       origin.send({ jsonrpc: "2.0", id: `native-handoff-${warmupOutcome}`, method: "turn/start", params: {
         threadId: "existing-a", input: [{ type: "text", text: "hold an uncertain warmup" }] } });
-      const held = await waitForBrokerEvent(events, (event) => event.type === "continuation" && isPendingHandoff(event.payload), "native held continuation missing") as { payload: { handoffRef: string } };
+      const held = await waitForBrokerEvent(events, (event) => event.type === "continuation" && isPendingHandoff(event.payload), "native held continuation missing", 15_000) as { payload: { handoffRef: string } };
       const confirmed = await control.invoke({ version: 1, requestId: `native-handoff-${warmupOutcome}-confirm`, command: "handoff.confirm", params: { handoffRef: held.payload.handoffRef } });
       assert.equal(confirmed.ok, false);
       assert.deepEqual(coordinatorEvents, ["revalidated", "marked", "cleanup"], "the journal records dispatch before a probe whose outcome can become unknown");
@@ -2482,7 +2571,7 @@ test("native paged and archived lists preserve exact rows without leaking child 
     assert.equal(archived.result.nextCursor, null);
 
     client.send({ jsonrpc: "2.0", id: "native-archive-exact-owner", method: "thread/archive", params: { threadId: "archived-b" } });
-    const archive = await waitForMessage(client.messages, (message) => responseFor([message], "native-archive-exact-owner") !== undefined, "native archive response missing") as {
+    const archive = await waitForMessage(client.messages, (message) => responseFor([message], "native-archive-exact-owner") !== undefined, "native archive response missing", 15_000) as {
       result: { threadId: string; archivedBy: string };
     };
     assert.equal(archive.result.threadId, "archived-b");
@@ -2546,11 +2635,13 @@ test("a native thread writer conflict blocks only that thread without replay", a
     const sqlitePath = join(fixture.homesRoot, "accounts", fixture.accounts[0]!, "codex-home", "thread-writer-locks", "existing-a.lock");
     mkdirSync(join(sqlitePath, ".."), { recursive: true, mode: 0o700 });
     privateWrite(sqlitePath, "fixture sqlite writer marker");
-    foreignWriter = spawn(process.execPath, ["-e", "const fs=require('node:fs');fs.openSync(process.argv[1], 'r+');setInterval(()=>{}, 1000);", sqlitePath], { stdio: "ignore" });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+    let writerReady = false;
+    foreignWriter = spawn(process.execPath, ["-e", "const fs=require('node:fs');fs.openSync(process.argv[1], 'r+');process.stdout.write('ready');setInterval(()=>{}, 1000);", sqlitePath], { stdio: ["ignore", "pipe", "ignore"] });
+    foreignWriter.stdout!.once("data", () => { writerReady = true; });
+    await waitForCondition(() => writerReady, "foreign writer did not open its fixture lock");
 
     client.send({ jsonrpc: "2.0", id: "native-conflict-archive", method: "thread/archive", params: { threadId: "existing-a" } });
-    const rejected = await waitForMessage(client.messages, (message) => responseFor([message], "native-conflict-archive") !== undefined, "terminal native writer-conflict response missing") as {
+    const rejected = await waitForMessage(client.messages, (message) => responseFor([message], "native-conflict-archive") !== undefined, "terminal native writer-conflict response missing", 15_000) as {
       error?: { data?: { code?: string } };
     };
     assert.equal(rejected.error?.data?.code, "account_history_busy");
@@ -2577,7 +2668,7 @@ test("a native thread writer conflict blocks only that thread without replay", a
     recoveredClient = await connectDesktop(fixture, 834, "chatgpt");
     recoveredClient.send({ jsonrpc: "2.0", id: "native-recovered-archive", method: "thread/archive", params: { threadId: "existing-a" } });
     const archived = await waitForMessage(recoveredClient.messages, (message) => responseFor([message], "native-recovered-archive") !== undefined,
-      "fresh owner archive response missing", 7_000) as {
+      "fresh owner archive response missing", 15_000) as {
       result: { archivedBy: string };
     };
     assert.equal(archived.result.archivedBy, fixture.accounts[0]);
@@ -2624,8 +2715,9 @@ async function waitForBrokerEvent(
   events: readonly BrokerEventV1[],
   predicate: (event: BrokerEventV1) => boolean,
   failure: string,
+  timeoutMs = 3_000,
 ): Promise<BrokerEventV1> {
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const match = events.find(predicate);
     if (match) return match;
@@ -2675,7 +2767,8 @@ test("native donor child closure publishes settings independently of the routing
     assert.ok(loadSharedAccountBase(fixture.root)!.config.generation > base.shared!.config.generation);
     assert.equal(await lifecycle.quiesceIdleAccount(secondary.opaqueAccountId), true);
     client.send({ jsonrpc: "2.0", id: "continuity-next", method: "thread/resume", params: { threadId: "existing-b" } });
-    await waitForMessage(client.messages, (message) => responseFor([message], "continuity-next") !== undefined, "cold native child resume missing", 15_000);
+    // Cold continuity can publish and inherit settings across several writer censuses.
+    await waitForMessage(client.messages, (message) => responseFor([message], "continuity-next") !== undefined, "cold native child resume missing", 30_000);
     const inherited = readFileSync(join(secondary.codexHome, "config.toml"), "utf8");
     assert.match(inherited, /updated-shared/);
     assert.match(inherited, /model_verbosity = "low"/);
@@ -3169,7 +3262,7 @@ test("direct child initialization gates provider readiness on private external l
 });
 
 test("isolated credential refresh is single-flight and reconnect publishes only matching successful auth", async () => {
-  for (const loginIdentity of ["registered", "foreign"]) {
+  for (const loginIdentity of ["registered", "foreign"]) for (const originalReconnect of [false, true]) {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-isolated-auth-"))); chmodSync(root, 0o700);
     const authHome = join(root, "auth-home"); mkdirSync(authHome, { mode: 0o700 });
     const originalHome = join(root, "original"); mkdirSync(originalHome, { mode: 0o700 });
@@ -3217,6 +3310,11 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
     assert.ok(await profileRead); assert.deepEqual(serialOrder, ["profile-start", "profile-done"]);
     assert.equal((await first)?.accessToken, "fresh"); assert.equal(readFileSync(join(authHome, "refresh-count"), "utf8"), "1");
     const beforeReconnect = readFileSync(join(authHome, "auth.json"));
+    const originalBinding = owner.nativeAccountBinding;
+    if (originalReconnect) {
+      owner.isolatedAuthHome = () => null;
+      owner.nativeAccountBinding = () => ({ ...originalBinding(), codexHome: authHome });
+    }
     const helper = owner.reconnectHelper("reconnect-fixture", account);
     assert.ok(helper.root.startsWith(authHome)); assert.notEqual(helper.root, authHome);
     assert.equal(await helper.child.initialize(owner.desktopInitialization.params, {}), true);
@@ -3229,6 +3327,8 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
     const cancel = owner.reconnectHelper("cancel-fixture", account); const cancelBefore = readFileSync(join(authHome, "auth.json"));
     owner.retireEnrollmentHelper("cancel-fixture"); await cancel.child.whenClosed();
     assert.deepEqual(readFileSync(join(authHome, "auth.json")), cancelBefore);
+    owner.isolatedAuthHome = () => authHome;
+    owner.nativeAccountBinding = originalBinding;
     writeFileSync(join(authHome, "auth.json"), JSON.stringify({ tokens: { account_id: "registered", access_token: "expired", refresh_token: "refresh" } }), { mode: 0o600 });
     Object.assign(owner, {
       stateRoot: root, nativeHistory: {}, nativeTransferHeldAccounts: new Set(), children: new Map(),
@@ -3451,4 +3551,33 @@ test("shared native children keep original homes and bypass copying with a verif
     host.command = "/usr/bin/true";
     assert.throws(() => host.createChild(fixture.accounts[0]), /unverified shared native resolver binary/);
   } finally { desktop?.close(); await owner.close(); }
+});
+
+test("native credential drift returns recovery-required without killing the broker", async () => {
+  const f = createNativeFixture();
+  const owner = new AccountsBrokerOwnerV1(f.config, f.root, f.secret, process.execPath, ["-e", nativeFixtureChildProgram(f.accounts[0]!, f.accounts[1]!)]);
+  let client: DesktopClient | null = null;
+  const manager = new AccountsBrokerManagerClientV1({ root: f.root, secret: f.secret });
+  try {
+    await owner.start();
+    client = await connectDesktop(f, 997, "tweakers");
+    assert.equal(await manager.prepareAuthenticationRecovery("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), false, "healthy brokers cannot be retired by recovery");
+    const path = join(f.homesRoot, "accounts", f.accounts[0]!, "codex-home", "auth.json");
+    const before = readFileSync(path);
+    for (const method of ["account/login/start", "account/logout"]) {
+      client.send({ jsonrpc: "2.0", id: method, method, params: { type: "chatgptDeviceCode" } });
+      const response = await waitForMessage(client.messages, m => responseFor([m], method) !== undefined, "auth mutation rejection missing") as { error?: unknown };
+      assert.ok(response.error); assert.deepEqual(readFileSync(path), before);
+    }
+    privateWrite(path, JSON.stringify({ tokens: { account_id: f.rawAccounts[1], access_token: "fixture-other" } }));
+    for (const id of ["drift-one", "drift-two"]) {
+      client.send({ jsonrpc: "2.0", id, method: "account/read", params: {} });
+      const response = await waitForMessage(client.messages, m => responseFor([m], id) !== undefined, "recovery result missing") as { error?: { data?: { code?: string } } };
+      assert.equal(response.error?.data?.code, "authentication_recovery_required");
+    }
+    assert.equal((owner as any).closed, false, "repeated requests leave recovery reachable");
+    assert.equal(await manager.prepareAuthenticationRecovery("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"), true);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal((owner as any).closed, true, "explicit recovery retires the idle owner");
+  } finally { client?.close(); await manager.close(); await owner.close(); }
 });

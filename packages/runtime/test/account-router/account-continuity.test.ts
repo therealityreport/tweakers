@@ -673,8 +673,12 @@ test("shared native reference mode preserves homes and recovers exact signed cop
         }
         const recovered = recoverSharedNativeModeV1({ ...context, expectedTransitionFingerprint: prepared.fingerprint, accountWriteEvidence: writeEvidence });
         assert.equal(recovered.state, "published", recovered.state === "blocked" ? recovered.reason : undefined);
+        if (recovered.state === "published") context.binding = recovered.binding;
         assert.equal(recoverSharedNativeModeV1({ ...context, expectedTransitionFingerprint: prepared.fingerprint, accountWriteEvidence: writeEvidence }).state, "published");
-      } else assert.equal(publication.state, "published", publication.state === "blocked" ? publication.reason : undefined);
+      } else {
+        assert.equal(publication.state, "published", publication.state === "blocked" ? publication.reason : undefined);
+        if (publication.state === "published") context.binding = publication.binding;
+      }
       const ready = readSharedNativeModeV1(context);
       assert.equal(ready.state, "ready", ready.state === "blocked" ? ready.reason : undefined);
       if (ready.state !== "ready") return;

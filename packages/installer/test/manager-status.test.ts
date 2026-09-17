@@ -959,3 +959,46 @@ function directorySnapshot(root: string): readonly [string, string][] {
 function processSnapshot(): { pid: number; ppid: number; argv: readonly string[] } {
   return { pid: process.pid, ppid: process.ppid, argv: [...process.argv] };
 }
+
+test("Accounts recovery preflight failure releases only an entirely unstarted operation and preserves evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-manager-status-"));
+  const id = "018f0d36-4c08-7a3e-9c1d-123456789abd";
+  try {
+    const store = new ManagerOperationStore(root);
+    const record = recoveryRequiredIndependentRefreshRecord(id, "Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime.");
+    const timing = refreshTimingDetail();
+    for (const key of Object.keys(timing.phases) as Array<keyof typeof timing.phases>) timing.phases[key] = { state: "skipped", startedAt: null, completedAt: null, durationMs: null, reason: "No phase started." };
+    store.create({ ...record, timing });
+    const path = join(store.paths.root, `${id}.json`);
+    const original = readFileSync(path, "utf8");
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, null);
+    assert.equal(readFileSync(path, "utf8"), original);
+    store.replace({ ...record });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id, "missing timing remains blocked");
+    store.replace({ ...record, timing: refreshTimingDetail() });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id, "started work remains blocked");
+    store.replace({ ...record, timing, error: "Unclassified recovery failure" });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id, "other failures remain blocked");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("candidate copy failure permits retry only with proven unstarted cutover", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-manager-copy-"));
+  const id = "018f0d36-4c08-7a3e-9c1d-123456789abd";
+  try {
+    const store = new ManagerOperationStore(root);
+    const record = recoveryRequiredIndependentRefreshRecord(id, "Copied candidate artifact changed");
+    const timing = refreshTimingDetail();
+    for (const key of Object.keys(timing.phases) as Array<keyof typeof timing.phases>) timing.phases[key] = { state: "skipped", startedAt: null, completedAt: null, durationMs: null, reason: "No phase started." };
+    timing.phases["patch-stage"] = { state: "failed", startedAt: "2026-09-16T20:00:00.000Z", completedAt: "2026-09-16T20:00:00.000Z", durationMs: 0, reason: null };
+    store.create({ ...record, timing });
+    const path = join(store.paths.root, `${id}.json`), original = readFileSync(path, "utf8");
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, null);
+    assert.equal(readFileSync(path, "utf8"), original);
+    timing.phases["quiesce-promote"] = { state: "failed", startedAt: "2026-09-16T20:00:00.000Z", completedAt: "2026-09-16T20:00:00.000Z", durationMs: 0, reason: null };
+    store.replace({ ...record, timing });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id);
+    store.replace({ ...record });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -74,19 +74,13 @@ export interface DirectOfficialUpdateDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export async function performDirectOfficialUpdate(
+/** Download and verify only. Caller owns durable output and cleanup; never quits or installs. */
+export async function prepareOfficialUpdateSource(
   input: DirectOfficialUpdateInput,
   deps: DirectOfficialUpdateDeps = {},
-): Promise<{ marketingVersion: string | null; build: string | null }> {
-  const appPath = input.selection.selectedDesktopPath;
-  // Single-owner under the lifecycle lock: stale debris from crashed runs is
-  // ours to clear, and multi-GB partials must never accumulate.
-  rmSync(input.workRoot, { recursive: true, force: true });
-  const workRoot = join(input.workRoot, `direct-${process.pid}`);
+): Promise<string> {
+  const workRoot = input.workRoot;
   mkdirSync(workRoot, { recursive: true, mode: 0o700 });
-  const stagedSibling = `${appPath}.tweakers-direct-staged`;
-  const previousSibling = `${appPath}.tweakers-direct-previous`;
-  try {
     const archive = join(workRoot, "official-update.zip");
     const archiveBytes = await downloadBounded(
       input.enclosureUrl,
@@ -100,6 +94,8 @@ export async function performDirectOfficialUpdate(
     }
 
     const extracted = join(workRoot, "extracted");
+    // Extraction is disposable: never merge a resumed download into partial old bytes.
+    rmSync(extracted, { recursive: true, force: true });
     mkdirSync(extracted, { recursive: true, mode: 0o700 });
     // ditto is the macOS-blessed extractor for signed app archives: it
     // preserves resource forks, xattrs, and symlinks exactly as signed.
@@ -108,6 +104,23 @@ export async function performDirectOfficialUpdate(
     const verified = locateSingleApp(extracted);
     assertVerifiedOfficialBundle(verified, input, deps);
 
+  return verified;
+}
+
+export async function performDirectOfficialUpdate(
+  input: DirectOfficialUpdateInput,
+  deps: DirectOfficialUpdateDeps = {},
+): Promise<{ marketingVersion: string | null; build: string | null }> {
+  const appPath = input.selection.selectedDesktopPath;
+  // Single-owner under the lifecycle lock: stale debris from crashed runs is
+  // ours to clear, and multi-GB partials must never accumulate.
+  rmSync(input.workRoot, { recursive: true, force: true });
+  const workRoot = join(input.workRoot, `direct-${process.pid}`);
+  mkdirSync(workRoot, { recursive: true, mode: 0o700 });
+  const stagedSibling = `${appPath}.tweakers-direct-staged`;
+  const previousSibling = `${appPath}.tweakers-direct-previous`;
+  try {
+    const verified = await prepareOfficialUpdateSource({ ...input, workRoot }, deps);
     if (input.shouldAbort?.() === true) {
       throw new Error("Direct update aborted before touching the live app");
     }

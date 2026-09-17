@@ -34,9 +34,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// node_modules/toml-eslint-parser/lib/internal-utils/index.js
+// ../../node_modules/toml-eslint-parser/lib/internal-utils/index.js
 var require_internal_utils = __commonJS({
-  "node_modules/toml-eslint-parser/lib/internal-utils/index.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/internal-utils/index.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.last = last;
@@ -51,9 +51,9 @@ var require_internal_utils = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/parser-options.js
+// ../../node_modules/toml-eslint-parser/lib/parser-options.js
 var require_parser_options = __commonJS({
-  "node_modules/toml-eslint-parser/lib/parser-options.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/parser-options.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.getTOMLVer = getTOMLVer;
@@ -86,9 +86,9 @@ var require_parser_options = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/errors.js
+// ../../node_modules/toml-eslint-parser/lib/errors.js
 var require_errors = __commonJS({
-  "node_modules/toml-eslint-parser/lib/errors.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/errors.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.ParseError = void 0;
@@ -149,9 +149,9 @@ var require_errors = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/tokenizer/locs.js
+// ../../node_modules/toml-eslint-parser/lib/tokenizer/locs.js
 var require_locs = __commonJS({
-  "node_modules/toml-eslint-parser/lib/tokenizer/locs.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/tokenizer/locs.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.Locations = void 0;
@@ -200,9 +200,9 @@ var require_locs = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/tokenizer/code-point-iterator.js
+// ../../node_modules/toml-eslint-parser/lib/tokenizer/code-point-iterator.js
 var require_code_point_iterator = __commonJS({
-  "node_modules/toml-eslint-parser/lib/tokenizer/code-point-iterator.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/tokenizer/code-point-iterator.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.CodePointIterator = void 0;
@@ -260,9 +260,9 @@ var require_code_point_iterator = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/tokenizer/code-point.js
+// ../../node_modules/toml-eslint-parser/lib/tokenizer/code-point.js
 var require_code_point = __commonJS({
-  "node_modules/toml-eslint-parser/lib/tokenizer/code-point.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/tokenizer/code-point.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.isControl = isControl;
@@ -314,9 +314,9 @@ var require_code_point = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/tokenizer/tokenizer.js
+// ../../node_modules/toml-eslint-parser/lib/tokenizer/tokenizer.js
 var require_tokenizer = __commonJS({
-  "node_modules/toml-eslint-parser/lib/tokenizer/tokenizer.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/tokenizer/tokenizer.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.Tokenizer = void 0;
@@ -1414,9 +1414,9 @@ var require_tokenizer = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/tokenizer/index.js
+// ../../node_modules/toml-eslint-parser/lib/tokenizer/index.js
 var require_tokenizer2 = __commonJS({
-  "node_modules/toml-eslint-parser/lib/tokenizer/index.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/tokenizer/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
@@ -1439,9 +1439,9 @@ var require_tokenizer2 = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/toml-parser/keys-resolver.js
+// ../../node_modules/toml-eslint-parser/lib/toml-parser/keys-resolver.js
 var require_keys_resolver = __commonJS({
-  "node_modules/toml-eslint-parser/lib/toml-parser/keys-resolver.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/toml-parser/keys-resolver.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.KeysResolver = void 0;
@@ -1615,9 +1615,9 @@ var require_keys_resolver = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/toml-parser/context.js
+// ../../node_modules/toml-eslint-parser/lib/toml-parser/context.js
 var require_context = __commonJS({
-  "node_modules/toml-eslint-parser/lib/toml-parser/context.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/toml-parser/context.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.Context = void 0;
@@ -1727,9 +1727,9 @@ var require_context = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/toml-parser/index.js
+// ../../node_modules/toml-eslint-parser/lib/toml-parser/index.js
 var require_toml_parser = __commonJS({
-  "node_modules/toml-eslint-parser/lib/toml-parser/index.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/toml-parser/index.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.TOMLParser = void 0;
@@ -2608,9 +2608,9 @@ var require_eslint_visitor_keys = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/visitor-keys.js
+// ../../node_modules/toml-eslint-parser/lib/visitor-keys.js
 var require_visitor_keys = __commonJS({
-  "node_modules/toml-eslint-parser/lib/visitor-keys.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/visitor-keys.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.KEYS = void 0;
@@ -2631,9 +2631,9 @@ var require_visitor_keys = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/parser.js
+// ../../node_modules/toml-eslint-parser/lib/parser.js
 var require_parser = __commonJS({
-  "node_modules/toml-eslint-parser/lib/parser.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/parser.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.parseForESLint = parseForESLint;
@@ -2653,9 +2653,9 @@ var require_parser = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/traverse.js
+// ../../node_modules/toml-eslint-parser/lib/traverse.js
 var require_traverse = __commonJS({
-  "node_modules/toml-eslint-parser/lib/traverse.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/traverse.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.getFallbackKeys = getFallbackKeys;
@@ -2705,9 +2705,9 @@ var require_traverse = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/utils.js
+// ../../node_modules/toml-eslint-parser/lib/utils.js
 var require_utils = __commonJS({
-  "node_modules/toml-eslint-parser/lib/utils.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/utils.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.getStaticTOMLValue = void 0;
@@ -2852,9 +2852,9 @@ var require_utils = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/meta.js
+// ../../node_modules/toml-eslint-parser/lib/meta.js
 var require_meta = __commonJS({
-  "node_modules/toml-eslint-parser/lib/meta.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/meta.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.version = exports2.name = void 0;
@@ -2863,9 +2863,9 @@ var require_meta = __commonJS({
   }
 });
 
-// node_modules/toml-eslint-parser/lib/index.js
+// ../../node_modules/toml-eslint-parser/lib/index.js
 var require_lib = __commonJS({
-  "node_modules/toml-eslint-parser/lib/index.js"(exports2) {
+  "../../node_modules/toml-eslint-parser/lib/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
@@ -5950,7 +5950,7 @@ function assertNativeContinuityIdentity(input) {
   if (!(0, import_node_path.isAbsolute)(input.account.codexHome) || (0, import_node_fs.realpathSync)(home) !== home) throw new Error("native account home is not canonical");
   assertSafeCapabilityDirectory(home);
   const stat = (0, import_node_fs.lstatSync)(home);
-  if (stat.dev !== input.nativeHomeIdentity.device || stat.ino !== input.nativeHomeIdentity.inode) throw new Error("native account home identity changed");
+  if (stat.ino !== input.nativeHomeIdentity.inode || stat.dev !== input.nativeHomeIdentity.device && !input.nativeBindingPreflight()) throw new Error("native account home identity changed");
   for (const root of privateRoots) {
     assertSafeCapabilityDirectory(root);
     if ((0, import_node_fs.realpathSync)(root) !== root || ((0, import_node_fs.lstatSync)(root).mode & 63) !== 0 || root === home || safeResolvedChild(home, (0, import_node_path.relative)(home, root)) || safeResolvedChild(root, (0, import_node_path.relative)(root, home))) {

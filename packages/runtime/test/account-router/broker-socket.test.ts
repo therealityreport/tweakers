@@ -7,6 +7,7 @@ import test from "node:test";
 import { AccountsBrokerV1 } from "../../src/account-router/broker";
 import { AccountsBrokerRendererAdapterV1 } from "../../src/account-router/broker-adapter";
 import {
+  AccountsBrokerManagerClientV1,
   AccountsBrokerSocketClientV1,
   resolveAccountsBrokerRoot,
   resolveAccountsBrokerRootResolution,
@@ -45,6 +46,34 @@ test("owner-private broker socket authenticates a renderer session and does not 
   assert.deepEqual(replay, { version: 1, requestId: "profile", ok: false, error: { code: "request_replayed", retryable: false } });
   await client.close();
   await socket.close();
+});
+
+test("owner-private manager frames expose the exact Doctor lease lifecycle without a renderer identity", async () => {
+  const root = privateRoot();
+  const broker = new AccountsBrokerV1({ accounts: [{ opaqueAccountId: account, enabled: true }], secret });
+  const leaseId = `rs_${"l".repeat(22)}`;
+  const requests: unknown[] = [];
+  const socket = await startAccountsBrokerSocket({ root, broker, secret, managerExecution: async (request) => {
+    requests.push(request);
+    if (request.action === "acquire") return { status: "ready", leaseId, opaqueAccountId: account, codexHome: root };
+    if (request.action === "mark_dispatched") return { status: "dispatched", leaseId };
+    return { status: "settled", leaseId, outcome: request.outcome };
+  } });
+  const client = new AccountsBrokerManagerClientV1({ root, secret });
+  const requestId = "123e4567-e89b-42d3-a456-426614174000";
+  try {
+    assert.deepEqual(await client.acquireDoctorReviewLease({ requestId, purpose: "doctor_review", estimatedCost: 20_000 }), {
+      status: "ready", leaseId, opaqueAccountId: account, codexHome: root,
+    });
+    assert.deepEqual(await client.markDoctorReviewLeaseDispatched({ requestId, leaseId }), { status: "dispatched", leaseId });
+    assert.deepEqual(await client.settleDoctorReviewLease({ requestId, leaseId, outcome: "completed", usage: { inputTokens: 2, outputTokens: 3 } }), {
+      status: "settled", leaseId, outcome: "completed",
+    });
+    assert.equal(requests.length, 3);
+    assert.deepEqual(await client.acquireDoctorReviewLease({ requestId: "not-a-uuid", purpose: "doctor_review", estimatedCost: 1 }), {
+      status: "unavailable", reason: "invalid_request",
+    });
+  } finally { await client.close(); await socket.close(); }
 });
 
 test("owner-private browser context and child RPC stay bound to the authenticated opaque account", async () => {

@@ -1,3 +1,5 @@
+import { preparePersistentIdentityGeneration, publishPersistentIdentityGeneration, type PreparedPersistentIdentities } from "./persistent-directory-identity";
+import { validateNativeHistoryManagedEnrollmentReceiptV1, prepareNativeEnrollmentIdentityIntentV2, verifyNativeEnrollmentIdentityIntentV2, type NativeEnrollmentIdentityIntentV2 } from "./native-history-extensions";
 import { readNativeExternalTokensV1, readNativeAuthPrivateFileV1, type NativeExternalTokensV1 } from "./native-auth-binding";
 import { readSharedNativeModeV1 } from "./shared-native-mode";
 import { DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1, loadSharedAccountBase, loadSharedPluginsManifestV1, loadAccountContinuitySharedSourceProvenanceV1, ensureAccountContinuityEnrollment, observeExistingNativeAccountContinuity, captureUnmaterializedNativeChangesBeforeSpawn, prepareAccountConfigBeforeSpawn, captureIdleAccountChangesBeforeSpawn, publishPrimarySharedBaseAfterExit, publishPrimaryPluginInventoryAfterExit, isAccountScopedCapabilityMutationV1 } from "./account-continuity";
@@ -40,6 +42,8 @@ import {
   reserveAccountsBrokerSocket,
   startBrokerControlSocket,
   type NativeBrowserContextV1,
+  type DoctorExecutionLeaseRequestV1,
+  type DoctorExecutionLeaseResultV1,
 } from "./broker-socket";
 import { ACCOUNT_ROUTER_CONFIG_FILE, readRouterLaunchSelection, routerConfigFingerprint, validateRouterConfig } from "./config";
 import { parseJsonRpcLine, threadIdFrom, isNotification, isRequest, isResponse } from "./protocol";
@@ -75,6 +79,7 @@ import { isOpaqueAccountId, isPlainRecord } from "./types";
 import { materializeSharedPluginsIntoAccount, materializeSharedSkillsIntoAccount, preflightRouterHomes, readOwnerPrivateAuthAccountId, sharedPluginChildArgs, sharedPluginsHomeMatches, sharedSkillsHomeMatches } from "./app-server-mux";
 import { compareQuotaCandidates, parseAccountRead, parseRateLimitsRead, QUOTA_STALE_AFTER_MS } from "./quota";
 import { TokenBalanceLedger, type TokenBalanceReservation } from "./token-balance";
+import { AccountLedger } from "./ledger";
 import { isBoundedNativeResultV1, parseNativeBrowserChildRequestV1, requestNativeHttpV1, requestNativeUsageCreditsV1 } from "./native-request";
 import { AccountModelCatalogsV1, requestedModelFromParamsV1 } from "./models";
 import { NativeProjectLinksV1 } from "./native-projects";
@@ -304,7 +309,7 @@ interface EnrollmentHelper {
 
 interface EnrollmentMaterializationJournalV1 {
   version: 1;
-  nativeExtension?: { source: NativeHistorySourceV1; sourceDocumentFingerprint: `sha256:${string}`; prepared: PreparedNativeHistoryExtensionUpdateV1 | null };
+  nativeExtension?: { source: NativeHistorySourceV1; sourceDocumentFingerprint: `sha256:${string}`; prepared: PreparedNativeHistoryExtensionUpdateV1 | null; persistentIdentities?: PreparedPersistentIdentities; receiptIntent?: NativeEnrollmentIdentityIntentV2 };
   enrollmentRef: string;
   opaqueAccountId: OpaqueAccountId;
   phase: "prepared" | "home_moved" | "state_published" | "config_published";
@@ -379,6 +384,8 @@ export class AccountsBrokerOwnerV1 {
   private readonly nativeProjectStartTranslations = new WeakMap<JsonRpcRequest, { account: OpaqueAccountId; projectId: string }>();
   private canonicalHistory!: CanonicalHistoryStoreV1;
   private tokenBalance!: TokenBalanceLedger;
+  private executionLedger!: AccountLedger;
+  private managerExecutionTail: Promise<void> = Promise.resolve();
   /** Null preserves the existing canonical-history route when no companion exists. */
   private nativeHistory: NativeHistorySourceBindingV1 | null = null;
   private nativeProjects: NativeProjectLinksV1 | null = null;
@@ -740,6 +747,7 @@ export class AccountsBrokerOwnerV1 {
   * only while the lifetime owner-election reservation is held.
   */
   private initializeAfterElection(): void {
+    if (existsSync(join(this.stateRoot, "native-storage-identities-repair.v2.json"))) throw new Error("accounts broker: identity_repair_incomplete; open Tweakers Doctor");
     this.config = recoverEnrollmentMaterialization(this.stateRoot, this.config, this.secret);
     const native = readAndPreflightNativeHistorySourceStaticV1(this.stateRoot, this.config, this.secret);
     if (native.state === "invalid") {
@@ -776,6 +784,8 @@ export class AccountsBrokerOwnerV1 {
     this.store = store;
     // Adopt the quota policy once, retaining the historical token ledger for recovery.
     if (this.config.policy === "balanced_tokens_v1" && !this.persistBalanceSetting(false)) throw new Error("quota policy migration failed");
+    this.executionLedger = new AccountLedger(this.store, this.config);
+    this.executionLedger.recoverDoctorReviewReservations();
     const canonicalPreflight = preflightCanonicalHistoryStore(this.stateRoot);
     if (canonicalPreflight.state !== "ready") {
       throw new Error(`canonical history store is ${canonicalPreflight.state}; migration/bootstrap is required before v3 broker startup`);
@@ -891,7 +901,8 @@ export class AccountsBrokerOwnerV1 {
       const brokerSocket = reservation.activate({ broker: this.broker,
         mapNativeTargets: (rendererRef, request) => this.mapNativeTargets(rendererRef, request),
         resolveNativeBrowserContext: (rendererRef, account) => this.resolveNativeBrowserContext(rendererRef, account),
-        invokeNativeBrowserRequest: (rendererRef, account, method, params) => this.invokeNativeBrowserRequest(rendererRef, account, method, params) });
+        invokeNativeBrowserRequest: (rendererRef, account, method, params) => this.invokeNativeBrowserRequest(rendererRef, account, method, params),
+        managerExecution: (request) => this.handleManagerExecution(request) });
       this.brokerClose = () => brokerSocket.close();
       const controlSocket = await startBrokerControlSocket({ root: this.stateRoot, secret: this.secret, status: () => this.broker.status() });
       this.controlClose = () => controlSocket.close();
@@ -1141,6 +1152,7 @@ export class AccountsBrokerOwnerV1 {
       writePrivateJsonAtomic(this.stateRoot, ACCOUNT_ROUTER_CONFIG_FILE, next);
       this.config = next;
       this.store = new RouterStateStore(this.stateRoot, next);
+      this.executionLedger = new AccountLedger(this.store, this.config);
       this.syncTokenBalanceAccounts();
       return true;
     } catch {
@@ -1179,6 +1191,7 @@ export class AccountsBrokerOwnerV1 {
       writePrivateJsonAtomic(this.stateRoot, ACCOUNT_ROUTER_CONFIG_FILE, next);
       this.config = next;
       this.store = new RouterStateStore(this.stateRoot, next);
+      this.executionLedger = new AccountLedger(this.store, this.config);
       this.syncTokenBalanceAccounts();
       return true;
     } catch {
@@ -1274,6 +1287,106 @@ export class AccountsBrokerOwnerV1 {
     return refresh;
   }
 
+  /** Serialize the manager-only lease protocol with every durable state transition. */
+  private handleManagerExecution(request: DoctorExecutionLeaseRequestV1): Promise<DoctorExecutionLeaseResultV1> {
+    const run = this.managerExecutionTail.then(() => this.performManagerExecution(request));
+    this.managerExecutionTail = run.then(() => undefined, () => undefined);
+    return run.catch(() => ({ status: "unavailable", reason: "broker_unavailable" }));
+  }
+
+  private async performManagerExecution(request: DoctorExecutionLeaseRequestV1): Promise<DoctorExecutionLeaseResultV1> {
+    if (request.action === "prepare_auth_recovery") {
+      if (!this.nativeHistory || nativeHistoryBindingSafeV1(this.nativeHistory) || this.pendingDesktop.size > 0
+        || this.store.snapshot().reservations.some(r => r.state === "dispatched" || r.state === "reserved")) return { status: "unavailable", reason: "binding_unavailable" };
+      // Reply before orderly retirement. Doctor must still win exclusive election.
+      setTimeout(() => { void this.close().catch(() => {}); }, 50);
+      return { status: "recovery_ready" };
+    }
+    const requestDigest = this.doctorReviewRequestDigest(request.requestId);
+    if (request.action === "acquire") {
+      const prior = this.executionLedger.doctorReviewReservation(requestDigest);
+      if (prior) {
+        if (prior.state !== "reserved" || prior.estimatedCost !== request.estimatedCost) {
+          return { status: "unavailable", reason: "request_replayed" };
+        }
+        const codexHome = this.doctorReviewCodexHome(prior.opaqueAccountId);
+        return codexHome
+          ? { status: "ready", leaseId: prior.reservationId, opaqueAccountId: prior.opaqueAccountId, codexHome }
+          : { status: "unavailable", reason: "binding_unavailable" };
+      }
+      if (this.config.mode !== "quota_aware") return { status: "unavailable", reason: "quota_unavailable" };
+      const poolBefore = this.broker.pool().accounts.filter((account) => account.enabled
+        && account.state !== "disabled" && account.state !== "reauth_required" && account.state !== "unhealthy");
+      const quotaBefore = new Map(this.broker.quota().map((quota) => [quota.opaqueAccountId, quota]));
+      const refresh = poolBefore.filter((account) => quotaNeedsRefresh(quotaBefore.get(account.opaqueAccountId))
+        || this.automaticAccountAuthenticated.get(account.opaqueAccountId) === undefined);
+      await Promise.allSettled(refresh.map((account) => this.refreshAutomaticCapacity(account.opaqueAccountId)));
+
+      const pool = this.broker.pool().accounts;
+      const quotas = new Map(this.broker.quota().map((quota) => [quota.opaqueAccountId, quota]));
+      const doctorLoad = new Map<OpaqueAccountId, number>();
+      for (const reservation of this.store.snapshot().reservations) {
+        if (reservation.purpose !== "doctor_review") continue;
+        const load = reservation.state === "reserved" || reservation.state === "dispatched" || reservation.state === "stranded_ambiguous"
+          ? reservation.estimatedCost
+          : reservation.state === "reconciled" && reservation.settledUsage
+            ? reservation.settledUsage.inputTokens + reservation.settledUsage.outputTokens
+            : 0;
+        doctorLoad.set(reservation.opaqueAccountId,
+          Math.min(Number.MAX_SAFE_INTEGER, (doctorLoad.get(reservation.opaqueAccountId) ?? 0) + load));
+      }
+      const eligible = pool.filter((account) => account.enabled
+        && account.state !== "disabled" && account.state !== "reauth_required" && account.state !== "unhealthy"
+        && this.automaticAccountAuthenticated.get(account.opaqueAccountId) !== false
+        && hasFreshPositiveQuota(quotas.get(account.opaqueAccountId)));
+      const withBindings = eligible.flatMap((account) => {
+        const codexHome = this.doctorReviewCodexHome(account.opaqueAccountId);
+        return codexHome ? [{ account, codexHome }] : [];
+      });
+      withBindings.sort((left, right) => compareNewWorkCapacity(
+        quotas.get(left.account.opaqueAccountId), left.account.assignedTaskCount + (doctorLoad.get(left.account.opaqueAccountId) ?? 0), left.account.opaqueAccountId,
+        quotas.get(right.account.opaqueAccountId), right.account.assignedTaskCount + (doctorLoad.get(right.account.opaqueAccountId) ?? 0), right.account.opaqueAccountId,
+        this.config.accounts.findIndex((account) => account.opaqueAccountId === left.account.opaqueAccountId),
+        this.config.accounts.findIndex((account) => account.opaqueAccountId === right.account.opaqueAccountId),
+      ));
+      const chosen = withBindings[0];
+      if (!chosen) {
+        if (eligible.length > 0) return { status: "unavailable", reason: "binding_unavailable" };
+        const configured = pool.filter((account) => account.enabled
+          && account.state !== "disabled" && account.state !== "reauth_required" && account.state !== "unhealthy");
+        const depleted = configured.length > 0 && configured.every((account) => hasConfirmedQuotaDepletion(quotas.get(account.opaqueAccountId)));
+        return { status: "unavailable", reason: depleted ? "pool_depleted" : "quota_unavailable" };
+      }
+      const lease = this.executionLedger.reserveDoctorReview(chosen.account.opaqueAccountId, request.estimatedCost, requestDigest);
+      return { status: "ready", leaseId: lease.reservationId, opaqueAccountId: lease.opaqueAccountId, codexHome: chosen.codexHome };
+    }
+
+    const reservation = this.store.snapshot().reservations.find((candidate) => candidate.purpose === "doctor_review"
+      && candidate.reservationId === request.leaseId && candidate.requestDigest === requestDigest);
+    if (!reservation) return { status: "unavailable", reason: "request_replayed" };
+    if (request.action === "mark_dispatched") {
+      try { this.executionLedger.markDoctorReviewDispatched(request.leaseId); }
+      catch { return { status: "unavailable", reason: "request_replayed" }; }
+      return { status: "dispatched", leaseId: request.leaseId };
+    }
+    try { this.executionLedger.settleDoctorReview(request.leaseId, request.outcome, request.usage); }
+    catch { return { status: "unavailable", reason: "request_replayed" }; }
+    return { status: "settled", leaseId: request.leaseId, outcome: request.outcome };
+  }
+
+  private doctorReviewRequestDigest(requestId: string): `hmac-sha256:${string}` {
+    return `hmac-sha256:${createHmac("sha256", this.secret).update(`doctor-review-request:v1:${requestId}`, "utf8").digest("base64url")}`;
+  }
+
+  /** Return only a currently verified native account-home binding. */
+  private doctorReviewCodexHome(account: OpaqueAccountId): string | null {
+    if (!this.nativeHistory || !nativeHistoryBindingSafeV1(this.nativeHistory)) return null;
+    const binding = this.nativeAccountBinding(account);
+    if (!binding) return null;
+    try { return this.isolatedAuthHome(account) ?? binding.codexHome; }
+    catch { return null; }
+  }
+
   /** Renderer-safe read projection; no provider ids, requests, or contents enter it. */
   private readBalance(): BrokerBalanceProjectionV1 {
     const snapshot = this.tokenBalance.snapshot();
@@ -1312,6 +1425,7 @@ export class AccountsBrokerOwnerV1 {
 
   /** Dispatch only proven account-local provider methods; unknown surfaces fail closed. */
   private async dispatchDeviceAction(action: BrokerDeviceActionV1): Promise<BrokerDeviceActionResultV1> {
+    if (this.nativeHistory && !nativeHistoryBindingSafeV1(this.nativeHistory)) return { outcome: "rejected" };
     if (action.kind === "device.start") {
       if (this.nativeHistory && !this.nativeHistoryWritersSafe()) return { outcome: "rejected" };
       const helper = action.opaqueAccountId === null
@@ -1350,7 +1464,7 @@ export class AccountsBrokerOwnerV1 {
       this.retireEnrollmentHelper(action.enrollmentRef);
       return { outcome: "accepted", value: {} };
     }
-    if (action.kind === "native.request" && this.isolatedAuthHome(action.opaqueAccountId) && isolatedAuthMutation(action.method, action.params)) return { outcome: "rejected" };
+    if (action.kind === "native.request" && isolatedAuthMutation(action.method, action.params)) return { outcome: "rejected" };
     if (action.kind === "native.request" && action.surface === "plugins" && !await this.ensureNativePluginInventory()) return { outcome: "rejected" };
     const child = this.broker.acquireChild(action.opaqueAccountId) as BrokerProcessChild | null;
     if (!child) return { outcome: "rejected" };
@@ -1490,10 +1604,14 @@ export class AccountsBrokerOwnerV1 {
     }
   }
 
+  private reconnectAuthHome(account: OpaqueAccountId): string | null {
+    return this.isolatedAuthHome(account) ?? this.nativeAccountBinding(account)?.codexHome ?? null;
+  }
+
   private reconnectHelper(enrollmentRef: string, opaqueAccountId: OpaqueAccountId): EnrollmentHelper | null {
     const existing = this.enrollmentHelpers.get(enrollmentRef);
     if (existing) return existing;
-    const authHome = this.isolatedAuthHome(opaqueAccountId);
+    const authHome = this.reconnectAuthHome(opaqueAccountId);
     if (authHome) {
       if ((this.authHelperQueued.get(opaqueAccountId) ?? 0) > 0 || this.activeAuthHelpers.has(opaqueAccountId) || [...this.enrollmentHelpers.values()].some((helper) => helper.opaqueAccountId === opaqueAccountId && helper.isolatedReconnect)) return null;
       const root = mkdtempSync(join(authHome, ".reconnect-")); chmodSync(root, 0o700);
@@ -1850,6 +1968,7 @@ export class AccountsBrokerOwnerV1 {
       publishEnrollmentNativeExtension(this.stateRoot, journal, this.secret);
       this.store = new RouterStateStore(this.stateRoot, next);
       this.config = next;
+      this.executionLedger = new AccountLedger(this.store, this.config);
       if (journal.nativeExtension) {
         const native = readAndPreflightNativeHistorySourceStaticV1(this.stateRoot, next, this.secret);
         if (native.state !== "ready") throw new Error("new native account union unavailable");
@@ -1993,6 +2112,11 @@ export class AccountsBrokerOwnerV1 {
     nativeProvenOwner: OpaqueAccountId | null = null,
   ): void {
     if (this.closed || this.clients.get(client.rendererRef) !== client) return;
+    // Drift is recoverable, but never grants authority to dispatch under another account.
+    if (this.nativeHistory && !nativeHistoryBindingSafeV1(this.nativeHistory)) {
+      if (isRequest(message)) this.sendDesktop(client, redactedRouterError(message.id, "authentication_recovery_required"));
+      return;
+    }
     if (isResponse(message)) {
       this.resolveChildRequest(client, message);
       return;
@@ -2218,8 +2342,8 @@ export class AccountsBrokerOwnerV1 {
         return;
       }
     }
-    if (this.isolatedAuthHome(account) && isolatedAuthMutation(request.method, request.params)) {
-      this.sendDesktop(client, redactedRouterError(request.id, "post_start_failure")); return;
+    if (isolatedAuthMutation(request.method, request.params)) {
+      this.sendDesktop(client, redactedRouterError(request.id, "balanced_mode_auth_mutation")); return;
     }
     const child = this.broker.acquireChild(account) as BrokerProcessChild | null;
     if (!child) {
@@ -4340,6 +4464,10 @@ export class AccountsBrokerOwnerV1 {
   }
 
   private receiveChild(account: OpaqueAccountId, child: BrokerProcessChild, message: JsonRpcMessage): void {
+    if (this.nativeHistory && !nativeHistoryBindingSafeV1(this.nativeHistory)) {
+      if (isRequest(message)) { try { child.send(redactedRouterError(message.id, "authentication_recovery_required")); } catch {} }
+      return;
+    }
     if (isResponse(message)) {
       if (this.resolveHistoryFanout(account, message)) return;
       if (typeof message.id === "string") {
@@ -4381,11 +4509,11 @@ export class AccountsBrokerOwnerV1 {
     const repair = helper.isolatedReconnect; const account = helper.opaqueAccountId;
     if (!repair || !account || !helper.root) return;
     try {
-      const entry = this.nativeAccountBinding(account); if (!entry || this.isolatedAuthHome(account) !== repair.authHome) throw new Error("unavailable");
+      const entry = this.nativeAccountBinding(account); if (!entry || this.reconnectAuthHome(account) !== repair.authHome) throw new Error("unavailable");
       readNativeExternalTokensV1(helper.root, entry, this.secret);
       const profile = await helper.child.requestPrivate("account/read", { refreshToken: false });
       if (!profile || profile.error || !providerAuthenticated(profile.result) || !await helper.child.terminateAndWait()) throw new Error("unavailable");
-      if (this.enrollmentHelpers.get(helper.enrollmentRef) !== helper || this.isolatedAuthHome(account) !== repair.authHome) throw new Error("unavailable");
+      if (this.enrollmentHelpers.get(helper.enrollmentRef) !== helper || this.reconnectAuthHome(account) !== repair.authHome) throw new Error("unavailable");
       readNativeExternalTokensV1(helper.root, entry, this.secret);
       const fresh = readNativeAuthPrivateFileV1(join(helper.root, "auth.json"));
       const current = readNativeAuthPrivateFileV1(join(repair.authHome, "auth.json"));
@@ -4398,7 +4526,7 @@ export class AccountsBrokerOwnerV1 {
         writeFileSync(priorEvidence, current, { flag: "wx", mode: 0o600 });
         for (const path of [staged, priorEvidence]) { const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); try { fsyncSync(fd); } finally { closeSync(fd); } }
         const check = readNativeAuthPrivateFileV1(target);
-        try { if (!check.equals(current) || lstatSync(target).ino !== before.ino || this.isolatedAuthHome(account) !== repair.authHome) throw new Error("unavailable"); }
+        try { if (!check.equals(current) || lstatSync(target).ino !== before.ino || this.reconnectAuthHome(account) !== repair.authHome) throw new Error("unavailable"); }
         finally { check.fill(0); }
         renameSync(staged, target);
         const fd = openSync(repair.authHome, fsConstants.O_RDONLY); try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -6395,6 +6523,7 @@ function recoverEnrollmentMaterialization(root: string, fallbackConfig: RouterCo
 function prepareEnrollmentNativeExtension(root: string, journal: EnrollmentMaterializationJournalV1, secret: Buffer): void {
   const extension = journal.nativeExtension;
   if (!extension) return;
+  if (extension.persistentIdentities) publishPersistentIdentityGeneration(root, secret, extension.persistentIdentities);
   const base = readAndPreflightNativeHistoryBaseSourceStaticV1(root, journal.priorConfig.protocolFingerprint, secret);
   if (base.state !== "ready" || base.sourceDocumentFingerprint !== extension.sourceDocumentFingerprint
     || durableDigest(base.source) !== durableDigest(extension.source)) throw new Error("native enrollment base source drifted");
@@ -6410,10 +6539,33 @@ function prepareEnrollmentNativeExtension(root: string, journal: EnrollmentMater
   const raw = readOwnerPrivateAuthAccountId(codexHome);
   if (!raw) throw new Error("native enrollment auth identity unavailable");
   const identity = (path: string) => { const st = lstatSync(path); return { device: st.dev, inode: st.ino, uid: st.uid, mode: st.mode & 0o7777 }; };
-  const account: NativeHistoryManagedAccountDraftV1 = { opaqueAccountId: journal.opaqueAccountId,
+  let account: NativeHistoryManagedAccountDraftV1 = { opaqueAccountId: journal.opaqueAccountId,
     accountRootRelativePath: `accounts/${journal.opaqueAccountId}`, codexHomeIdentity: identity(codexHome), sqliteHomeIdentity: identity(sqliteHome),
     authIdentityHmac: nativeHistoryAuthIdentityHmacV1(raw, secret) as `hmac-sha256:${string}` };
-  const receipt = writeNativeHistoryManagedEnrollmentReceiptV1({ stateRoot: root, secret, account, issuedAt: journal.nextConfig.updatedAt });
+  if (process.platform === "darwin") {
+    if (!extension.receiptIntent) {
+      extension.receiptIntent = prepareNativeEnrollmentIdentityIntentV2({ stateRoot: root, secret, account, issuedAt: journal.nextConfig.updatedAt });
+      writeEnrollmentMaterializationJournal(root, journal);
+    }
+    const intent = verifyNativeEnrollmentIdentityIntentV2(root, secret, extension.receiptIntent);
+    if (intent.account.opaqueAccountId !== journal.opaqueAccountId || intent.issuedAt !== journal.nextConfig.updatedAt
+      || intent.account.authIdentityHmac !== account.authIdentityHmac) throw new Error("Native enrollment identity intent changed");
+    account = intent.account;
+  }
+  const receipt = writeNativeHistoryManagedEnrollmentReceiptV1({ stateRoot: root, secret, account, issuedAt: journal.nextConfig.updatedAt,
+    ...(extension.receiptIntent ? { identityIntent: extension.receiptIntent } : {}) });
+  if (!extension.persistentIdentities && process.platform === "darwin") {
+    extension.persistentIdentities = preparePersistentIdentityGeneration({ stateRoot: root, secret,
+      verifiedLegacyAuthorities: extension.receiptIntent ? [`accounts/${journal.opaqueAccountId}/native-history-enrollment-receipt.v1.json`] : [], verify: () => {
+      const prior = readAndPreflightNativeHistorySourceStaticV1(root, journal.priorConfig, secret);
+      return prior.state === "ready"
+        && readSharedNativeModeV1({ stateRoot: root, secret, binding: prior.binding }).state !== "blocked"
+        && validateNativeHistoryManagedEnrollmentReceiptV1({ stateRoot: root, secret, account: { ...account, enrollmentReceiptFingerprint: receipt.enrollmentReceiptFingerprint } }) !== null;
+    } });
+    // Journal both generations before the extension can name its new receipt.
+    writeEnrollmentMaterializationJournal(root, journal);
+    publishPersistentIdentityGeneration(root, secret, extension.persistentIdentities);
+  }
   extension.prepared = prepareNativeHistoryExtensionUpdateV1({ stateRoot: root, secret, baseSource: base.source,
     baseSourceDocumentFingerprint: base.sourceDocumentFingerprint, priorConfig: journal.priorConfig, nextConfig: journal.nextConfig,
     managedAccount: { ...account, enrollmentReceiptFingerprint: receipt.enrollmentReceiptFingerprint }, issuedAt: journal.nextConfig.updatedAt });
@@ -6493,10 +6645,12 @@ function isEnrollmentMaterializationJournal(value: unknown): value is Enrollment
     || !isOpaqueAccountId(value.opaqueAccountId)
     || !["prepared", "home_moved", "state_published", "config_published"].includes(String(value.phase))) return false;
   if (value.nativeExtension !== undefined && (!isPlainRecord(value.nativeExtension)
-    || Object.keys(value.nativeExtension).sort().join("\0") !== "prepared\0source\0sourceDocumentFingerprint"
+    || Object.keys(value.nativeExtension).sort().join("\0") !== ["prepared", "source", "sourceDocumentFingerprint", ...(value.nativeExtension.persistentIdentities === undefined ? [] : ["persistentIdentities"]), ...(value.nativeExtension.receiptIntent === undefined ? [] : ["receiptIntent"])].sort().join("\0")
     || !isPlainRecord(value.nativeExtension.source) || typeof value.nativeExtension.sourceDocumentFingerprint !== "string"
     || !/^sha256:[a-f0-9]{64}$/.test(value.nativeExtension.sourceDocumentFingerprint)
-    || (value.nativeExtension.prepared !== null && !isPlainRecord(value.nativeExtension.prepared)))) return false;
+    || (value.nativeExtension.prepared !== null && !isPlainRecord(value.nativeExtension.prepared))
+    || (value.nativeExtension.persistentIdentities !== undefined && !isPlainRecord(value.nativeExtension.persistentIdentities))
+    || (value.nativeExtension.receiptIntent !== undefined && !isPlainRecord(value.nativeExtension.receiptIntent)))) return false;
   const priorConfig = validatedRouterConfigV3(value.priorConfig);
   const nextConfig = validatedRouterConfigV3(value.nextConfig);
   if (!priorConfig || !nextConfig || !nextConfig.accounts.some((account) => account.opaqueAccountId === value.opaqueAccountId)

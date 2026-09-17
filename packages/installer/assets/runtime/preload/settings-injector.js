@@ -1332,7 +1332,7 @@ function renderConfigPage(sectionsWrap, subtitle) {
             return;
         const projection = value;
         if (projection?.deploymentKind === "independent") {
-            renderIndependentSettingsSurface(sectionsWrap, cardUpdates, projection, subtitle, cleanups);
+            renderIndependentSettingsSurface(sectionsWrap, projection, subtitle, cleanups);
             return;
         }
         renderInjectedSettingsSurface(sectionsWrap, cardUpdates, subtitle, cleanups);
@@ -1342,7 +1342,7 @@ function renderConfigPage(sectionsWrap, subtitle) {
             return;
         // Failure to establish the deployment authority is treated as an
         // independent manager outage. Never reveal the legacy writer controls.
-        renderIndependentSettingsSurface(sectionsWrap, cardUpdates, {
+        renderIndependentSettingsSurface(sectionsWrap, {
             deploymentKind: "independent",
             manager: {
                 available: false,
@@ -1362,25 +1362,20 @@ function renderConfigPage(sectionsWrap, subtitle) {
         }
     };
 }
-function renderIndependentSettingsSurface(sectionsWrap, cardUpdates, projection, subtitle, cleanups) {
+function renderIndependentSettingsSurface(sectionsWrap, projection, subtitle, cleanups) {
     if (subtitle) {
         subtitle.textContent = projection.manager.available
             ? "Independent Tweakers is managed by the global Tweakers manager."
             : "Independent Tweakers is read-only because its global manager is unavailable.";
     }
     renderIndependentAppearanceHealthSection(sectionsWrap, cleanups);
-    renderIndependentManagerStatusSection(sectionsWrap, projection);
-    if (projection.manager.available) {
-        cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "independent", projection));
-    }
-    else {
-        renderIndependentRefreshUnavailableSection(sectionsWrap, projection.manager.reason);
-    }
+    renderIndependentDoctorSummary(sectionsWrap, cleanups);
 }
 function renderIndependentAppearanceHealthSection(sectionsWrap, cleanups) {
     const section = document.createElement("section");
     section.className = "flex flex-col gap-2";
-    section.appendChild(sectionTitle("Appearance"));
+    section.hidden = true;
+    section.appendChild(sectionTitle("Appearance needs attention"));
     const card = roundedCard();
     section.appendChild(card);
     sectionsWrap.appendChild(section);
@@ -1389,29 +1384,21 @@ function renderIndependentAppearanceHealthSection(sectionsWrap, cleanups) {
             return;
         const status = health?.appearance.status ?? "not_observed";
         const presentation = status === "normal"
-            ? {
-                badge: "Normal",
-                tone: "ok",
-                detail: "The owned primary Tweakers window is at native Actual Size.",
-            }
+            ? null
             : status === "needs_attention"
                 ? {
                     badge: "Needs attention",
                     tone: "warn",
                     detail: "Native or CSS scaling still needs a later Actual Size validation.",
                 }
-                : {
-                    badge: "Not observed",
-                    tone: "warn",
-                    detail: "The current process has not yet observed an owned primary Tweakers window.",
-                };
+                : null;
+        section.hidden = presentation === null;
+        if (!presentation)
+            return;
         card.textContent = "";
         const row = actionRow("Window appearance", presentation.detail);
         row.querySelector("[data-tweaker-row-actions]")?.appendChild(statusBadge(presentation.tone, presentation.badge));
         card.appendChild(row);
-        if (health?.observedAt) {
-            card.appendChild(rowSimple("Last observed", new Date(health.observedAt).toLocaleString()));
-        }
     };
     render(null);
     void electron_1.ipcRenderer.invoke("tweaker:get-independent-live-health")
@@ -1423,9 +1410,85 @@ function renderIndependentAppearanceHealthSection(sectionsWrap, cleanups) {
     electron_1.ipcRenderer.on("tweaker:independent-live-health-changed", onChanged);
     cleanups.push(() => electron_1.ipcRenderer.removeListener("tweaker:independent-live-health-changed", onChanged));
 }
+function renderIndependentDoctorSummary(sectionsWrap, cleanups) {
+    const section = document.createElement("section");
+    section.className = "flex flex-col gap-2";
+    section.appendChild(sectionTitle("Tweakers"));
+    const card = roundedCard();
+    card.appendChild(rowSimple("Loading Tweakers", "Checking installed version, health, and update status."));
+    section.appendChild(card);
+    sectionsWrap.appendChild(section);
+    let disposed = false;
+    let lastReport = null;
+    let lastError = null;
+    let refreshInFlight = false;
+    let managerOpenError = null;
+    const render = (report, error) => {
+        if (disposed || !card.isConnected)
+            return;
+        card.textContent = "";
+        if (!report) {
+            card.appendChild(rowSimple("Tweakers", error ? "Manager summary is unavailable." : "Checking installed version, health, and update status."));
+            if (error)
+                card.appendChild(rowSimple("Error", String(error)));
+        }
+        else {
+            const version = report.target?.version ? `v${report.target.version}${report.target.build ? ` (${report.target.build})` : ""}` : "Version unavailable";
+            const health = report.health?.state === "healthy" ? "Healthy" : report.health?.state === "attention" ? "Needs attention" : "Blocked";
+            const status = report.update?.progress || report.update?.state || "Not checked";
+            card.appendChild(rowSimple("Tweakers", `${version} · ${health}`));
+            const updates = actionRow("Updates", error ? `${status} (stale)` : status);
+            if (error)
+                updates.querySelector("[data-tweaker-row-actions]")?.appendChild(statusBadge("warn", "Stale"));
+            card.appendChild(updates);
+            if (health !== "Healthy")
+                card.appendChild(rowSimple("Health", "Open Manager to see the exact finding and available recovery action."));
+        }
+        const manager = actionRow("Manager", managerOpenError ? `Could not open Manager: ${String(managerOpenError)}` : "Open full maintenance details and recovery actions.");
+        const actions = manager.querySelector("[data-tweaker-row-actions]");
+        const openManager = compactButton("Open Manager", () => {
+            openManager.disabled = true;
+            void electron_1.ipcRenderer.invoke("tweaker:manager-open")
+                .then(() => {
+                managerOpenError = null;
+                render(lastReport, lastError);
+            })
+                .catch((error) => {
+                managerOpenError = error;
+                render(lastReport, lastError);
+            })
+                .finally(() => { openManager.disabled = false; });
+        });
+        actions?.append(openManager);
+        card.appendChild(manager);
+    };
+    const refresh = () => {
+        if (disposed || refreshInFlight)
+            return;
+        refreshInFlight = true;
+        void electron_1.ipcRenderer.invoke("tweaker:doctor-status")
+            .then((value) => {
+            lastReport = value;
+            lastError = null;
+            render(lastReport);
+        })
+            .catch((error) => {
+            lastError = error;
+            render(lastReport, error);
+        })
+            .finally(() => { refreshInFlight = false; });
+    };
+    render(null);
+    refresh();
+    window.addEventListener("focus", refresh);
+    cleanups.push(() => {
+        disposed = true;
+        window.removeEventListener("focus", refresh);
+    });
+}
 function renderInjectedSettingsSurface(sectionsWrap, cardUpdates, subtitle, cleanups) {
     cleanups.push(renderEnvironmentSection(sectionsWrap, cardUpdates));
-    cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "injected"));
+    cleanups.push(renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates));
     cleanups.push(renderTweaksHealthSection(sectionsWrap, cardUpdates));
     cleanups.push(renderMcpIntegrationSection(sectionsWrap, cardUpdates));
     cleanups.push(renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates));
@@ -1492,15 +1555,6 @@ function renderIndependentManagerStatusSection(sectionsWrap, projection) {
             card.appendChild(rowSimple("Manager coordination", coordinator.problem ?? `Manager state: ${coordinator.state}.`));
         }
     }
-    section.appendChild(card);
-    sectionsWrap.appendChild(section);
-}
-function renderIndependentRefreshUnavailableSection(sectionsWrap, reason) {
-    const section = document.createElement("section");
-    section.className = "flex flex-col gap-2";
-    section.appendChild(sectionTitle("Tweakers App Update"));
-    const card = roundedCard();
-    card.appendChild(rowSimple("Tweakers reapplication unavailable", reason ?? "The verified global Tweakers manager is unavailable. This surface is read-only; no Tweakers reapplication control is exposed."));
     section.appendChild(card);
     sectionsWrap.appendChild(section);
 }
@@ -2397,38 +2451,27 @@ function openEnvironmentConfirmModal(requested, transaction) {
     confirm.focus();
     return decision;
 }
-function renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, deploymentKind, projection) {
+function renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates) {
     const section = document.createElement("section");
     section.className = "flex flex-col gap-2";
-    section.appendChild(sectionTitle(deploymentKind === "independent" ? "Tweakers App Update" : "Tweaker Mode Runtime"));
+    section.appendChild(sectionTitle("Tweaker Mode Runtime"));
     const card = roundedCard();
-    card.dataset.tweakerRuntimeRefreshCard = deploymentKind;
+    card.dataset.tweakerRuntimeRefreshCard = "injected";
     section.appendChild(card);
     sectionsWrap.appendChild(section);
-    const actionId = deploymentKind === "independent" ? "refresh.independent" : "refresh.injected";
-    const managerAction = projection?.manager.actions.find((action) => action.actionId === actionId) ?? null;
     let busy = false;
     let detail = null;
     const draw = () => {
         card.textContent = "";
-        const patch = projection?.manager.status?.tweakersPatch;
-        const independentlyAvailable = deploymentKind !== "independent" || managerAction?.available === true;
-        const summary = deploymentKind === "independent"
-            ? patch?.state === "source-changes-available"
-                ? "A verified source change is ready to rebuild only this independent Tweakers app."
-                : patch?.state === "current"
-                    ? "Reapply this independent Tweakers app from its manager-verified official source."
-                    : managerAction?.reason ?? patch?.problem ?? "A manager-verified official source is required before Tweakers can be rebuilt."
-            : "Refreshes the separately selected ChatGPT Tweaker mode from its manager-verified source.";
-        const row = actionRow(deploymentKind === "independent" ? "Independent Tweakers" : "ChatGPT Tweaker mode", detail ?? summary);
+        const row = actionRow("ChatGPT Tweaker mode", detail ?? "Refreshes the separately selected ChatGPT Tweaker mode from its manager-verified source.");
         const actions = row.querySelector("[data-tweaker-row-actions]");
-        const button = compactButton(deploymentKind === "independent" ? "Rebuild Tweakers App" : "Refresh Tweaker Mode", () => {
+        const button = compactButton("Refresh Tweaker Mode", () => {
             if (busy)
                 return;
             busy = true;
             detail = "The global Tweakers manager is preparing the selected refresh.";
             draw();
-            const update = cardUpdates.begin(`tweakers-runtime-${deploymentKind}`);
+            const update = cardUpdates.begin("tweakers-runtime-injected");
             void electron_1.ipcRenderer.invoke("tweaker:reapply-tweakers")
                 .then((value) => {
                 if (!cardUpdates.complete(update, value))
@@ -2451,18 +2494,15 @@ function renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, deployme
                 draw();
             });
         });
-        button.disabled = busy || !independentlyAvailable;
+        button.disabled = busy;
         actions?.appendChild(button);
-        row.querySelector("[data-tweaker-row-actions]")?.prepend(statusBadge(independentlyAvailable ? "ok" : "warn", independentlyAvailable ? "Manager ready" : "Blocked"));
+        row.querySelector("[data-tweaker-row-actions]")?.prepend(statusBadge("ok", "Manager ready"));
         card.appendChild(row);
         card.appendChild(rowSimple("ChatGPT updater", "ChatGPT remains on its own native updater. This control only refreshes Tweakers or the separately selected Tweaker mode."));
-        if (patch?.installedVersion || patch?.officialVersion) {
-            card.appendChild(rowSimple("Source comparison", `Tweakers ${patch.installedVersion ?? "unknown"} · Official ChatGPT ${patch.officialVersion ?? "unknown"}.`));
-        }
     };
     draw();
     return () => {
-        cardUpdates.invalidate(`tweakers-runtime-${deploymentKind}`);
+        cardUpdates.invalidate("tweakers-runtime-injected");
     };
 }
 function renderTweaksHealthSection(sectionsWrap, cardUpdates) {
@@ -2760,7 +2800,7 @@ function renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates) {
     };
 }
 function renderAdvancedRuntimeSection(sectionsWrap) {
-    renderCodexVersionsSection(sectionsWrap);
+    renderCodexVersionsSection(sectionsWrap, { collapsed: true });
 }
 function renderCodexVersionsSection(sectionsWrap, options = {}) {
     const section = document.createElement("section");
