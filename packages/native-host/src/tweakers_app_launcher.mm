@@ -20,6 +20,8 @@
 namespace {
 
 constexpr char kElectronName[] = "Tweakers Electron";
+constexpr char kDoctorRelativeExecutable[] = "Resources/tweakers/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor";
+constexpr char kInstalledLauncherName[] = "ChatGPT";
 constexpr char kConfigDirectory[] = "tweakers";
 constexpr char kUserDataConfig[] = "variant-user-data-path";
 constexpr char kCodexHomeConfig[] = "variant-codex-home-path";
@@ -279,15 +281,9 @@ bool BuildExactLaunchEnvironment(
   return true;
 }
 
-// The manager authenticates this wrapper's exact pre-Electron ancestry. No
-// caller-selected command or environment crosses this fixed launch boundary.
-bool PreparePortableDesktop() {
+bool ReadVerifiedManagerLauncher(std::string *manager) {
   std::string home, user, shell, temporaryDirectory;
   if (!ReadTrustedUserEnvironment(&home, &user, &shell, &temporaryDirectory)) return false;
-  const std::string continuity = home + "/Library/Application Support/Tweakers Desktop Continuity";
-  struct stat continuityStat {};
-  if (lstat(continuity.c_str(), &continuityStat) != 0 && errno == ENOENT) return true;
-  if (!IsSafePrivateDirectory(continuity, getuid(), "desktop continuity root")) return false;
   const std::string descriptor = home + "/Library/Application Support/Menu Bar/manager-descriptors/com.thomashulihan.tweakers.json";
   struct stat descriptorStat {};
   if (!IsSafeAppFile(descriptor, getuid(), false, "manager descriptor", &descriptorStat)
@@ -301,14 +297,53 @@ bool PreparePortableDesktop() {
   NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
   id value = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
   if (![value isKindOfClass:[NSDictionary class]] || ![value[@"executable"] isKindOfClass:[NSString class]]) return Fail("invalid manager descriptor");
-  const std::string manager([value[@"executable"] UTF8String]);
+  const std::string candidate([value[@"executable"] UTF8String]);
   const std::string prefix = home + "/Library/Application Support/Tweakers/managers/com.thomashulihan.tweakers/generations/";
   const std::string suffix = "/Tweakers Manager Launcher";
-  if (manager.rfind(prefix, 0) != 0 || manager.size() != prefix.size() + 64 + suffix.size()
-      || manager.substr(manager.size() - suffix.size()) != suffix) return Fail("manager path is outside its fixed generation");
-  const std::string generation = manager.substr(prefix.size(), 64);
+  if (candidate.rfind(prefix, 0) != 0 || candidate.size() != prefix.size() + 64 + suffix.size()
+      || candidate.substr(candidate.size() - suffix.size()) != suffix) return Fail("manager path is outside its fixed generation");
+  const std::string generation = candidate.substr(prefix.size(), 64);
   if (generation.find_first_not_of("0123456789abcdef") != std::string::npos
-      || !IsSafeAppFile(manager, getuid(), true, "manager launcher")) return false;
+      || !IsSafeAppFile(candidate, getuid(), true, "manager launcher")) return false;
+  *manager = candidate;
+  return true;
+}
+
+bool LaunchDoctorForEarlyFailure(const std::string &contentsDirectory, uid_t launcherOwner) {
+  const std::string doctor = Join(contentsDirectory, kDoctorRelativeExecutable);
+  if (!IsSafeAppFile(doctor, launcherOwner, true, "Tweakers Doctor")) return false;
+  std::string manager;
+  if (!ReadVerifiedManagerLauncher(&manager)) return false;
+
+  std::array<char *, 3> arguments = {{
+    const_cast<char *>(doctor.c_str()),
+    const_cast<char *>(manager.c_str()),
+    nullptr,
+  }};
+  std::array<char *, 1> environment = {{nullptr}};
+  posix_spawn_file_actions_t actions;
+  if (posix_spawn_file_actions_init(&actions) != 0) return Fail("could not prepare Tweakers Doctor");
+  posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+  pid_t child = 0;
+  const int spawned = posix_spawn(&child, doctor.c_str(), &actions, nullptr, arguments.data(), environment.data());
+  posix_spawn_file_actions_destroy(&actions);
+  if (spawned != 0) return Fail("could not open Tweakers Doctor");
+  return true;
+}
+
+// The manager authenticates this wrapper's exact pre-Electron ancestry. No
+// caller-selected command or environment crosses this fixed launch boundary.
+bool PreparePortableDesktop() {
+  std::string home, user, shell, temporaryDirectory;
+  if (!ReadTrustedUserEnvironment(&home, &user, &shell, &temporaryDirectory)) return false;
+  const std::string continuity = home + "/Library/Application Support/Tweakers Desktop Continuity";
+  struct stat continuityStat {};
+  if (lstat(continuity.c_str(), &continuityStat) != 0 && errno == ENOENT) return true;
+  if (!IsSafePrivateDirectory(continuity, getuid(), "desktop continuity root")) return false;
+  std::string manager;
+  if (!ReadVerifiedManagerLauncher(&manager)) return false;
   std::array<char *, 3> arguments = {{const_cast<char *>(manager.c_str()), const_cast<char *>("portable-desktop-prelaunch-v1"), nullptr}};
   std::array<char *, 1> environment = {{nullptr}};
   posix_spawn_file_actions_t actions;
@@ -346,7 +381,8 @@ int main(int argc, char *argv[]) {
   const std::string macosDirectory = Dirname(launcher);
   const std::string contentsDirectory = Dirname(macosDirectory);
   const std::string appRoot = Dirname(contentsDirectory);
-  if (Basename(macosDirectory) != "MacOS" || Basename(contentsDirectory) != "Contents"
+  if (Basename(launcher) != kInstalledLauncherName
+      || Basename(macosDirectory) != "MacOS" || Basename(contentsDirectory) != "Contents"
       || appRoot.size() <= 4 || appRoot.substr(appRoot.size() - 4) != ".app") {
     Fail("must run from a canonical Tweakers app bundle");
     return 1;
@@ -354,8 +390,12 @@ int main(int argc, char *argv[]) {
 
   struct stat launcherStat {};
   if (!IsSafeAppFile(launcher, getuid(), true, "Tweakers App Launcher", &launcherStat)) return 1;
+  const auto failToDoctor = [&contentsDirectory, &launcherStat]() {
+    LaunchDoctorForEarlyFailure(contentsDirectory, launcherStat.st_uid);
+    return 1;
+  };
   const std::string electron = Join(macosDirectory, kElectronName);
-  if (!IsSafeAppFile(electron, launcherStat.st_uid, true, "original Electron executable")) return 1;
+  if (!IsSafeAppFile(electron, launcherStat.st_uid, true, "original Electron executable")) return failToDoctor();
 
   const std::string resources = Join(contentsDirectory, "Resources");
   const std::string configuration = Join(resources, kConfigDirectory);
@@ -365,18 +405,18 @@ int main(int argc, char *argv[]) {
   if (!ReadSignedPath(Join(configuration, kUserDataConfig), launcherStat.st_uid, &userData)
       || !ReadSignedPath(Join(configuration, kCodexHomeConfig), launcherStat.st_uid, &codexHome)
       || !ReadSignedPath(Join(configuration, kAccountsBrokerConfig), launcherStat.st_uid, &accountsBrokerRoot)) {
-    return 1;
+    return failToDoctor();
   }
   if (!IsSafePrivateDirectory(userData, getuid(), "isolated user-data path")
       || !IsSafePrivateDirectory(codexHome, getuid(), "isolated Codex home")) {
-    return 1;
+    return failToDoctor();
   }
   // The Accounts broker can be absent during first launch or recovery. Its
   // signed, canonical path still binds this client to one global owner; the
   // runtime will enter its fail-closed unavailable state if no broker appears.
 
   std::vector<char *> forwarded;
-  if (!RemoveUntrustedUserDataSwitches(argc, argv, &forwarded)) return 1;
+  if (!RemoveUntrustedUserDataSwitches(argc, argv, &forwarded)) return failToDoctor();
   std::vector<std::string> environmentStorage;
   std::vector<char *> environment;
   if (!BuildExactLaunchEnvironment(
@@ -385,9 +425,9 @@ int main(int argc, char *argv[]) {
     accountsBrokerRoot,
     &environmentStorage,
     &environment
-  )) return 1;
+  )) return failToDoctor();
 
-  if (!PreparePortableDesktop()) return 1;
+  if (!PreparePortableDesktop()) return failToDoctor();
 
   std::string forcedUserDataArgument = "--user-data-dir=" + userData;
   std::vector<char *> launchArguments;
@@ -403,5 +443,5 @@ int main(int argc, char *argv[]) {
   // isolation bindings above cross this native process boundary.
   execve(electron.c_str(), launchArguments.data(), environment.data());
   Fail("could not start Electron: " + std::string(std::strerror(errno)));
-  return 1;
+  return failToDoctor();
 }

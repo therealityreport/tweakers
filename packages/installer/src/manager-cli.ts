@@ -4,7 +4,8 @@
  * shell text, generic command, or caller-supplied executable can cross this
  * boundary.
  */
-import { readFileSync, realpathSync, writeSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { isTweakersManagerSection, type TweakersManagerSection } from "@therealityreport/tweakers-sdk";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -65,6 +66,16 @@ const PUBLIC_STATUS_ACTION_IDS = [
   "refresh.independent",
 ] as const satisfies readonly TweakersManagerActionIdV1[];
 
+interface ParsedDoctorRequest {
+  command: "doctor-status" | "doctor-action" | "doctor-open" | "doctor-run";
+  requestId: string;
+}
+interface ParsedManagerOpenRequest {
+  command: "manager-open";
+  requestId: string;
+  section: TweakersManagerSection;
+}
+
 interface ParsedStatusRequest {
   command: "status";
   requestId: string;
@@ -96,7 +107,7 @@ interface ParsedOperationRequest {
   operationId: string;
 }
 
-type ParsedTweakersManagerRequest = ParsedStatusRequest
+type ParsedTweakersManagerRequest = ParsedDoctorRequest | ParsedStatusRequest | ParsedManagerOpenRequest
   | ParsedOfficialSourceRegistrationRequest
   | ParsedPrepareRequest
   | ParsedOperationRequest;
@@ -204,6 +215,17 @@ export function parseTweakersManagerStatusArguments(argv: readonly string[]): { 
 
 export function parseTweakersManagerArguments(argv: readonly string[]): ParsedTweakersManagerRequest {
   const command = argv[0] ?? "";
+  if (command === "manager-open") {
+    if (argv.length !== 6 || argv[1] !== "--request-id" || argv[3] !== "--section"
+      || !isTweakersManagerSection(argv[4]) || argv[5] !== "--json") {
+      throw managerCliError("invalid_request", "Expected: manager-open --request-id <uuid> --section <overview|updates|doctor> --json");
+    }
+    return { command, requestId: parseUuid(argv[2], "request-id"), section: argv[4] };
+  }
+  if (command === "doctor-status" || command === "doctor-action" || command === "doctor-open" || command === "doctor-run") {
+    if (argv.length !== 4 || argv[1] !== "--request-id" || argv[3] !== "--json") throw managerCliError("invalid_request", "Invalid fixed Doctor invocation");
+    return { command, requestId: parseUuid(argv[2], "request-id") };
+  }
   if (command === "status") {
     if (argv.length !== 4 || argv[1] !== "--request-id" || argv[3] !== "--json") {
       throw managerCliError("invalid_request", "Expected: status --request-id <lowercase-uuid> --json");
@@ -265,7 +287,8 @@ export async function runTweakersManagerCli(
   argv: readonly string[],
   dependencies: RunTweakersManagerCliDependencies = {},
 ): Promise<number> {
-  const write = dependencies.write ?? ((line: string) => writeSync(1, line));
+  const output: string[] = [];
+  const write = dependencies.write ?? ((line: string) => { output.push(line); });
   const now = dependencies.now ?? (() => new Date().toISOString());
   let requestId: string | null = maybeRequestId(argv);
   try {
@@ -284,6 +307,15 @@ export async function runTweakersManagerCli(
       enabledActionIds: adapterActionIds(adapter),
       officialSourceVerification,
     });
+    if (parsed.command === "manager-open" || parsed.command === "doctor-status" || parsed.command === "doctor-action" || parsed.command === "doctor-open" || parsed.command === "doctor-run") {
+      if (executable.state !== "resolved") throw managerCliError("invalid_request", "Doctor requires the verified manager launcher");
+      const doctor = await import("./doctor-actions.js");
+      const report = await doctor.runDoctorManagerCommand({ command: parsed.command, requestId: parsed.requestId,
+        root: boundUserRoot, executable, ...(parsed.command === "manager-open" ? { section: parsed.section } : {}), input: parsed.command === "doctor-action"
+          ? parseManagerStrictJsonObject((dependencies.readStdin ?? (() => readFileSync(0)))(), { maxBytes: 64 * 1024, label: "Doctor action" }) : undefined });
+      writeJson(write, { ...report, requestId: parsed.requestId });
+      return 0;
+    }
     if (parsed.command === "status") {
       const status = snapshot();
       const response: TweakersManagerStatusResponseV1 = {
@@ -346,6 +378,7 @@ export async function runTweakersManagerCli(
       writeJson(write, response);
       return 0;
     }
+    if (parsed.command !== "cancel") throw managerCliError("unsupported_action", "Unsupported manager command");
     const cancelled = await adapter.cancel({ operationId: parsed.operationId, executable });
     const response: TweakersManagerCancelResponseV1 = {
       protocolVersion: MANAGER_PROTOCOL_VERSION,
@@ -372,6 +405,10 @@ export async function runTweakersManagerCli(
     };
     writeJson(write, response);
     return 64;
+  } finally {
+    // Flush outside the protocol error handler: a transport failure must not
+    // append another JSON document to a partially delivered response.
+    if (!dependencies.write && output.length > 0) await writeManagerStdout(output.join(""));
   }
 }
 
@@ -468,6 +505,14 @@ function writeJson(write: (line: string) => void, value: unknown): void {
   write(`${JSON.stringify(value)}\n`);
 }
 
+function writeManagerStdout(text: string): Promise<void> {
+  // Native callers supply nonblocking pipes. The stream handles partial
+  // writes and EAGAIN; its callback confirms the whole response was flushed.
+  return new Promise((resolve, reject) => {
+    process.stdout.write(text, "utf8", (error) => error ? reject(error) : resolve());
+  });
+}
+
 function safeNow(now: () => string): string {
   try {
     const value = now();
@@ -506,7 +551,7 @@ if (isDirectExecution()) {
   } else if ([PORTABLE_DESKTOP_PRELAUNCH_MANAGER_RUN_COMMAND, PORTABLE_DESKTOP_HANDOFF_OFFICIAL_MANAGER_RUN_COMMAND,
     PORTABLE_DESKTOP_HANDOFF_TWEAKERS_MANAGER_RUN_COMMAND].some((command) => command === argv[0])) {
     const result = runPortableDesktopManagerCommand(argv);
-    writeSync(1, `${JSON.stringify(result.result)}\n`);
+    await writeManagerStdout(`${JSON.stringify(result.result)}\n`);
     process.exitCode = result.exitCode;
   } else {
     process.exitCode = await runTweakersManagerCli(argv);

@@ -1,8 +1,9 @@
+import { persistentIdentityProposalFingerprint, matchesPersistentDirectoryIdentity, preparePersistentIdentityGeneration, journalAndPublishPersistentIdentityGeneration } from "./persistent-directory-identity";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { abortUnpublishedSharedSourceRebase, loadSharedAccountBase, loadSharedPluginsManifestV1, type AccountContinuityWriteEvidenceV1 } from "./account-continuity";
-import { nativeHistoryBindingSafeV1, readAndPreflightNativeHistorySourceStaticV1, signNativeHistorySourceV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceBindingV1 } from "./native-history";
+import { refreshNativeHistoryBindingAfterIdentityPublication, nativeHistoryBindingSafeV1, readAndPreflightNativeHistorySourceStaticV1, signNativeHistorySourceV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceBindingV1 } from "./native-history";
 import { isOpaqueAccountId, isPlainRecord, type OpaqueAccountId } from "./types";
 
 export const SHARED_NATIVE_MODE_FILE_V1 = "shared-native-mode.v1.json";
@@ -34,7 +35,7 @@ export type SharedNativeModeReadResultV1 = { state: "absent" } | Blocked | {
   state: "ready"; document: SharedNativeModeV1; fingerprint: Sha256;
   environment: { TWEAKERS_NATIVE_BASE_ROOT: string; TWEAKERS_OVERLAY_ROOT: string };
 };
-export type SharedNativeModePublishResultV1 = Blocked | { state: "published"; document: SharedNativeModeV1; fingerprint: Sha256 };
+export type SharedNativeModePublishResultV1 = Blocked | { state: "published"; document: SharedNativeModeV1; fingerprint: Sha256; binding: NativeHistorySourceBindingV1 };
 export interface PrepareSharedNativeModeInputV1 extends SharedNativeModeContextV1 {
   overlayPath: string; expectedSourceFingerprint: Sha256; expectedRebaseIntentFingerprint: Sha256 | null; resolverBinarySha256: string;
 }
@@ -124,8 +125,10 @@ function parseDocument(value: unknown, context: SharedNativeModeContextV1): Shar
   const original = context.binding.source.accounts.find((a) => a.opaqueAccountId === document.sourceAccountId);
   if (document.sourceFingerprint !== context.binding.sourceDocumentFingerprint || document.sourceAccountId !== context.binding.source.metadataAccountId || !original
     || document.nativeBase.path !== original.codexHome || canonical(document.nativeBase.identity) !== canonical(original.codexHomeIdentity)
-    || canonical(directory(document.nativeBase.path, false)) !== canonical(document.nativeBase.identity)
-    || canonical(directory(document.overlay.path)) !== canonical(document.overlay.identity)) return fail("shared native source or root changed");
+    || !matchesPersistentDirectoryIdentity({ stateRoot: context.stateRoot, secret: context.secret, path: document.nativeBase.path, expected: document.nativeBase.identity, authorityFile: "native-history-source.v1.json", accountId: document.sourceAccountId })
+    || !(present(join(context.stateRoot, SHARED_NATIVE_MODE_FILE_V1))
+      ? matchesPersistentDirectoryIdentity({ stateRoot: context.stateRoot, secret: context.secret, path: document.overlay.path, expected: document.overlay.identity, authorityFile: SHARED_NATIVE_MODE_FILE_V1, accountId: document.sourceAccountId })
+      : canonical(directory(document.overlay.path)) === canonical(document.overlay.identity))) return fail("shared native source or root changed");
   if (!document.overlay.path.startsWith(context.stateRoot + "/")
     || ["accounts", "shared-account-config"].some((name) => overlap(join(context.stateRoot, name), document.overlay.path))
     || context.binding.accounts.some((a) => [a.codexHome, a.sqliteHome].some((root) => overlap(root, document.overlay.path)))) return fail("shared overlay must be manager-owned and disjoint from history and continuity state");
@@ -230,7 +233,13 @@ function finish(input: WriteInput, plan: SharedNativeModePlanV1, transitionFinge
   assertTransition(); unlinkSync(transitionPath); sync(input.stateRoot);
   const result = readSharedNativeModeV1(input);
   if (result.state !== "ready" || result.fingerprint !== hash(finalBytes)) return fail("published shared native registration failed readback");
-  return { state: "published", document: result.document, fingerprint: result.fingerprint };
+  if (process.platform === "darwin") {
+    const proposal = preparePersistentIdentityGeneration({ stateRoot: input.stateRoot, secret: input.secret,
+      verify: () => readSharedNativeModeV1(input).state === "ready" });
+    journalAndPublishPersistentIdentityGeneration(input.stateRoot, input.secret, proposal);
+    input.binding = refreshNativeHistoryBindingAfterIdentityPublication(input.binding, persistentIdentityProposalFingerprint(proposal));
+  }
+  return { state: "published", document: result.document, fingerprint: result.fingerprint, binding: input.binding };
 }
 
 export function publishSharedNativeModeV1(input: WriteInput & { plan: SharedNativeModePlanV1; expectedPlanFingerprint: Sha256 }): SharedNativeModePublishResultV1 {
@@ -241,7 +250,7 @@ export function publishSharedNativeModeV1(input: WriteInput & { plan: SharedNati
     if (present(transitionPath)) fail("shared native transition requires explicit recovery");
     if (present(join(input.stateRoot, SHARED_NATIVE_MODE_FILE_V1))) {
       const current = readSharedNativeModeV1(input);
-      if (current.state === "ready" && current.fingerprint === fingerprint(plan.document)) return { state: "published", document: current.document, fingerprint: current.fingerprint };
+      if (current.state === "ready" && current.fingerprint === fingerprint(plan.document)) return { state: "published", document: current.document, fingerprint: current.fingerprint, binding: input.binding };
       fail("shared native registration already exists");
     }
     priorGlobals(input, plan.document);
@@ -262,7 +271,7 @@ export function recoverSharedNativeModeV1(input: WriteInput & { expectedTransiti
       if (hash(content) !== input.expectedTransitionFingerprint) fail("completed transition evidence changed");
       const plan = parsePlan(JSON.parse(content.toString("utf8")), input); const current = readSharedNativeModeV1(input);
       if (current.state !== "ready" || current.fingerprint !== fingerprint(plan.document)) return fail("completed transition registration changed");
-      return { state: "published", document: current.document, fingerprint: current.fingerprint };
+      return { state: "published", document: current.document, fingerprint: current.fingerprint, binding: input.binding };
     }
     const content = read(path);
     if (hash(content) !== input.expectedTransitionFingerprint) fail("shared native recovery transaction changed");

@@ -72,6 +72,8 @@ export interface CodexSparkleBridgeOptions {
     suppressNativeSideEffects?: boolean;
     /** Runs the bounded Tweakers-owned manual update check without invoking raw Sparkle/XPC. */
     requestManualCheck?: () => void | Promise<void>;
+    /** Consume an existing native availability signal; never schedules discovery. */
+    onUpdateAvailable?: () => void;
     /** Runs the bounded metadata-only check used by OpenAI's startup/interval timer. */
     requestBackgroundCheck?: () => void | Promise<void>;
     /** Starts Tweakers' durable desktop-update transaction from OpenAI's native Update control. */

@@ -31,6 +31,8 @@ interface Fixture {
   codexHome: string;
   brokerRoot: string;
   config: string;
+  doctorOutput: string;
+  managerLauncher: string | null;
 }
 
 function writePrivateDirectory(path: string): void {
@@ -38,7 +40,7 @@ function writePrivateDirectory(path: string): void {
   chmodSync(path, 0o700);
 }
 
-function stageFixture(options: { missingBroker?: boolean; malformedUserData?: boolean } = {}): Fixture {
+function stageFixture(options: { missingBroker?: boolean; malformedUserData?: boolean; withDoctor?: boolean } = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "tweakers-app-launcher-test-"));
   const app = join(root, "Tweakers.app");
   const macos = join(app, "Contents", "MacOS");
@@ -47,6 +49,7 @@ function stageFixture(options: { missingBroker?: boolean; malformedUserData?: bo
   const codexHomePath = join(root, "private-codex-home");
   const brokerRoot = join(root, "absent-broker-root");
   const output = join(root, "observed.json");
+  const doctorOutput = join(root, "doctor-observed.json");
   writePrivateDirectory(macos);
   writePrivateDirectory(config);
   writePrivateDirectory(userDataPath);
@@ -104,15 +107,48 @@ writeFileSync(${JSON.stringify(output)}, JSON.stringify({
 }));
 `, { mode: 0o755 });
   chmodSync(join(macos, electronName), 0o755);
+  let managerLauncher: string | null = null;
+  if (options.withDoctor) {
+    managerLauncher = join(
+      realpathSync(root),
+      "Library", "Application Support", "Tweakers", "managers", "com.thomashulihan.tweakers",
+      "generations", "a".repeat(64), "Tweakers Manager Launcher",
+    );
+    mkdirSync(join(root, "Library", "Application Support", "Menu Bar", "manager-descriptors"), { recursive: true });
+    mkdirSync(join(managerLauncher, ".."), { recursive: true });
+    writeFileSync(managerLauncher, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(managerLauncher, 0o755);
+    writeFileSync(
+      join(root, "Library", "Application Support", "Menu Bar", "manager-descriptors", "com.thomashulihan.tweakers.json"),
+      `${JSON.stringify({ executable: managerLauncher })}\n`,
+      { mode: 0o600 },
+    );
+    const doctor = join(app, "Contents", "Resources", "tweakers", "native", "Tweakers Doctor.app", "Contents", "MacOS", "Tweakers Doctor");
+    mkdirSync(join(doctor, ".."), { recursive: true });
+    writeFileSync(doctor, `#!${process.execPath}\nconst { writeFileSync, renameSync } = require("node:fs");\nwriteFileSync(${JSON.stringify(doctorOutput + ".tmp")}, JSON.stringify({ argv: process.argv.slice(2), secret: process.env.TWEAKERS_TEST_PARENT_SECRET ?? null, codexHome: process.env.CODEX_HOME ?? null }));\nrenameSync(${JSON.stringify(doctorOutput + ".tmp")}, ${JSON.stringify(doctorOutput)});\n`, { mode: 0o755 });
+    chmodSync(doctor, 0o755);
+  }
   writeFileSync(join(config, "variant-user-data-path"), `${options.malformedUserData ? "relative-path" : userData}\n`, { mode: 0o600 });
   writeFileSync(join(config, "variant-codex-home-path"), `${codexHome}\n`, { mode: 0o600 });
   writeFileSync(join(config, "variant-accounts-broker-root"), `${brokerRoot}\n`, { mode: 0o600 });
-  return { root, app, launcher, output, userData, codexHome, brokerRoot, config };
+  return { root, app, launcher, output, userData, codexHome, brokerRoot, config, doctorOutput, managerLauncher };
+}
+
+function waitForFile(path: string): boolean {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (existsSync(path)) return true;
+    Atomics.wait(pause, 0, 0, 25);
+  }
+  return existsSync(path);
 }
 
 test("app launcher source binds all pre-singleton identity inputs and scoped asset publication", () => {
   const source = readFileSync(launcherImplementation, "utf8");
   assert.match(source, /kElectronName\[\] = "Tweakers Electron"/);
+  assert.match(source, /kDoctorRelativeExecutable\[\] = "Resources\/tweakers\/native\/Tweakers Doctor\.app\/Contents\/MacOS\/Tweakers Doctor"/);
+  assert.match(source, /kInstalledLauncherName\[\] = "ChatGPT"/);
+  assert.match(source, /Basename\(launcher\) != kInstalledLauncherName/);
   assert.match(source, /variant-user-data-path/);
   assert.match(source, /variant-codex-home-path/);
   assert.match(source, /variant-accounts-broker-root/);
@@ -127,6 +163,12 @@ test("app launcher source binds all pre-singleton identity inputs and scoped ass
   assert.match(source, /--user-data-dir=/);
   assert.match(source, /execve\(electron\.c_str\(\)/);
   assert.doesNotMatch(source, /\bexecv\(electron\.c_str\(\)/);
+  assert.match(source, /ReadVerifiedManagerLauncher/);
+  assert.match(source, /manager-descriptors\/com\.thomashulihan\.tweakers\.json/);
+  assert.match(source, /LaunchDoctorForEarlyFailure/);
+  assert.match(source, /posix_spawn\(&child, doctor\.c_str\(\)/);
+  assert.match(source, /return failToDoctor\(\)/);
+  assert.doesNotMatch(source, /openURL|openApplication|\/Applications\/ChatGPT\.app/);
   const build = readFileSync(buildScript, "utf8");
   assert.match(build, /tweakers_app_launcher\.mm/);
   assert.match(build, /Tweakers App Launcher/);
@@ -212,6 +254,27 @@ test("app launcher fails closed before Electron when its signed launch configura
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /signed launch configuration is not a canonical absolute path/);
     assert.equal(existsSync(fixture.output), false);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("app launcher routes an early failure to Doctor with only the verified manager launcher", { skip: process.platform !== "darwin" }, () => {
+  const fixture = stageFixture({ malformedUserData: true, withDoctor: true });
+  try {
+    const result = spawnSync(fixture.launcher, [], {
+      encoding: "utf8",
+      env: { ...process.env, TWEAKERS_TEST_PARENT_SECRET: "must-not-cross-doctor" },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /signed launch configuration is not a canonical absolute path/);
+    assert.equal(existsSync(fixture.output), false, "failed Tweakers launch must not reach Electron");
+    assert.equal(waitForFile(fixture.doctorOutput), true, "Doctor helper should be launched");
+    assert.deepEqual(JSON.parse(readFileSync(fixture.doctorOutput, "utf8")), {
+      argv: [fixture.managerLauncher],
+      secret: null,
+      codexHome: null,
+    });
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

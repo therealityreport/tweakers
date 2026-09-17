@@ -189,6 +189,13 @@ function createPromotionFixture(root: string, faultPoint: string): {
       cloneApp: (_from, to) => mkdirSync(to, { recursive: true }),
       installApp: async (opts) => installCandidateFixture(opts),
       stageTweaks: (tweaks) => stageBundledFixture(tweaks),
+      // This fixture isolates filesystem rollback after environment validation.
+      bootstrapManagerEnvironment: ({ sourceRoot, destinationRoot }) => ({
+        sourceRoot, destinationRoot,
+        registryFile: join(destinationRoot, "environment-registry.json"),
+        selectionFile: join(destinationRoot, "environment-selection.json"),
+        bootstrapped: true, restoreOnFailure: () => {},
+      }),
       fault: (point) => {
         if (point === faultPoint) throw new Error(`injected filesystem failure at ${point}`);
       },
@@ -574,5 +581,16 @@ test("refreshTweakersVariant restores the prior app and state for every promotio
 
   for (const faultPoint of faultPoints) {
     await assertPromotionRollback(faultPoint);
+  }
+});
+
+test("retained registered backend cannot bypass Doctor promotion or mix backend authorities", async () => {
+  const retained = {} as NonNullable<Parameters<typeof createTweakersVariant>[0]>["retainRegisteredBackend"];
+  for (const options of [
+    { retainRegisteredBackend: retained, refresh: true },
+    { retainRegisteredBackend: retained, candidateOnly: true, baselineMaintenance: {} as never },
+    { retainRegisteredBackend: retained, candidateOnly: true, prebuiltBackend: {} as never },
+  ]) {
+    await assert.rejects(createTweakersVariant(options, { platform: () => "darwin" }), /exclusive candidate-only/);
   }
 });

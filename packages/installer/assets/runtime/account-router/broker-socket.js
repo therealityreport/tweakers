@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.AccountsBrokerSocketClientV1 = exports.ACCOUNTS_BROKER_COMMAND_TIMEOUT_MS = exports.ACCOUNTS_BROKER_HANDSHAKE_TIMEOUT_MS = exports.ACCOUNTS_BROKER_MAX_NATIVE_RESPONSE_FRAME_BYTES = exports.ACCOUNTS_BROKER_MAX_PROJECTION_FRAME_BYTES = exports.ACCOUNTS_BROKER_MAX_FRAME_BYTES = exports.ACCOUNTS_BROKER_SECRET_FILE = exports.ACCOUNTS_BROKER_CONTROL_SOCKET_FILE = exports.ACCOUNTS_BROKER_SOCKET_FILE = void 0;
+exports.AccountsBrokerSocketClientV1 = exports.AccountsBrokerManagerClientV1 = exports.ACCOUNTS_BROKER_COMMAND_TIMEOUT_MS = exports.ACCOUNTS_BROKER_HANDSHAKE_TIMEOUT_MS = exports.ACCOUNTS_BROKER_MAX_NATIVE_RESPONSE_FRAME_BYTES = exports.ACCOUNTS_BROKER_MAX_PROJECTION_FRAME_BYTES = exports.ACCOUNTS_BROKER_MAX_FRAME_BYTES = exports.ACCOUNTS_BROKER_SECRET_FILE = exports.ACCOUNTS_BROKER_CONTROL_SOCKET_FILE = exports.ACCOUNTS_BROKER_SOCKET_FILE = void 0;
 exports.resolveAccountsBrokerRootResolution = resolveAccountsBrokerRootResolution;
 exports.resolveAccountsBrokerRoot = resolveAccountsBrokerRoot;
 exports.accountsBrokerConfigPath = accountsBrokerConfigPath;
@@ -101,7 +101,8 @@ function readAccountsBrokerSecret(root) {
 async function startAccountsBrokerSocket(options) {
     const reservation = await reserveAccountsBrokerSocket(options);
     return reservation.activate({ broker: options.broker, mapNativeTargets: options.mapNativeTargets,
-        resolveNativeBrowserContext: options.resolveNativeBrowserContext, invokeNativeBrowserRequest: options.invokeNativeBrowserRequest });
+        resolveNativeBrowserContext: options.resolveNativeBrowserContext, invokeNativeBrowserRequest: options.invokeNativeBrowserRequest,
+        managerExecution: options.managerExecution });
 }
 /**
  * Bind the owner-election socket before touching any shared broker state.
@@ -133,7 +134,7 @@ async function reserveAccountsBrokerSocket(options) {
             socket.destroy();
             return;
         }
-        serveBrokerPeer(socket, activation.broker, maxFrameBytes, activation.mapNativeTargets, activation.resolveNativeBrowserContext, activation.invokeNativeBrowserRequest);
+        serveBrokerPeer(socket, activation.broker, options.secret, maxFrameBytes, activation.mapNativeTargets, activation.resolveNativeBrowserContext, activation.invokeNativeBrowserRequest, activation.managerExecution);
     });
     try {
         await listen(server, path);
@@ -211,6 +212,112 @@ async function startBrokerControlSocket(options) {
         },
     };
 }
+/** Owner-private manager client. Each operation uses one authenticated frame and is never replayed by the transport. */
+class AccountsBrokerManagerClientV1 {
+    root;
+    secret;
+    socketFileName;
+    maxFrameBytes;
+    sockets = new Set();
+    closed = false;
+    constructor(options) {
+        this.root = assertBrokerRoot(options.root);
+        if (options.secret.byteLength !== 32)
+            throw new Error("invalid accounts broker manager capability");
+        this.secret = Buffer.from(options.secret);
+        this.socketFileName = options.socketFileName ?? exports.ACCOUNTS_BROKER_SOCKET_FILE;
+        this.maxFrameBytes = boundedFrameBytes(options.maxFrameBytes ?? exports.ACCOUNTS_BROKER_MAX_FRAME_BYTES);
+    }
+    async prepareAuthenticationRecovery(requestId) {
+        const request = { version: 1, action: "prepare_auth_recovery", requestId };
+        if (!isDoctorExecutionLeaseRequest(request))
+            return false;
+        return (await this.invoke(request)).status === "recovery_ready";
+    }
+    async acquireDoctorReviewLease(input) {
+        const request = { version: 1, action: "acquire", ...input };
+        if (!isDoctorExecutionLeaseRequest(request))
+            return managerUnavailable("invalid_request");
+        const result = await this.invoke(request);
+        return isDoctorExecutionAcquireResult(result) ? result : managerUnavailable("broker_unavailable");
+    }
+    async markDoctorReviewLeaseDispatched(input) {
+        const request = { version: 1, action: "mark_dispatched", ...input };
+        if (!isDoctorExecutionLeaseRequest(request))
+            return managerUnavailable("invalid_request");
+        const result = await this.invoke(request);
+        return isDoctorExecutionMarkResult(result) ? result : managerUnavailable("broker_unavailable");
+    }
+    async settleDoctorReviewLease(input) {
+        const request = { version: 1, action: "settle", ...input };
+        if (!isDoctorExecutionLeaseRequest(request))
+            return managerUnavailable("invalid_request");
+        const result = await this.invoke(request);
+        return isDoctorExecutionSettleResult(result) ? result : managerUnavailable("broker_unavailable");
+    }
+    async close() {
+        if (this.closed)
+            return;
+        this.closed = true;
+        for (const socket of this.sockets)
+            socket.destroy();
+        this.sockets.clear();
+        this.secret.fill(0);
+    }
+    invoke(request) {
+        if (this.closed)
+            return Promise.resolve(managerUnavailable("broker_unavailable"));
+        const path = accountsBrokerSocketPath(this.root, this.socketFileName);
+        return new Promise((resolvePromise) => {
+            const socket = (0, node_net_1.createConnection)(path);
+            this.sockets.add(socket);
+            let buffered = "", bytes = 0, settled = false;
+            let timer = null;
+            const finish = (result) => {
+                if (settled)
+                    return;
+                settled = true;
+                if (timer)
+                    clearTimeout(timer);
+                this.sockets.delete(socket);
+                socket.destroy();
+                resolvePromise(result);
+            };
+            timer = setTimeout(() => finish(managerUnavailable("broker_unavailable")), exports.ACCOUNTS_BROKER_COMMAND_TIMEOUT_MS);
+            timer.unref();
+            socket.once("error", () => finish(managerUnavailable("broker_unavailable")));
+            socket.once("close", () => finish(managerUnavailable("broker_unavailable")));
+            socket.setEncoding("utf8");
+            socket.on("data", (chunk) => {
+                bytes += Buffer.byteLength(chunk, "utf8");
+                if (bytes > this.maxFrameBytes * 2)
+                    return finish(managerUnavailable("broker_unavailable"));
+                buffered += chunk;
+                const newline = buffered.indexOf("\n");
+                if (newline < 0)
+                    return;
+                if (buffered.slice(newline + 1).trim())
+                    return finish(managerUnavailable("broker_unavailable"));
+                try {
+                    const frame = JSON.parse(buffered.slice(0, newline));
+                    if (!isManagerExecutionResultFrame(frame) || frame.requestId !== request.requestId)
+                        return finish(managerUnavailable("broker_unavailable"));
+                    finish(frame.result);
+                }
+                catch {
+                    finish(managerUnavailable("broker_unavailable"));
+                }
+            });
+            socket.once("connect", () => {
+                const frame = { version: 1, kind: "manager-execution", request,
+                    proof: doctorExecutionProof(this.secret, request) };
+                if (!writeManagerExecutionFrame(socket, frame, this.maxFrameBytes))
+                    finish(managerUnavailable("broker_unavailable"));
+            });
+        });
+    }
+}
+exports.AccountsBrokerManagerClientV1 = AccountsBrokerManagerClientV1;
 /**
  * Main-process-only client.  It never retries a command after a connection
  * loss: the owner consumed its request id before execution, so automatic
@@ -600,10 +707,11 @@ class AccountsBrokerSocketClientV1 {
     }
 }
 exports.AccountsBrokerSocketClientV1 = AccountsBrokerSocketClientV1;
-function serveBrokerPeer(socket, broker, maxFrameBytes, mapNativeTargets, resolveNativeBrowserContext, invokeNativeBrowserRequest) {
+function serveBrokerPeer(socket, broker, secret, maxFrameBytes, mapNativeTargets, resolveNativeBrowserContext, invokeNativeBrowserRequest, managerExecution) {
     let buffered = "";
     let byteLength = 0;
     let rendererRef = null;
+    let managerRequestConsumed = false;
     let unsubscribe = null;
     let handshakeTimer = setTimeout(() => socket.destroy(), exports.ACCOUNTS_BROKER_HANDSHAKE_TIMEOUT_MS);
     handshakeTimer.unref();
@@ -616,6 +724,10 @@ function serveBrokerPeer(socket, broker, maxFrameBytes, mapNativeTargets, resolv
     };
     socket.once("close", close);
     socket.on("data", (chunk) => {
+        if (managerRequestConsumed) {
+            socket.destroy();
+            return;
+        }
         byteLength += chunk.byteLength;
         if (byteLength > maxFrameBytes * 2) {
             socket.destroy();
@@ -642,6 +754,30 @@ function serveBrokerPeer(socket, broker, maxFrameBytes, mapNativeTargets, resolv
                 return;
             }
             if (!rendererRef) {
+                if (isManagerExecutionRequestFrame(frame)) {
+                    if (buffered.trim().length > 0 || !managerExecution || !verifyDoctorExecutionProof(secret, frame.request, frame.proof)) {
+                        socket.destroy();
+                        return;
+                    }
+                    managerRequestConsumed = true;
+                    socket.pause();
+                    if (handshakeTimer)
+                        clearTimeout(handshakeTimer);
+                    handshakeTimer = null;
+                    void managerExecution(frame.request).then((result) => {
+                        if (!isDoctorExecutionResultForRequest(frame.request, result)
+                            || !writeManagerExecutionFrame(socket, { version: 1, kind: "manager-execution-result", requestId: frame.request.requestId, result }, maxFrameBytes)) {
+                            socket.destroy();
+                            return;
+                        }
+                        socket.end();
+                    }).catch(() => {
+                        writeManagerExecutionFrame(socket, { version: 1, kind: "manager-execution-result", requestId: frame.request.requestId,
+                            result: managerUnavailable("broker_unavailable") }, maxFrameBytes);
+                        socket.end();
+                    });
+                    return;
+                }
                 if (!isBrokerHandshakeFrame(frame)) {
                     socket.destroy();
                     return;
@@ -909,6 +1045,120 @@ function isNativeBrowserRequestResultFrame(value) {
     return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === ["kind", "requestId", "result", "version"].join("\0")
         && value.version === 1 && value.kind === "native-browser-request-result" && safeNativeMapRequestId(value.requestId)
         && (0, native_request_1.isBoundedNativeResultV1)(value.result, "plugins");
+}
+function isManagerExecutionRequestFrame(value) {
+    return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === "kind\0proof\0request\0version"
+        && value.version === 1 && value.kind === "manager-execution" && typeof value.proof === "string"
+        && /^hmac-sha256:[A-Za-z0-9_-]{43}$/.test(value.proof) && isDoctorExecutionLeaseRequest(value.request);
+}
+function isManagerExecutionResultFrame(value) {
+    return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === "kind\0requestId\0result\0version"
+        && value.version === 1 && value.kind === "manager-execution-result" && isDoctorExecutionRequestId(value.requestId)
+        && isDoctorExecutionLeaseResult(value.result);
+}
+function isDoctorExecutionLeaseRequest(value) {
+    if (!(0, types_1.isPlainRecord)(value) || value.version !== 1 || !isDoctorExecutionRequestId(value.requestId))
+        return false;
+    if (value.action === "prepare_auth_recovery")
+        return Object.keys(value).sort().join() === "action,requestId,version";
+    if (value.action === "acquire")
+        return Object.keys(value).sort().join("\0") === "action\0estimatedCost\0purpose\0requestId\0version"
+            && value.purpose === "doctor_review" && Number.isSafeInteger(value.estimatedCost) && Number(value.estimatedCost) >= 1 && Number(value.estimatedCost) <= 1_000_000;
+    if (value.action === "mark_dispatched")
+        return Object.keys(value).sort().join("\0") === "action\0leaseId\0requestId\0version"
+            && isDoctorExecutionLeaseId(value.leaseId);
+    if (value.action === "settle") {
+        const allowed = new Set(["action", "leaseId", "outcome", "requestId", "usage", "version"]);
+        if (Object.keys(value).some((key) => !allowed.has(key)) || !isDoctorExecutionLeaseId(value.leaseId)
+            || !["pre_dispatch", "completed", "ambiguous"].includes(String(value.outcome)))
+            return false;
+        if (value.outcome === "completed")
+            return isDoctorExecutionUsage(value.usage);
+        return value.usage === undefined;
+    }
+    return false;
+}
+function isDoctorExecutionLeaseResult(value) {
+    return ((0, types_1.isPlainRecord)(value) && value.status === "recovery_ready" && Object.keys(value).join() === "status") || isDoctorExecutionAcquireResult(value) || isDoctorExecutionMarkResult(value) || isDoctorExecutionSettleResult(value);
+}
+function isDoctorExecutionAcquireResult(value) {
+    if (!(0, types_1.isPlainRecord)(value))
+        return false;
+    if (value.status === "unavailable")
+        return isManagerUnavailable(value);
+    return value.status === "ready" && Object.keys(value).sort().join("\0") === "codexHome\0leaseId\0opaqueAccountId\0status"
+        && isDoctorExecutionLeaseId(value.leaseId) && typeof value.opaqueAccountId === "string" && /^ar_[A-Za-z0-9_-]{43}$/.test(value.opaqueAccountId)
+        && typeof value.codexHome === "string" && (0, node_path_1.isAbsolute)(value.codexHome) && (0, node_path_1.resolve)(value.codexHome) === value.codexHome;
+}
+function isDoctorExecutionMarkResult(value) {
+    return (0, types_1.isPlainRecord)(value) && (value.status === "unavailable" ? isManagerUnavailable(value)
+        : value.status === "dispatched" && Object.keys(value).sort().join("\0") === "leaseId\0status" && isDoctorExecutionLeaseId(value.leaseId));
+}
+function isDoctorExecutionSettleResult(value) {
+    return (0, types_1.isPlainRecord)(value) && (value.status === "unavailable" ? isManagerUnavailable(value)
+        : value.status === "settled" && Object.keys(value).sort().join("\0") === "leaseId\0outcome\0status"
+            && isDoctorExecutionLeaseId(value.leaseId) && ["pre_dispatch", "completed", "ambiguous"].includes(String(value.outcome)));
+}
+function isDoctorExecutionResultForRequest(request, result) {
+    if ((0, types_1.isPlainRecord)(result) && result.status === "unavailable")
+        return isManagerUnavailable(result);
+    if (request.action === "prepare_auth_recovery")
+        return (0, types_1.isPlainRecord)(result) && result.status === "recovery_ready" && Object.keys(result).join() === "status";
+    return request.action === "acquire" ? isDoctorExecutionAcquireResult(result)
+        : request.action === "mark_dispatched" ? isDoctorExecutionMarkResult(result)
+            : isDoctorExecutionSettleResult(result) && result.status === "settled" && result.outcome === request.outcome;
+}
+function isManagerUnavailable(value) {
+    return Object.keys(value).sort().join("\0") === "reason\0status" && value.status === "unavailable"
+        && ["broker_unavailable", "pool_depleted", "quota_unavailable", "binding_unavailable", "request_replayed", "invalid_request"].includes(String(value.reason));
+}
+function managerUnavailable(reason) {
+    return { status: "unavailable", reason };
+}
+function doctorExecutionProof(secret, request) {
+    const normalized = request.action === "prepare_auth_recovery" ? { version: 1, requestId: request.requestId, action: request.action } : request.action === "acquire"
+        ? { version: 1, requestId: request.requestId, action: request.action, purpose: request.purpose, estimatedCost: request.estimatedCost }
+        : request.action === "mark_dispatched"
+            ? { version: 1, requestId: request.requestId, action: request.action, leaseId: request.leaseId }
+            : { version: 1, requestId: request.requestId, action: request.action, leaseId: request.leaseId, outcome: request.outcome, ...(request.usage ? { usage: request.usage } : {}) };
+    return `hmac-sha256:${(0, node_crypto_1.createHmac)("sha256", secret).update(`manager-execution:v1:${JSON.stringify(normalized)}`, "utf8").digest("base64url")}`;
+}
+function verifyDoctorExecutionProof(secret, request, proof) {
+    try {
+        const expected = Buffer.from(doctorExecutionProof(secret, request));
+        const actual = Buffer.from(proof);
+        return expected.byteLength === actual.byteLength && (0, node_crypto_1.timingSafeEqual)(expected, actual);
+    }
+    catch {
+        return false;
+    }
+}
+function writeManagerExecutionFrame(socket, frame, maxFrameBytes) {
+    try {
+        if (frame.kind === "manager-execution") {
+            if (!isDoctorExecutionLeaseRequest(frame.request) || !/^hmac-sha256:[A-Za-z0-9_-]{43}$/.test(frame.proof))
+                return false;
+        }
+        else if (!isDoctorExecutionRequestId(frame.requestId) || !isDoctorExecutionLeaseResult(frame.result))
+            return false;
+        const encoded = Buffer.from(`${JSON.stringify(frame)}\n`, "utf8");
+        if (encoded.byteLength > maxFrameBytes || !socket.writable)
+            return false;
+        socket.write(encoded);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function isDoctorExecutionRequestId(value) {
+    return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+function isDoctorExecutionLeaseId(value) { return typeof value === "string" && /^rs_[A-Za-z0-9_-]{16,64}$/.test(value); }
+function isDoctorExecutionUsage(value) {
+    return (0, types_1.isPlainRecord)(value) && Object.keys(value).sort().join("\0") === "inputTokens\0outputTokens"
+        && Number.isSafeInteger(value.inputTokens) && Number(value.inputTokens) >= 0
+        && Number.isSafeInteger(value.outputTokens) && Number(value.outputTokens) >= 0;
 }
 function isNativeBrowserContext(value) {
     if (!(0, types_1.isPlainRecord)(value) || value.version !== 1)

@@ -1,3 +1,4 @@
+import { matchesPersistentDirectoryIdentity, readPersistentIdentityGeneration } from "./persistent-directory-identity";
 import { readNativeAuthBindingV1 } from "./native-auth-binding";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -101,6 +102,8 @@ export type NativeHistorySourceFailureV1 =
   | "unsafe_state_root"
   | "unsafe_source_file"
   | "invalid_source"
+  | "authentication_binding_invalid"
+  | "identity_repair_incomplete"
   | "invalid_extensions"
   | "source_drift"
   | "writer_census_failed"
@@ -125,7 +128,9 @@ export interface NativeHistoryAsyncWriterCensusDependenciesV1 {
 }
 
 /** Secrets stay in a module-private weak side table, never in the public binding shape. */
+const bindingConfigurations = new WeakMap<NativeHistorySourceBindingV1, RouterConfig>();
 const bindingSecrets = new WeakMap<NativeHistorySourceBindingV1, Buffer>();
+const bindingPersistentFingerprints = new WeakMap<NativeHistorySourceBindingV1, string | null>();
 const bindingAuthFingerprints = new WeakMap<NativeHistorySourceBindingV1, string | null>();
 
 /** Authentication-only override; history and settings keep their signed original paths. */
@@ -234,9 +239,11 @@ export function readAndPreflightNativeHistorySourceStaticV1(
       sourceDocumentFingerprint: base.sourceDocumentFingerprint,
       extensionsPreflight: extensions,
     });
+    bindingPersistentFingerprints.set(binding, readPersistentIdentityGeneration(binding.stateRoot, secret)?.fingerprint ?? null);
     bindingAuthFingerprints.set(binding, readNativeAuthBindingV1(binding.stateRoot, binding.source, secret)?.fingerprint ?? null);
     if (!bindingPathsAndIdentitiesMatchWithSecret(binding, secret)) return { state: "invalid", reason: "source_drift" };
     bindingSecrets.set(binding, Buffer.from(secret));
+    bindingConfigurations.set(binding, structuredClone(config));
     return { state: "ready", binding };
   } catch {
     return { state: "invalid", reason: "invalid_source" };
@@ -261,7 +268,9 @@ export function readAndPreflightNativeHistoryBaseSourceStaticV1(
   if (!bytes) return { state: "invalid", reason: "unsafe_source_file" };
   try {
     const source = parseNativeHistorySourceAgainstProtocolV1(JSON.parse(bytes.toString("utf8")) as unknown, protocolFingerprint, secret);
-    if (!source || !sourcePathsAndIdentitiesMatchWithSecret(root, source, secret)) return { state: "invalid", reason: "source_drift" };
+    if (!source) return { state: "invalid", reason: "invalid_source" };
+    const failure = sourcePathsAndIdentitiesFailure(root, source, secret);
+    if (failure) return { state: "invalid", reason: failure };
     return { state: "ready", stateRoot: root, source, sourceDocumentFingerprint: nativeHistoryDocumentFingerprintV1(bytes) };
   } catch {
     return { state: "invalid", reason: "invalid_source" };
@@ -525,36 +534,47 @@ function bindingPathsAndIdentitiesMatchWithSecret(binding: NativeHistorySourceBi
   } finally {
     sourceBytes.fill(0);
   }
+  try { if (bindingPersistentFingerprints.has(binding) && bindingPersistentFingerprints.get(binding) !== (readPersistentIdentityGeneration(root, secret)?.fingerprint ?? null)) return false; } catch { return false; }
   try { if (bindingAuthFingerprints.has(binding) && bindingAuthFingerprints.get(binding) !== (readNativeAuthBindingV1(root, binding.source, secret)?.fingerprint ?? null)) return false; } catch { return false; }
   return sourcePathsAndIdentitiesMatchWithSecret(root, binding.source, secret)
     && nativeHistoryExtensionsBindingSafeV1(binding, secret);
 }
 
 /** Revalidates immutable external homes before any extension state is considered. */
-function sourcePathsAndIdentitiesMatchWithSecret(
+function sourcePathsAndIdentitiesFailure(
   stateRoot: string,
   source: NativeHistorySourceV1,
   secret: Buffer,
-): boolean {
-  if (secret.byteLength !== 32 || !privateCanonicalDirectory(stateRoot)) return false;
-  let authBinding: ReturnType<typeof readNativeAuthBindingV1>;
-  try { authBinding = readNativeAuthBindingV1(stateRoot, source, secret); } catch { return false; }
+  authorityOnly = false,
+): "source_drift" | "authentication_binding_invalid" | null {
+  if (secret.byteLength !== 32 || !privateCanonicalDirectory(stateRoot)) return "source_drift";
   const roots: Array<{ path: string; account: OpaqueAccountId }> = [];
   for (const account of source.accounts) {
-    if (!pathMatchesIdentity(account.codexHome, account.codexHomeIdentity)
-      || !pathMatchesIdentity(account.sqliteHome, account.sqliteHomeIdentity)) return false;
-    const rawAccountId = readAuthAccountId(authBinding?.document.accounts.find((entry) => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
-    if (!rawAccountId || !sameSecretString(nativeHistoryAuthIdentityHmacV1(rawAccountId, secret), account.authIdentityHmac)
-      || !sameOpaqueAccountId(rawAccountId, secret, account.opaqueAccountId)) return false;
+    if (!matchesPersistentDirectoryIdentity({ stateRoot, secret, path: account.codexHome, expected: account.codexHomeIdentity, authorityFile: NATIVE_HISTORY_SOURCE_FILE_V1, accountId: account.opaqueAccountId })
+      || !matchesPersistentDirectoryIdentity({ stateRoot, secret, path: account.sqliteHome, expected: account.sqliteHomeIdentity, authorityFile: NATIVE_HISTORY_SOURCE_FILE_V1, accountId: account.opaqueAccountId })) return "source_drift";
     roots.push(
       { path: account.codexHome, account: account.opaqueAccountId },
       { path: account.sqliteHome, account: account.opaqueAccountId },
     );
   }
-  return roots.every((entry) => !pathsOverlap(entry.path, stateRoot))
+  const pathsSafe = roots.every((entry) => !pathsOverlap(entry.path, stateRoot))
     && roots.every((left, index) => roots.slice(index + 1).every((right) => left.account === right.account
       ? left.path === right.path || !pathsOverlap(left.path, right.path)
       : !pathsOverlap(left.path, right.path)));
+  if (!pathsSafe) return "source_drift";
+  if (authorityOnly) return null;
+  let authBinding: ReturnType<typeof readNativeAuthBindingV1>;
+  try { authBinding = readNativeAuthBindingV1(stateRoot, source, secret); } catch { return "authentication_binding_invalid"; }
+  for (const account of source.accounts) {
+    const rawAccountId = readAuthAccountId(authBinding?.document.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
+    if (!rawAccountId || !sameSecretString(nativeHistoryAuthIdentityHmacV1(rawAccountId, secret), account.authIdentityHmac)
+      || !sameOpaqueAccountId(rawAccountId, secret, account.opaqueAccountId)) return "authentication_binding_invalid";
+  }
+  return null;
+}
+
+function sourcePathsAndIdentitiesMatchWithSecret(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): boolean {
+  return sourcePathsAndIdentitiesFailure(stateRoot, source, secret) === null;
 }
 
 /** Source parsing without router-account equality: the extension proves the effective union. */
@@ -661,16 +681,6 @@ function privateCanonicalDirectory(path: string): string | null {
   }
 }
 
-function pathMatchesIdentity(path: string, expected: NativeHistoryDirectoryIdentityV1): boolean {
-  try {
-    if (!canonicalPath(path) || realpathSync(path) !== path) return false;
-    const stat = lstatSync(path);
-    return stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o022) === 0
-      && stat.dev === expected.device && stat.ino === expected.inode && stat.uid === expected.uid && (stat.mode & 0o7777) === expected.mode;
-  } catch {
-    return false;
-  }
-}
 
 function readAuthAccountId(codexHome: string): string | null {
   const bytes = readPrivateRegularFile(join(codexHome, "auth.json"), NATIVE_HISTORY_AUTH_MAX_BYTES_V1, false);
@@ -955,6 +965,19 @@ function canonicalJson(value: unknown): string {
 /* This must never run: it protects accidental use of secretless binding validation. */
 
 /** Static native identity remains valid while unrelated apps read or write other threads. */
+/** The publishing writer may acquire a new fully validated binding; the old one remains stale. */
+export function refreshNativeHistoryBindingAfterIdentityPublication(binding: NativeHistorySourceBindingV1, expectedGeneration: string): NativeHistorySourceBindingV1 {
+  const secret = bindingSecrets.get(binding), config = bindingConfigurations.get(binding);
+  if (!secret || !config || readPersistentIdentityGeneration(binding.stateRoot, secret)?.fingerprint !== expectedGeneration) throw new Error("Published identity generation changed");
+  const fresh = readAndPreflightNativeHistorySourceStaticV1(binding.stateRoot, config, secret);
+  if (fresh.state !== "ready" || fresh.binding.sourceDocumentFingerprint !== binding.sourceDocumentFingerprint
+    || fresh.binding.extensionDocumentFingerprint !== binding.extensionDocumentFingerprint
+    || JSON.stringify(fresh.binding.accounts) !== JSON.stringify(binding.accounts)
+    || bindingAuthFingerprints.get(fresh.binding) !== bindingAuthFingerprints.get(binding)
+    || bindingPersistentFingerprints.get(fresh.binding) !== expectedGeneration) throw new Error("Native source changed during identity publication");
+  return fresh.binding;
+}
+
 export function nativeHistoryBindingSafeV1(binding: NativeHistorySourceBindingV1): boolean {
   const secret = bindingSecrets.get(binding);
   return !!secret && bindingPathsAndIdentitiesMatchWithSecret(binding, secret);
@@ -1048,4 +1071,17 @@ function nativeThreadWriterObservations(
       : { state: foreign.size ? "conflict" : "clear", foreignPids: [...foreign].sort((a, b) => a - b) });
   }
   return results;
+}
+
+/** Recovery-only signed source validation. Does not produce a runnable history binding. */
+export function readNativeHistoryRecoveryAuthorityV1(stateRoot: string, config: RouterConfig, secret: Buffer): NativeHistorySourceV1 {
+  const root = privateCanonicalDirectory(stateRoot);
+  if (!root) throw new Error("Unsafe recovery root");
+  const bytes = readPrivateRegularFile(join(root, NATIVE_HISTORY_SOURCE_FILE_V1), NATIVE_HISTORY_SOURCE_MAX_BYTES_V1, false);
+  if (!bytes) throw new Error("Unsafe recovery source");
+  try {
+    const source = parseNativeHistorySourceV1(JSON.parse(bytes.toString("utf8")), config, secret);
+    if (!source || sourcePathsAndIdentitiesFailure(root, source, secret, true)) throw new Error("Recovery authority unavailable");
+    return source;
+  } finally { bytes.fill(0); }
 }

@@ -34,6 +34,7 @@ export interface AccountsNativeBridgeController {
   api: AccountsNativeApi;
   transport: AccountsNativeTransport;
   setCompatibility(status: { compatible: boolean; reason?: string; hookSetSha256?: string | null }): void;
+  waitForInitialization(timeoutMs: number): Promise<AccountsNativeStatus>;
   dispose(): void;
 }
 
@@ -118,7 +119,7 @@ export function createAccountsNativeBridge(): AccountsNativeBridgeController {
     enabled: compatible && initialized && !revoked && !disposed && adapter !== null,
     generation,
     ...(!compatible || !initialized || disposed ? {
-      reason: disposed ? "disposed" : revoked ? "native-wrapper-changed" : compatible && !initialized ? "native-wrapper-uninitialized" : reason,
+      reason: disposed ? "disposed" : revoked ? "native-wrapper-changed" : compatible && !initialized ? initializationAttempted ? "native-wrapper-initialization-rejected" : "native-wrapper-uninitialized" : reason,
     } : {}),
   });
 
@@ -241,6 +242,27 @@ export function createAccountsNativeBridge(): AccountsNativeBridgeController {
       if (!compatible) clearOauthBindings();
       if (nextHash) trustedHookSetSha256 = nextHash;
       advance(null);
+    },
+    waitForInitialization(timeoutMs) {
+      // DOMContentLoaded does not wait for the desktop's asynchronous module
+      // graph. Only its receipt-bound wrapper may complete this handshake.
+      const current = status();
+      if (current.reason !== "native-wrapper-uninitialized") return Promise.resolve(current);
+      return new Promise((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (next: AccountsNativeStatus) => {
+          subscribers.delete(onChange);
+          if (timer !== undefined) clearTimeout(timer);
+          resolve(next);
+        };
+        const onChange = () => {
+          const next = status();
+          if (next.reason !== "native-wrapper-uninitialized") finish(next);
+        };
+        subscribers.add(onChange);
+        timer = setTimeout(() => finish(status()), Math.max(0, Math.min(timeoutMs, 30_000)));
+        onChange();
+      });
     },
     dispose() {
       if (disposed) return;

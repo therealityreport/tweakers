@@ -5950,7 +5950,7 @@ function assertNativeContinuityIdentity(input) {
   if (!(0, import_node_path.isAbsolute)(input.account.codexHome) || (0, import_node_fs.realpathSync)(home) !== home) throw new Error("native account home is not canonical");
   assertSafeCapabilityDirectory(home);
   const stat = (0, import_node_fs.lstatSync)(home);
-  if (stat.dev !== input.nativeHomeIdentity.device || stat.ino !== input.nativeHomeIdentity.inode) throw new Error("native account home identity changed");
+  if (stat.ino !== input.nativeHomeIdentity.inode || stat.dev !== input.nativeHomeIdentity.device && !input.nativeBindingPreflight()) throw new Error("native account home identity changed");
   for (const root of privateRoots) {
     assertSafeCapabilityDirectory(root);
     if ((0, import_node_fs.realpathSync)(root) !== root || ((0, import_node_fs.lstatSync)(root).mode & 63) !== 0 || root === home || safeResolvedChild(home, (0, import_node_path.relative)(home, root)) || safeResolvedChild(root, (0, import_node_path.relative)(root, home))) {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import {
   computeRuntimeFingerprint,
   readRuntimeFingerprint,
 } from "../src/runtime-fingerprint";
-import { assertAccountsTransferRuntimeCompatible, prepareAccountsTransferRecovery, readAccountsSourceRetirementReaderVersion, readAccountsTransferReaderVersion } from "../src/accounts-transfer-compatibility";
+import { assertAccountsTransferRuntimeCompatible, prepareAccountsTransferRecovery, prepareProbedAccountsTransferRecovery, readAccountsSourceRetirementReaderVersion, readAccountsTransferReaderVersion } from "../src/accounts-transfer-compatibility";
 import { verifyAccountsTransferRecovery } from "../../runtime/src/account-router/transfer-recovery";
 import { installManagedRuntime, managedSourceRoot } from "../src/managed-runtime";
 
@@ -45,9 +45,10 @@ test("Accounts recovery binds the verified reader and validation receipt to a se
     writeFileSync(join(runtime, "account-router", "native-source-retirement.js"), retirementReaderSource());
     writeFileSync(join(runtime, "unrelated-reader-helper.js"), "original\n");
     writeFileSync(join(runtime, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(runtime) }));
+    chmodSync(join(runtime, "runtime-fingerprint.json"), 0o444);
     assert.equal(readAccountsTransferReaderVersion(runtime), 2);
     assert.equal(readAccountsSourceRetirementReaderVersion(runtime), 2);
-    prepareAccountsTransferRecovery({ runtimeRoot: runtime, recoveryRoot: recovery, validation: { version: 1, checks: [{ command: "native transfer compatibility checks", exitCode: 0, outputSha256: "a".repeat(64) }] } });
+    prepareProbedAccountsTransferRecovery(runtime, recovery);
     const receipt = JSON.parse(readFileSync(join(runtime, "accounts-transfer-recovery.v1.json"), "utf8"));
     const validation = JSON.parse(readFileSync(join(recovery, "accounts-transfer-validation.v1.json"), "utf8"));
     assert.equal(receipt.sourceRuntimeFingerprint, validation.sourceRuntimeFingerprint);

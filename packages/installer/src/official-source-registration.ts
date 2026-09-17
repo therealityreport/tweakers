@@ -195,6 +195,8 @@ export interface RegisterStableOfficialSourceInput {
   root: string;
   operationId: string;
   expectedSourceDigest: string;
+  /** Internal Doctor preparation path; never accepted by the public registration action. */
+  preparedSourcePath?: string;
   managerExecutable: ManagerResolvedExecutableIdentityV1;
 }
 
@@ -370,8 +372,8 @@ export function readRegisteredOfficialSource(root: string): RegisteredOfficialSo
     // Revalidate the immutable artifact independently.  It was copied from
     // the fixed source but must still carry the original OpenAI trust chain.
     assertCloneMatchesOfficialReceipt(receipt.artifact.appPath, receipt.source, receipt.artifact.treeSeal);
-    if (candidate === null) throw new Error(candidateProblem ?? "The fixed official source cannot be revalidated");
-    if (digestObservation(candidate) !== pointer.sourceDigest) {
+    if (receipt.source.appPath === STABLE_DESKTOP_PATH && candidate === null) throw new Error(candidateProblem ?? "The fixed official source cannot be revalidated");
+    if (receipt.source.appPath === STABLE_DESKTOP_PATH && candidate && digestObservation(candidate) !== pointer.sourceDigest) {
       throw new Error("The fixed official ChatGPT source changed after registration");
     }
     return {
@@ -382,6 +384,32 @@ export function readRegisteredOfficialSource(root: string): RegisteredOfficialSo
   } catch (error) {
     return statusFailure("stale", pointer.generationId, pointer.receiptDigest, pointer.appPath, pointer.version, pointer.build, candidateDigest, pointer.sourceDigest, revision, errorMessage(error));
   }
+}
+
+/** Read a retained baseline without requiring the live desktop to remain on it. */
+export function findRetainedOfficialSourceForDoctor(root: string, expected: {
+  version: string; build: string; originalAsarHash: string;
+}): { receipt: RegisteredOfficialSourceReceipt; receiptDigest: string } {
+  const paths = officialSourcePaths(root);
+  assertPrivateDirectory(paths.generationsRoot, "Official-source generations root");
+  const matches: Array<{ receipt: RegisteredOfficialSourceReceipt; receiptDigest: string }> = [];
+  for (const id of readdirSync(paths.generationsRoot).sort()) {
+    if (!UUID.test(id)) continue;
+    const bytes = readOptionalPrivateBytes(join(paths.generationsRoot, id, "receipt.json"), "Retained source receipt");
+    if (!bytes) continue;
+    const receipt = parseReceipt(bytes, paths, id);
+    if (receipt.source.version !== expected.version || receipt.source.build !== expected.build
+      || receipt.source.appAsarHeaderHash !== expected.originalAsarHash) continue;
+    if (realpathSync(receipt.artifact.appPath) !== receipt.artifact.physicalPath
+      || !sameSeal(sealOfficialSourceTree(receipt.artifact.appPath), receipt.artifact.treeSeal)) throw new Error("Doctor retained baseline changed");
+    assertCloneMatchesOfficialReceipt(receipt.artifact.appPath, receipt.source, receipt.artifact.treeSeal);
+    matches.push({ receipt, receiptDigest: sha256(bytes) });
+  }
+  if (!matches.length) throw new Error("Doctor cannot prove the source used by installed Tweakers");
+  // Duplicate sealed copies of identical source bytes are equivalent; differing
+  // sources with the same version/header are not silently substituted.
+  if (matches.some(item => item.receipt.source.treeSeal.sha256 !== matches[0].receipt.source.treeSeal.sha256)) throw new Error("Doctor baseline source is ambiguous");
+  return matches[0];
 }
 
 /**
@@ -454,8 +482,8 @@ export function readRegisteredOfficialSourceStatusProjection(
       || !sameProjectedMetadata(artifact, receipt.source)) {
       throw new Error("Registered official-source artifact metadata changed");
     }
-    const live = observeMetadata(STABLE_DESKTOP_PATH, "Fixed official ChatGPT source");
-    if (!sameProjectedMetadata(live, receipt.source)) {
+    const live = receipt.source.appPath === STABLE_DESKTOP_PATH ? observeMetadata(STABLE_DESKTOP_PATH, "Fixed official ChatGPT source") : null;
+    if (live && !sameProjectedMetadata(live, receipt.source)) {
       throw new Error("The fixed official ChatGPT source changed after registration");
     }
     return {
@@ -553,10 +581,12 @@ export function registerStableOfficialSource(
   try {
     assertRegistrationEnvironment(paths);
     ensurePrivateDirectory(paths.sourceRoot);
-    const observe = deps.observe ?? observeStableOfficialSource;
+    const sourcePath = input.preparedSourcePath ?? STABLE_DESKTOP_PATH;
+    if (input.preparedSourcePath) assertDoctorPreparedSourcePath(input.root, sourcePath);
+    const observe: (path: string) => OfficialSourceObservation = deps.observe ?? (input.preparedSourcePath ? observeClone : ((path: string) => { if (path !== STABLE_DESKTOP_PATH) throw new Error("Invalid fixed source"); return observeStableOfficialSource(); }));
     const observeArtifact = deps.observeClone ?? observeClone;
     const readRegistered = deps.readRegistered ?? readRegisteredOfficialSource;
-    const before = observe(STABLE_DESKTOP_PATH);
+    const before = observe(sourcePath);
     const sourceDigest = digestObservation(before);
     observedSourceDigest = sourceDigest;
     if (sourceDigest !== input.expectedSourceDigest) {
@@ -582,10 +612,10 @@ export function registerStableOfficialSource(
       throw new Error("Official-source generation collision");
     }
     ensurePrivateDirectory(stagingGeneration);
-    (deps.cloneApp ?? cloneAppTree)(STABLE_DESKTOP_PATH, stagedApp);
+    (deps.cloneApp ?? cloneAppTree)(sourcePath, stagedApp);
     const clone = observeArtifact(stagedApp);
     assertObservationContentMatches(before, clone, "The registered clone does not match the sealed official source");
-    const after = observe(STABLE_DESKTOP_PATH);
+    const after = observe(sourcePath);
     assertObservationContentMatches(before, after, "The fixed official ChatGPT source changed while it was being cloned");
     deps.fault?.("official-source:clone-verified");
 
@@ -647,15 +677,29 @@ export function registerStableOfficialSource(
     const registryBefore = readFileSync(paths.environmentRegistryFile);
     const selectionBefore = readFileSync(paths.environmentSelectionFile);
     const pointerBefore = readOptionalPrivateBytes(paths.currentFile, "Official-source current pointer");
-    const { registry, selection } = refreshedCanonicalEnvironment(paths, before, now);
-    (deps.publishEnvironment ?? publishEnvironmentSnapshot)(
-      paths.environmentRegistryFile,
-      paths.environmentSelectionFile,
-      registry,
-      selection,
-    );
-    const registryPublished = readFileSync(paths.environmentRegistryFile);
-    const selectionPublished = readFileSync(paths.environmentSelectionFile);
+    let registryPublished: Buffer;
+    let selectionPublished: Buffer;
+    if (input.preparedSourcePath) {
+      // A prepared download is source-store evidence for a possible update. It
+      // is not the installed canonical desktop environment. Preserve that
+      // independently verified environment until promotion changes the app.
+      assertRegistrationEnvironment(paths);
+      registryPublished = readFileSync(paths.environmentRegistryFile);
+      selectionPublished = readFileSync(paths.environmentSelectionFile);
+      if (!registryPublished.equals(registryBefore) || !selectionPublished.equals(selectionBefore)) {
+        throw new Error("Canonical manager environment changed during prepared-source registration");
+      }
+    } else {
+      const { registry, selection } = refreshedCanonicalEnvironment(paths, before, now);
+      (deps.publishEnvironment ?? publishEnvironmentSnapshot)(
+        paths.environmentRegistryFile,
+        paths.environmentSelectionFile,
+        registry,
+        selection,
+      );
+      registryPublished = readFileSync(paths.environmentRegistryFile);
+      selectionPublished = readFileSync(paths.environmentSelectionFile);
+    }
 
     const pointer: OfficialSourceCurrentPointer = {
       schemaVersion: OFFICIAL_SOURCE_SCHEMA_VERSION,
@@ -960,7 +1004,10 @@ function parseReceipt(bytes: Buffer, paths: OfficialSourcePaths, expectedGenerat
   }
   const generationId = requiredUuid(value.generationId, "Official-source receipt generation ID");
   if (expectedGenerationId !== undefined && generationId !== expectedGenerationId) throw new Error("Official-source receipt generation ID does not match its path");
-  const source = parseObservation(record(value.source, "Official-source receipt source"), "source", STABLE_DESKTOP_PATH);
+  const rawSource = record(value.source, "Official-source receipt source");
+  const sourcePath = exactAbsoluteString(rawSource.appPath, "Official-source source path");
+  if (sourcePath !== STABLE_DESKTOP_PATH) assertDoctorPreparedSourcePath(paths.root, sourcePath);
+  const source = parseObservation(rawSource, "source", sourcePath);
   const artifact = record(value.artifact, "Official-source receipt artifact");
   assertKeys(artifact, ["appPath", "physicalPath", "rootIdentity", "treeSeal"], "Official-source receipt artifact");
   const appPath = exactAbsoluteString(artifact.appPath, "Official-source receipt artifact path");
@@ -1428,4 +1475,16 @@ function canonicalJson(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Only manager-owned Doctor job staging can register downloaded sources. */
+function assertDoctorPreparedSourcePath(root: string, path: string): void {
+  const prefix = join(root, "doctor", "jobs") + "/";
+  if (!path.startsWith(prefix) || !/^[a-f0-9-]{36}\/upstream\/extracted\/[^/]+\.app$/.test(path.slice(prefix.length))) {
+    throw new Error("Prepared official source is outside Doctor job staging");
+  }
+}
+export function preparedOfficialSourceDigest(root: string, path: string): string {
+  assertDoctorPreparedSourcePath(root, path);
+  return digestObservation(observeClone(path));
 }

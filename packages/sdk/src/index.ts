@@ -921,6 +921,8 @@ export interface CodexWindowRef {
 }
 
 /** Helper to give authors type inference without `satisfies`. */
+export * from "./doctor.js";
+
 export function defineTweak(tweak: Tweak): Tweak {
   return tweak;
 }

@@ -51,3 +51,43 @@ test("epoch reset refuses active durable work and keeps sticky ownership local",
   ledger.resetEpoch();
   assert.equal(store.snapshot().epoch, 2);
 });
+
+test("Doctor review leases are correlation-idempotent and reconcile ambiguous usage exactly once", () => {
+  const store = fakeStore(createInitialRouterState(config));
+  const ledger = new AccountLedger(store as never, config, () => 1, () => Buffer.alloc(16, 7));
+  const digest = `hmac-sha256:${"d".repeat(43)}` as const;
+  const lease = ledger.reserveDoctorReview(accountA, 90_000, digest);
+  assert.deepEqual(ledger.reserveDoctorReview(accountA, 90_000, digest), lease);
+  assert.equal(store.snapshot().reservations.length, 1);
+  assert.equal(store.snapshot().ledger[accountA].reservedRequestCost, 90_000);
+  ledger.markDoctorReviewDispatched(lease.reservationId);
+  ledger.settleDoctorReview(lease.reservationId, "ambiguous");
+  assert.equal(store.snapshot().reservations[0]?.state, "stranded_ambiguous");
+  assert.equal(store.snapshot().ledger[accountA].reservedRequestCost, 90_000);
+
+  ledger.settleDoctorReview(lease.reservationId, "completed", { inputTokens: 123, outputTokens: 456 });
+  ledger.settleDoctorReview(lease.reservationId, "completed", { inputTokens: 123, outputTokens: 456 });
+  assert.deepEqual(store.snapshot().ledger[accountA], {
+    completedInputTokens: 123, completedOutputTokens: 456, reservedRequestCost: 0, weight: 1, assignedThreadCount: 0,
+  });
+  assert.throws(() => ledger.settleDoctorReview(lease.reservationId, "completed", { inputTokens: 123, outputTokens: 457 }), /different outcome/);
+  assert.throws(() => ledger.settleDoctorReview(lease.reservationId, "ambiguous"), /different outcome/);
+});
+
+test("Doctor review recovery releases unmarked work and strands marked work", () => {
+  const store = fakeStore(createInitialRouterState(config));
+  let nonce = 0;
+  const ledger = new AccountLedger(store as never, config, () => 1, () => Buffer.alloc(16, ++nonce));
+  const unmarked = ledger.reserveDoctorReview(accountA, 10, `hmac-sha256:${"a".repeat(43)}`);
+  const marked = ledger.reserveDoctorReview(accountB, 20, `hmac-sha256:${"b".repeat(43)}`);
+  ledger.markDoctorReviewDispatched(marked.reservationId);
+  ledger.recoverDoctorReviewReservations();
+  const state = store.snapshot();
+  assert.equal(state.reservations.find((entry) => entry.reservationId === unmarked.reservationId)?.state, "released_pre_dispatch");
+  assert.equal(state.reservations.find((entry) => entry.reservationId === marked.reservationId)?.state, "stranded_ambiguous");
+  assert.equal(state.ledger[accountA].reservedRequestCost, 0);
+  assert.equal(state.ledger[accountB].reservedRequestCost, 20);
+  ledger.settleDoctorReview(marked.reservationId, "pre_dispatch");
+  assert.equal(store.snapshot().ledger[accountB].reservedRequestCost, 0, "durable no-CLI proof resolves a lost mark acknowledgement");
+  assert.equal(store.snapshot().reservations.find((entry) => entry.reservationId === marked.reservationId)?.state, "released_pre_dispatch");
+});

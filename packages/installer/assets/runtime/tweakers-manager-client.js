@@ -1,6 +1,10 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createTweakersManagerClient = createTweakersManagerClient;
+exports.readTweakersDoctor = readTweakersDoctor;
+exports.runTweakersDoctorAction = runTweakersDoctorAction;
+exports.openTweakersManager = openTweakersManager;
+exports.openTweakersDoctor = openTweakersDoctor;
 exports.readTweakersManagerStatus = readTweakersManagerStatus;
 exports.startTweakersManagerAction = startTweakersManagerAction;
 exports.readTweakersManagerOfficialSourceRegistration = readTweakersManagerOfficialSourceRegistration;
@@ -10,6 +14,7 @@ const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
+const tweakers_sdk_1 = require("@therealityreport/tweakers-sdk");
 const MANAGER_ID = "com.thomashulihan.tweakers";
 const MANAGER_REQUIREMENT = 'identifier "com.therealityreport.tweakers.manager-launcher" and certificate leaf = H"631275551276127985a524acf1f469bf5164d50d"';
 const STATUS_TIMEOUT_MS = 10_000;
@@ -24,8 +29,8 @@ function createTweakersManagerClient(overrides = {}) {
         execute: overrides.execute ?? ((executable, args, input) => (0, node_child_process_1.execFileSync)(executable, [...args], {
             encoding: "utf8",
             ...(input === undefined ? {} : { input }),
-            timeout: STATUS_TIMEOUT_MS,
-            maxBuffer: 1024 * 1024,
+            timeout: args[0] === "doctor-action" ? 120_000 : STATUS_TIMEOUT_MS,
+            maxBuffer: args[0]?.startsWith("doctor-") ? 32 * 1024 * 1024 : 1024 * 1024,
         })),
         spawnDetached: overrides.spawnDetached ?? ((executable, args) => {
             const child = (0, node_child_process_1.spawn)(executable, [...args], { detached: true, stdio: "ignore" });
@@ -113,13 +118,40 @@ function createTweakersManagerClient(overrides = {}) {
         // captured by the sealed manager from this capability's state token.
         return startPreparedAction(executable, "official-source.register", registration.stateToken);
     };
+    const doctorRequest = (command, input) => {
+        const requestId = deps.createId();
+        const response = JSON.parse(deps.execute(verifiedManagerExecutable(deps), [command, "--request-id", requestId, "--json"], input ? JSON.stringify(input) : undefined));
+        if (response.requestId !== requestId || !(0, tweakers_sdk_1.isDoctorReportV1)(response))
+            throw new Error("Tweakers Doctor returned an invalid report");
+        return response;
+    };
+    const openManager = (section = "overview") => {
+        // Keep this runtime boundary strict even though callers are typed: the
+        // detached process is a fixed protocol and must never receive arbitrary UI text.
+        if (!(0, tweakers_sdk_1.isTweakersManagerSection)(section))
+            throw new Error("Invalid Tweakers Manager section");
+        deps.spawnDetached(verifiedManagerExecutable(deps), [
+            "manager-open", "--request-id", deps.createId(), "--section", section, "--json",
+        ]);
+    };
+    // Existing callers that specifically need the legacy Doctor launch remain
+    // supported while new UI entry points use the unified Manager protocol.
+    const openDoctor = () => deps.spawnDetached(verifiedManagerExecutable(deps), ["doctor-open", "--request-id", deps.createId(), "--json"]);
     return {
         readStatus,
         startAction,
         readOfficialSourceRegistration,
         startOfficialSourceRegistration,
+        readDoctor: () => doctorRequest("doctor-status"),
+        doctorAction: (input) => doctorRequest("doctor-action", input),
+        openManager,
+        openDoctor,
     };
 }
+function readTweakersDoctor() { return createTweakersManagerClient().readDoctor(); }
+function runTweakersDoctorAction(input) { return createTweakersManagerClient().doctorAction(input); }
+function openTweakersManager(section = "overview") { createTweakersManagerClient().openManager(section); }
+function openTweakersDoctor() { createTweakersManagerClient().openDoctor(); }
 function readTweakersManagerStatus() {
     return createTweakersManagerClient().readStatus();
 }

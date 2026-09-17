@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { cloneOrCopyDirectoryPreservingModes } from "./fs-copy.js";
 import { computeRuntimeFingerprint, readRuntimeFingerprintEvidence } from "./runtime-fingerprint.js";
@@ -11,6 +11,17 @@ const MARKER = "native-transfer.minimum-runtime.json";
 const RECOVERY_FILE = "accounts-transfer-recovery.v1.json";
 const VALIDATION_FILE = "accounts-transfer-validation.v1.json";
 const sha = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
+
+function publishPreparedRuntimeFingerprint(root: string): void {
+  const contents = JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(root) }) + "\n";
+  const temporary = join(root, `.runtime-fingerprint-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, contents, { flag: "wx", mode: 0o600 });
+    // Sealed sources have read-only files. Replace this candidate-owned metadata
+    // atomically instead of mutating permissions or overwriting the source inode.
+    renameSync(temporary, join(root, "runtime-fingerprint.json"));
+  } finally { rmSync(temporary, { force: true }); }
+}
 
 function regularFile(path: string, limit: number): Buffer | null {
   try {
@@ -153,7 +164,7 @@ export function prepareAccountsTransferRecovery(input: {
   }, null, 2) + "\n";
   writeFileSync(join(recovery, VALIDATION_FILE), validation, { flag: "wx", mode: 0o600 });
   const fingerprint = computeRuntimeFingerprint(recovery);
-  writeFileSync(join(recovery, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...fingerprint }) + "\n", { mode: 0o600 });
+  publishPreparedRuntimeFingerprint(recovery);
   if (readAccountsTransferReaderVersion(recovery) !== 2
     || readAccountsSourceRetirementReaderVersion(recovery) !== 2) {
     throw new Error("Prepared recovery runtime failed its current reader verification");
@@ -169,5 +180,30 @@ export function prepareAccountsTransferRecovery(input: {
     recoveryRuntimeRoot: realpathSync(recovery), recoveryFingerprint: fingerprint.fingerprint,
     validationSha256: sha(validation), verifiedAt: new Date().toISOString(),
   }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-  writeFileSync(join(root, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(root) }) + "\n", { mode: 0o600 });
+  publishPreparedRuntimeFingerprint(root);
+}
+
+/** Derive recovery evidence from fresh-process probes of this exact runtime. */
+export function prepareProbedAccountsTransferRecovery(runtimeRoot: string, recoveryRoot: string): void {
+  const before = readRuntimeFingerprintEvidence(runtimeRoot);
+  if (!before) throw new Error("Accounts recovery source fingerprint is unavailable");
+  const observed = { transferReader: readAccountsTransferReaderVersion(runtimeRoot), sourceRetirementReader: readAccountsSourceRetirementReaderVersion(runtimeRoot) };
+  const after = readRuntimeFingerprintEvidence(runtimeRoot);
+  if (observed.transferReader !== 2 || observed.sourceRetirementReader !== 2 || after?.fingerprint !== before.fingerprint) throw new Error("Accounts recovery reader probes failed or source changed");
+  prepareAccountsTransferRecovery({ runtimeRoot, recoveryRoot, validation: { version: 1, checks: [{
+    command: "Fresh-process transfer v1/v2 and source-retirement v2 reader compatibility probes",
+    exitCode: 0, outputSha256: sha(JSON.stringify({ source: before, observed })),
+  }] } });
+}
+
+/** Verify the retained recovery binding using the exact fingerprinted candidate runtime. */
+export function verifyProbedAccountsTransferRecovery(runtimeRoot: string): boolean {
+  const before = readRuntimeFingerprintEvidence(runtimeRoot);
+  if (!before) return false;
+  const helper = join(runtimeRoot, "account-router", "transfer-recovery.js");
+  if (!regularFile(helper, 8 * 1024 * 1024)) return false;
+  const result = spawnSync(process.execPath, ["-e", "const m=require(process.argv[1]);if(m.verifyAccountsTransferRecovery(process.argv[2]))process.stdout.write('verified');", helper, runtimeRoot], {
+    encoding: "utf8", timeout: 10000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0 && result.stdout === "verified" && readRuntimeFingerprintEvidence(runtimeRoot)?.fingerprint === before.fingerprint;
 }

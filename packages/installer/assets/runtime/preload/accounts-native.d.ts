@@ -21,6 +21,7 @@ export interface AccountsNativeBridgeController {
         reason?: string;
         hookSetSha256?: string | null;
     }): void;
+    waitForInitialization(timeoutMs: number): Promise<AccountsNativeStatus>;
     dispose(): void;
 }
 /**

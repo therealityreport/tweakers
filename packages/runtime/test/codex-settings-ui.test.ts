@@ -17,6 +17,10 @@ const source = readFileSync(
   resolve(process.cwd(), "packages/runtime/src/preload/settings-injector.ts"),
   "utf8",
 );
+const doctorSource = readFileSync(
+  resolve(process.cwd(), "packages/runtime/src/preload/doctor-view.ts"),
+  "utf8",
+);
 
 function functionBody(name: string, nextName: string): string {
   const start = source.indexOf(`function ${name}`);
@@ -237,30 +241,42 @@ test("Config card updates remain independent and reject stale completion", () =>
   });
 });
 
-test("Config selects manager-backed independent Settings before exposing legacy operational controls", () => {
+test("Config keeps independent Settings compact and opens Manager for full diagnostics", () => {
   const config = functionBody("renderConfigPage", "renderIndependentSettingsSurface");
   const independent = functionBody("renderIndependentSettingsSurface", "renderInjectedSettingsSurface");
   const appearance = functionBody("renderIndependentAppearanceHealthSection", "renderInjectedSettingsSurface");
   const injected = functionBody("renderInjectedSettingsSurface", "renderIndependentManagerStatusSection");
-  const unavailable = functionBody("renderIndependentRefreshUnavailableSection", "renderEnvironmentSection");
   assert.match(config, /tweaker:get-independent-manager-status/);
   assert.match(config, /projection\?\.deploymentKind === "independent"/);
   assert.match(config, /Failure to establish the deployment authority/);
-  assert.match(independent, /renderIndependentManagerStatusSection/);
   assert.match(independent, /renderIndependentAppearanceHealthSection/);
-  assert.match(independent, /renderTweakersRuntimeRefreshSection\(sectionsWrap, cardUpdates, "independent", projection\)/);
-  assert.match(independent, /renderIndependentRefreshUnavailableSection/);
+  assert.match(independent, /renderIndependentDoctorSummary/);
+  assert.doesNotMatch(independent, /mountDoctorView\(sectionsWrap/);
+  assert.match(doctorSource, /tweaker:doctor-status/);
+  assert.match(doctorSource, /tweaker:doctor-action/);
+  assert.match(doctorSource, /fingerprint: report\.fingerprint/);
+  assert.match(doctorSource, /void controller\.refresh\(\)/);
+  assert.doesNotMatch(doctorSource, /setTimeout|schedulePoll|pollInterval|cancelSchedule/);
+  assert.match(doctorSource, /controller\.dispose\(\)/);
+  assert.match(independent, /tweaker:manager-open/);
+  assert.match(independent, /Open Manager/);
+  assert.doesNotMatch(independent, /Check for updates/);
+  assert.doesNotMatch(independent, /tweaker:doctor-action/);
+  assert.match(independent, /Could not open Manager/);
+  assert.match(independent, /window\.addEventListener\("focus", refresh\)/);
+  assert.match(independent, /window\.removeEventListener\("focus", refresh\)/);
+  assert.match(independent, /refreshInFlight/);
+  assert.match(independent, /\$\{status\} \(stale\)/);
   assert.doesNotMatch(independent, /renderEnvironmentSection|renderMcpIntegrationSection|renderAutomaticMaintenanceSection|renderTweakerConfig|renderAdvancedRuntimeSection|uninstallRow/);
   assert.match(appearance, /tweaker:get-independent-live-health/);
   assert.match(appearance, /tweaker:independent-live-health-changed/);
-  assert.match(appearance, /Normal/);
   assert.match(appearance, /Needs attention/);
-  assert.match(appearance, /Not observed/);
   assert.match(appearance, /Native or CSS scaling still needs a later Actual Size validation/);
+  assert.match(appearance, /section\.hidden = presentation === null/);
   assert.match(appearance, /ipcRenderer\.removeListener/);
   for (const control of [
     "renderEnvironmentSection(sectionsWrap, cardUpdates)",
-    'renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates, "injected")',
+    "renderTweakersRuntimeRefreshSection(sectionsWrap, cardUpdates)",
     "renderTweaksHealthSection(sectionsWrap, cardUpdates)",
     "renderMcpIntegrationSection(sectionsWrap, cardUpdates)",
     "renderAutomaticMaintenanceSection(sectionsWrap, cardUpdates)",
@@ -268,8 +284,6 @@ test("Config selects manager-backed independent Settings before exposing legacy 
     "renderAdvancedRuntimeSection(sectionsWrap)",
     'sectionTitle("Maintenance")',
   ]) assert.match(injected, new RegExp(control.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(unavailable, /read-only/);
-  assert.doesNotMatch(unavailable, /GitHub|watcher|repair|refresh-variant/i);
   assert.doesNotMatch(source, /function renderModeSection/);
   assert.doesNotMatch(source, /sectionTitle\("App Mode"\)/);
   assert.doesNotMatch(source, /tweaker:switch-app-mode/);
@@ -380,14 +394,15 @@ test("Environment transaction status surfaces durable helper failure and log det
   assert.doesNotMatch(inFlight, /outcomePhase !== "failed"/);
 });
 
-test("Tweakers refresh is manager-owned and never invokes ChatGPT update IPC", () => {
+test("injected Tweaker mode refresh stays manager-owned while independent updates use Doctor", () => {
   const body = functionBody("renderTweakersRuntimeRefreshSection", "renderMcpIntegrationSection");
-  assert.match(body, /Tweakers App Update/);
   assert.match(body, /Tweaker Mode Runtime/);
-  assert.match(body, /Rebuild Tweakers App/);
   assert.match(body, /Refresh Tweaker Mode/);
   assert.match(body, /ChatGPT remains on its own native updater/);
   assert.match(body, /tweaker:reapply-tweakers/);
+  assert.doesNotMatch(body, /Tweakers App Update|Rebuild Tweakers App|refresh\.independent/);
+  assert.match(doctorSource, /updateStateLabel/);
+  assert.match(doctorSource, /action\.enabled/);
   assert.doesNotMatch(body, /codex-desktop-update|Update ChatGPT|desktop-update/);
   assert.doesNotMatch(source, /tweaker:(?:check|get|start|resume|cancel)-codex-desktop-update/);
 });
@@ -439,8 +454,7 @@ test("Runtime Versions keeps active, stable, and alpha backend truth visible", (
   const body = functionBody("renderCodexVersionsSection", "renderCodexVersionsCard");
   const caller = functionBody("renderAdvancedRuntimeSection", "renderCodexVersionsSection");
   assert.match(body, /Runtime Versions/);
-  assert.match(caller, /renderCodexVersionsSection\(sectionsWrap\)/);
-  assert.doesNotMatch(caller, /collapsed:\s*true/);
+  assert.match(caller, /renderCodexVersionsSection\(sectionsWrap, \{ collapsed: true \}\)/);
   assert.match(source, /Active Codex backend/);
   assert.match(source, /Desktop-Embedded Codex CLI/);
   assert.match(source, /Latest Stable CLI Release/);

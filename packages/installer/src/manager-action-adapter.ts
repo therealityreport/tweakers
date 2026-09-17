@@ -141,7 +141,7 @@ export interface SealedIndependentRefreshLifecycleForTest {
   readRuntimeReady(userRoot: string): unknown | null;
   now(): number;
   sleep(milliseconds: number): Promise<void>;
-  sealedAccountsRuntimeRoot(): string;
+  sealedAccountsRuntimeRoot(managerRoot: string): string | Promise<string>;
   verifyAccountsTransferRecovery(runtimeRoot: string): boolean;
   prepareAccountContinuity(stateRoot: string): AccountContinuityPrelaunchResultV1;
 }
@@ -1023,11 +1023,10 @@ function createSealedIndependentRefreshLifecycle(): SealedIndependentRefreshLife
     },
     now: () => Date.now(),
     sleep: (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-    sealedAccountsRuntimeRoot(): string {
-      const assets = resolveSealedManagerRuntimeAssets();
-      if (assets === null) throw new Error("Independent Tweakers refresh requires sealed runtime assets.");
-      verifySealedManagerRuntimeAssets(assets);
-      return assets.root;
+    async sealedAccountsRuntimeRoot(managerRoot: string): Promise<string> {
+      const { verifyDoctorCandidate } = await import("./doctor-approval.js");
+      const { job } = verifyDoctorCandidate(managerRoot);
+      return join(job.candidatePackage!, "runtime");
     },
     verifyAccountsTransferRecovery(runtimeRoot: string): boolean {
       const assets = resolveSealedManagerManagedRuntimeAssets();
@@ -1063,11 +1062,11 @@ function createSealedIndependentRefreshExecutor(
       quiescenceProven: false,
       continuityAttemptFailed: false,
     };
-    const sealedAccountsRuntimeRoot = lifecycle.sealedAccountsRuntimeRoot();
+    const sealedAccountsRuntimeRoot = await lifecycle.sealedAccountsRuntimeRoot(managerUserRoot);
     if (!lifecycle.verifyAccountsTransferRecovery(sealedAccountsRuntimeRoot)) {
       throw new ManagerActionAdapterError(
         "stale_state",
-        "Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime.",
+        "Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime. Rebuild candidate compatibility evidence.",
       );
     }
     const beforePromotion = async (): Promise<void> => {

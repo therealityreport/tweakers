@@ -38,11 +38,22 @@ interface Check {
 }
 
 export interface DoctorOptions {
+  target?: string;
+  ui?: boolean;
+  "scan-updates"?: boolean;
   deep?: boolean;
   json?: boolean;
 }
 
 export async function doctor(options: DoctorOptions = {}): Promise<void> {
+  if (options.target && !["legacy", "independent"].includes(options.target)) throw new Error("Doctor target must be legacy or independent");
+  if (options.target === "independent") {
+    const { runIndependentDoctorCli } = await import("../doctor-actions.js");
+    await runIndependentDoctorCli(options);
+    return;
+  }
+  if (options.ui || options["scan-updates"]) throw new Error("Doctor UI and update scan require --target independent");
+  if (!options.json) console.log("Doctor target: legacy injected installation");
   const checks: Check[] = [];
   // Doctor is read-only: unlike install/repair it must never create user dirs.
   const paths = userPaths();

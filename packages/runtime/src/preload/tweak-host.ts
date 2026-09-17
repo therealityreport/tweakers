@@ -108,9 +108,13 @@ export async function startTweakHost(): Promise<void> {
       sendLifecycle(t.manifest.id, t.status === "quarantined" ? "quarantined" : "disabled");
       continue;
     }
-    if (t.manifest.id === "co.tweakers.account-switcher" && !accountsNativeApi.status().compatible) {
-      sendLifecycle(t.manifest.id, "failed", "Accounts is unavailable in this desktop build. Refresh Tweakers to restore the native account screens.");
-      continue;
+    if (t.manifest.id === "co.tweakers.account-switcher") {
+      sendLifecycle(t.manifest.id, "starting");
+      const compatibility = await accountsNativeBridge.waitForInitialization(30_000);
+      if (!compatibility.compatible) {
+        sendLifecycle(t.manifest.id, "failed", `Accounts native initialization failed: ${compatibility.reason ?? "compatibility unavailable"}.`);
+        continue;
+      }
     }
     sendLifecycle(t.manifest.id, "starting");
     try {

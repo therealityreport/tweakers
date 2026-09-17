@@ -602,9 +602,33 @@ static napi_value AcquireNativeThreadWriterLease(napi_env env, napi_callback_inf
   return result;
 }
 
+// A persistent filesystem identity, unlike st_dev which may change on remount.
+// No file contents, credentials, or mutation cross this boundary.
+static napi_value VolumeUuid(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  std::string path;
+  if (argc != 1 || !GetStringArgument(env, args[0], &path) || path.empty() || path[0] != '/') {
+    Throw(env, "volumeUuid requires an absolute path");
+    return Undefined(env);
+  }
+  @autoreleasepool {
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+    NSString *uuid = nil;
+    NSError *error = nil;
+    if (![url getResourceValue:&uuid forKey:NSURLVolumeUUIDStringKey error:&error] || ![uuid isKindOfClass:[NSString class]] || uuid.length == 0) {
+      Throw(env, "persistent volume identity unavailable");
+      return Undefined(env);
+    }
+    return MakeString(env, uuid.lowercaseString);
+  }
+}
+
 NAPI_MODULE_INIT() {
   napi_property_descriptor properties[] = {
     {"getCapabilities", nullptr, GetCapabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"volumeUuid", nullptr, VolumeUuid, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"createPanel", nullptr, CreatePanel, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"attachView", nullptr, AttachView, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"disposeAll", nullptr, DisposeAll, nullptr, nullptr, nullptr, napi_default, nullptr},

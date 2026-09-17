@@ -57,7 +57,7 @@ export function nativeAccountsDesktopProjectsSource(): string {
 }
 
 /** Read overlays keep the native project consumers and their normal write paths. */
-function nativeAccountsDesktopProjects(native: any): any {
+export function nativeAccountsDesktopProjects(native: any): any {
   const keys = new Set([
     "local-projects", "thread-project-assignments", "project-order", "pinned-project-ids",
     "sidebar-project-thread-orders", "electron-saved-workspace-roots", "electron-workspace-root-labels",
@@ -314,7 +314,7 @@ function nativeAccountsDesktopProjects(native: any): any {
 }
 
 /** Trusted main-world functions; renderer messages cannot supply homes or functions. */
-function nativeAccountsMainFactory(input: any, native: any): any {
+export function nativeAccountsMainFactory(input: any, native: any): any {
   if (!input || typeof input.codexHome !== "string" || !input.codexHome.startsWith("/")
     || typeof input.appServerVersion !== "string" || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(input.appServerVersion)
     || typeof input.request !== "function" || typeof input.assertCurrent !== "function") throw new Error("Accounts browser binding is unavailable.");
@@ -361,7 +361,7 @@ export function nativeAccountsConsumerPreservationSource(): string {
   return `\n;var __twAccountsPreserveNativeConsumers=((__name)=>(input)=>(${preserveNativeBrowserConsumers.toString()})(input,{fs:l.default,path:i,registryPath:KX,readRegistry:IX,parseConsumer:UX,ownsManifest:mZ,write:tZ,removeRegistration:MZ,description:lX,uid:process.getuid?.(),Buffer}))((fn)=>fn);\n`;
 }
 
-async function preserveNativeBrowserConsumers(input: any, native: any): Promise<void> {
+export async function preserveNativeBrowserConsumers(input: any, native: any): Promise<void> {
   const { fs, path } = native;
   const registryPath = native.registryPath();
   const snapshot = registryPath === null ? { resources: { entries: [] } } : await native.readRegistry(registryPath);

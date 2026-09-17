@@ -155,12 +155,14 @@ function preflightRouterHomesDetail(config, stateRoot) {
         return { ok: false, reason: "history_adoption_required" };
     const secret = readControlSecret(stateRoot);
     if (!secret)
-        return { ok: false, reason: "startup_selfcheck_failed" };
+        return { ok: false, reason: "authentication_binding_invalid" };
     let intentBytes = null;
     let receiptBytes = null;
     let ownersBytes = null;
     try {
-        (0, state_store_1.ensurePrivateDirectory)(stateRoot);
+        assertPrivateDirectoryForSkills(stateRoot);
+        if ((0, node_fs_1.existsSync)((0, node_path_1.join)(stateRoot, "native-storage-identities-repair.v2.json")))
+            return { ok: false, reason: "identity_repair_incomplete" };
         // A signed in-place source is an explicit v3 alternative to the old
         // adopted-home receipt. This parent/bridge check is deliberately static:
         // it must not classify an already-running broker-owned child as a foreign
@@ -170,7 +172,7 @@ function preflightRouterHomesDetail(config, stateRoot) {
             if (native.state === "ready")
                 return { ok: true };
             if (native.state === "invalid")
-                return { ok: false, reason: "startup_selfcheck_failed" };
+                return { ok: false, reason: native.reason };
         }
         const state = stateAllowsBalancedStartup(config, stateRoot);
         if (!state)
@@ -198,7 +200,7 @@ function preflightRouterHomesDetail(config, stateRoot) {
             ]) {
                 if (!(0, node_fs_1.existsSync)(directory))
                     return { ok: false, reason: "startup_selfcheck_failed" };
-                (0, state_store_1.ensurePrivateDirectory)(directory);
+                assertPrivateDirectoryForSkills(directory);
             }
             if (!validateIsolatedAccountHome(account.opaqueAccountId, stateRoot, secret))
                 return { ok: false, reason: "startup_selfcheck_failed" };

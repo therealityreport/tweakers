@@ -3877,7 +3877,9 @@ function assertNativeContinuityIdentity(input: AccountNativeBaselineInputV1): vo
   if (!isAbsolute(input.account.codexHome) || realpathSync(home) !== home) throw new Error("native account home is not canonical");
   assertSafeCapabilityDirectory(home);
   const stat = lstatSync(home);
-  if (stat.dev !== input.nativeHomeIdentity.device || stat.ino !== input.nativeHomeIdentity.inode) throw new Error("native account home identity changed");
+  // The signed history binding verifies persistent volume identity on remount.
+  // Keep original recorded identities in continuity receipts; do not rewrite them.
+  if (stat.ino !== input.nativeHomeIdentity.inode || (stat.dev !== input.nativeHomeIdentity.device && !input.nativeBindingPreflight())) throw new Error("native account home identity changed");
   for (const root of privateRoots) {
     assertSafeCapabilityDirectory(root);
     if (realpathSync(root) !== root || (lstatSync(root).mode & 0o077) !== 0

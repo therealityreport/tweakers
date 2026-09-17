@@ -86,15 +86,23 @@ test("Accounts context retains more than 64 validated subscriptions when the com
   assert.equal(context.selectedAccountId, accounts[64].accountId);
 });
 
-test("native Usage selector mounts only when one typed Usage surface is unambiguous", () => {
-  const root = { isConnected: true, append() {}, contains(child) { return child === nested; } };
-  const nested = { isConnected: true, append() {}, closest() { return root; } };
-  assert.equal(helpers.nativeUsageSelectorTarget([{ kind: "usage", confidence: "high", element: nested }]), root);
-  const second = { isConnected: true, append() {}, contains() { return false; } };
-  assert.equal(helpers.nativeUsageSelectorTarget([
-    { kind: "usage", confidence: "high", element: nested },
-    { kind: "usage", confidence: "high", element: second },
-  ]), null);
+test("native Usage selector excludes sidebar matches and requires a concrete dialog", () => {
+  const dialog = {
+    isConnected: true,
+    append() {},
+    querySelector() { return {}; },
+    closest(selector) { return selector.includes("dialog") ? dialog : null; },
+  };
+  const usage = {
+    isConnected: true,
+    closest(selector) { return selector.includes("dialog") ? dialog : null; },
+  };
+  assert.equal(helpers.nativeUsageSelectorTarget([{ kind: "usage", confidence: "high", element: usage }]), dialog);
+  const sidebar = {
+    isConnected: true,
+    closest(selector) { return selector.includes("sidebar") ? sidebar : null; },
+  };
+  assert.equal(helpers.nativeUsageSelectorTarget([{ kind: "usage", confidence: "high", element: sidebar }]), null);
 });
 
 // Loop fix: an observation that only advances observedAt (same counters) must

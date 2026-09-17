@@ -62,7 +62,6 @@ const ACCOUNT_REMOTE_PAIRING_POLL_MS = 2_000;
 // host proves each of these page boundaries independently.
 const ACCOUNT_NATIVE_CONNECTION_SURFACES = Object.freeze([
   Object.freeze({ kind: "apps-settings", surface: "apps", title: "Apps" }),
-  Object.freeze({ kind: "plugins-settings", surface: "plugins", title: "Plugins" }),
   Object.freeze({ kind: "mcp-settings", surface: "mcp", title: "MCP" }),
 ]);
 const ACCOUNT_NATIVE_CONNECTION_SURFACE_KINDS = Object.freeze(
@@ -265,6 +264,7 @@ module.exports = {
     applyAllAccountQuotaResult, refreshAllBrokerQuotas, accountSurfacesVisible,
     requestAccountsNativeValue, projectAccountsNativeValue, nativeWhamProfile,
     projectNativeUsageWindow, projectNativeUsageWindows, projectNativeUsageStatus, nativePooledQuota,
+    projectNativeUsageResetModal,
     mountAccountSwitcherPanel, syncAccountsNativeSelections,
     subscribeToAccountBroker, isSerializedValueWithinBound, brokerAccountSelector, brokerAccountAvatar, accountBrokerDisplayMessage,
     accountConnectionDisplayMessage, renderBrokerUnavailable,
@@ -4240,6 +4240,7 @@ function startRenderer(api) {
     nativeConnectionDataRevision: 0,
     nativeSurfaceRevision: 0,
     nativeProfileRefreshPromise: null,
+    nativeUsageResetProjections: new Map(),
     quotaRefreshPromise: null,
     quotaRefreshTimer: null,
     visibleAccountMenuTarget: null,
@@ -4292,6 +4293,7 @@ function startRenderer(api) {
       state.cleanups.push(() => window.clearInterval?.(state.quotaRefreshTimer));
     }
   }
+  installNativeUsageResetModalProjection(state);
   const schedule = () => {
     if (state.disposed || state.timer) return;
     state.timer = window.setTimeout(() => {
@@ -4837,12 +4839,17 @@ function nativeAccountSettingsSurfaceTarget(kind, matches) {
 
 function updateNativeAccountSettingsTargets(state, snapshots) {
   const source = Array.isArray(snapshots) ? snapshots : [];
+  // The shared catalog can contain an Apps heading/card and match the Apps
+  // host heuristic. Never mount subscription controls on Plugins or Skills.
+  const sharedCatalog = typeof document !== "undefined" && typeof document.querySelectorAll === "function"
+    && Array.from(document.querySelectorAll("h1,h2,[role='heading']"))
+      .some((heading) => /^(Skills|Plugins)$/.test(String(heading.textContent || "").trim()));
   for (const definition of ACCOUNT_NATIVE_CONNECTION_SURFACES) {
     const matches = source
       .filter((snapshot) => snapshot?.kind === definition.kind)
       .flatMap((snapshot) => Array.isArray(snapshot.matches) ? snapshot.matches : []);
-    const target = namedAccountsNativeSlot(definition.surface)
-      || nativeAccountSettingsSurfaceTarget(definition.kind, matches);
+    const target = sharedCatalog ? null : (namedAccountsNativeSlot(definition.surface)
+      || nativeAccountSettingsSurfaceTarget(definition.kind, matches));
     if (state.nativeSettingsTargets.get(definition.kind) === target) continue;
     state.nativeSurfaceRevision += 1;
     if (target) state.nativeSettingsTargets.set(definition.kind, target);
@@ -6276,6 +6283,7 @@ function clearBrokerEnrollmentTimer(state, enrollmentId) {
 
 function publishAccountsContext(state) {
   syncAccountsNativeSelections(state);
+  projectNativeUsageResetModal(state);
   if (typeof window === "undefined" || typeof window.dispatchEvent !== "function" || !state.profile) return;
   const accounts = state.profile.accounts.map((account) => ({
     accountId: account.accountId,
@@ -6310,6 +6318,8 @@ function syncAccountsNativeSelections(state) {
     select("profile", profile);
     select("usage", usage);
     select("thread-summary", owner);
+    // Plugins and Skills keep their native page; no per-account selector is mounted.
+    select("plugins", selected);
     for (const definition of ACCOUNT_NATIVE_CONNECTION_SURFACES) {
       const accountId = nativeConnectionSelectionForBridge(state, definition, accounts, selected);
       select(definition.surface, accountId);
@@ -6353,13 +6363,20 @@ function projectAccountsNativeValue(state, surface, kind, input) {
   if (surface !== "usage") return input;
   if (kind === "windows") return projectNativeUsageWindows(state, input);
   if (kind === "depleted-message") {
-    const pool = brokerPoolStats(state?.profile?.accounts || []);
+    const accounts = state?.profile?.accounts || [];
+    const pool = brokerPoolStats(accounts);
     if (pool.allDepleted) {
       return `All enabled subscriptions are depleted${pool.earliestResetAt ? ` until ${formatResetAt(pool.earliestResetAt)}` : ""}.`;
     }
-    return nativePoolHasIncompleteDepletion(state)
-      ? "Pooled usage is incomplete. Usage for another enabled subscription is not available yet."
-      : input;
+    const enabled = accounts.filter((account) => account.enabled);
+    if (enabled.length < 2) return input;
+    const remaining = enabled.map((account) => freshBrokerQuotaRemainingPercent(account.quota));
+    if (remaining.some((value) => value !== null && value > 0)) {
+      return "Usage is still available across your enabled subscriptions. This warning does not mean the subscription pool is exhausted.";
+    }
+    // Without fresh readings for every enabled subscription, the native
+    // account warning cannot be promoted into a claim that the pool is empty.
+    return "Pooled usage is incomplete because one or more enabled subscriptions have not reported fresh usage yet.";
   }
   return input;
 }
@@ -6481,6 +6498,91 @@ function suppressNativeUsageWarnings(input) {
   if (Object.prototype.hasOwnProperty.call(next, "model_picker_upsell")) next.model_picker_upsell = null;
   if (Object.prototype.hasOwnProperty.call(next, "rate_limit_warning")) next.rate_limit_warning = null;
   return next;
+}
+
+/**
+ * The 9275 reset offer reads an app-primary rate-limit query that is separate
+ * from the settings usage request. Keep its real subscription price and reset
+ * actions, while preventing one depleted subscription from being presented as
+ * exhaustion of a freshly positive pool.
+ */
+function projectNativeUsageResetModal(state, root = typeof document === "undefined" ? null : document) {
+  const accounts = (state?.profile?.accounts || []).filter((account) => account.enabled);
+  const positivePool = accounts.length >= 2 && accounts.some((account) => {
+    const remaining = freshBrokerQuotaRemainingPercent(account.quota);
+    return remaining !== null && remaining > 0;
+  });
+  if (!positivePool) {
+    restoreNativeUsageResetProjections(state);
+    return 0;
+  }
+  if (!root?.querySelectorAll) return 0;
+  let projected = 0;
+  for (const dialog of root.querySelectorAll('[role="dialog"]')) {
+    if (dialog?.dataset?.tweakersPooledUsageReset === "true" || typeof dialog?.querySelectorAll !== "function") continue;
+    const headings = [...dialog.querySelectorAll('h1,h2,h3,[role="heading"]')];
+    const title = headings.find((element) => /^You['’]re out of usage$/i.test(element.textContent?.trim?.() || ""));
+    const weekly = [...dialog.querySelectorAll("span,div,p")]
+      .find((element) => element.children?.length === 0 && /^Weekly usage limit$/i.test(element.textContent?.trim?.() || ""));
+    const text = dialog.textContent || "";
+    const resetButton = [...dialog.querySelectorAll("button")]
+      .some((element) => /^(?:Use available reset|Pay .+ to reset)$/i.test(element.textContent?.trim?.() || ""));
+    if (!title || !weekly || !resetButton || !/\b0% left\b/i.test(text)) continue;
+    const description = [...dialog.querySelectorAll("span,p")].find((element) => {
+      const value = element.textContent?.trim?.() || "";
+      return element.children?.length === 0 && (/reset your usage limits/i.test(value) || /banked reset/i.test(value));
+    });
+    const original = {
+      title, titleText: title.textContent, weekly, weeklyText: weekly.textContent,
+      description, descriptionText: description?.textContent ?? null, note: null,
+    };
+    title.textContent = "This subscription is out of usage";
+    weekly.textContent = "This subscription’s weekly usage limit";
+    const context = "Usage is still available across your enabled subscriptions. The reset options here apply only to this subscription.";
+    if (description) description.textContent = `${context} ${description.textContent?.trim?.() || ""}`;
+    else {
+      const note = root.createElement?.("p");
+      if (note) {
+        note.textContent = context;
+        note.setAttribute?.("role", "status");
+        note.setAttribute?.("data-tweakers-pooled-usage-context", "true");
+        Object.assign(note.style || {}, { margin: "0 24px 16px", textAlign: "center" });
+        dialog.append?.(note);
+        original.note = note;
+      }
+    }
+    dialog.dataset.tweakersPooledUsageReset = "true";
+    state?.nativeUsageResetProjections?.set?.(dialog, original);
+    projected += 1;
+  }
+  return projected;
+}
+
+function restoreNativeUsageResetProjections(state) {
+  for (const [dialog, original] of state?.nativeUsageResetProjections || []) {
+    if (original.title?.textContent === "This subscription is out of usage") original.title.textContent = original.titleText;
+    if (original.weekly?.textContent === "This subscription’s weekly usage limit") original.weekly.textContent = original.weeklyText;
+    if (original.description && original.descriptionText !== null
+      && original.description.textContent?.startsWith?.("Usage is still available across your enabled subscriptions.")) {
+      original.description.textContent = original.descriptionText;
+    }
+    original.note?.remove?.();
+    if (dialog?.dataset) delete dialog.dataset.tweakersPooledUsageReset;
+  }
+  state?.nativeUsageResetProjections?.clear?.();
+}
+
+function installNativeUsageResetModalProjection(state) {
+  const Observer = typeof MutationObserver === "function" ? MutationObserver : null;
+  if (!Observer || typeof document === "undefined" || !document.documentElement) return;
+  const project = () => { if (!state.disposed) projectNativeUsageResetModal(state, document); };
+  const observer = new Observer(project);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  state.cleanups.push(() => {
+    observer.disconnect();
+    restoreNativeUsageResetProjections(state);
+  });
+  project();
 }
 
 async function consumeResetCreditFromUsage(state, accountId, requestId) {

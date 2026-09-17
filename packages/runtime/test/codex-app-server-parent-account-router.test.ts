@@ -10,7 +10,7 @@ import type { ChildProcess } from "node:child_process";
 import {
   buildAccountRouterMuxArgs,
   buildAccountsBrokerAppServerArgs,
-  ACCOUNTS_BROKER_BLOCKED_SOURCE,
+  buildAccountsBrokerBlockedArgs,
   ACCOUNTS_BROKER_IDENTITY_FD_ENV,
   ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS,
   CODEX_APP_SERVER_PARENT_SOURCE,
@@ -284,7 +284,7 @@ test("an explicitly invalid or conflicting global root blocks parent launch befo
       },
     });
     childProcess.spawn("/usr/local/bin/codex", ["app-server"], { stdio: "pipe" });
-    assert.deepEqual(calls[0]?.args, ["-e", ACCOUNTS_BROKER_BLOCKED_SOURCE], name);
+    assert.deepEqual(calls[0]?.args, buildAccountsBrokerBlockedArgs(), name);
     assert.doesNotMatch(JSON.stringify(calls[0]?.args), /app-server-mux|CODEX_APP_SERVER_PARENT_SOURCE/, name);
     installation.uninstall();
   }
@@ -444,7 +444,7 @@ test("v3 broker preflight failures are blocked rather than routed direct", () =>
     },
   });
   childProcess.spawn("/usr/local/bin/codex", ["app-server"], { stdio: "pipe" });
-  assert.deepEqual(calls[0]?.args, ["-e", ACCOUNTS_BROKER_BLOCKED_SOURCE]);
+  assert.deepEqual(calls[0]?.args, buildAccountsBrokerBlockedArgs("history_adoption_invalid"));
   assert.doesNotMatch(JSON.stringify(calls[0]?.args), /CODEX_APP_SERVER_PARENT_SOURCE/);
   installation.uninstall();
 });
@@ -488,7 +488,7 @@ test("a present global broker config blocks malformed, incompatible, and unreada
       },
     });
     childProcess.spawn("/usr/local/bin/codex", ["app-server"], { stdio: "pipe" });
-    assert.deepEqual(calls[0]?.args, ["-e", ACCOUNTS_BROKER_BLOCKED_SOURCE], name);
+    assert.deepEqual(calls[0]?.args, buildAccountsBrokerBlockedArgs(), name);
     assert.doesNotMatch(JSON.stringify(calls[0]?.args), /app-server-mux|CODEX_APP_SERVER_PARENT_SOURCE/, name);
     installation.uninstall();
   }

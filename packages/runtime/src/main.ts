@@ -24,6 +24,9 @@ import { invokeAccountsNativeBrowserAction } from "./accounts-native-browser";
 import { createDiskStorage, removeLegacyModeSwitcherState, type DiskStorage } from "./storage";
 import { applyHealthProbeKeychainIsolation } from "./health-probe-keychain";
 import { applyHealthProbeDialogSuppression } from "./health-probe-dialog";
+import { installIndependentStartupRecovery } from "./independent-startup-recovery";
+import { readTweakersDoctor, runTweakersDoctorAction, openTweakersDoctor, openTweakersManager } from "./tweakers-manager-client";
+import { isTweakersManagerSection, type DoctorActionRequestV1 } from "@therealityreport/tweakers-sdk";
 import { hashRawAsarHeader } from "./promotion-asar";
 import {
   fingerprintPromotionCodexConfigPath,
@@ -365,6 +368,10 @@ const HEALTH_RECEIPT_WATCHDOG_MS = 30_000;
 // peer-authorizer's three-process ancestry window while preserving all of the
 // native host's existing signature and identifier checks.
 const codexAppServerParent = installCodexAppServerParent({
+  onAuthenticationRecovery: derivedVariant && !healthCheckOnly ? () => {
+    const openRecoveryManager = () => openTweakersManager("doctor");
+    if (app.isReady()) openRecoveryManager(); else app.once("ready", openRecoveryManager);
+  } : undefined,
   secondaryVariant: derivedVariant,
   secondaryVariantSharedSqliteHome: derivedVariant
     ? process.env.CODEX_SQLITE_HOME
@@ -810,6 +817,7 @@ let runtimeReadySettingsMounted = false;
 type RuntimeReadyBrokerState = "connected" | "unavailable" | "blocked";
 let runtimeReadyBrokerState: RuntimeReadyBrokerState | null = null;
 let runtimeReadySettingsOpenTimer: ReturnType<typeof setInterval> | null = null;
+let independentTweakersLiveHealthTimer: ReturnType<typeof setInterval> | null = null;
 const RUNTIME_READY_SETTINGS_OPEN_INTERVAL_MS = 2_000;
 const RUNTIME_READY_SETTINGS_OPEN_ACK_GRACE_MS = 6_000;
 const RUNTIME_READY_SETTINGS_OPEN_DEADLINE_MS = 45_000;
@@ -2190,9 +2198,9 @@ function publishIndependentTweakersLiveHealth(health: IndependentTweakersLiveHea
   }
 }
 
-function scheduleIndependentTweakersLiveHealthCapture(): void {
+function scheduleIndependentTweakersLiveHealthCapture(normalizeAppearance = true): void {
   if (!derivedVariant || independentTweakersLiveHealthCapture) return;
-  independentTweakersLiveHealthCapture = captureIndependentTweakersLiveHealth()
+  independentTweakersLiveHealthCapture = captureIndependentTweakersLiveHealth(normalizeAppearance)
     .catch((error) => log("warn", "independent live health capture failed", { message: String((error as Error)?.message ?? error) }))
     .finally(() => {
       independentTweakersLiveHealthCapture = null;
@@ -2200,7 +2208,7 @@ function scheduleIndependentTweakersLiveHealthCapture(): void {
     });
 }
 
-async function captureIndependentTweakersLiveHealth(): Promise<void> {
+async function captureIndependentTweakersLiveHealth(normalizeAppearance = true): Promise<void> {
   if (!isExactIndependentTweakersProcess()) return;
   const brokerAuthority = currentRuntimeReadyBrokerAuthorityExpectation();
   const processStartToken = currentProcessStartToken();
@@ -2262,7 +2270,7 @@ async function captureIndependentTweakersLiveHealth(): Promise<void> {
   if (independentTweakersZoomNormalized && nativeZoomNeedsNormalization(before)) {
     independentTweakersZoomNormalized = false;
   }
-  if (!independentTweakersZoomNormalized && nativeZoomNeedsNormalization(before)) {
+  if (normalizeAppearance && !independentTweakersZoomNormalized && nativeZoomNeedsNormalization(before)) {
     try {
       primary.webContents.setZoomLevel(0);
       primary.webContents.setZoomFactor(1);
@@ -2283,18 +2291,20 @@ async function captureIndependentTweakersLiveHealth(): Promise<void> {
   });
 }
 
-function requestRuntimeReadyBrokerConnection(window: Electron.BrowserWindow | null = exactIndependentTweakersPrimaryWindow()): void {
+function requestRuntimeReadyBrokerConnection(window: Electron.BrowserWindow | null = exactIndependentTweakersPrimaryWindow(), normalizeAppearance = true): void {
   if (!derivedVariant || independentTweakersBrokerProbeInFlight) return;
   const authority = currentRuntimeReadyBrokerAuthorityExpectation();
   if (!authority) return;
   if (authority.globalRootState === "absent") {
     markRuntimeReadyBrokerState("blocked");
+    scheduleIndependentTweakersLiveHealthCapture(normalizeAppearance);
     return;
   }
   if (!window || !accountsBrokerRoot || !accountsBrokerSecret) return;
   const client = accountsBrokerClientForRenderer(window.webContents.id);
   if (!client) {
     markRuntimeReadyBrokerState("blocked");
+    scheduleIndependentTweakersLiveHealthCapture(normalizeAppearance);
     return;
   }
   independentTweakersBrokerProbeInFlight = true;
@@ -2308,7 +2318,7 @@ function requestRuntimeReadyBrokerConnection(window: Electron.BrowserWindow | nu
     markRuntimeReadyBrokerState("blocked");
   }).finally(() => {
     independentTweakersBrokerProbeInFlight = false;
-    scheduleIndependentTweakersLiveHealthCapture();
+    scheduleIndependentTweakersLiveHealthCapture(normalizeAppearance);
   });
 }
 
@@ -2663,8 +2673,26 @@ function configureCodexSparkleForProcess(): void {
   // probes and the locally signed independent app receive the inert wrapper:
   // it prevents an inherited native updater from touching a probe or derived
   // bundle, while leaving every official launch unwrapped and native-owned.
-  if (healthCheckOnly || derivedVariant) {
+  if (healthCheckOnly) {
     configureCodexSparkleBridge(createHealthProbeCodexSparkleBridgeOptions());
+  } else if (derivedVariant) {
+    configureCodexSparkleBridge({ ...createHealthProbeCodexSparkleBridgeOptions(),
+      requestManualCheck: () => { const report = readTweakersDoctor(); runTweakersDoctorAction({ schemaVersion: 1, action: "scan", fingerprint: report.fingerprint }); openTweakersManager("updates"); },
+      onUpdateAvailable: () => { try { const report = readTweakersDoctor(); runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", fingerprint: report.fingerprint }); } catch (error) { log("warn", "Doctor available-update signal could not be consumed", { error: String(error) }); } },
+      requestInstall: () => openTweakersManager("updates"),
+      getInstallPrerequisite: () => ({ ok: false, reason: "Use Tweakers Manager to review and apply an independent update." }) });
+    // Consume only an already persisted availability flag. No startup fetch or timer.
+    setImmediate(() => {
+      try {
+        const cached = readState().tweaker?.codexAppcastCache;
+        const installed = installedCodexDesktopVersion(inferMacAppRoot());
+        if (cached && isCodexDesktopUpdateNewer(installed.installedMarketingVersion, installed.installedBuild, cached.marketingVersion, cached.build)) {
+          const report = readTweakersDoctor();
+          runTweakersDoctorAction({ schemaVersion: 1, action: "scan", scanTrigger: "available_update", availableUpdateBuild: cached.build, fingerprint: report.fingerprint });
+        }
+      } catch (error) { log("warn", "Existing update availability flag could not be consumed", { error: String(error) }); }
+    });
+    installIndependentStartupRecovery(dialog as unknown as Parameters<typeof installIndependentStartupRecovery>[0], () => openTweakersManager("doctor"));
   }
 }
 
@@ -3935,6 +3963,13 @@ const originalMainPromotionProbe = healthOriginalMain
 
 app.whenReady().then(() => {
   log("info", "app ready fired");
+  if (derivedVariant && !healthCheckOnly) {
+    // Doctor's two-minute freshness limit requires ongoing runtime evidence,
+    // even when the user leaves the app idle. Each publication follows a live
+    // authenticated broker probe rather than extending an old receipt's age.
+    independentTweakersLiveHealthTimer = setInterval(() => requestRuntimeReadyBrokerConnection(exactIndependentTweakersPrimaryWindow(), false), 30_000);
+    independentTweakersLiveHealthTimer.unref?.();
+  }
   originalMainPromotionProbe?.registerSession(session.defaultSession, "defaultSession-whenReady");
   // A disposable health probe launches Codex's main process only far enough to
   // reach app.whenReady — the real Codex bootstrap never runs, so services the
@@ -4116,6 +4151,8 @@ if (!healthCheckOnly) {
 }
 
 app.on("will-quit", () => {
+  if (independentTweakersLiveHealthTimer !== null) clearInterval(independentTweakersLiveHealthTimer);
+  independentTweakersLiveHealthTimer = null;
   void mcpReconciler?.close();
   stopAllMainTweaks();
   nativeBridge.disposeAll();
@@ -4948,6 +4985,33 @@ ipcMain.handle("tweaker:get-environment-status", async (_e, ...args: unknown[]) 
 ipcMain.handle("tweaker:get-independent-manager-status", (_e, ...args: unknown[]) => {
   assertNoIpcArguments(args, "get-independent-manager-status");
   return independentManagerStatusProjection();
+});
+
+ipcMain.handle("tweaker:doctor-status", (event, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "doctor-status");
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
+  return readTweakersDoctor();
+});
+ipcMain.handle("tweaker:doctor-open", (event, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "doctor-open");
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
+  openTweakersDoctor();
+  return { opened: true };
+});
+ipcMain.handle("tweaker:manager-open", (event, section?: unknown, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "manager-open");
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Tweakers Manager requires the independent app");
+  const selectedSection = section === undefined ? "overview" : section;
+  if (!isTweakersManagerSection(selectedSection)) throw new Error("Invalid Tweakers Manager section");
+  openTweakersManager(selectedSection);
+  return { opened: true, section: selectedSection };
+});
+ipcMain.handle("tweaker:doctor-action", (event, request: DoctorActionRequestV1, ...args: unknown[]) => {
+  assertNoIpcArguments(args, "doctor-action");
+  if (!derivedVariant || !isExactIndependentTweakersPrimaryMainFrame(event.sender, event.senderFrame)) throw new Error("Doctor requires the independent app");
+  // Interactive login can take minutes and must not block Electron's main loop.
+  if (request?.action === "reconnect") { openTweakersDoctor(); return readTweakersDoctor(); }
+  return runTweakersDoctorAction(request);
 });
 
 ipcMain.handle("tweaker:get-independent-live-health", (event, ...args: unknown[]) => {

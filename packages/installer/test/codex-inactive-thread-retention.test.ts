@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -243,4 +243,146 @@ test("no policy anywhere reports not-applicable", () => {
   } finally {
     rmSync(appDir, { recursive: true, force: true });
   }
+});
+
+test("Doctor data-only repair locates a renamed retention event without granting code edits", async () => {
+  const { validateDoctorPatchRepair, applyDoctorPatchRepairs } = await import("../src/doctor-patch-repair.js");
+  const anchor = "inactive_thread_retention_candidates_evaluated";
+  const source = policyFixture().replace("inactive_thread_unsubscribe_candidates_evaluated", anchor);
+  const repair = {version: 1 as const, patchId: "inactive-thread-retention-patch" as const, path: "webview/assets/retention.js", sourceSha256: `sha256:${sha256(source)}`, telemetryAnchor: anchor};
+  assert.equal(patchCodexInactiveThreadRetentionSource(source), null);
+  assert.deepEqual(validateDoctorPatchRepair(repair, source), repair);
+  assert.throws(() => validateDoctorPatchRepair({...repair, executable: "disableChecks()"}, source), /scope/);
+  assert.throws(() => validateDoctorPatchRepair({...repair, path: "webview/../config.js"}, source), /scope/);
+  assert.throws(() => validateDoctorPatchRepair({...repair, patchId: "accounts-native-patch"}, source), /scope/);
+  assert.throws(() => validateDoctorPatchRepair(repair, source + "\n"), /binding/);
+  const bait = "const wrongTTL=3600*1e3,wrongCache=4;\n" + source.replace("{safe:{candidateCount", "{other:{ttlMs:wrongTTL,maxInactiveOwnerThreads:wrongCache},safe:{candidateCount");
+  assert.throws(() => validateDoctorPatchRepair({...repair, sourceSha256: `sha256:${sha256(bait)}`}, bait), /exact telemetry binding/);
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-repair-adapter-")));
+  try {
+    mkdirSync(join(root, "webview/assets"), {recursive: true}); writeFileSync(join(root, repair.path), source);
+    applyDoctorPatchRepairs(root, [repair]);
+    const result = patchCodexInactiveThreadRetentionInExtractedApp(root, new Map([[repair.path, anchor]]));
+    assert.equal(result.status, "already-patched");
+    assert.match(readFileSync(join(root, repair.path), "utf8"), /activeThreadSafeguard\(e\)\{return e\.active\|\|e\.inProgress\|\|e\.isFollower\}/);
+    assert.throws(() => applyDoctorPatchRepairs(root, [repair]), /binding/);
+  } finally { rmSync(root, {recursive: true, force: true}); }
+});
+
+test("Doctor repair attempts are bounded, retained, reused and never replay interrupted requests", async () => {
+  const asar = (await import("@electron/asar")).default;
+  const { repairDoctorConflict } = await import("../src/doctor-repair.js");
+  const { writeDoctorPrivateJson, readDoctorPrivateJson } = await import("../src/doctor-store.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-repair-loop-")));
+  try {
+    const source = policyFixture().replace("inactive_thread_unsubscribe_candidates_evaluated", "inactive_thread_retention_candidates_evaluated");
+    const input = join(root, "source"); mkdirSync(join(input, "webview/assets"), {recursive: true}); writeFileSync(join(input, "webview/assets/retention.js"), source);
+    const packagePath = join(root, "app.asar"); await asar.createPackage(input, packagePath);
+    const request = {jobRoot: root, binding: "fixed-inputs", conflictId: "inactive-thread-retention-patch", failure: "anchor missing", asarPath: packagePath, reviewerBinary: "/exact/codex", model: "configured", effort: "high"};
+    let calls = 0;
+    const rejected = {execute: async () => { calls++; throw new Error("Invalid selector"); }};
+    const failed = await repairDoctorConflict(request, rejected);
+    assert.equal(calls, 2); assert.equal(failed.attempts.length, 2); assert.match(failed.summary, /exhausted/);
+    await repairDoctorConflict(request, rejected); assert.equal(calls, 2);
+    const repaired = await repairDoctorConflict({...request, binding: "changed-source-inputs"}, {execute: async data => {
+      calls++; writeDoctorPrivateJson(data.outputPath, {version: 1, patchId: "inactive-thread-retention-patch", path: "webview/assets/retention.js", sourceSha256: `sha256:${sha256(source)}`, telemetryAnchor: "inactive_thread_retention_candidates_evaluated"});
+      return {run: {status: 0}, observed: {inputTokens: 1, outputTokens: 1}, adapterIdentity: "cli-v1" as const};
+    }});
+    assert.equal(repaired.repairs.length, 1);
+    await repairDoctorConflict({...request, binding: "changed-source-inputs"}, rejected); assert.equal(calls, 3);
+    const statePath = join(root, "repairs/state.json");
+    const state = readDoctorPrivateJson(statePath) as {version: 1; attempts: Array<Record<string, unknown>>};
+    state.attempts.push({binding: "interrupted", conflictId: request.conflictId, attempt: 1, status: "reserved", evidence: join(root, "repairs/attempt-4.json"), summary: "reserved"}); writeDoctorPrivateJson(statePath, state);
+    const interrupted = await repairDoctorConflict({...request, binding: "interrupted"}, rejected);
+    assert.match(interrupted.summary, /interrupted/); assert.equal(calls, 3);
+    const exhausted = await repairDoctorConflict({...request, binding: "another-input"}, rejected);
+    assert.match(exhausted.summary, /four-execution/); assert.equal(calls, 3);
+  } finally { rmSync(root, {recursive: true, force: true}); }
+});
+
+test("Doctor repair recovers a terminal retained attempt without replaying it", async () => {
+  const asar = (await import("@electron/asar")).default;
+  const { repairDoctorConflict } = await import("../src/doctor-repair.js");
+  const { reserveDoctorReviewRequest, recordDoctorReviewUsage, readDoctorReviewUsage } = await import("../src/doctor-review-budget.js");
+  const { writeDoctorPrivateJson, readDoctorPrivateJson } = await import("../src/doctor-store.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-repair-recovery-")));
+  try {
+    const source = policyFixture().replace("inactive_thread_unsubscribe_candidates_evaluated", "inactive_thread_retention_candidates_evaluated");
+    const input = join(root, "source");
+    mkdirSync(join(input, "webview/assets"), { recursive: true });
+    writeFileSync(join(input, "webview/assets/retention.js"), source);
+    const asarPath = join(root, "app.asar");
+    await asar.createPackage(input, asarPath);
+    const request = { jobRoot: root, binding: "recovery-inputs", conflictId: "inactive-thread-retention-patch", failure: "anchor missing", asarPath,
+      reviewerBinary: "/exact/codex", model: "configured", effort: "high" };
+    const repairRoot = join(root, "repairs"), outputPath = join(repairRoot, "attempt-1.json");
+    const reservation = reserveDoctorReviewRequest(repairRoot, request.binding, 1, {
+      evidenceFingerprint: request.binding, outputPath, eventsPath: `${outputPath}.events.json`, questionIds: [request.conflictId],
+    });
+    recordDoctorReviewUsage(repairRoot, request.binding, reservation, { inputTokens: 7, outputTokens: 3 });
+    writeDoctorPrivateJson(`${outputPath}.events.json`, {
+      status: 1,
+      stdout: JSON.stringify({ type: "turn.completed", usage: { input_tokens: 7, output_tokens: 3 } }),
+    });
+    writeDoctorPrivateJson(join(repairRoot, "state.json"), {
+      version: 1,
+      attempts: [{ binding: request.binding, conflictId: request.conflictId, attempt: 1, status: "reserved", evidence: outputPath, summary: "reserved" }],
+    });
+
+    let dispatches = 0;
+    const recovered = await repairDoctorConflict(request, { execute: async data => {
+      dispatches += 1;
+      writeDoctorPrivateJson(data.outputPath, { version: 1, patchId: request.conflictId, path: "webview/assets/retention.js",
+        sourceSha256: `sha256:${sha256(source)}`, telemetryAnchor: "inactive_thread_retention_candidates_evaluated" });
+      return { run: { status: 0 }, observed: { inputTokens: 1, outputTokens: 1 }, adapterIdentity: "cli-v1" as const };
+    }});
+    assert.equal(dispatches, 1, "the recovered terminal request must not be replayed");
+    assert.equal(recovered.repairs.length, 1, "one corrective execution remains after the recovered rejection");
+    assert.deepEqual(recovered.usage, { inputTokens: 7, outputTokens: 3 });
+    const rejected = (readDoctorPrivateJson(join(repairRoot, "state.json")) as { attempts: Array<{ status: string }> }).attempts;
+    assert.deepEqual(rejected.map(attempt => attempt.status), ["rejected", "completed"]);
+    assert.equal(readDoctorReviewUsage(repairRoot, request.binding).requests.length, 1, "recovery must reuse the persisted ledger reservation");
+
+    await repairDoctorConflict(request, { execute: async () => { dispatches += 1; throw new Error("should not dispatch a completed recovery"); }});
+    assert.equal(dispatches, 1, "the corrective success is reused without redispatch");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Doctor repair reuses a recovered successful attempt without dispatch", async () => {
+  const asar = (await import("@electron/asar")).default;
+  const { repairDoctorConflict } = await import("../src/doctor-repair.js");
+  const { reserveDoctorReviewRequest, recordDoctorReviewUsage } = await import("../src/doctor-review-budget.js");
+  const { writeDoctorPrivateJson } = await import("../src/doctor-store.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-repair-recovered-success-")));
+  try {
+    const source = policyFixture().replace("inactive_thread_unsubscribe_candidates_evaluated", "inactive_thread_retention_candidates_evaluated");
+    const input = join(root, "source");
+    mkdirSync(join(input, "webview/assets"), { recursive: true });
+    writeFileSync(join(input, "webview/assets/retention.js"), source);
+    const asarPath = join(root, "app.asar");
+    await asar.createPackage(input, asarPath);
+    const request = { jobRoot: root, binding: "recovered-success-inputs", conflictId: "inactive-thread-retention-patch", failure: "anchor missing", asarPath,
+      reviewerBinary: "/exact/codex", model: "configured", effort: "high" };
+    const repairRoot = join(root, "repairs"), outputPath = join(repairRoot, "attempt-1.json");
+    const reservation = reserveDoctorReviewRequest(repairRoot, request.binding, 1, {
+      evidenceFingerprint: request.binding, outputPath, eventsPath: `${outputPath}.events.json`, questionIds: [request.conflictId],
+    });
+    recordDoctorReviewUsage(repairRoot, request.binding, reservation, { inputTokens: 5, outputTokens: 2 });
+    writeDoctorPrivateJson(outputPath, { version: 1, patchId: request.conflictId, path: "webview/assets/retention.js",
+      sourceSha256: `sha256:${sha256(source)}`, telemetryAnchor: "inactive_thread_retention_candidates_evaluated" });
+    writeDoctorPrivateJson(`${outputPath}.events.json`, {
+      status: 0,
+      stdout: JSON.stringify({ type: "turn.completed", usage: { input_tokens: 5, output_tokens: 2 } }),
+    });
+    writeDoctorPrivateJson(join(repairRoot, "state.json"), {
+      version: 1,
+      attempts: [{ binding: request.binding, conflictId: request.conflictId, attempt: 1, status: "reserved", evidence: outputPath, summary: "reserved" }],
+    });
+
+    let dispatches = 0;
+    const result = await repairDoctorConflict(request, { execute: async () => { dispatches += 1; throw new Error("recovery should be reused"); }});
+    assert.equal(dispatches, 0);
+    assert.equal(result.repairs.length, 1);
+    assert.match(result.summary, /Reused exact-input verified repair/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

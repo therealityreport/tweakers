@@ -15,9 +15,12 @@ exports.observeNativeAccountOperationWritersV1 = observeNativeAccountOperationWr
 exports.nativeHistoryAccountSourceForV1 = nativeHistoryAccountSourceForV1;
 exports.nativeHistoryThreadReadContextV1 = nativeHistoryThreadReadContextV1;
 exports.renderNativeHistoryContextV1 = renderNativeHistoryContextV1;
+exports.refreshNativeHistoryBindingAfterIdentityPublication = refreshNativeHistoryBindingAfterIdentityPublication;
 exports.nativeHistoryBindingSafeV1 = nativeHistoryBindingSafeV1;
 exports.observeNativeThreadWriterV1 = observeNativeThreadWriterV1;
 exports.observeNativeThreadWritersV1 = observeNativeThreadWritersV1;
+exports.readNativeHistoryRecoveryAuthorityV1 = readNativeHistoryRecoveryAuthorityV1;
+const persistent_directory_identity_1 = require("./persistent-directory-identity");
 const native_auth_binding_1 = require("./native-auth-binding");
 const node_child_process_1 = require("node:child_process");
 const node_crypto_1 = require("node:crypto");
@@ -45,7 +48,9 @@ exports.NATIVE_HISTORY_SOURCE_MODE_V1 = "in_place";
 exports.NATIVE_HISTORY_SOURCE_MAX_BYTES_V1 = 64 * 1024;
 exports.NATIVE_HISTORY_AUTH_MAX_BYTES_V1 = 256 * 1024;
 /** Secrets stay in a module-private weak side table, never in the public binding shape. */
+const bindingConfigurations = new WeakMap();
 const bindingSecrets = new WeakMap();
+const bindingPersistentFingerprints = new WeakMap();
 const bindingAuthFingerprints = new WeakMap();
 /** Authentication-only override; history and settings keep their signed original paths. */
 function nativeHistoryEffectiveAuthHomeV1(binding, account) {
@@ -139,10 +144,12 @@ function readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret) 
             sourceDocumentFingerprint: base.sourceDocumentFingerprint,
             extensionsPreflight: extensions,
         });
+        bindingPersistentFingerprints.set(binding, (0, persistent_directory_identity_1.readPersistentIdentityGeneration)(binding.stateRoot, secret)?.fingerprint ?? null);
         bindingAuthFingerprints.set(binding, (0, native_auth_binding_1.readNativeAuthBindingV1)(binding.stateRoot, binding.source, secret)?.fingerprint ?? null);
         if (!bindingPathsAndIdentitiesMatchWithSecret(binding, secret))
             return { state: "invalid", reason: "source_drift" };
         bindingSecrets.set(binding, Buffer.from(secret));
+        bindingConfigurations.set(binding, structuredClone(config));
         return { state: "ready", binding };
     }
     catch {
@@ -166,8 +173,11 @@ function readAndPreflightNativeHistoryBaseSourceStaticV1(stateRoot, protocolFing
         return { state: "invalid", reason: "unsafe_source_file" };
     try {
         const source = parseNativeHistorySourceAgainstProtocolV1(JSON.parse(bytes.toString("utf8")), protocolFingerprint, secret);
-        if (!source || !sourcePathsAndIdentitiesMatchWithSecret(root, source, secret))
-            return { state: "invalid", reason: "source_drift" };
+        if (!source)
+            return { state: "invalid", reason: "invalid_source" };
+        const failure = sourcePathsAndIdentitiesFailure(root, source, secret);
+        if (failure)
+            return { state: "invalid", reason: failure };
         return { state: "ready", stateRoot: root, source, sourceDocumentFingerprint: (0, native_history_extensions_1.nativeHistoryDocumentFingerprintV1)(bytes) };
     }
     catch {
@@ -408,6 +418,13 @@ function bindingPathsAndIdentitiesMatchWithSecret(binding, secret) {
         sourceBytes.fill(0);
     }
     try {
+        if (bindingPersistentFingerprints.has(binding) && bindingPersistentFingerprints.get(binding) !== ((0, persistent_directory_identity_1.readPersistentIdentityGeneration)(root, secret)?.fingerprint ?? null))
+            return false;
+    }
+    catch {
+        return false;
+    }
+    try {
         if (bindingAuthFingerprints.has(binding) && bindingAuthFingerprints.get(binding) !== ((0, native_auth_binding_1.readNativeAuthBindingV1)(root, binding.source, secret)?.fingerprint ?? null))
             return false;
     }
@@ -418,31 +435,41 @@ function bindingPathsAndIdentitiesMatchWithSecret(binding, secret) {
         && (0, native_history_extensions_1.nativeHistoryExtensionsBindingSafeV1)(binding, secret);
 }
 /** Revalidates immutable external homes before any extension state is considered. */
-function sourcePathsAndIdentitiesMatchWithSecret(stateRoot, source, secret) {
+function sourcePathsAndIdentitiesFailure(stateRoot, source, secret, authorityOnly = false) {
     if (secret.byteLength !== 32 || !privateCanonicalDirectory(stateRoot))
-        return false;
+        return "source_drift";
+    const roots = [];
+    for (const account of source.accounts) {
+        if (!(0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot, secret, path: account.codexHome, expected: account.codexHomeIdentity, authorityFile: exports.NATIVE_HISTORY_SOURCE_FILE_V1, accountId: account.opaqueAccountId })
+            || !(0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot, secret, path: account.sqliteHome, expected: account.sqliteHomeIdentity, authorityFile: exports.NATIVE_HISTORY_SOURCE_FILE_V1, accountId: account.opaqueAccountId }))
+            return "source_drift";
+        roots.push({ path: account.codexHome, account: account.opaqueAccountId }, { path: account.sqliteHome, account: account.opaqueAccountId });
+    }
+    const pathsSafe = roots.every((entry) => !pathsOverlap(entry.path, stateRoot))
+        && roots.every((left, index) => roots.slice(index + 1).every((right) => left.account === right.account
+            ? left.path === right.path || !pathsOverlap(left.path, right.path)
+            : !pathsOverlap(left.path, right.path)));
+    if (!pathsSafe)
+        return "source_drift";
+    if (authorityOnly)
+        return null;
     let authBinding;
     try {
         authBinding = (0, native_auth_binding_1.readNativeAuthBindingV1)(stateRoot, source, secret);
     }
     catch {
-        return false;
+        return "authentication_binding_invalid";
     }
-    const roots = [];
     for (const account of source.accounts) {
-        if (!pathMatchesIdentity(account.codexHome, account.codexHomeIdentity)
-            || !pathMatchesIdentity(account.sqliteHome, account.sqliteHomeIdentity))
-            return false;
-        const rawAccountId = readAuthAccountId(authBinding?.document.accounts.find((entry) => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
+        const rawAccountId = readAuthAccountId(authBinding?.document.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId)?.authHome ?? account.codexHome);
         if (!rawAccountId || !sameSecretString(nativeHistoryAuthIdentityHmacV1(rawAccountId, secret), account.authIdentityHmac)
             || !sameOpaqueAccountId(rawAccountId, secret, account.opaqueAccountId))
-            return false;
-        roots.push({ path: account.codexHome, account: account.opaqueAccountId }, { path: account.sqliteHome, account: account.opaqueAccountId });
+            return "authentication_binding_invalid";
     }
-    return roots.every((entry) => !pathsOverlap(entry.path, stateRoot))
-        && roots.every((left, index) => roots.slice(index + 1).every((right) => left.account === right.account
-            ? left.path === right.path || !pathsOverlap(left.path, right.path)
-            : !pathsOverlap(left.path, right.path)));
+    return null;
+}
+function sourcePathsAndIdentitiesMatchWithSecret(stateRoot, source, secret) {
+    return sourcePathsAndIdentitiesFailure(stateRoot, source, secret) === null;
 }
 /** Source parsing without router-account equality: the extension proves the effective union. */
 function parseNativeHistorySourceAgainstProtocolV1(value, protocolFingerprint, secret) {
@@ -544,18 +571,6 @@ function privateCanonicalDirectory(path) {
     }
     catch {
         return null;
-    }
-}
-function pathMatchesIdentity(path, expected) {
-    try {
-        if (!canonicalPath(path) || (0, node_fs_1.realpathSync)(path) !== path)
-            return false;
-        const stat = (0, node_fs_1.lstatSync)(path);
-        return stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o022) === 0
-            && stat.dev === expected.device && stat.ino === expected.inode && stat.uid === expected.uid && (stat.mode & 0o7777) === expected.mode;
-    }
-    catch {
-        return false;
     }
 }
 function readAuthAccountId(codexHome) {
@@ -851,6 +866,20 @@ function canonicalJson(value) {
 }
 /* This must never run: it protects accidental use of secretless binding validation. */
 /** Static native identity remains valid while unrelated apps read or write other threads. */
+/** The publishing writer may acquire a new fully validated binding; the old one remains stale. */
+function refreshNativeHistoryBindingAfterIdentityPublication(binding, expectedGeneration) {
+    const secret = bindingSecrets.get(binding), config = bindingConfigurations.get(binding);
+    if (!secret || !config || (0, persistent_directory_identity_1.readPersistentIdentityGeneration)(binding.stateRoot, secret)?.fingerprint !== expectedGeneration)
+        throw new Error("Published identity generation changed");
+    const fresh = readAndPreflightNativeHistorySourceStaticV1(binding.stateRoot, config, secret);
+    if (fresh.state !== "ready" || fresh.binding.sourceDocumentFingerprint !== binding.sourceDocumentFingerprint
+        || fresh.binding.extensionDocumentFingerprint !== binding.extensionDocumentFingerprint
+        || JSON.stringify(fresh.binding.accounts) !== JSON.stringify(binding.accounts)
+        || bindingAuthFingerprints.get(fresh.binding) !== bindingAuthFingerprints.get(binding)
+        || bindingPersistentFingerprints.get(fresh.binding) !== expectedGeneration)
+        throw new Error("Native source changed during identity publication");
+    return fresh.binding;
+}
 function nativeHistoryBindingSafeV1(binding) {
     const secret = bindingSecrets.get(binding);
     return !!secret && bindingPathsAndIdentitiesMatchWithSecret(binding, secret);
@@ -946,5 +975,23 @@ function nativeThreadWriterObservations(binding, threadIds, ownedPids, rows, ope
             : { state: foreign.size ? "conflict" : "clear", foreignPids: [...foreign].sort((a, b) => a - b) });
     }
     return results;
+}
+/** Recovery-only signed source validation. Does not produce a runnable history binding. */
+function readNativeHistoryRecoveryAuthorityV1(stateRoot, config, secret) {
+    const root = privateCanonicalDirectory(stateRoot);
+    if (!root)
+        throw new Error("Unsafe recovery root");
+    const bytes = readPrivateRegularFile((0, node_path_1.join)(root, exports.NATIVE_HISTORY_SOURCE_FILE_V1), exports.NATIVE_HISTORY_SOURCE_MAX_BYTES_V1, false);
+    if (!bytes)
+        throw new Error("Unsafe recovery source");
+    try {
+        const source = parseNativeHistorySourceV1(JSON.parse(bytes.toString("utf8")), config, secret);
+        if (!source || sourcePathsAndIdentitiesFailure(root, source, secret, true))
+            throw new Error("Recovery authority unavailable");
+        return source;
+    }
+    finally {
+        bytes.fill(0);
+    }
 }
 //# sourceMappingURL=native-history.js.map

@@ -572,25 +572,38 @@ function pruneBadges(instance) {
   }
 }
 
+function isSidebarUsageElement(element) {
+  return Boolean(element?.closest?.('aside, nav, [role="navigation"], [data-sidebar], [class*="sidebar" i]'));
+}
+
+function hasConcreteNativeUsageContent(element) {
+  return Boolean(element?.matches?.('[data-usage-limit-key], [data-usage-limit], [data-testid*="usage" i]')
+    || element?.querySelector?.('[data-usage-limit-key], [data-usage-limit], [data-testid*="usage" i]'));
+}
+
 function nativeUsageSelectorTarget(matches) {
   if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
     const slots = Array.from(document.querySelectorAll('[data-tweakers-native-surface="usage"]'))
-      .filter((element) => element?.isConnected !== false && typeof element.append === "function");
+      .filter((element) => element?.isConnected !== false && typeof element.append === "function"
+        && !isSidebarUsageElement(element) && hasConcreteNativeUsageContent(element));
     if (slots.length === 1) return slots[0];
   }
-  const roots = [...new Set((Array.isArray(matches) ? matches : [])
+  const dialogs = [...new Set((Array.isArray(matches) ? matches : [])
     .filter((match) => match?.kind === "usage" && match.confidence === "high" && match.element?.isConnected !== false)
-    .map((match) => match.element.closest?.('[role="dialog"], [aria-modal="true"], section, article') || match.element)
-    .filter((element) => element && typeof element.append === "function"))];
-  const outermost = roots.filter((candidate) => !roots.some((other) => other !== candidate && other.contains?.(candidate)));
-  // A selector must belong to exactly one semantically identified native Usage
-  // surface. Multiple candidates mean the host ownership is uncertain, so do
-  // not inject into any of them.
-  return outermost.length === 1 ? outermost[0] : null;
+    .map((match) => match.element.closest?.('[role="dialog"], [aria-modal="true"]'))
+    .filter((element) => element && typeof element.append === "function"
+      && !isSidebarUsageElement(element) && hasConcreteNativeUsageContent(element)))];
+  // Only a concrete Usage dialog is a safe native insertion target. Generic
+  // sections and articles can be sidebar cards, so the owned Settings page is
+  // the fallback when no dialog is unambiguous.
+  return dialogs.length === 1 ? dialogs[0] : null;
 }
 
 function removeNativeUsageSelectors(instance) {
-  for (const node of [...(instance.nativeAccountSelectors || [])]) {
+  const owned = typeof document !== "undefined"
+    ? [...document.querySelectorAll?.('[data-tweakers-usage-account-selector="true"]') || []]
+    : [];
+  for (const node of [...(instance.nativeAccountSelectors || []), ...owned]) {
     try { node.remove?.(); } catch {}
   }
   instance.nativeAccountSelectors?.clear?.();
@@ -615,9 +628,10 @@ function refreshNativeUsageAccountSelectors(instance, matches = null) {
     removeNativeUsageSelectors(instance);
     return;
   }
-  // A route transition can leave an old native card connected briefly. Remove
-  // its owned control rather than retaining a selector on the wrong surface.
-  for (const node of [...instance.nativeAccountSelectors]) {
+  // A route transition or earlier unsafe anchor can leave an owned card in a
+  // sidebar. Remove every owned selector outside the concrete Usage target.
+  const ownedSelectors = [...document.querySelectorAll?.('[data-tweakers-usage-account-selector="true"]') || []];
+  for (const node of ownedSelectors) {
     if (!target.contains?.(node)) {
       try { node.remove?.(); } catch {}
       instance.nativeAccountSelectors.delete(node);

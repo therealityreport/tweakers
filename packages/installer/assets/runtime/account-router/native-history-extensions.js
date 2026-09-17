@@ -8,6 +8,8 @@ exports.signNativeHistoryExtensionsV1 = signNativeHistoryExtensionsV1;
 exports.parseNativeHistoryExtensionsV1 = parseNativeHistoryExtensionsV1;
 exports.signNativeHistoryManagedEnrollmentReceiptV1 = signNativeHistoryManagedEnrollmentReceiptV1;
 exports.parseNativeHistoryManagedEnrollmentReceiptV1 = parseNativeHistoryManagedEnrollmentReceiptV1;
+exports.prepareNativeEnrollmentIdentityIntentV2 = prepareNativeEnrollmentIdentityIntentV2;
+exports.verifyNativeEnrollmentIdentityIntentV2 = verifyNativeEnrollmentIdentityIntentV2;
 exports.writeNativeHistoryManagedEnrollmentReceiptV1 = writeNativeHistoryManagedEnrollmentReceiptV1;
 exports.validateNativeHistoryManagedEnrollmentReceiptV1 = validateNativeHistoryManagedEnrollmentReceiptV1;
 exports.preflightNativeHistoryExtensionsV1 = preflightNativeHistoryExtensionsV1;
@@ -18,6 +20,7 @@ exports.prepareNativeHistoryExtensionUpdateV1 = prepareNativeHistoryExtensionUpd
 exports.publishPreparedNativeHistoryExtensionUpdateV1 = publishPreparedNativeHistoryExtensionUpdateV1;
 exports.recoverNativeHistoryExtensionUpdateV1 = recoverNativeHistoryExtensionUpdateV1;
 exports.nativeHistoryExtensionsDocumentBytes = nativeHistoryExtensionsDocumentBytes;
+const persistent_directory_identity_1 = require("./persistent-directory-identity");
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -98,6 +101,32 @@ function parseNativeHistoryManagedEnrollmentReceiptV1(value, secret) {
         return null;
     return { ...cloneManagedReceiptUnsigned(unsigned), signature: value.signature };
 }
+function enrollmentIntentSignature(value, secret) {
+    return `hmac-sha256:${(0, node_crypto_1.createHmac)("sha256", secret).update("native-enrollment-identities:v2\0" + JSON.stringify(value)).digest("hex")}`;
+}
+function prepareNativeEnrollmentIdentityIntentV2(input) {
+    const home = validateManagedAccountHome(input.stateRoot, input.account, input.secret);
+    if (!home || !isIsoTimestamp(input.issuedAt))
+        throw new Error("Native enrollment identity intent failed preflight");
+    const unsigned = { version: 2, account: cloneManagedAccountDraft(input.account), issuedAt: input.issuedAt,
+        codexVolumeUuid: (0, persistent_directory_identity_1.nativeVolumeUuid)(home.codexHome), sqliteVolumeUuid: (0, persistent_directory_identity_1.nativeVolumeUuid)(home.sqliteHome) };
+    return { ...unsigned, signature: enrollmentIntentSignature(unsigned, input.secret) };
+}
+function verifyNativeEnrollmentIdentityIntentV2(stateRoot, secret, value) {
+    if (!(0, types_1.isPlainRecord)(value) || Object.keys(value).sort().join() !== "account,codexVolumeUuid,issuedAt,signature,sqliteVolumeUuid,version"
+        || value.version !== 2 || !isManagedAccountDraft(value.account) || !isIsoTimestamp(value.issuedAt)
+        || typeof value.codexVolumeUuid !== "string" || !/^[a-f0-9-]{36}$/.test(value.codexVolumeUuid)
+        || typeof value.sqliteVolumeUuid !== "string" || !/^[a-f0-9-]{36}$/.test(value.sqliteVolumeUuid))
+        throw new Error("Invalid native enrollment identity intent");
+    const intent = value;
+    const { signature, ...unsigned } = intent;
+    if (secret.length !== 32 || !sameSecretString(enrollmentIntentSignature(unsigned, secret), signature))
+        throw new Error("Native enrollment identity intent signature failed");
+    const home = validateManagedAccountHome(stateRoot, intent.account, secret, false, intent);
+    if (!home)
+        throw new Error("Native enrollment persistent identity changed");
+    return intent;
+}
 /**
  * Writes the one receipt needed by a newly materialized manager-local home.
  * Existing bytes are never overwritten unless they already prove the exact
@@ -108,9 +137,9 @@ function writeNativeHistoryManagedEnrollmentReceiptV1(input) {
         throw new Error("invalid native history managed enrollment receipt input");
     }
     const account = cloneManagedAccountDraft(input.account);
-    const home = validateManagedAccountHome(input.stateRoot, account, input.secret);
-    if (!home)
-        throw new Error("native history managed enrollment home failed preflight");
+    const intent = input.identityIntent ? verifyNativeEnrollmentIdentityIntentV2(input.stateRoot, input.secret, input.identityIntent) : undefined;
+    if (intent && (JSON.stringify(intent.account) !== JSON.stringify(account) || intent.issuedAt !== input.issuedAt))
+        throw new Error("Native enrollment intent differs from receipt input");
     const unsigned = {
         version: 1,
         kind: exports.NATIVE_HISTORY_MANAGED_ENROLLMENT_RECEIPT_KIND_V1,
@@ -124,15 +153,18 @@ function writeNativeHistoryManagedEnrollmentReceiptV1(input) {
         if (!current || !sameManagedReceipt(current.receipt, receipt)) {
             throw new Error("native history managed enrollment receipt already differs");
         }
-        if (!validateManagedAccountHome(input.stateRoot, account, input.secret))
+        if (!validateManagedAccountHome(input.stateRoot, account, input.secret, true) && !validateManagedAccountHome(input.stateRoot, account, input.secret, false, intent))
             throw new Error("native history managed enrollment home drifted");
         return { receipt: current.receipt, enrollmentReceiptFingerprint: current.fingerprint };
     }
+    const home = validateManagedAccountHome(input.stateRoot, account, input.secret, false, intent);
+    if (!home)
+        throw new Error("native history managed enrollment home failed preflight");
     // `accountRoot` was just proved owner-private and is the only write target.
     (0, state_store_1.writePrivateJsonAtomicBounded)(home.accountRoot, exports.NATIVE_HISTORY_MANAGED_ENROLLMENT_RECEIPT_FILE_V1, receipt, exports.NATIVE_HISTORY_MANAGED_ENROLLMENT_RECEIPT_MAX_BYTES_V1);
     const persisted = readManagedReceipt(input.stateRoot, account.opaqueAccountId, input.secret);
     if (!persisted || !sameManagedReceipt(persisted.receipt, receipt)
-        || !validateManagedAccountHome(input.stateRoot, account, input.secret)) {
+        || !validateManagedAccountHome(input.stateRoot, account, input.secret, false, intent)) {
         throw new Error("native history managed enrollment receipt postcondition failed");
     }
     return { receipt: persisted.receipt, enrollmentReceiptFingerprint: persisted.fingerprint };
@@ -157,7 +189,7 @@ function validateNativeHistoryManagedEnrollmentReceiptV1(input) {
     };
     if (!sameManagedReceipt(receipt.receipt, signNativeHistoryManagedEnrollmentReceiptV1(expected, input.secret)))
         return null;
-    const home = validateManagedAccountHome(input.stateRoot, input.account, input.secret);
+    const home = validateManagedAccountHome(input.stateRoot, input.account, input.secret, true);
     return home ? { ...cloneManagedAccount(input.account), kind: "managed_adopted", ...home } : null;
 }
 /**
@@ -488,7 +520,7 @@ function readManagedReceipt(stateRoot, account, secret) {
         bytes.fill(0);
     }
 }
-function validateManagedAccountHome(stateRoot, account, secret) {
+function validateManagedAccountHome(stateRoot, account, secret, persistentAuthority = false, intent) {
     if (secret.byteLength !== 32 || !isManagedAccountDraft(account))
         return null;
     const root = privateCanonicalDirectory(stateRoot);
@@ -499,8 +531,12 @@ function validateManagedAccountHome(stateRoot, account, secret) {
         return null;
     const codexHome = (0, node_path_1.join)(accountRoot, "codex-home");
     const sqliteHome = (0, node_path_1.join)(accountRoot, "sqlite-home");
-    if (!managerPathMatchesIdentity(codexHome, account.codexHomeIdentity)
-        || !managerPathMatchesIdentity(sqliteHome, account.sqliteHomeIdentity))
+    const matches = (path, expected) => persistentAuthority
+        ? (0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot, secret, path, expected, authorityFile: `accounts/${account.opaqueAccountId}/${exports.NATIVE_HISTORY_MANAGED_ENROLLMENT_RECEIPT_FILE_V1}`, accountId: account.opaqueAccountId })
+        : intent ? managerPathMatchesIdentity(path, { ...expected, device: (0, node_fs_1.lstatSync)(path).dev })
+            && (0, persistent_directory_identity_1.nativeVolumeUuid)(path) === (path === codexHome ? intent.codexVolumeUuid : intent.sqliteVolumeUuid)
+            : managerPathMatchesIdentity(path, expected);
+    if (!matches(codexHome, account.codexHomeIdentity) || !matches(sqliteHome, account.sqliteHomeIdentity))
         return null;
     const rawAccountId = readAuthAccountId(codexHome);
     if (!rawAccountId || !sameSecretString(nativeHistoryAuthIdentityHmac(rawAccountId, secret), account.authIdentityHmac)

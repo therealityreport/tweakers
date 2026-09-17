@@ -9,8 +9,10 @@ This file governs repository-wide work. For implementation details inside
 - Before builds, refreshes, promotions, or artifact cleanup, read and follow
   [Build artifact retention and post-change updates](rules/build-artifact-retention.md).
   The user gives standing authorization to rebuild and open the newest verified
-  Tweakers version when a change requires it, then move obsolete versions/builds
-  to Trash under that rule. Do not ask for duplicate confirmation.
+  Tweakers version when a change requires it, then archive older historical
+  versions to SHOWS DB and move unneeded artifacts to Trash under that rule.
+  Keep active dependencies and one verified rollback locally. Do not ask for
+  duplicate confirmation.
 
 ## Shared user-level workflow
 
@@ -82,7 +84,8 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - **Runtime/installer:** run focused tests, typecheck/build, and full suite.
   When needed to apply the completed change, use the guarded refresh flow to
   rebuild and open the newest verified Tweakers version under the standing
-  authorization, then perform live verification and eligible Trash cleanup.
+  authorization, then perform live verification and the required SHOWS DB
+  archival and eligible Trash cleanup.
 - **Release:** update versions and changelog, run synchronization in check mode,
   history checks, build, and tests. A semver tag push can trigger publication;
   the existence of a tag is not evidence of user approval.
@@ -119,3 +122,9 @@ permissions, settings ownership, or maintenance, ask one structured question.
 - State the practical result, relevant verification, and anything unfinished. Scale detail to the task.
 - For feature work, include the selected owner/route. Include generated-state, live-sync, promotion, or restart status only when the task touches those surfaces. Explain skipped required checks.
 - For documentation-only work, report the instruction/reference checks; omit unrelated build, release, and live-app checklists.
+<!-- project-manager:graphify:start -->
+## Project knowledge
+
+- Follow [Memory and project knowledge](/Users/thomashulihan/.codex/instructions/RULES/memory-and-project-knowledge.md). It owns Engram repository history and checkout-scoped, on-demand Graphify retrieval.
+- Keep only repository-specific code-corpus exclusions in `.graphifyignore`; Project Manager treats nested Git repositories as independent source roots.
+<!-- project-manager:graphify:end -->

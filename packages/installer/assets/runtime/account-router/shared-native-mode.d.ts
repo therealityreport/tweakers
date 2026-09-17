@@ -55,6 +55,7 @@ export type SharedNativeModePublishResultV1 = Blocked | {
     state: "published";
     document: SharedNativeModeV1;
     fingerprint: Sha256;
+    binding: NativeHistorySourceBindingV1;
 };
 export interface PrepareSharedNativeModeInputV1 extends SharedNativeModeContextV1 {
     overlayPath: string;

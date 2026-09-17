@@ -1,4 +1,5 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,4 +22,18 @@ for (const entry of readdirSync(outDir)) {
   }
 }
 cpSync(src, out);
+const doctor = resolve(repoRoot, "packages/native-host/dist/Tweakers Doctor.app");
+if (existsSync(doctor)) {
+  const destination = resolve(outDir, "Tweakers Doctor.app");
+  const candidate = resolve(outDir, `.Tweakers Doctor.app.candidate-${process.pid}`);
+  rmSync(candidate, { recursive: true, force: true });
+  cpSync(doctor, candidate, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true });
+  if (process.platform === "darwin") {
+    const verified = spawnSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", candidate], { encoding: "utf8" });
+    if (verified.status !== 0) throw new Error(`Copied Tweakers Doctor signature did not verify: ${verified.stderr}`);
+  }
+  rmSync(destination, { recursive: true, force: true });
+  renameSync(candidate, destination);
+  rmSync(resolve(outDir, "Tweakers Doctor"), { force: true });
+}
 console.log(`[runtime] native host -> ${out}`);

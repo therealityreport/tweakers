@@ -8,6 +8,7 @@ exports.recoverSharedNativeModeV1 = recoverSharedNativeModeV1;
 exports.prepareSharedNativeResolverTransitionV1 = prepareSharedNativeResolverTransitionV1;
 exports.executeSharedNativeResolverTransitionV1 = executeSharedNativeResolverTransitionV1;
 exports.executeSharedNativeResolverTransitionAtRootV1 = executeSharedNativeResolverTransitionAtRootV1;
+const persistent_directory_identity_1 = require("./persistent-directory-identity");
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -140,8 +141,10 @@ function parseDocument(value, context) {
     const original = context.binding.source.accounts.find((a) => a.opaqueAccountId === document.sourceAccountId);
     if (document.sourceFingerprint !== context.binding.sourceDocumentFingerprint || document.sourceAccountId !== context.binding.source.metadataAccountId || !original
         || document.nativeBase.path !== original.codexHome || canonical(document.nativeBase.identity) !== canonical(original.codexHomeIdentity)
-        || canonical(directory(document.nativeBase.path, false)) !== canonical(document.nativeBase.identity)
-        || canonical(directory(document.overlay.path)) !== canonical(document.overlay.identity))
+        || !(0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot: context.stateRoot, secret: context.secret, path: document.nativeBase.path, expected: document.nativeBase.identity, authorityFile: "native-history-source.v1.json", accountId: document.sourceAccountId })
+        || !(present((0, node_path_1.join)(context.stateRoot, exports.SHARED_NATIVE_MODE_FILE_V1))
+            ? (0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot: context.stateRoot, secret: context.secret, path: document.overlay.path, expected: document.overlay.identity, authorityFile: exports.SHARED_NATIVE_MODE_FILE_V1, accountId: document.sourceAccountId })
+            : canonical(directory(document.overlay.path)) === canonical(document.overlay.identity)))
         return fail("shared native source or root changed");
     if (!document.overlay.path.startsWith(context.stateRoot + "/")
         || ["accounts", "shared-account-config"].some((name) => overlap((0, node_path_1.join)(context.stateRoot, name), document.overlay.path))
@@ -299,7 +302,13 @@ function finish(input, plan, transitionFingerprint) {
     const result = readSharedNativeModeV1(input);
     if (result.state !== "ready" || result.fingerprint !== hash(finalBytes))
         return fail("published shared native registration failed readback");
-    return { state: "published", document: result.document, fingerprint: result.fingerprint };
+    if (process.platform === "darwin") {
+        const proposal = (0, persistent_directory_identity_1.preparePersistentIdentityGeneration)({ stateRoot: input.stateRoot, secret: input.secret,
+            verify: () => readSharedNativeModeV1(input).state === "ready" });
+        (0, persistent_directory_identity_1.journalAndPublishPersistentIdentityGeneration)(input.stateRoot, input.secret, proposal);
+        input.binding = (0, native_history_1.refreshNativeHistoryBindingAfterIdentityPublication)(input.binding, (0, persistent_directory_identity_1.persistentIdentityProposalFingerprint)(proposal));
+    }
+    return { state: "published", document: result.document, fingerprint: result.fingerprint, binding: input.binding };
 }
 function publishSharedNativeModeV1(input) {
     try {
@@ -314,7 +323,7 @@ function publishSharedNativeModeV1(input) {
         if (present((0, node_path_1.join)(input.stateRoot, exports.SHARED_NATIVE_MODE_FILE_V1))) {
             const current = readSharedNativeModeV1(input);
             if (current.state === "ready" && current.fingerprint === fingerprint(plan.document))
-                return { state: "published", document: current.document, fingerprint: current.fingerprint };
+                return { state: "published", document: current.document, fingerprint: current.fingerprint, binding: input.binding };
             fail("shared native registration already exists");
         }
         priorGlobals(input, plan.document);
@@ -343,7 +352,7 @@ function recoverSharedNativeModeV1(input) {
             const current = readSharedNativeModeV1(input);
             if (current.state !== "ready" || current.fingerprint !== fingerprint(plan.document))
                 return fail("completed transition registration changed");
-            return { state: "published", document: current.document, fingerprint: current.fingerprint };
+            return { state: "published", document: current.document, fingerprint: current.fingerprint, binding: input.binding };
         }
         const content = read(path);
         if (hash(content) !== input.expectedTransitionFingerprint)

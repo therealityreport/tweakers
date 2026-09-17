@@ -70,8 +70,10 @@ interface NumericBinding {
  */
 export function patchCodexInactiveThreadRetentionSource(
   source: string,
+  telemetryAnchor = RETENTION_TELEMETRY_ANCHOR,
 ): CodexInactiveThreadRetentionPatch | null {
-  const anchors = [...source.matchAll(new RegExp(escapeRegExp(RETENTION_TELEMETRY_ANCHOR), "g"))];
+  if (!/^[A-Za-z_][A-Za-z0-9_.:-]{7,160}$/.test(telemetryAnchor)) throw new Error("Invalid retention telemetry anchor");
+  const anchors = [...source.matchAll(new RegExp(escapeRegExp(telemetryAnchor), "g"))];
   if (anchors.length === 0) return null;
   if (anchors.length > 1) {
     throw new Error(
@@ -108,7 +110,7 @@ export function patchCodexInactiveThreadRetentionSource(
 
   // Re-read our own output through the same discovery path. A matcher loose
   // enough to hit the wrong site fails here rather than shipping.
-  const verified = patchCodexInactiveThreadRetentionSource(patched);
+  const verified = patchCodexInactiveThreadRetentionSource(patched, telemetryAnchor);
   if (!verified || verified.changed || verified.strategy !== "already-patched") {
     throw new Error("Codex inactive-thread retention patch did not produce a verifiable bounded policy");
   }
@@ -119,6 +121,7 @@ export function patchCodexInactiveThreadRetentionSource(
 /** Patch exactly one verified inactive-thread policy in an extracted app tree. */
 export function patchCodexInactiveThreadRetentionInExtractedApp(
   appDir: string,
+  anchorOverrides: ReadonlyMap<string, string> = new Map(),
 ): CodexInactiveThreadRetentionAppPatch {
   const rendererRoot = resolve(appDir, RENDERER_ROOT);
   const candidates = collectJavaScriptFiles(rendererRoot);
@@ -131,7 +134,7 @@ export function patchCodexInactiveThreadRetentionInExtractedApp(
   for (const path of candidates) {
     const source = readFileSync(path, "utf8");
     try {
-      inspected.push({ path, source, patch: patchCodexInactiveThreadRetentionSource(source) });
+      inspected.push({ path, source, patch: patchCodexInactiveThreadRetentionSource(source, anchorOverrides.get(relative(appDir, path))) });
     } catch (error) {
       const relativePath = relative(appDir, path);
       const message = `Codex inactive-thread retention patch rejected ${relativePath}: ${errorMessage(error)}`;

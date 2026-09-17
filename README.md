@@ -127,7 +127,9 @@ Runtime flow:
 | `tweaker update` | Install the latest published Tweakers release; keep the managed runtime unchanged when no release exists. |
 | `tweaker codex-build-attestation review` | Independently verify one frozen source build and write its immutable review manifest. |
 | `tweaker codex-build-attestation accept` | Explicitly accept the exact reviewed manifest hash and issue the private accepted-build pair. |
-| `tweaker doctor` | Diagnose signatures, integrity, permissions, and common failures. |
+| `tweaker doctor` | Diagnose the legacy injected target: signatures, integrity, permissions, and common failures. |
+| `tweaker doctor --target independent` | Inspect independent Tweakers health and update readiness without changing files. Add `--json` for structured output or `--ui` for the standalone recovery window. |
+| `tweaker doctor --target independent --scan-updates` | Request a source comparison, compatibility review, and disposable candidate validation. |
 | `tweaker safe-mode` | Disable all tweaks without deleting them. |
 | `tweaker safe-mode --off` | Leave safe mode. |
 | `tweaker uninstall` | Remove Tweaker and restore the app when safe. |
@@ -454,3 +456,25 @@ See [Security](./SECURITY.md).
 ## License
 
 MIT.
+
+### Independent Tweakers Manager
+
+Open **Manager** in Tweakers settings for one native maintenance window. **Overview** separates app health from update readiness, **Updates** contains changes and candidate review, and **Doctor** contains health findings and recovery actions. The standalone window also works when Electron or the Accounts broker cannot start; startup failures open its Doctor section. Settings retains a compact status summary rather than a second set of maintenance controls.
+
+Opening a section only navigates: it never starts a scan or authorizes maintenance. Existing `doctor-open` callers still open Doctor. Manager verifies the current report and exact candidate before executing any action; navigation does not change those safeguards. Closing the window stops its polling without cancelling durable review or installation work.
+
+The managed watcher detects a stable, signed native Codex update, retains its exact source, compares shipped files and app-server schemas with the installed baseline, and runs a read-only compatibility review using the configured Codex model and reasoning effort. Missing evidence, unavailable review, or a failed candidate check leaves the update blocked with a copyable handoff. Reviews do not edit source code.
+
+**Update Changes** in the standalone Doctor window separates compatibility from adoption. It compares the exact shipped upstream builds using hashes and a bounded JavaScript dependency index, labels inferred and unknown behavior, and keeps every changed artifact in the evidence. Official-source release provenance is supplementary; missing mappings are explicit. Graphify is not required.
+
+Before paid review, a grouped preflight accounts for every original change and stops on unknown or ambiguous evidence. Eligible reviews still use bounded source units; grouping is not a claim that every UI change has been explained. Requests are limited to 32 KiB and four paid calls per upstream pair, with a durable ledger that survives retries and model changes. Reported usage of 100,000 input or 16,000 output tokens stops further calls; unavailable usage also pauses spending. These are request and observed-usage limits, not a provider-enforced cap on an in-flight request. Shell execution, web search, whole-file retrieval instructions and the global implementation catalog are disabled for review.
+
+The Doctor window supports resizing and scrolling independently of two fixed action rows, so the bottom controls remain reachable on smaller screens.
+
+Accept individual changes or **Accept explained** changes in bulk; unknown entries require an explicit decision. **Request preservation** records a blocking request for a separately implemented patch. **Defer update** keeps the working app. Preservation and deferral survive rebuilding the same upstream comparison; acceptance must be renewed for a different candidate or report. Existing overrides are offered only when a candidate-specific adapter and verification are available; unsupported overrides remain unavailable.
+
+**Preview before / Preview after** prepare separate signed variants from the compared source builds, with empty disposable profiles, file-only CLI authentication and isolated broker roots. Both previews use the current Tweakers implementation, so they are controlled source comparisons, not replicas of historical user configuration. No credentials are copied. Sign-in and server-controlled features may be unavailable. **Record comparison** stores your manual before/after notes and conditions without claiming automated native verification.
+
+**Install reviewed update** becomes available only after compatibility, candidate verification and adoption decisions pass. Clicking it authorizes the exact candidate and decision revision; the manager rechecks both before promotion, then requires fresh startup readiness. Changed inputs invalidate approval. New upstream versions supersede old jobs automatically; interrupted reviews reuse durable checkpoints. Reports and decisions live in the private Doctor job directory, separately from disposable staging. The native Codex application stays untouched.
+
+**Repair storage binding** is available only for a verified metadata repair while the broker is idle. It preserves original signed account bindings, credentials, and conversation data, and records persistent volume identity in a separate signed generation. Legacy device-only records cannot prove the previous volume UUID; Doctor states that limit before repair. **Retry Tweakers** starts the independent app after storage preflight passes.

@@ -27,6 +27,11 @@ export declare function readNativeAuthBindingV1(stateRoot: string, source: Nativ
     document: NativeAuthBindingV1;
     fingerprint: string;
 } | null;
+/** Recovery-only authority. Verifies signatures and paths, never claims credentials are valid. */
+export declare function readNativeAuthBindingAuthorityV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): {
+    document: NativeAuthBindingV1;
+    fingerprint: string;
+} | null;
 export interface PreparedNativeAuthBindingV1 {
     readonly sourceFingerprint: string;
     readonly accounts: readonly {

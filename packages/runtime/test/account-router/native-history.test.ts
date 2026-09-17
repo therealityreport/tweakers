@@ -1,3 +1,4 @@
+import { inspectNativeAuthenticationAtRoot, reconnectNativeAuthenticationAtRoot } from "../../src/account-router/doctor-auth";
 import { NATIVE_AUTH_BINDING_FILE_V1, prepareNativeAuthBindingV1, publishPreparedNativeAuthBindingV1 } from "../../src/account-router/native-auth-binding";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -152,7 +153,7 @@ test("native source binding is signed to storage identities but survives routing
 
   privateWrite(join(fixture.codexHomes[0]!, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: "different-account" } }));
   const drifted = readAndPreflightNativeHistorySourceStaticV1(fixture.stateRoot, changed, fixture.secret);
-  assert.deepEqual(drifted, { state: "invalid", reason: "source_drift" });
+  assert.deepEqual(drifted, { state: "invalid", reason: "authentication_binding_invalid" });
 });
 
 test("native writer census permits only explicit child roots and rejects wrapper argv impersonation", async () => {
@@ -162,14 +163,24 @@ test("native writer census permits only explicit child roots and rejects wrapper
   if (preflight.state !== "ready") return;
   const openPath = join(fixture.sqliteHomes[0]!, "state_5.sqlite");
   privateWrite(openPath, "fixture sqlite marker");
-  const writer = spawn(process.execPath, ["-e", "const fs=require('node:fs');fs.openSync(process.argv[1], 'r+');setInterval(()=>{}, 1000);", openPath], { stdio: "ignore" });
+  const writer = spawn(process.execPath, ["-e", "const fs=require('node:fs');fs.openSync(process.argv[1], 'r+');process.stdout.write('ready');setInterval(()=>{}, 1000);", openPath], { stdio: ["ignore", "pipe", "ignore"] });
   try {
-    await delay(120);
-    const foreign = observeNativeHistoryWritersV1(preflight.binding);
+    await new Promise<void>((resolvePromise, reject) => { writer.stdout!.once("data", () => resolvePromise()); writer.once("error", reject); });
+    let foreign = observeNativeHistoryWritersV1(preflight.binding);
+    const censusDeadline = Date.now() + 15_000;
+    while (!foreign.ok && foreign.reason === "writer_census_failed" && Date.now() < censusDeadline) {
+      await delay(25);
+      foreign = observeNativeHistoryWritersV1(preflight.binding);
+    }
     assert.equal(foreign.ok, false);
     assert.equal(foreign.reason, "foreign_writer");
     assert.equal(foreign.foreignPids.includes(writer.pid!), true);
-    const owned = observeNativeHistoryWritersV1(preflight.binding, [writer.pid!]);
+    let owned = observeNativeHistoryWritersV1(preflight.binding, [writer.pid!]);
+    const ownedDeadline = Date.now() + 15_000;
+    while (!owned.ok && owned.reason === "writer_census_failed" && Date.now() < ownedDeadline) {
+      await delay(25);
+      owned = observeNativeHistoryWritersV1(preflight.binding, [writer.pid!]);
+    }
     assert.equal(owned.ok, true, `the exact child root is allowed to retain its native sqlite handle: ${JSON.stringify(owned)}`);
   } finally {
     writer.kill("SIGTERM");
@@ -181,7 +192,13 @@ test("native writer census permits only explicit child roots and rejects wrapper
   const wrapper = spawn(process.execPath, ["-e", "setInterval(()=>{}, 1000);", "/tmp/codex", "app-server"], { stdio: "ignore" });
   try {
     await delay(80);
-    const observation = observeNativeHistoryWritersV1(preflight.binding);
+    let observation = observeNativeHistoryWritersV1(preflight.binding);
+    const wrapperDeadline = Date.now() + 15_000;
+    while (!observation.ok && observation.reason === "writer_census_failed" && Date.now() < wrapperDeadline) {
+      await delay(25);
+      observation = observeNativeHistoryWritersV1(preflight.binding);
+    }
+    assert.equal(observation.ok, true, `wrapper census failed: ${JSON.stringify(observation)}`);
     assert.equal(observation.foreignPids.includes(wrapper.pid!), false, `Node wrapper was misclassified: ${JSON.stringify(observation)}`);
   } finally {
     wrapper.kill("SIGTERM");
@@ -378,4 +395,41 @@ test("auth companion supports only the exact owner-private manager-local executi
   assert.equal(nativeHistoryEffectiveAuthHomeV1(ready.binding, fixture.accounts[0]!), authHome);
   chmodSync(join(fixture.stateRoot, "accounts", fixture.accounts[0]!), 0o755);
   assert.equal(nativeHistoryBindingSafeV1(ready.binding), false);
+});
+
+for (const isolated of [false, true]) test(`Doctor reconnect preserves both identities (${isolated ? "isolated" : "original"} home)`, async () => {
+  const f = nativeFixture();
+  privateWrite(join(f.stateRoot, "account-router-config.json"), JSON.stringify(f.config));
+  privateWrite(join(f.stateRoot, "control-secret.v1"), f.secret);
+  const auth = (raw: string) => JSON.stringify({ tokens: { account_id: raw, access_token: "fixture-access", refresh_token: "fixture-refresh" } });
+  for (let i = 0; i < f.accounts.length; i++) privateWrite(join(f.codexHomes[i]!, "auth.json"), auth(f.rawAccounts[i]!));
+  let home = f.codexHomes[0]!;
+  if (isolated) {
+    home = realpathSync(mkdtempSync(join(tmpdir(), "reconnect-auth-"))); chmodSync(home, 0o700);
+    privateWrite(join(home, "auth.json"), auth(f.rawAccounts[0]!));
+    const bytes = readFileSync(join(f.stateRoot, "native-history-source.v1.json"));
+    publishPreparedNativeAuthBindingV1(prepareNativeAuthBindingV1({ ...f, expectedSourceFingerprint: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, accounts: [{ opaqueAccountId: f.accounts[0]!, authHome: home }] }));
+  }
+  const source = readFileSync(join(f.stateRoot, "native-history-source.v1.json"));
+  const other = readFileSync(join(f.codexHomes[1]!, "auth.json"));
+  privateWrite(join(home, "auth.json"), auth(f.rawAccounts[1]!));
+  const before = readFileSync(join(home, "auth.json"));
+  const inspection = inspectNativeAuthenticationAtRoot(f.stateRoot);
+  assert.equal(inspection.state, "reconnect_required");
+  assert.deepEqual(inspection.accounts.map(a => a.accountId), [f.accounts[0]]);
+  const input = { root: f.stateRoot, accountId: f.accounts[0]!, expectedFingerprint: inspection.fingerprint };
+  await assert.rejects(reconnectNativeAuthenticationAtRoot({ ...input, login: async staged => { privateWrite(join(staged, "auth.json"), auth(f.rawAccounts[1]!)); } }), /not Account/);
+  assert.deepEqual(readFileSync(join(home, "auth.json")), before);
+  await assert.rejects(reconnectNativeAuthenticationAtRoot({ ...input, login: async () => { throw new Error("cancelled"); } }), /cancelled/);
+  assert.deepEqual(readFileSync(join(home, "auth.json")), before);
+  await assert.rejects(reconnectNativeAuthenticationAtRoot({ ...input, login: async staged => {
+    privateWrite(join(staged, "auth.json"), auth(f.rawAccounts[0]!));
+    privateWrite(join(home, "auth.json"), auth(f.rawAccounts[1]!) + " ");
+  } }), /changed/);
+  const changed = inspectNativeAuthenticationAtRoot(f.stateRoot);
+  const restored = await reconnectNativeAuthenticationAtRoot({ ...input, expectedFingerprint: changed.fingerprint, login: async staged => { privateWrite(join(staged, "auth.json"), auth(f.rawAccounts[0]!)); } });
+  assert.equal(restored.state, "ready");
+  assert.equal(readAndPreflightNativeHistorySourceStaticV1(f.stateRoot, f.config, f.secret).state, "ready");
+  assert.deepEqual(readFileSync(join(f.stateRoot, "native-history-source.v1.json")), source);
+  assert.deepEqual(readFileSync(join(f.codexHomes[1]!, "auth.json")), other);
 });

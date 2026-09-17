@@ -4,6 +4,7 @@ const FORBIDDEN_KEY = /(?:access|refresh|id)_?token|authorization|cookie|secret|
 const FORBIDDEN_VALUE = /(?:bearer\s+|sk-[A-Za-z0-9]|@|\/auth\.json|BEGIN [A-Z ]+PRIVATE KEY)/i;
 
 export type RedactedErrorCode =
+  | "authentication_recovery_required"
   | "invalid_request"
   | "unknown_method"
   | "unknown_thread_owner"
@@ -29,7 +30,7 @@ export function redactedRouterError(id: string | number | null, code: RedactedEr
   return {
     jsonrpc: "2.0",
     id,
-    error: { code: -32080, message: code === "account_history_busy" ? "This account is busy in another app or remote session. Let that work finish or close its session, then Retry." : "Account router request could not be completed", data: { code } },
+    error: { code: -32080, message: code === "balanced_mode_auth_mutation" ? "Use Accounts to reconnect the original account or switch to another saved account. Direct login and logout cannot replace a registered account." : code === "authentication_recovery_required" ? "An account needs to reconnect. Open Tweakers Doctor to restore its login without changing account history." : code === "account_history_busy" ? "This account is busy in another app or remote session. Let that work finish or close its session, then Retry." : "Account router request could not be completed", data: { code } },
   };
 }
 

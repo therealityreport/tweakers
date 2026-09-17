@@ -169,8 +169,9 @@ process.stdin.resume();
 process.stdin.once("data", () => process.exit(1));
 setTimeout(() => process.exit(1), 1000).unref();
 `;
-function buildAccountsBrokerBlockedArgs() {
-    return ["-e", exports.ACCOUNTS_BROKER_BLOCKED_SOURCE];
+function buildAccountsBrokerBlockedArgs(reason = "unavailable") {
+    const safe = /^[a-z_]{1,64}$/.test(reason) ? reason : "unavailable";
+    return ["-e", exports.ACCOUNTS_BROKER_BLOCKED_SOURCE.replace("broker: unavailable", `broker: ${safe}; Open Tweakers Doctor`)];
 }
 /**
  * A derived desktop has its own Codex configuration home, but OpenAI's main
@@ -227,6 +228,14 @@ function installCodexAppServerParent(options = {}) {
     if (!pathExists(bundledNodePath)) {
         return result(false, bundledNodePath, "missing-bundled-node", childProcess);
     }
+    let recoveryReported = false;
+    const reportRecovery = () => { if (!recoveryReported && options.onAuthenticationRecovery) {
+        recoveryReported = true;
+        setImmediate(() => { try {
+            options.onAuthenticationRecovery?.();
+        }
+        catch { } });
+    } };
     const originalSpawn = childProcess.spawn;
     const installed = {
         originalSpawn,
@@ -253,7 +262,7 @@ function installCodexAppServerParent(options = {}) {
                 : router?.kind === "broker"
                     ? buildAccountsBrokerAppServerArgs(router.entrypoint, router.configPath, command, appServerArgs)
                     : router?.kind === "blocked"
-                        ? buildAccountsBrokerBlockedArgs()
+                        ? buildAccountsBrokerBlockedArgs(router.reason)
                         : buildCodexAppServerParentArgs(command, appServerArgs);
             const spawnOptions = sanitizeParentSpawnOptions(maybeOptions, options.secondaryVariant === true, router?.kind === "broker" || router?.kind === "blocked", router?.kind === "broker" ? router.identity : null);
             const bootstrapIdentity = router?.kind === "broker" && !router.identity;
@@ -272,6 +281,28 @@ function installCodexAppServerParent(options = {}) {
                 childArgs,
                 spawnOptions,
             ]);
+            if (router?.kind === "blocked" && router.reason === "authentication_binding_invalid")
+                reportRecovery();
+            if (router?.kind === "broker") {
+                let pending = "";
+                child.stdout?.on("data", (chunk) => {
+                    pending += chunk.toString();
+                    if (pending.length > 1024 * 1024) {
+                        pending = "";
+                        return;
+                    }
+                    let newline;
+                    while ((newline = pending.indexOf("\n")) >= 0) {
+                        const line = pending.slice(0, newline);
+                        pending = pending.slice(newline + 1);
+                        try {
+                            if (JSON.parse(line)?.error?.data?.code === "authentication_recovery_required")
+                                reportRecovery();
+                        }
+                        catch { }
+                    }
+                });
+            }
             installed.children.add(child);
             child.once?.("exit", () => installed.children.delete(child));
             child.once?.("error", () => installed.children.delete(child));
@@ -319,8 +350,11 @@ function accountRouterLaunch(options) {
         return null;
     if (selection.config?.schemaVersion === 3) {
         const entrypoint = options.router?.brokerEntrypointPath ?? (0, node_path_1.join)(__dirname, "account-router", "broker-app-server.js");
-        if (!pathExists(entrypoint) || !(0, app_server_mux_1.preflightRouterHomes)(selection.config, (0, node_path_1.dirname)(configPath)))
-            return { kind: "blocked" };
+        if (!pathExists(entrypoint))
+            return { kind: "blocked", reason: "broker_entrypoint_missing" };
+        const preflight = (0, app_server_mux_1.preflightRouterHomesDetail)(selection.config, (0, node_path_1.dirname)(configPath));
+        if (!preflight.ok)
+            return { kind: "blocked", reason: preflight.reason };
         const identity = options.router?.resolveBrokerDesktopIdentity?.() ?? null;
         return { kind: "broker", entrypoint, configPath, identity: validBrokerDesktopIdentity(identity) ? identity : null };
     }

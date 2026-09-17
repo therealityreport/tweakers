@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { performDirectOfficialUpdate, type DirectOfficialUpdateDeps } from "../src/official-update-download";
+import { prepareOfficialUpdateSource, performDirectOfficialUpdate, type DirectOfficialUpdateDeps } from "../src/official-update-download";
 import type { EnvironmentSelection } from "../src/environment-profile";
 
 const LATEST = { marketingVersion: "26.818.32112", build: "6933" };
@@ -241,5 +241,20 @@ test("the direct install refuses untrusted, mismatched, or oversized archives be
 
     assert.deepEqual(events, [], "no quit, swap, or reopen may run for a refused archive");
     assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8"), liveBefore);
+  } finally { f.cleanup(); }
+});
+
+
+test("Doctor preparation validates and retains upstream without quitting or replacing the live app", async () => {
+  const f = fixture();
+  try {
+    const events: string[] = [];
+    const before = readFileSync(join(f.live, "Contents", "Info.plist"), "utf8");
+    const staged = await prepareOfficialUpdateSource(input(f), { ...passingDeps(events), fetch: fetchServing(f.zip) });
+    assert.deepEqual(events, []);
+    assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8"), before);
+    assert.ok(existsSync(staged));
+    assert.ok(readFileSync(join(staged, "Contents", "Info.plist"), "utf8").includes(LATEST.build));
+    assert.ok(existsSync(join(f.root, "work")), "Caller owns retained preparation output");
   } finally { f.cleanup(); }
 });

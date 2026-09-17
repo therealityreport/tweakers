@@ -1,3 +1,5 @@
+import { prepareProbedAccountsTransferRecovery } from "../accounts-transfer-compatibility.js";
+import type { DoctorPatchRepairV1 } from "../doctor-patch-repair.js";
 import kleur from "kleur";
 import {
   chmodSync,
@@ -107,6 +109,8 @@ import {
 const REQUIRED_TWEAKERS_TWEAKS = new Set(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS);
 
 function verifiedVariantBackend(options: CreateVariantOptions, sourceAppRoot: string): BundledDerivedBackendArtifact | undefined {
+  if (options.retainRegisteredBackend) return verifiedRegisteredBackendForUpstreamCandidate(options, sourceAppRoot);
+  if (options.baselineMaintenance) return verifiedBaselineMaintenance(options, sourceAppRoot).backend;
   if (!options.prebuiltBackend) return undefined;
   const accepted = validatePrebuiltCombinedCandidate(options.prebuiltBackend, {
     installerPayloadHash: installerPayloadHash(),
@@ -120,6 +124,86 @@ function verifiedVariantBackend(options: CreateVariantOptions, sourceAppRoot: st
     receiptPath: accepted.acceptedBuildReceipt.path,
     transactionId: accepted.transactionId,
   };
+}
+
+/** Carry the exact signed, registered resolver into a separately reviewed upstream candidate. */
+function verifiedRegisteredBackendForUpstreamCandidate(options: CreateVariantOptions, source: string): BundledDerivedBackendArtifact {
+  const binding = options.retainRegisteredBackend;
+  const app = "/Applications/Tweakers.app";
+  const variantRoot = join(canonicalTweakersManagerRoot(), "variants", "tweakers");
+  const brokerRoot = defaultTweakersAccountsBrokerRoot();
+  if (!binding || !(options.candidateOnly || options["candidate-only"]) || options.baselineMaintenance || options.prebuiltBackend
+    || (options.app && options.app !== app) || (options.userRoot && options.userRoot !== variantRoot)
+    || (options["user-root"] && options["user-root"] !== variantRoot)
+    || (options.userData && options.userData !== join(variantRoot, "app-data"))
+    || (options["user-data"] && options["user-data"] !== join(variantRoot, "app-data"))) throw new Error("Invalid retained registered backend candidate binding");
+  assertFingerprint(binding.installedFingerprint, "Installed registered backend app");
+  assertFingerprint(binding.sourceFingerprint, "Reviewed upstream source");
+  if (!fingerprintsMatch(binding.installedFingerprint, fingerprintVariantGeneration(app)) || !verifySignature(app).ok
+    || !fingerprintsMatch(binding.sourceFingerprint, fingerprintVariantGeneration(source))) throw new Error("Registered backend app or upstream source changed");
+  assertOfficialSource(source, {});
+  const statePath = join(variantRoot, "state.json");
+  const registrationPath = join(brokerRoot, "shared-native-mode.v1.json");
+  assertPrivateRegularFile(statePath, "Installed registered backend state");
+  assertPrivateRegularFile(registrationPath, "Installed shared native registration");
+  const hash = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+  if (!isSha256(binding.installedStateSha256) || !isSha256(binding.registrationSha256) || !isSha256(binding.backendSha256)
+    || hash(statePath) !== binding.installedStateSha256 || hash(registrationPath) !== binding.registrationSha256) throw new Error("Registered backend state or registration changed");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  if (readPlist(join(app, "Contents", "Info.plist")).CFBundleIdentifier !== TWEAKERS_VARIANT_BUNDLE_ID
+    || state.appRoot !== app || state.patchedAsarHash !== readHeaderHash(join(app, "Contents", "Resources", "app.asar")).headerHash) throw new Error("Installed registered backend identity changed");
+  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), brokerRoot, {}, true);
+  assertRegisteredSharedNativeBackend(app, brokerRoot);
+  const binaryPath = join(app, "Contents", "Resources", "codex");
+  if (hash(binaryPath) !== binding.backendSha256) throw new Error("Registered backend bytes changed");
+  const probe = spawnSync(binaryPath, ["--version"], { encoding: "utf8", timeout: 10_000, env: {} });
+  const version = probe.stdout?.trim().match(/^codex-cli (\S+)$/)?.[1];
+  if (probe.status !== 0 || !version) throw new Error("Registered backend version unavailable");
+  return { binaryPath, version, fingerprint: binding.backendSha256, receiptPath: statePath, transactionId: "retained-registered-upstream-candidate", preserveSignature: true };
+}
+
+/** Maintenance is not an upstream update: prove the exact original source and retain the signed backend bytes. */
+function verifiedBaselineMaintenance(options: CreateVariantOptions, source: string): { backend: BundledDerivedBackendArtifact; receipt?: TweakersVariantCandidateReceipt } {
+  const binding = options.baselineMaintenance;
+  const app = "/Applications/Tweakers.app", root = canonicalTweakersManagerRoot();
+  const variantRoot = join(root, "variants", "tweakers");
+  if (!binding || (options.app && options.app !== app) || options.prebuiltBackend) throw new Error("Invalid baseline maintenance binding");
+  assertFingerprint(binding.installedFingerprint, "Installed maintenance baseline");
+  if (!fingerprintsMatch(binding.installedFingerprint, fingerprintVariantGeneration(app)) || !verifySignature(app).ok) throw new Error("Installed maintenance baseline changed");
+  const statePath = join(variantRoot, "state.json");
+  assertPrivateRegularFile(statePath, "Installed maintenance state");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  const installedInfo = readPlist(join(app, "Contents", "Info.plist")), sourceInfo = readPlist(join(source, "Contents", "Info.plist"));
+  if (installedInfo.CFBundleIdentifier !== TWEAKERS_VARIANT_BUNDLE_ID || state.appRoot !== app
+    || state.patchedAsarHash !== readHeaderHash(join(app, "Contents", "Resources", "app.asar")).headerHash
+    || state.originalAsarHash !== readHeaderHash(join(source, "Contents", "Resources", "app.asar")).headerHash
+    || sourceInfo.CFBundleShortVersionString !== installedInfo.CFBundleShortVersionString
+    || sourceInfo.CFBundleVersion !== installedInfo.CFBundleVersion) throw new Error("Maintenance cannot change the installed upstream baseline");
+  assertOfficialSource(source, {});
+  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), defaultTweakersAccountsBrokerRoot(), {}, true);
+  const binaryPath = join(app, "Contents", "Resources", "codex");
+  const versionProbe = spawnSync(binaryPath, ["--version"], { encoding: "utf8", timeout: 10_000, env: {} });
+  const version = versionProbe.stdout?.trim().match(/^codex-cli (\S+)$/)?.[1];
+  if (versionProbe.status !== 0 || !version) throw new Error("Installed maintenance backend version is unavailable");
+  const backend: BundledDerivedBackendArtifact = { binaryPath, version, fingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"), receiptPath: statePath, transactionId: "retained-installed-baseline", preserveSignature: true };
+  if (!binding.candidatePackage) return { backend };
+  const candidatePackage = resolve(binding.candidatePackage);
+  const expected = binding.candidateReceipt;
+  if (!expected) throw new Error("Maintenance requires the exact prepared receipt");
+  const receipt = verifyTweakersVariantCandidateReceipt(candidatePackage, { expectedPackageRoot: candidatePackage,
+    expectedObservedPackageRoot: candidatePackage, expectedSigningIdentityHash: state.signingIdentityHash,
+    expectedTransactionId: expected.id, expectedSource: expected.source, expectedIdentity: expected.identity });
+  const candidateInfo = readPlist(join(candidatePackage, "Tweakers.app", "Contents", "Info.plist"));
+  const candidateState = JSON.parse(readFileSync(join(candidatePackage, "state.json"), "utf8"));
+  if (candidateInfo.CFBundleVersion !== installedInfo.CFBundleVersion
+    || candidateInfo.CFBundleShortVersionString !== installedInfo.CFBundleShortVersionString
+    || candidateState.originalAsarHash !== state.originalAsarHash) throw new Error("Maintenance candidate changed the installed upstream baseline");
+  if (receipt.source.path !== source || receipt.identity.appTarget !== app || receipt.identity.userRoot !== variantRoot
+    || receipt.identity.appUserDataRoot !== join(variantRoot, "app-data") || receipt.identity.codexHomeRoot !== join(variantRoot, "codex-home")
+    || receipt.identity.accountsBrokerRoot !== defaultTweakersAccountsBrokerRoot()
+    || !fingerprintsMatch(receipt.source.fingerprint, fingerprintVariantGeneration(source))
+    || createHash("sha256").update(readFileSync(join(candidatePackage, "Tweakers.app", "Contents", "Resources", "codex"))).digest("hex") !== backend.fingerprint) throw new Error("Maintenance candidate changed its baseline or backend");
+  return { backend, receipt };
 }
 
 /** A future refresh must not replace a registered resolver with the stock backend. */
@@ -141,17 +225,32 @@ function assertRegisteredSharedNativeBackend(candidate: string, accountsBrokerRo
 }
 
 export interface CreateVariantOptions {
+  /** Internal, candidate-only, data-only verified repair adapters. */
+  doctorPatchRepairs?: DoctorPatchRepairV1[];
+  /** Frozen configuration captured by Doctor, sealed into the candidate receipt. */
+  doctorConfiguration?: Record<string, unknown>;
+  /** Explicit candidate-only UI setting, sealed into its configuration artifact. */
+  doctorTitlebarEnabled?: boolean;
   source?: string;
   app?: string;
   /** Build a private, inspectable package and deliberately stop before promotion. */
   candidateOnly?: boolean;
+  /** Doctor-only disposable home. Never valid for installation or promotion. */
+  doctorPreviewHome?: string;
   "candidate-only"?: boolean;
   /** Required private package root for --candidate-only. It must not exist yet. */
   output?: string;
   /** Source-validated retained recovery artifact, prepared before candidate sealing. */
   accountsTransferRecovery?: { root: string; validation: AccountsTransferValidationEvidence };
+  doctorAccountsRecoveryRoot?: string;
   /** Internal accepted-build input, verified against this exact official source and runtime. */
   prebuiltBackend?: PrebuiltCombinedCandidateInput;
+  /** Internal post-change maintenance only: exact installed app, unchanged upstream and backend. */
+  baselineMaintenance?: { installedFingerprint: VariantGenerationFingerprint; candidatePackage?: string; candidateReceipt?: TweakersVariantCandidateReceipt };
+  /** Internal candidate-only upstream update; normal Doctor approval is still required for promotion. */
+  retainRegisteredBackend?: { installedFingerprint: VariantGenerationFingerprint; sourceFingerprint: VariantGenerationFingerprint;
+    installedStateSha256: string; registrationSha256: string; backendSha256: string };
+
   userRoot?: string;
   "user-root"?: string;
   userData?: string;
@@ -461,6 +560,18 @@ export async function createTweakersVariant(
   }
 
   const candidateOnly = options.candidateOnly === true || options["candidate-only"] === true;
+  if (options.doctorPreviewHome) {
+    const home = resolve(options.doctorPreviewHome), jobs = join(canonicalTweakersManagerRoot(), "doctor", "jobs");
+    if (!candidateOnly || options.refresh || !home.startsWith(`${jobs}/`) || !/\/previews\/[a-f0-9-]{36}\/home$/.test(home)
+      || !options.userRoot || !resolve(options.userRoot).startsWith(`${home}/`) || !options.app || !resolve(options.app).startsWith(`${home}/`)
+      || options.retainRegisteredBackend || options.prebuiltBackend || options.baselineMaintenance) throw new Error("Doctor preview requires disposable candidate-only identities");
+    assertNoSymlinkPathWithin(jobs, home, "Doctor preview home");
+  }
+  if ((options.doctorPatchRepairs || options.doctorConfiguration) && !candidateOnly) throw new Error("Doctor inputs require isolated candidate preparation");
+  if (options.doctorTitlebarEnabled !== undefined && (!candidateOnly || typeof options.doctorTitlebarEnabled !== "boolean")) throw new Error("Titlebar override requires candidate-only preparation");
+  if (options.retainRegisteredBackend && (!candidateOnly || options.baselineMaintenance || options.prebuiltBackend)) {
+    throw new Error("Retaining the registered backend requires an exclusive candidate-only request");
+  }
   if (candidateOnly) {
     if (options.refresh === true) {
       throw new Error("A candidate-only variant cannot refresh or promote an installed Tweakers app.");
@@ -510,6 +621,30 @@ export async function createTweakersVariant(
   const codexHomeRoot = join(userRoot, "codex-home");
   const accountsBrokerRoot = defaultTweakersAccountsBrokerRoot((deps.home ?? homedir)());
   const refresh = options.refresh === true;
+  // Every production independent refresh consumes the exact Doctor-reviewed
+  // package; callers cannot bypass review by using the old rebuild command.
+  let reviewed: { receipt: TweakersVariantCandidateReceipt; candidatePackage: string; revalidate(): void } | null = null;
+  if (refresh && target === "/Applications/Tweakers.app") {
+    if (options.baselineMaintenance) {
+      const check = () => verifiedBaselineMaintenance(options, source);
+      const checked = check();
+      if (!checked.receipt || !options.baselineMaintenance.candidatePackage) throw new Error("Baseline maintenance requires a verified candidate package");
+      reviewed = { receipt: checked.receipt, candidatePackage: options.baselineMaintenance.candidatePackage,
+        revalidate() { if (JSON.stringify(check().receipt) !== JSON.stringify(checked.receipt)) throw new Error("Baseline maintenance candidate changed"); } };
+    } else {
+      const { consumeDoctorCandidateApproval, verifyDoctorCandidate } = await import("../doctor-approval.js");
+      const { assertDoctorAdoptionReady } = await import("../doctor-adoption.js");
+      const { doctorImplementationScopes } = await import("../doctor-implementation.js");
+      const checked = consumeDoctorCandidateApproval(managerRoot, options.runtimeReadyOperationId);
+      reviewed = { receipt: checked.receipt, candidatePackage: checked.job.candidatePackage!, revalidate() {
+        if (doctorImplementationScopes().promotion !== checked.promotionFingerprint) throw new Error("Promotion implementation changed before cutover");
+        const fresh = verifyDoctorCandidate(managerRoot);
+        if (assertDoctorAdoptionReady(managerRoot, fresh.job).fingerprint !== checked.adoptionFingerprint || fresh.job.id !== checked.job.id || JSON.stringify(fresh.receipt) !== JSON.stringify(checked.receipt)) throw new Error("Reviewed candidate changed before promotion");
+      } };
+    }
+  }
+  if (reviewed && (reviewed.receipt.source.path !== source || reviewed.receipt.identity.userRoot !== userRoot
+    || reviewed.receipt.identity.appUserDataRoot !== appUserDataRoot)) throw new Error("Reviewed candidate target or source changed");
   const deferRuntimeReadyCommit = options.deferRuntimeReadyCommit === true;
   if (deferRuntimeReadyCommit && !refresh) {
     throw new Error("Deferred runtime-ready commit is valid only for an independent Tweakers refresh.");
@@ -581,7 +716,7 @@ export async function createTweakersVariant(
           }
         }
         assertOfficialSource(source, deps);
-        (deps.cloneApp ?? cloneAppTree)(source, candidate);
+        (deps.cloneApp ?? cloneAppTree)(reviewed ? join(reviewed.candidatePackage, "Tweakers.app") : source, candidate);
         if (registeredOfficialSourceRoot !== null) {
           const after = readRegisteredOfficialSource(registeredOfficialSourceRoot);
           if (after.state !== "ready"
@@ -594,6 +729,13 @@ export async function createTweakersVariant(
         sealedSourceLease?.release();
         registeredSourceLease?.release();
       }
+      if (reviewed) {
+        for (const [name, destination] of [["runtime", buildPaths.runtime], ["tweaks", buildPaths.tweaks], ["state.json", buildPaths.stateFile], ["config.json", buildPaths.configFile]] as const) {
+          const key = name === "state.json" ? "state" : name === "config.json" ? "config" : name;
+          copyReviewedVariantArtifact(join(reviewed.candidatePackage, name), destination, reviewed.receipt.artifacts[key]);
+        }
+        if (fingerprintVariantGeneration(candidate).sha256 !== reviewed.receipt.artifacts.app.sha256) throw new Error("Copied Doctor candidate changed");
+      } else {
       await (deps.installApp ?? install)({
         app: candidate,
         fuse: false,
@@ -601,10 +743,11 @@ export async function createTweakersVariant(
         localSigning: true,
         macAppIdentity: defaultTweakersVariantIdentity(appUserDataRoot, userRoot, accountsBrokerRoot),
         candidateContext: { paths: buildPaths, finalUserRoot: userRoot,
-          ...(options.prebuiltBackend ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
+          ...((options.prebuiltBackend || options.baselineMaintenance) ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
       });
       (deps.stageTweaks ?? stageBundledTweaks)(buildPaths.tweaks, buildPaths.runtime);
-      if (options.accountsTransferRecovery) prepareAccountsTransferRecovery({ runtimeRoot: buildPaths.runtime, recoveryRoot: options.accountsTransferRecovery.root, validation: options.accountsTransferRecovery.validation });
+      }
+      if (options.accountsTransferRecovery && !reviewed) prepareAccountsTransferRecovery({ runtimeRoot: buildPaths.runtime, recoveryRoot: options.accountsTransferRecovery.root, validation: options.accountsTransferRecovery.validation });
       assertAccountsTransferRuntimeCompatible(buildPaths.runtime, [accountsBrokerRoot]);
       assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot);
       verifyCreatedVariant(
@@ -614,9 +757,19 @@ export async function createTweakersVariant(
         codexHomeRoot,
         accountsBrokerRoot,
         deps,
-        false,
+        reviewed !== null,
+        reviewed ? target : candidate,
       );
-      prepareFinalVariantState(buildPaths, userRoot, target, id, deps);
+      if (!reviewed) prepareFinalVariantState(buildPaths, userRoot, target, id, deps);
+      reviewed?.revalidate();
+      // Revalidate canonical official identity before the callback may close Tweakers.
+      assertNoSymlinkPathWithin((deps.home ?? homedir)(), managerRoot, "Canonical manager root");
+      managerEnvironmentPublication = (
+        deps.bootstrapManagerEnvironment ?? bootstrapCanonicalManagerEnvironmentSnapshot
+      )({
+        sourceRoot: environmentAuthoritySourceRoot,
+        destinationRoot: managerRoot,
+      });
       try {
         await deps.beforePromotion?.({ target, candidate, userRoot });
       } catch (error) {
@@ -627,6 +780,13 @@ export async function createTweakersVariant(
       // at this boundary, after staging and before either app is promoted.
       assertIndependentTweakersAccountsRegistration(accountsBrokerRoot);
       assertTargetNotRunning(target, deps);
+      if (reviewed) {
+        // Nothing may rewrite the sealed choices between review and promotion.
+        for (const [key, path] of [["app", candidate], ["runtime", buildPaths.runtime], ["tweaks", buildPaths.tweaks], ["state", buildPaths.stateFile], ["config", buildPaths.configFile]] as const) {
+          if (!fingerprintsMatch(fingerprintVariantGeneration(path), reviewed.receipt.artifacts[key])) throw new Error(`Reviewed staged ${key} changed before promotion`);
+        }
+        reviewed.revalidate();
+      }
       promotion = new VariantPromotion({
         build: buildPaths,
         userRoot,
@@ -645,13 +805,6 @@ export async function createTweakersVariant(
         deps,
         true,
       );
-      assertNoSymlinkPathWithin((deps.home ?? homedir)(), managerRoot, "Canonical manager root");
-      managerEnvironmentPublication = (
-        deps.bootstrapManagerEnvironment ?? bootstrapCanonicalManagerEnvironmentSnapshot
-      )({
-        sourceRoot: environmentAuthoritySourceRoot,
-        destinationRoot: managerRoot,
-      });
       managerPublication = publishManagerAfterVariantPromotion(managerRoot, deps);
       // Keep manager publication inside the promotion's compensating window:
       // a later failure restores both variant state and the previous manager
@@ -860,6 +1013,7 @@ async function createTweakersVariantCandidateOnly(
     ? readCandidateSealedSource(sealedEnvironmentRoot!, deps)
     : null;
   const source = resolve(options.source ?? deps.defaultSource?.() ?? initialSealedReceipt!.roles.inactive.appPath);
+  if (options.retainRegisteredBackend) verifiedRegisteredBackendForUpstreamCandidate(options, source);
   const target = resolve(options.app ?? "/Applications/Tweakers.app");
   const userRoot = resolve(
     options.userRoot
@@ -872,7 +1026,7 @@ async function createTweakersVariantCandidateOnly(
       ?? join(userRoot, "app-data"),
   );
   const codexHomeRoot = join(userRoot, "codex-home");
-  const accountsBrokerRoot = defaultTweakersAccountsBrokerRoot((deps.home ?? homedir)());
+  const accountsBrokerRoot = defaultTweakersAccountsBrokerRoot(options.doctorPreviewHome ?? (deps.home ?? homedir)());
   const output = resolve(options.output);
   const id = (deps.id ?? randomUUID)();
   assertVariantPromotionId(id);
@@ -945,14 +1099,21 @@ async function createTweakersVariantCandidateOnly(
       macAppIdentity: defaultTweakersVariantIdentity(appUserDataRoot, userRoot, accountsBrokerRoot),
       // This is an embedded runtime identity string only. install() uses
       // candidateContext paths for every filesystem mutation in this mode.
-      candidateContext: { paths: candidatePaths, finalUserRoot: userRoot,
-        ...(options.prebuiltBackend ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
+      candidateContext: { paths: candidatePaths, finalUserRoot: userRoot, doctorPatchRepairs: options.doctorPatchRepairs,
+        ...((options.prebuiltBackend || options.baselineMaintenance || options.retainRegisteredBackend) ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
     });
     assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
     (deps.stageTweaks ?? stageBundledTweaks)(candidatePaths.tweaks, candidatePaths.runtime);
+    if (options.doctorAccountsRecoveryRoot) prepareProbedAccountsTransferRecovery(candidatePaths.runtime, options.doctorAccountsRecoveryRoot);
     if (options.accountsTransferRecovery) prepareAccountsTransferRecovery({ runtimeRoot: candidatePaths.runtime, recoveryRoot: options.accountsTransferRecovery.root, validation: options.accountsTransferRecovery.validation });
     assertAccountsTransferRuntimeCompatible(candidatePaths.runtime, [accountsBrokerRoot]);
     assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot);
+    if (options.retainRegisteredBackend) {
+      verifiedRegisteredBackendForUpstreamCandidate(options, source);
+      const installedState = JSON.parse(readFileSync(join(canonicalTweakersManagerRoot(), "variants", "tweakers", "state.json"), "utf8"));
+      const candidateState = JSON.parse(readFileSync(candidatePaths.stateFile, "utf8"));
+      if (candidateState.signingIdentityHash !== installedState.signingIdentityHash) throw new Error("Retained backend candidate signing identity changed");
+    }
     verifyCreatedVariant(
       candidate,
       candidatePaths.stateFile,
@@ -962,7 +1123,15 @@ async function createTweakersVariantCandidateOnly(
       deps,
       false,
     );
-    prepareCandidateOnlyVariantState(candidatePaths, target, id, deps);
+    prepareCandidateOnlyVariantState(candidatePaths, target, id, deps, options.doctorTitlebarEnabled);
+    if (options.doctorConfiguration) {
+      const config = structuredClone(options.doctorConfiguration);
+      if (options.doctorTitlebarEnabled !== undefined) (config.tweaks as Record<string, {enabled: boolean}>)["co.tweakers.titlebar-controls"]!.enabled = options.doctorTitlebarEnabled;
+      writeJsonAtomic(candidatePaths.configFile, config, id, deps, "candidate-only:frozen-config");
+      const state = JSON.parse(readFileSync(candidatePaths.stateFile, "utf8"));
+      state.doctorConfigurationSha256 = createHash("sha256").update(JSON.stringify(config)).digest("hex");
+      writeJsonAtomic(candidatePaths.stateFile, state, id, deps, "candidate-only:frozen-config-binding");
+    }
     verifyCreatedVariant(
       candidate,
       candidatePaths.stateFile,
@@ -1272,6 +1441,7 @@ function prepareCandidateOnlyVariantState(
   target: string,
   id: string,
   deps: CreateVariantDeps,
+  titlebarEnabled?: boolean,
 ): void {
   const state = JSON.parse(readFileSync(paths.stateFile, "utf8")) as Record<string, unknown>;
   state.appRoot = target;
@@ -1280,6 +1450,11 @@ function prepareCandidateOnlyVariantState(
   // Candidate-only preparation must not read production config: those values
   // are identity inputs only, never a source of mutable live state.
   enableAllBundledTweaks(paths.configFile, null, paths.tweaks, id, deps);
+  if (titlebarEnabled !== undefined) {
+    const config = JSON.parse(readFileSync(paths.configFile, "utf8"));
+    config.tweaks["co.tweakers.titlebar-controls"].enabled = titlebarEnabled;
+    writeJsonAtomic(paths.configFile, config, id, deps, "candidate-only:titlebar");
+  }
 }
 
 function createTweakersVariantCandidateReceipt(input: {
@@ -1664,18 +1839,20 @@ function assertCandidateReceiptSemanticBindings(
     throw new Error("Candidate receipt staged state binding is inconsistent.");
   }
   const config = JSON.parse(readFileSync(join(packageRoot, VARIANT_CANDIDATE_ARTIFACT_PATHS.config), "utf8")) as Record<string, unknown>;
-  if (Object.keys(config).sort().join(",") !== "tweaks" || !config.tweaks || typeof config.tweaks !== "object" || Array.isArray(config.tweaks)) {
+  const frozenConfiguration = state.doctorConfigurationSha256 !== undefined;
+  if (frozenConfiguration && state.doctorConfigurationSha256 !== createHash("sha256").update(JSON.stringify(config)).digest("hex")) throw new Error("Candidate frozen configuration binding changed");
+  if ((!frozenConfiguration && Object.keys(config).sort().join(",") !== "tweaks") || !config.tweaks || typeof config.tweaks !== "object" || Array.isArray(config.tweaks)) {
     throw new Error("Candidate-only config is not derived from a null live configuration.");
   }
   const tweaks = config.tweaks as Record<string, unknown>;
-  if (Object.keys(tweaks).sort().join(",") !== [...REQUIRED_TWEAKERS_TWEAKS].sort().join(",")) {
+  if (!frozenConfiguration && Object.keys(tweaks).sort().join(",") !== [...REQUIRED_TWEAKERS_TWEAKS].sort().join(",")) {
     throw new Error("Candidate-only config does not contain exactly the bundled tweak map.");
   }
   for (const id of REQUIRED_TWEAKERS_TWEAKS) {
     const setting = tweaks[id];
     if (!setting || typeof setting !== "object" || Array.isArray(setting)
-      || Object.keys(setting as Record<string, unknown>).sort().join(",") !== "enabled"
-      || (setting as Record<string, unknown>).enabled !== true) {
+      || (!frozenConfiguration && Object.keys(setting as Record<string, unknown>).sort().join(",") !== "enabled")
+      || ((setting as Record<string, unknown>).enabled !== true && !(id === "co.tweakers.titlebar-controls" && (setting as Record<string, unknown>).enabled === false))) {
       throw new Error(`Candidate-only config does not enable bundled tweak ${id}.`);
     }
   }
@@ -2362,7 +2539,7 @@ function stageIndependentTweakersRuntimeReadyExpectation(input: {
     accountsBrokerRoot: resolve(input.accountsBrokerRoot),
     brokerAuthorityExpectation,
     appearanceExpectation: { status: "normal", normalized: true },
-    expectedTweakIds: [...REQUIRED_TWEAKERS_TWEAKS].sort(),
+    expectedTweakIds: expectedEnabledCandidateTweaks(join(input.userRoot, "config.json")),
     createdAt: new Date().toISOString(),
   };
   assertIndependentTweakersRuntimeReadyExpectation(expectation);
@@ -2491,7 +2668,7 @@ function assertIndependentTweakersRuntimeReadyExpectation(
     || !isCanonicalAbsolutePath(String(expectation.accountsBrokerRoot ?? ""))
     || !isIndependentTweakersBrokerAuthorityExpectation(expectation.brokerAuthorityExpectation)
     || !isIndependentTweakersRuntimeReadyAppearanceBinding(expectation.appearanceExpectation)
-    || !sameSortedStringSet(expectation.expectedTweakIds, [...REQUIRED_TWEAKERS_TWEAKS])
+    || !isSupportedEnabledTweakSet(expectation.expectedTweakIds)
     || !isValidRfc3339(expectation.createdAt)) {
     throw new Error("Independent Tweakers runtime-ready expectation has an invalid schema.");
   }
@@ -2528,7 +2705,7 @@ function assertIndependentTweakersRuntimeReadyReceipt(
     || receipt.preloadInitialized !== true
     || receipt.settingsMounted !== true
     || !["connected", "blocked"].includes(String(receipt.sharedHistoryBrokerState ?? ""))
-    || !sameSortedStringSet(receipt.initializedTweakIds, [...REQUIRED_TWEAKERS_TWEAKS])
+    || !isSupportedEnabledTweakSet(receipt.initializedTweakIds)
     || !isValidRfc3339(receipt.observedAt)) {
     throw new Error("Independent Tweakers runtime-ready receipt has an invalid schema.");
   }
@@ -2600,6 +2777,22 @@ function writeVariantPromotionJournal(
   deps: Pick<CreateVariantDeps, "onDurableBoundary"> = {},
 ): void {
   writePrivateJsonAtomic(path, journal, deps);
+}
+
+/** Preserve the sealed package's directory modes and literal link targets. */
+export function copyReviewedVariantArtifact(source: string, destination: string, expected: VariantGenerationFingerprint): void {
+  cpSync(source, destination, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true, dereference: false, verbatimSymlinks: true });
+  preserveCopiedDirectoryModes(source, destination);
+  if (!fingerprintsMatch(fingerprintVariantGeneration(destination), expected)) throw new Error(`Copied candidate artifact changed: ${basename(source)}`);
+}
+
+function preserveCopiedDirectoryModes(source: string, destination: string): void {
+  const sourceStat = lstatSync(source);
+  if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) return;
+  const destinationStat = lstatSync(destination);
+  if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) throw new Error("Copied artifact directory identity changed");
+  for (const name of readdirSync(source)) preserveCopiedDirectoryModes(join(source, name), join(destination, name));
+  chmodSync(destination, permissionBits(sourceStat));
 }
 
 /** A deterministic no-follow hash for the staged immutable variant generations. */
@@ -3438,17 +3631,7 @@ export function prepareDeferredTweakersRuntimeRepair(
         }
         if (!existsNoFollow(nextApp)) {
           cpSync(combined.sourceAppRoot, nextApp, { recursive: true, dereference: false, verbatimSymlinks: true, errorOnExist: true, force: false });
-          // Node preserves file modes but creates directories with default
-          // permissions. Restore only real staged directories, never links.
-          const preserveDirectoryModes = (source: string, destination: string): void => {
-            const sourceStat = lstatSync(source);
-            if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) return;
-            const destinationStat = lstatSync(destination);
-            if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) throw new Error("Combined app copy directory identity changed");
-            for (const name of readdirSync(source)) preserveDirectoryModes(join(source, name), join(destination, name));
-            chmodSync(destination, permissionBits(sourceStat));
-          };
-          preserveDirectoryModes(combined.sourceAppRoot, nextApp);
+          preserveCopiedDirectoryModes(combined.sourceAppRoot, nextApp);
           fsyncGeneration(nextApp, deps);
         }
         assertArtifactPresent(nextApp, combined.expectedSourceAppFingerprint, "staged combined app");
@@ -3871,7 +4054,7 @@ function verifyCreatedVariant(
   }
   if (expectEnabled) {
     const config = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8")) as { tweaks?: Record<string, { enabled?: unknown }> };
-    if ([...REQUIRED_TWEAKERS_TWEAKS].some((id) => config.tweaks?.[id]?.enabled !== true)) {
+    if ([...REQUIRED_TWEAKERS_TWEAKS].some((id) => config.tweaks?.[id]?.enabled !== true && !(id === "co.tweakers.titlebar-controls" && config.tweaks?.[id]?.enabled === false))) {
       throw new Error("Created variant did not enable every bundled tweak.");
     }
   }
@@ -3932,4 +4115,33 @@ function bundledTweakIds(root: string): Set<string> {
     if (typeof parsed.id === "string") ids.add(parsed.id);
   }
   return ids;
+}
+
+/** Re-seal one supported UI setting in an already verified disposable candidate. */
+export function setDoctorCandidateTitlebarEnabled(packageRoot: string, expected: TweakersVariantCandidateReceipt, enabled: boolean): TweakersVariantCandidateReceipt {
+  const jobs = join(canonicalTweakersManagerRoot(), "doctor", "jobs");
+  if (!packageRoot.startsWith(`${jobs}/`) || !/^[a-f0-9-]{36}\/candidate$/.test(packageRoot.slice(jobs.length + 1)) || typeof enabled !== "boolean") throw new Error("Titlebar setting requires an owned Doctor candidate");
+  const signing = findExistingPreparedSigningIdentity();
+  const verify = (receipt: TweakersVariantCandidateReceipt) => verifyTweakersVariantCandidateReceipt(packageRoot, { expectedSigningIdentityHash: signing.hash,
+    expectedTransactionId: receipt.id, expectedPackageRoot: packageRoot, expectedObservedPackageRoot: packageRoot, expectedSource: receipt.source, expectedIdentity: receipt.identity });
+  if (JSON.stringify(verify(expected)) !== JSON.stringify(expected)) throw new Error("Candidate changed before applying its titlebar setting");
+  const configPath = join(packageRoot, "config.json"), config = JSON.parse(readFileSync(configPath, "utf8"));
+  config.tweaks["co.tweakers.titlebar-controls"].enabled = enabled;
+  writePrivateJsonAtomic(configPath, config, {});
+  const statePath = join(packageRoot, "state.json"), state = JSON.parse(readFileSync(statePath, "utf8"));
+  if (state.doctorConfigurationSha256 !== undefined) {
+    state.doctorConfigurationSha256 = createHash("sha256").update(JSON.stringify(config)).digest("hex");
+    writePrivateJsonAtomic(statePath, state, {});
+  }
+  const receipt = { ...expected, artifacts: { ...expected.artifacts, config: fingerprintVariantGeneration(configPath), state: fingerprintVariantGeneration(statePath) } };
+  writeTweakersVariantCandidateReceipt(packageRoot, receipt, signing, candidateReceiptSignatureAdapter({}), {});
+  return verify(receipt);
+}
+
+function isSupportedEnabledTweakSet(value: unknown): boolean {
+  return sameSortedStringSet(value, [...REQUIRED_TWEAKERS_TWEAKS]) || sameSortedStringSet(value, [...REQUIRED_TWEAKERS_TWEAKS].filter(id => id !== "co.tweakers.titlebar-controls"));
+}
+function expectedEnabledCandidateTweaks(configPath: string): string[] {
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  return [...REQUIRED_TWEAKERS_TWEAKS].filter(id => id !== "co.tweakers.titlebar-controls" || config.tweaks?.[id]?.enabled !== false).sort();
 }

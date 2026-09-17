@@ -1,4 +1,5 @@
 import { type HistoryAdoptionFailure } from "./history-adoption";
+import { type NativeHistorySourceFailureV1 } from "./native-history";
 import type { RouterConfig } from "./types";
 interface SharedSkillsTreeEntryV1 {
     path: string;
@@ -63,7 +64,7 @@ export declare function preflightRouterHomesDetail(config: RouterConfig, stateRo
     ok: true;
 } | {
     ok: false;
-    reason: HistoryAdoptionFailure | "startup_selfcheck_failed";
+    reason: HistoryAdoptionFailure | NativeHistorySourceFailureV1 | "startup_selfcheck_failed";
 };
 /**
  * Materialize the sealed manager-global Skills source into a brand-new,

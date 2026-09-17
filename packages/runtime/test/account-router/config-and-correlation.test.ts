@@ -146,3 +146,19 @@ test("control output rejects secret-shaped keys and values while retaining opaqu
   assert.equal(status.includes("accessToken"), false);
   assert.deepEqual(redactedRouterError(1, "pool_depleted").error.data, { code: "pool_depleted" });
 });
+
+test("Doctor synthetic checks exercise production routing without accounts or turn execution", async () => {
+  const {runDoctorProtocolAdapterChecks} = await import("../../src/account-router/doctor-protocol-checks");
+  const results = runDoctorProtocolAdapterChecks([
+    {method: "account/read", direction: "client"},
+    {method: "thread/list", direction: "client"},
+    {method: "turn/interrupt", direction: "client"},
+    {method: "account/chatgptAuthTokens/refresh", direction: "server"},
+    {method: "item/commandExecution/requestApproval", direction: "server"},
+    {method: "thread/tokenUsage/updated", direction: "notification"},
+    {method: "account/rateLimits/updated", direction: "notification"},
+  ]);
+  assert.equal(results.length, 7);
+  assert.ok(results.every(result => result.passed), JSON.stringify(results));
+  assert.equal(runDoctorProtocolAdapterChecks([{method: "future/unknown", direction: "client"}])[0]!.passed, false);
+});

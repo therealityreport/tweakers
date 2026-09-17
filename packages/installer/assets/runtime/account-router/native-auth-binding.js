@@ -4,8 +4,10 @@ exports.NATIVE_AUTH_BINDING_FILE_V1 = void 0;
 exports.readNativeAuthPrivateFileV1 = readNativeAuthPrivateFileV1;
 exports.readNativeExternalTokensV1 = readNativeExternalTokensV1;
 exports.readNativeAuthBindingV1 = readNativeAuthBindingV1;
+exports.readNativeAuthBindingAuthorityV1 = readNativeAuthBindingAuthorityV1;
 exports.prepareNativeAuthBindingV1 = prepareNativeAuthBindingV1;
 exports.publishPreparedNativeAuthBindingV1 = publishPreparedNativeAuthBindingV1;
+const persistent_directory_identity_1 = require("./persistent-directory-identity");
 const node_crypto_1 = require("node:crypto");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
@@ -100,6 +102,13 @@ function readNativeExternalTokensV1(home, entry, secret) {
 }
 /** Absence preserves legacy auth. Malformed or changed companions fail closed. */
 function readNativeAuthBindingV1(stateRoot, source, secret) {
+    const binding = readNativeAuthBindingAuthorityV1(stateRoot, source, secret);
+    for (const entry of binding?.document.accounts ?? [])
+        proveIdentity(entry.authHome, entry, secret);
+    return binding;
+}
+/** Recovery-only authority. Verifies signatures and paths, never claims credentials are valid. */
+function readNativeAuthBindingAuthorityV1(stateRoot, source, secret) {
     const path = (0, node_path_1.join)(stateRoot, exports.NATIVE_AUTH_BINDING_FILE_V1);
     try {
         (0, node_fs_1.lstatSync)(path);
@@ -143,12 +152,11 @@ function readNativeAuthBindingV1(stateRoot, source, secret) {
             sourceBytes.fill(0);
         }
         for (const entry of entries) {
-            if (encode(entry.authHomeIdentity) !== encode(directory(entry.authHome))
+            if (!(0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot, secret, path: entry.authHome, expected: entry.authHomeIdentity, authorityFile: exports.NATIVE_AUTH_BINDING_FILE_V1, accountId: entry.opaqueAccountId })
                 || source.accounts.some((a) => overlaps(entry.authHome, a.codexHome) || overlaps(entry.authHome, a.sqliteHome))
                 || !authHomeLocationSafe(entry.authHome, stateRoot, entry.opaqueAccountId)
                 || entries.some((other) => other !== entry && overlaps(other.authHome, entry.authHome)))
                 return fail();
-            proveIdentity(entry.authHome, entry, secret);
         }
         return { document: { ...unsigned, signature: value.signature }, fingerprint: digest(bytes) };
     }
@@ -163,6 +171,8 @@ const prepared = new WeakMap();
 /** Offline-only preparation. No original credentials are read and no source document is rewritten. */
 function prepareNativeAuthBindingV1(input) {
     directory(input.stateRoot);
+    if ((0, node_fs_1.existsSync)((0, node_path_1.join)(input.stateRoot, persistent_directory_identity_1.PERSISTENT_IDENTITIES_JOURNAL)))
+        return fail();
     try {
         (0, node_fs_1.lstatSync)((0, node_path_1.join)(input.stateRoot, exports.NATIVE_AUTH_BINDING_FILE_V1));
         return fail();
@@ -182,7 +192,7 @@ function prepareNativeAuthBindingV1(input) {
             for (const [path, expected] of [[account.codexHome, account.codexHomeIdentity], [account.sqliteHome, account.sqliteHomeIdentity]]) {
                 const stat = (0, node_fs_1.lstatSync)(path);
                 if ((0, node_fs_1.realpathSync)(path) !== path || !stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0
-                    || stat.dev !== expected.device || stat.ino !== expected.inode || stat.uid !== expected.uid || (stat.mode & 0o7777) !== expected.mode)
+                    || !(0, persistent_directory_identity_1.matchesPersistentDirectoryIdentity)({ stateRoot: input.stateRoot, secret: input.secret, path, expected, authorityFile: "native-history-source.v1.json", accountId: account.opaqueAccountId }))
                     return fail();
             }
         }
@@ -237,9 +247,18 @@ function publishPreparedNativeAuthBindingV1(value) {
     finally {
         (0, node_fs_1.closeSync)(rootFd);
     }
-    plan.secret.fill(0);
-    rechecked.secret.fill(0);
-    prepared.delete(fresh);
-    prepared.delete(value);
+    try {
+        if (process.platform === "darwin") {
+            const proposal = (0, persistent_directory_identity_1.preparePersistentIdentityGeneration)({ stateRoot: plan.stateRoot, secret: plan.secret,
+                verify: () => (0, native_history_1.readAndPreflightNativeHistorySourceStaticV1)(plan.stateRoot, plan.config, plan.secret).state === "ready" });
+            (0, persistent_directory_identity_1.journalAndPublishPersistentIdentityGeneration)(plan.stateRoot, plan.secret, proposal);
+        }
+    }
+    finally {
+        plan.secret.fill(0);
+        rechecked.secret.fill(0);
+        prepared.delete(fresh);
+        prepared.delete(value);
+    }
 }
 //# sourceMappingURL=native-auth-binding.js.map
