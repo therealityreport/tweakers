@@ -8,7 +8,7 @@ Run context: the audit ran non-interactively, so per the skill's default the top
 
 **Execution protocol (all plans)**: HEAD is `46a2fcc` and the working tree is intentionally dirty (73 pre-existing changed paths) — commit-range drift checks prove nothing, so every plan starts with a baseline capture (`git status --porcelain` + path-scoped `git diff` into `plans/artifacts/`) and ends by diffing against it. No branches, no commits, no stash, no reset — all work stays in the working tree and the operator decides commits (`AGENTS.md`: preserve unrelated staged, modified, and untracked work). Runtime/installer plans run the full `npm test` suite per `AGENTS.md`; tweak-touching plans additionally sync, catalog-check, and end with an operator-gated `tweaker dev-sync` step — never an app restart.
 
-Pre-existing files in this directory (`recon.md`, `architecture.md`, `dock-icon-customizer.md`) are earlier planning artifacts from July 2026, written against commit `401100a`. They were kept, not superseded: `architecture.md` remains a useful map (revalidate per its own drift rule), and `dock-icon-customizer.md` is an unbuilt feature plan referenced by direction finding DIR-03 below.
+Pre-existing files in this directory (`archive/planning-2026-07/recon.md`, `archive/planning-2026-07/architecture.md`, `014-dock-icon-customizer.md`) are earlier planning artifacts from July 2026, written against commit `401100a`. They were kept, not superseded: `archive/planning-2026-07/architecture.md` remains a useful map (revalidate per its own drift rule), and `014-dock-icon-customizer.md` is an unbuilt feature plan referenced by direction finding DIR-03 below.
 
 ## Execution order & status
 
@@ -99,3 +99,13 @@ Every row was verified against the cited source by the advisor (not just subagen
 - The Python `packages/mcp-lifecycle` internals beyond structure and test wiring.
 - `docs/research/`, `docs/releases/`, `_workspace/` content.
 - Full `npm test`/`npm run build` were not executed by the advisor (they write artifacts); executors run them per plan.
+
+## Planning reconciliation — 2026-10-01
+
+Current AGENTS and the current request own execution policy; the older packet context above is historical. DONE requires complete committed-main revision/file:line proof plus any stated runtime acceptance. The July audit/map originals are [archived](archive/planning-2026-07/INDEX.md) byte-for-byte. Existing 001–008 requirements remain active; later records do not establish main/runtime completion. Hidden scratch, untracked execution records and recovered-worktree material remain local and are not published by this cleanup.
+
+| Plan | Status |
+| --- | --- |
+| [009 — Doctor Codex](009-doctor-codex-upstream-integration.md) | PARTIAL (main/runtime acceptance unverified) |
+| [010 — Unified manager](010-unified-tweakers-manager.md) | PARTIAL (main/runtime acceptance unverified) |
+| [014 — Dock icon](014-dock-icon-customizer.md) | PARTIAL (no committed-main dock-icon source; acceptance pending) |

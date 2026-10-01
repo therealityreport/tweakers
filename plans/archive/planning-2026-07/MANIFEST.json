@@ -1,0 +1,26 @@
+{
+  "baseline": "90181674cc423b2c63275029629108036a4c509c",
+  "files": [
+    {
+      "source": "plans/architecture.md",
+      "destination": "plans/archive/planning-2026-07/architecture.md",
+      "sha256": "0bfdb21ff924eba844304bb9384b7026841d853c4542d666876eb479dea71dcc",
+      "classification": "historical audit/map snapshot",
+      "successor": null
+    },
+    {
+      "source": "plans/recon.md",
+      "destination": "plans/archive/planning-2026-07/recon.md",
+      "sha256": "6ce79cd9e209c66ba5c130c852877f92affff4fc3a5449b0c5bbb1479b2950e1",
+      "classification": "historical audit/map snapshot",
+      "successor": null
+    },
+    {
+      "source": "plans/dock-icon-customizer.md",
+      "destination": "plans/archive/planning-2026-07/dock-icon-customizer.md",
+      "sha256": "0fd357335b2c9e03b484e9cebc9ee3b2010b32170f7a578ca3f19313faf11082",
+      "classification": "pending",
+      "successor": "plans/014-dock-icon-customizer.md"
+    }
+  ]
+}
