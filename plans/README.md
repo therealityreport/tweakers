@@ -113,3 +113,9 @@ Current AGENTS and the current request own execution policy; the older packet co
 ## Continuation pruning — 2026-10-01
 
 The previously public Dock icon proposal is archived as REJECTED (stale). Its original July17 target has no main implementation, relevant open issue or active affected work. Local-only continuation records remain ignored; their status table is in the local README.
+
+## Final pass — 2026-10-01
+
+Active numbered plan owners: 20. The cap is 20. Supplemental contracts/revisions are not separate plans. Deferred requirements remain retained; this is not rejection or completion.
+
+Local plan/evidence status and deferred details remain in the ignored local README; this public file adds no private plan payloads.
