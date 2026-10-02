@@ -108,4 +108,8 @@ Current AGENTS and the current request own execution policy; the older packet co
 | --- | --- |
 | [009 — Doctor Codex](009-doctor-codex-upstream-integration.md) | PARTIAL (main/runtime acceptance unverified) |
 | [010 — Unified manager](010-unified-tweakers-manager.md) | PARTIAL (main/runtime acceptance unverified) |
-| [014 — Dock icon](014-dock-icon-customizer.md) | PARTIAL (no committed-main dock-icon source; acceptance pending) |
+| [014 — Dock icon](archive/continuation-prune-2026-10/014-dock-icon-customizer.md) | REJECTED (stale) — archived |
+
+## Continuation pruning — 2026-10-01
+
+The previously public Dock icon proposal is archived as REJECTED (stale). Its original July17 target has no main implementation, relevant open issue or active affected work. Local-only continuation records remain ignored; their status table is in the local README.

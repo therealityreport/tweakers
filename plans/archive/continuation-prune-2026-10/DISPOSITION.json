@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-01",
+  "plans": [
+    {
+      "title": "Dock icon customizer",
+      "path": "plans/014-dock-icon-customizer.md",
+      "originalSource": "plans/archive/planning-2026-07/dock-icon-customizer.md",
+      "originalSourceSha256": "0fd357335b2c9e03b484e9cebc9ee3b2010b32170f7a578ca3f19313faf11082",
+      "originalDate": "2026-07-17",
+      "originalDateProvenance": "original run/proposal date",
+      "affectedPaths": [
+        "tweaks/co.tweakers.dock-icon"
+      ],
+      "latestCodeCommit": null,
+      "latestCodeDate": null,
+      "ageDate": "2026-07-17",
+      "ageDays": 76,
+      "disposition": "stale",
+      "rationale": "New dock-icon tweak is absent on main and filesystem; no relevant dirty target or issue. Original July 17 proposal is older than 30 days. Recommend stale rejection, preserving public provenance.",
+      "mainEvidence": [],
+      "P1": false,
+      "successor": null,
+      "scratchNeeded": false,
+      "gaps": [],
+      "visibility": "public retained proposal",
+      "assessmentDisposition": "REJECT_STALE",
+      "originalPlanSha256": "989ef217c87986416e71d2e6bd9e65f7d666d4c185d566bd047dc3e27c39339a",
+      "archivedPath": "plans/archive/continuation-prune-2026-10/014-dock-icon-customizer.md"
+    }
+  ]
+}
