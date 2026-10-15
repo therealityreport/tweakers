@@ -14791,7 +14791,7 @@ function resolveSealedManagerRuntimeAssets() {
   };
 }
 function resolveSealedManagerManagedRuntimeAssets() {
-  const fingerprint5 = false ? null : "a41e0bcc6a7234c4d4696dafc3da918dbb493dfcfad1d7379dfb97b71f521c10";
+  const fingerprint5 = false ? null : "37f870d79158195c89c6abaee6e3cb38175e6ea127dc8156cf7c1abcb93d0742";
   if (fingerprint5 === null) return null;
   if (!SHA256_HEX.test(fingerprint5)) {
     throw new Error("The sealed Tweakers manager has an invalid compiled managed-runtime fingerprint");
@@ -15895,6 +15895,8 @@ var require_brace_expansion = __commonJS({
     var escPeriod = "\0PERIOD" + Math.random() + "\0";
     var EXPANSION_MAX = 1e5;
     var EXPANSION_MAX_LENGTH = 4e6;
+    var EXPANSION_MAX_DEPTH = 1e3;
+    var EXPANSION_MAX_REWRITES = 1e3;
     function numeric(str2) {
       return parseInt(str2, 10) == str2 ? parseInt(str2, 10) : str2.charCodeAt(0);
     }
@@ -15904,25 +15906,36 @@ var require_brace_expansion = __commonJS({
     function unescapeBraces(str2) {
       return str2.split(escSlash).join("\\").split(escOpen).join("{").split(escClose).join("}").split(escComma).join(",").split(escPeriod).join(".");
     }
-    function parseCommaParts(str2) {
-      if (!str2)
-        return [""];
-      var parts = [];
-      var m2 = balanced("{", "}", str2);
-      if (!m2)
-        return str2.split(",");
-      var pre = m2.pre;
-      var body = m2.body;
-      var post = m2.post;
-      var p2 = pre.split(",");
-      p2[p2.length - 1] += "{" + body + "}";
-      var postParts = parseCommaParts(post);
-      if (post.length) {
-        p2[p2.length - 1] += postParts.shift();
-        p2.push.apply(p2, postParts);
+    function pushAll(target2, items) {
+      for (var i2 = 0; i2 < items.length; i2++) {
+        target2.push(items[i2]);
       }
-      parts.push.apply(parts, p2);
-      return parts;
+    }
+    function parseCommaParts(str2) {
+      var parts = [];
+      var carry = "";
+      for (; ; ) {
+        var m2 = balanced("{", "}", str2);
+        if (!m2) {
+          var tail = str2.split(",");
+          tail[0] = carry + tail[0];
+          pushAll(parts, tail);
+          return parts;
+        }
+        var pre = m2.pre;
+        var body = m2.body;
+        var post = m2.post;
+        var p2 = pre.split(",");
+        p2[0] = carry + p2[0];
+        p2[p2.length - 1] += "{" + body + "}";
+        if (!post.length) {
+          pushAll(parts, p2);
+          return parts;
+        }
+        carry = p2.pop();
+        pushAll(parts, p2);
+        str2 = post;
+      }
     }
     function expandTop(str2, options) {
       if (!str2)
@@ -15930,10 +15943,12 @@ var require_brace_expansion = __commonJS({
       options = options || {};
       var max = options.max == null ? EXPANSION_MAX : options.max;
       var maxLength = options.maxLength == null ? EXPANSION_MAX_LENGTH : options.maxLength;
+      var maxDepth = options.maxDepth == null ? EXPANSION_MAX_DEPTH : options.maxDepth;
+      var maxRewrites = options.maxRewrites == null ? EXPANSION_MAX_REWRITES : options.maxRewrites;
       if (str2.substr(0, 2) === "{}") {
         str2 = "\\{\\}" + str2.substr(2);
       }
-      return expand(escapeBraces(str2), max, maxLength, true).map(unescapeBraces);
+      return expand(escapeBraces(str2), max, maxLength, maxDepth, 0, maxRewrites, true).map(unescapeBraces);
     }
     function embrace(str2) {
       return "{" + str2 + "}";
@@ -16008,9 +16023,13 @@ var require_brace_expansion = __commonJS({
       }
       return N2;
     }
-    function expand(str2, max, maxLength, isTop) {
+    function expand(str2, max, maxLength, maxDepth, depth, maxRewrites, isTop) {
+      if (depth > maxDepth) {
+        return [str2];
+      }
       var acc = [""];
       var accBase = [0];
+      var rewrites = 0;
       var dropEmpties = false;
       var firstGroup = true;
       var nextBase;
@@ -16028,7 +16047,8 @@ var require_brace_expansion = __commonJS({
         var isSequence = isNumericSequence || isAlphaSequence;
         var isOptions = m2.body.indexOf(",") >= 0;
         if (!isSequence && !isOptions) {
-          if (m2.post.match(/,(?!,).*\}/)) {
+          if (rewrites < maxRewrites && m2.post.match(/,(?!,).*\}/)) {
+            rewrites++;
             str2 = m2.pre + "{" + m2.body + escClose + m2.post;
             isTop = true;
             firstGroup = true;
@@ -16060,7 +16080,7 @@ var require_brace_expansion = __commonJS({
         } else {
           var n = parseCommaParts(m2.body);
           if (n.length === 1 && n[0] !== void 0) {
-            n = expand(n[0], max, maxLength, false).map(embrace);
+            n = expand(n[0], max, maxLength, maxDepth, depth + 1, maxRewrites, false).map(embrace);
             if (n.length === 1) {
               nextBase = [];
               acc = combine(
@@ -16088,7 +16108,7 @@ var require_brace_expansion = __commonJS({
           values = [];
           var valuesLength = 0;
           outer: for (var j2 = 0; j2 < n.length; j2++) {
-            var expanded = expand(n[j2], max, maxLength, false);
+            var expanded = expand(n[j2], max, maxLength, maxDepth, depth + 1, maxRewrites, false);
             for (var k2 = 0; k2 < expanded.length; k2++) {
               var v2 = expanded[k2];
               if (dropsEmpties && !v2) continue;
@@ -95890,4 +95910,4 @@ export {
   withLocalOperation
 };
 //# TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1=e4fd139ddfbcffffb90c76503ada99bdcbb84f68a0c7f368336795fa9a61686c
-//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=a41e0bcc6a7234c4d4696dafc3da918dbb493dfcfad1d7379dfb97b71f521c10
+//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=37f870d79158195c89c6abaee6e3cb38175e6ea127dc8156cf7c1abcb93d0742
