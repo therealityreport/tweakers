@@ -14779,7 +14779,7 @@ import { lstatSync as lstatSync7, readdirSync as readdirSync7, realpathSync as r
 import { basename, dirname as dirname6, join as join11, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 function resolveSealedManagerRuntimeAssets() {
-  const fingerprint5 = false ? null : "4598d896e2eaf8945a96fea4e5e386f1d547ca1a80ae93fdc9983dc962fabf6a";
+  const fingerprint5 = false ? null : "e4fd139ddfbcffffb90c76503ada99bdcbb84f68a0c7f368336795fa9a61686c";
   if (fingerprint5 === null) return null;
   if (!SHA256_HEX.test(fingerprint5)) {
     throw new Error("The sealed Tweakers manager has an invalid compiled runtime fingerprint");
@@ -14791,7 +14791,7 @@ function resolveSealedManagerRuntimeAssets() {
   };
 }
 function resolveSealedManagerManagedRuntimeAssets() {
-  const fingerprint5 = false ? null : "da4677f1450f8f305e59e6a966bb695b570483da36ba709c990c7dc6eef56844";
+  const fingerprint5 = false ? null : "a41e0bcc6a7234c4d4696dafc3da918dbb493dfcfad1d7379dfb97b71f521c10";
   if (fingerprint5 === null) return null;
   if (!SHA256_HEX.test(fingerprint5)) {
     throw new Error("The sealed Tweakers manager has an invalid compiled managed-runtime fingerprint");
@@ -95889,5 +95889,5 @@ export {
   runTweakersManagerCli,
   withLocalOperation
 };
-//# TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1=4598d896e2eaf8945a96fea4e5e386f1d547ca1a80ae93fdc9983dc962fabf6a
-//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=da4677f1450f8f305e59e6a966bb695b570483da36ba709c990c7dc6eef56844
+//# TWEAKERS_MANAGER_RUNTIME_FINGERPRINT_V1=e4fd139ddfbcffffb90c76503ada99bdcbb84f68a0c7f368336795fa9a61686c
+//# TWEAKERS_MANAGER_MANAGED_RUNTIME_FINGERPRINT_V1=a41e0bcc6a7234c4d4696dafc3da918dbb493dfcfad1d7379dfb97b71f521c10

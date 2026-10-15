@@ -116,7 +116,8 @@ function fileIdentity(path: string, optional: boolean, maxBytes?: number): unkno
 
 async function readSqlite(path: string, query = QUERY): Promise<string | null> {
   return new Promise((resolvePromise) => {
-    const child = spawn("/usr/bin/sqlite3", ["-readonly", "-noinit", "-nofollow", "-batch", "-cmd", ".timeout 1000", path], {
+    // `-init /dev/null` skips ~/.sqliterc like `-noinit`, which older macOS sqlite3 rejects.
+    const child = spawn("/usr/bin/sqlite3", ["-readonly", "-init", "/dev/null", "-nofollow", "-batch", "-cmd", ".timeout 1000", path], {
       stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
     });
     const chunks: Buffer[] = []; let total = 0, failed = false, settled = false;

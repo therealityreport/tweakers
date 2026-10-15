@@ -115,7 +115,7 @@ test("bound saved reads work with an open WAL writer and preserve all persistent
   writeFileSync(db, "", { mode: 0o600, flag: "wx" });
   const emptyDb = lstatSync(db);
   assert.ok(emptyDb.isFile() && !emptyDb.isSymbolicLink() && emptyDb.nlink === 1 && emptyDb.uid === process.getuid?.() && (emptyDb.mode & 0o077) === 0);
-  const writer = spawn("/usr/bin/sqlite3", ["-noinit", "-nofollow", "-batch", db], { stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+  const writer = spawn("/usr/bin/sqlite3", ["-init", "/dev/null", "-nofollow", "-batch", db], { stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
   try {
     const ready = new Promise<void>((resolve, reject) => {
       let output = "";
