@@ -29,6 +29,8 @@ test("20398 required Accounts fixture is readable and has the reviewed carrier i
   assert.equal(patched().record.status, "compatible", patched().record.reason);
 });
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+/** Load the shipped compiled module, typed by its source, so `typecheck:tests` needs no prior build. */
+const compiled = <T>(name: string): Promise<T> => import(new URL(`../dist/${name}.js`, import.meta.url).href) as Promise<T>;
 let cached: Map<string,string>;
 const original = () => cached ??= new Map(listPackage(asar, { isPack: false }).map(p => p.replace(/^\//,""))
   .filter(p => /^webview\/assets\/(app-initial|app-shared|app-primary|profile|plugins-settings|page|mcp-settings|local-conversation-thread|apps-availability)-.*\.js$/.test(p) || /^\.vite\/build\/(main|src|application-network-startup)-.*\.js$/.test(p))
@@ -261,7 +263,12 @@ test("20398 Accounts authenticates and parses all relocated hooks in the actual 
 });
 
 test("20398 compiled installation composes policy, window, model, retention, Billing, and Accounts with exact native carrier checks",{skip:!available},async()=>{
-  const accounts=await import("../dist/codex-accounts-native.js"),policy=await import("../dist/codex-native-service-policy.js"),window=await import("../dist/codex-window-services.js"),model=await import("../dist/codex-model-selection.js"),retention=await import("../dist/codex-inactive-thread-retention.js"),billing=await import("../dist/codex-billing-analytics.js");
+  const accounts=await compiled<typeof import("../src/codex-accounts-native.js")>("codex-accounts-native"),
+    policy=await compiled<typeof import("../src/codex-native-service-policy.js")>("codex-native-service-policy"),
+    window=await compiled<typeof import("../src/codex-window-services.js")>("codex-window-services"),
+    model=await compiled<typeof import("../src/codex-model-selection.js")>("codex-model-selection"),
+    retention=await compiled<typeof import("../src/codex-inactive-thread-retention.js")>("codex-inactive-thread-retention"),
+    billing=await compiled<typeof import("../src/codex-billing-analytics.js")>("codex-billing-analytics");
   const ordered=new Map(original()),main=".vite/build/main-CwxgTOle.js";
   ordered.set(main,window.patchCodexWindowServicesSource(policy.patchCodexNativeServicePolicySource(ordered.get(main)!).source)!.source);
   assert.equal(hash(ordered.get(main)!),"70a5e142d90356580709a3f023cfe86c993e7114d53c1a9ff153c12bcb5a153c");
