@@ -1,7 +1,8 @@
+import { readDoctorAdoptionRecord } from "./doctor-adoption-history.js";
 import { validateDoctorChangelog, changelogDecisionGroups } from "./doctor-changelog.js";
 import { TITLEBAR_CHANGE_ID, verifyDoctorTitlebarSelection } from "./doctor-overrides.js";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { DoctorActionRequestV1, DoctorAdoptionReviewV1, DoctorChangeReportV1 } from "@therealityreport/tweakers-sdk";
 import { acquireProcessLock } from "./process-lock.js";
 import { doctorDigest, doctorDirectory, readDoctorPrivateJson, readDoctorUpdateJob, writeDoctorPrivateJson, type DoctorUpdateJobV1 } from "./doctor-store.js";
@@ -29,18 +30,18 @@ function saveChangeReportLocked(root: string, job: DoctorUpdateJobV1, report: Do
     priorPacket = join(doctorDirectory(root), "jobs", predecessor);
     // Most historical technical reports have no adoption intent. Do not load
     // their potentially huge inventories merely to discover that fact.
-    const intent = readDoctorPrivateJson(join(priorPacket, "decisions.json")) as SavedDecisions | null;
+    const intent = readDoctorAdoptionRecord(root, basename(priorPacket), "decisions.json") as SavedDecisions | null;
     if (intent) {
-      prior = readDoctorPrivateJson(join(priorPacket, "changes.json"), { maxBytes: 128 * 1024 * 1024 }) as DoctorChangeReportV1 | null;
+      prior = readDoctorAdoptionRecord(root, predecessor, "changes.json") as DoctorChangeReportV1 | null;
       if (!prior) throw new Error("Historical adoption intent has missing report evidence; restore it before continuing");
     }
     if (!prior) {
-      const ancestor = readDoctorPrivateJson(join(priorPacket, "job.json")) as DoctorUpdateJobV1 | null;
+      const ancestor = readDoctorAdoptionRecord(root, predecessor, "job.json") as DoctorUpdateJobV1 | null;
       if (!ancestor || ancestor.id !== predecessor) throw new Error("Update predecessor evidence is missing; restore it before continuing");
       predecessor = ancestor.predecessorId;
     }
   }
-  const previous = prior ? readDoctorPrivateJson(join(priorPacket, "decisions.json")) as SavedDecisions | null : null;
+  const previous = prior ? readDoctorAdoptionRecord(root, basename(priorPacket), "decisions.json") as SavedDecisions | null : null;
   let inherited: SavedDecisions | null = null;
   if (prior && previous && prior.fingerprint === changeReportFingerprint(prior)
     && prior.beforeFingerprint === report.beforeFingerprint && prior.afterFingerprint === report.afterFingerprint
@@ -153,7 +154,7 @@ export function readDoctorAdoption(root: string, job = readDoctorUpdateJob(root)
         const adapter = change.overrides.find(o => o.id === decision.overrideId);
         if (change.id !== TITLEBAR_CHANGE_ID || !adapter || !decision.overrideId) throw new Error("No verified adapter");
         verifyDoctorTitlebarSelection(job, decision.overrideId, adapter.verificationFingerprint);
-        if (!saved.observations.some(o => o.changeId === change.id && o.outcome === "matches")) blockers.push(`${change.title}: verify the selected setting in the isolated preview and record its interaction outcome.`);
+        if (!saved.observations.some(o => o.changeId === change.id && o.outcome === "matches")) blockers.push(`${change.title}: a current interaction observation is still required for this override. Standalone previews are disabled; retain the default unless guarded verification supplies that evidence.`);
       } catch { blockers.push(`${change.title}: selected override lacks current candidate verification.`); }
     } else if (!compatibilityWorkflow && !decision && (!change.technicalOnly || change.status === "unknown")) blockers.push(`${change.title}: awaiting your decision${change.status === "unknown" ? " on unknown behavior" : ""}.`);
   }

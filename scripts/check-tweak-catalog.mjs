@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { guardStableInputs } from "./read-only-inputs.mjs";
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -115,8 +116,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log("tweak catalog discovery self-test passed");
   } else if (process.argv[2]) {
     const catalogPath = resolve(process.argv[2]);
+    const root = resolve(dirname(catalogPath), "..");
+    const stable = guardStableInputs([catalogPath, join(root,"tweaks"),join(root,"packages/installer/assets/runtime")]);
     const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-    assertCanonicalSourceParity(catalog, resolve(dirname(catalogPath), ".."));
+    assertCanonicalSourceParity(catalog, root);
+    stable();
     console.log(`tweak catalog parity passed: ${process.argv[2]}`);
   } else {
     console.error("usage: node scripts/check-tweak-catalog.mjs --self-test | <catalog.json>");

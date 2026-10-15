@@ -155,6 +155,8 @@ export interface BrokerControlSocketOptions {
     socketFileName?: string;
     maxFrameBytes?: number;
 }
+/** Bounded authenticated liveness probe; no account child or profile fanout. */
+export declare function probeAccountsBrokerControlStatus(root: string, secret: Buffer): Promise<boolean>;
 /**
  * One-shot status endpoint.  Its exact successful response is
  * `{version:1,requestId,status:BrokerControlStatusV1}`; malformed or

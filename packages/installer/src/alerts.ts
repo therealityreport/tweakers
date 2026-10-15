@@ -1,7 +1,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 import { readPlist } from "./plist.js";
 import { TWEAKER_VERSION } from "./version.js";
@@ -503,8 +504,21 @@ export function openCodex(appRoot: string, opts: OpenCodexOptions = {}): void {
 }
 
 /** Open the exact app path, preserving user focus for unattended workflows. */
-export function openAndActivateCodex(appRoot: string): void {
+export function openAndActivateCodex(appRoot: string, startupStreams?: { stdout: string; stderr: string }): void {
   if (platform() !== "darwin") return;
+  if (startupStreams) {
+    if (appRoot !== "/Applications/Tweakers.app" || dirname(startupStreams.stdout) !== dirname(startupStreams.stderr)) throw new Error("Startup capture requires the exact independent Tweakers app");
+    const directory = dirname(startupStreams.stdout), parent = lstatSync(directory);
+    if (realpathSync(directory) !== directory || !parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o777) !== 0o700) throw new Error("Startup capture directory is not private");
+    for (const file of [startupStreams.stdout, startupStreams.stderr]) {
+      const stat = lstatSync(file);
+      if (file !== resolve(file) || realpathSync(file) !== file || !stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.()
+        || (stat.mode & 0o777) !== 0o600 || stat.nlink !== 1 || stat.size !== 0) throw new Error("Startup capture file is not a fresh private regular file");
+    }
+    reconcileLaunchServices(appRoot);
+    alertExecFileSync("/usr/bin/open", ["-a", appRoot, ...(reopenShouldActivate() ? [] : ["-g"]), "--stdout", startupStreams.stdout, "--stderr", startupStreams.stderr], { stdio: "ignore" });
+    return;
+  }
   const bundleId = codexBundleId(appRoot);
   alertExecFileSync(
     "osascript",

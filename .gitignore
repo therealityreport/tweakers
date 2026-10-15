@@ -25,3 +25,14 @@ coverage
 
 # Impeccable plugin hook caches must never ship in packages
 .impeccable/
+
+# Generated managed runtime and local extraction work
+/packages/installer/assets/managed-runtime/
+/.tweaker-*/
+/main-*.js
+/src-*.js
+/app-window-*.js
+/appearance-settings-*.js
+/apps-availability-*.js
+
+__pycache__/

@@ -3,12 +3,17 @@ import test from "node:test";
 import { bindMainTweakStop } from "../src/tweak-lifecycle";
 
 test("bindMainTweakStop preserves the tweak as `this` when the runtime calls stop() detached", () => {
-  const tweak = {
+  interface TweakFixture {
+    _instance: { cleaned: boolean };
+    start(this: TweakFixture): void;
+    stop(this: TweakFixture): void;
+  }
+  const tweak: TweakFixture = {
     _instance: { cleaned: false },
-    start(this: typeof tweak) {
+    start(this: TweakFixture) {
       this._instance.cleaned = false;
     },
-    stop(this: typeof tweak) {
+    stop(this: TweakFixture) {
       // Real tweaks read per-instance cleanup handles off `this`.
       this._instance.cleaned = true;
     },
@@ -35,7 +40,7 @@ test("without binding, a detached main stop() loses `this` (regression guard)", 
       return this.marker;
     },
   };
-  const detached = { stop: tweak.stop };
+  const detached = { stop: tweak.stop, marker: undefined as string | undefined };
   // The old behavior: `this` is the wrapper, not the tweak.
   assert.notEqual(detached.stop(), "tweak");
   // The bound behavior: `this` is the tweak.

@@ -2942,13 +2942,17 @@ __export(account_continuity_exports, {
   ACCOUNT_LOCAL_OAUTH_MUTATION_METHOD_V1: () => ACCOUNT_LOCAL_OAUTH_MUTATION_METHOD_V1,
   ACCOUNT_SCOPED_CAPABILITY_MUTATION_METHODS_V1: () => ACCOUNT_SCOPED_CAPABILITY_MUTATION_METHODS_V1,
   DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1: () => DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1,
+  OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1: () => OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1,
   abortUnpublishedSharedSourceRebase: () => abortUnpublishedSharedSourceRebase,
+  assertNonsecretDefinitionJsonV1: () => assertNonsecretDefinitionJsonV1,
   bootstrapAccountContinuity: () => bootstrapAccountContinuity,
   bootstrapSharedPluginsManifest: () => bootstrapSharedPluginsManifest,
   captureAccountCapabilitiesAfterExit: () => captureAccountCapabilitiesAfterExit,
   captureAccountConfigAfterExit: () => captureAccountConfigAfterExit,
   captureIdleAccountChangesBeforeSpawn: () => captureIdleAccountChangesBeforeSpawn,
+  captureOfficialPluginPackageV1: () => captureOfficialPluginPackageV1,
   captureUnmaterializedNativeChangesBeforeSpawn: () => captureUnmaterializedNativeChangesBeforeSpawn,
+  copyOfficialPluginPackageV1: () => copyOfficialPluginPackageV1,
   ensureAccountContinuityEnrollment: () => ensureAccountContinuityEnrollment,
   isAccountScopedCapabilityMutationV1: () => isAccountScopedCapabilityMutationV1,
   loadAccountCapabilityOverrides: () => loadAccountCapabilityOverrides,
@@ -2956,18 +2960,31 @@ __export(account_continuity_exports, {
   loadAccountContinuitySharedSourceProvenanceV1: () => loadAccountContinuitySharedSourceProvenanceV1,
   loadSharedAccountBase: () => loadSharedAccountBase,
   loadSharedPluginsManifestV1: () => loadSharedPluginsManifestV1,
+  nonsecretPluginPolicyV1: () => nonsecretPluginPolicyV1,
   observeExistingNativeAccountContinuity: () => observeExistingNativeAccountContinuity,
+  officialLocalPluginExecutionVersionV1: () => officialLocalPluginExecutionVersionV1,
+  officialLocalPluginIdV1: () => officialLocalPluginIdV1,
+  officialPluginDefinitionBlocksV1: () => officialPluginDefinitionBlocksV1,
+  officialPluginDefinitionWithheldReasonV1: () => officialPluginDefinitionWithheldReasonV1,
+  officialPluginSourceChangeRelevantV1: () => officialPluginSourceChangeRelevantV1,
   parseLosslessTomlDocument: () => parseLosslessTomlDocument,
   prepareAccountConfigBeforeSpawn: () => prepareAccountConfigBeforeSpawn,
+  projectOfficialPluginPackagesV1: () => projectOfficialPluginPackagesV1,
   projectPrimarySharedBase: () => projectPrimarySharedBase,
   publishPrimaryPluginInventoryAfterExit: () => publishPrimaryPluginInventoryAfterExit,
   publishPrimarySharedBaseAfterExit: () => publishPrimarySharedBaseAfterExit,
   readLosslessTomlDocument: () => readLosslessTomlDocument,
+  readOfficialInstalledPluginSnapshotV1: () => readOfficialInstalledPluginSnapshotV1,
+  readOfficialPluginHttpServersV1: () => readOfficialPluginHttpServersV1,
   rebaseAccountContinuitySharedSource: () => rebaseAccountContinuitySharedSource,
+  reconcileOfficialPluginLayoutReceiptV1: () => reconcileOfficialPluginLayoutReceiptV1,
   renderResolvedAccountToml: () => renderResolvedAccountToml,
+  renderTomlConfigOverridesV1: () => renderTomlConfigOverridesV1,
   resolveAccountCapabilities: () => resolveAccountCapabilities,
   resolveAccountConfig: () => resolveAccountConfig,
   scanCapabilityTree: () => scanCapabilityTree,
+  selectNonsecretDefinitionTreeV1: () => selectNonsecretDefinitionTreeV1,
+  tomlThreadConfigOverridesV1: () => tomlThreadConfigOverridesV1,
   validateAccountContinuityMaterialization: () => validateAccountContinuityMaterialization
 });
 module.exports = __toCommonJS(account_continuity_exports);
@@ -3861,18 +3878,17 @@ function sharedAccountConfigRoot(stateRoot) {
 }
 function assertSafeOwnerDirectory(path, create = false) {
   const resolved = (0, import_node_path.resolve)(path);
-  if ((0, import_node_fs.existsSync)(resolved)) {
-    const stat = (0, import_node_fs.lstatSync)(resolved);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid?.() !== void 0 && stat.uid !== process.getuid?.() || (stat.mode & 18) !== 0) {
-      throw new Error("account continuity refused an unsafe directory");
-    }
-  } else {
+  if (!(0, import_node_fs.existsSync)(resolved)) {
     if (!create) throw new Error("account continuity directory is missing");
     (0, import_node_fs.mkdirSync)(resolved, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   }
-  (0, import_node_fs.chmodSync)(resolved, PRIVATE_DIRECTORY_MODE);
-  const checked = (0, import_node_fs.statSync)(resolved);
-  if (!checked.isDirectory() || process.getuid?.() !== void 0 && checked.uid !== process.getuid?.() || (checked.mode & 63) !== 0) {
+  const stat = (0, import_node_fs.lstatSync)(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid?.() !== void 0 && stat.uid !== process.getuid?.() || (stat.mode & 18) !== 0) {
+    throw new Error("account continuity refused an unsafe directory");
+  }
+  if ((stat.mode & 4095) !== PRIVATE_DIRECTORY_MODE) (0, import_node_fs.chmodSync)(resolved, PRIVATE_DIRECTORY_MODE);
+  const checked = (0, import_node_fs.lstatSync)(resolved);
+  if (!checked.isDirectory() || checked.isSymbolicLink() || process.getuid?.() !== void 0 && checked.uid !== process.getuid?.() || (checked.mode & 4095) !== PRIVATE_DIRECTORY_MODE) {
     throw new Error("account continuity directory is not owner-private");
   }
 }
@@ -3920,12 +3936,16 @@ function readSafeRegularFile(path, maxBytes, allowEmpty, requirePrivate) {
   }
 }
 function atomicWriteFile(path, bytes, mode, requireExistingSafe = false) {
+  atomicWriteBoundedFile(path, bytes, mode, MAX_CAPABILITY_TOTAL_BYTES, requireExistingSafe);
+}
+function atomicWriteBoundedFile(path, bytes, mode, maxBytes, requireExistingSafe = false, directoryBatch) {
   const parent = (0, import_node_path.dirname)(path);
-  assertSafeOwnerDirectory(parent);
-  if (bytes.byteLength > MAX_CAPABILITY_TOTAL_BYTES) throw new Error("account continuity refused an oversized write");
+  if (directoryBatch) directoryBatch.prepare(parent);
+  else assertSafeOwnerDirectory(parent);
+  if (bytes.byteLength > maxBytes) throw new Error("account continuity refused an oversized write");
   if ((0, import_node_fs.existsSync)(path)) {
-    if (requireExistingSafe) assertSafeRegularFile(path, Math.max(MAX_CONFIG_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, false);
-    else assertSafeRegularFile(path, Math.max(MAX_METADATA_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, true);
+    if (requireExistingSafe) assertSafeRegularFile(path, maxBytes, true, false);
+    else assertSafeRegularFile(path, maxBytes, true, true);
   }
   const temporary = (0, import_node_path.join)(parent, `.${(0, import_node_path.basename)(path)}.${process.pid}.${(0, import_node_crypto.randomBytes)(8).toString("hex")}.tmp`);
   let descriptor;
@@ -3935,11 +3955,14 @@ function atomicWriteFile(path, bytes, mode, requireExistingSafe = false) {
     (0, import_node_fs.fsyncSync)(descriptor);
     (0, import_node_fs.closeSync)(descriptor);
     descriptor = void 0;
-    (0, import_node_fs.chmodSync)(temporary, mode);
-    assertSafeRegularFile(temporary, Math.max(MAX_CONFIG_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, mode === PRIVATE_FILE_MODE);
+    if ((assertSafeRegularFile(temporary, maxBytes, true, false).mode & 4095) !== mode) (0, import_node_fs.chmodSync)(temporary, mode);
+    assertSafeRegularFile(temporary, maxBytes, true, mode === PRIVATE_FILE_MODE);
+    directoryBatch?.assertUnchanged(parent);
     (0, import_node_fs.renameSync)(temporary, path);
-    (0, import_node_fs.chmodSync)(path, mode);
-    fsyncDirectory(parent);
+    directoryBatch?.assertUnchanged(parent);
+    if ((assertSafeRegularFile(path, maxBytes, true, mode === PRIVATE_FILE_MODE).mode & 4095) !== mode) (0, import_node_fs.chmodSync)(path, mode);
+    if (directoryBatch) directoryBatch.assertUnchanged(parent);
+    else fsyncDirectory(parent);
   } finally {
     if (descriptor !== void 0) (0, import_node_fs.closeSync)(descriptor);
     if ((0, import_node_fs.existsSync)(temporary)) {
@@ -4318,7 +4341,10 @@ function pluginPrivateContainer(name) {
   const value = name.toLowerCase();
   return value === ".env" || value.startsWith(".env.") || ["auth.json", "authorization.json", "cookies.json", "credentials", "credentials.json", "oauth.json", "token.json", "tokens.json", "secret.json", "secrets.json", "client_secret.json", "api-key.json", "api_key.json", ".netrc"].includes(value) || value.endsWith(".sqlite");
 }
-function scanPluginPackage(root) {
+function stockPrivatePluginContainer(name) {
+  return [".plugin-data", ".codex-remote-plugin-install.json", ".credentials.json", ".auth.json", "mcp_oauth.json", "mcp-oauth.json", "credentials.toml", "auth.toml"].includes(name.toLowerCase());
+}
+function scanPluginPackage(root, stockDefinitionsOnly = false) {
   assertSafeCapabilityDirectory(root);
   const canonicalRoot = (0, import_node_fs.realpathSync)(root);
   const files = [];
@@ -4326,7 +4352,7 @@ function scanPluginPackage(root) {
   const visit = (directory, prefix, depth) => {
     if (depth > 64) throw new Error("plugin package exceeds maximum depth");
     for (const name of (0, import_node_fs.readdirSync)(directory).sort()) {
-      if (name === ".DS_Store" || pluginPrivateContainer(name)) continue;
+      if (name === ".DS_Store" || pluginPrivateContainer(name) || stockDefinitionsOnly && stockPrivatePluginContainer(name)) continue;
       if (!isSafePluginSegment(name)) throw new Error("unsafe plugin package path");
       const path = (0, import_node_path.join)(directory, name);
       const relativePath = prefix ? `${prefix}/${name}` : name;
@@ -4336,7 +4362,7 @@ function scanPluginPackage(root) {
         const linkTarget = (0, import_node_fs.readlinkSync)(path);
         const target = (0, import_node_fs.realpathSync)(path);
         const targetRelative = (0, import_node_path.relative)(canonicalRoot, target);
-        if ((0, import_node_path.isAbsolute)(linkTarget) || !targetRelative || targetRelative.startsWith(`..${import_node_path.sep}`) || targetRelative === ".." || targetRelative.split(import_node_path.sep).some(pluginPrivateContainer)) throw new Error("plugin package link escapes its definition tree");
+        if ((0, import_node_path.isAbsolute)(linkTarget) || !targetRelative || targetRelative.startsWith(`..${import_node_path.sep}`) || targetRelative === ".." || targetRelative.split(import_node_path.sep).some(pluginPrivateContainer) || stockDefinitionsOnly && targetRelative.split(import_node_path.sep).some(stockPrivatePluginContainer)) throw new Error("plugin package link escapes its definition tree");
         files.push({ path: relativePath, bytes: 0, fingerprint: sha256Json({ linkTarget }), linkTarget });
         continue;
       }
@@ -4386,7 +4412,7 @@ function compareNativePluginVersions(left, right) {
   }
   return lexical(a[5] ?? "", b[5] ?? "");
 }
-function scanPluginCache(source, enabledIds) {
+function scanPluginCache(source, enabledIds, stockDefinitionsOnly = false) {
   assertSafeCapabilityDirectory(source);
   const packages = [];
   const selectedRegistries = enabledIds ? new Set([...enabledIds].map((id) => id.split("@")[1])) : void 0;
@@ -4404,7 +4430,7 @@ function scanPluginCache(source, enabledIds) {
       const versions = (0, import_node_fs.readdirSync)(nameRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^[A-Za-z0-9_.+-]+$/.test(entry.name) && entry.name !== "." && entry.name !== "..").map((entry) => entry.name).sort(compareNativePluginVersions);
       const version = versions.includes("local") ? "local" : versions.at(-1);
       if (!version) continue;
-      const files = scanPluginPackage((0, import_node_path.join)(nameRoot, version));
+      const files = scanPluginPackage((0, import_node_path.join)(nameRoot, version), stockDefinitionsOnly);
       if (!files.length) throw new Error("empty plugin package is not a sealed inventory entry");
       packages.push({ id, registry, name, version, files, fingerprint: sha256Json({ id, version, files }), bytes: files.reduce((total, file) => total + file.bytes, 0) });
     }
@@ -4424,18 +4450,80 @@ function pluginInventoryFingerprint(generation, plugins) {
     })).sort((left, right) => left.id.localeCompare(right.id))
   });
 }
+var PluginDirectorySyncBatch = class {
+  directories = /* @__PURE__ */ new Map();
+  containingDirectory;
+  constructor(destination) {
+    let containing = (0, import_node_path.dirname)((0, import_node_path.resolve)(destination));
+    while (!lstatIfPresent(containing)) {
+      const parent = (0, import_node_path.dirname)(containing);
+      if (parent === containing) throw new Error("plugin copy containing directory is missing");
+      containing = parent;
+    }
+    this.containingDirectory = containing;
+    this.remember(containing);
+  }
+  remember(path) {
+    const stat = (0, import_node_fs.lstatSync)(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || process.getuid?.() !== void 0 && stat.uid !== process.getuid?.() || (stat.mode & 63) !== 0) throw new Error("plugin copy directory is not owner-private");
+    const prior = this.directories.get(path);
+    if (prior && (stat.dev !== prior.dev || stat.ino !== prior.ino || stat.uid !== prior.uid)) throw new Error("plugin copy directory identity changed");
+    if (!prior) this.directories.set(path, { dev: stat.dev, ino: stat.ino, uid: stat.uid });
+  }
+  assertUnchanged(path) {
+    let current = (0, import_node_path.resolve)(path);
+    if (current !== this.containingDirectory && !safeResolvedChild(this.containingDirectory, current)) throw new Error("plugin copy directory escapes its staging tree");
+    for (; ; ) {
+      if (!this.directories.has(current)) throw new Error("plugin copy directory lacks custody");
+      this.remember(current);
+      if (current === this.containingDirectory) return;
+      current = (0, import_node_path.dirname)(current);
+    }
+  }
+  prepare(path) {
+    const current = (0, import_node_path.resolve)(path);
+    if (this.directories.has(current)) this.assertUnchanged(current);
+    else {
+      if (!safeResolvedChild(this.containingDirectory, current)) throw new Error("plugin copy directory escapes its staging tree");
+      this.prepare((0, import_node_path.dirname)(current));
+    }
+    if (current !== this.containingDirectory) assertSafeOwnerDirectory(current, true);
+    this.remember(current);
+    this.assertUnchanged(current);
+  }
+  flush() {
+    const paths = [...this.directories.keys()].sort((a, b) => b.split(import_node_path.sep).length - a.split(import_node_path.sep).length || a.localeCompare(b));
+    for (const path of paths) {
+      this.assertUnchanged(path);
+      const descriptor = (0, import_node_fs.openSync)(path, import_node_fs.constants.O_RDONLY | import_node_fs.constants.O_NOFOLLOW);
+      try {
+        const actual = (0, import_node_fs.fstatSync)(descriptor), expected = this.directories.get(path);
+        if (!actual.isDirectory() || actual.dev !== expected.dev || actual.ino !== expected.ino || actual.uid !== expected.uid || (actual.mode & 63) !== 0) throw new Error("plugin copy directory identity changed before flush");
+        try {
+          (0, import_node_fs.fsyncSync)(descriptor);
+        } catch {
+        }
+        this.assertUnchanged(path);
+      } finally {
+        (0, import_node_fs.closeSync)(descriptor);
+      }
+    }
+    for (const path of paths) this.assertUnchanged(path);
+  }
+};
 function copyPluginPackage(source, destination, files, immutable = true, afterFile) {
   assertSafeCapabilityDirectory(source);
-  assertSafeOwnerDirectory(destination, true);
+  const directoryBatch = new PluginDirectorySyncBatch(destination);
+  directoryBatch.prepare(destination);
   for (const file of files) {
     const target = (0, import_node_path.join)(destination, ...file.path.split("/"));
-    assertSafeOwnerDirectory((0, import_node_path.dirname)(target), true);
+    directoryBatch.prepare((0, import_node_path.dirname)(target));
     if (file.linkTarget !== void 0) (0, import_node_fs.symlinkSync)(file.linkTarget, target);
     else {
       const bytes = readSafeRegularFile((0, import_node_path.join)(source, ...file.path.split("/")), MAX_PLUGIN_BYTES, true, false);
       if (!bytes || sha256(bytes) !== file.fingerprint) throw new Error("plugin source changed before immutable copy");
       try {
-        atomicWriteFile(target, bytes, file.executable ? 448 : PRIVATE_FILE_MODE);
+        atomicWriteBoundedFile(target, bytes, file.executable ? 448 : PRIVATE_FILE_MODE, MAX_PLUGIN_BYTES, false, directoryBatch);
       } finally {
         bytes.fill(0);
       }
@@ -4446,12 +4534,18 @@ function copyPluginPackage(source, destination, files, immutable = true, afterFi
     const stat = (0, import_node_fs.lstatSync)(path);
     if (stat.isSymbolicLink()) return;
     if (stat.isDirectory()) {
+      directoryBatch.assertUnchanged(path);
       for (const entry of (0, import_node_fs.readdirSync)(path)) seal((0, import_node_path.join)(path, entry));
-      (0, import_node_fs.chmodSync)(path, 320);
-    } else if (stat.isFile()) (0, import_node_fs.chmodSync)(path, stat.mode & 73 ? 320 : 256);
-    else throw new Error("unsafe plugin seal artifact");
+      directoryBatch.assertUnchanged(path);
+      if (((0, import_node_fs.lstatSync)(path).mode & 4095) !== 320) (0, import_node_fs.chmodSync)(path, 320);
+    } else if (stat.isFile()) {
+      const checked = assertSafeRegularFile(path, MAX_PLUGIN_BYTES, true, true);
+      const mode = stat.mode & 73 ? 320 : 256;
+      if ((checked.mode & 4095) !== mode) (0, import_node_fs.chmodSync)(path, mode);
+    } else throw new Error("unsafe plugin seal artifact");
   };
   if (immutable) seal(destination);
+  directoryBatch.flush();
 }
 function pluginGenerationArtifactFingerprint(manifest, cache) {
   assertSafePrivateDirectoryReadOnly(cache);
@@ -4710,12 +4804,12 @@ function publishPrimaryPluginInventoryAfterExit(input) {
 }
 var PLUGIN_PROJECTIONS_FILE = "plugin-projections.v1.json";
 var PLUGIN_PROJECTION_INTENT_FILE = "plugin-projection-intent.v1.json";
-function pluginNameFingerprint(path, id, entry) {
+function pluginNameFingerprint(path, id, entry, stockOnly = false) {
   try {
     assertSafeCapabilityDirectory(path);
-    const names = (0, import_node_fs.readdirSync)(path);
+    const names = (0, import_node_fs.readdirSync)(path).filter((name) => name !== ".DS_Store" || !(0, import_node_fs.lstatSync)((0, import_node_path.join)(path, name)).isFile());
     if (names.length !== 1 || names[0] !== entry.version) return null;
-    return sha256Json({ id, version: entry.version, files: scanPluginPackage((0, import_node_path.join)(path, entry.version)) });
+    return sha256Json({ id, version: entry.version, files: scanPluginPackage((0, import_node_path.join)(path, entry.version), stockOnly) });
   } catch {
     return null;
   }
@@ -4746,12 +4840,12 @@ function preparePluginPackages(input, accountRoot) {
     const before = pending.before;
     const after = pending.after;
     const backup = (0, import_node_path.join)(transaction, "backup");
-    if (pluginNameFingerprint(target, id, after) === after.fingerprint) {
+    if (pluginNameFingerprint(target, id, after, input.strict) === after.fingerprint) {
       entries[id] = after;
       save();
-    } else if (!lstatIfPresent(target) && before && pluginNameFingerprint(backup, id, before) === before.fingerprint) {
+    } else if (!lstatIfPresent(target) && before && pluginNameFingerprint(backup, id, before, input.strict) === before.fingerprint) {
       (0, import_node_fs.renameSync)(backup, target);
-    } else if (before && pluginNameFingerprint(target, id, before) === before.fingerprint || !before && !lstatIfPresent(target)) {
+    } else if (before && pluginNameFingerprint(target, id, before, input.strict) === before.fingerprint || !before && !lstatIfPresent(target)) {
     } else throw new Error("plugin projection recovery requires inspection");
     (0, import_node_fs.rmSync)(transaction, { recursive: true, force: true });
     (0, import_node_fs.unlinkSync)((0, import_node_path.join)(accountRoot, PLUGIN_PROJECTION_INTENT_FILE));
@@ -4767,25 +4861,34 @@ function preparePluginPackages(input, accountRoot) {
     }
     const prior = entries[plugin.id];
     const present = lstatIfPresent(target);
-    if (present && (!prior || pluginNameFingerprint(target, plugin.id, prior) !== prior.fingerprint)) continue;
+    if (present && (!prior || pluginNameFingerprint(target, plugin.id, prior, input.strict) !== prior.fingerprint)) {
+      if (input.strict) throw new Error("stock plugin projection refused modified or unowned account package");
+      continue;
+    }
     if (present && prior?.version === plugin.version && prior.fingerprint === plugin.fingerprint) continue;
     ready = false;
     if (!input.apply) continue;
     assertWriteEvidence(input.writeEvidence);
     assertSafeOwnerDirectory((0, import_node_path.join)(root, registry), true);
     const after = { version: plugin.version, fingerprint: plugin.fingerprint };
-    const source = (0, import_node_path.join)(input.plugins.root, registry, name, plugin.version);
-    const files = scanPluginPackage(source);
+    const source = input.sourcePaths?.[plugin.id] ?? (0, import_node_path.join)(input.plugins.root, registry, name, plugin.version);
+    const files = scanPluginPackage(source, Boolean(input.sourcePaths));
     if (sha256Json({ id: plugin.id, version: plugin.version, files }) !== plugin.fingerprint) throw new Error("shared plugin package changed");
     const transactionName = `.tweakers-plugins-${(0, import_node_crypto.randomBytes)(8).toString("hex")}`;
     const transaction = (0, import_node_path.join)((0, import_node_path.resolve)(input.account.codexHome), transactionName);
     (0, import_node_fs.mkdirSync)(transaction, { mode: PRIVATE_DIRECTORY_MODE });
     const candidate = (0, import_node_path.join)(transaction, "candidate");
     copyPluginPackage(source, (0, import_node_path.join)(candidate, plugin.version), files, false);
-    if (pluginNameFingerprint(candidate, plugin.id, after) !== plugin.fingerprint) throw new Error("account plugin copy failed verification");
-    atomicWritePrivateJson(accountRoot, PLUGIN_PROJECTION_INTENT_FILE, { id: plugin.id, transaction: transactionName, before: present ? prior : null, after });
+    if (pluginNameFingerprint(candidate, plugin.id, after, input.strict) !== plugin.fingerprint) throw new Error("account plugin copy failed verification");
+    atomicWritePrivateJson(accountRoot, PLUGIN_PROJECTION_INTENT_FILE, {
+      id: plugin.id,
+      transaction: transactionName,
+      before: present ? prior : null,
+      after,
+      ...input.writeEvidence?.pluginProjectionOwner ? { projectionOwner: input.writeEvidence.pluginProjectionOwner } : {}
+    });
     assertWriteEvidence(input.writeEvidence);
-    if (present ? pluginNameFingerprint(target, plugin.id, prior) !== prior.fingerprint : lstatIfPresent(target) !== null) throw new Error("account plugin changed before publication");
+    if (present ? pluginNameFingerprint(target, plugin.id, prior, input.strict) !== prior.fingerprint : lstatIfPresent(target) !== null) throw new Error("account plugin changed before publication");
     if (present) (0, import_node_fs.renameSync)(target, (0, import_node_path.join)(transaction, "backup"));
     (0, import_node_fs.renameSync)(candidate, target);
     fsyncDirectory((0, import_node_path.dirname)(target));
@@ -6535,18 +6638,424 @@ function captureIdleAccountChangesBeforeSpawn(input) {
     return { state: "blocked", reason: error instanceof Error ? error.message : "idle account change capture failed" };
   }
 }
+function selectNonsecretDefinitionTreeV1(tree) {
+  const selected = selectSharedTomlTree(tree, DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1);
+  return Object.fromEntries(["marketplaces", "marketplace", "mcp_servers"].filter((key) => selected[key] !== void 0).map((key) => [key, selected[key]]));
+}
+function inlineTomlOverrideValueV1(node) {
+  if (isTomlTable(node)) return { type: "inline-table", entries: Object.fromEntries(Object.entries(node).map(([key, child]) => [key, inlineTomlOverrideValueV1(child)])) };
+  if (node.type === "inline-table") return { type: "inline-table", entries: Object.fromEntries(Object.entries(node.entries).map(([key, child]) => [key, inlineTomlOverrideValueV1(child)])) };
+  if (node.type === "array-table") return { type: "array", values: node.entries.map((entry) => inlineTomlOverrideValueV1(entry)) };
+  if (node.type === "array") return { type: "array", values: node.values.map(inlineTomlOverrideValueV1) };
+  return node;
+}
+function renderTomlConfigOverridesV1(tree, rootTables = false) {
+  if (rootTables) return Object.entries(tree).map(([key, node]) => `${key}=${renderTomlValue(inlineTomlOverrideValueV1(node))}`);
+  return [...flattenTomlLeaves(tree).values()].map(({ path, value }) => {
+    if (!isTomlDataValue(value)) throw new Error("invalid stock configuration override");
+    return `${renderTomlPath(path)}=${renderTomlValue(value)}`;
+  });
+}
+var PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1 = Object.freeze({
+  gmail: "b80ebfce75a3e6ed85b6cc7a0528569ec6a551fbd38c3df91b98a5ff85075a29",
+  "google-drive": "6ca6c73630d09520915831a55c15cefcab7810f960de6def47e405207f2f8397"
+});
+var OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1 = sha256Json({
+  strictGuardRevision: "nonsecret-definition-json-v2-complete-public-oauth-pins",
+  publicOAuthMcpCanonicalPins: PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1
+});
+function assertNonsecretDefinitionJsonV1(value) {
+  if (isRecord(value) && Object.keys(value).length === 1 && Object.prototype.hasOwnProperty.call(value, "mcpServers") && isRecord(value.mcpServers)) {
+    const names = Object.keys(value.mcpServers), name = names[0];
+    if (names.length === 1 && (name === "gmail" || name === "google-drive") && isRecord(value.mcpServers[name]) && sha256Json(value) === `sha256:${PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1[name]}`) return;
+  }
+  assertNonsecretDefinitionJsonValueV1(value);
+}
+function assertNonsecretDefinitionJsonValueV1(value) {
+  const referenceValue = (child) => typeof child === "string" && /^(?:(?:Bearer|Basic)\s+)?(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)$/i.test(child);
+  const credentialKey = (key) => {
+    const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+    return credentialShaped(normalized) || /(?:^|[_-])private[_-]?key(?:$|[_-])/i.test(normalized);
+  };
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const child = value[index], flag = typeof child === "string" ? /^--?([^=\s]+)$/.exec(child) : null;
+      const next = value[index + 1];
+      if (flag && credentialKey(flag[1]) && typeof next === "string" && next !== "" && !next.startsWith("-") && !referenceValue(next)) throw new Error("plugin definition contains account-local authorization");
+      assertNonsecretDefinitionJsonValueV1(child);
+    }
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      if (/(?:env|environment)(?:_|-)?(?:vars?|variables?)$/i.test(key) && (typeof child === "string" ? /^[A-Za-z_][A-Za-z0-9_]*$/.test(child) : Array.isArray(child) && child.every((item) => typeof item === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(item)))) continue;
+      if (key === "env_http_headers") {
+        if (!isRecord(child) || Object.values(child).some((name) => typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error("plugin definition contains account-local authorization");
+        continue;
+      }
+      const reference = referenceValue(child);
+      const authKind = ["auth", "oauth"].includes(key.toLowerCase()) && ["oauth", "oAuth", "none"].includes(String(child));
+      const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+      const numericTokenBudget = typeof child === "number" && Number.isFinite(child) && /^(?:(?:[a-z0-9]+[_-])*tokens?[_-](?:budget|limit|count)|max[_-](?:(?:input|output|total)[_-])?tokens)$/i.test(normalizedKey);
+      if (credentialKey(key) && !numericTokenBudget && !isRecord(child) && !Array.isArray(child) && !reference && !authKind && child !== null && child !== false && child !== "") throw new Error("plugin definition contains account-local authorization");
+      if (!reference && !authKind) assertNonsecretDefinitionJsonValueV1(child);
+    }
+  } else if (typeof value === "string") {
+    const assignment = /^(?:--?)?([^=\s]+)\s*=\s*(.*)$/.exec(value.trim());
+    const literalScheme = [...value.matchAll(/\b(?:Bearer|Basic)\s+(\S+)/ig)].some((match) => !referenceValue(match[1]));
+    if (assignment && credentialKey(assignment[1]) && assignment[2] !== "" && !referenceValue(assignment[2]) || literalScheme || /-----BEGIN (?:[A-Z ]+)?PRIVATE KEY-----/i.test(value)) throw new Error("plugin definition contains account-local authorization");
+    const urlText = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/i.exec(value)?.[0];
+    if (urlText) {
+      try {
+        const url = new URL(urlText);
+        if (url.username || url.password || [...url.searchParams].some(([key, child]) => credentialKey(key) && child !== "" && !referenceValue(child))) throw new Error("plugin definition contains account-local authorization");
+      } catch (error) {
+        if (error instanceof Error && error.message === "plugin definition contains account-local authorization") throw error;
+      }
+    }
+  }
+}
+var OFFICIAL_PLUGIN_MANIFEST_PATHS_V1 = [".codex-plugin/plugin.json", ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"];
+var OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1 = "https://agent-plugins.org/schemas/";
+var OFFICIAL_AGENT_PLUGIN_SCHEMA_V1 = `${OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1}1.0.0/plugin.schema.json`;
+var OFFICIAL_PLUGIN_WITHHELD_REASON_V1 = "Plugin definition is unsafe to share; its native installation remains unchanged.";
+function officialPluginDefinitionWithheldReasonV1(error) {
+  return error instanceof SyntaxError || error instanceof Error && ["plugin definition contains account-local authorization", "unsafe MCP definition reference", "unsafe MCP definition declaration", "unsafe plugin definition", "unsafe plugin manifest"].includes(error.message) ? OFFICIAL_PLUGIN_WITHHELD_REASON_V1 : null;
+}
+function officialPluginMcpDeclarationsV1(manifest) {
+  if (!isRecord(manifest)) throw new Error("unsafe plugin manifest");
+  const declared = manifest.mcpServers;
+  if (typeof declared === "string") return declared.startsWith("./") ? [declared] : [];
+  return isRecord(declared) ? [declared] : [];
+}
+function officialAgentPluginManifestV1(manifest) {
+  if (!isRecord(manifest) || typeof manifest.$schema !== "string" || !manifest.$schema.startsWith(OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1)) return false;
+  if (manifest.$schema !== OFFICIAL_AGENT_PLUGIN_SCHEMA_V1) throw new Error("unsafe plugin manifest");
+  return true;
+}
+function officialPluginDefinitionPathV1(source, relativePath) {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+  if ((0, import_node_path.isAbsolute)(normalized) || !safeResolvedChild(source, normalized) || normalized.split("/").some((part) => !part || part === "." || part === ".." || pluginPrivateContainer(part) || stockPrivatePluginContainer(part))) throw new Error("unsafe MCP definition reference");
+  return normalized;
+}
+function assertNonsecretPluginDefinitions(source, files) {
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const checked = /* @__PURE__ */ new Set();
+  const readDefinition = (relativePath) => {
+    const normalized = officialPluginDefinitionPathV1(source, relativePath);
+    const file = byPath.get(normalized);
+    if (!file || file.linkTarget !== void 0) throw new Error("unsafe MCP definition reference");
+    const bytes = readSafeRegularFile((0, import_node_path.join)(source, ...normalized.split("/")), MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin definition");
+    try {
+      const value = JSON.parse(bytes.toString("utf8"));
+      assertNonsecretDefinitionJsonV1(value);
+      checked.add(normalized);
+      return value;
+    } finally {
+      bytes.fill(0);
+    }
+  };
+  for (const path of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+    if (!byPath.has(path)) continue;
+    const manifest = readDefinition(path);
+    for (const declaration of officialPluginMcpDeclarationsV1(manifest)) {
+      if (typeof declaration === "string") readDefinition(declaration);
+      else assertNonsecretDefinitionJsonV1(declaration);
+    }
+  }
+  if (byPath.has("plugin.json")) {
+    const rootManifest = readDefinition("plugin.json");
+    if (officialAgentPluginManifestV1(rootManifest) && byPath.has("mcp.json")) readDefinition("mcp.json");
+  }
+  for (const file of files) {
+    if (file.linkTarget !== void 0 || checked.has(file.path)) continue;
+    const name = (0, import_node_path.basename)(file.path);
+    if (![".mcp.json", "mcp.json", "plugin.json", "config.json"].includes(name) && !name.endsWith(".toml")) continue;
+    const bytes = readSafeRegularFile((0, import_node_path.join)(source, ...file.path.split("/")), MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin definition");
+    try {
+      const text = bytes.toString("utf8");
+      if (name.endsWith(".toml")) {
+        const tree = parseLosslessTomlDocument(text).tree;
+        assertNonsecretDefinitionJsonV1(tomlThreadConfigOverridesV1(tree, true));
+      } else assertNonsecretDefinitionJsonV1(JSON.parse(text));
+    } finally {
+      bytes.fill(0);
+    }
+  }
+}
+function officialPluginSourceChangeRelevantV1(relativePath) {
+  return relativePath.replace(/\\/g, "/").split("/").every((part) => part !== ".DS_Store" && (part === ".codex-remote-plugin-install.json" || !pluginPrivateContainer(part) && !stockPrivatePluginContainer(part)));
+}
+function projectOfficialPluginPackagesV1(input) {
+  const expected = (0, import_node_path.join)((0, import_node_path.resolve)(input.stateRoot), "accounts", input.account.opaqueAccountId, "execution-home");
+  if ((0, import_node_path.resolve)(input.account.codexHome) !== expected || (0, import_node_path.resolve)(input.sourceHome) === expected) throw new Error("stock plugin projection requires a Tweakers-owned account home");
+  if (input.account.accountStateRoot && (0, import_node_path.resolve)(input.account.accountStateRoot) !== (0, import_node_path.dirname)(expected)) throw new Error("stock plugin projection receipt requires the exact owned account root");
+  assertSafePrivateDirectoryReadOnly(expected);
+  assertWriteEvidence(input.writeEvidence);
+  if (!input.custody) readOfficialPluginHttpServersV1(input.sourceHome, input.plugins, true);
+  const root = (0, import_node_path.join)((0, import_node_path.resolve)(input.sourceHome), "plugins", "cache");
+  const packages = input.custody ? input.custody.map((packageEntry) => {
+    const snapshot = captureOfficialPluginPackageV1(packageEntry.path);
+    if (snapshot.digest !== packageEntry.digest || !isSafePluginId(packageEntry.id) || !isSafePluginSegment(packageEntry.version)) throw new Error("sealed stock package custody changed");
+    const [name, registry] = packageEntry.id.split("@");
+    return { id: packageEntry.id, name, registry, version: packageEntry.version, files: snapshot.files, bytes: snapshot.files.reduce((n, file) => n + file.bytes, 0) };
+  }) : input.plugins.length ? scanPluginCache(root, new Set(input.plugins.map((plugin) => plugin.id)), true) : [];
+  const selected = [];
+  const sourcePaths = {};
+  for (const plugin of input.plugins) {
+    const entry = packages.find((candidate) => candidate.id === plugin.id);
+    if (!entry || plugin.version !== null && entry.version !== plugin.version) throw new Error("stock inventory package is missing or changed");
+    const source = input.custody?.find((packageEntry) => packageEntry.id === plugin.id)?.path ?? (0, import_node_path.join)(root, entry.registry, entry.name, entry.version);
+    assertNonsecretPluginDefinitions(source, entry.files);
+    const alias = input.canonical === false ? officialLocalPluginIdV1(entry.id) : entry.id;
+    sourcePaths[alias] = source;
+    selected.push({ id: alias, version: entry.version, fingerprint: sha256Json({ id: alias, version: entry.version, files: entry.files }), fileCount: entry.files.length, bytes: entry.bytes });
+  }
+  const generation = input.generation ?? 1;
+  const plugins = { version: 1, generation, plugins: selected, root, fingerprint: pluginInventoryFingerprint(generation, selected) };
+  const accountRoot = accountStateRoot(input.stateRoot, input.account);
+  assertSafeOwnerDirectory(accountRoot, true);
+  return preparePluginPackages({ account: input.account, plugins, apply: true, writeEvidence: input.writeEvidence, sourcePaths, strict: true }, accountRoot);
+}
+function officialLocalPluginExecutionVersionV1(source, sourceVersion) {
+  if (!isSafePluginSegment(sourceVersion)) throw new Error("invalid plugin source version");
+  for (const relative2 of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+    const path = (0, import_node_path.join)(source, relative2);
+    if (!lstatIfPresent(path)) continue;
+    const bytes = readSafeRegularFile(path, MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin manifest");
+    const manifest = JSON.parse(bytes.toString("utf8"));
+    if (!isRecord(manifest)) throw new Error("unsafe plugin manifest");
+    if (!Object.prototype.hasOwnProperty.call(manifest, "version")) return sourceVersion;
+    if (typeof manifest.version !== "string" || !isSafePluginSegment(manifest.version)) throw new Error("unsafe plugin execution version");
+    return manifest.version;
+  }
+  return sourceVersion;
+}
+function reconcileOfficialPluginLayoutReceiptV1(input) {
+  const home = (0, import_node_path.resolve)(input.account.codexHome), root = (0, import_node_path.join)((0, import_node_path.resolve)(input.stateRoot), "accounts", input.account.opaqueAccountId);
+  if (home !== (0, import_node_path.join)(root, "execution-home") || input.account.accountStateRoot && (0, import_node_path.resolve)(input.account.accountStateRoot) !== root) throw new Error("layout reconciliation requires the owned account home");
+  assertSafePrivateDirectoryReadOnly(home);
+  const current = readPrivateJson(root, PLUGIN_PROJECTIONS_FILE), before = input.before ?? current;
+  if (!isRecord(before) || before.version !== 1 || before.opaqueAccountId !== input.account.opaqueAccountId || !isRecord(before.entries) || readPrivateJson(root, PLUGIN_PROJECTION_INTENT_FILE) !== null) throw new Error("layout receipt is unavailable or has a pending projection");
+  const beforeEntries = before.entries;
+  const entries = {};
+  for (const [id, value] of Object.entries(beforeEntries)) {
+    if (!isSafePluginId(id) || !isRecord(value) || typeof value.version !== "string" || !isSafePluginSegment(value.version) || !isSha256(value.fingerprint)) throw new Error("invalid layout receipt entry");
+    entries[id] = { version: value.version, fingerprint: value.fingerprint };
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const validate = (change, unchanged = false) => {
+    if (!isSafePluginId(change.id) || !isSafePluginSegment(change.beforeVersion) || !isSafePluginSegment(change.afterVersion) || !unchanged && change.beforeVersion === change.afterVersion || !isSha256(change.digest)) throw new Error("invalid layout change");
+    const [name, market] = change.id.split("@"), parent = (0, import_node_path.join)(home, "plugins/cache", market, name);
+    assertSafePrivateDirectoryReadOnly(home);
+    for (const path2 of [(0, import_node_path.join)(home, "plugins"), (0, import_node_path.join)(home, "plugins/cache"), (0, import_node_path.join)(home, "plugins/cache", market), parent]) assertSafeCapabilityDirectory(path2);
+    const names = (0, import_node_fs.readdirSync)(parent);
+    if (names.length !== 1 || names[0] !== change.afterVersion) throw new Error("layout reconciliation requires one exact version");
+    const path = (0, import_node_path.join)(parent, change.afterVersion), snapshot = captureOfficialPluginPackageV1(path);
+    if (snapshot.digest !== change.digest || !unchanged && officialLocalPluginExecutionVersionV1(path, change.beforeVersion) !== change.afterVersion) throw new Error("layout payload or manifest differs");
+    const old = beforeEntries[change.id];
+    if (!isRecord(old) || old.version !== change.beforeVersion || old.fingerprint !== sha256Json({ id: change.id, version: change.beforeVersion, files: snapshot.files })) throw new Error("layout receipt does not own the unchanged payload");
+    return { version: change.afterVersion, fingerprint: sha256Json({ id: change.id, version: change.afterVersion, files: snapshot.files }) };
+  };
+  for (const entry of input.unchanged) {
+    if (seen.has(entry.id)) throw new Error("duplicate layout package");
+    seen.add(entry.id);
+    validate({ id: entry.id, beforeVersion: entry.version, afterVersion: entry.version, digest: entry.digest }, true);
+  }
+  for (const change of input.changes) {
+    if (seen.has(change.id)) throw new Error("duplicate layout change");
+    seen.add(change.id);
+    entries[change.id] = validate(change);
+  }
+  if (!seen.size) throw new Error("empty layout reconciliation");
+  const after = { ...before, entries };
+  if (sha256Json(current) !== sha256Json(before) && sha256Json(current) !== sha256Json(after)) throw new Error("layout receipt changed outside the recorded transition");
+  if (input.apply) {
+    assertWriteEvidence(input.writeEvidence);
+    for (const entry of input.unchanged) validate({ id: entry.id, beforeVersion: entry.version, afterVersion: entry.version, digest: entry.digest }, true);
+    for (const change of input.changes) validate(change);
+    if (!input.authorize() || sha256Json(readPrivateJson(root, PLUGIN_PROJECTIONS_FILE)) !== sha256Json(current)) throw new Error("layout reconciliation authority changed");
+    if (sha256Json(current) !== sha256Json(after)) atomicWritePrivateJson(root, PLUGIN_PROJECTIONS_FILE, after);
+  }
+  return { before, after };
+}
+function captureOfficialPluginPackageV1(source) {
+  const files = scanPluginPackage(source, true);
+  assertNonsecretPluginDefinitions(source, files);
+  return { files, digest: sha256Json(files) };
+}
+function copyOfficialPluginPackageV1(source, destination, expectedDigest) {
+  const snapshot = captureOfficialPluginPackageV1(source);
+  if (snapshot.digest !== expectedDigest || lstatIfPresent(destination)) throw new Error("stock package custody changed or destination is occupied");
+  assertSafeOwnerDirectory((0, import_node_path.dirname)(destination), true);
+  copyPluginPackage(source, destination, snapshot.files, false);
+  if (captureOfficialPluginPackageV1(destination).digest !== expectedDigest || captureOfficialPluginPackageV1(source).digest !== expectedDigest) throw new Error("stock package custody changed during copy");
+}
+function readOfficialPluginHttpServersV1(home, plugins, rejectSecrets = false, includeStdio = false) {
+  const config = readAccountConfig(home);
+  const configuredPlugins = getTomlNode(config.tree, ["plugins"]);
+  const configured = Object.keys(isTomlInlineTable(configuredPlugins) ? configuredPlugins.entries : configuredPlugins ?? {});
+  const selected = plugins ?? configured.map((id) => ({ id, version: null }));
+  const output = [];
+  for (const plugin of selected) {
+    if (!isSafePluginId(plugin.id)) throw new Error("invalid installed plugin id");
+    const [name, registry] = plugin.id.split("@");
+    const nameRoot = (0, import_node_path.join)(home, "plugins", "cache", registry, name);
+    if (!lstatIfPresent(nameRoot)) continue;
+    assertSafeCapabilityDirectory(nameRoot);
+    const versions = (0, import_node_fs.readdirSync)(nameRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && isSafePluginSegment(entry.name)).map((entry) => entry.name).sort(compareNativePluginVersions);
+    const version = plugin.version ?? (versions.includes("local") ? "local" : versions.at(-1));
+    if (!version || !isSafePluginSegment(version)) continue;
+    const packageRoot = (0, import_node_path.join)(nameRoot, version);
+    assertSafeCapabilityDirectory(packageRoot);
+    const readDefinition = (relativePath, required = false) => {
+      const normalized = officialPluginDefinitionPathV1(packageRoot, relativePath), path = (0, import_node_path.join)(packageRoot, ...normalized.split("/"));
+      if (!lstatIfPresent(path)) {
+        if (required) throw new Error("unsafe MCP definition reference");
+        return void 0;
+      }
+      let parent = packageRoot;
+      for (const part of normalized.split("/").slice(0, -1)) {
+        parent = (0, import_node_path.join)(parent, part);
+        const stat = (0, import_node_fs.lstatSync)(parent);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || stat.mode & 18) throw new Error("unsafe MCP definition reference");
+      }
+      const bytes = readSafeRegularFile(path, MAX_CONFIG_BYTES, true, false);
+      if (!bytes) throw new Error("unsafe plugin definition");
+      try {
+        const value = JSON.parse(bytes.toString("utf8"));
+        if (rejectSecrets) assertNonsecretDefinitionJsonV1(value);
+        return value;
+      } finally {
+        bytes.fill(0);
+      }
+    };
+    const definitions = [readDefinition(".mcp.json"), readDefinition("mcp.json")];
+    const rootManifest = readDefinition("plugin.json");
+    if (rootManifest !== void 0) officialAgentPluginManifestV1(rootManifest);
+    for (const manifestPath of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+      const manifest = readDefinition(manifestPath);
+      if (manifest === void 0) continue;
+      for (const declaration of officialPluginMcpDeclarationsV1(manifest)) {
+        if (rejectSecrets && typeof declaration !== "string") assertNonsecretDefinitionJsonV1(declaration);
+        definitions.push(typeof declaration === "string" ? readDefinition(declaration, true) : declaration);
+      }
+    }
+    for (const definition of definitions) {
+      if (!isRecord(definition)) continue;
+      const servers = isRecord(definition.mcpServers) ? definition.mcpServers : isRecord(definition.mcp_servers) ? definition.mcp_servers : definition;
+      for (const [serverName, server] of Object.entries(servers)) {
+        if (isRecord(server) && (typeof server.url === "string" || includeStdio && typeof server.command === "string") && !output.some((entry) => entry.pluginId === plugin.id && entry.name === serverName)) output.push({ pluginId: plugin.id, name: serverName });
+      }
+    }
+  }
+  return output;
+}
+function officialPluginDefinitionBlocksV1(home, plugins) {
+  const blocked = {};
+  for (const plugin of plugins) {
+    try {
+      readOfficialPluginHttpServersV1(home, [plugin], true);
+    } catch (error) {
+      const reason = officialPluginDefinitionWithheldReasonV1(error);
+      if (!reason) throw error;
+      blocked[plugin.id] = reason;
+    }
+  }
+  return blocked;
+}
+function readOfficialInstalledPluginSnapshotV1(home) {
+  assertSafeCapabilityDirectory(home);
+  const before = readAccountConfig(home);
+  const configuredNode = getTomlNode(before.tree, ["plugins"]);
+  const configured = isTomlInlineTable(configuredNode) ? configuredNode.entries : isTomlTable(configuredNode) ? configuredNode : {};
+  const ids = Object.keys(configured).sort();
+  if (ids.length > 4096 || ids.some((id) => !isSafePluginId(id))) throw new Error("invalid installed source plugin configuration");
+  const cache = (0, import_node_path.join)(home, "plugins", "cache");
+  const readPackages = () => lstatIfPresent(cache) ? scanPluginCache(cache, new Set(ids), true) : [];
+  const first = readPackages(), second = readPackages();
+  if (before.fingerprint !== readAccountConfig(home).fingerprint || stableJson(first) !== stableJson(second)) throw new Error("source plugin snapshot changed during read");
+  const plugins = ids.map((id) => {
+    const node = configured[id];
+    const settings = isTomlInlineTable(node) ? node.entries : isTomlTable(node) ? node : {};
+    const enabled = settings.enabled;
+    if (enabled !== void 0 && (!isTomlScalar(enabled) || enabled.type !== "boolean")) throw new Error("invalid installed source plugin enablement");
+    return {
+      id,
+      enabled: enabled === void 0 ? true : enabled.value,
+      version: first.find((plugin) => plugin.id === id)?.version ?? null
+    };
+  });
+  return {
+    plugins,
+    configFingerprint: before.fingerprint,
+    fingerprint: sha256Json({ configFingerprint: before.fingerprint, packages: first.map(({ id, version, fingerprint }) => ({ id, version, fingerprint })), plugins })
+  };
+}
+function officialLocalPluginIdV1(id) {
+  if (!isSafePluginId(id)) throw new Error("invalid shared plugin identity");
+  const [name, marketplace] = id.split("@");
+  return `${name}@tweakers-shared-${(0, import_node_crypto.createHash)("sha256").update(marketplace).digest("hex").slice(0, 16)}`;
+}
+function nonsecretPluginPolicyV1(value) {
+  const tree = isTomlInlineTable(value) ? value.entries : isTomlTable(value) ? value : {};
+  const selected = {};
+  for (const { path, value: child } of flattenTomlLeaves(tree).values()) {
+    if (!path.some(credentialShaped) && !containsLiteralAuthorization(child)) setTomlNode(selected, path, child);
+  }
+  return selected;
+}
+function tomlThreadConfigOverridesV1(tree, rootTables = false) {
+  const value = (node) => {
+    switch (node.type) {
+      case "string":
+      case "boolean":
+        return node.value;
+      case "integer": {
+        const number = Number(node.value);
+        if (!Number.isSafeInteger(number)) throw new Error("stock thread override integer is not JSON-safe");
+        return number;
+      }
+      case "float":
+        return Number(node.value);
+      case "datetime":
+        return node.value;
+      case "array":
+        return node.values.map(value);
+      case "inline-table":
+        return Object.fromEntries(Object.entries(node.entries).map(([key, child]) => {
+          if (!isTomlDataValue(child)) throw new Error("unsupported stock inline policy");
+          return [key, value(child)];
+        }));
+      case "array-table":
+        throw new Error("unsupported stock array policy");
+    }
+  };
+  if (rootTables) return Object.fromEntries(Object.entries(tree).map(([key, node]) => [key, value(inlineTomlOverrideValueV1(node))]));
+  return Object.fromEntries([...flattenTomlLeaves(tree).values()].map(({ path, value: node }) => {
+    if (!isTomlDataValue(node)) throw new Error("invalid stock thread policy");
+    return [renderTomlPath(path), value(node)];
+  }));
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   ACCOUNT_LOCAL_OAUTH_MUTATION_METHOD_V1,
   ACCOUNT_SCOPED_CAPABILITY_MUTATION_METHODS_V1,
   DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1,
+  OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1,
   abortUnpublishedSharedSourceRebase,
+  assertNonsecretDefinitionJsonV1,
   bootstrapAccountContinuity,
   bootstrapSharedPluginsManifest,
   captureAccountCapabilitiesAfterExit,
   captureAccountConfigAfterExit,
   captureIdleAccountChangesBeforeSpawn,
+  captureOfficialPluginPackageV1,
   captureUnmaterializedNativeChangesBeforeSpawn,
+  copyOfficialPluginPackageV1,
   ensureAccountContinuityEnrollment,
   isAccountScopedCapabilityMutationV1,
   loadAccountCapabilityOverrides,
@@ -6554,18 +7063,31 @@ function captureIdleAccountChangesBeforeSpawn(input) {
   loadAccountContinuitySharedSourceProvenanceV1,
   loadSharedAccountBase,
   loadSharedPluginsManifestV1,
+  nonsecretPluginPolicyV1,
   observeExistingNativeAccountContinuity,
+  officialLocalPluginExecutionVersionV1,
+  officialLocalPluginIdV1,
+  officialPluginDefinitionBlocksV1,
+  officialPluginDefinitionWithheldReasonV1,
+  officialPluginSourceChangeRelevantV1,
   parseLosslessTomlDocument,
   prepareAccountConfigBeforeSpawn,
+  projectOfficialPluginPackagesV1,
   projectPrimarySharedBase,
   publishPrimaryPluginInventoryAfterExit,
   publishPrimarySharedBaseAfterExit,
   readLosslessTomlDocument,
+  readOfficialInstalledPluginSnapshotV1,
+  readOfficialPluginHttpServersV1,
   rebaseAccountContinuitySharedSource,
+  reconcileOfficialPluginLayoutReceiptV1,
   renderResolvedAccountToml,
+  renderTomlConfigOverridesV1,
   resolveAccountCapabilities,
   resolveAccountConfig,
   scanCapabilityTree,
+  selectNonsecretDefinitionTreeV1,
+  tomlThreadConfigOverridesV1,
   validateAccountContinuityMaterialization
 });
 //# sourceMappingURL=account-continuity.js.map

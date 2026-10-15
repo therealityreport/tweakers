@@ -1,3 +1,4 @@
+import { doctorSourceFile } from "./doctor-baseline.js";
 import { changelogEntryId, validateDoctorChangelog } from "./doctor-changelog.js";
 import { changeReportFingerprint } from "./doctor-adoption.js";
 import asar from "@electron/asar";
@@ -925,7 +926,7 @@ function readEvidenceBytes(
   try {
     let bytes: Buffer;
     if (artifact === "asar_member") {
-      const archive = exactChild(evidence.appPath, evidence.asar.path);
+      const archive = doctorSourceFile(evidence.appPath, evidence.asar.path);
       const archiveStat = lstatSync(archive);
       if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) return { bytes: null, problem: "the ASAR evidence path is not a regular file" };
       bytes = Buffer.from(asar.extractFile(archive, path));
@@ -937,7 +938,7 @@ function readEvidenceBytes(
       if (!isAbsolute(root) || resolve(root) !== root) return { bytes: null, problem: "the evidence root is not an exact absolute path" };
       const rootStat = lstatSync(root);
       if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return { bytes: null, problem: "the evidence root is not a regular directory" };
-      const source = exactChild(root, path);
+      const source = artifact === "schema" ? exactChild(root,path) : doctorSourceFile(root,path);
       const stat = lstatSync(source);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== expectedBytes) return { bytes: null, problem: "the source identity or size changed" };
       const fd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);

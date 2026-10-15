@@ -24,6 +24,7 @@ import {
   parseTweakersManagerDescriptor,
   parseTweakersManagerTargetSeal,
   publishTweakersManagerDescriptor,
+  readTweakersManagerGenerationRecord,
   removeTweakersManagerDescriptor,
   validateTweakersManagerGeneration,
   type ManagerDescriptorDependencies,
@@ -63,7 +64,11 @@ test("publishes a sealed immutable status manager generation before its descript
     assert.equal(seal.managedRuntimeFingerprint, first.managedRuntime.split("/").at(-1));
     assert.equal(lstatSync(first.seal).mode & 0o7777, 0o400);
     assert.equal(lstatSync(fixture.descriptorFile).mode & 0o7777, 0o600);
+    const firstRecord = readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot);
+    assert.equal(firstRecord.current.generationId, first.generationId);
+    assert.equal(firstRecord.previous, null);
     const second = publish(fixture);
+    assert.deepEqual(readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot), firstRecord);
     assert.equal(second.reusedGeneration, true, "content-addressed generation must never be rewritten");
     assert.equal(second.generationRoot, first.generationRoot);
   } finally {
@@ -132,6 +137,10 @@ test("publisher restores the prior descriptor after an injected post-publication
   try {
     publish(fixture);
     const priorDescriptor = readFileSync(fixture.descriptorFile, "utf8");
+    const priorRecord = readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot);
+    chmodSync(fixture.bundle, 0o600);
+    writeFileSync(fixture.bundle, readFileSync(fixture.bundle, "utf8") + "\n// next generation\n");
+    chmodSync(fixture.bundle, 0o400);
     assert.throws(
       () => publish(fixture, {
         now: () => "2026-08-28T00:00:00.000Z",
@@ -140,6 +149,24 @@ test("publisher restores the prior descriptor after an injected post-publication
       /injected post-publication failure/,
     );
     assert.equal(readFileSync(fixture.descriptorFile, "utf8"), priorDescriptor);
+    assert.deepEqual(readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot), priorRecord);
+    const next = publish(fixture);
+    const nextRecord = readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot);
+    assert.equal(nextRecord.current.generationId, next.generationId);
+    assert.deepEqual(nextRecord.previous, priorRecord.current);
+    publish(fixture);
+    assert.deepEqual(readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot), nextRecord);
+    chmodSync(fixture.bundle, 0o600);
+    writeFileSync(fixture.bundle, readFileSync(fixture.bundle, "utf8") + "\n// third generation\n");
+    chmodSync(fixture.bundle, 0o400);
+    publish(fixture);
+    assert.deepEqual(readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot).previous, nextRecord.current);
+    const recordPath = join(fixture.userRoot, "managers", TWEAKERS_MANAGER_ID, "previous-generation.json");
+    writeFileSync(recordPath, JSON.stringify(nextRecord));
+    assert.throws(() => readTweakersManagerGenerationRecord(fixture.userRoot, fixture.descriptorRoot), /disagrees/);
+    assert.throws(() => publish(fixture), /disagrees/);
+    writeFileSync(recordPath, "{}");
+    assert.throws(() => publish(fixture), /Invalid previous-generation record/);
   } finally {
     fixture.cleanup();
   }

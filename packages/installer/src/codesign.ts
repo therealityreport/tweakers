@@ -10,14 +10,32 @@
  * uses the same identity before the bundle wrappers and main app are signed.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, platform, tmpdir } from "node:os";
 import { readPlist, writePlist, type Plist } from "./plist.js";
+import { assertOfficialBundledBackendSigningClosure, isPreservedOfficialBundledBackendPath, type OfficialBundledBackendClosure } from "./native-bundled-backend.js";
 
 export const DEFAULT_LOCAL_SIGNING_IDENTITY = "Tweakers Local Signing";
 export const OPENAI_DEVELOPER_ID_TEAM_IDENTIFIER = "2DC432GLL2";
+
+const binaryHashes = new Map<string, { identity: string; hash: string }>();
+function binarySha256(path: string): string {
+  const identity = () => { const s = lstatSync(path); return [s.dev, s.ino, s.size, s.ctimeMs, s.mtimeMs, s.mode].join(":"); };
+  const before = identity();
+  const cached = binaryHashes.get(path);
+  if (cached?.identity === before) return cached.hash;
+  const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024), fd = openSync(path, "r");
+  try {
+    for (;;) { const bytes = readSync(fd, buffer, 0, buffer.length, null); if (!bytes) break; hash.update(buffer.subarray(0, bytes)); }
+  } finally { closeSync(fd); }
+  if (identity() !== before) throw new Error("Signing input changed during hashing");
+  const digest = hash.digest("hex");
+  if (binaryHashes.size >= 64) binaryHashes.clear();
+  binaryHashes.set(path, { identity: before, hash: digest });
+  return digest;
+}
 
 export type SigningMode = "local-identity" | "adhoc";
 
@@ -51,7 +69,11 @@ export interface CodeSigningOptions {
   preparedIdentity?: PreparedSigningIdentity | null;
   signingPosture?: SigningPosture;
   /** Exact installed backend whose signed bytes must remain registered during baseline maintenance. */
-  retainedSignedBackend?: { sourcePath: string; sha256: string };
+  retainedSignedBackend?: { sourcePath: string; sha256: string; certificateSha1?: string };
+  /** Receipt-bound companion whose signed bytes must remain paired with the backend. */
+  retainedSignedCodeModeHost?: { sourcePath: string; sha256: string; certificateSha1?: string };
+  /** Preserve the complete supplied native CLI resource tree and its upstream signatures. */
+  officialBundledBackend?: OfficialBundledBackendClosure;
 }
 
 export interface PreparedSigningIdentity {
@@ -82,6 +104,8 @@ export interface UserKeychainPreferenceOptions {
 
 function defaultSecurityRunner(command: string, args: string[]): SecurityCommandResult {
   const result = spawnSync(command, args, {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -116,6 +140,12 @@ const MACHO_MAGICS = new Set([
 export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): CodeSigningResult | null {
   if (platform() !== "darwin") return null;
 
+  if (opts.officialBundledBackend && (opts.retainedSignedBackend || opts.retainedSignedCodeModeHost)) {
+    throw new Error("Official bundled closure cannot combine with retained flat executable authority");
+  }
+  const preserved = (path: string) => isPreservedOfficialBundledBackendPath(appRoot, path, opts.officialBundledBackend);
+  if (opts.officialBundledBackend) assertOfficialBundledBackendSigningClosure(appRoot, opts.officialBundledBackend);
+
   const posture = resolveSigningPosture(opts.signingPosture);
   const useLocalIdentity = opts.useLocalIdentity !== false;
   const localIdentity = useLocalIdentity
@@ -145,6 +175,7 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
         nestedEntitlementsRoot,
         entitlementSequence,
         expectedEntitlementsByTarget,
+        preserved,
       );
     }
     signNestedBundles(
@@ -155,6 +186,7 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
       nestedEntitlementsRoot,
       entitlementSequence,
       expectedEntitlementsByTarget,
+      preserved,
     );
   } finally {
     rmSync(nestedEntitlementsRoot, { recursive: true, force: true });
@@ -163,6 +195,14 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
   if (opts.retainedSignedBackend) {
     if (!localIdentity) throw new Error("Retaining an installed backend requires its exact local signing identity");
     restoreVerifiedSignedBackend(appRoot, opts.retainedSignedBackend, localIdentity.hash);
+    expectedEntitlementsByTarget.set(join(appRoot, "Contents", "Resources", "codex"),
+      assertPortableEntitlements(readEmbeddedEntitlements(opts.retainedSignedBackend.sourcePath) ?? {}));
+  }
+  if (opts.retainedSignedCodeModeHost) {
+    if (!localIdentity) throw new Error("Retaining a code-mode helper requires its exact signing certificate");
+    restoreVerifiedSignedCodeModeHost(appRoot, opts.retainedSignedCodeModeHost, localIdentity.hash);
+    expectedEntitlementsByTarget.set(join(appRoot, "Contents", "Resources", "codex-code-mode-host"),
+      assertPortableEntitlements(readEmbeddedEntitlements(opts.retainedSignedCodeModeHost.sourcePath) ?? {}));
   }
 
   // Step 2: sign the outer bundle only after its nested code. `--deep` can
@@ -208,7 +248,13 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
     if (portableSignature) rmSync(portableSignature.tempRoot, { recursive: true, force: true });
   }
 
-  if (localIdentity) auditLocallySignedApp(appRoot, localIdentity.name, expectedEntitlementsByTarget);
+  if (opts.officialBundledBackend) assertOfficialBundledBackendSigningClosure(appRoot, opts.officialBundledBackend);
+  if (localIdentity) auditLocallySignedApp(appRoot, localIdentity.name, expectedEntitlementsByTarget,
+    opts.retainedSignedBackend, opts.retainedSignedCodeModeHost, localIdentity.hash, preserved);
+  else if (opts.officialBundledBackend) {
+    const strict = verifySignature(appRoot);
+    if (!strict.ok) throw new Error(`Official bundled candidate failed strict verification: ${strict.output}`);
+  }
 
   return localIdentity
     ? {
@@ -221,17 +267,31 @@ export function signCodexApp(appRoot: string, opts: CodeSigningOptions = {}): Co
 }
 
 /** Restore only certificate-pinned signed bytes before the outer bundle seal; never after signing. */
-export function restoreVerifiedSignedBackend(appRoot: string, binding: { sourcePath: string; sha256: string }, signingIdentityHash: string,
+export function restoreVerifiedSignedBackend(appRoot: string, binding: NonNullable<CodeSigningOptions["retainedSignedBackend"]>, signingIdentityHash: string,
   deps: { certificate?: typeof codeSigningCertificateLeafHash; verify?: typeof verifySignature; copy?: typeof copyFileSync } = {}): void {
-  const source = binding.sourcePath, target = join(appRoot, "Contents", "Resources", "codex");
-  if (!isAbsolute(source) || resolve(source) !== source || !/^[a-f0-9]{64}$/.test(binding.sha256)) throw new Error("Invalid retained backend binding");
+  restoreVerifiedSignedResource(appRoot, "codex", "backend", binding, signingIdentityHash, deps);
+}
+
+export function restoreVerifiedSignedCodeModeHost(appRoot: string, binding: NonNullable<CodeSigningOptions["retainedSignedCodeModeHost"]>, signingIdentityHash: string,
+  deps: { certificate?: typeof codeSigningCertificateLeafHash; verify?: typeof verifySignature; copy?: typeof copyFileSync } = {}): void {
+  restoreVerifiedSignedResource(appRoot, "codex-code-mode-host", "code-mode helper", binding, signingIdentityHash, deps);
+}
+
+function restoreVerifiedSignedResource(appRoot: string, resource: "codex" | "codex-code-mode-host", label: string,
+  binding: NonNullable<CodeSigningOptions["retainedSignedBackend"]>, signingIdentityHash: string,
+  deps: { certificate?: typeof codeSigningCertificateLeafHash; verify?: typeof verifySignature; copy?: typeof copyFileSync }): void {
+  const source = binding.sourcePath, target = join(appRoot, "Contents", "Resources", resource);
+  if (!isAbsolute(source) || resolve(source) !== source || !/^[a-f0-9]{64}$/.test(binding.sha256)) throw new Error(`Invalid retained ${label} binding`);
   const sourceStat = lstatSync(source), targetStat = lstatSync(target);
-  if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || !targetStat.isFile() || targetStat.isSymbolicLink()) throw new Error("Retained backend must use physical regular files");
-  const sha = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
-  if (sha(source) !== binding.sha256 || (deps.certificate ?? codeSigningCertificateLeafHash)(source).toUpperCase() !== signingIdentityHash.toUpperCase()
-    || !(deps.verify ?? verifySignature)(source).ok) throw new Error("Retained backend signature or bytes changed");
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || !targetStat.isFile() || targetStat.isSymbolicLink()) throw new Error(`Retained ${label} must use physical regular files`);
+  const sha = binarySha256;
+  const expectedCertificate = normalizedCertificateLeafHash(binding.certificateSha1 ?? signingIdentityHash, `Retained ${label} certificate`);
+  if (sha(source) !== binding.sha256 || (deps.certificate ?? codeSigningCertificateLeafHash)(source).toUpperCase() !== expectedCertificate
+    || !(deps.verify ?? verifySignature)(source, expectedCertificate).ok) throw new Error(`Retained ${label} signature or bytes changed`);
   (deps.copy ?? copyFileSync)(source, target);
-  if (sha(source) !== binding.sha256 || sha(target) !== binding.sha256 || !(deps.verify ?? verifySignature)(target).ok) throw new Error("Retained backend copy did not verify");
+  if (sha(source) !== binding.sha256 || sha(target) !== binding.sha256
+    || (deps.certificate ?? codeSigningCertificateLeafHash)(target).toUpperCase() !== expectedCertificate
+    || !(deps.verify ?? verifySignature)(target, expectedCertificate).ok) throw new Error(`Retained ${label} copy did not verify`);
 }
 
 /**
@@ -244,6 +304,8 @@ const NON_PORTABLE_ENTITLEMENTS = new Set([
   "com.apple.security.application-groups",
   "keychain-access-groups",
   "com.apple.developer.aps-environment",
+  // Communication Notifications is configured for the upstream team's app capability.
+  "com.apple.developer.usernotifications.communication",
 ]);
 
 /**
@@ -279,6 +341,8 @@ function preparePortableSignature(appRoot: string, identityHash: string, posture
   const identifier = String(info.CFBundleIdentifier ?? "");
   const signatureSource = portableOuterSignatureSource(appRoot, info);
   const requirementResult = spawnSync("codesign", ["-d", "-r-", signatureSource], {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -387,6 +451,9 @@ export function assertPortableEntitlements(entitlements: Plist): Plist {
 function filterPortableEntitlements(entitlements: Plist): Plist {
   const portable: Plist = {};
   for (const [key, value] of Object.entries(entitlements)) {
+    if (key === "com.apple.developer.usernotifications.communication" && typeof value !== "boolean") {
+      throw new Error(`Communication Notifications entitlement must be a boolean: ${key}`);
+    }
     if (NON_PORTABLE_ENTITLEMENTS.has(key)) continue;
     if (!PORTABLE_ENTITLEMENT_KEYS.has(key)) {
       throw new Error(`Unreviewed non-portable entitlement: ${key}`);
@@ -442,6 +509,8 @@ export function isNestedCodeBundle(path: string): boolean {
 /** Only MH_EXECUTE processes carry enforceable process entitlements after local signing. */
 export function machOAcceptsProcessEntitlements(path: string): boolean {
   const inspected = spawnSync("file", ["-b", path], {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -507,6 +576,10 @@ function auditLocallySignedApp(
   appRoot: string,
   identityName: string,
   expectedEntitlementsByTarget: ReadonlyMap<string, Plist>,
+  retainedBackend?: CodeSigningOptions["retainedSignedBackend"],
+  retainedHelper?: CodeSigningOptions["retainedSignedCodeModeHost"],
+  signingIdentityHash?: string,
+  preserved: (path: string) => boolean = () => false,
 ): void {
   const targets = new Set([
     ...collectMachOFiles(join(appRoot, "Contents")),
@@ -515,13 +588,25 @@ function auditLocallySignedApp(
   ]);
   const failures: string[] = [];
   for (const target of [...targets].sort()) {
-    const strict = verifySignature(target);
+    // The native subtree retains its source certificate and entitlements. Its
+    // exact closure was rechecked above; outer deep verification still covers it.
+    if (preserved(target)) continue;
+    const retained = target === join(appRoot, "Contents", "Resources", "codex") ? retainedBackend
+      : target === join(appRoot, "Contents", "Resources", "codex-code-mode-host") ? retainedHelper : undefined;
+    const certificate = retained?.certificateSha1 ?? (retained ? signingIdentityHash : undefined);
+    const strict = verifySignature(target, certificate);
     if (!strict.ok) {
       failures.push(`${target}: strict signature verification failed: ${strict.output}`);
       continue;
     }
     const signature = signatureInfo(target);
-    if (!isLocallySignedWithIdentity(signature, identityName)) {
+    if (retained) {
+      if (binarySha256(target) !== retained.sha256
+        || codeSigningCertificateLeafHash(target) !== normalizedCertificateLeafHash(certificate!, "Retained executable certificate")) {
+        failures.push(`${target}: retained executable certificate or bytes changed`);
+        continue;
+      }
+    } else if (!isLocallySignedWithIdentity(signature, identityName)) {
       failures.push(`${target}: not signed by local identity ${identityName}`);
       continue;
     }
@@ -654,6 +739,7 @@ export function parseCertificateLeafHashRequirement(output: string): string | nu
 /** Read the signed designated requirement; this never selects an identity. */
 export function codeSigningCertificateLeafHash(path: string): string {
   const result = spawnSync("codesign", ["-d", "-r-", path], {
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
@@ -664,6 +750,147 @@ export function codeSigningCertificateLeafHash(path: string): string {
   const leaf = parseCertificateLeafHashRequirement(`${result.stdout ?? ""}${result.stderr ?? ""}`);
   if (!leaf) throw new Error("Code-signing designated requirement does not pin an exact certificate leaf hash.");
   return leaf;
+}
+
+/** Read an actual CMS leaf certificate without requiring a custom designated leaf pin. */
+export function suppliedCodeSigningCertificateLeafHash(path: string): string {
+  const directory = mkdtempSync(join(tmpdir(), "tweakers-supplied-certificate-"));
+  try {
+    const prefix = join(directory, "certificate-");
+    const result = spawnSync("/usr/bin/codesign", ["--display", `--extract-certificates=${prefix}`, path], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 128 * 1024,
+      timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
+    });
+    if (result.error || result.status !== 0) throw new Error("Unable to extract the supplied signing certificate");
+    const leaf = prefix + "0", stat = lstatSync(leaf);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 128 * 1024) {
+      throw new Error("Supplied signing certificate is missing or unsafe");
+    }
+    const der = readFileSync(leaf), certificate = new X509Certificate(der);
+    if (!certificate.raw.equals(der)) throw new Error("Supplied signing certificate is not exact DER");
+    const fingerprint = createHash("sha1").update(der).digest("hex").toUpperCase();
+    if (!verifySignature(path, fingerprint).ok) throw new Error("Supplied code does not verify against its extracted certificate");
+    return fingerprint;
+  } finally {
+    // This directory contains only public certificates created by this invocation.
+    rmSync(directory, {recursive: true, force: true});
+  }
+}
+
+/** Sign only the source-built backend with an existing Apple identity. Stable
+ * Team ID partitioning prevents a new CDHash from becoming a new Keychain caller. */
+export function signDeveloperIdBackend(path: string, identity: PreparedSigningIdentity): void {
+  if (identity.created || !/^Developer ID Application: .+ \([A-Z0-9]{10}\)$/.test(identity.name)) {
+    throw new Error("Backend signing requires a preexisting Developer ID Application identity");
+  }
+  const certificate = normalizedCertificateLeafHash(identity.hash, "Backend signing certificate");
+  const requirement = `designated => identifier "co.tweakers.codex-backend" and anchor apple generic and certificate leaf = H"${certificate}" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`;
+  execFileSync("codesign", ["--force", "--sign", certificate, ...codeSigningKeychainArgs(identity),
+    "--identifier", "co.tweakers.codex-backend", "--timestamp=none", "--requirements", `=${requirement}`, path],
+  { stdio: ["ignore", "ignore", "pipe"], timeout: 30_000 });
+  execFileSync("codesign", ["--verify", "--strict", "-R", `=${requirement.replace(/^designated => /, "")}`, path],
+    { stdio: ["ignore", "ignore", "pipe"], timeout: 15_000 });
+  if (codeSigningCertificateLeafHash(path) !== certificate || !signatureInfo(path).teamIdentifier) {
+    throw new Error("Backend Developer ID signature did not verify");
+  }
+}
+
+export const CODE_MODE_HOST_SIGNING_IDENTIFIER = "co.tweakers.codex-code-mode-host";
+export const CODE_MODE_HOST_ENTITLEMENTS: Readonly<Plist> = Object.freeze({
+  "com.apple.security.cs.allow-jit": true,
+  "com.apple.security.cs.allow-unsigned-executable-memory": true,
+});
+
+export interface CodeModeHostSigningPostureEvidence {
+  signature: SignatureInfo;
+  entitlements: Plist | null;
+  strictVerification: { ok: boolean };
+}
+
+/** The helper requires the exact reviewed native V8 posture, without wider exceptions. */
+export function hasExactCodeModeHostSigningPosture(evidence: CodeModeHostSigningPostureEvidence): boolean {
+  const { signature, entitlements } = evidence;
+  const flags = /^CodeDirectory\b[^\n]*\bflags=0x([a-f0-9]+)/im.exec(signature.output)?.[1];
+  const derHash = /^\s*-7=([a-f0-9]{64})\s*$/im.exec(signature.output)?.[1];
+  const identifier = /^Identifier=(.*)$/m.exec(signature.output)?.[1]?.trim();
+  return signature.ok === true && signature.adHoc === false && evidence.strictVerification.ok === true
+    && /^[A-Z0-9]{10}$/.test(signature.teamIdentifier ?? "")
+    && new RegExp(`^Developer ID Application: .+ \\(${signature.teamIdentifier}\\)$`).test(signature.authority[0] ?? "")
+    && identifier === CODE_MODE_HOST_SIGNING_IDENTIFIER
+    && flags !== undefined && (Number.parseInt(flags, 16) & 0x10000) !== 0
+    && derHash !== undefined && !/^0+$/.test(derHash)
+    && entitlements !== null && typeof entitlements === "object" && !Array.isArray(entitlements)
+    && Object.keys(entitlements).length === 2
+    && Object.keys(CODE_MODE_HOST_ENTITLEMENTS).every(key => entitlements[key] === true);
+}
+
+/** Display slot -7 proves DER presence; strict verification validates its signed bytes. */
+export function verifyCodeModeHostSigningPosture(path: string, deps: {
+  run?: SecurityCommandRunner;
+  readEntitlements?: (path: string) => Plist | null;
+  verify?: typeof verifySignature;
+} = {}): boolean {
+  if (platform() !== "darwin" && !deps.run) return false;
+  try {
+    const result = (deps.run ?? ((command: string, args: string[]) => {
+      const output = spawnSync(command, args, {
+        timeout: 15_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (output.error) throw output.error;
+      return { status: output.status, stdout: String(output.stdout ?? ""), stderr: String(output.stderr ?? "") };
+    }))("codesign", ["-d", "--verbose=5", path]);
+    if (result.status !== 0) return false;
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    return hasExactCodeModeHostSigningPosture({
+      signature: { ...parseSignatureInfo(output), output },
+      entitlements: (deps.readEntitlements ?? readEmbeddedEntitlements)(path),
+      strictVerification: (deps.verify ?? verifySignature)(path),
+    });
+  } catch { return false; }
+}
+
+export function assertCodeModeHostSigningPosture(path: string): void {
+  if (!verifyCodeModeHostSigningPosture(path)) {
+    throw new Error("Code-mode helper signing posture requires strict Developer ID, hardened runtime, valid DER and exactly the reviewed entitlements");
+  }
+}
+
+function codeModeHostSigningCertificate(identity: PreparedSigningIdentity): string {
+  if (identity.created || !/^Developer ID Application: .+ \([A-Z0-9]{10}\)$/.test(identity.name)) {
+    throw new Error("Code-mode helper signing requires a preexisting Developer ID Application identity");
+  }
+  return normalizedCertificateLeafHash(identity.hash, "Code-mode helper signing certificate");
+}
+
+/** Shared command construction keeps identifier, exact leaf pin and keychain authority testable. */
+export function codeModeHostSigningCommands(path: string, identity: PreparedSigningIdentity, entitlementsPath: string): {
+  certificate: string; sign: string[]; verify: string[];
+} {
+  const certificate = codeModeHostSigningCertificate(identity);
+  const requirement = `identifier "${CODE_MODE_HOST_SIGNING_IDENTIFIER}" and anchor apple generic and certificate leaf = H"${certificate}" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`;
+  return {
+    certificate,
+    sign: ["--force", "--sign", certificate, ...codeSigningKeychainArgs(identity),
+      "--identifier", CODE_MODE_HOST_SIGNING_IDENTIFIER, "--timestamp=none", "--options", "runtime",
+      "--entitlements", entitlementsPath, "--generate-entitlement-der", "--requirements", `=designated => ${requirement}`, path],
+    verify: ["--verify", "--strict", "-R", `=${requirement}`, path],
+  };
+}
+
+export function signDeveloperIdCodeModeHost(path: string, identity: PreparedSigningIdentity): void {
+  codeModeHostSigningCertificate(identity);
+  const root = mkdtempSync(join(tmpdir(), "tweakers-code-mode-entitlements-"));
+  try {
+    const entitlementsPath = join(root, "helper.plist");
+    writePlist(entitlementsPath, { ...CODE_MODE_HOST_ENTITLEMENTS });
+    const commands = codeModeHostSigningCommands(path, identity, entitlementsPath);
+    execFileSync("codesign", commands.sign, { stdio: ["ignore", "ignore", "pipe"], timeout: 30_000 });
+    execFileSync("codesign", commands.verify, { stdio: ["ignore", "ignore", "pipe"], timeout: 15_000 });
+    if (codeSigningCertificateLeafHash(path) !== commands.certificate) {
+      throw new Error("Code-mode helper Developer ID certificate did not verify");
+    }
+    assertCodeModeHostSigningPosture(path);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
 /**
@@ -690,6 +917,7 @@ export function signCandidateReceiptResourceBundle(
     `=designated => identifier "${bundleIdentifier}" and certificate leaf = H"${hash}"`,
     bundlePath,
   ], {
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
@@ -706,6 +934,7 @@ export function signCandidateReceiptResourceBundle(
 export function verifyCandidateReceiptResourceBundle(bundlePath: string, expectedSigningIdentityHash: string): void {
   const expected = normalizedCertificateLeafHash(expectedSigningIdentityHash, "Expected signing identity hash");
   const result = spawnSync("codesign", ["--verify", "--strict", bundlePath], {
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: CANDIDATE_RECEIPT_SIGN_TIMEOUT_MS,
@@ -795,7 +1024,8 @@ export function signingAvailable(opts: { identityName?: string } = {}): boolean 
       "codesign",
       ["--sign", identity.hash, ...codeSigningKeychainArgs(identity), "--force", scratch],
       {
-      encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 750,
       },
@@ -818,6 +1048,7 @@ function walkAndSign(
   entitlementsRoot: string,
   entitlementSequence: { value: number },
   expectedEntitlementsByTarget: Map<string, Plist>,
+  preserved: (path: string) => boolean = () => false,
 ): void {
   const failures: string[] = [];
   walkAndSignInto(
@@ -830,6 +1061,7 @@ function walkAndSign(
     entitlementSequence,
     expectedEntitlementsByTarget,
     failures,
+    preserved,
   );
   if (failures.length > 0) {
     throw new Error(
@@ -848,6 +1080,7 @@ function walkAndSignInto(
   entitlementSequence: { value: number },
   expectedEntitlementsByTarget: Map<string, Plist>,
   failures: string[],
+  preserved: (path: string) => boolean,
 ): void {
   let entries: string[];
   try {
@@ -857,6 +1090,7 @@ function walkAndSignInto(
   }
   for (const name of entries) {
     const full = join(current, name);
+    if (preserved(full)) continue;
     if (!isInsideCodeSigningRoot(root, full)) continue;
     let st;
     try {
@@ -877,6 +1111,7 @@ function walkAndSignInto(
         entitlementSequence,
         expectedEntitlementsByTarget,
         failures,
+        preserved,
       );
       continue;
     }
@@ -917,9 +1152,11 @@ function signNestedBundles(
   entitlementsRoot: string,
   entitlementSequence: { value: number },
   expectedEntitlementsByTarget: Map<string, Plist>,
+  preserved: (path: string) => boolean = () => false,
 ): void {
   const failures: string[] = [];
   for (const bundle of collectNestedCodeBundles(appRoot)) {
+    if (preserved(bundle)) continue;
     try {
       const entitlements = portableEntitlementsForCode(
         bundle,
@@ -969,6 +1206,8 @@ function portableEntitlementsForCode(
 
 function readEmbeddedEntitlements(code: string): Plist | null {
   const extracted = spawnSync("codesign", ["-d", "--entitlements", ":-", code], {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1032,6 +1271,8 @@ function findCodeSigningIdentities(
   const args = ["find-identity", "-v", "-p", "codesigning"];
   if (keychainPath) args.push(keychainPath);
   const result = spawnSync("security", args, {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1347,6 +1588,8 @@ function execFileSyncRedacted(
 
 function defaultUserKeychain(): string {
   const result = spawnSync("security", ["default-keychain", "-d", "user"], {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1394,11 +1637,14 @@ export function isMachOMagic(magic: number): boolean {
   return MACHO_MAGICS.has(magic >>> 0);
 }
 
-export function verifySignature(appRoot: string): { ok: boolean; output: string } {
+export function verifySignature(appRoot: string, certificateSha1?: string): { ok: boolean; output: string } {
   if (platform() !== "darwin") return { ok: true, output: "(not macOS)" };
   try {
-    const out = execFileSync("codesign", ["--verify", "--deep", "--strict", appRoot], {
-      encoding: "utf8",
+    const out = execFileSync("codesign", ["--verify", "--deep", "--strict",
+      ...(certificateSha1 ? ["-R", `=certificate leaf = H"${normalizedCertificateLeafHash(certificateSha1, "Expected signing certificate")}"`] : []), appRoot], {
+      timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
+    encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { ok: true, output: out };
@@ -1454,6 +1700,8 @@ export function signatureInfo(appRoot: string): SignatureInfo {
     return { ok: true, adHoc: false, teamIdentifier: null, authority: [], output: "(not macOS)" };
   }
   const result = spawnSync("codesign", ["-dv", "--verbose=4", appRoot], {
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });

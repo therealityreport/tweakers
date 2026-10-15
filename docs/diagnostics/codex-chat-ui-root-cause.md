@@ -25,7 +25,8 @@ The diagnostic reproduction proves both sides of the gap:
 - the browser cannot deliver that record because the production observer did
   not subscribe to text mutations.
 
-From the enclosing `revi` directory, reproduce the old failure with:
+In the archived `revi` workspace that retains the original `diagnostics/`
+fixtures, reproduce the old failure with:
 
 ```sh
 node diagnostics/codex-chat-ui/streaming-observer-repro.cjs
@@ -64,4 +65,3 @@ Run the current regression suite from this repository:
 ```sh
 node --test tweaks/co.tweakers.shadcn-codex-ui/test/rich-block-lifecycle.test.cjs
 ```
-

@@ -4,7 +4,7 @@ import test from "node:test";
 import { AccountsBrokerRendererAdapterV1 } from "../../src/account-router/broker-adapter";
 import { AccountsBrokerV1, createBrokerHandshakeProof } from "../../src/account-router/broker";
 import { NATIVE_REQUEST_PLUGINS_MAX_RESULT_BYTES } from "../../src/account-router/native-request";
-import type { BrokerHandshakeV1, OpaqueAccountId, OpaqueAppToolsRef, OpaqueConnectionDefinitionRef, OpaqueRendererRef } from "../../src/account-router/types";
+import type { BrokerCommandV1, BrokerHandshakeV1, OpaqueAccountId, OpaqueAppToolsRef, OpaqueConnectionDefinitionRef, OpaqueRendererRef } from "../../src/account-router/types";
 
 const secret = Buffer.alloc(32, 31);
 const account = `ar_${"q".repeat(43)}` as OpaqueAccountId;
@@ -439,7 +439,7 @@ test("Accounts preferences cross the authenticated adapter with exact defaults a
   const adapter = new AccountsBrokerRendererAdapterV1({ secret, client: {
     invoke: (envelope) => broker.invoke(renderer, envelope), subscribe: (handler) => broker.subscribe(renderer, handler),
   } });
-  const invoke = (command: string, params = {}) => adapter.invoke({ version: 1, action: "broker", requestId: `pref-${Math.random().toString(36).slice(2)}`, command, params });
+  const invoke = (command: BrokerCommandV1, params = {}) => adapter.invoke({ version: 1, action: "broker", requestId: `pref-${Math.random().toString(36).slice(2)}`, command, params });
   const initial = await invoke("preferences.read");
   assert.equal(initial.ok, true);
   assert.deepEqual(initial.ok && initial.result, { failoverMode: "automatic", unifiedCatalogEnabled: false });

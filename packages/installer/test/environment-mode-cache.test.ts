@@ -956,7 +956,7 @@ test("T6 retains a released current pointer until replacement, then reclaims onl
       mode: "apply",
     });
     assert.equal(applied.generationEntries.find((entry) => entry.generationId === "generation-a")?.action, "deleted");
-    assert.equal(existsSync(first.receipt.paths.inactiveRoot), false);
+    assert.equal(existsSync(dirname(first.receipt.paths.inactiveAppPath)), false);
     assert.equal(existsSync(first.receipt.paths.runtimeRoot), false);
     assert.equal(existsSync(first.receipt.paths.managedRuntimeRoot), false);
     assert.equal(existsSync(join(oldGenerationRoot, "backend")), false);

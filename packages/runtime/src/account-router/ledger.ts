@@ -130,6 +130,7 @@ export class AccountLedger {
       const ledger = state.ledger[opaqueAccountId];
       if (!ledger || state.accountEligibility[opaqueAccountId] !== "eligible") throw new Error("account is not eligible for reservation");
       ledger.reservedRequestCost += estimatedCost;
+      pruneSettledReservations(state);
       state.reservations.push(reservation);
     });
     return reservation;
@@ -419,4 +420,18 @@ function clamp(value: number, min: number, max: number): number {
 function isUsage(value: TokenUsage): boolean {
   return Number.isInteger(value.inputTokens) && value.inputTokens >= 0
     && Number.isInteger(value.outputTokens) && value.outputTokens >= 0;
+}
+
+/**
+ * Settled ordinary reservations carry no further accounting obligation, but
+ * nothing else removes them and the state file has a hard size cap. Keep the
+ * newest few for diagnostics; never prune live, ambiguous, or Doctor records.
+ */
+const SETTLED_RESERVATIONS_RETAINED = 64;
+function pruneSettledReservations(state: RouterState): void {
+  const settled = (reservation: Reservation) => reservation.purpose === undefined
+    && (reservation.state === "released_pre_dispatch" || reservation.state === "reconciled");
+  let excess = state.reservations.filter(settled).length - SETTLED_RESERVATIONS_RETAINED;
+  if (excess <= 0) return;
+  state.reservations = state.reservations.filter((reservation) => !(settled(reservation) && excess-- > 0));
 }

@@ -477,6 +477,17 @@ function errorMessage(error: unknown): string {
 export function isCandidateCopyPrecutoverFailure(operation: TweakersManagerPreparedOperationV1 | null): boolean {
   if (!operation || operation.actionId !== "refresh.independent" || operation.phase !== "recovery-required"
     || !/^Copied candidate artifact changed(?:: (?:runtime|tweaks|state\.json|config\.json))?$/.test(operation.error ?? "")) return false;
+  return failedBeforeCutover(operation);
+}
+
+/** The exact process admission guard rejected staging before any cutover work. */
+export function isRunningTargetPrecutoverFailure(operation: TweakersManagerPreparedOperationV1 | null): boolean {
+  return !!operation && operation.actionId === "refresh.independent" && operation.phase === "recovery-required"
+    && operation.error === "Refusing variant promotion while the exact Tweakers target app or helper process is running."
+    && failedBeforeCutover(operation);
+}
+
+function failedBeforeCutover(operation: TweakersManagerPreparedOperationV1): boolean {
   const phases = operation.timing?.phases;
   if (!phases || phases["patch-stage"]?.state !== "failed" || !phases["patch-stage"].startedAt || !phases["patch-stage"].completedAt) return false;
   return MANAGER_REFRESH_TIMING_PHASES_V1.filter(key => key !== "patch-stage").every(key => {

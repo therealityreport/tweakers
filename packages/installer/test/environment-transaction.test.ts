@@ -916,7 +916,7 @@ test("commit records the exact old PID, retries once, and proves a different vis
     });
 
     assert.equal(
-      (coordinator as { registryFile: string }).registryFile,
+      (coordinator as unknown as { registryFile: string }).registryFile,
       join(root, "environment-registry.json"),
       "an isolated selection file must never fall back to the live user registry",
     );
@@ -2062,6 +2062,7 @@ test("default proof rejects exact bundle, path, version, backend lane, backend v
         appExperience: requested.appExperience,
         appRoot: mutable.appRoot,
         bundleId: requested.selectedDesktopBundleId,
+        originalAsarHash: "a".repeat(64),
         patchedAsarHash: "a".repeat(64),
       }),
       readRuntimeProof: () => ({
@@ -2305,7 +2306,6 @@ test("default preparation stages immutable app/backend/rollback evidence and def
         if (asarPath.startsWith(appPath)) return liveMode === "chatgpt" ? "absent" : "present";
         return "present";
       },
-      readAsarHeaderHash: () => "a".repeat(64),
       appFingerprint: (path) => {
         if (path === appPath) return liveDigest;
         if (path.includes("candidate.app") || path.includes("pristine")) return "pristine-digest";
@@ -2481,7 +2481,7 @@ test("default preparation stages immutable app/backend/rollback evidence and def
     assert.equal(tweakersState.watcherStatGuardPasses, 0);
     symlinkSync("../../outside-runtime", join(root, "runtime", "escaping-link"));
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "unsafe-rollback-runtime",
         current,
         requested,
@@ -2769,7 +2769,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     executionSourceRoot = mismatchedExecutionRoot;
     const callsBeforeMismatch = [...calls];
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "mismatched-execution-root",
         current,
         requested,
@@ -2787,7 +2787,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     rmSync(join(root, "packages"), { recursive: true, force: true });
     mutateControlPlaneDuringBuild = true;
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "stale-executing-control-plane",
         current,
         requested,
@@ -2802,7 +2802,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     writeFileSync(sourceCli, "export {};\n");
     requestedRuntimeLinkTarget = "../../outside-runtime";
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "escaping-runtime-link",
         current,
         requested,
@@ -2814,7 +2814,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     requestedRuntimeLinkTarget = "same-a.js";
     managedRuntimeLinkTarget = "same-b.js";
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "cross-runtime-link-drift",
         current,
         requested,
@@ -2826,7 +2826,7 @@ test("rebuilding stable Tweakers after an official update binds the candidate to
     managedRuntimeLinkTarget = "same-a.js";
     mutateManagedSourceDuringStage = true;
     await assert.rejects(
-      adapters.preparePrerequisites({
+      async () => adapters.preparePrerequisites({
         transactionId: "managed-source-stage-drift",
         current,
         requested,
@@ -3067,7 +3067,7 @@ test("explicit bundled-derived receipt controls backend selection while every pa
       candidateVersion: derivedVersion,
     });
     await assert.rejects(
-      () => mismatchedVersionAdapters.preparePrerequisites({
+      async () => mismatchedVersionAdapters.preparePrerequisites({
         transactionId: "derived-version-mismatch",
         current,
         requested,
@@ -4512,10 +4512,10 @@ test("legacy receipts without asar integrity evidence stay readable when termina
   const file = join(root, "environment.json");
   const { current, requested } = selections();
   try {
-    const prepared = preparedEvidence(current, requested) as Record<string, unknown>;
+    const prepared = preparedEvidence(current, requested) as unknown as Record<string, unknown>;
     delete (prepared.candidate as Record<string, unknown>).asarHeaderHash;
     delete (prepared.rollback as Record<string, unknown>).desktopAsarHeaderHash;
-    const applied = appliedEvidence(requested) as Record<string, unknown>;
+    const applied = appliedEvidence(requested) as unknown as Record<string, unknown>;
     delete applied.asarHeaderHash;
     const receipt = {
       schemaVersion: 1,
@@ -4541,8 +4541,8 @@ test("legacy receipts without asar integrity evidence stay readable when termina
     for (const selection of [
       receipt.source,
       receipt.requested,
-      (receipt.prepared as PreparedEnvironmentEvidence).rollback.selection,
-      (receipt.applied as EnvironmentAppliedEvidence).selection,
+      (receipt.prepared as unknown as PreparedEnvironmentEvidence).rollback.selection,
+      (receipt.applied as unknown as EnvironmentAppliedEvidence).selection,
     ]) {
       for (const axis of protectionAxes) delete (selection as unknown as Record<string, unknown>)[axis];
     }

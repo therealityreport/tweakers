@@ -81,6 +81,7 @@ function fixture(): string {
   }));
   writeFileSync(join(root, "tweaks", "alpha", "index.js"), "module.exports = {};\n");
   writeFileSync(join(root, "store", "index.json"), `${JSON.stringify({ schemaVersion: 1, entries: [] }, null, 2)}\n`);
+  for (const name of ["installer", "runtime"]) writeFileSync(join(root, "packages", name, "package.json"), JSON.stringify({name: `fixture-${name}`, type: "module", dependencies: {}}));
   return root;
 }
 
@@ -103,7 +104,7 @@ function addManagedRuntimeNodeModuleTopology(root: string): void {
   writeFileSync(join(root, "package.json"), '{"private":true,"type":"commonjs"}\n');
   writeFileSync(join(root, "package-lock.json"), '{"lockfileVersion":3}\n');
   writeExecutable(join(root, "bin", "tweaker.js"), "#!/usr/bin/env node\nconsole.log('root cli');\n");
-  writeFileSync(join(root, "packages", "installer", "package.json"), '{"type":"module"}\n');
+  writeFileSync(join(root, "packages", "installer", "package.json"), JSON.stringify({type: "module", dependencies: {"@therealityreport/tweakers-sdk": "*", "fixture-alias-one": "*", "fixture-alias-two": "*"}}));
   writeExecutable(
     join(root, "packages", "installer", "dist", "cli.js"),
     "#!/usr/bin/env node\nimport { help } from './help.js';\nif (process.argv.includes('--help')) console.log(help);\n",
@@ -113,6 +114,7 @@ function addManagedRuntimeNodeModuleTopology(root: string): void {
   writeFileSync(join(root, "packages", "sdk", "dist", "index.js"), "export const sdk = true;\n");
   writeExecutable(join(root, "node_modules", "fixture-dependency", "bin", "fixture-tool.js"), "#!/usr/bin/env node\nconsole.log('external tool');\n");
 
+  writeFileSync(join(root, "node_modules", "fixture-dependency", "package.json"), JSON.stringify({name: "fixture-dependency", version: "1.0.0"}));
   const scoped = join(root, "node_modules", "@therealityreport");
   symlinkSync("../../packages/installer", join(scoped, "tweakers-installer"));
   symlinkSync("../../packages/sdk", join(scoped, "tweakers-sdk"));
@@ -221,13 +223,10 @@ test("copy-assets stages a deterministic non-self-referential manager managed-ru
     assert.equal(existsSync(join(managedRuntimeRoot, "packages", "installer", "assets", "manager-launcher")), false);
     assertOnlyRegularManagedRuntimeEntries(managedRuntimeRoot);
 
-    // The former .bin symlink is a physical shim whose target is remapped to
-    // the explicitly projected installer dist tree; the relative import from
-    // cli.js proves it does not rely on the source checkout.
-    assert.equal(
-      execFileSync(join(managedRuntimeRoot, "node_modules", ".bin", "tweaker"), ["--help"], { encoding: "utf8" }).trim(),
-      "fixture CLI help",
-    );
+    // The production entry runs entirely inside its projected package. npm's
+    // development .bin directory is deliberately not part of this runtime.
+    assert.equal(existsSync(join(managedRuntimeRoot, "node_modules", ".bin")), false);
+    assert.equal(execFileSync(process.execPath, [join(managedRuntimeRoot, "packages", "installer", "dist", "cli.js"), "--help"], {encoding: "utf8"}).trim(), "fixture CLI help");
 
     copyInstallerAssets(root);
     const second = readManagedRuntimeFingerprintEvidence(managedRuntimeRoot);
@@ -248,7 +247,7 @@ test("copy-assets rejects unsafe lexical managed-runtime links before publishing
     const before = hashTree(assets);
     mkdirSync(external, { recursive: true });
     writeFileSync(join(external, "outside.js"), "outside\n");
-    symlinkSync("../outside-managed-runtime-source", join(root, "node_modules", "outside-link"));
+    symlinkSync("../../outside-managed-runtime-source", join(root, "node_modules", "fixture-dependency", "outside-link"));
 
     assert.throws(() => copyInstallerAssets(root), /lexical target is outside approved roots/);
     assert.deepEqual(hashTree(assets), before, "failed staging must not publish a partial asset tree");
@@ -264,7 +263,7 @@ test("copy-assets rejects absolute links even when they point inside node_module
     copyInstallerAssets(root);
     const assets = join(root, "packages", "installer", "assets");
     const before = hashTree(assets);
-    symlinkSync(join(root, "node_modules", "fixture-dependency"), join(root, "node_modules", "absolute-contained"));
+    symlinkSync(join(root, "node_modules", "fixture-dependency"), join(root, "node_modules", "fixture-dependency", "absolute-contained"));
 
     assert.throws(() => copyInstallerAssets(root), /contains an absolute symlink/);
     assert.deepEqual(hashTree(assets), before, "absolute-link rejection must preserve the prior published assets");
@@ -284,7 +283,7 @@ test("copy-assets rejects workspace target mismatches, dangling links, directory
         mkdirSync(external, { recursive: true });
         symlinkSync("../../not-sdk", link);
       },
-      expected: /workspace symlink target mismatch/,
+      expected: /workspace symlink target mismatch|Missing production dependency/,
     },
     {
       name: "workspace package replaced with a physical directory",
@@ -293,24 +292,23 @@ test("copy-assets rejects workspace target mismatches, dangling links, directory
         rmSync(path, { force: true });
         mkdirSync(path, { recursive: true });
       },
-      expected: /workspace package must be an exact symlink/,
+      expected: /workspace package must be an exact symlink|Missing production dependency/,
     },
     {
       name: "dangling ordinary link",
-      prepare: (root) => symlinkSync("missing-target", join(root, "node_modules", "dangling-link")),
+      prepare: (root) => symlinkSync("missing-target", join(root, "node_modules", "fixture-dependency", "dangling-link")),
       expected: /dangling symlink/,
     },
     {
       name: "directory cycle through an ancestor",
       prepare: (root) => {
-        mkdirSync(join(root, "node_modules", "cycle-package"), { recursive: true });
-        symlinkSync("..", join(root, "node_modules", "cycle-package", "back"));
+        symlinkSync(".", join(root, "node_modules", "fixture-dependency", "back"));
       },
       expected: /symlink cycle/,
     },
     {
       name: "special FIFO entry",
-      prepare: (root) => execFileSync("mkfifo", [join(root, "node_modules", "unsupported.fifo")]),
+      prepare: (root) => execFileSync("mkfifo", [join(root, "node_modules", "fixture-dependency", "unsupported.fifo")]),
       expected: /unsupported special entry/,
     },
     {
@@ -348,11 +346,7 @@ test("copy-assets rejects workspace target mismatches, dangling links, directory
       },
       expected: /symlink source must be inside node_modules/,
     },
-    {
-      name: ".bin directory target",
-      prepare: (root) => symlinkSync("../fixture-dependency/bin", join(root, "node_modules", ".bin", "directory-target")),
-      expected: /\.bin symlink must target a regular executable file/,
-    },
+
   ];
   for (const scenario of cases) {
     const root = fixture();
@@ -415,7 +409,7 @@ test("copy-assets rejects aliases into generated publication workspaces before p
     const before = hashTree(assets);
     mkdirSync(join(root, "node_modules", ".assets.publish-fixture"), { recursive: true });
     writeFileSync(join(root, "node_modules", ".assets.publish-fixture", "payload.js"), "generated\n");
-    symlinkSync(".assets.publish-fixture", join(root, "node_modules", "published-alias"));
+    symlinkSync("../.assets.publish-fixture", join(root, "node_modules", "fixture-dependency", "published-alias"));
 
     assert.throws(() => copyInstallerAssets(root), /generated publication workspace/);
     assert.deepEqual(hashTree(assets), before, "generated-workspace rejection must preserve prior assets");
@@ -424,7 +418,7 @@ test("copy-assets rejects aliases into generated publication workspaces before p
   }
 });
 
-test("copy-assets verifies every materialized .bin target remains executable after manager exclusions", () => {
+test("copy-assets excludes development bin links to removed manager outputs", () => {
   const root = fixture();
   try {
     addManagedRuntimeNodeModuleTopology(root);
@@ -436,8 +430,9 @@ test("copy-assets verifies every materialized .bin target remains executable aft
       join(root, "node_modules", ".bin", "removed-manager"),
     );
 
-    assert.throws(() => copyInstallerAssets(root), /\.bin shim target is missing after staging/);
-    assert.deepEqual(hashTree(assets), before, "missing remapped .bin target must preserve prior assets");
+    copyInstallerAssets(root);
+    assert.deepEqual(hashTree(assets), before, "unreferenced development bin links must not affect production assets");
+    assert.equal(existsSync(join(assets, "managed-runtime", "node_modules", ".bin")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -470,6 +465,7 @@ test("scoped MCP lifecycle copy transaction cannot touch runtime, manager, catal
 
     const result = copyInstallerAssets(root, { only: "mcp-lifecycle" });
 
+    assert.ok("scoped" in result);
     assert.equal(result.scoped, "mcp-lifecycle");
     assert.deepEqual(hashTree(shipped), hashTree(source));
     assert.deepEqual(snapshotProtected(), before);

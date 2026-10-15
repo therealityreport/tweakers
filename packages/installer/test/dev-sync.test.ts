@@ -15,6 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   acceptDevSnapshot,
+  verifyBundledSnapshotOwnership,
   clearLegacyDevMode,
   prepareDevSnapshot,
   readDevSnapshotReceipt,
@@ -22,6 +23,7 @@ import {
   resolveDevSyncSourceRoot,
   rollbackDevSnapshot,
   runDevSyncCycle,
+  createDevWatchScheduler,
   shouldIgnoreDevWatchPath,
 } from "../src/commands/dev-sync";
 import { readConfigFile, readDevTweaksRoot, updateConfigFile } from "../src/config";
@@ -448,6 +450,61 @@ test("development watcher ignores its own generated build output", () => {
   assert.equal(shouldIgnoreDevWatchPath("packages/runtime/dist/main.js"), true);
   assert.equal(shouldIgnoreDevWatchPath("packages/native-host/dist/addon.node"), true);
   assert.equal(shouldIgnoreDevWatchPath("packages/installer/assets/runtime/main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("packages/installer/assets/managed-runtime/main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("packages/installer/.assets.publish-123/runtime/main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("packages\\installer\\assets\\managed-runtime\\main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("packages\\installer\\.assets.publish-123\\runtime\\main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("packages/installer/assets/managed-runtime-source/main.js"), false);
+  assert.equal(shouldIgnoreDevWatchPath("packages/installer/.assets.publish-source/main.js"), true);
+  assert.equal(shouldIgnoreDevWatchPath("other/.assets.publish-123/main.js"), false);
   assert.equal(shouldIgnoreDevWatchPath("node_modules/example/index.js"), true);
   assert.equal(shouldIgnoreDevWatchPath("tweaks/followup/index.js"), false);
+});
+
+test("development watcher events ignore generated paths and coalesce source edits without overlapping runs", async () => {
+  const f = fixture();
+  const calls: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const firstRun = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const scheduler = createDevWatchScheduler(async () => {
+    calls.push(f.root);
+    if (calls.length === 1) await firstRun;
+  }, 5);
+  try {
+    scheduler.onEvent("packages/installer/assets/managed-runtime/main.js");
+    scheduler.onEvent("packages/installer/.assets.publish-123/runtime/main.js");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls, []);
+
+    scheduler.onEvent("tweaks/followup/index.js");
+    scheduler.onEvent("tweaks/followup/manifest.json");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls, [f.root]);
+
+    scheduler.onEvent("tweaks/followup/index.js");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls, [f.root]);
+    releaseFirst?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(calls, [f.root, f.root]);
+  } finally {
+    releaseFirst?.();
+    scheduler.close();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+ test("explicit bundled ownership recovery rejects mismatches and preserves a rollback", () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "example", "co.example.tweak");
+    writeTweak(f.liveTweaks, "example", "co.example.tweak");
+    assert.equal(verifyBundledSnapshotOwnership(f.repoTweaks, f.liveTweaks).folders.length, 1);
+    const receipt = prepareDevSnapshot(f.repoTweaks, f.liveTweaks, { verifiedBundledRoot: f.repoTweaks });
+    assert.ok(receipt.ownershipRecovery);
+    assert.ok(existsSync(join(receipt.priorTreeRoot, "example")));
+    assert.throws(() => verifyBundledSnapshotOwnership(f.liveTweaks, f.liveTweaks), /independent/);
+    writeFileSync(join(f.liveTweaks, "example", "custom.txt"), "custom");
+    assert.throws(() => verifyBundledSnapshotOwnership(f.repoTweaks, f.liveTweaks), /does not match/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

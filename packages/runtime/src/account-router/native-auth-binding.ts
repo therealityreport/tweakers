@@ -1,13 +1,19 @@
-import { matchesPersistentDirectoryIdentity, preparePersistentIdentityGeneration, journalAndPublishPersistentIdentityGeneration, PERSISTENT_IDENTITIES_JOURNAL } from "./persistent-directory-identity";
+import { matchesPersistentDirectoryIdentity, preparePersistentIdentityGeneration, journalAndPublishPersistentIdentityGeneration, readPersistentIdentityGeneration, PERSISTENT_IDENTITIES_JOURNAL } from "./persistent-directory-identity";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { isPlainRecord, type OpaqueAccountId, type RouterConfig } from "./types";
+import { isPlainRecord, type BrokerSafeProfileV1, type OpaqueAccountId, type RouterConfig } from "./types";
 import { nativeHistoryAuthIdentityHmacV1, parseNativeHistorySourceV1, readAndPreflightNativeHistorySourceStaticV1, type NativeHistoryDirectoryIdentityV1, type NativeHistorySourceV1 } from "./native-history";
 
 export const NATIVE_AUTH_BINDING_FILE_V1 = "native-auth-binding.v1.json";
 type Entry = { opaqueAccountId: OpaqueAccountId; authHome: string; authHomeIdentity: NativeHistoryDirectoryIdentityV1; authIdentityHmac: string };
 export interface NativeAuthBindingV1 { version: 1; kind: "account-router-native-auth-binding"; sourceFingerprint: string; accounts: Entry[]; signature: string }
+interface EffectiveNativeAuthBindingV1 { document: NativeAuthBindingV1; accounts: Entry[]; fingerprint: string }
+const EXECUTION_HOME_RECEIPT = "native-execution-home.v1.json";
+const executionReceiptFile = (account: OpaqueAccountId) => `accounts/${account}/native-execution-home.v1/${EXECUTION_HOME_RECEIPT}`;
+const entryExists = (path: string): boolean => {
+  try { lstatSync(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+};
 export interface NativeExternalTokensV1 { accessToken: string; chatgptAccountId: string; chatgptPlanType: string | null }
 const fail = (): never => { throw new Error("native authentication binding unavailable"); };
 const digest = (bytes: Buffer): string => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -61,17 +67,46 @@ export function readNativeExternalTokensV1(home: string, entry: Pick<Entry, "opa
   if (typeof tokens.access_token !== "string" || !tokens.access_token || tokens.access_token.length > 128 * 1024 || /[\s\x00-\x1f]/.test(tokens.access_token)) return fail();
   return { accessToken: tokens.access_token, chatgptAccountId: tokens.account_id as string, chatgptPlanType: null };
 }
+/** Saved credential display facts grant no authentication or mutation authority. */
+export function readNativeSavedProfileV1(home: string, entry: Pick<Entry, "opaqueAccountId" | "authIdentityHmac">, secret: Buffer): BrokerSafeProfileV1 | null {
+  const tokens = proveIdentity(home, entry, secret);
+  if (typeof tokens.id_token !== "string" || tokens.id_token.length > 128 * 1024) return null;
+  const parts = tokens.id_token.split(".");
+  if (parts.length !== 3 || !parts.every(part => /^[A-Za-z0-9_-]+$/.test(part))) return null;
+  const bytes = Buffer.from(parts[1]!, "base64url");
+  try {
+    const claims: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!isPlainRecord(claims) || !isPlainRecord(claims["https://api.openai.com/auth"])) return null;
+    const auth = claims["https://api.openai.com/auth"];
+    // Do not treat an arbitrary email claim beside a bound account_id as the
+    // identity of that account. The stored token must name the same account.
+    if (auth.chatgpt_account_id !== tokens.account_id) return null;
+    const email = claims.email;
+    if (typeof email !== "string" || email.length > 254 || /[\s\x00-\x1f\x7f]/.test(email)) return null;
+    const parts = email.split("@");
+    const local = parts[0], domain = parts[1]?.toLowerCase();
+    if (parts.length !== 2 || !local || !domain || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}$/.test(local)
+      || !/^(?=.{1,80}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(domain)) return null;
+    const visible = local.slice(0, Math.min(3, local.length));
+    const plan = typeof auth.chatgpt_plan_type === "string" && /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/.test(auth.chatgpt_plan_type) ? auth.chatgpt_plan_type : null;
+    return { identifierMasked: `${visible}${"*".repeat(Math.max(3, local.length - visible.length))}@${domain}`, plan, avatarUrl: null };
+  } catch { return null; } finally { bytes.fill(0); }
+}
 /** Absence preserves legacy auth. Malformed or changed companions fail closed. */
-export function readNativeAuthBindingV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): { document: NativeAuthBindingV1; fingerprint: string } | null {
+export function readNativeAuthBindingV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): EffectiveNativeAuthBindingV1 | null {
   const binding = readNativeAuthBindingAuthorityV1(stateRoot, source, secret);
-  for (const entry of binding?.document.accounts ?? []) proveIdentity(entry.authHome, entry, secret);
+  for (const entry of binding?.accounts ?? []) proveIdentity(entry.authHome, entry, secret);
   return binding;
 }
 
 /** Recovery-only authority. Verifies signatures and paths, never claims credentials are valid. */
-export function readNativeAuthBindingAuthorityV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): { document: NativeAuthBindingV1; fingerprint: string } | null {
+export function readNativeAuthBindingAuthorityV1(stateRoot: string, source: NativeHistorySourceV1, secret: Buffer): EffectiveNativeAuthBindingV1 | null {
   const path = join(stateRoot, NATIVE_AUTH_BINDING_FILE_V1);
-  try { lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; return fail(); }
+  try { lstatSync(path); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT"
+      && !source.accounts.some(account => entryExists(join(stateRoot, executionReceiptFile(account.opaqueAccountId))))) return null;
+    return fail();
+  }
   directory(stateRoot);
   const bytes = readNativeAuthPrivateFileV1(path, 64 * 1024);
   try {
@@ -101,7 +136,34 @@ export function readNativeAuthBindingAuthorityV1(stateRoot: string, source: Nati
         || !authHomeLocationSafe(entry.authHome, stateRoot, entry.opaqueAccountId)
         || entries.some((other) => other !== entry && overlaps(other.authHome, entry.authHome))) return fail();
     }
-    return { document: { ...unsigned, signature: value.signature as string }, fingerprint: digest(bytes) };
+    const baseFingerprint = digest(bytes), accounts = [...entries], receipts: string[] = [];
+    for (const original of source.accounts) {
+      const authorityFile = executionReceiptFile(original.opaqueAccountId), receiptPath = join(stateRoot, authorityFile);
+      if (!entryExists(receiptPath)) continue;
+      directory(join(stateRoot, "accounts", original.opaqueAccountId, "native-execution-home.v1"));
+      const receiptBytes = readNativeAuthPrivateFileV1(receiptPath, 64 * 1024);
+      try {
+        const receipt: unknown = JSON.parse(receiptBytes.toString("utf8"));
+        if (!isPlainRecord(receipt) || Object.keys(receipt).sort().join() !== "baseFingerprint,entry,kind,signature,sourceFingerprint,version"
+          || receipt.version !== 1 || receipt.kind !== "account-router-native-execution-home" || receipt.baseFingerprint !== baseFingerprint
+          || receipt.sourceFingerprint !== unsigned.sourceFingerprint || !isPlainRecord(receipt.entry)) return fail();
+        const { signature: signed, ...body } = receipt;
+        const expected = `hmac-sha256:${createHmac("sha256", secret).update(`native-execution-home:v1\0${encode(body)}`).digest("hex")}`;
+        if (!sameSignature(expected, signed)) return fail();
+        const entry = receipt.entry as unknown as Entry;
+        if (Object.keys(entry).sort().join() !== "authHome,authHomeIdentity,authIdentityHmac,opaqueAccountId"
+          || entry.opaqueAccountId !== original.opaqueAccountId || entry.authIdentityHmac !== original.authIdentityHmac
+          || entry.authHome !== join(stateRoot, "accounts", original.opaqueAccountId, "execution-home")
+          || accounts.some(account => account.opaqueAccountId === entry.opaqueAccountId || overlaps(account.authHome, entry.authHome))
+          || source.accounts.some(account => overlaps(entry.authHome, account.codexHome) || overlaps(entry.authHome, account.sqliteHome))
+          || !authHomeLocationSafe(entry.authHome, stateRoot, entry.opaqueAccountId)
+          || !matchesPersistentDirectoryIdentity({ stateRoot, secret, path: entry.authHome, expected: entry.authHomeIdentity,
+            authorityFile, accountId: entry.opaqueAccountId })) return fail();
+        accounts.push(entry); receipts.push(digest(receiptBytes));
+      } finally { receiptBytes.fill(0); }
+    }
+    return { document: { ...unsigned, signature: value.signature as string }, accounts,
+      fingerprint: receipts.length ? digest(Buffer.from(encode([baseFingerprint, ...receipts]))) : baseFingerprint };
   } catch { return fail(); } finally { bytes.fill(0); }
 }
 
@@ -157,4 +219,106 @@ export function publishPreparedNativeAuthBindingV1(value: PreparedNativeAuthBind
       journalAndPublishPersistentIdentityGeneration(plan.stateRoot, plan.secret, proposal);
     }
   } finally { plan.secret.fill(0); rechecked.secret.fill(0); prepared.delete(fresh); prepared.delete(value); }
+}
+
+/**
+ * Called only by the elected broker before admitting children. Complete an
+ * older partial migration without replacing its signed registration. Each
+ * additional original account gets one immutable, account-specific receipt.
+ */
+export function ensureNativeExecutionHomesV1(input: {
+  stateRoot: string; config: RouterConfig; secret: Buffer;
+  authorizeCopy(account: OpaqueAccountId, destination: string): boolean;
+}): void {
+  const { stateRoot, config, secret } = input;
+  if (existsSync(join(stateRoot, PERSISTENT_IDENTITIES_JOURNAL))) return fail();
+  const initial = readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret);
+  if (initial.state !== "ready") return fail();
+  const source = initial.binding.source, sourceFingerprint = initial.binding.sourceDocumentFingerprint;
+  const prior = readNativeAuthBindingV1(stateRoot, source, secret);
+  if (!prior) throw new Error("Stock account execution-home migration requires an existing signed auth binding");
+  const missing = config.accounts.filter(account => account.included && !prior?.accounts.some(entry => entry.opaqueAccountId === account.opaqueAccountId));
+  const staged: Array<{ opaqueAccountId: OpaqueAccountId; authHome: string }> = [];
+  const authorized = () => missing.every(account => input.authorizeCopy(account.opaqueAccountId, join(stateRoot, "accounts", account.opaqueAccountId, "execution-home")));
+  if (missing.length && !authorized()) throw new Error("Stock account execution-home migration requires its original account and destination to be idle");
+  for (const account of missing) {
+    const original = source.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId);
+    if (!original) throw new Error("Stock account execution-home migration requires an original signed account");
+    readNativeExternalTokensV1(original.codexHome, original, secret);
+    const home = join(stateRoot, "accounts", account.opaqueAccountId, "execution-home");
+    for (const path of [join(stateRoot, "accounts"), join(stateRoot, "accounts", account.opaqueAccountId), home]) {
+      if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
+      directory(path);
+    }
+    if (readdirSync(home).some(name => name !== "auth.json")) throw new Error("Unregistered execution-home contains data; retain it for recovery");
+    const bytes = readNativeAuthPrivateFileV1(join(original.codexHome, "auth.json"));
+    try {
+      const target = join(home, "auth.json");
+      if (existsSync(target)) {
+        const stagedBytes = readNativeAuthPrivateFileV1(target);
+        try { if (!bytes.equals(stagedBytes)) throw new Error("Unregistered execution-home authentication changed; retain it for recovery"); }
+        finally { stagedBytes.fill(0); }
+      } else {
+        // Rename a complete directory, never an incomplete credential file.
+        // POSIX refuses to replace a nonempty destination directory. The
+        // elected broker owns publication; a raced auth file is preserved.
+        const staging = join(stateRoot, "accounts", account.opaqueAccountId, `.execution-home-${randomBytes(16).toString("hex")}.staging`);
+        mkdirSync(staging, { mode: 0o700 });
+        const fd = openSync(join(staging, "auth.json"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+        try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+        const stagingFd = openSync(staging, constants.O_RDONLY); try { fsyncSync(stagingFd); } finally { closeSync(stagingFd); }
+        if (!authorized() || readdirSync(home).length) return fail();
+        directory(home);
+        renameSync(staging, home);
+        const parentFd = openSync(join(stateRoot, "accounts", account.opaqueAccountId), constants.O_RDONLY);
+        try { fsyncSync(parentFd); } finally { closeSync(parentFd); }
+      }
+      readNativeExternalTokensV1(home, original, secret);
+      const current = readNativeAuthPrivateFileV1(join(original.codexHome, "auth.json"));
+      try { if (!bytes.equals(current) || !authorized()) return fail(); } finally { current.fill(0); }
+      const fd = openSync(home, constants.O_RDONLY); try { fsyncSync(fd); } finally { closeSync(fd); }
+      staged.push({ opaqueAccountId: original.opaqueAccountId, authHome: home });
+    } finally { bytes.fill(0); }
+  }
+  for (const account of staged) {
+    const fresh = readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret);
+    if (fresh.state !== "ready" || fresh.binding.sourceDocumentFingerprint !== sourceFingerprint
+      || !authorized() || readNativeAuthBindingV1(stateRoot, source, secret)?.accounts.some(entry => entry.opaqueAccountId === account.opaqueAccountId)) return fail();
+    const baseBytes = readNativeAuthPrivateFileV1(join(stateRoot, NATIVE_AUTH_BINDING_FILE_V1), 64 * 1024);
+    try {
+      // Bind the exact original document; it and every prior account remain intact.
+      const original = source.accounts.find(entry => entry.opaqueAccountId === account.opaqueAccountId)!;
+      const originalAuth = readNativeAuthPrivateFileV1(join(original.codexHome, "auth.json"));
+      const copiedAuth = readNativeAuthPrivateFileV1(join(account.authHome, "auth.json"));
+      try { if (!originalAuth.equals(copiedAuth)) return fail(); }
+      finally { originalAuth.fill(0); copiedAuth.fill(0); }
+      const entry: Entry = { ...account, authHomeIdentity: directory(account.authHome), authIdentityHmac: original.authIdentityHmac };
+      const body = { version: 1, kind: "account-router-native-execution-home", sourceFingerprint, baseFingerprint: digest(baseBytes), entry };
+      const signature = `hmac-sha256:${createHmac("sha256", secret).update(`native-execution-home:v1\0${encode(body)}`).digest("hex")}`;
+      const receiptRoot = join(stateRoot, "accounts", account.opaqueAccountId, "native-execution-home.v1");
+      const stagingRoot = `${receiptRoot}.${randomBytes(16).toString("hex")}.staging`;
+      mkdirSync(stagingRoot, { mode: 0o700 });
+      const temporary = join(stagingRoot, EXECUTION_HOME_RECEIPT);
+      const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      try { writeFileSync(fd, encode({ ...body, signature }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+      const stagingFd = openSync(stagingRoot, constants.O_RDONLY); try { fsyncSync(stagingFd); } finally { closeSync(stagingFd); }
+      if (entryExists(receiptRoot) || !authorized()) return fail();
+      // A published nonempty receipt directory cannot be replaced by rename.
+      // No hard-link window can strand a valid receipt with nlink === 2.
+      renameSync(stagingRoot, receiptRoot);
+      const rootFd = openSync(join(stateRoot, "accounts", account.opaqueAccountId), constants.O_RDONLY);
+      try { fsyncSync(rootFd); } finally { closeSync(rootFd); }
+    } finally { baseBytes.fill(0); }
+  }
+  // An interrupted publication may have its immutable receipt but not its
+  // persistent anchors. Exact-device validation remains required until sealed.
+  const identities = readPersistentIdentityGeneration(stateRoot, secret);
+  const unanchored = source.accounts.some(account => entryExists(join(stateRoot, executionReceiptFile(account.opaqueAccountId)))
+    && !identities?.document.anchors.some(anchor => anchor.authorityFile === executionReceiptFile(account.opaqueAccountId)));
+  if (process.platform === "darwin" && (staged.length || unanchored)) {
+    const proposal = preparePersistentIdentityGeneration({ stateRoot, secret,
+      verify: () => readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret).state === "ready" });
+    journalAndPublishPersistentIdentityGeneration(stateRoot, secret, proposal);
+  }
+  if (readAndPreflightNativeHistorySourceStaticV1(stateRoot, config, secret).state !== "ready") return fail();
 }

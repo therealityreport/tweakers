@@ -60,6 +60,10 @@ class RouterStateStore {
     snapshot() {
         return structuredClone(this.state);
     }
+    /** Read-only lookup for hot paths that need one owner, not a full state copy. */
+    ownerOf(threadId) {
+        return this.state.threadOwners[threadId];
+    }
     update(mutator) {
         const next = structuredClone(this.state);
         mutator(next);

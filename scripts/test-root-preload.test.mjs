@@ -27,8 +27,11 @@ test("script-test phase runs behind the disposable root preload", () => {
 
 test("every package test phase names the disposable root preload", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  const preload = "--import ./scripts/test-root-preload.mjs";
-  assert.equal(pkg.scripts.test.split(preload).length - 1, 2);
+  assert.equal(pkg.scripts.test, "node scripts/local-work.mjs test");
+  const owner = readFileSync(new URL("./local-work.mjs", import.meta.url), "utf8");
+  assert.match(owner, /const args = \['--import','\.\/scripts\/test-root-preload\.mjs'/);
+  assert.match(owner, /command\(process\.execPath,\[\.\.\.args,\.\.\.extra,\.\.\.packageTests/);
+  assert.match(owner, /command\(process\.execPath,\[\.\.\.args,\.\.\.readdirSync/);
   assert.match(pkg.scripts["test:user-questions"], /--import \.\/scripts\/test-root-preload\.mjs/);
   assert.match(pkg.scripts["test:tweaks"], /--import \.\/scripts\/test-root-preload\.mjs/);
 });

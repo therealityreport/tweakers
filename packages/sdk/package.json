@@ -1,6 +1,6 @@
 {
   "name": "@therealityreport/tweakers-sdk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Public types and helpers for tweaker tweak authors",
   "type": "module",
   "main": "dist/index.js",
@@ -9,10 +9,11 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "node ../../scripts/local-work.mjs workspace-build sdk"
   },
   "devDependencies": {
     "typescript": "^5.6.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "tweakersBuildCommand": "tsc -p tsconfig.json"
 }

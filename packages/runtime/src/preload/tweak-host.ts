@@ -1,3 +1,6 @@
+import { consolidateTweakTopics, topicMigrationOwner } from "../tweak-topic-migration";
+import { nativeCaptureBridge } from "./native-capture";
+import { TweakResources, guardTweakApi } from "../tweak-resources";
 /**
  * Renderer-side tweak host. We:
  *   1. Ask main for the tweak list (with resolved entry path).
@@ -76,15 +79,29 @@ interface ElectronBridge {
   usesOwlAppShell?: () => boolean;
 }
 
-const loaded = new Map<string, { stop?: () => void }>();
+const loaded = new Map<string, { stop?: () => void | Promise<void>; resources: TweakResources; startPending?: Promise<void>; stopPending?: Promise<void> }>();
+let hostGeneration = 0;
+let lifecycleToken: string | null = null;
 let cachedPaths: UserPaths | null = null;
 
-export async function startTweakHost(): Promise<void> {
+export async function startTweakHost(requiredId?: string): Promise<void> {
+  const readyIds = new Set<string>();
+  const generation = ++hostGeneration;
+  const token = await ipcRenderer.invoke("tweaker:renderer-lifecycle-begin");
+  if (generation !== hostGeneration) return;
+  if (typeof token !== "string") throw new Error("Renderer lifecycle admission is unavailable");
+  lifecycleToken = token;
   // Revalidate at startup and re-enable even when Accounts was disabled when
   // this payload was prepared. This never initializes an unreviewed wrapper.
   try { accountsNativeBridge.setCompatibility(ipcRenderer.sendSync("tweaker:accounts-native-compatibility")); }
   catch { accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts compatibility could not be checked.", hookSetSha256: "" }); }
-  const tweaks = (await ipcRenderer.invoke("tweaker:list-tweaks")) as ListedTweak[];
+  const listed = (await ipcRenderer.invoke("tweaker:list-tweaks")) as ListedTweak[];
+  const suppressed = consolidateTweakTopics(listed, localStorage);
+  if (lifecycleToken) ipcRenderer.send("tweaker:renderer-topic-delegations", {
+    token: lifecycleToken,
+    delegations: [...suppressed].map(id => ({ id, owner: topicMigrationOwner(id, listed) })),
+  });
+  const tweaks = listed.filter(tweak => !suppressed.has(tweak.manifest.id));
   const paths = (await ipcRenderer.invoke("tweaker:user-paths")) as UserPaths;
   cachedPaths = paths;
   // Push the list to the settings injector so the Tweaks page can render
@@ -95,7 +112,11 @@ export async function startTweakHost(): Promise<void> {
   (window as unknown as { __tweaker_tweaks_dir__?: string }).__tweaker_tweaks_dir__ =
     paths.tweaksDir;
 
-  for (const t of tweaks) {
+  // Accounts may wait up to 30 s for its native bridge; load it last so that
+  // wait never delays every other renderer tweak.
+  const ordered = [...tweaks].sort((a, b) =>
+    Number(a.manifest.id === "co.tweakers.account-switcher") - Number(b.manifest.id === "co.tweakers.account-switcher"));
+  for (const t of ordered) {
     if (t.manifest.scope === "main") {
       sendLifecycle(t.manifest.id, "disabled", "main-scoped tweak");
       continue;
@@ -119,16 +140,20 @@ export async function startTweakHost(): Promise<void> {
     sendLifecycle(t.manifest.id, "starting");
     try {
       const result = await runWithStartupTimeout(
-        () => loadTweak(t, paths),
+        () => loadTweak(t, paths, generation),
         DEFAULT_TWEAK_STARTUP_TIMEOUT_MS,
       );
+      if (generation !== hostGeneration) return;
       if (result.status === "timed_out") {
+        await stopRendererTweak(t.manifest.id).catch(error => console.warn("[tweaker] activation held for cleanup:", t.manifest.id, error));
         sendLifecycle(t.manifest.id, "timed_out", `startup exceeded ${DEFAULT_TWEAK_STARTUP_TIMEOUT_MS}ms`);
         console.error("[tweaker] tweak startup timed out:", t.manifest.id);
       } else {
+        readyIds.add(t.manifest.id);
         sendLifecycle(t.manifest.id, "ready");
       }
     } catch (e) {
+      await stopRendererTweak(t.manifest.id).catch(error => console.warn("[tweaker] activation held for cleanup:", t.manifest.id, error));
       sendLifecycle(t.manifest.id, "failed", e);
       console.error("[tweaker] tweak load failed:", t.manifest.id, e);
       try {
@@ -141,6 +166,13 @@ export async function startTweakHost(): Promise<void> {
     }
   }
 
+  if (requiredId) {
+    const required = listed.find(tweak => tweak.manifest.id === requiredId);
+    const owner = suppressed.has(requiredId) ? topicMigrationOwner(requiredId, listed) : requiredId;
+    if (required?.enabled && required.manifest.scope !== "main" && (!owner || !readyIds.has(owner))) {
+      throw new Error(`Tweak ${requiredId} activation was not acknowledged`);
+    }
+  }
   console.info(
     `[tweaker] renderer host loaded ${loaded.size} tweak(s):`,
     [...loaded.keys()].join(", ") || "(none)",
@@ -168,6 +200,7 @@ function sendLifecycle(
     ipcRenderer.send("tweaker:tweak-lifecycle", {
       id,
       process: "renderer",
+      token: lifecycleToken,
       status,
       ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
     });
@@ -181,26 +214,37 @@ function sendLifecycle(
  * re-evaluate fresh source. Module cache isn't relevant since we eval
  * source strings directly — each load creates a fresh scope.
  */
-export function teardownTweakHost(): void {
-  for (const [id, t] of loaded) {
-    try {
-      t.stop?.();
-    } catch (e) {
-      console.warn("[tweaker] tweak stop failed:", id, e);
-    } finally {
-      void ipcRenderer.invoke("tweaker:codex-view-dispose-tweak", id).catch(() => {});
-      void ipcRenderer.invoke("tweaker:native-dispose-tweak", id).catch(() => {});
-    }
-  }
-  loaded.clear();
+async function stopRendererTweak(id: string): Promise<void> {
+  const tweak = loaded.get(id);
+  if (!tweak) return;
+  tweak.resources.cancel();
+  tweak.stopPending ??= Promise.resolve().then(() => tweak.stop?.());
+  const result = await runWithStartupTimeout(() => Promise.all([tweak.stopPending, tweak.startPending?.catch(() => {})]), DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+  const cleanup = await runWithStartupTimeout(() => tweak.resources.close(), DEFAULT_TWEAK_STARTUP_TIMEOUT_MS);
+  await Promise.all([
+    ipcRenderer.invoke("tweaker:codex-view-dispose-tweak", id),
+    ipcRenderer.invoke("tweaker:native-dispose-tweak", id),
+  ]);
+  if (result.status === "timed_out" || cleanup.status === "timed_out") throw new Error(`Tweak ${id} shutdown is still pending; reload held`);
+  if (loaded.get(id) === tweak) loaded.delete(id);
+}
+
+export async function teardownTweakHost(): Promise<void> {
+  hostGeneration++;
+  await Promise.all([...loaded.keys()].map(stopRendererTweak));
   clearSections();
 }
 
-async function loadTweak(t: ListedTweak, paths: UserPaths): Promise<void> {
+async function loadTweak(t: ListedTweak, paths: UserPaths, generation: number): Promise<void> {
+  const resources = new TweakResources();
+  const instance: { stop?: () => void | Promise<void>; resources: TweakResources; startPending?: Promise<void>; stopPending?: Promise<void> } = { resources };
+  loaded.set(t.manifest.id, instance);
   const source = (await ipcRenderer.invoke(
     "tweaker:read-tweak-source",
     t.entry,
   )) as string;
+
+  if (generation !== hostGeneration || resources.signal.aborted) return;
 
   // Evaluate as CJS-shaped: provide module/exports/api. Tweak code may use
   // `module.exports = { start, stop }` or `exports.start = ...` or pure ESM
@@ -220,12 +264,13 @@ async function loadTweak(t: ListedTweak, paths: UserPaths): Promise<void> {
   if (typeof tweak?.start !== "function") {
     throw new Error(`tweak ${t.manifest.id} has no start()`);
   }
-  const api = makeRendererApi(t.manifest, paths);
-  await tweak.start(api);
-  loaded.set(t.manifest.id, { stop: tweak.stop?.bind(tweak) });
+  instance.stop = tweak.stop?.bind(tweak);
+  const api = guardTweakApi(makeRendererApi(t.manifest, paths, resources), resources);
+  instance.startPending = Promise.resolve().then(() => tweak.start(api));
+  await instance.startPending;
 }
 
-function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
+function makeRendererApi(manifest: TweakManifest, paths: UserPaths, resources: TweakResources): TweakApi {
   const id = manifest.id;
   const assertIpcPermission = () => {
     if (!manifest.permissions?.includes("ipc")) {
@@ -260,18 +305,27 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
   return {
     manifest,
     process: "renderer",
-    accountsNative: accountsNativeApi,
+    accountsNative: { ...accountsNativeApi, register: adapter => resources.add(accountsNativeApi.register(adapter)) },
     log: {
       debug: (...a) => log("debug", ...a),
       info: (...a) => log("info", ...a),
       warn: (...a) => log("warn", ...a),
       error: (...a) => log("error", ...a),
     },
+    nativeCapture: nativeCaptureBridge.api,
+    lifecycle: { signal: resources.signal, add: resources.add.bind(resources) },
     storage: rendererStorage(id),
     settings: {
-      register: (s) => registerSection({ ...s, id: `${id}:${s.id}` }),
-      registerPage: (p) =>
-        registerPage(id, manifest, { ...p, id: `${id}:${p.id}` }),
+      register: (s) => {
+        const handle = registerSection({ ...s, id: `${id}:${s.id}` });
+        resources.add(() => handle.unregister());
+        return handle;
+      },
+      registerPage: (p) => {
+        const handle = registerPage(id, manifest, { ...p, id: `${id}:${p.id}` });
+        resources.add(() => handle.unregister());
+        return handle;
+      },
       openPage: (pageId) => openRegisteredPage(id, `${id}:${pageId}`),
     },
     react: {
@@ -289,27 +343,33 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
         new Promise((resolve, reject) => {
           const existing = document.querySelector(sel);
           if (existing) return resolve(existing);
-          const deadline = Date.now() + timeoutMs;
+          let settled = false;
+          const onAbort = () => finish(null);
+          const finish = (element: Element | null) => {
+            if (settled) return;
+            settled = true;
+            obs.disconnect();
+            clearTimeout(timer);
+            resources.signal.removeEventListener("abort", onAbort);
+            if (element) resolve(element);
+            else reject(new Error(`timeout waiting for ${sel}`));
+          };
           const obs = new MutationObserver(() => {
             const el = document.querySelector(sel);
-            if (el) {
-              obs.disconnect();
-              resolve(el);
-            } else if (Date.now() > deadline) {
-              obs.disconnect();
-              reject(new Error(`timeout waiting for ${sel}`));
-            }
+            if (el) finish(el);
           });
           obs.observe(document.documentElement, { childList: true, subtree: true });
+          const timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
+          resources.signal.addEventListener("abort", onAbort, { once: true });
         }),
-      host: hostUiApi,
+      host: { ...hostUiApi, observe: (kinds, listener) => resources.add(hostUiApi.observe(kinds, listener)) },
     },
     ipc: {
       on: (c, h) => {
         assertIpcPermission();
         const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
         ipcRenderer.on(`tweaker:${id}:${c}`, wrapped);
-        return () => ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped);
+        return resources.add(() => { ipcRenderer.removeListener(`tweaker:${id}:${c}`, wrapped); });
       },
       send: (c, ...args) => {
         assertIpcPermission();
@@ -339,11 +399,11 @@ function makeRendererApi(manifest: TweakManifest, paths: UserPaths): TweakApi {
       },
     },
     fs: rendererFs(id, paths),
-    codex: rendererCodexApi(id),
+    codex: rendererCodexApi(id, resources),
   };
 }
 
-function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
+function rendererCodexApi(tweakId: string, resources: TweakResources): NonNullable<TweakApi["codex"]> {
   return {
     runtime: {
       getInfo: async () => {
@@ -424,7 +484,7 @@ function rendererCodexApi(tweakId: string): NonNullable<TweakApi["codex"]> {
       onStatusChanged: (listener) => {
         const handler = () => { void ipcRenderer.invoke("tweaker:get-refresh-status").then(listener); };
         ipcRenderer.on("tweaker:refresh-status-changed", handler);
-        return () => ipcRenderer.removeListener("tweaker:refresh-status-changed", handler);
+        return resources.add(() => { ipcRenderer.removeListener("tweaker:refresh-status-changed", handler); });
       },
     },
     capture: {

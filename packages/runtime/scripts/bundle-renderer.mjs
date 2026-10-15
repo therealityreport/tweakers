@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 /**
  * Bundles both the renderer-side preload AND the main-process entry into
  * single files. Both run inside Codex.app's runtime — we don't want to ship
@@ -56,16 +58,33 @@ await build({
 
 // The standalone broker and installer load this module outside main.js.
 // Include its TOML parser so sealed runtimes need no ambient node_modules.
+for (const entry of ["account-continuity", "desktop-app-tools"]) {
+  await build({
+    entryPoints: [resolve(root, `src/account-router/${entry}.ts`)],
+    bundle: true,
+    outfile: resolve(root, `dist/account-router/${entry}.js`),
+    platform: "node",
+    target: "node20",
+    format: "cjs",
+    sourcemap: true,
+    minify: false,
+    logLevel: "info",
+  });
+}
+
+// The sealed Manager imports this entry directly, outside bundled main.js.
+// Keep runtime-local modules shared while embedding the SDK lock implementation.
 await build({
-  entryPoints: [resolve(root, "src/account-router/account-continuity.ts")],
+  entryPoints: [resolve(root, "src/account-router/broker-socket.ts")],
   bundle: true,
-  outfile: resolve(root, "dist/account-router/account-continuity.js"),
+  outfile: resolve(root, "dist/account-router/broker-socket.js"),
   platform: "node",
   target: "node20",
   format: "cjs",
+  external: ["./*", "../*"],
   sourcemap: true,
   minify: false,
   logLevel: "info",
 });
 
-console.log("[bundle] preload + promotion health preload + main + account continuity bundled");
+console.log("[bundle] preload + promotion health preload + main + account continuity + desktop app tools + broker socket bundled");

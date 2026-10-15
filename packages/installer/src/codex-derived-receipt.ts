@@ -25,6 +25,8 @@ import {
   type ManagedMcpPreparedRuntimeEvidence,
 } from "./managed-mcp-lifecycle.js";
 
+import { qualifiedRustShape, v8EvidenceShape, type QualifiedRustTestEvidence, type VerifiedV8BuildEvidence } from "./qualified-rust-evidence.js";
+
 export const CODEX_DERIVED_RECEIPT_SCHEMA_VERSION = 2 as const;
 
 export const CODEX_DERIVED_PHASES = [
@@ -89,10 +91,13 @@ export interface CodexSourceEvidence {
   archiveDigest: NamedDigest | null;
   treeDigest: NamedDigest;
   patchSeriesDigest: NamedDigest;
+  /** Ordered immutable patch inputs; required for new accepted-build issuance. */
+  patchSeriesFiles?: readonly { path: string; sha256: string }[];
   /** Canonical `git diff --cached --binary --full-index` bytes for the applied review set. */
   reviewedDiffDigest?: NamedDigest;
   /** Exact argv used for the locked release build. Required by accepted-build issuance. */
   buildCommand?: readonly string[];
+  v8BuildInputs?: VerifiedV8BuildEvidence;
   toolchainDigests: readonly NamedDigest[];
   lockfileDigests: readonly NamedDigest[];
 }
@@ -110,7 +115,9 @@ export interface CodexTrustedSourceEvidence {
   sha256: string;
 }
 
-export interface CodexRustLifecycleTestEvidence {
+export type CodexRustLifecycleTestEvidence = CodexExecutedRustLifecycleTestEvidence | QualifiedRustTestEvidence;
+
+export interface CodexExecutedRustLifecycleTestEvidence {
   schemaVersion: 1;
   kind: "codex-rust-lifecycle-tests";
   sourceCommit: string;
@@ -132,6 +139,24 @@ export interface SignatureEvidence {
   identity: string;
   teamIdentifier: string | null;
   designatedRequirement: string | null;
+}
+
+/** Every external companion required by the reviewed backend generation. */
+export interface CodexBackendClosureEvidence {
+  codeModeHost: {
+    path: string;
+    sha256: string;
+    architecture: "arm64";
+    signature: SignatureEvidence;
+  };
+  resources: readonly { relativePath: string; sourcePath: string; sha256: string }[];
+}
+
+export interface CodexGeneratedRuntimeEvidence {
+  sourceRoot: string;
+  fingerprint: string;
+  fileCount: number;
+  documentSha256: string;
 }
 
 export interface ArtifactEvidence {
@@ -190,6 +215,8 @@ export interface CodexDerivedReceipt {
   frontendControl: FrontendControlEvidence;
   controlBinary: ArtifactEvidence;
   candidateBinary: ArtifactEvidence;
+  backendClosure?: CodexBackendClosureEvidence;
+  generatedRuntime?: CodexGeneratedRuntimeEvidence;
   /** Required for complete on-demand rollout receipts; absent only on legacy schema-v2 evidence. */
   managedMcp?: ManagedMcpPreparedRuntimeEvidence;
   trustedCanaryRunner?: CodexTrustedSourceEvidence;
@@ -500,6 +527,8 @@ export function isCodexDerivedReceipt(value: unknown): value is CodexDerivedRece
     || !isFrontendEvidence(value.frontendControl)
     || !isArtifactEvidence(value.controlBinary)
     || !isArtifactEvidence(value.candidateBinary)
+    || (value.backendClosure !== undefined && !isCodexBackendClosureEvidence(value.backendClosure))
+    || (value.generatedRuntime !== undefined && !isCodexGeneratedRuntimeEvidence(value.generatedRuntime))
     || (value.managedMcp !== undefined && !managedMcpPreparedRuntimeEvidenceShapeIsValid(value.managedMcp))
     || (value.trustedCanaryRunner !== undefined && !isTrustedSourceEvidence(value.trustedCanaryRunner))
     || (value.trustedCanaryAdapter !== undefined && !isTrustedSourceEvidence(value.trustedCanaryAdapter))
@@ -532,11 +561,30 @@ export function isCodexDerivedReceipt(value: unknown): value is CodexDerivedRece
     && resolution.checkpoints.every((item) => item.channel === value.channel);
 }
 
+export function isCodexBackendClosureEvidence(value: unknown): value is CodexBackendClosureEvidence {
+  return isRecord(value) && isRecord(value.codeModeHost)
+    && nonEmptyString(value.codeModeHost.path)
+    && validDigestValue(value.codeModeHost.sha256, 64)
+    && value.codeModeHost.architecture === "arm64"
+    && isSignatureEvidence(value.codeModeHost.signature)
+    && Array.isArray(value.resources)
+    && value.resources.every(item => isRecord(item) && nonEmptyString(item.relativePath)
+      && nonEmptyString(item.sourcePath) && validDigestValue(item.sha256, 64))
+    && new Set(value.resources.map(item => item.relativePath)).size === value.resources.length;
+}
+
+export function isCodexGeneratedRuntimeEvidence(value: unknown): value is CodexGeneratedRuntimeEvidence {
+  return isRecord(value) && nonEmptyString(value.sourceRoot)
+    && validDigestValue(value.fingerprint, 64) && validDigestValue(value.documentSha256, 64)
+    && Number.isSafeInteger(value.fileCount) && Number(value.fileCount) > 0;
+}
+
 function isTrustedSourceEvidence(value: unknown): value is CodexTrustedSourceEvidence {
   return isRecord(value) && nonEmptyString(value.sourcePath) && validDigestValue(value.sha256, 64);
 }
 
 function isRustLifecycleTestEvidence(value: unknown): value is CodexRustLifecycleTestEvidence {
+  if (qualifiedRustShape(value)) return true;
   if (!isRecord(value)) return false;
   return value.schemaVersion === 1
     && value.kind === "codex-rust-lifecycle-tests"
@@ -672,6 +720,7 @@ function isSourceEvidence(value: unknown): value is CodexSourceEvidence {
     && (value.reviewedDiffDigest === undefined || isNamedDigest(value.reviewedDiffDigest))
     && (value.buildCommand === undefined
       || (Array.isArray(value.buildCommand) && value.buildCommand.length > 0 && value.buildCommand.every(nonEmptyString)))
+    && (value.v8BuildInputs === undefined || v8EvidenceShape(value.v8BuildInputs))
     && Array.isArray(value.toolchainDigests)
     && value.toolchainDigests.every(isNamedDigest)
     && Array.isArray(value.lockfileDigests)

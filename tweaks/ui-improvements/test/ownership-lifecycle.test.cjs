@@ -12,21 +12,26 @@ const helpers = tweak._test ?? tweak.__test;
 const manifest = require("../manifest.json");
 const packageJson = require("../package.json");
 
-test("UI Improvements exposes four independently switchable, patch-versioned improvements", () => {
+test("UI Improvements exposes six independently switchable improvements", () => {
   assert.ok(helpers, "UI Improvements must expose focused test helpers");
   assert.deepEqual(helpers.TOGGLE_IDS, [
     "sidebar-layout",
     "chat-multi-select",
     "slash-menu-improvements",
     "message-metrics",
+    "titlebar-controls",
+    "rich-blocks",
   ]);
-  assert.equal(manifest.version, "0.2.5");
+  assert.match(manifest.version, /^0\.3\.\d+$/);
   assert.equal(packageJson.version, manifest.version);
 });
 
 test("persisted toggle state defaults safely and preserves independent disables", () => {
   const all = helpers.normalizeToggleState(null);
   assert.equal(all.size, 4);
+  const consolidated = helpers.normalizeToggleState({ version: 3, enabled: { "titlebar-controls": true, "rich-blocks": false } });
+  assert.equal(consolidated.has("titlebar-controls"), true);
+  assert.equal(consolidated.has("rich-blocks"), false);
   const configured = helpers.normalizeToggleState({ version: 1, enabled: { "settings-search": false, "message-metrics": false } });
   assert.equal(configured.has("settings-search"), false);
   assert.equal(configured.has("message-metrics"), false);
@@ -449,3 +454,74 @@ function restoreGlobal(name, descriptor) {
   if (descriptor) Object.defineProperty(global, name, descriptor);
   else delete global[name];
 }
+
+
+test("unchanged message metrics do not feed DOM mutations back into host discovery", async () => {
+  await withFakeDom(async (fixture) => {
+    const instance = {};
+    tweak.start.call(instance, fixture.api);
+    try {
+      const badge = fixture.assistant.querySelector("[data-tweaker-message-metrics]");
+      assert.equal(badge.getAttribute("data-tweakers-host-surface-owned"), "true");
+      const descriptor = Object.getOwnPropertyDescriptor(FakeElement.prototype, "textContent");
+      let writes = 0;
+      Object.defineProperty(badge, "textContent", {
+        get() { return descriptor.get.call(this); },
+        set(value) { writes++; descriptor.set.call(this, value); },
+      });
+      for (let i = 0; i < 5; i++) { fixture.notifyHostMutation(); fixture.flushAnimationFrames(); }
+      assert.equal(writes, 0, "unrelated mutations must not rewrite unchanged metrics");
+      fixture.assistant.setOwnText("one two three");
+      fixture.notifyHostMutation(); fixture.flushAnimationFrames();
+      assert.equal(writes, 1, "changed message content still updates its badge");
+      assert.equal(badge.textContent, "3 words");
+    } finally { tweak.stop.call(instance); }
+  });
+});
+
+
+test("consolidated rich blocks and titlebar controls switch independently and restart releases previous owner resources", async () => {
+  await withFakeDom(async (fixture) => {
+    const instance = {};
+    tweak.start.call(instance, fixture.api);
+    fixture.settingsPage.render(fixture.settingsRoot);
+    const originalStyles = fixture.document.head.children.length;
+    changeToggle(fixture.settingsRoot, "Rich Blocks", true);
+    assert.equal(fixture.settingsPage.id, "ui-improvements", "child behavior does not register a competing settings page");
+    assert.equal(fixture.observerStarts, 2, "rich blocks start their owned observer independently");
+    assert.equal(fixture.document.head.children.length, originalStyles + 1);
+    changeToggle(fixture.settingsRoot, "Rich Blocks", false);
+    assert.equal(fixture.observerDisconnects, 1, "disabling rich blocks disposes only their observer");
+    assert.equal(fixture.sidebar.hasAttribute("data-tweaker-sidebar-layout"), true);
+    assert.equal(fixture.document.head.children.length, originalStyles);
+    fixture.navigator.platform = "MacIntel";
+    changeToggle(fixture.settingsRoot, "Titlebar Controls", true);
+    assert.equal(fixture.observerStarts, 3, "titlebar controls start their owned observer independently");
+    assert.equal(fixture.settingsPage.id, "ui-improvements");
+    assert.equal(fixture.document.head.children.length, originalStyles + 1);
+    changeToggle(fixture.settingsRoot, "Titlebar Controls", false);
+    assert.equal(fixture.observerDisconnects, 2);
+    assert.equal(fixture.document.head.children.length, originalStyles);
+    assert.equal(fixture.sidebar.hasAttribute("data-tweaker-sidebar-layout"), true);
+    tweak.start.call(instance, fixture.api);
+    assert.equal(fixture.observerDisconnects, 3, "repeated start releases the earlier owner instance");
+    assert.equal(fixture.document.head.children.length, originalStyles, "repeated start cannot leak styles");
+    tweak.stop.call(instance);
+    assert.equal(fixture.observerDisconnects, 4);
+    assert.equal(fixture.document.head.children.length, 0);
+  });
+});
+
+
+test("activation preserves settings with an unsupported schema for legacy fallback", async () => {
+  await withFakeDom(async (fixture) => {
+    const original = { version: 99, enabled: { "titlebar-controls": true }, future: "preserve" };
+    let writes = 0;
+    fixture.api.storage.get = (key, fallback) => key === "enabledImprovements" ? original : fallback;
+    fixture.api.storage.set = () => { writes++; };
+    const instance = {};
+    tweak.start.call(instance, fixture.api);
+    try { assert.equal(writes, 0); assert.equal(original.version, 99); }
+    finally { tweak.stop.call(instance); }
+  });
+});

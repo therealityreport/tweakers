@@ -25,3 +25,7 @@ occurs once per discovered candidate before reconciliation.
 The focused suite uses a fake DOM and semantic-host fake to cover mount,
 update, invalidation, newest-candidate selection, and cleanup. It does not
 prove live Codex rendering, accessibility, or a large-payload host profile.
+
+## Consolidated ownership
+
+UI Improvements now owns this behavior through the Rich Blocks toggle. The runtime migrates explicit settings before startup and suppresses this legacy tweak only after a successful destination write. Old data is retained. This compatibility entry remains usable if migration fails or the destination owner is disabled. Edit the owning tweak source module; its entry builder writes this compatibility entry.

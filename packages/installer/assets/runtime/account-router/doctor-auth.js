@@ -20,7 +20,7 @@ function authority(root, secret) {
     const source = (0, native_history_1.readNativeHistoryRecoveryAuthorityV1)(root, config, secret);
     const companion = (0, native_auth_binding_1.readNativeAuthBindingAuthorityV1)(root, source, secret);
     const accounts = source.accounts.map((entry, index) => {
-        const home = companion?.document.accounts.find(a => a.opaqueAccountId === entry.opaqueAccountId)?.authHome ?? entry.codexHome;
+        const home = companion?.accounts.find(a => a.opaqueAccountId === entry.opaqueAccountId)?.authHome ?? entry.codexHome;
         const bytes = (0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(home, "auth.json"));
         let valid = false;
         try {
@@ -34,7 +34,7 @@ function authority(root, secret) {
     });
     const metadata = ["account-router-config.json", "native-history-source.v1.json", "native-auth-binding.v1.json", "native-storage-identities.v2.json"]
         .map(name => [name, (0, node_fs_1.existsSync)((0, node_path_1.join)(root, name)) ? digest((0, native_auth_binding_1.readNativeAuthPrivateFileV1)((0, node_path_1.join)(root, name)).toString("base64")) : null]);
-    return { config, accounts, fingerprint: digest({ metadata, accounts: accounts.map(a => [a.entry.opaqueAccountId, a.home, a.fingerprint]) }) };
+    return { config, accounts, fingerprint: digest({ metadata, authBindingFingerprint: companion?.fingerprint ?? null, accounts: accounts.map(a => [a.entry.opaqueAccountId, a.home, a.fingerprint]) }) };
 }
 function inspectNativeAuthenticationAtRoot(root) {
     const secret = (0, broker_socket_1.readAccountsBrokerSecret)(root);

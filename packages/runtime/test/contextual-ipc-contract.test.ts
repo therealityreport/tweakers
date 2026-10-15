@@ -45,5 +45,5 @@ test("renderer and main IPC operations freeze the declared ipc permission requir
   assert.match(preload, /on: \(c, h\) => \{\s*assertIpcPermission\(\)/);
   assert.match(preload, /send: \(c, \.\.\.args\) => \{\s*assertIpcPermission\(\)/);
   assert.match(preload, /invoke: <T>\(c: string, \.\.\.args: unknown\[\]\) => \{\s*assertIpcPermission\(\)/);
-  assert.match(main, /const requireIpc = \(\) => assertTweakPermission\(tweak, "ipc"\)/);
+  assert.match(main, /const requireIpc = \(\) => \{[\s\S]*?assertTweakPermission\(tweak, "ipc"\);\s*\}/);
 });

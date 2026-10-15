@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "./owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";

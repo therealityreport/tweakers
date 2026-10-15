@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  resolveBundledCodexBackend,
   inferCodexChannel,
   locateCodex,
   locateCodexAtExactPath,
@@ -130,4 +131,21 @@ test("resolveLinuxInstall accepts a launcher symlink override", { skip: process.
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test("bundled backend resolution supports the signed CLI app layout and retains explicit legacy backends", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-backend-layout-"));
+  try {
+    const resources = join(root, "Contents", "Resources");
+    const nested = join(resources, "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex");
+    mkdirSync(join(nested, ".."), { recursive: true });
+    writeFileSync(nested, "new CLI");
+    assert.equal(resolveBundledCodexBackend(root), nested);
+    writeFileSync(join(resources, "codex"), "retained derived CLI");
+    assert.equal(resolveBundledCodexBackend(root), join(resources, "codex"));
+    rmSync(join(resources, "codex")); rmSync(nested);
+    symlinkSync(process.execPath, nested);
+    assert.throws(() => resolveBundledCodexBackend(root), /regular|symlink|outside/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

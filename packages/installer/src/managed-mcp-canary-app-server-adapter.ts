@@ -309,6 +309,8 @@ export function createJsonlManagedMcpAppServerTransport(
   if (!child.pid) throw new Error("Managed MCP app-server child lacks pid");
   let nextId = 0;
   let closed = false;
+  let ioFailure: Error | null = null;
+  let termination: Promise<void> | null = null;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   lines.on("line", (line) => {
@@ -339,7 +341,14 @@ export function createJsonlManagedMcpAppServerTransport(
     for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(error); }
     pending.clear();
   };
+  const fail = (error: Error): void => { ioFailure ??= error; rejectAll(ioFailure); };
+  child.on("error", fail);
+  child.stdin.on("error", fail);
+  child.stdout.on("error", fail);
+  child.stderr.on("error", fail);
+  lines.on("error", fail);
   const write = (value: unknown): void => {
+    if (ioFailure) throw ioFailure;
     if (closed || !child.stdin.writable) throw new Error("Managed MCP app-server stdin is closed");
     child.stdin.write(`${JSON.stringify(value)}\n`);
   };
@@ -353,17 +362,31 @@ export function createJsonlManagedMcpAppServerTransport(
           reject(new Error(`Managed MCP app-server RPC timed out: ${method}`));
         }, timeoutMs);
         pending.set(id, { resolve: resolvePromise, reject, timer });
-        write({ id, method, params });
+        try { write({ id, method, params }); }
+        catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
       });
     },
     notify(method, params) { write(params === undefined ? { method } : { method, params }); },
     async terminate() {
       if (closed) return;
-      child.stdin.end();
-      await Promise.race([
-        new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise())),
-        new Promise<void>((resolvePromise) => setTimeout(() => { child.kill("SIGKILL"); resolvePromise(); }, 2_000)),
-      ]);
+      termination ??= new Promise<void>((resolvePromise, reject) => {
+        let forceTimer: NodeJS.Timeout | undefined;
+        const finish = (error?: Error) => {
+          clearTimeout(timer);
+          if (forceTimer) clearTimeout(forceTimer);
+          child.removeListener("exit", onExit);
+          lines.close();
+          if (error) reject(error); else resolvePromise();
+        };
+        const onExit = () => finish();
+        const timer = setTimeout(() => {
+          forceTimer = setTimeout(() => finish(new Error("Managed MCP app-server exit was not observed")), 1_000);
+          child.kill("SIGKILL");
+        }, 2_000);
+        child.once("exit", onExit);
+        try { child.stdin.end(); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+      });
+      await termination;
     },
   };
 }

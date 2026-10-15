@@ -312,7 +312,7 @@ function patchCodexAccountsNativeReviewedSources(
     edit(data, "await Dm(i,t).sendRequest(`config/batchWrite`,{edits:xSn({pluginId:_.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0})",
       `await ${BRIDGE}.capturedRpc(__twInstallScope,"config/batchWrite",{edits:xSn({pluginId:_.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0},()=>Dm(i,t).sendRequest(\`config/batchWrite\`,{edits:xSn({pluginId:_.plugin.id,enabled:!0}),filePath:E?.configWriteTarget?.filePath??null,expectedVersion:null,reloadUserConfig:!0}))`);
     edit(data, "let e=await DS.safeGet(`/wham/profiles/me`)",
-      `let e=await ${BRIDGE}.request("profile","profile.statistics",{},()=>DS.safeGet(\`/wham/profiles/me\`))`);
+      `let __twNativeProfile=await DS.safeGet(\`/wham/profiles/me\`);let e=await ${BRIDGE}.request("profile","profile.statistics",{native:__twNativeProfile},()=>__twNativeProfile)`);
     edit(data, "let n=await DS.safeGet(`/wham/usage`,{additionalHeaders:{\"OAI-App-Brand\":SS.toLowerCase(),...e},signal:t})",
       `let n=await ${BRIDGE}.usage(await DS.safeGet(\`/wham/usage\`,{additionalHeaders:{"OAI-App-Brand":SS.toLowerCase(),...e},signal:t}))`);
     edit(data, "function oji(){return DS.safeGet(`/wham/rate-limit-reset-credits`)}",
@@ -352,7 +352,7 @@ function patchCodexAccountsNativeReviewedSources(
       edit(ui, `defaultMessage:\`${original}\``, `defaultMessage:${BRIDGE}.project("usage","depleted-message",${JSON.stringify(original)})`);
     }
     edit("profile-9e1aa6f4c439.js", "className:`flex flex-col items-center`,children:un",
-      `className:\`flex flex-col items-center\`,children:${BRIDGE}.render("profile",un,{jsx:$.jsx,react:Hc})`);
+      `className:\`flex flex-col items-center\`,children:[un,${BRIDGE}.render("profile",null,{jsx:$.jsx,react:Hc})]`);
     // The native Apps and Plugins browser shares this page. Each selector gets
     // its own account binding; the native list components and actions stay put.
     edit("plugins-page-7d29260e396d.js", "className:`flex h-full min-h-0 flex-col`,children:[vl,bl]",

@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import { readDesktopUpdateReceipt } from "./desktop-update-transaction.js";
-import { readEnvironmentTransactionReceipt } from "./environment-transaction.js";
+import { readDesktopUpdateReceipt } from "./desktop-update-receipt.js";
+import { readEnvironmentTransactionReceipt } from "./manager-environment-action.js";
 import {
   isLockHeldByLiveOwner,
 } from "./process-lock.js";

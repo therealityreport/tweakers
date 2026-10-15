@@ -112,6 +112,25 @@ test("reloadTweaks stops before clearing cache when stop fails", async () => {
   assert.deepEqual(calls, ["log:reloading tweaks (manual)", "stopAllMainTweaks"]);
 });
 
+test("reloadTweaks awaits asynchronous cleanup before clearing modules", async () => {
+  const calls: string[] = [];
+  let finish!: () => void;
+  const barrier = new Promise<void>((resolve) => { finish = resolve; });
+  const pending = reloadTweaks("async-stop", {
+    ...deps(calls),
+    async stopAllMainTweaks() {
+      calls.push("stop:start");
+      await barrier;
+      calls.push("stop:end");
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["log:reloading tweaks (async-stop)", "stop:start"]);
+  finish();
+  await pending;
+  assert.ok(calls.indexOf("stop:end") < calls.indexOf("clearTweakModuleCache"));
+});
+
 test("reloadTweaks awaits loading before broadcasting and serializes overlapping reloads", async () => {
   const calls: string[] = [];
   let releaseFirstLoad!: () => void;

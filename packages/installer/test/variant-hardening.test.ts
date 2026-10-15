@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { readPlist, writePlist } from "../src/plist";
+import { captureOfficialBundledBackendClosure, NATIVE_CODEX_BACKEND, NATIVE_CODE_MODE_HOST, NATIVE_CODEX_CLI_ROOT } from "../src/native-bundled-backend.js";
 import {
   TWEAKERS_VARIANT_BUNDLE_ID,
   TWEAKERS_VARIANT_COMPUTER_USE_BUNDLE_ID,
@@ -17,6 +18,31 @@ function writeInfo(path: string, value: Record<string, unknown>): void {
   mkdirSync(join(path, ".."), { recursive: true });
   writePlist(path, value);
 }
+
+test("variant identity preserves the verified supplied native CLI closure while isolating sibling desktop helpers",()=>{
+  const root=mkdtempSync(join(tmpdir(),"tweakers-native-identity-"));
+  try {
+    const app=join(root,"Tweakers.app"),main=join(app,"Contents/Info.plist"),nativeInfo=join(app,NATIVE_CODEX_CLI_ROOT,"CodexCLI.app/Contents/Info.plist");
+    const sibling=join(app,"Contents/Resources/codex-cli-shadow/Helper.app/Contents/Info.plist");
+    writeInfo(main,{CFBundleIdentifier:"com.openai.codex",CFBundleName:"Codex"});
+    writeInfo(nativeInfo,{CFBundleIdentifier:"com.openai.codex.CodexCLI",CFBundleExecutable:"codex",CFBundleName:"CodexCLI"});
+    writeInfo(sibling,{CFBundleIdentifier:"com.openai.codex.helper",CFBundleName:"Codex Helper"});
+    for(const name of [NATIVE_CODEX_BACKEND,NATIVE_CODE_MODE_HOST]) {
+      const file=join(app,name);mkdirSync(join(file,".."),{recursive:true});writeFileSync(file,Buffer.from([0xcf,0xfa,0xed,0xfe,1,2,3,4]),{mode:0o755});
+    }
+    const port={certificate:()=>"A".repeat(40),verify:()=>({ok:true,output:"fixture signature"})};
+    const closure=captureOfficialBundledBackendClosure(app,port)!,before=readFileSync(nativeInfo);
+    applyMacAppIdentity(app,defaultTweakersVariantIdentity(join(root,"app-data"),root),closure,port);
+    assert.deepEqual(readFileSync(nativeInfo),before);
+    assert.deepEqual(captureOfficialBundledBackendClosure(app,port)!.resourceTree,closure.resourceTree);
+    assert.equal(readPlist(main).CFBundleIdentifier,TWEAKERS_VARIANT_BUNDLE_ID);
+    assert.equal(readPlist(sibling).CFBundleIdentifier,`${TWEAKERS_VARIANT_BUNDLE_ID}.helper`);
+    assert.doesNotThrow(()=>assertNoResidualOpenAIRuntimeIdentities(app,closure,port));
+    writeInfo(nativeInfo,{...readPlist(nativeInfo),CFBundleName:"tampered native resource"});
+    assert.throws(()=>applyMacAppIdentity(app,defaultTweakersVariantIdentity(join(root,"app-data"),root),closure,port),/resource closure changed/);
+    assert.throws(()=>assertNoResidualOpenAIRuntimeIdentities(app,closure,port),/resource closure changed/);
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
 
 test("variant identity rewrite covers all nested desktop and Computer Use names while retaining only dSYM metadata", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-variant-hardening-"));

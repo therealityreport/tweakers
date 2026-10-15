@@ -74,7 +74,8 @@ interface CandidateInstallOptions {
   candidateContext?: { paths: UserPaths };
 }
 
-function installCandidateFixture(opts: CandidateInstallOptions): void {
+function installCandidateFixture(opts?: CandidateInstallOptions): void {
+  if (!opts) throw new Error("Expected candidate install options");
   const candidate = opts.app!;
   const paths = opts.candidateContext!.paths;
   const identity = opts.macAppIdentity!;
@@ -235,6 +236,7 @@ test("applyMacAppIdentity isolates main and OpenAI helper identities", () => {
       CFBundleName: "ChatGPT",
       CFBundleDisplayName: "ChatGPT",
       CFBundleExecutable: "ChatGPT",
+      CFBundleAlternateNames: ["Codex", "ChatGPT"],
       CFBundleIconName: "Icon",
       CodexAppIconBaseName: "icon-chatgpt",
       NSDockTilePlugIn: "CodexDockTilePlugin.docktileplugin",
@@ -268,6 +270,7 @@ test("applyMacAppIdentity isolates main and OpenAI helper identities", () => {
     const mainValue = readPlist(main);
     assert.equal(mainValue.CFBundleIdentifier, TWEAKERS_VARIANT_BUNDLE_ID);
     assert.equal(mainValue.CFBundleDisplayName, "Tweakers");
+    assert.equal(mainValue.CFBundleAlternateNames, undefined);
     assert.equal(mainValue.CrProductDirName, TWEAKERS_VARIANT_PRODUCT_NAME);
     assert.equal(mainValue.BundleSigningBaseName, "Tweakers");
     assert.equal(mainValue.CFBundleIconFile, TWEAKERS_VARIANT_ICON_FILE);
@@ -331,7 +334,7 @@ test("applyMacAppIdentity isolates main and OpenAI helper identities", () => {
         configPath,
       );
     }
-    assert.doesNotThrow(() => applyMacAppIdentity(app, identity));
+    assert.deepEqual(applyMacAppIdentity(app, identity), []);
     assert.doesNotThrow(() => installMacAppLauncher(app, identity));
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -454,6 +457,7 @@ test("createTweakersVariant enforces isolated state and disables the watcher", a
       },
       stageTweaks: (tweaks) => stageBundledFixture(tweaks),
       installApp: async (opts) => {
+        if (!opts) throw new Error("Expected candidate install options");
         observedHome = process.env.TWEAKERS_HOME;
         assert.equal(opts.watcher, false);
         assert.equal(opts.macAppIdentity?.bundleId, TWEAKERS_VARIANT_BUNDLE_ID);

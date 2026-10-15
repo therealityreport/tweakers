@@ -9,6 +9,8 @@ export declare class RouterStateStore {
     constructor(root: string, config: RouterConfig, fileName?: string);
     get path(): string;
     snapshot(): RouterState;
+    /** Read-only lookup for hot paths that need one owner, not a full state copy. */
+    ownerOf(threadId: string): RouterState["threadOwners"][string] | undefined;
     update(mutator: (state: RouterState) => void): RouterState;
     private load;
 }

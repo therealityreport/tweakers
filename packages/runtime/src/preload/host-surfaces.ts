@@ -1,4 +1,4 @@
-import { ipcRenderer } from "electron";
+import type { IpcRenderer } from "electron";
 import { fiberForNode } from "./react-hook";
 import type {
   HostMcpDeliveryAcknowledgement,
@@ -58,7 +58,7 @@ const NATIVE_SETTINGS_SURFACES: Record<NativeSettingsSurfaceKind, NativeSettings
 };
 
 const SELECTORS: Record<Exclude<HostSurfaceKind, "projects" | "thread-context" | "usage" | NativeSettingsSurfaceKind>, string> = {
-  "assistant-turns": '[data-testid="conversation-turn"], [data-testid*="assistant-message" i], [data-message-author-role="assistant"], [data-role="assistant"]',
+  "assistant-turns": '[data-testid="conversation-turn"], [data-testid*="assistant-message" i], [data-message-author-role="assistant"], [data-role="assistant"], [data-markdown-text-style="assistant-message"]',
   composer: '#prompt-textarea, [data-testid="composer"] textarea, [data-testid="composer"] [contenteditable="true"], form textarea:not([disabled]), form [contenteditable="true"]',
   "command-menu": '[data-command-menu], [data-slash-menu], [role="listbox"]',
   "account-menu": '[role="menu"], [role="dialog"]',
@@ -534,6 +534,9 @@ export async function getSharedHistoryTarget(): Promise<HostSharedHistoryTargetR
   if (native.status !== "available") return native;
   let response: unknown;
   try {
+    // Resolve Electron only when the native target seam is used. Pure host
+    // adapter tests can load this module without an installed Electron binary.
+    const ipcRenderer = (require("electron") as { ipcRenderer: IpcRenderer }).ipcRenderer;
     response = await ipcRenderer.invoke(SHARED_HISTORY_MAP_NATIVE_TARGET_CHANNEL, {
       version: SHARED_HISTORY_MAP_VERSION,
       conversationNativeId: native.target.conversationNativeId,
@@ -686,12 +689,21 @@ function ensureObserver(): void {
     if (pendingFrame !== null) return;
     pendingFrame = requestAnimationFrame(() => {
       pendingFrame = null;
-      for (const entry of listeners) safelyNotify(entry, entry.kinds.map(snapshot));
+      // A shared observer should also share discovery: each surface is scanned
+      // once per frame even when several tweaks subscribe to the same kind.
+      const snapshots = new Map<HostSurfaceKind, HostSurfaceSnapshot>();
+      for (const entry of listeners) {
+        safelyNotify(entry, entry.kinds.map((kind) => {
+          let value = snapshots.get(kind);
+          if (!value) { value = snapshot(kind); snapshots.set(kind, value); }
+          return value;
+        }));
+      }
     });
   });
   sharedObserver.observe(document.documentElement, {
     attributes: true,
-    attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-settings-panel-slug", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
+    attributeFilter: ["aria-label", "aria-current", "role", "data-testid", "data-markdown-text-style", "data-settings-panel-slug", "data-project-id", "data-project-name", "data-workspace-path", "data-usage-limit-key", "data-usage-limit", "disabled"],
     childList: true,
     characterData: true,
     subtree: true,
@@ -861,7 +873,8 @@ function semanticFilter(kind: HostSurfaceKind, element: Element): boolean {
   const text = compact(element.textContent);
   if (kind === "assistant-turns") {
     const role = element.getAttribute("data-message-author-role") || element.getAttribute("data-role");
-    return role ? role.toLowerCase() === "assistant" : /assistant-message/i.test(element.getAttribute("data-testid") || "");
+    return role ? role.toLowerCase() === "assistant" : element.getAttribute("data-markdown-text-style") === "assistant-message"
+      || /assistant-message/i.test(element.getAttribute("data-testid") || "");
   }
   if (kind === "account-menu") return /account|settings|log\s*out/i.test(text);
   if (kind === "settings-rows") return text.length > 0;

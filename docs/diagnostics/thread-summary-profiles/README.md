@@ -19,8 +19,9 @@ The current implementation splits ownership deliberately:
 
 ## Reproduction and regression commands
 
-The original data-disconnect fixture remains archived outside this repo at
-`diagnostics/thread-summary-profiles/thread-summary-profiles.compat.test.cjs`.
+The original data-disconnect fixture requires the archived `revi` workspace;
+its `diagnostics/thread-summary-profiles/thread-summary-profiles.compat.test.cjs`
+fixture is absent from this checkout.
 Run the current contracts with:
 
 ```sh

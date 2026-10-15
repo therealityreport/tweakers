@@ -15,6 +15,26 @@ const source = [
     .map((file) => fs.readFileSync(path.join(tweakRoot, "lib", file), "utf8")),
 ].join("\n");
 
+test("native project registry keeps its last good projection while a changed large file refreshes", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "projects-native-cache-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, ".codex-global-state.json");
+  const read = require("../lib/state").readNativeLocalProjects;
+  const state = (name) => ({ "local-projects": { "native-one": { id: "native-one", name, rootPaths: ["/tmp/native-one"] } }, padding: "x".repeat(9 * 1024 * 1024) });
+  fs.writeFileSync(file, JSON.stringify(state("First")));
+  assert.equal(read({ CODEX_HOME: directory })[0].name, "First");
+  fs.writeFileSync(file, JSON.stringify(state("Second")));
+  assert.equal(read({ CODEX_HOME: directory })[0].name, "First");
+  for (let attempt = 0; attempt < 50 && read({ CODEX_HOME: directory })[0]?.name !== "Second"; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(read({ CODEX_HOME: directory })[0].name, "Second");
+  fs.writeFileSync(file, "{".repeat(100));
+  assert.equal(read({ CODEX_HOME: directory })[0].name, "Second");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(read({ CODEX_HOME: directory })[0].name, "Second");
+});
+
 test("nested groups and emoji/Iconify icons validate", () => {
   const state = _test.normalizeState({ schemaVersion: 1, nodes: [
     { id: "group", type: "group", parentId: null, name: "Work", icon: { kind: "emoji", value: "📁" }, connections: {} },
@@ -858,6 +878,233 @@ test("project overflow resolves from the live project row when semantic hosts ar
   assert.equal(context.source, "live-row");
 });
 
+test("native project discovery exposes color and boldness in current Radix menus without writing until explicit save", async (t) => {
+  const projectState = require("../lib/state");
+  const sidebar = require("../lib/sidebar");
+  const { createProjectService } = require("../lib/service");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "projects-menu-discovery-"));
+  const previous = { document: global.document, window: global.window, Element: global.Element, HTMLElement: global.HTMLElement, MutationObserver: global.MutationObserver };
+  const document = new FakeDocument();
+  const timers = new Map();
+  const observers = new Set();
+  let timerId = 0;
+  global.document = document;
+  global.Element = global.HTMLElement = FakeElement;
+  global.window = { setTimeout(callback) { timers.set(++timerId, callback); return timerId; }, clearTimeout(id) { timers.delete(id); } };
+  global.MutationObserver = class {
+    constructor(callback) { this.callback = callback; }
+    observe() { observers.add(this); }
+    disconnect() { observers.delete(this); }
+  };
+  t.after(() => { Object.assign(global, previous); fs.rmSync(directory, { recursive: true, force: true }); });
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: "saved", type: "project", name: "Existing", projectPath: "/tmp/existing", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "strong", taskSort: "created-asc", pinnedTaskIds: ["task-one"], connections: {} },
+  ] });
+  projectState.createSecureProjectStore(directory).write(saved);
+  const file = path.join(directory, "projects-v1.json");
+  const before = fs.readFileSync(file);
+  const native = [
+    { id: "native-existing", name: "Existing", rootPaths: ["/tmp/existing"] },
+    { id: "native-sticky", name: "sticky-fingers", rootPaths: ["/tmp/sticky-fingers"] },
+  ];
+  const dependencies = { readNativeLocalProjects: () => native, detectConnections: async () => ({}) };
+  let service = createProjectService({ fs: { dataDir: directory }, ipc: { send() {} } }, dependencies);
+  t.after(() => service.dispose());
+  let response = await service.handle({ action: "get" });
+  assert.deepEqual(response.state.nodes[0], saved.nodes[0], "existing order, color, boldness and task settings win");
+  assert.ok(response.state.nodes.some((node) => node.id === "native-sticky"), "a newly native project enters the in-memory projection by actual ID");
+  assert.deepEqual(fs.readFileSync(file), before, "discovery does not write the saved store");
+  service.dispose();
+  service = createProjectService({ fs: { dataDir: directory }, ipc: { send() {} } }, dependencies);
+  response = await service.handle({ action: "get" });
+  assert.equal(response.state.nodes.filter((node) => node.id === "native-sticky").length, 1, "disable and re-enable does not duplicate discovery");
+  const runtime = projectState.bindNativeProjectIdentities(response.state, native);
+  const row = document.createElement("div");
+  row.setAttribute("data-app-action-sidebar-project-row", "true");
+  row.setAttribute("data-app-action-sidebar-project-id", "native-sticky");
+  row.setAttribute("data-app-action-sidebar-project-label", "sticky-fingers");
+  row.setAttribute("role", "button");
+  const overflow = document.createElement("button");
+  const icon = document.createElement("svg");
+  for (const node of [overflow, icon]) {
+    const closest = node.closest.bind(node);
+    node.closest = (selector) => selector === 'button, [role="button"]' ? overflow : closest(selector);
+  }
+  overflow.appendChild(icon);
+  row.appendChild(overflow);
+  document.body.appendChild(row);
+  const menu = document.createElement("div");
+  menu.setAttribute("data-radix-menu-content", "");
+  menu.setAttribute("data-state", "open");
+  const nativeCalls = [];
+  for (const label of ["Pin", "Edit", "Section", "Reveal in Finder", "Archive chats", "Remove project"]) {
+    const item = document.createElement("div");
+    item.setAttribute("role", "menuitem");
+    item.textContent = label;
+    item.addEventListener("click", () => nativeCalls.push(label));
+    menu.appendChild(item);
+  }
+  const hostItems = [...menu.children];
+  const saves = [];
+  const api = { react: { host: { query: () => [] } }, ipc: { on() { return () => {}; } } };
+  const install = () => sidebar.installProjectColorControls(api, () => runtime, async (id, choice) => {
+    saves.push({ id, choice });
+    const result = await service.handle({ action: "save", baseRevision: response.revision,
+      state: { ...response.state, nodes: response.state.nodes.map((node) => node.id === id ? { ...node, ...choice } : node) } });
+    assert.equal(result.ok, true, "the discovered project uses the existing revision-checked explicit save");
+  });
+  let dispose = install();
+  document.dispatchEvent({ type: "pointerdown", target: icon, clientX: 10, clientY: 10 });
+  document.body.appendChild(menu);
+  for (const observer of [...observers]) observer.callback();
+  const trigger = menu.querySelector('[data-tweaker-project-menu="trigger"]');
+  assert.ok(trigger, "the current native Radix portal receives Projects controls after it mounts");
+  trigger.click();
+  const settings = document.body.querySelector('[data-tweaker-project-menu="settings-submenu"]');
+  const color = settings.querySelector('[data-tweaker-project-color-menu="trigger"]');
+  assert.equal(color.children[0].textContent, "Edit color / boldness");
+  color.click();
+  const palette = document.body.querySelector('[data-tweaker-project-color-menu="submenu"]');
+  palette.querySelector('[data-overlay-id="subtle"]').click();
+  await Promise.resolve();
+  assert.deepEqual(saves, [{ id: "native-sticky", choice: { overlayIntensity: "subtle" } }]);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).nodes.find((node) => node.id === "native-sticky").overlayIntensity, "subtle");
+  assert.ok(hostItems.every((item) => menu.contains(item)), "all original native menu commands remain mounted");
+  hostItems[1].click();
+  assert.deepEqual(nativeCalls, ["Edit"], "native action remains untouched");
+  dispose();
+  assert.equal(document.listenerCount(), 0);
+  assert.equal(observers.size, 0);
+  assert.equal(timers.size, 0);
+  assert.equal(menu.querySelector('[data-tweaker-project-menu="trigger"]'), null);
+  dispose = install();
+  document.dispatchEvent({ type: "click", target: overflow, clientX: 0, clientY: 0 });
+  assert.equal(menu.querySelectorAll('[data-tweaker-project-menu="trigger"]').length, 1);
+  dispose();
+  assert.equal(document.listenerCount(), 0);
+  assert.equal(observers.size, 0);
+  assert.equal(timers.size, 0);
+});
+
+test("native project discovery keeps identical names bound to native IDs and preserves ambiguous legacy nodes", async (t) => {
+  const projectState = require("../lib/state");
+  const { createProjectService } = require("../lib/service");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "projects-discovery-identities-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: "saved", type: "project", name: "Same", projectPath: "/tmp/first", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "strong", connections: {} },
+    { id: "unbound", type: "project", name: "Legacy", color: "#15803d", colorMode: "manual", overlayIntensity: "off", connections: {} },
+  ] });
+  projectState.createSecureProjectStore(directory).write(saved);
+  let native = [{ id: "native-first", name: "Same", rootPaths: ["/tmp/first"] }];
+  const service = createProjectService({ fs: { dataDir: directory }, ipc: { send() {} } }, {
+    readNativeLocalProjects: () => native, detectConnections: async () => ({}),
+  });
+  t.after(() => service.dispose());
+  await service.handle({ action: "get" });
+  native = [...native,
+    { id: "native-second", name: "Same", rootPaths: ["/tmp/second"] },
+    { id: "native-multi", name: "Multiple roots", rootPaths: ["/tmp/other-one", "/tmp/other-two"] },
+    { id: "native-legacy", name: "Legacy", rootPaths: ["/tmp/legacy"] },
+  ];
+  const result = await service.handle({ action: "get" });
+  assert.deepEqual(result.state.nodes.slice(0, 2), saved.nodes);
+  const bound = projectState.bindNativeProjectIdentities(result.state, native);
+  assert.equal(require("../lib/sidebar").unambiguousProjectForNativeIdentity(bound.nodes, "Same", "native-second")?.id, "native-second");
+  assert.equal(require("../lib/sidebar").unambiguousProjectForNativeIdentity(bound.nodes, "Same", null), null, "a name alone cannot pick between native identities");
+  assert.equal(result.state.nodes.find((node) => node.id === "native-multi")?.projectPath, undefined, "multi-root discovery never guesses an inventory root");
+  assert.equal(result.state.nodes.some((node) => node.id === "native-legacy"), false, "unbound same-name legacy appearance is not silently replaced or duplicated");
+  native.reverse();
+  assert.deepEqual((await service.handle({ action: "get" })).state, result.state, "native registry reorder preserves project IDs and existing order");
+});
+
+test("native identity ownership separates distinct live UUIDs with identical names and roots", () => {
+  const projectState = require("../lib/state");
+  const sidebar = require("../lib/sidebar");
+  const firstId = "11111111-1111-4111-8111-111111111111";
+  const secondId = "22222222-2222-4222-8222-222222222222";
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: firstId, type: "project", name: "Same", projectPath: "/tmp/shared", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "strong", connections: {} },
+  ] });
+  const native = [firstId, secondId].map((id) => ({ id, name: "Same", rootPaths: ["/tmp/shared"] }));
+  const discovered = projectState.reconcileNativeProjectDiscovery(saved, native);
+  assert.deepEqual(discovered.nodes[0], saved.nodes[0], "existing actual-ID owner retains its appearance");
+  assert.equal(discovered.nodes.some((node) => node.id === secondId), true, "shared path must not consume a distinct native ID as an alias");
+  const bound = projectState.bindNativeProjectIdentities(discovered, native);
+  assert.deepEqual(bound.nodes.find((node) => node.id === firstId).nativeProjectIds, [firstId]);
+  assert.deepEqual(bound.nodes.find((node) => node.id === secondId).nativeProjectIds, [secondId]);
+  const context = sidebar.unambiguousProjectForNativeIdentity(bound.nodes, "Same", secondId);
+  assert.equal(context?.id, secondId, "the second project's menu targets its own saved appearance");
+  const changed = projectState.normalizeState({ ...discovered, nodes: discovered.nodes.map((node) => node.id === context.id ? { ...node, overlayIntensity: "subtle" } : node) });
+  assert.equal(changed.nodes[0].overlayIntensity, "strong");
+  assert.equal(changed.nodes[1].overlayIntensity, "subtle");
+  assert.deepEqual(projectState.reconcileNativeProjectDiscovery(discovered, [...native].reverse()), discovered);
+  const moved = projectState.bindNativeProjectIdentities(saved, [{ id: firstId, name: "Renamed", rootPaths: ["/tmp/moved"] }]);
+  assert.deepEqual(moved.nodes[0].nativeProjectIds, [firstId], "exact native ID remains strongest even after its root moves");
+  assert.equal(sidebar.unambiguousProjectForNativeIdentity(moved.nodes, "Renamed", firstId)?.id, firstId);
+  assert.equal(moved.nodes[0].projectPath, "/tmp/shared", "discovery does not replace an explicitly saved inventory root");
+});
+
+test("native identity ownership separates same-label multi-root projects without treating current IDs as legacy", () => {
+  const projectState = require("../lib/state");
+  const firstId = "33333333-3333-4333-8333-333333333333";
+  const secondId = "44444444-4444-4444-8444-444444444444";
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: firstId, type: "project", name: "Same", color: "#15803d", colorMode: "manual", overlayIntensity: "off", connections: {} },
+  ] });
+  const native = [firstId, secondId].map((id, index) => ({ id, name: "Same", rootPaths: [`/tmp/multi-${index}-one`, `/tmp/multi-${index}-two`] }));
+  const discovered = projectState.reconcileNativeProjectDiscovery(saved, native);
+  assert.deepEqual(discovered.nodes[0], saved.nodes[0]);
+  assert.equal(discovered.nodes.some((node) => node.id === secondId), true, "a current native owner without an inventory root cannot suppress a distinct same-label project");
+  const bound = projectState.bindNativeProjectIdentities(discovered, native);
+  assert.equal(require("../lib/sidebar").unambiguousProjectForNativeIdentity(bound.nodes, "Same", secondId)?.id, secondId);
+  assert.ok(discovered.nodes.every((node) => node.projectPath === undefined), "multi-root discovery does not invent a primary root");
+});
+
+test("native identity ownership preserves unique legacy path aliases and refuses ambiguous shared legacy roots", () => {
+  const projectState = require("../lib/state");
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: "legacy-project", type: "project", name: "Saved name", projectPath: "/tmp/old-root", color: "#1d4ed8", colorMode: "manual", overlayIntensity: "strong", connections: {} },
+  ] });
+  const first = { id: "55555555-5555-4555-8555-555555555555", name: "Renamed", rootPaths: ["/tmp/new-root"], rootPathAliases: ["/tmp/old-root"] };
+  const unique = projectState.reconcileNativeProjectDiscovery(saved, [first]);
+  assert.deepEqual(unique, saved, "a supported legacy alias keeps its saved ID, name and appearance");
+  assert.deepEqual(projectState.bindNativeProjectIdentities(unique, [first]).nodes[0].nativeProjectIds, [first.id]);
+  const second = { ...first, id: "66666666-6666-4666-8666-666666666666" };
+  const ambiguous = projectState.bindNativeProjectIdentities(saved, [first, second]);
+  assert.equal(ambiguous.nodes[0].nativeProjectIds, undefined, "two live native IDs cannot both own one legacy path mapping");
+  const discovered = projectState.reconcileNativeProjectDiscovery(saved, [first, second]);
+  assert.deepEqual(discovered.nodes[0], saved.nodes[0]);
+  assert.ok([first.id, second.id].every((id) => discovered.nodes.some((node) => node.id === id)));
+});
+
+test("native identity ownership preserves a colliding legacy group UUID and rejects its native project menu", (t) => {
+  const projectState = require("../lib/state");
+  const sidebar = require("../lib/sidebar");
+  const collision = "77777777-7777-4777-8777-777777777777";
+  const saved = projectState.normalizeState({ schemaVersion: 1, nodes: [
+    { id: collision, type: "group", name: "Legacy group", color: "#1d4ed8", connections: {} },
+    { id: "existing-project", type: "project", name: "Same", projectPath: "/tmp/existing-project", color: "#15803d", colorMode: "manual", overlayIntensity: "strong", connections: {} },
+  ] });
+  const native = [{ id: collision, name: "Same", rootPaths: ["/tmp/colliding-project"] }];
+  const discovered = projectState.reconcileNativeProjectDiscovery(saved, native);
+  assert.deepEqual(discovered, saved, "no schema or alternate ID is invented for the collision");
+  const runtime = projectState.bindNativeProjectIdentities(discovered, native);
+  const previous = { Element: global.Element, HTMLElement: global.HTMLElement };
+  global.Element = global.HTMLElement = FakeElement;
+  t.after(() => Object.assign(global, previous));
+  const document = new FakeDocument();
+  const row = document.createElement("div");
+  row.setAttribute("data-app-action-sidebar-project-row", "true");
+  row.setAttribute("data-app-action-sidebar-project-id", collision);
+  row.setAttribute("data-app-action-sidebar-project-label", "Same");
+  const button = document.createElement("button");
+  row.appendChild(button);
+  document.body.appendChild(row);
+  assert.equal(sidebar.resolveProjectContext({ react: { host: { query: () => [] } } }, runtime, button), null, "the colliding native menu must not fall back to another same-label project's appearance");
+  assert.equal(sidebar.resolveProjectContext({ react: { host: { query: () => [{ element: row }] } } }, runtime, button), null, "semantic project hosts reject the same non-project ID collision");
+});
+
 test("renamed native projects retain their saved color and menu identity by workspace path", (t) => {
   const previousDocument = global.document;
   const previousElement = global.Element;
@@ -923,6 +1170,30 @@ test("renamed native projects retain their saved color and menu identity by work
   assert.equal(row.getAttribute("data-tweaker-project-color-row"), "true");
   assert.equal(row.style.values.get("--tweaker-project-color"), "#6d28d9");
   assert.equal(title.getAttribute("data-tweaker-project-color-title"), "true");
+});
+
+test("native project anchors preserve colors and menu context with emoji labels and unmatched UUIDs", (t) => {
+  const previous = { document: global.document, Element: global.Element, HTMLElement: global.HTMLElement };
+  const document = new FakeDocument();
+  Object.assign(global, { document, Element: FakeElement, HTMLElement: FakeElement });
+  t.after(() => Object.assign(global, previous));
+  const state = { nodes: [{ id: "project-tweakers", type: "project", name: "Tweakers", color: "#b91c1c", colorMode: "manual" }] };
+  const row = document.createElement("div");
+  row.setAttribute("role", "button");
+  row.setAttribute("data-app-action-sidebar-project-row", "true");
+  row.setAttribute("data-app-action-sidebar-project-id", "native-project-uuid");
+  row.setAttribute("data-app-action-sidebar-project-label", "Tweakers");
+  row.textContent = "📁 Tweakers";
+  const title = document.createElement("span");
+  title.textContent = "Tweakers";
+  row.appendChild(title);
+  document.body.appendChild(row);
+  const api = { react: { host: { query: () => [] } } };
+  assert.equal(_test.resolveProjectContext(api, state, title)?.project.id, "project-tweakers");
+  _test.applyNativeProjectColors(api, state);
+  assert.equal(row.getAttribute("data-tweaker-project-color-row"), "true");
+  assert.equal(row.style.values.get("--tweaker-project-color"), "#b91c1c");
+  assert.equal(_test.resolveProjectContext(api, { nodes: [...state.nodes, { ...state.nodes[0], id: "duplicate" }] }, title), null);
 });
 
 test("moved native projects retain their saved appearance through Codex's workspace-root label alias", () => {
@@ -1737,7 +2008,7 @@ test("first run persists only an exact native root and leaves ambiguous folders 
   const unboundInventory = await restored.handle({ action: "inventory.get", projectId: many.id });
   assert.equal(unboundInventory.ok, false);
   assert.equal(unboundInventory.error.code, "project-unbound");
-  assert.match(source, /Needs folder repair/);
+  assert.match(source, /No primary folder is stored\./);
   assert.match(source, /Repair folder/);
   restored.dispose();
 });
@@ -2013,6 +2284,26 @@ test("pinned project rows are discovered between native Pinned and Projects head
   assert.deepEqual(_test.pinnedProjectRows(document), [pinnedRow]);
 });
 
+test("Projects settings renders one ordered hierarchy and routes project Edit to native", async t => {
+  const document = new FakeDocument(), previous = { document: global.document, window: global.window };
+  global.document = document; global.window = { addEventListener() {}, removeEventListener() {} };
+  t.after(() => Object.assign(global, previous));
+  const project = { id: "p", type: "project", parentId: "g", name: "Alpha", color: "#123456", icon: { kind: "emoji", value: "📁" }, connections: {} };
+  const group = { id: "g", type: "group", parentId: null, name: "Work", color: "#123456", icon: { kind: "emoji", value: "📁" }, connections: {} };
+  const root = document.createElement("div"); document.body.append(root);
+  const edits = [];
+  const presenter = require("../lib/settings").createSettingsPresenter({ openNativeProjectEditDialog: node => edits.push(node.id) });
+  const dispose = presenter.renderProjectsPage({ ipc: { invoke: async () => ({ ok: true, state: { nodes: [group, project] }, connections: {}, revision: "fixture" }) } }, root);
+  await new Promise(resolve => setImmediate(resolve));
+  const names = root.querySelectorAll("button").filter(node => node.textContent === "Alpha");
+  assert.equal(names.length, 1);
+  const row = names[0].parentElement;
+  assert.equal(row.style.paddingLeft, "32px");
+  row.children.find(node => node.textContent === "Edit").click();
+  assert.deepEqual(edits, ["p"]);
+  dispose();
+});
+
 test("Edit Project discovery tolerates the current dialog wrapper and compact appearance editor uses wrapping rows", (t) => {
   const document = new FakeDocument();
   const previousDocument = global.document;
@@ -2020,7 +2311,7 @@ test("Edit Project discovery tolerates the current dialog wrapper and compact ap
   t.after(() => { global.document = previousDocument; });
   const dialog = document.createElement("div");
   dialog.setAttribute("role", "dialog");
-  dialog.textContent = "Edit project tweakers Save";
+  dialog.textContent = "Edit projectNameProject nameSave";
   const heading = document.createElement("h2");
   heading.textContent = "Edit project";
   const save = document.createElement("button");
@@ -2040,6 +2331,116 @@ test("Edit Project discovery tolerates the current dialog wrapper and compact ap
   assert.match(editor.children[0].children[1].className, /\bflex-wrap\b/);
   assert.doesNotMatch(editor.children[0].children[1].className, /grid-cols/);
   assert.match(editor.children[1].children[1].className, /\bflex\b/);
+});
+
+test("Edit Project opens from full-page Settings through Home and the native Edit menu", (t) => {
+  const document = new FakeDocument();
+  document.querySelector = (selector) => document.querySelectorAll(selector)[0] || null;
+  const previous = { document: global.document, window: global.window, MutationObserver: global.MutationObserver };
+  let mutation;
+  let opened = 0;
+  const timers = new Map();
+  global.document = document;
+  global.window = { setTimeout(callback) { timers.set(1, callback); return 1; }, clearTimeout(id) { timers.delete(id); }, alert() { assert.fail("navigation should find the project"); } };
+  global.MutationObserver = class { constructor(callback) { mutation = callback; } observe() {} disconnect() {} };
+  t.after(() => Object.assign(global, previous));
+  const settings = document.createElement("div"); settings.setAttribute("data-settings-panel-slug", "projects");
+  const home = document.createElement("button"); home.setAttribute("aria-label", "Home");
+  document.body.append(settings, home);
+  home.addEventListener("click", () => { settings.remove(); });
+  require("../lib/sidebar").openNativeProjectEditDialog({ id: "p" });
+  const row = document.createElement("div"); row.setAttribute("data-app-action-sidebar-project-id", "p");
+  const menu = document.createElement("button"); menu.setAttribute("aria-label", "More options"); row.append(menu);
+  menu.addEventListener("click", () => {
+    const edit = document.createElement("button"); edit.setAttribute("role", "menuitem"); edit.textContent = "Edit";
+    edit.addEventListener("click", () => { opened++; }); document.body.append(edit);
+  });
+  document.body.append(row);
+  mutation([{ addedNodes: [row] }]);
+  assert.equal(opened, 1);
+  assert.equal(timers.size, 0, "successful navigation cancels its timeout");
+});
+
+test("Edit Project appearance is staged until Save, discarded by Cancel, and saved once", async (t) => {
+  const document = new FakeDocument();
+  const previous = { document: global.document, window: global.window, MutationObserver: global.MutationObserver };
+  const create = document.createElement.bind(document);
+  document.createElement = (tag) => {
+    const node = create(tag);
+    node.replaceChildren = (...children) => { node.children = []; node.append(...children); };
+    node.removeEventListener = (type, listener) => { if (node.listeners.get(type) === listener) node.listeners.delete(type); };
+    return node;
+  };
+  global.document = document;
+  let mutation;
+  let frame;
+  global.window = { addEventListener() {}, removeEventListener() {}, requestAnimationFrame(callback) { frame = callback; return 1; }, cancelAnimationFrame() { frame = null; } };
+  global.MutationObserver = class { constructor(callback) { mutation = callback; } observe() {} disconnect() {} };
+  t.after(() => Object.assign(global, previous));
+  const project = { id: "p", type: "project", name: "Alpha", projectPath: "/repo/one", color: "#123456", colorMode: "manual", overlayIntensity: "medium" };
+  let currentProjects = [project];
+  const saves = [];
+  let saveResult = true;
+  const makeDialog = (hasRole = true) => {
+    const dialog = document.createElement("form");
+    dialog.matches = (selector) => selector === "form";
+    if (hasRole) dialog.setAttribute("role", "dialog");
+    dialog.nodeType = 1;
+    Object.defineProperty(dialog, "isConnected", { get: () => document.body.contains(dialog) });
+    dialog.textContent = "Edit project Alpha Save Cancel";
+    const heading = document.createElement("h2"); heading.textContent = "Edit project";
+    heading.matches = () => true;
+    dialog.append(heading);
+    const footer = document.createElement("div");
+    const save = document.createElement("button"); save.textContent = "Save";
+    const cancel = document.createElement("button"); cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => dialog.remove());
+    footer.append(save, cancel); dialog.append(footer); document.body.append(dialog);
+    return { dialog, save, cancel };
+  };
+  const install = () => require("../lib/settings").installEditProjectDialogControls({}, () => ({ nodes: currentProjects }), (...args) => { saves.push(args); return saveResult; });
+  const first = makeDialog();
+  const disposeFirst = install();
+  first.dialog.querySelector('[aria-label="Blue project color"]').click();
+  assert.deepEqual(saves, [], "changing a color must not persist before Save");
+  first.cancel.click(); disposeFirst();
+  assert.deepEqual(saves, [], "Cancel discards staged appearance");
+  assert.equal(project.color, "#123456", "staging must not mutate saved state");
+  const disposeSecond = install();
+  const second = makeDialog(false);
+  mutation([{ addedNodes: [second.dialog] }]);
+  assert.equal(typeof frame, "function", "late native dialog without a role schedules injection");
+  frame();
+  second.dialog.querySelector('[aria-label="Blue project color"]').click();
+  const tint = second.dialog.querySelector('[aria-label="Task tint for Alpha"]');
+  tint.children.find((node) => node.textContent === "Strong").click();
+  second.save.click();
+  assert.deepEqual(saves, [], "Save click alone is not native success");
+  const succeeded = second.dialog.listeners.get("tweaker:project-save-succeeded");
+  succeeded({ target: second.dialog, detail: { projectId: "other" } });
+  assert.deepEqual(saves, [], "mismatched native identity is rejected");
+  succeeded({ target: second.dialog, detail: { projectId: "p" } });
+  succeeded({ target: second.dialog, detail: { projectId: "p" } });
+  assert.deepEqual(saves, [["p", { colorMode: "manual", color: "#1d4ed8", overlayIntensity: "strong" }]]);
+  second.dialog.remove();
+  await Promise.resolve();
+  saveResult = false;
+  const third = makeDialog(); mutation([{ addedNodes: [third.dialog] }]); frame();
+  third.dialog.querySelector('[aria-label="Blue project color"]').click();
+  third.dialog.listeners.get("tweaker:project-save-succeeded")({ target: third.dialog, detail: { projectId: "p" } });
+  third.dialog.remove(); await Promise.resolve();
+  const retry = makeDialog(); mutation([{ addedNodes: [retry.dialog] }]); frame();
+  assert.equal(retry.dialog.querySelector('[aria-label="Blue project color"]').getAttribute("aria-pressed"), "true");
+  retry.cancel.click();
+  const afterCancel = makeDialog(); mutation([{ addedNodes: [afterCancel.dialog] }]); frame();
+  assert.equal(afterCancel.dialog.querySelector('[aria-label="Blue project color"]').getAttribute("aria-pressed"), "false", "Cancel clears retained retry choices");
+  afterCancel.dialog.querySelector('[aria-label="Blue project color"]').click();
+  const countBeforeConflict = saves.length;
+  currentProjects = [project, { ...project, id: "other", name: "Beta" }];
+  afterCancel.dialog.listeners.get("tweaker:project-save-succeeded")({ target: afterCancel.dialog, detail: { projectId: "other" } });
+  assert.equal(saves.length, countBeforeConflict, "a different known native owner is rejected even when it shares the original folder");
+  disposeSecond();
+  assert.equal(second.dialog.listeners.has("tweaker:project-save-succeeded"), false, "disable removes the native success listener");
 });
 
 test("Edit Project gets a Settings button even when project state arrives after the dialog", (t) => {
@@ -2134,6 +2535,7 @@ test("project row end inset mirrors native geometry at compact, default, and wid
   const navigation = {
     tagName: "NAV",
     parentElement: null,
+    querySelectorAll: () => [projectsHeadingWrapper, projectsHeading],
     rect: { left: 0, right: 552, width: 552 },
     getBoundingClientRect() { return this.rect; },
     contains() { return false; },
@@ -2634,8 +3036,9 @@ class FakeElement {
   }
   closest(selector) {
     let node = this;
+    const attribute = selector.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
     while (node) {
-      if (selector === '[role="listitem"]' && node.getAttribute("role") === "listitem") return node;
+      if (attribute && node.hasAttribute(attribute[1]) && (attribute[2] === undefined || node.getAttribute(attribute[1]) === attribute[2])) return node;
       node = node.parentElement;
     }
     return null;
@@ -2660,3 +3063,91 @@ class FakeElement {
     return matches;
   }
 }
+
+test("layout transactions read each element once before changed writes and preserve aligned offsets", () => {
+  const events = [];
+  const values = new Map([["--tweaker-project-native-row-offset", "16px"]]);
+  const row = {
+    style: { getPropertyValue: (name) => values.get(name) || "", setProperty(name, value) { events.push("write"); values.set(name, value); } },
+    getBoundingClientRect() { events.push("row-read"); return { left: 16, width: 520, height: 30 }; },
+    getAttribute: () => "true",
+  };
+  const header = { getBoundingClientRect() { events.push("header-read"); return { left: 16, width: 520, height: 30 }; } };
+  const group = { querySelectorAll: (selector) => selector.includes("color-task") ? [row] : [] };
+  const pass = _test.createProjectLayoutPass();
+  _test.applyProjectTaskGeometry(group, header, { blockSize: 30, inlineSize: 520 }, pass);
+  _test.applyProjectTaskGeometry(group, header, { blockSize: 30, inlineSize: 520 }, pass);
+  assert.deepEqual(events, ["header-read", "row-read"]);
+  pass.commit();
+  assert.equal(events.filter((event) => event === "write").length, 2);
+  assert.equal(values.get("--tweaker-project-native-row-offset"), "16px");
+});
+
+test("sidebar updates coalesce unchanged host notifications and cancel work on disposal", (t) => {
+  const previous = { document: global.document, window: global.window, requestAnimationFrame: global.requestAnimationFrame, cancelAnimationFrame: global.cancelAnimationFrame };
+  const document = new FakeDocument();
+  let reads = 0;
+  const navigation = document.createElement("nav");
+  const group = document.createElement("div");
+  const header = document.createElement("button");
+  group.setAttribute("data-tweaker-project-color-group", "true");
+  header.setAttribute("data-tweaker-project-color-row", "true");
+  group.appendChild(header); navigation.appendChild(group); document.body.appendChild(navigation);
+  for (const node of [navigation, group, header]) node.getBoundingClientRect = () => { reads += 1; return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; };
+  let scheduled = null;
+  global.document = document;
+  global.window = { addEventListener() {}, removeEventListener() {} };
+  global.requestAnimationFrame = (callback) => { scheduled = callback; return 1; };
+  global.cancelAnimationFrame = () => { scheduled = null; };
+  t.after(() => Object.assign(global, previous));
+  const updater = _test.createProjectSidebarUpdater({ react: { host: { query: () => [{ element: group }] } } }, () => null);
+  const flush = () => { const run = scheduled; scheduled = null; run?.(); };
+  updater.schedule(); updater.schedule(); flush();
+  assert.ok(reads > 0);
+  reads = 0;
+  group.setAttribute("data-tweaker-project-id", "owned-change");
+  updater.schedule(); flush();
+  assert.equal(reads, 0, "owned and repeated notifications do not measure geometry");
+  header.setAttribute("aria-expanded", "true"); updater.schedule(); flush();
+  assert.ok(reads > 0, "native expansion invalidates geometry");
+  reads = 0;
+  const replacement = document.createElement("button");
+  replacement.setAttribute("data-tweaker-project-color-row", "true");
+  replacement.getBoundingClientRect = header.getBoundingClientRect;
+  header.remove(); group.appendChild(replacement); updater.schedule(); flush();
+  assert.ok(reads > 0, "replacement identity invalidates cached state");
+  reads = 0;
+  updater.schedule(false, true); updater.dispose(); flush();
+  assert.equal(reads, 0);
+});
+
+test("native Save binds legacy appearance by the form's original unique source, never its name", () => {
+  const { projectForNativeSave } = require("../lib/settings");
+  const saved = { id: "legacy", type: "project", name: "Same", projectPath: "/repo/one" };
+  const other = { id: "other", type: "project", name: "Same", projectPath: "/repo/two" };
+  const form = {};
+  const props = { projectId: "native-one", initialSources: ["/repo/one"] };
+  const api = { react: { getFiber: () => ({ memoizedProps: props }) } };
+  const current = { nodes: [saved, other] };
+  assert.equal(projectForNativeSave(api, current, form, "native-one"), saved);
+  assert.equal(projectForNativeSave(api, current, form, "native-two"), null);
+  assert.equal(projectForNativeSave(api, { nodes: [other] }, form, "native-one"), null);
+  assert.equal(projectForNativeSave(api, { nodes: [saved, { ...other, projectPath: saved.projectPath }] }, form, "native-one"), null);
+  const refreshed = { ...saved, id: "new-owner" };
+  assert.equal(projectForNativeSave(api, { nodes: [refreshed] }, form, "native-one"), refreshed);
+  assert.equal(projectForNativeSave({}, { nodes: [{ ...saved, nativeProjectIds: ["native-one"] }] }, form, "native-one").id, "legacy");
+});
+
+test("isolated native Save keeps the unique initial-name owner and rejects stale or conflicting identity", () => {
+  const { projectForNativeSave } = require("../lib/settings");
+  const saved = { id: "legacy", type: "project", name: "Alpha", projectPath: "/repo/one" };
+  const fallback = { id: "legacy", initialName: "Alpha" };
+  const resolve = (nodes, nativeId = "native-one", binding = fallback) => projectForNativeSave({}, { nodes }, {}, nativeId, binding);
+  assert.equal(resolve([saved]), saved);
+  assert.equal(resolve([saved], ""), null);
+  assert.equal(resolve([saved], "native-one", null), null);
+  assert.equal(resolve([{ ...saved, id: "replacement" }]), null);
+  assert.equal(resolve([{ ...saved, name: "Renamed" }]), null);
+  assert.equal(resolve([saved, { ...saved, id: "duplicate" }]), null);
+  assert.equal(resolve([saved, { ...saved, id: "native-one", name: "Other" }]).id, "native-one", "caller must reject a known different owner rather than use name fallback");
+});

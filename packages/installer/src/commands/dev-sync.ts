@@ -82,6 +82,7 @@ export interface DevSnapshotReceipt {
   surfaces: DevSnapshotSurface[];
   priorTreeRoot: string;
   archivedLegacySnapshots: string[];
+  ownershipRecovery?: { sourceRoot: string; sourceHash: string };
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -188,7 +189,7 @@ function runDevelopmentBuild(sourceRoot: string): void {
  * Publish an already-built complete tweak tree as a rollback-safe pending
  * snapshot. This seam intentionally performs no build or source checkout work.
  */
-export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): DevSnapshotReceipt {
+export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string, recovery?: { verifiedBundledRoot: string }): DevSnapshotReceipt {
   if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
   mkdirSync(liveTweaks, { recursive: true });
   const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");
@@ -201,7 +202,9 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
     if (!existsSync(path)) return false;
     return path !== manifestPath || existing === null;
   });
-  const priorFolders = existing?.folders ?? readLegacySnapshotFolders(...legacySources);
+  const recovered = recovery ? verifyBundledSnapshotOwnership(recovery.verifiedBundledRoot, liveTweaks) : null;
+  if (recovered && (existing || legacySources.length)) throw new Error("Ownership recovery requires an absent snapshot receipt.");
+  const priorFolders = existing?.folders ?? recovered?.folders ?? readLegacySnapshotFolders(...legacySources);
   const transactionId = pending?.transactionId ?? randomUUID();
   const transactionRoot = join(liveTweaks, ".tweaker-dev-history", transactionId);
   const nextRoot = join(transactionRoot, "next");
@@ -242,6 +245,9 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
   const promoted: string[] = [];
   writeFileSync(publishLock, String(Date.now()), "utf8");
   try {
+    if (recovery && JSON.stringify(verifyBundledSnapshotOwnership(recovery.verifiedBundledRoot, liveTweaks)) !== JSON.stringify(recovered)) {
+      throw new Error("Bundled ownership evidence changed before publication.");
+    }
     for (const folder of affected) {
       const destination = join(liveTweaks, folder);
       if (existsSync(destination) || symlinkTargetIsPresent(destination)) {
@@ -274,6 +280,7 @@ export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string): Dev
       surfaces,
       priorTreeRoot: previousRoot,
       archivedLegacySnapshots,
+      ...(recovered ? { ownershipRecovery: { sourceRoot: recovery!.verifiedBundledRoot, sourceHash: recovered.sourceHash } } : {}),
     };
     writeJsonAtomic(manifestPath, receipt);
     rmSync(legacyManifestPath, { force: true });
@@ -397,6 +404,33 @@ function assertDevSnapshotCas(receipt: DevSnapshotReceipt, liveTweaks: string): 
   }
 }
 
+/** Explicit recovery from a separately verified bundled generation; never infer ownership from IDs alone. */
+export function verifyBundledSnapshotOwnership(sourceRoot: string, liveRoot: string): { folders: string[]; sourceHash: string } {
+  if (resolve(sourceRoot) === resolve(liveRoot)) throw new Error("Ownership evidence must be independent of the live tree.");
+  const digest = (root: string): string => {
+    const hash = createHash("sha256");
+    const visit = (path: string, relative: string): void => {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()) || stat.uid !== process.getuid?.() || (stat.mode & 0o022)) {
+        throw new Error(`Unsafe ownership evidence: ${path}`);
+      }
+      hash.update(relative).update("\0").update(stat.isDirectory() ? "directory\0" : "file\0");
+      if (stat.isDirectory()) for (const name of readdirSync(path).sort()) visit(join(path, name), `${relative}/${name}`);
+      else hash.update(readFileSync(path));
+    };
+    visit(root, "");
+    return hash.digest("hex");
+  };
+  const bundled = inspectBuiltTweakTree(sourceRoot);
+  const folders = listDirectories(liveRoot).filter((folder) => !folder.startsWith("."));
+  for (const folder of folders) {
+    if (!bundled.some((proof) => proof.folder === folder) || digest(join(sourceRoot, folder)) !== digest(join(liveRoot, folder))) {
+      throw new Error(`Installed tweak does not match verified bundle: ${folder}`);
+    }
+  }
+  return { folders: folders.sort(), sourceHash: digest(sourceRoot) };
+}
+
 function inspectBuiltTweakTree(root: string): DevSnapshotFolderProof[] {
   return listDirectories(root).map((folder) => {
     if (!isSafeFolder(folder)) throw new Error(`Unsafe built tweak folder: ${folder}`);
@@ -504,38 +538,61 @@ function symlinkTargetIsPresent(path: string): boolean {
 }
 
 async function watchDevelopmentSource(sourceRoot: string, liveTweaks: string, quiet: boolean): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  let running = false;
-  let rerun = false;
-  const run = async (): Promise<void> => {
-    if (running) { rerun = true; return; }
-    running = true;
+  const scheduler = createDevWatchScheduler(async () => {
     try {
       await runDevSyncCycle({ sourceRoot, liveTweaks });
       if (!quiet) console.log(kleur.green("✓ Development changes published."));
     } catch (error) {
       console.error(kleur.yellow(`Development changes rejected; live runtime preserved: ${errorMessage(error)}`));
-    } finally {
-      running = false;
-      if (rerun) { rerun = false; void run(); }
     }
-  };
+  });
   const watcher = watchFs(sourceRoot, { recursive: true }, (_event, filename) => {
-    const path = filename?.toString() ?? "";
-    if (shouldIgnoreDevWatchPath(path)) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => void run(), 250);
+    scheduler.onEvent(filename?.toString() ?? "");
   });
   if (!quiet) console.log(kleur.cyan("Watching the development checkout. Press Ctrl+C to stop."));
   await new Promise<void>((resolve) => {
-    const stop = (): void => { watcher.close(); resolve(); };
+    const stop = (): void => { scheduler.close(); watcher.close(); resolve(); };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
 }
 
+/** The event callback is exposed so generated/source events can be tested without a live watcher. */
+export function createDevWatchScheduler(runCycle: () => void | Promise<void>, debounceMs = 250): {
+  onEvent: (path: string) => void;
+  close: () => void;
+} {
+  let timer: NodeJS.Timeout | undefined;
+  let running = false;
+  let rerun = false;
+  let closed = false;
+  const run = async (): Promise<void> => {
+    if (closed) return;
+    if (running) { rerun = true; return; }
+    running = true;
+    try { await runCycle(); }
+    finally {
+      running = false;
+      if (rerun && !closed) { rerun = false; void run(); }
+    }
+  };
+  return {
+    onEvent(path) {
+      if (closed || shouldIgnoreDevWatchPath(path)) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { timer = undefined; void run(); }, debounceMs);
+    },
+    close() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
+}
+
 export function shouldIgnoreDevWatchPath(path: string): boolean {
-  return /(^|\/)(?:\.git|node_modules|dist|packages\/installer\/assets\/runtime)(\/|$)/.test(path);
+  const normalized = path.replaceAll("\\", "/");
+  return /(^|\/)(?:\.git|node_modules|dist)(\/|$)/.test(normalized) ||
+    /(^|\/)packages\/installer\/(?:assets\/(?:runtime|managed-runtime)(\/|$)|\.assets\.publish-[^/]+(\/|$))/.test(normalized);
 }
 
 function errorMessage(error: unknown): string {

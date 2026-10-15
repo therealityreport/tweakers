@@ -44,9 +44,10 @@ module.exports = {
   async stop() {
     const state = states.get(this);
     if (!state) return;
-    states.delete(this);
+    state.stopping = true;
     try { await state.started; } catch {}
     await cleanupState(state);
+    if (states.get(this) === state) states.delete(this);
   },
 };
 
@@ -185,11 +186,12 @@ async function startRenderer(api, state) {
 }
 
 async function scanForCarriers(api, state) {
-  if (state.scanning || state.stopped) return;
+  if (state.stopped || state.stopping) return;
+  if (state.scanning) { state.scanPending = true; return; }
   state.scanning = true;
   try {
     for (const form of document.querySelectorAll?.("form") || []) {
-      if (state.stopped || state.sessions.has(form)) continue;
+      if (state.stopped || state.stopping || state.sessions.has(form)) continue;
       const nonces = discoverCarrierNonces(api, form);
       if (nonces.length !== 1) continue;
       const attached = api.react.host.attachMcpFormCarrier(nonces[0]);
@@ -198,6 +200,10 @@ async function scanForCarriers(api, state) {
     }
   } finally {
     state.scanning = false;
+    if (state.scanPending && !state.stopped && !state.stopping) {
+      state.scanPending = false;
+      void scanForCarriers(api, state);
+    }
   }
 }
 
@@ -212,14 +218,14 @@ async function receiveEnhancementDelivery(api, state, delivery) {
   let session;
   try {
     const normalized = normalizeEnhancementDelivery(delivery);
-    if (state.stopped || state.enhancementSessions.has(normalized.session_id)) {
+    if (state.stopped || state.stopping || state.enhancementSessions.has(normalized.session_id)) {
       throw Object.assign(new Error("enhancement_session_unavailable"), { code: "renderer_unavailable" });
     }
     session = createEnhancementSession(api, state, normalized);
     state.enhancementSessions.set(session.id, session);
     mountEnhancementSession(session);
     await survivePaint();
-    if (state.stopped || !session.card?.isConnected) {
+    if (state.stopped || state.stopping || !session.card?.isConnected) {
       throw Object.assign(new Error("enhancement_mount_failed"), { code: "owned_mount" });
     }
     session.heading?.focus?.({ preventScroll: true });
@@ -258,6 +264,7 @@ function normalizeEnhancementDelivery(value) {
     || typeof elicitation.message !== "string"
     || elicitation.message.length > 8_192
     || schema?.type !== "object"
+    || Object.keys(schema).some((key) => !["type", "properties", "required", "title", "description"].includes(key))
     || !properties
     || Object.keys(properties).length < 1
     || Object.keys(properties).length > 8
@@ -294,6 +301,15 @@ function enhancementField(name, value, required) {
     ? (Array.isArray(items?.anyOf) ? items.anyOf : null)
     : (Array.isArray(property.oneOf) ? property.oneOf : null);
   if (choices) {
+    const supportedKeys = multiple
+      ? ["type", "title", "description", "items", "minItems", "maxItems"]
+      : ["type", "title", "description", "oneOf"];
+    // Represent the entire schema or let the standard form own it. Dropping
+    // validation keywords or restored defaults would change the requested form.
+    if (
+      Object.keys(property).some((key) => !supportedKeys.includes(key))
+      || (multiple && Object.keys(items).some((key) => !["type", "anyOf"].includes(key)))
+    ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
     if (!choices.length || choices.length > 32) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
     const seenValues = new Set();
     const normalizedChoices = choices.map((choice) => {
@@ -302,6 +318,8 @@ function enhancementField(name, value, required) {
         !option
         || typeof option.const !== "string"
         || typeof option.title !== "string"
+        || (option.type !== undefined && option.type !== "string")
+        || Object.keys(option).some((key) => !["const", "title", "description", "type"].includes(key))
         || seenValues.has(option.const)
       ) {
         throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
@@ -329,7 +347,13 @@ function enhancementField(name, value, required) {
       choices: Object.freeze(normalizedChoices),
     });
   }
-  if (property.type !== "string") throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
+  // This enhancement renders plain text only. A schema with an enum, format,
+  // length, pattern, default, or other unsupported constraint belongs to the
+  // standard form, which must remain the fallback before acknowledgement.
+  if (
+    property.type !== "string"
+    || Object.keys(property).some((key) => !["type", "title", "description"].includes(key))
+  ) throw Object.assign(new Error("enhancement_schema_invalid"), { code: "request_failed" });
   return Object.freeze({
     name,
     title: property.title,
@@ -439,7 +463,7 @@ async function submitEnhancementSession(session) {
 }
 
 async function finishEnhancementSession(session, response) {
-  if (session.responding || !session.acknowledged || session.state.stopped) return;
+  if (session.responding || !session.acknowledged || session.state.stopped || session.state.stopping) return;
   session.responding = true;
   setBusy(session, true);
   try {
@@ -497,7 +521,7 @@ async function claimCarrier(api, state, nonce, attached) {
   let session = null;
   try {
     const claim = await api.ipc.invoke("claim", nonce, identity.hostId, identity.conversationId);
-    if (state.stopped) {
+    if (state.stopped || state.stopping) {
       state.sessions.delete(controller.form);
       if (claim?.status === "claimed" && claim.claimToken && claim.initial) {
         session = createSession(api, state, attached, claim);
@@ -514,12 +538,12 @@ async function claimCarrier(api, state, nonce, attached) {
       session.deliveryOwner = "generic";
       session.formSnapshot = snapshotHostForm(controller.form);
       await acknowledgeVisibleGenericFallback(session);
-      if (state.stopped) {
+      if (state.stopped || state.stopping) {
         await abandonStoppedSession(session);
         return;
       }
       await releaseSession(session);
-      if (state.stopped) return;
+      if (state.stopped || state.stopping) return;
       renderDeliveryNotice(controller.form, "This host form uses the compatible standard question layout.", () => {
         clearDeliveryNotices(controller.form);
       });
@@ -527,7 +551,7 @@ async function claimCarrier(api, state, nonce, attached) {
     }
     await mountSession(session);
   } catch (error) {
-    if (state.stopped) {
+    if (state.stopped || state.stopping) {
       state.sessions.delete(controller.form);
       if (session) await abandonStoppedSession(session);
       return;
@@ -535,7 +559,7 @@ async function claimCarrier(api, state, nonce, attached) {
     if (session?.deliveryOwner === "generic") {
       restoreHostForm(controller.form, session.formSnapshot);
       await releaseSession(session);
-      if (state.stopped) return;
+      if (state.stopped || state.stopping) return;
       api.log.warn("User Questions generic form was not visibly mounted; acknowledgement withheld", redactedErrorMetadata(error));
     } else if (session) {
       state.sessions.set(controller.form, session);
@@ -544,7 +568,7 @@ async function claimCarrier(api, state, nonce, attached) {
       } catch (fallbackError) {
         api.log.warn("User Questions mount fallback was not visibly painted; acknowledgement withheld", redactedErrorMetadata(fallbackError));
       }
-      if (state.stopped) {
+      if (state.stopped || state.stopping) {
         await abandonStoppedSession(session);
         return;
       }
@@ -552,7 +576,7 @@ async function claimCarrier(api, state, nonce, attached) {
     } else {
       state.sessions.delete(controller.form);
       restoreHostForm(controller.form, null);
-      if (state.stopped) return;
+      if (state.stopped || state.stopping) return;
       renderDeliveryNotice(controller.form, "Questions are still available in the standard form.", () => {
         clearDeliveryNotices(controller.form);
         void scanForCarriers(api, state);

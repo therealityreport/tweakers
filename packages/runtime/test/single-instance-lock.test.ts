@@ -10,18 +10,19 @@ test("runtime requests a single instance and focuses the primary window", () => 
   assert.match(mainSource, /app\.on\("second-instance"/);
 });
 
-test("single-instance locking is guarded away from the health-check probe", () => {
-  const guardIndex = mainSource.indexOf("if (!healthCheckOnly) {");
-  const lockIndex = mainSource.indexOf("app.requestSingleInstanceLock()");
-
-  assert.ok(guardIndex >= 0, "missing health-check exemption guard");
-  assert.ok(lockIndex > guardIndex, "single-instance lock must be inside the exemption guard");
-
-  const lockOccurrences = mainSource.match(/app\.requestSingleInstanceLock\(\)/g) ?? [];
-  assert.equal(lockOccurrences.length, 1, "single-instance lock must not be duplicated outside the guard");
+test("derived Tweakers health probes share the user-wide desktop lock before broker startup", () => {
+  const start = mainSource.indexOf('const desktopLockPath =');
+  const end = mainSource.indexOf('const accountsBrokerRootResolution =');
+  assert.ok(start > 0 && end > start);
+  const locking = mainSource.slice(start, end);
+  assert.match(locking, /userInfo\(\)\.homedir/);
+  assert.match(locking, /acquireProcessLock\(desktopLockPath/);
+  assert.match(locking, /identity\.startedAt === processStart\(owner\)/);
+  assert.match(locking, /app\.exit\(healthCheckOnly \? 1 : 0\)/);
+  assert.match(locking, /if \(!verifiedOwner\) throw new Error/);
+  assert.ok(locking.indexOf('acquireProcessLock') < locking.indexOf('if (!healthCheckOnly'));
 });
 
-test("single-instance caveats document installer launches and injected ordering", () => {
-  assert.match(mainSource, /installer-side launches|not the primary fix|belt-and-/i);
-  assert.match(mainSource, /evaluation order[\s\S]*OpenAI's own entrypoint[\s\S]*not guaranteed/i);
+test("native Electron single-instance behavior remains separate from derived Tweakers ownership", () => {
+  assert.match(mainSource, /if \(!derivedVariant && !healthCheckOnly\) \{[\s\S]*?app\.requestSingleInstanceLock\(\)/);
 });

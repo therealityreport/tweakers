@@ -292,6 +292,8 @@ export interface EnsureAccountContinuityEnrollmentResultV1 {
 export interface AccountContinuityWriteEvidenceV1 {
     /** The host's same-account lease already proved this and holds through spawn. */
     readonly accountChildAbsent: boolean;
+    /** Private active shared-projection ownership; never grants a child or HTTP request. */
+    readonly pluginProjectionOwner?: string;
     /** Supply for native in-place homes only. It is called twice before a write. */
     readonly nativeWriterCensus?: () => "zero" | "running" | "unknown";
 }
@@ -464,6 +466,13 @@ export declare function loadAccountCapabilityOverrides(stateRoot: string, accoun
  * It only writes manager-private state; account homes are never changed here.
  */
 export declare function publishPrimarySharedBaseAfterExit(input: PublishPrimarySharedBaseInputV1): PublishPrimarySharedBaseResultV1;
+interface PluginSourceFileV1 {
+    readonly path: string;
+    readonly bytes: number;
+    readonly fingerprint: Sha256;
+    readonly linkTarget?: string;
+    readonly executable?: boolean;
+}
 /**
  * Seal an inventory copied from a primary native home.  It never follows a
  * pre-existing cache link and does not import credentials or mutable state.
@@ -534,4 +543,93 @@ export declare function captureAccountCapabilitiesAfterExit(input: AccountCapabi
  * their exact persisted expectation and become explicit account overrides.
  */
 export declare function captureIdleAccountChangesBeforeSpawn(input: IdleAccountChangesCaptureInputV1): IdleAccountChangesCaptureResultV1;
+/** Nonsecret definitions only; no user policy, auth store or enabled settings. */
+export declare function selectNonsecretDefinitionTreeV1(tree: TomlTableV1): TomlTableV1;
+export declare function renderTomlConfigOverridesV1(tree: TomlTableV1, rootTables?: boolean): string[];
+/** Bump the guard revision on classification changes; signed custody must then be reclassified. */
+export declare const OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1: Sha256;
+export declare function assertNonsecretDefinitionJsonV1(value: unknown): void;
+export declare function officialPluginDefinitionWithheldReasonV1(error: unknown): string | null;
+/** Same public package boundary for the single store-owned source watcher. */
+export declare function officialPluginSourceChangeRelevantV1(relativePath: string): boolean;
+/** Use the existing target-owned journal/copy primitive; never link a native cache. */
+export declare function projectOfficialPluginPackagesV1(input: {
+    stateRoot: string;
+    sourceHome: string;
+    account: AccountContinuityAccountV1;
+    plugins: readonly {
+        id: string;
+        version: string | null;
+    }[];
+    writeEvidence: AccountContinuityWriteEvidenceV1;
+    canonical?: boolean;
+    generation?: number;
+    custody?: readonly {
+        id: string;
+        version: string;
+        path: string;
+        digest: string;
+    }[];
+}): boolean;
+/** Native local packages use their manifest version; source cache versions remain source identities. */
+export declare function officialLocalPluginExecutionVersionV1(source: string, sourceVersion: string): string;
+export interface OfficialPluginLayoutChangeV1 {
+    id: string;
+    beforeVersion: string;
+    afterVersion: string;
+    digest: string;
+}
+/** Metadata-only adoption of an exact signed payload already moved to its native manifest version. */
+export declare function reconcileOfficialPluginLayoutReceiptV1(input: {
+    stateRoot: string;
+    account: AccountContinuityAccountV1;
+    changes: readonly OfficialPluginLayoutChangeV1[];
+    unchanged: readonly {
+        id: string;
+        version: string;
+        digest: string;
+    }[];
+    apply: boolean;
+    before?: unknown;
+    authorize: () => boolean;
+    writeEvidence: AccountContinuityWriteEvidenceV1;
+}): {
+    before: unknown;
+    after: unknown;
+};
+/** Bounded nonsecret package custody; caller owns destination and mutation authority. */
+export declare function captureOfficialPluginPackageV1(source: string): {
+    files: PluginSourceFileV1[];
+    digest: `sha256:${string}`;
+};
+export declare function copyOfficialPluginPackageV1(source: string, destination: string, expectedDigest: string): void;
+/** Inspect only declared MCP JSON definitions; package code and credentials are not loaded. */
+export declare function readOfficialPluginHttpServersV1(home: string, plugins?: readonly {
+    id: string;
+    version: string | null;
+}[], rejectSecrets?: boolean, includeStdio?: boolean): Array<{
+    pluginId: string;
+    name: string;
+}>;
+/** Unsafe declarations are withheld independently; unrelated filesystem drift still blocks admission. */
+export declare function officialPluginDefinitionBlocksV1(home: string, plugins: readonly {
+    id: string;
+    version: string | null;
+}[]): Record<string, string>;
+/** Source-only inventory. Configured disabled entries remain installed definitions. */
+export declare function readOfficialInstalledPluginSnapshotV1(home: string): {
+    plugins: Array<{
+        id: string;
+        enabled: boolean;
+        version: string | null;
+    }>;
+    configFingerprint: Sha256;
+    fingerprint: Sha256;
+};
+/** Stable local namespace outside stock remote reconciliation ownership. */
+export declare function officialLocalPluginIdV1(id: string): string;
+/** Policies belong to the selected account; authorization values never become CLI arguments. */
+export declare function nonsecretPluginPolicyV1(value: TomlNodeV1 | undefined): TomlTableV1;
+/** JSON values for the stock thread config override map, preserving policy leaves. */
+export declare function tomlThreadConfigOverridesV1(tree: TomlTableV1, rootTables?: boolean): Record<string, unknown>;
 export {};

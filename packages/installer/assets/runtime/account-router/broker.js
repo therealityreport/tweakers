@@ -38,17 +38,22 @@ class AccountsBrokerV1 {
     options;
     accounts = new Map();
     children = new Map();
+    startupChildLeases = new Map();
     sessions = new Map();
+    rendererTransports = new Map();
+    retiredSessions = new Map();
     tasks = new Map();
     handoffs = new Map();
     enrollments = new Map();
     quotas = new Map();
+    recoveryRevisions = new Map();
     connections = new Map();
     subscribers = new Map();
     eventBuffers = new Map();
     usedHandshakeNonces = new Map();
     sequence = 0;
     heldWorkCount = 0;
+    activeOperations = 0;
     closed = false;
     profileRefresh = null;
     quotaRefreshes = new Map();
@@ -110,12 +115,16 @@ class AccountsBrokerV1 {
         if (nonceExpiry && nonceExpiry > this.now())
             return { ok: false, code: "unauthenticated" };
         this.usedHandshakeNonces.set(handshake.nonce, this.now() + HANDSHAKE_NONCE_TTL_MS);
-        const existing = this.sessions.get(handshake.rendererRef);
+        const existing = this.sessions.get(handshake.rendererRef) ?? this.retiredSessions.get(handshake.rendererRef)?.session;
+        if (!existing && this.retiredSessions.size >= types_1.ACCOUNTS_BROKER_MAX_CLIENTS * 16) {
+            return { ok: false, code: "incompatible_client" };
+        }
         // A reconnect must prove the identical app-tools endpoint. Ref reuse with
         // a different route would otherwise let a stale peer steal reverse tools.
         if (existing && (existing.clientKind !== handshake.clientKind || existing.appToolsRef !== handshake.appToolsRef)) {
             return { ok: false, code: "incompatible_client" };
         }
+        this.retiredSessions.delete(handshake.rendererRef);
         this.sessions.set(handshake.rendererRef, {
             rendererRef: handshake.rendererRef,
             clientKind: handshake.clientKind,
@@ -147,7 +156,7 @@ class AccountsBrokerV1 {
         session.usedRequestIds.set(envelope.requestId, this.now());
         trimOldest(session.usedRequestIds, MAX_COMMAND_IDS_PER_CLIENT);
         try {
-            const result = await this.execute(session, envelope);
+            const result = await this.withActiveOperation(() => this.execute(session, envelope));
             assertBrokerCommandResult(envelope.command, result);
             return { version: types_1.ACCOUNTS_BROKER_VERSION, requestId: envelope.requestId, ok: true, result };
         }
@@ -169,6 +178,32 @@ class AccountsBrokerV1 {
             current.delete(handler);
             if (current.size === 0)
                 this.subscribers.delete(rendererRef);
+        };
+    }
+    /** Async authenticated work outlives a disconnected transport until it settles. */
+    async withActiveOperation(operation) {
+        this.activeOperations++;
+        try {
+            return await operation();
+        }
+        finally {
+            this.activeOperations--;
+        }
+    }
+    hasActiveOperations() { return this.activeOperations > 0; }
+    /** Each authenticated socket owns one token; an old close cannot evict its replacement. */
+    retainRendererTransport(rendererRef) {
+        if (!this.hasAuthenticatedRenderer(rendererRef))
+            throw new Error("Unauthenticated renderer transport");
+        const tokens = this.rendererTransports.get(rendererRef) ?? new Set();
+        const token = {};
+        tokens.add(token);
+        this.rendererTransports.set(rendererRef, tokens);
+        return () => {
+            if (this.rendererTransports.get(rendererRef) !== tokens || !tokens.delete(token))
+                return;
+            if (tokens.size === 0)
+                this.disconnectRenderer(rendererRef);
         };
     }
     /** Owner-private helpers may verify the socket's authenticated renderer without exposing session data. */
@@ -332,20 +367,59 @@ class AccountsBrokerV1 {
         return publicTask(task);
     }
     /** Acquires a lazy account-local worker. No idle worker is killed while active. */
-    acquireChild(opaqueAccountId) {
+    /** Exclusive owner-only startup residency; ordinary consumers cannot borrow it. */
+    childAdmissionRefused(stage) {
+        try {
+            this.options.onChildAdmissionFailure?.(stage);
+        }
+        catch { /* Diagnostics are observational. */ }
+        return null;
+    }
+    reserveStartupChild(opaqueAccountId) {
+        if (this.closed || this.children.has(opaqueAccountId) || this.startupChildLeases.has(opaqueAccountId))
+            return this.childAdmissionRefused("pool-lease");
+        const token = Symbol("startup policy child");
+        this.startupChildLeases.set(opaqueAccountId, token);
+        this.pinnedChildren.add(opaqueAccountId);
+        return {
+            acquire: () => this.acquireChild(opaqueAccountId, token),
+            retire: () => {
+                if (this.startupChildLeases.get(opaqueAccountId) !== token)
+                    return null;
+                const resident = this.children.get(opaqueAccountId);
+                if (!resident || resident.activeRunCount > 0)
+                    return null;
+                this.evictChild(opaqueAccountId, resident, "idle");
+                return resident.child;
+            },
+            release: () => {
+                if (this.startupChildLeases.get(opaqueAccountId) !== token || this.children.has(opaqueAccountId))
+                    return false;
+                this.startupChildLeases.delete(opaqueAccountId);
+                this.pinnedChildren.delete(opaqueAccountId);
+                return true;
+            },
+        };
+    }
+    acquireChild(opaqueAccountId, startupToken, recoveryProbe = false) {
+        if (this.startupChildLeases.has(opaqueAccountId) && this.startupChildLeases.get(opaqueAccountId) !== startupToken)
+            return this.childAdmissionRefused("pool-lease");
         this.sweep();
         if (this.closed)
-            return null;
+            return this.childAdmissionRefused("pool-closed");
         const account = this.accounts.get(opaqueAccountId);
         const resident = this.children.get(opaqueAccountId);
         if (resident) {
             resident.lastUsedAt = this.now();
             return resident.child;
         }
-        if (!account || !account.enabled || account.state === "disabled" || account.state === "reauth_required" || account.state === "unhealthy")
-            return null;
-        if (!this.options.childFactory || this.children.size >= types_1.ACCOUNTS_BROKER_MAX_RESIDENT_CHILDREN)
-            return null;
+        if (!account || !account.enabled || account.state === "disabled" || account.state === "reauth_required"
+            || (account.state === "unhealthy" && !recoveryProbe))
+            return this.childAdmissionRefused("pool-account");
+        if (!this.options.childFactory)
+            return this.childAdmissionRefused("pool-factory");
+        if (this.children.size >= types_1.ACCOUNTS_BROKER_MAX_RESIDENT_CHILDREN)
+            return this.childAdmissionRefused("pool-capacity");
         try {
             const child = this.options.childFactory.create({ opaqueAccountId, remoteControlDisabled: true, storageScope: "account_local" });
             if (child.opaqueAccountId !== opaqueAccountId || child.remoteControlDisabled !== true) {
@@ -353,14 +427,14 @@ class AccountsBrokerV1 {
                     child.terminate("capacity");
                 }
                 catch { /* exact rejected child only */ }
-                return null;
+                return this.childAdmissionRefused("pool-child-identity");
             }
             this.children.set(opaqueAccountId, { child, activeRunCount: 0, lastUsedAt: this.now() });
             this.emitAll("profile", this.pool());
             return child;
         }
         catch {
-            return null;
+            return this.childAdmissionRefused("pool-factory-exception");
         }
     }
     /** Host calls only after a proved native resume and durable owner commit. */
@@ -427,15 +501,62 @@ class AccountsBrokerV1 {
         this.emitAll("profile", this.pool());
         return true;
     }
-    /** Owner bridge reports an exited child without exposing its process details. */
-    markChildUnavailable(opaqueAccountId) {
+    /** Owner-private generation boundary for asynchronous child health reports. */
+    accountRecoveryRevision(opaqueAccountId) {
+        return this.recoveryRevisions.get(opaqueAccountId) ?? 0;
+    }
+    /** Ignore stale live health reports before changing residency or run counters. */
+    markChildUnavailable(opaqueAccountId, errorCode = "connection", observation) {
         const resident = this.children.get(opaqueAccountId);
+        if (observation && observation.recoveryRevision !== this.accountRecoveryRevision(opaqueAccountId))
+            return;
+        if (observation && resident && resident.child !== observation.child)
+            return;
         if (resident)
             this.children.delete(opaqueAccountId);
+        this.markAccountFailure(opaqueAccountId, errorCode);
+    }
+    /** Failed startup or confirmed exit retires only that exact unusable child. */
+    retireFailedChild(opaqueAccountId, child, recoveryRevision, errorCode = "connection") {
+        const resident = this.children.get(opaqueAccountId);
+        if (resident && resident.child !== child)
+            return;
+        if (resident)
+            this.children.delete(opaqueAccountId);
+        if (recoveryRevision !== this.accountRecoveryRevision(opaqueAccountId)) {
+            if (resident)
+                this.emitAll("profile", this.pool());
+            return;
+        }
+        this.markAccountFailure(opaqueAccountId, errorCode);
+    }
+    /** Report a failed probe before normal child cleanup can hide its cause. */
+    markAccountFailure(opaqueAccountId, errorCode) {
         const account = this.accounts.get(opaqueAccountId);
-        if (account && account.enabled)
-            account.state = "unhealthy";
+        if (!account || this.closed)
+            return;
+        if (account.enabled) {
+            if (errorCode === "authentication")
+                account.state = "reauth_required";
+            else if (account.state !== "reauth_required")
+                account.state = "unhealthy";
+        }
+        const quota = this.quotas.get(opaqueAccountId);
+        if (quota)
+            this.updateQuota({ ...quota, freshness: quota.freshness === "unknown" ? "unknown" : "stale",
+                refreshState: "error", errorCode: account.state === "reauth_required" ? "authentication" : errorCode });
         this.emitAll("profile", this.pool());
+    }
+    accountFailure(opaqueAccountId) {
+        const state = this.accounts.get(opaqueAccountId)?.state;
+        return state === "reauth_required" ? "authentication" : state === "unhealthy" ? this.quotas.get(opaqueAccountId)?.errorCode ?? "unavailable" : undefined;
+    }
+    recoverTransientAccount(opaqueAccountId) {
+        const account = this.accounts.get(opaqueAccountId);
+        if (account?.enabled && account.state === "unhealthy") {
+            account.state = this.hasActiveRun(opaqueAccountId) ? "active" : "ready";
+            this.emitAll("profile", this.pool());
+        }
     }
     /** App-tools routing returns only the origin endpoint handle, never request content. */
     routeAppTools(taskRef) {
@@ -476,18 +597,19 @@ class AccountsBrokerV1 {
             this.evictChild(opaqueAccountId, resident, "shutdown");
         this.children.clear();
         this.sessions.clear();
+        this.rendererTransports.clear();
+        this.retiredSessions.clear();
         this.subscribers.clear();
         this.eventBuffers.clear();
     }
-    /**
-     * The app-server connection is the authoritative renderer lease. Control
-     * socket churn does not call this method, so a second authenticated channel
-     * cannot accidentally evict a live desktop. Pending unsent work is
-     * cancelled; a forwarding receipt remains terminally ambiguous.
-     */
+    /** Last transport closure cancels unsent work while preserving forwarding ambiguity. */
     disconnectRenderer(rendererRef) {
         if (!(0, types_1.isOpaqueRendererRef)(rendererRef))
             return;
+        const session = this.sessions.get(rendererRef);
+        if (session?.usedRequestIds.size)
+            this.retiredSessions.set(rendererRef, { session, expiresAt: this.now() + COMMAND_REPLAY_TTL_MS });
+        this.rendererTransports.delete(rendererRef);
         this.sessions.delete(rendererRef);
         this.subscribers.delete(rendererRef);
         this.eventBuffers.delete(rendererRef);
@@ -526,6 +648,9 @@ class AccountsBrokerV1 {
         for (const [nonce, expiry] of this.usedHandshakeNonces)
             if (expiry <= now)
                 this.usedHandshakeNonces.delete(nonce);
+        for (const [ref, retired] of this.retiredSessions)
+            if (retired.expiresAt <= now)
+                this.retiredSessions.delete(ref);
         for (const session of this.sessions.values()) {
             for (const [requestId, consumedAt] of session.usedRequestIds) {
                 if (consumedAt + COMMAND_REPLAY_TTL_MS <= now)
@@ -682,7 +807,7 @@ class AccountsBrokerV1 {
         const opaqueAccountId = command === "enrollment.start" ? exactEmptyParams(params) : exactAccountParams(params);
         if (opaqueAccountId !== null) {
             const account = this.accounts.get(opaqueAccountId);
-            if (!account || !account.enabled || account.state === "disabled" || account.state === "unhealthy")
+            if (!account || !account.enabled || account.state === "disabled")
                 throw new BrokerCommandError("account_unavailable");
         }
         const enrollment = {
@@ -745,6 +870,27 @@ class AccountsBrokerV1 {
                 }
                 else
                     enrollment.opaqueAccountId = opaqueAccountId;
+            }
+            else if (completed && enrollment.kind === "reconnect" && enrollment.opaqueAccountId !== null) {
+                // The host has committed credentials and stopped the login child.
+                // Release its enrollment slot before quota/profile helpers need it.
+                try {
+                    this.options.onEnrollmentSettled?.(publicEnrollment(enrollment));
+                }
+                catch { }
+                const account = this.accounts.get(enrollment.opaqueAccountId);
+                if (account?.enabled) {
+                    // device.status is accepted only after the host verified the same
+                    // identity and committed credentials. Never reassign its tasks.
+                    account.state = this.hasActiveRun(account.opaqueAccountId) ? "active" : "ready";
+                    this.recoveryRevisions.set(account.opaqueAccountId, (this.recoveryRevisions.get(account.opaqueAccountId) ?? 0) + 1);
+                    // Ignore probes that began before the verified recovery.
+                    await this.quotaRefreshes.get(account.opaqueAccountId);
+                    await this.refreshQuota(account.opaqueAccountId);
+                    await this.profileRefresh;
+                    this.readProfiles();
+                    this.emitAll("profile", this.pool());
+                }
             }
             this.emitAll("enrollment", publicEnrollment(enrollment));
         }
@@ -822,10 +968,24 @@ class AccountsBrokerV1 {
         // Each successful account refresh updates subscribers independently.
         const accounts = [...this.accounts.values()].filter((account) => account.enabled && account.state !== "disabled");
         this.profileRefresh = Promise.allSettled(accounts.map(async (account) => {
-            const action = await this.dispatchDevice({ kind: "profile.read", opaqueAccountId: account.opaqueAccountId });
+            const revision = this.recoveryRevisions.get(account.opaqueAccountId) ?? 0;
+            let action;
+            try {
+                action = await this.dispatchDevice({ kind: "profile.read", opaqueAccountId: account.opaqueAccountId });
+            }
+            catch {
+                action = { outcome: "ambiguous", errorCode: "connection" };
+            }
             if (this.closed || this.accounts.get(account.opaqueAccountId) !== account || !account.enabled || account.state === "disabled"
-                || action.outcome !== "accepted" || !isBrokerSafeProfile(action.value)
-                || canonicalJson(account.safeProfile) === canonicalJson(action.value))
+                || revision !== (this.recoveryRevisions.get(account.opaqueAccountId) ?? 0))
+                return;
+            if (action.outcome !== "accepted" || !isBrokerSafeProfile(action.value)) {
+                if (action.errorCode)
+                    this.markAccountFailure(account.opaqueAccountId, action.errorCode);
+                return;
+            }
+            this.recoverTransientAccount(account.opaqueAccountId);
+            if (canonicalJson(account.safeProfile) === canonicalJson(action.value))
                 return;
             account.safeProfile = { ...action.value };
             this.emitAll("profile", this.pool());
@@ -850,25 +1010,34 @@ class AccountsBrokerV1 {
         if (active)
             return active;
         const attemptedAt = new Date(this.now()).toISOString();
+        const revision = this.recoveryRevisions.get(opaqueAccountId) ?? 0;
         const previous = this.quotas.get(opaqueAccountId) ?? {
             opaqueAccountId, freshness: "unknown", remainingPercent: null, resetAt: null,
             shortWindowPressure: null, resetCredits: null,
         };
         this.updateQuota({ ...previous, refreshState: "loading", errorCode: null, lastAttemptAt: attemptedAt });
         const refresh = this.dispatchDevice({ kind: "quota.read", opaqueAccountId }).then((action) => {
+            if (this.closed || revision !== (this.recoveryRevisions.get(opaqueAccountId) ?? 0))
+                return;
             if (action.outcome === "accepted") {
                 const projection = quotaFromProviderValue(opaqueAccountId, action.value);
                 if (projection) {
+                    this.recoverTransientAccount(opaqueAccountId);
                     this.updateQuota({ ...projection, refreshState: "idle", errorCode: null, lastAttemptAt: attemptedAt });
                     return;
                 }
             }
             const cached = this.quotas.get(opaqueAccountId) ?? previous;
-            const errorCode = action.outcome === "ambiguous" ? "connection" : "unavailable";
-            this.updateQuota({ ...cached, refreshState: "error", errorCode, lastAttemptAt: attemptedAt });
+            const errorCode = action.errorCode ?? (action.outcome === "ambiguous" ? "connection" : "unavailable");
+            if (action.errorCode)
+                this.markAccountFailure(opaqueAccountId, errorCode);
+            this.updateQuota({ ...cached, freshness: cached.freshness === "unknown" ? "unknown" : "stale", refreshState: "error", errorCode, lastAttemptAt: attemptedAt });
         }).catch(() => {
+            if (this.closed || revision !== (this.recoveryRevisions.get(opaqueAccountId) ?? 0))
+                return;
             const cached = this.quotas.get(opaqueAccountId) ?? previous;
-            this.updateQuota({ ...cached, refreshState: "error", errorCode: "connection", lastAttemptAt: attemptedAt });
+            this.markAccountFailure(opaqueAccountId, "connection");
+            this.updateQuota({ ...cached, freshness: cached.freshness === "unknown" ? "unknown" : "stale", refreshState: "error", errorCode: this.accountFailure(opaqueAccountId) ?? "connection", lastAttemptAt: attemptedAt });
         }).finally(() => this.quotaRefreshes.delete(opaqueAccountId));
         this.quotaRefreshes.set(opaqueAccountId, refresh);
         return refresh;
@@ -1609,7 +1778,8 @@ function isSafeOAuthUrl(value) {
     }
 }
 function isDeviceActionResult(value) {
-    return (0, types_1.isPlainRecord)(value) && Object.keys(value).every((key) => key === "outcome" || key === "value")
+    return (0, types_1.isPlainRecord)(value) && Object.keys(value).every((key) => key === "outcome" || key === "value" || key === "errorCode")
+        && (value.errorCode === undefined || (value.outcome !== "accepted" && ["authentication", "connection", "unavailable"].includes(value.errorCode)))
         && (value.outcome === "accepted" || value.outcome === "rejected" || value.outcome === "ambiguous");
 }
 function applyDeviceStart(enrollment, value) {

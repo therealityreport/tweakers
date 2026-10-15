@@ -1,3 +1,20 @@
+import { assertHistoricalManagerAdmission } from "../manager-historical-continuations.js";
+import { authenticateSettledAcceptedRuntimeRepairPromotion, authenticateSupersededAcceptedRuntimeRepairPromotion, readAuthenticatedAcceptedRuntimeRepair } from "../accepted-runtime-repair.js";
+import { INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_FILE, INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE, INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION, INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND, INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND, assertIndependentTweakersRuntimeReadyExpectation, assertIndependentTweakersRuntimeReadyReceipt, sameRuntimeReadyAppearanceBinding, sameBrokerAuthorityExpectation, isProcessStartToken, sameSortedStringSet, isSha256, isValidRfc3339, verifyRuntimeReadyReceiptBinding, type IndependentTweakersRuntimeReadyExpectation, type IndependentTweakersRuntimeReadyAppearanceBinding, type IndependentTweakersRuntimeReadyReceipt } from "../runtime-ready-receipt.js";
+export { INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_FILE, INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE, INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION, INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND, INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND, type IndependentTweakersRuntimeReadyExpectation, type IndependentTweakersRuntimeReadyAppearanceBinding, type IndependentTweakersRuntimeReadyReceipt } from "../runtime-ready-receipt.js";
+import { observeExactTargetProcesses as targetProcesses } from "../process-observation.js";
+import { createManagerRecoveryBinding, persistManagerRecoveryBinding, persistManagerRuntimeAcceptance, persistRequiredManagerRuntimeAcceptance, readManagerRetainedPromotionEvidence, managerOperationRecoveryIsVerified, settleVerifiedManagerRecoveryOperations } from "../manager-recovery-evidence.js";
+import { parseManagerStrictJsonObject } from "../manager-strict-json.js";
+import { isManagerOperationId, ManagerOperationStore } from "../manager-operation-store.js";
+import { fingerprintVariantGeneration, type VariantGenerationFingerprint } from "../variant-generation.js";
+import { captureOfficialBundledBackendClosure, bindConsumedOfficialBundledBackendClosure, assertOfficialBundledBackendSigningClosure, NATIVE_CODEX_BACKEND } from "../native-bundled-backend.js";
+export { fingerprintVariantGeneration } from "../variant-generation.js";
+import { prepareInstalledMetadataRepair, recordInstalledMetadataRepair, verifyInstalledMetadataRepair, type InstalledMetadataRepairBinding } from "../installed-metadata-repair.js";
+import { withLifecycleLock, lifecycleLockFile, assertLifecycleReceiptsIdle } from "../lifecycle-lock.js";
+import { prepareLocalArtifactSlot } from "../artifact-retirement.js";
+import { consumePreparedOfficialSource } from "../official-source-registration.js";
+import { withLocalOperation,updateLocalOperationPhase } from "../local-operation.js";
+import { assertLocalExecutionPath, inspectLocalArtifactCapacity, bindLocalArtifactPromotion, reconcileLocalArtifactPromotion, relocateLocalArtifactReservation, reserveLocalArtifact, reconcileArtifactDeviceIdentities, publishLocalArtifactSnapshot, readReservations } from "../local-artifacts.js";
 import { prepareProbedAccountsTransferRecovery } from "../accounts-transfer-compatibility.js";
 import type { DoctorPatchRepairV1 } from "../doctor-patch-repair.js";
 import kleur from "kleur";
@@ -35,11 +52,18 @@ import {
   verifySignature,
   type PreparedSigningIdentity,
 } from "../codesign.js";
-import { install, installerPayloadHash, packagedRuntimeAssetsRoot, stageBundledTweaks, type BundledDerivedBackendArtifact } from "./install.js";
+import { install, installerPayloadHash, packagedRuntimeAssetsRoot, stageBundledTweaks, validateBundledDerivedCodeModeHost, type BundledDerivedBackendArtifact, type BundledDerivedCodeModeHostArtifact } from "./install.js";
 import { validatePrebuiltCombinedCandidate, type PrebuiltCombinedCandidateInput } from "../prebuilt-combined-candidate.js";
+import { sealAcceptedSharedNativeBackendTransition, assertAcceptedSharedNativeBackendTransitionShape,
+  assertAcceptedSharedNativeBackendTransitionPrior, assertAcceptedSharedNativeBackendTransitionClosure,
+  type AcceptedSharedNativeBackendTransitionRequest, type AcceptedSharedNativeBackendTransitionLane,
+  type SharedNativeBackendTransitionPort, type AcceptedBackendTransitionJournalBinding,
+  sharedNativeBackendTransitionPort,
+  AcceptedBackendTransitionJournal, ForwardBackendTransitionRecoveryRequired } from "../shared-native-backend-transition.js";
 import { cloneAppTree } from "../transaction.js";
 import { readPlist, writePlist } from "../plist.js";
 import { assertResourceAsarIntegrity } from "../integrity.js";
+import { resolveMacElectronFrameworkBinary } from "../platform.js";
 import {
   acquireSealedInactiveEnvironmentModeSourceLease,
   assertSealedInactiveEnvironmentModeSource,
@@ -62,7 +86,9 @@ import {
 } from "../manager-runtime-assets.js";
 import {
   bootstrapCanonicalManagerEnvironmentSnapshot,
+  canonicalNativeSourceBinding,
   type CanonicalManagerEnvironmentPublication,
+  type CanonicalOfficialSourceBinding,
 } from "../environment-profile.js";
 import {
   TWEAKERS_VARIANT_BUNDLE_ID,
@@ -82,6 +108,7 @@ import {
   defaultTweakersAccountsBrokerRoot,
   defaultTweakersVariantIdentity,
 } from "../macos-variant.js";
+import { reconcileVariantLaunchServices } from "../macos-app-identity.js";
 import {
   assertCandidatePackageExistingDirectory,
   assertCandidatePackageParentAnchor,
@@ -99,8 +126,8 @@ import {
   type CandidatePackageParentAnchor,
   type CandidatePackageScratchAnchor,
 } from "../candidate-package-filesystem.js";
-import { readRuntimeFingerprintEvidence } from "../runtime-fingerprint.js";
-import { accountsTransferBrokerRoots, assertAccountsTransferRuntimeCompatible, prepareAccountsTransferRecovery, type AccountsTransferValidationEvidence } from "../accounts-transfer-compatibility.js";
+import { computeRuntimeFingerprint, readRuntimeFingerprintEvidence } from "../runtime-fingerprint.js";
+import { accountsTransferBrokerRoots, verifyProbedAccountsTransferRecovery, assertAccountsTransferRuntimeCompatible, prepareAccountsTransferRecovery, type AccountsTransferValidationEvidence } from "../accounts-transfer-compatibility.js";
 import {
   assertIndependentTweakersAccountsRegistration,
   type IndependentTweakersBrokerAuthorityExpectation,
@@ -111,8 +138,10 @@ const REQUIRED_TWEAKERS_TWEAKS = new Set(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS
 function verifiedVariantBackend(options: CreateVariantOptions, sourceAppRoot: string): BundledDerivedBackendArtifact | undefined {
   if (options.retainRegisteredBackend) return verifiedRegisteredBackendForUpstreamCandidate(options, sourceAppRoot);
   if (options.baselineMaintenance) return verifiedBaselineMaintenance(options, sourceAppRoot).backend;
-  if (!options.prebuiltBackend) return undefined;
-  const accepted = validatePrebuiltCombinedCandidate(options.prebuiltBackend, {
+  if (options.acceptedBackendTransition?.version === 2) return undefined;
+  const prebuilt = options.acceptedBackendTransition?.version === 1 ? options.acceptedBackendTransition.prebuilt : options.prebuiltBackend;
+  if (!prebuilt) return undefined;
+  const accepted = validatePrebuiltCombinedCandidate(prebuilt, {
     installerPayloadHash: installerPayloadHash(),
     runtimeRoot: packagedRuntimeAssetsRoot(),
     sourceAppRoot,
@@ -123,11 +152,15 @@ function verifiedVariantBackend(options: CreateVariantOptions, sourceAppRoot: st
     fingerprint: accepted.backend.sha256,
     receiptPath: accepted.acceptedBuildReceipt.path,
     transactionId: accepted.transactionId,
+    preserveSignature: Boolean(signatureInfo(accepted.backend.sourcePath).teamIdentifier),
+    codeModeHost: { binaryPath: accepted.closure.codeModeHost.path,
+      fingerprint: accepted.closure.codeModeHost.sha256, receiptPath: accepted.acceptedBuildReceipt.path,
+      receiptSha256: accepted.acceptedBuildReceipt.sha256, resources: accepted.closure.resources },
   };
 }
 
 /** Carry the exact signed, registered resolver into a separately reviewed upstream candidate. */
-function verifiedRegisteredBackendForUpstreamCandidate(options: CreateVariantOptions, source: string): BundledDerivedBackendArtifact {
+function verifiedRegisteredBackendForUpstreamCandidate(options: CreateVariantOptions, source: string, consumed=false): BundledDerivedBackendArtifact {
   const binding = options.retainRegisteredBackend;
   const app = "/Applications/Tweakers.app";
   const variantRoot = join(canonicalTweakersManagerRoot(), "variants", "tweakers");
@@ -140,8 +173,9 @@ function verifiedRegisteredBackendForUpstreamCandidate(options: CreateVariantOpt
   assertFingerprint(binding.installedFingerprint, "Installed registered backend app");
   assertFingerprint(binding.sourceFingerprint, "Reviewed upstream source");
   if (!fingerprintsMatch(binding.installedFingerprint, fingerprintVariantGeneration(app)) || !verifySignature(app).ok
-    || !fingerprintsMatch(binding.sourceFingerprint, fingerprintVariantGeneration(source))) throw new Error("Registered backend app or upstream source changed");
-  assertOfficialSource(source, {});
+    || (!consumed && !fingerprintsMatch(binding.sourceFingerprint, fingerprintVariantGeneration(source)))) throw new Error("Registered backend app or upstream source changed");
+  if(!consumed)assertOfficialSource(source, {});
+  else if(!options.consumePreparedSource)throw new Error("Unbound consumed source");
   const statePath = join(variantRoot, "state.json");
   const registrationPath = join(brokerRoot, "shared-native-mode.v1.json");
   assertPrivateRegularFile(statePath, "Installed registered backend state");
@@ -152,14 +186,17 @@ function verifiedRegisteredBackendForUpstreamCandidate(options: CreateVariantOpt
   const state = JSON.parse(readFileSync(statePath, "utf8"));
   if (readPlist(join(app, "Contents", "Info.plist")).CFBundleIdentifier !== TWEAKERS_VARIANT_BUNDLE_ID
     || state.appRoot !== app || state.patchedAsarHash !== readHeaderHash(join(app, "Contents", "Resources", "app.asar")).headerHash) throw new Error("Installed registered backend identity changed");
-  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), brokerRoot, {}, true);
+  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), brokerRoot, {}, "configured", app, true);
   assertRegisteredSharedNativeBackend(app, brokerRoot);
   const binaryPath = join(app, "Contents", "Resources", "codex");
   if (hash(binaryPath) !== binding.backendSha256) throw new Error("Registered backend bytes changed");
   const probe = spawnSync(binaryPath, ["--version"], { encoding: "utf8", timeout: 10_000, env: {} });
   const version = probe.stdout?.trim().match(/^codex-cli (\S+)$/)?.[1];
   if (probe.status !== 0 || !version) throw new Error("Registered backend version unavailable");
-  return { binaryPath, version, fingerprint: binding.backendSha256, receiptPath: statePath, transactionId: "retained-registered-upstream-candidate", preserveSignature: true };
+  const artifact: BundledDerivedBackendArtifact = { binaryPath, version, fingerprint: binding.backendSha256, receiptPath: statePath,
+    transactionId: "retained-registered-upstream-candidate", preserveSignature: true, ...(binding.codeModeHost ? { codeModeHost: binding.codeModeHost } : {}) };
+  validateBundledDerivedCodeModeHost(artifact);
+  return artifact;
 }
 
 /** Maintenance is not an upstream update: prove the exact original source and retain the signed backend bytes. */
@@ -180,12 +217,14 @@ function verifiedBaselineMaintenance(options: CreateVariantOptions, source: stri
     || sourceInfo.CFBundleShortVersionString !== installedInfo.CFBundleShortVersionString
     || sourceInfo.CFBundleVersion !== installedInfo.CFBundleVersion) throw new Error("Maintenance cannot change the installed upstream baseline");
   assertOfficialSource(source, {});
-  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), defaultTweakersAccountsBrokerRoot(), {}, true);
+  verifyCreatedVariant(app, statePath, join(variantRoot, "app-data"), join(variantRoot, "codex-home"), defaultTweakersAccountsBrokerRoot(), {}, "configured", app, true);
   const binaryPath = join(app, "Contents", "Resources", "codex");
   const versionProbe = spawnSync(binaryPath, ["--version"], { encoding: "utf8", timeout: 10_000, env: {} });
   const version = versionProbe.stdout?.trim().match(/^codex-cli (\S+)$/)?.[1];
   if (versionProbe.status !== 0 || !version) throw new Error("Installed maintenance backend version is unavailable");
-  const backend: BundledDerivedBackendArtifact = { binaryPath, version, fingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"), receiptPath: statePath, transactionId: "retained-installed-baseline", preserveSignature: true };
+  const backend: BundledDerivedBackendArtifact = { binaryPath, version, fingerprint: createHash("sha256").update(readFileSync(binaryPath)).digest("hex"), receiptPath: statePath,
+    transactionId: "retained-installed-baseline", preserveSignature: true, ...(binding.codeModeHost ? { codeModeHost: binding.codeModeHost } : {}) };
+  validateBundledDerivedCodeModeHost(backend);
   if (!binding.candidatePackage) return { backend };
   const candidatePackage = resolve(binding.candidatePackage);
   const expected = binding.candidateReceipt;
@@ -206,22 +245,53 @@ function verifiedBaselineMaintenance(options: CreateVariantOptions, source: stri
   return { backend, receipt };
 }
 
-/** A future refresh must not replace a registered resolver with the stock backend. */
-function assertRegisteredSharedNativeBackend(candidate: string, accountsBrokerRoot: string): void {
+export interface OrdinarySharedNativeBackendBinding {
+  registrationFingerprint: string;
+  resolverBinarySha256: string;
+  resolverProtocol: "official-bundled-v1" | "shared-native-overlay-v1";
+}
+type RegistrationReadPort = Pick<SharedNativeBackendTransitionPort, "readSharedNativeModeAtRootV1">;
+
+function presentWithoutFollowing(path: string): boolean {
+  try { lstatSync(path); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return false;
+  }
+}
+
+/** Authenticate source, account, roots and signature before trusting resolver metadata. */
+export function captureRegisteredSharedNativeBackend(accountsBrokerRoot: string, port?: RegistrationReadPort): OrdinarySharedNativeBackendBinding | null {
   const registration = join(accountsBrokerRoot, "shared-native-mode.v1.json");
   const transition = join(accountsBrokerRoot, "shared-native-mode-transition.v1.json");
-  if (existsSync(transition)) throw new Error("Shared native mode recovery must finish before another Tweakers refresh.");
-  if (!existsSync(registration)) return;
-  const stat = lstatSync(registration);
-  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("Unsafe shared native registration.");
-  const document = JSON.parse(readFileSync(registration, "utf8")) as { resolverBinarySha256?: unknown };
-  const expected = document.resolverBinarySha256;
-  const backend = join(candidate, "Contents", "Resources", "codex");
+  if (presentWithoutFollowing(transition)) throw new Error("Shared native mode recovery must finish before another Tweakers refresh.");
+  if (!presentWithoutFollowing(registration)) return null;
+  const result = (port ?? sharedNativeBackendTransitionPort()).readSharedNativeModeAtRootV1({stateRoot: accountsBrokerRoot});
+  if (result.state !== "ready" || !/^sha256:[a-f0-9]{64}$/.test(result.fingerprint ?? "")
+    || !/^[a-f0-9]{64}$/.test(result.document?.resolverBinarySha256 ?? "")
+    || !["official-bundled-v1", "shared-native-overlay-v1"].includes(result.document?.resolverProtocol ?? "")) {
+    throw new Error("Shared native registration could not be authenticated against its source, account and roots.");
+  }
+  return {registrationFingerprint: result.fingerprint!, resolverBinarySha256: result.document!.resolverBinarySha256,
+    resolverProtocol: result.document!.resolverProtocol as OrdinarySharedNativeBackendBinding["resolverProtocol"]};
+}
+
+/** Ordinary refresh preserves the exact authenticated registration reviewed with its candidate. */
+export function assertRegisteredSharedNativeBackend(candidate: string, accountsBrokerRoot: string,
+  options: {port?: RegistrationReadPort; expected?: OrdinarySharedNativeBackendBinding | null} = {}): OrdinarySharedNativeBackendBinding | null {
+  const binding = captureRegisteredSharedNativeBackend(accountsBrokerRoot, options.port);
+  if (Object.hasOwn(options, "expected") && JSON.stringify(binding) !== JSON.stringify(options.expected)) {
+    throw new Error("Reviewed shared native registration changed before promotion.");
+  }
+  if (!binding) return null;
+  const expected = binding.resolverBinarySha256;
+  const backend = binding.resolverProtocol === "official-bundled-v1"
+    ? join(candidate, NATIVE_CODEX_BACKEND) : join(candidate, "Contents", "Resources", "codex");
   if (typeof expected !== "string" || !/^[a-f0-9]{64}$/.test(expected)
     || !existsSync(backend) || lstatSync(backend).isSymbolicLink()
     || createHash("sha256").update(readFileSync(backend)).digest("hex") !== expected) {
     throw new Error("This candidate does not contain the registered shared native backend. Prepare a compatible backend transition before refreshing Tweakers.");
   }
+  return binding;
 }
 
 export interface CreateVariantOptions {
@@ -235,6 +305,8 @@ export interface CreateVariantOptions {
   app?: string;
   /** Build a private, inspectable package and deliberately stop before promotion. */
   candidateOnly?: boolean;
+  /** Internal Doctor path: the reserved downloaded app becomes the candidate. */
+  consumePreparedSource?: {root:string};
   /** Doctor-only disposable home. Never valid for installation or promotion. */
   doctorPreviewHome?: string;
   "candidate-only"?: boolean;
@@ -245,11 +317,14 @@ export interface CreateVariantOptions {
   doctorAccountsRecoveryRoot?: string;
   /** Internal accepted-build input, verified against this exact official source and runtime. */
   prebuiltBackend?: PrebuiltCombinedCandidateInput;
+  /** Candidate-only input. Promotion derives this authority only from its Doctor-reviewed signed receipt. */
+  acceptedBackendTransition?: AcceptedSharedNativeBackendTransitionRequest;
   /** Internal post-change maintenance only: exact installed app, unchanged upstream and backend. */
-  baselineMaintenance?: { installedFingerprint: VariantGenerationFingerprint; candidatePackage?: string; candidateReceipt?: TweakersVariantCandidateReceipt };
+  baselineMaintenance?: { installedFingerprint: VariantGenerationFingerprint; candidatePackage?: string; candidateReceipt?: TweakersVariantCandidateReceipt;
+    codeModeHost?: BundledDerivedCodeModeHostArtifact };
   /** Internal candidate-only upstream update; normal Doctor approval is still required for promotion. */
   retainRegisteredBackend?: { installedFingerprint: VariantGenerationFingerprint; sourceFingerprint: VariantGenerationFingerprint;
-    installedStateSha256: string; registrationSha256: string; backendSha256: string };
+    installedStateSha256: string; registrationSha256: string; backendSha256: string; codeModeHost?: BundledDerivedCodeModeHostArtifact };
 
   userRoot?: string;
   "user-root"?: string;
@@ -275,6 +350,12 @@ interface RuntimeRepairResolverPort {
 }
 
 interface CreateVariantDeps {
+  /** Test seams for the retained-promotion coordinator; production derives immutable Manager evidence. */
+  retainedPromotionEvidence?: typeof readManagerRetainedPromotionEvidence;
+  persistRetainedAcceptance?: typeof persistRequiredManagerRuntimeAcceptance;
+  observeRetainedProcess?: (target: string) => {pid: number; startedAtRaw: string | null; visibleWindow: boolean} | null;
+  settleRetainedPromotion?: (root: string, operationId: string) => boolean;
+  backendTransitionPort?: SharedNativeBackendTransitionPort;
   /** Existing-test seam; production loads the hash-bound staged runtime port. */
   runtimeRepairResolverPort?: RuntimeRepairResolverPort;
   platform?: () => NodeJS.Platform;
@@ -292,6 +373,8 @@ interface CreateVariantDeps {
   id?: () => string;
   /** Test-only hook for simulating a filesystem failure at a promotion edge. */
   fault?: (point: string) => void;
+  /** Post-commit LaunchServices cleanup seam; production only touches /Applications/Tweakers.app. */
+  reconcileAppRegistration?: (appRoot: string) => void;
   /** Test-only hook that simulates abrupt process termination after a durable journal phase. */
   crashAfterJournalPhase?: (phase: string) => boolean;
   /** Injectable exact-target process check; a running target is never stopped by this command. */
@@ -307,6 +390,9 @@ interface CreateVariantDeps {
     candidate: string;
     userRoot: string;
   }) => void | Promise<void>;
+  /** Synchronous assertion that the caller currently holds closed desktop and
+   * broker admission. Required before production deferred rollback compensation. */
+  beforeRollback?: () => void;
   /** Test-only fault seam for the post-commit, non-rollbackable challenge cleanup. */
   removeRuntimeReadyExpectation?: (userRoot: string) => void;
   /**
@@ -358,7 +444,11 @@ interface CreateVariantDeps {
    * Test-only manager environment bootstrap. Production validates the legacy
    * authority and materializes a canonical manager-owned snapshot.
    */
-  bootstrapManagerEnvironment?: (options: { sourceRoot: string; destinationRoot: string }) =>
+  bootstrapManagerEnvironment?: (options: {
+    sourceRoot: string;
+    destinationRoot: string;
+    expectedOfficialSource?: CanonicalOfficialSourceBinding;
+  }) =>
     CanonicalManagerEnvironmentPublication;
 }
 
@@ -392,74 +482,15 @@ const VARIANT_CANDIDATE_ARTIFACT_PATHS = {
  * initialized.  Both files live below the exact isolated variant root, never
  * below the official ChatGPT profile or an arbitrary caller-selected path.
  */
-export const INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_FILE = "runtime-ready-expectation.json";
-export const INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE = "runtime-ready.json";
-export const INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION = 5 as const;
-export const INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND = "tweakers-independent-runtime-ready" as const;
-export const INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND = "tweakers-independent-runtime-ready-expectation" as const;
-
-export interface IndependentTweakersRuntimeReadyExpectation {
-  schemaVersion: typeof INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION;
-  kind: typeof INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND;
-  operationId: string;
-  promotionId: string;
-  activePromotionReceiptSha256: string;
-  appRoot: string;
-  bundleId: typeof TWEAKERS_VARIANT_BUNDLE_ID;
-  appAsarHeaderHash: string;
-  runtimeFingerprint: string;
-  appUserDataRoot: string;
-  codexHomeRoot: string;
-  accountsBrokerRoot: string;
-  brokerAuthorityExpectation: IndependentTweakersBrokerAuthorityExpectation;
-  /**
-   * The manager requires the independent window to have a verified Actual
-   * Size observation before it can accept a startup receipt. This is a fixed
-   * contract rather than a best-effort diagnostics field, so the runtime
-   * receipt must bind it exactly.
-   */
-  appearanceExpectation: IndependentTweakersRuntimeReadyAppearanceBinding;
-  expectedTweakIds: readonly string[];
-  createdAt: string;
-}
-
-export interface IndependentTweakersRuntimeReadyAppearanceBinding {
-  status: "normal";
-  normalized: true;
-}
-
-export interface IndependentTweakersRuntimeReadyReceipt {
-  schemaVersion: typeof INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION;
-  kind: typeof INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND;
-  operationId: string;
-  promotionId: string;
-  activePromotionReceiptSha256: string;
-  pid: number;
-  processStartToken: string;
-  appRoot: string;
-  bundleId: typeof TWEAKERS_VARIANT_BUNDLE_ID;
-  appAsarHeaderHash: string;
-  runtimeFingerprint: string;
-  appUserDataRoot: string;
-  codexHomeRoot: string;
-  accountsBrokerRoot: string;
-  brokerAuthorityExpectation: IndependentTweakersBrokerAuthorityExpectation;
-  appearance: IndependentTweakersRuntimeReadyAppearanceBinding;
-  mainInitialized: true;
-  preloadInitialized: true;
-  settingsMounted: true;
-  sharedHistoryBrokerState: "connected" | "blocked";
-  initializedTweakIds: readonly string[];
-  observedAt: string;
-}
-
 /**
  * The manager holds this object (and its exact transaction lock) across the
  * short relaunch/proof interval. It can commit only after verifyRuntimeReady
- * accepts a freshly written receipt. Any failure uses rollback while the
- * durable journal is still uncommitted.
+ * accepts a freshly written receipt. A commit failure retains the uncommitted
+ * journal until the caller retains it or performs an admitted rollback.
  */
 export interface DeferredTweakersVariantRefresh {
+  /** Derived only from a sealed accepted-transition journal; never a caller option. */
+  readonly recoveryMode?: "forward-only";
   readonly target: string;
   readonly userRoot: string;
   readonly runtimeReadyExpectation: IndependentTweakersRuntimeReadyExpectation;
@@ -497,6 +528,8 @@ export interface TweakersVariantCandidateReceipt {
   };
   signingIdentityHash: string;
   artifacts: Record<keyof typeof VARIANT_CANDIDATE_ARTIFACT_PATHS, VariantGenerationFingerprint>;
+  acceptedBackendTransition?: AcceptedSharedNativeBackendTransitionLane;
+  ordinarySharedNativeBackend?: OrdinarySharedNativeBackendBinding | null;
 }
 
 export interface TweakersVariantCandidateReceiptVerificationOptions {
@@ -554,6 +587,22 @@ export async function prepareDeferredTweakersVariantRefresh(
 export async function createTweakersVariant(
   options: CreateVariantOptions = {},
   deps: CreateVariantDeps = {},
+): Promise<void | DeferredTweakersVariantRefresh> {
+  const operationRoot = deps.home ? join(canonicalTweakersManagerRoot(deps.home()), "local-operation") : undefined;
+  return withLocalOperation("create-variant", () => createTweakersVariantOwned(options, deps), operationRoot, (result, settle) => {
+    if (!result) return false;
+    // retain() durably hands recovery to the existing transaction journal. It
+    // ends execution ownership, not recovery ownership or artifact retention.
+    for (const method of ["commit", "rollback", "retain"] as const) {
+      const original = result[method].bind(result);
+      result[method] = () => { original(); settle(); };
+    }
+    return true;
+  });
+}
+async function createTweakersVariantOwned(
+  options: CreateVariantOptions,
+  deps: CreateVariantDeps,
 ): Promise<void | DeferredTweakersVariantRefresh> {
   if ((deps.platform ?? platform)() !== "darwin") {
     throw new Error("A separate Tweakers app is currently supported only on macOS.");
@@ -646,6 +695,12 @@ export async function createTweakersVariant(
   if (reviewed && (reviewed.receipt.source.path !== source || reviewed.receipt.identity.userRoot !== userRoot
     || reviewed.receipt.identity.appUserDataRoot !== appUserDataRoot)) throw new Error("Reviewed candidate target or source changed");
   const deferRuntimeReadyCommit = options.deferRuntimeReadyCommit === true;
+  const acceptedBackendTransition = reviewed?.receipt.acceptedBackendTransition;
+  const ordinarySharedNativeBackend = acceptedBackendTransition ? undefined : reviewed
+    ? reviewed.receipt.ordinarySharedNativeBackend ?? null
+    : captureRegisteredSharedNativeBackend(accountsBrokerRoot, deps.backendTransitionPort);
+  if (options.acceptedBackendTransition) throw new Error("Accepted backend transition input is candidate-only; promotion requires its Doctor approval");
+  if (acceptedBackendTransition && (!deferRuntimeReadyCommit || !options.runtimeReadyOperationId)) throw new Error("Accepted backend transition requires deferred installed acceptance and its manager operation");
   if (deferRuntimeReadyCommit && !refresh) {
     throw new Error("Deferred runtime-ready commit is valid only for an independent Tweakers refresh.");
   }
@@ -654,7 +709,7 @@ export async function createTweakersVariant(
   }
   if (options.runtimeReadyOperationId !== undefined) assertVariantPromotionId(options.runtimeReadyOperationId);
   const id = (deps.id ?? randomUUID)();
-  const candidate = join(dirname(target), `.${basename(target)}.candidate-${id}.app`);
+  const candidate = reviewed ? join(reviewed.candidatePackage, "Tweakers.app") : join(dirname(target), `.${basename(target)}.candidate-${id}.app`);
   const buildRoot = join(userRoot, "builds", id);
   const buildPaths = variantBuildPaths(buildRoot);
 
@@ -663,19 +718,31 @@ export async function createTweakersVariant(
     throw new Error("Refusing to create a variant at /Applications/ChatGPT.app. The official app remains untouched.");
   }
   if (!target.endsWith(".app")) throw new Error("The Tweakers variant target must be a macOS .app bundle.");
-  if (!existsSync(source)) throw new Error(`Official ChatGPT source not found: ${source}`);
+  if (!reviewed && !existsSync(source)) throw new Error(`Official ChatGPT source not found: ${source}`);
   const transactionLock = acquireVariantPromotionLock(userRoot, target, deps);
   let retainTransactionLock = false;
   try {
     assertNoSymlinkPathWithin(userRoot, variantPromotionJournalRoot(userRoot), "Variant promotion journal root");
+    assertHistoricalManagerAdmission(managerRoot);
     recoverInterruptedTweakersVariantPromotions(userRoot, target, deps);
-    if (existsSync(candidate)) throw new Error(`Variant candidate already exists: ${candidate}`);
+    if (!reviewed && existsSync(candidate)) throw new Error(`Variant candidate already exists: ${candidate}`);
     if (existsSync(target) && !refresh) {
       throw new Error(`Variant target already exists: ${target}. Use refresh-variant to replace it atomically.`);
     }
     if (existsSync(buildRoot)) throw new Error(`Variant build root already exists: ${buildRoot}`);
     mkdirSync(dirname(target), { recursive: true });
     assertNoSymlinkPathWithin(userRoot, buildRoot, "Variant build root");
+    if(!reviewed)assertLocalExecutionPath(source);
+    else assertLocalExecutionPath(candidate);
+    if (reviewed) {
+      const capacity = inspectLocalArtifactCapacity(managerRoot, target);
+      if (capacity.blockers.length || capacity.occupied > 2 || !capacity.paths.includes(resolve(candidate))) {
+        throw new Error(`Reviewed candidate cannot be promoted until local artifacts are reconciled (${capacity.occupied}/2)`);
+      }
+      // The sealed app is consumed by the existing rename journal; never clone it
+      // into a third application slot. Fail before cutover for unsupported paths.
+      assertPromotionCandidatePath(userRoot, target, id, candidate);
+    } else {await prepareLocalArtifactSlot(managerRoot,target);reserveLocalArtifact(managerRoot, target, [candidate, join(buildRoot, "failed-candidate.app")]);}
     ensurePrivateDirectory(buildRoot, deps);
     if (isPathWithin(userRoot, appUserDataRoot)) {
       assertNoSymlinkPathWithin(userRoot, appUserDataRoot, "Variant app-data root");
@@ -693,6 +760,8 @@ export async function createTweakersVariant(
     let beforePromotionFailed = false;
     let managerPublication: { restoreOnFailure(): void } | null = null;
     let managerEnvironmentPublication: CanonicalManagerEnvironmentPublication | null = null;
+    let registeredOfficialEnvironmentBinding: CanonicalOfficialSourceBinding | undefined;
+    let registeredSourceOriginalPath: string | undefined;
     try {
       let sealedSourceLease: ReturnType<typeof acquireSealedInactiveEnvironmentModeSourceLease> | null = null;
       let registeredSourceLease: ReturnType<typeof acquireRegisteredOfficialSourceLease> | null = null;
@@ -702,6 +771,13 @@ export async function createTweakersVariant(
           if (resolve(registeredSourceLease.receipt.artifact.appPath) !== source) {
             throw new Error("The manager registered official source changed before the Tweakers candidate was cloned.");
           }
+          registeredSourceOriginalPath = registeredSourceLease.receipt.source.appPath;
+          registeredOfficialEnvironmentBinding = {
+            version: registeredSourceLease.receipt.source.version,
+            build: registeredSourceLease.receipt.source.build,
+            teamIdentifier: registeredSourceLease.receipt.source.trust.teamIdentifier,
+            designatedRequirement: registeredSourceLease.receipt.source.trust.designatedRequirement,
+          };
           const expected = deps.registeredOfficialSourceBinding?.();
           if (expected !== undefined && (expected.generationId !== registeredSourceLease.pointer.generationId
             || expected.receiptDigest !== registeredSourceLease.receiptDigest)) {
@@ -715,8 +791,8 @@ export async function createTweakersVariant(
             throw new Error("The sealed inactive ChatGPT source changed before the Tweakers candidate was cloned.");
           }
         }
-        assertOfficialSource(source, deps);
-        (deps.cloneApp ?? cloneAppTree)(reviewed ? join(reviewed.candidatePackage, "Tweakers.app") : source, candidate);
+        if(!reviewed)assertOfficialSource(source, deps);
+        if (!reviewed) (deps.cloneApp ?? cloneAppTree)(source, candidate);
         if (registeredOfficialSourceRoot !== null) {
           const after = readRegisteredOfficialSource(registeredOfficialSourceRoot);
           if (after.state !== "ready"
@@ -736,6 +812,8 @@ export async function createTweakersVariant(
         }
         if (fingerprintVariantGeneration(candidate).sha256 !== reviewed.receipt.artifacts.app.sha256) throw new Error("Copied Doctor candidate changed");
       } else {
+      const officialBundledBackend = (options.prebuiltBackend || options.baselineMaintenance)
+        ? undefined : captureOfficialBundledBackendClosure(source);
       await (deps.installApp ?? install)({
         app: candidate,
         fuse: false,
@@ -743,13 +821,18 @@ export async function createTweakersVariant(
         localSigning: true,
         macAppIdentity: defaultTweakersVariantIdentity(appUserDataRoot, userRoot, accountsBrokerRoot),
         candidateContext: { paths: buildPaths, finalUserRoot: userRoot,
+          ...(officialBundledBackend ? { officialBundledBackend } : {}),
           ...((options.prebuiltBackend || options.baselineMaintenance) ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
       });
+      if (officialBundledBackend) assertOfficialBundledBackendSigningClosure(candidate, officialBundledBackend);
       (deps.stageTweaks ?? stageBundledTweaks)(buildPaths.tweaks, buildPaths.runtime);
       }
       if (options.accountsTransferRecovery && !reviewed) prepareAccountsTransferRecovery({ runtimeRoot: buildPaths.runtime, recoveryRoot: options.accountsTransferRecovery.root, validation: options.accountsTransferRecovery.validation });
       assertAccountsTransferRuntimeCompatible(buildPaths.runtime, [accountsBrokerRoot]);
-      assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot);
+      if (acceptedBackendTransition) {
+        assertAcceptedSharedNativeBackendTransitionPrior(acceptedBackendTransition, deps.backendTransitionPort);
+        assertAcceptedSharedNativeBackendTransitionClosure(acceptedBackendTransition, candidate, buildPaths.runtime);
+      } else assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot, {port: deps.backendTransitionPort, expected: ordinarySharedNativeBackend});
       verifyCreatedVariant(
         candidate,
         buildPaths.stateFile,
@@ -757,18 +840,32 @@ export async function createTweakersVariant(
         codexHomeRoot,
         accountsBrokerRoot,
         deps,
-        reviewed !== null,
+        reviewed ? "configured" : false,
         reviewed ? target : candidate,
       );
       if (!reviewed) prepareFinalVariantState(buildPaths, userRoot, target, id, deps);
       reviewed?.revalidate();
       // Revalidate canonical official identity before the callback may close Tweakers.
       assertNoSymlinkPathWithin((deps.home ?? homedir)(), managerRoot, "Canonical manager root");
+      if (registeredOfficialSourceRoot !== null) {
+        const registered = readRegisteredOfficialSource(registeredOfficialSourceRoot);
+        if (registeredOfficialEnvironmentBinding === undefined
+          || registered.state !== "ready"
+          || registered.generationId !== registeredSourceStatus!.generationId
+          || registered.receiptDigest !== registeredSourceStatus!.receiptDigest
+          || registered.version !== registeredOfficialEnvironmentBinding.version
+          || registered.build !== registeredOfficialEnvironmentBinding.build) {
+          throw new Error(registered.problem ?? "The manager registered official source changed before environment reconciliation.");
+        }
+      }
       managerEnvironmentPublication = (
         deps.bootstrapManagerEnvironment ?? bootstrapCanonicalManagerEnvironmentSnapshot
       )({
         sourceRoot: environmentAuthoritySourceRoot,
         destinationRoot: managerRoot,
+        ...(registeredOfficialEnvironmentBinding === undefined
+          ? {}
+          : { expectedOfficialSource: canonicalNativeSourceBinding(registeredSourceOriginalPath!, registeredOfficialEnvironmentBinding) }),
       });
       try {
         await deps.beforePromotion?.({ target, candidate, userRoot });
@@ -789,13 +886,32 @@ export async function createTweakersVariant(
       }
       promotion = new VariantPromotion({
         build: buildPaths,
+        artifactRoot: managerRoot,
         userRoot,
         target,
         candidate,
         id,
         deps,
+        ...(acceptedBackendTransition ? { acceptedBackendTransition: {lane: acceptedBackendTransition, operationId: options.runtimeReadyOperationId!} } : {}),
+        ...(!acceptedBackendTransition ? {beforeCutover: () => assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot,
+          {port: deps.backendTransitionPort, expected: ordinarySharedNativeBackend})} : {}),
+        beforePublication: (journal) => {
+          assertHistoricalManagerAdmission(managerRoot, journal.id);
+          if (!options.runtimeReadyOperationId || !isManagerOperationId(options.runtimeReadyOperationId)) return;
+          const record = new ManagerOperationStore(managerRoot).read(options.runtimeReadyOperationId);
+          if (!record) return; // Direct CLI recovery uses its own exact journal binding.
+          if (record.phase !== "consumed" || record.actionId !== "refresh.independent") throw new Error("Manager promotion requires its consumed refresh operation");
+          const runtime = readRuntimeFingerprintEvidence(buildPaths.runtime);
+          if (!runtime) throw new Error("Manager promotion has no verified runtime fingerprint");
+          persistManagerRecoveryBinding(managerRoot, createManagerRecoveryBinding({
+            managerRoot, operationId: record.operationId, journal, runtimeFingerprint: runtime.fingerprint,
+            receiptRefs: record.receiptRefs,
+            dependencyPaths: [buildPaths.root, join(userRoot, "previous", id)],
+          }));
+        },
       });
       promotion.promote();
+
       verifyCreatedVariant(
         target,
         join(userRoot, "state.json"),
@@ -803,7 +919,7 @@ export async function createTweakersVariant(
         codexHomeRoot,
         accountsBrokerRoot,
         deps,
-        true,
+        "configured",
       );
       managerPublication = publishManagerAfterVariantPromotion(managerRoot, deps);
       // Keep manager publication inside the promotion's compensating window:
@@ -830,6 +946,8 @@ export async function createTweakersVariant(
         };
         const rollback = (): void => {
           if (settled) throw new Error("Deferred independent Tweakers refresh was already finalized.");
+          promotion!.assertRollbackAllowed();
+          assertDeferredTweakersVariantRollbackAdmission(target, deps);
           const rollbackErrors: unknown[] = [];
           try {
             clearIndependentTweakersRuntimeReadyEvidence(userRoot);
@@ -856,6 +974,7 @@ export async function createTweakersVariant(
           }
         };
         return {
+          ...(acceptedBackendTransition ? { recoveryMode: "forward-only" as const } : {}),
           target,
           userRoot,
           runtimeReadyExpectation,
@@ -863,6 +982,7 @@ export async function createTweakersVariant(
             if (settled) throw new Error("Deferred independent Tweakers refresh was already finalized.");
             verifyIndependentTweakersRuntimeReadyReceipt(runtimeReadyExpectation, value, pid, processStartToken);
             assertIndependentTweakersRuntimeReadyExpectationAt(userRoot, runtimeReadyExpectation);
+            persistManagerRuntimeAcceptance(managerRoot, runtimeReadyExpectation, value, pid, processStartToken);
             runtimeReadyVerified = true;
           },
           commit(): void {
@@ -870,19 +990,10 @@ export async function createTweakersVariant(
             if (!runtimeReadyVerified) {
               throw new Error("Deferred independent Tweakers refresh requires accepted runtime-ready evidence before commit.");
             }
-            try {
-              promotion!.commit();
-            } catch (error) {
-              try {
-                rollback();
-              } catch (rollbackError) {
-                throw new AggregateError(
-                  [error, rollbackError],
-                  "Independent Tweakers promotion could not commit after runtime-ready verification and rollback was incomplete.",
-                );
-              }
-              throw error;
-            }
+            // A commit failure can occur while the freshly verified app is
+            // running. Preserve publication and readiness evidence; the caller
+            // owns retention or rollback after acquiring current admission.
+            promotion!.commit();
             // The runtime-ready challenge must survive the entire provisional
             // app:promoted interval. A manager interruption after verification
             // can therefore relaunch the exact journal-bound generation and
@@ -913,6 +1024,12 @@ export async function createTweakersVariant(
         retainTransactionLock = true;
         throw error;
       }
+      try { promotion?.assertRollbackAllowed(); }
+      catch (forwardError) {
+        // No app, manager, or environment compensation is safe after resolver begin.
+        retainTransactionLock = false;
+        throw new ForwardBackendTransitionRecoveryRequired(promotion!.journalPath, new AggregateError([error, forwardError]));
+      }
       const rollbackErrors: unknown[] = [];
       if (managerPublication !== null) {
         try {
@@ -929,9 +1046,11 @@ export async function createTweakersVariant(
         }
       }
       rollbackErrors.push(...(promotion?.rollback() ?? []));
-      if (existsSync(candidate)) {
+      if (!reviewed && existsSync(candidate)) {
         try {
-          (deps.archiveApp ?? renameSync)(candidate, join(buildRoot, "failed-candidate.app"));
+          const failedCandidate = join(buildRoot, "failed-candidate.app");
+          (deps.archiveApp ?? renameSync)(candidate, failedCandidate);
+          relocateLocalArtifactReservation(managerRoot, candidate, failedCandidate);
         } catch (archiveError) {
           rollbackErrors.push(archiveError);
         }
@@ -1062,6 +1181,8 @@ async function createTweakersVariantCandidateOnly(
   let retainedByPublication = false;
   try {
     parentAnchor = openCandidatePackageParentAnchor(preflight.outputParent, "Candidate output parent");
+    assertLocalExecutionPath(source);
+    if(!options.consumePreparedSource){const artifactRoot=canonicalTweakersManagerRoot((deps.home ?? homedir)());await prepareLocalArtifactSlot(artifactRoot,target);reserveLocalArtifact(artifactRoot, target, [candidate, join(output, "Tweakers.app"), join(failedScratch, "Tweakers.app")]);}
     currentPackage = createCandidatePackageScratch(scratch, parentAnchor);
     deps.afterCandidateScratchCreated?.({ scratch, outputParent });
     assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
@@ -1075,19 +1196,34 @@ async function createTweakersVariantCandidateOnly(
     );
     assertOfficialSource(source, deps);
     assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
-    (deps.cloneApp ?? cloneAppTree)(source, candidate);
-    assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
-    if (!fingerprintsMatch(sourceBefore.public.fingerprint, fingerprintVariantGeneration(candidate))) {
-      throw new Error("Candidate source drift: the raw clone does not equal the sealed source fingerprint.");
+    if (options.acceptedBackendTransition && (options.prebuiltBackend || options.retainRegisteredBackend || options.baselineMaintenance)) {
+      throw new Error("Accepted backend transition cannot combine with another backend authority");
     }
-    const sourceAfter = captureCandidateSourceSnapshot(
-      source,
-      sourceUsesSealedEnvironmentMode,
-      sealedEnvironmentRoot,
-      deps,
-    );
+    if (options.acceptedBackendTransition && (target !== "/Applications/Tweakers.app"
+      || userRoot !== join(canonicalTweakersManagerRoot((deps.home ?? homedir)()), "variants", "tweakers"))) {
+      throw new Error("Accepted backend transition requires the canonical installed Tweakers identity");
+    }
+    const acceptedBackendTransition = options.acceptedBackendTransition ? sealAcceptedSharedNativeBackendTransition({
+      request: options.acceptedBackendTransition, identity: { target, userRoot, brokerRoot: accountsBrokerRoot },
+      installerPayloadHash: installerPayloadHash(), runtimeRoot: packagedRuntimeAssetsRoot(), sourceAppRoot: source,
+      ...(deps.backendTransitionPort ? { port: deps.backendTransitionPort } : {}),
+    }) : undefined;
+    const ordinarySharedNativeBackend = acceptedBackendTransition ? undefined : captureRegisteredSharedNativeBackend(accountsBrokerRoot, deps.backendTransitionPort);
+    const backend=options.acceptedBackendTransition?.version === 2 ? undefined : verifiedVariantBackend(options,source);
+    let officialBundledBackend = backend ? undefined : captureOfficialBundledBackendClosure(source);
+    const sourceAfter = captureCandidateSourceSnapshot(source,sourceUsesSealedEnvironmentMode,sealedEnvironmentRoot,deps);
     assertCandidateSourceSnapshotMatches(sourceBefore, sourceAfter);
-    assertOfficialSource(source, deps);
+    if(options.consumePreparedSource) {
+      if(resolve(options.consumePreparedSource.root)!==canonicalTweakersManagerRoot((deps.home??homedir)()))throw new Error("Prepared source manager root mismatch");
+      consumePreparedOfficialSource(options.consumePreparedSource.root,source,candidate,[join(output,"Tweakers.app"),join(failedScratch,"Tweakers.app")]);
+    } else (deps.cloneApp ?? cloneAppTree)(source,candidate);
+    assertCandidatePackageScratchAnchor(currentPackage,parentAnchor);
+    const allocatedCandidateFingerprint = fingerprintVariantGeneration(candidate);
+    if(!fingerprintsMatch(sourceBefore.public.fingerprint,allocatedCandidateFingerprint))throw new Error("Candidate source drift during allocation");
+    if (options.consumePreparedSource && officialBundledBackend) {
+      officialBundledBackend = bindConsumedOfficialBundledBackendClosure(officialBundledBackend, candidate, sourceBefore.public.fingerprint, undefined, allocatedCandidateFingerprint);
+    }
+    if(!options.consumePreparedSource){assertCandidateSourceSnapshotMatches(sourceBefore,captureCandidateSourceSnapshot(source,sourceUsesSealedEnvironmentMode,sealedEnvironmentRoot,deps));assertOfficialSource(source,deps);}
 
     await (deps.installApp ?? install)({
       app: candidate,
@@ -1100,16 +1236,21 @@ async function createTweakersVariantCandidateOnly(
       // This is an embedded runtime identity string only. install() uses
       // candidateContext paths for every filesystem mutation in this mode.
       candidateContext: { paths: candidatePaths, finalUserRoot: userRoot, doctorPatchRepairs: options.doctorPatchRepairs,
-        ...((options.prebuiltBackend || options.baselineMaintenance || options.retainRegisteredBackend) ? { bundledDerivedBackend: verifiedVariantBackend(options, source) } : {}) },
+        ...(officialBundledBackend ? { officialBundledBackend } : {}),
+        ...((options.prebuiltBackend || options.acceptedBackendTransition || options.baselineMaintenance || options.retainRegisteredBackend) ? { bundledDerivedBackend: backend } : {}) },
     });
+    if (officialBundledBackend) assertOfficialBundledBackendSigningClosure(candidate, officialBundledBackend);
     assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
     (deps.stageTweaks ?? stageBundledTweaks)(candidatePaths.tweaks, candidatePaths.runtime);
     if (options.doctorAccountsRecoveryRoot) prepareProbedAccountsTransferRecovery(candidatePaths.runtime, options.doctorAccountsRecoveryRoot);
     if (options.accountsTransferRecovery) prepareAccountsTransferRecovery({ runtimeRoot: candidatePaths.runtime, recoveryRoot: options.accountsTransferRecovery.root, validation: options.accountsTransferRecovery.validation });
     assertAccountsTransferRuntimeCompatible(candidatePaths.runtime, [accountsBrokerRoot]);
-    assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot);
+    if (acceptedBackendTransition) {
+      assertAcceptedSharedNativeBackendTransitionPrior(acceptedBackendTransition, deps.backendTransitionPort);
+      assertAcceptedSharedNativeBackendTransitionClosure(acceptedBackendTransition, candidate, candidatePaths.runtime);
+    } else assertRegisteredSharedNativeBackend(candidate, accountsBrokerRoot, {port: deps.backendTransitionPort, expected: ordinarySharedNativeBackend});
     if (options.retainRegisteredBackend) {
-      verifiedRegisteredBackendForUpstreamCandidate(options, source);
+      verifiedRegisteredBackendForUpstreamCandidate(options, source,!!options.consumePreparedSource);
       const installedState = JSON.parse(readFileSync(join(canonicalTweakersManagerRoot(), "variants", "tweakers", "state.json"), "utf8"));
       const candidateState = JSON.parse(readFileSync(candidatePaths.stateFile, "utf8"));
       if (candidateState.signingIdentityHash !== installedState.signingIdentityHash) throw new Error("Retained backend candidate signing identity changed");
@@ -1139,7 +1280,7 @@ async function createTweakersVariantCandidateOnly(
       codexHomeRoot,
       accountsBrokerRoot,
       deps,
-      true,
+      options.doctorConfiguration ? "configured" : true,
       target,
     );
     assertCandidateAppSigningIdentity(candidate, candidatePaths.stateFile, preparedSigningIdentity.hash, receiptSignature);
@@ -1157,6 +1298,8 @@ async function createTweakersVariantCandidateOnly(
       accountsBrokerRoot,
       signingIdentityHash: preparedSigningIdentity.hash,
       candidatePaths,
+      ...(acceptedBackendTransition ? { acceptedBackendTransition } : {}),
+      ...(ordinarySharedNativeBackend === undefined ? {} : {ordinarySharedNativeBackend}),
     });
     writeTweakersVariantCandidateReceipt(scratch, receipt, preparedSigningIdentity, receiptSignature, deps);
     assertCandidatePackageScratchAnchor(currentPackage, parentAnchor);
@@ -1449,7 +1592,7 @@ function prepareCandidateOnlyVariantState(
   writeJsonAtomic(paths.stateFile, state, id, deps, "candidate-only:state");
   // Candidate-only preparation must not read production config: those values
   // are identity inputs only, never a source of mutable live state.
-  enableAllBundledTweaks(paths.configFile, null, paths.tweaks, id, deps);
+  configureBundledTweaks(paths.configFile, null, paths.tweaks, id, deps);
   if (titlebarEnabled !== undefined) {
     const config = JSON.parse(readFileSync(paths.configFile, "utf8"));
     config.tweaks["co.tweakers.titlebar-controls"].enabled = titlebarEnabled;
@@ -1469,6 +1612,8 @@ function createTweakersVariantCandidateReceipt(input: {
   accountsBrokerRoot: string;
   signingIdentityHash: string;
   candidatePaths: UserPaths;
+  acceptedBackendTransition?: AcceptedSharedNativeBackendTransitionLane;
+  ordinarySharedNativeBackend?: OrdinarySharedNativeBackendBinding | null;
 }): TweakersVariantCandidateReceipt {
   return {
     version: VARIANT_CANDIDATE_RECEIPT_VERSION,
@@ -1485,6 +1630,8 @@ function createTweakersVariantCandidateReceipt(input: {
       accountsBrokerRoot: input.accountsBrokerRoot,
     },
     signingIdentityHash: normalizedCandidateSigningHash(input.signingIdentityHash, "Prepared signing identity hash"),
+    ...(input.acceptedBackendTransition ? { acceptedBackendTransition: input.acceptedBackendTransition } : {}),
+    ...(input.ordinarySharedNativeBackend === undefined ? {} : {ordinarySharedNativeBackend: input.ordinarySharedNativeBackend}),
     artifacts: {
       app: fingerprintVariantGeneration(join(input.candidatePaths.root, VARIANT_CANDIDATE_ARTIFACT_PATHS.app)),
       runtime: fingerprintVariantGeneration(input.candidatePaths.runtime),
@@ -1599,6 +1746,7 @@ export function verifyTweakersVariantCandidateReceipt(
     expectedSigningIdentityHash,
     options.verifyResourceAsarIntegrity,
   );
+  if (receipt.acceptedBackendTransition) assertAcceptedSharedNativeBackendTransitionClosure(receipt.acceptedBackendTransition, appPath, join(packageRoot, "runtime"));
   return receipt;
 }
 
@@ -1610,7 +1758,7 @@ function assertTweakersVariantCandidateReceipt(
     throw new Error("Candidate receipt must be an object.");
   }
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join(",") !== "artifacts,id,identity,kind,packageIdentity,packageRoot,signingIdentityHash,source,version"
+  if (Object.keys(record).filter(key => !["acceptedBackendTransition", "ordinarySharedNativeBackend"].includes(key)).sort().join(",") !== "artifacts,id,identity,kind,packageIdentity,packageRoot,signingIdentityHash,source,version"
     || record.version !== VARIANT_CANDIDATE_RECEIPT_VERSION
     || record.kind !== "tweakers-variant-candidate"
     || typeof record.id !== "string") {
@@ -1658,6 +1806,22 @@ function assertTweakersVariantCandidateReceipt(
   const identity = assertCandidateReceiptRecord(record.identity, "Candidate receipt identity", [
     "accountsBrokerRoot", "appTarget", "appUserDataRoot", "codexHomeRoot", "userRoot",
   ]);
+  if (record.acceptedBackendTransition !== undefined) {
+    if (Object.hasOwn(record, "ordinarySharedNativeBackend")) throw new Error("Candidate has conflicting backend authority");
+    assertAcceptedSharedNativeBackendTransitionShape(record.acceptedBackendTransition);
+    const lane = record.acceptedBackendTransition;
+    if (lane.identity.target !== identity.appTarget || lane.identity.userRoot !== identity.userRoot
+      || lane.identity.brokerRoot !== identity.accountsBrokerRoot) throw new Error("Candidate backend transition identity differs from candidate identity");
+  }
+  if (Object.hasOwn(record, "ordinarySharedNativeBackend") && record.ordinarySharedNativeBackend !== null) {
+    const binding = assertCandidateReceiptRecord(record.ordinarySharedNativeBackend, "Candidate shared native registration",
+      ["registrationFingerprint", "resolverBinarySha256", "resolverProtocol"]);
+    if (typeof binding.registrationFingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(binding.registrationFingerprint)
+      || typeof binding.resolverBinarySha256 !== "string" || !/^[a-f0-9]{64}$/.test(binding.resolverBinarySha256)
+      || !["official-bundled-v1", "shared-native-overlay-v1"].includes(binding.resolverProtocol as string)) {
+      throw new Error("Candidate shared native registration authority is invalid");
+    }
+  }
   for (const key of ["appTarget", "userRoot", "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot"] as const) {
     if (typeof identity[key] !== "string" || !isAbsolute(identity[key] as string)
       || resolve(identity[key] as string) !== identity[key]) {
@@ -1683,6 +1847,8 @@ function assertTweakersVariantCandidateReceipt(
     id: record.id,
     packageRoot: expectedPackageRoot,
     packageIdentity: { dev: packageIdentity.dev as number, ino: packageIdentity.ino as number },
+    ...(record.acceptedBackendTransition ? { acceptedBackendTransition: record.acceptedBackendTransition as AcceptedSharedNativeBackendTransitionLane } : {}),
+    ...(Object.hasOwn(record, "ordinarySharedNativeBackend") ? {ordinarySharedNativeBackend: record.ordinarySharedNativeBackend as OrdinarySharedNativeBackendBinding | null} : {}),
     source: {
       path: source.path,
       physicalPath: source.physicalPath,
@@ -1793,6 +1959,7 @@ function assertCandidateReceiptSemanticBindings(
       resourcesDir: join(appRoot, "Contents", "Resources"),
       metaPath: join(appRoot, "Contents", "Info.plist"),
       platform: "darwin",
+      electronBinary: resolveMacElectronFrameworkBinary(appRoot),
     });
   }))(app);
   const plist = readPlist(join(app, "Contents", "Info.plist"));
@@ -1852,7 +2019,9 @@ function assertCandidateReceiptSemanticBindings(
     const setting = tweaks[id];
     if (!setting || typeof setting !== "object" || Array.isArray(setting)
       || (!frozenConfiguration && Object.keys(setting as Record<string, unknown>).sort().join(",") !== "enabled")
-      || ((setting as Record<string, unknown>).enabled !== true && !(id === "co.tweakers.titlebar-controls" && (setting as Record<string, unknown>).enabled === false))) {
+      || (frozenConfiguration
+        ? typeof (setting as Record<string, unknown>).enabled !== "boolean"
+        : (setting as Record<string, unknown>).enabled !== true && !(id === "co.tweakers.titlebar-controls" && (setting as Record<string, unknown>).enabled === false))) {
       throw new Error(`Candidate-only config does not enable bundled tweak ${id}.`);
     }
   }
@@ -1920,10 +2089,10 @@ function prepareFinalVariantState(
   state.appRoot = target;
   state.watcher = "none";
   writeJsonAtomic(build.stateFile, state, id, deps, "state:prepare:state");
-  enableAllBundledTweaks(build.configFile, join(userRoot, "config.json"), build.tweaks, id, deps);
+  configureBundledTweaks(build.configFile, join(userRoot, "config.json"), build.tweaks, id, deps);
 }
 
-function enableAllBundledTweaks(
+function configureBundledTweaks(
   configFile: string,
   currentConfigFile: string | null,
   tweaksRoot: string,
@@ -1945,9 +2114,11 @@ function enableAllBundledTweaks(
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { id?: unknown };
       if (typeof manifest.id !== "string") continue;
       const prior = existing[manifest.id];
+      const priorSettings = prior && typeof prior === "object" && !Array.isArray(prior)
+        ? prior as Record<string, unknown> : {};
       existing[manifest.id] = {
-        ...(prior && typeof prior === "object" && !Array.isArray(prior) ? prior as Record<string, unknown> : {}),
-        enabled: true,
+        ...priorSettings,
+        enabled: typeof priorSettings.enabled === "boolean" ? priorSettings.enabled : true,
       };
     } catch {
       // Catalog validation rejects invalid bundled manifests before promotion.
@@ -1982,6 +2153,10 @@ const VARIANT_PROMOTION_NAMES = ["runtime", "tweaks", "state.json", "config.json
 const VARIANT_IMMUTABLE_PROMOTION_NAMES = ["runtime", "tweaks", "state.json", "app"] as const;
 
 interface VariantPromotionOptions {
+  acceptedBackendTransition?: AcceptedBackendTransitionJournalBinding;
+  beforePublication?: (journal: VariantPromotionJournal) => void;
+  beforeCutover?: () => void;
+  artifactRoot:string;
   build: UserPaths;
   userRoot: string;
   target: string;
@@ -1992,13 +2167,6 @@ interface VariantPromotionOptions {
 
 type VariantPromotionName = typeof VARIANT_PROMOTION_NAMES[number];
 type VariantPromotionJournalVersion = typeof LEGACY_VARIANT_PROMOTION_JOURNAL_VERSION | typeof VARIANT_PROMOTION_JOURNAL_VERSION;
-type VariantGenerationKind = "file" | "directory";
-
-interface VariantGenerationFingerprint {
-  kind: VariantGenerationKind;
-  mode: number;
-  sha256: string;
-}
 
 interface VariantPromotionJournalEntry {
   name: VariantPromotionName;
@@ -2035,6 +2203,7 @@ interface VariantPromotionActiveReceiptEntry {
 }
 
 interface VariantPromotionJournal {
+  acceptedBackendTransition?: AcceptedBackendTransitionJournalBinding;
   version: VariantPromotionJournalVersion;
   id: string;
   userRoot: string;
@@ -2177,10 +2346,23 @@ function readVariantPromotionLockProjection(path: string): number | null {
   if (!existsNoFollow(path)) return null;
   assertPrivateRegularFile(path, "Variant transaction lock projection");
   const raw = readFileSync(path, "utf8");
-  if (!/^[1-9][0-9]*\n$/.test(raw)) {
+  const lines = raw.split("\n");
+  if (!/^[1-9][0-9]*$/.test(lines[0] ?? "")
+    || !((lines.length === 2 && lines[1] === "") || (lines.length === 3 && lines[2] === ""))) {
     throw new Error(`Variant transaction lock projection is corrupt: ${path}`);
   }
-  const pid = Number(raw.slice(0, -1));
+  if (lines.length === 3) {
+    let metadata: unknown;
+    try { metadata = JSON.parse(lines[1]!); } catch { throw new Error(`Variant transaction lock projection is corrupt: ${path}`); }
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)
+      || (metadata as {version?:unknown}).version !== 2
+      || typeof (metadata as {token?:unknown}).token !== "string"
+      || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test((metadata as {token:string}).token)
+      || !((metadata as {startedAt?:unknown}).startedAt === null || typeof (metadata as {startedAt?:unknown}).startedAt === "string")) {
+      throw new Error(`Variant transaction lock projection is corrupt: ${path}`);
+    }
+  }
+  const pid = Number(lines[0]);
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     throw new Error(`Variant transaction lock projection has an invalid owner: ${path}`);
   }
@@ -2520,9 +2702,7 @@ function stageIndependentTweakersRuntimeReadyExpectation(input: {
   if (!runtime) {
     throw new Error("Independent Tweakers promotion has no valid active runtime fingerprint for launch readiness.");
   }
-  const activePromotionReceipt = join(input.userRoot, "builds", input.promotionId, "active-receipt.json");
-  assertPrivateRegularFile(activePromotionReceipt, "Independent Tweakers staged active promotion receipt");
-  const activePromotionReceiptSha256 = fingerprintVariantGeneration(activePromotionReceipt).sha256;
+  const activePromotionReceiptSha256 = readRuntimeReadyPromotionReceiptSha256(input);
   const brokerAuthorityExpectation = assertIndependentTweakersAccountsRegistration(input.accountsBrokerRoot);
   const expectation: IndependentTweakersRuntimeReadyExpectation = {
     schemaVersion: INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION,
@@ -2548,6 +2728,23 @@ function stageIndependentTweakersRuntimeReadyExpectation(input: {
   return expectation;
 }
 
+/** A receipt rename can precede its durable phase; accept only this journal's exact receipt. */
+export function readRuntimeReadyPromotionReceiptSha256(input: {userRoot: string; target: string; promotionId: string}): string {
+  const journalPath = variantPromotionJournalPath(input.userRoot, input.promotionId);
+  assertPrivateRegularFile(journalPath, "Runtime-ready promotion journal");
+  const journal: unknown = JSON.parse(readFileSync(journalPath, "utf8"));
+  assertVariantPromotionJournal(journal, input.userRoot, input.target);
+  if (journal.id !== input.promotionId || journal.phase === "recovered") throw new Error("Runtime-ready promotion journal identity differs");
+  assertJournalFilesystemPathsAreNoFollow(journal);
+  const entry = journal.activeReceipt;
+  const receiptPath = existsNoFollow(entry.source) ? entry.source : entry.destination;
+  assertPrivateRegularFile(receiptPath, "Runtime-ready exact active promotion receipt");
+  assertArtifactPresent(receiptPath, entry.desired, "runtime-ready active receipt");
+  if (!activeReceiptEquals(JSON.parse(readFileSync(receiptPath, "utf8")), entry.expected)) throw new Error("Runtime-ready active receipt identity differs from journal");
+  if (receiptPath === entry.destination && entry.hadDestination) assertArtifactPresent(entry.archive, entry.previous!, "runtime-ready retained prior active receipt");
+  return entry.desired.sha256;
+}
+
 /**
  * Read only a regular owner-private receipt at the exact variant root.  A
  * malformed receipt deliberately reaches the verifier as data; it is never
@@ -2565,43 +2762,13 @@ export function readIndependentTweakersRuntimeReadyReceipt(userRoot: string): un
 }
 
 export function verifyIndependentTweakersRuntimeReadyReceipt(
-  expectation: IndependentTweakersRuntimeReadyExpectation,
-  value: unknown,
-  expectedPid: number,
-  expectedProcessStartToken: string,
+  expectation: IndependentTweakersRuntimeReadyExpectation, value: unknown,
+  expectedPid: number, expectedProcessStartToken: string,
 ): asserts value is IndependentTweakersRuntimeReadyReceipt {
-  assertIndependentTweakersRuntimeReadyExpectation(expectation);
-  if (!Number.isSafeInteger(expectedPid) || expectedPid <= 0) {
-    throw new Error("Independent Tweakers runtime-ready verification requires an exact new main PID.");
-  }
-  if (!isProcessStartToken(expectedProcessStartToken)) {
-    throw new Error("Independent Tweakers runtime-ready verification requires an exact process start token.");
-  }
-  assertIndependentTweakersRuntimeReadyReceipt(value);
-  const receipt = value as IndependentTweakersRuntimeReadyReceipt;
-  const currentBrokerAuthority = assertIndependentTweakersAccountsRegistration(expectation.accountsBrokerRoot);
-  if (receipt.operationId !== expectation.operationId
-    || receipt.promotionId !== expectation.promotionId
-    || receipt.activePromotionReceiptSha256 !== expectation.activePromotionReceiptSha256
-    || receipt.pid !== expectedPid
-    || receipt.processStartToken !== expectedProcessStartToken
-    || receipt.appRoot !== expectation.appRoot
-    || receipt.bundleId !== expectation.bundleId
-    || receipt.appAsarHeaderHash.toLowerCase() !== expectation.appAsarHeaderHash.toLowerCase()
-    || receipt.runtimeFingerprint.toLowerCase() !== expectation.runtimeFingerprint.toLowerCase()
-    || receipt.appUserDataRoot !== expectation.appUserDataRoot
-    || receipt.codexHomeRoot !== expectation.codexHomeRoot
-    || receipt.accountsBrokerRoot !== expectation.accountsBrokerRoot
-    || !sameBrokerAuthorityExpectation(receipt.brokerAuthorityExpectation, expectation.brokerAuthorityExpectation)
-    || !sameBrokerAuthorityExpectation(currentBrokerAuthority, expectation.brokerAuthorityExpectation)
-    || !sameRuntimeReadyAppearanceBinding(receipt.appearance, expectation.appearanceExpectation)
-    || receipt.mainInitialized !== true
-    || receipt.preloadInitialized !== true
-    || receipt.settingsMounted !== true
-    || expectation.brokerAuthorityExpectation.globalRootState !== "valid-v3"
-    || receipt.sharedHistoryBrokerState !== "connected"
-    || !sameSortedStringSet(receipt.initializedTweakIds, expectation.expectedTweakIds)) {
-    throw new Error("Independent Tweakers runtime-ready receipt does not match the prepared operation, broker authority, appearance requirement, derived-app identity, or complete tweak set.");
+  verifyRuntimeReadyReceiptBinding(expectation, value, expectedPid, expectedProcessStartToken);
+  const authority = assertIndependentTweakersAccountsRegistration(expectation.accountsBrokerRoot);
+  if (!sameBrokerAuthorityExpectation(authority, expectation.brokerAuthorityExpectation)) {
+    throw new Error("Independent Tweakers runtime-ready broker authority changed before acceptance.");
   }
 }
 
@@ -2618,7 +2785,8 @@ function assertIndependentTweakersRuntimeReadyExpectationAt(
     throw new Error("Independent Tweakers runtime-ready expectation is not valid JSON.");
   }
   assertIndependentTweakersRuntimeReadyExpectation(value);
-  if (JSON.stringify(value) !== JSON.stringify(expected)) {
+  if (JSON.stringify(value) !== JSON.stringify(expected)
+    || !sameSortedStringSet(expected.expectedTweakIds, expectedEnabledCandidateTweaks(join(userRoot, "config.json")))) {
     throw new Error("Independent Tweakers runtime-ready expectation changed before its receipt was accepted.");
   }
 }
@@ -2646,131 +2814,6 @@ function clearIndependentTweakersRuntimeReadyEvidence(userRoot: string): void {
   if (removed) fsyncPath(root);
 }
 
-function assertIndependentTweakersRuntimeReadyExpectation(
-  value: unknown,
-): asserts value is IndependentTweakersRuntimeReadyExpectation {
-  assertExactObjectKeys(value, [
-    "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "appRoot", "bundleId", "appAsarHeaderHash", "runtimeFingerprint",
-    "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot", "brokerAuthorityExpectation", "appearanceExpectation", "expectedTweakIds", "createdAt",
-  ], "Independent Tweakers runtime-ready expectation");
-  const expectation = value as Record<string, unknown>;
-  if (expectation.schemaVersion !== INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION
-    || expectation.kind !== INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND
-    || typeof expectation.operationId !== "string"
-    || typeof expectation.promotionId !== "string"
-    || !isSha256(expectation.activePromotionReceiptSha256)
-    || !isCanonicalAbsolutePath(String(expectation.appRoot ?? ""))
-    || expectation.bundleId !== TWEAKERS_VARIANT_BUNDLE_ID
-    || !isSha256(expectation.appAsarHeaderHash)
-    || !isSha256(expectation.runtimeFingerprint)
-    || !isCanonicalAbsolutePath(String(expectation.appUserDataRoot ?? ""))
-    || !isCanonicalAbsolutePath(String(expectation.codexHomeRoot ?? ""))
-    || !isCanonicalAbsolutePath(String(expectation.accountsBrokerRoot ?? ""))
-    || !isIndependentTweakersBrokerAuthorityExpectation(expectation.brokerAuthorityExpectation)
-    || !isIndependentTweakersRuntimeReadyAppearanceBinding(expectation.appearanceExpectation)
-    || !isSupportedEnabledTweakSet(expectation.expectedTweakIds)
-    || !isValidRfc3339(expectation.createdAt)) {
-    throw new Error("Independent Tweakers runtime-ready expectation has an invalid schema.");
-  }
-  assertVariantPromotionId(expectation.operationId);
-  assertVariantPromotionId(expectation.promotionId);
-}
-
-function assertIndependentTweakersRuntimeReadyReceipt(
-  value: unknown,
-): asserts value is IndependentTweakersRuntimeReadyReceipt {
-  assertExactObjectKeys(value, [
-    "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "pid", "processStartToken", "appRoot", "bundleId", "appAsarHeaderHash", "runtimeFingerprint",
-    "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot", "brokerAuthorityExpectation", "mainInitialized", "preloadInitialized",
-    "appearance", "settingsMounted", "sharedHistoryBrokerState", "initializedTweakIds", "observedAt",
-  ], "Independent Tweakers runtime-ready receipt");
-  const receipt = value as Record<string, unknown>;
-  if (receipt.schemaVersion !== INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION
-    || receipt.kind !== INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND
-    || typeof receipt.operationId !== "string"
-    || typeof receipt.promotionId !== "string"
-    || !isSha256(receipt.activePromotionReceiptSha256)
-    || !Number.isSafeInteger(receipt.pid) || (receipt.pid as number) <= 0
-    || !isProcessStartToken(receipt.processStartToken)
-    || !isCanonicalAbsolutePath(String(receipt.appRoot ?? ""))
-    || receipt.bundleId !== TWEAKERS_VARIANT_BUNDLE_ID
-    || !isSha256(receipt.appAsarHeaderHash)
-    || !isSha256(receipt.runtimeFingerprint)
-    || !isCanonicalAbsolutePath(String(receipt.appUserDataRoot ?? ""))
-    || !isCanonicalAbsolutePath(String(receipt.codexHomeRoot ?? ""))
-    || !isCanonicalAbsolutePath(String(receipt.accountsBrokerRoot ?? ""))
-    || !isIndependentTweakersBrokerAuthorityExpectation(receipt.brokerAuthorityExpectation)
-    || !isIndependentTweakersRuntimeReadyAppearanceBinding(receipt.appearance)
-    || receipt.mainInitialized !== true
-    || receipt.preloadInitialized !== true
-    || receipt.settingsMounted !== true
-    || !["connected", "blocked"].includes(String(receipt.sharedHistoryBrokerState ?? ""))
-    || !isSupportedEnabledTweakSet(receipt.initializedTweakIds)
-    || !isValidRfc3339(receipt.observedAt)) {
-    throw new Error("Independent Tweakers runtime-ready receipt has an invalid schema.");
-  }
-  assertVariantPromotionId(receipt.operationId);
-  assertVariantPromotionId(receipt.promotionId);
-}
-
-function isIndependentTweakersBrokerAuthorityExpectation(
-  value: unknown,
-): value is IndependentTweakersBrokerAuthorityExpectation {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const authority = value as Record<string, unknown>;
-  return Object.keys(authority).sort().join("\0") === ["configSha256", "globalRootState"].join("\0")
-    && ((authority.globalRootState === "absent" && authority.configSha256 === null)
-      || (authority.globalRootState === "valid-v3" && isSha256(authority.configSha256)));
-}
-
-function isIndependentTweakersRuntimeReadyAppearanceBinding(
-  value: unknown,
-): value is IndependentTweakersRuntimeReadyAppearanceBinding {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const appearance = value as Record<string, unknown>;
-  return Object.keys(appearance).sort().join("\0") === ["normalized", "status"].join("\0")
-    && appearance.status === "normal"
-    && appearance.normalized === true;
-}
-
-function sameRuntimeReadyAppearanceBinding(
-  left: IndependentTweakersRuntimeReadyAppearanceBinding,
-  right: IndependentTweakersRuntimeReadyAppearanceBinding,
-): boolean {
-  return left.status === right.status && left.normalized === right.normalized;
-}
-
-function sameBrokerAuthorityExpectation(
-  left: IndependentTweakersBrokerAuthorityExpectation,
-  right: IndependentTweakersBrokerAuthorityExpectation,
-): boolean {
-  return left.globalRootState === right.globalRootState && left.configSha256 === right.configSha256;
-}
-
-function isProcessStartToken(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && !/[\u0000-\u001f\u007f]/.test(value);
-}
-
-function sameSortedStringSet(value: unknown, expected: readonly string[]): boolean {
-  return Array.isArray(value)
-    && value.every((entry) => typeof entry === "string")
-    && value.length === expected.length
-    && [...value].sort().every((entry, index) => entry === [...expected].sort()[index]);
-}
-
-function isSha256(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
-}
-
-function isValidRfc3339(value: unknown): value is string {
-  return typeof value === "string"
-    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
-    && Number.isFinite(Date.parse(value));
-}
-
 function writeVariantPromotionJournal(
   path: string,
   journal: VariantPromotionJournal,
@@ -2795,43 +2838,6 @@ function preserveCopiedDirectoryModes(source: string, destination: string): void
   chmodSync(destination, permissionBits(sourceStat));
 }
 
-/** A deterministic no-follow hash for the staged immutable variant generations. */
-export function fingerprintVariantGeneration(path: string): VariantGenerationFingerprint {
-  const root = lstatOrNull(path);
-  if (!root || root.isSymbolicLink()) {
-    throw new Error(`Variant generation root must be present and non-symlinked: ${path}`);
-  }
-  const kind: VariantGenerationKind = root.isFile() ? "file" : root.isDirectory() ? "directory" : (() => {
-    throw new Error(`Variant generation root has an unsupported type: ${path}`);
-  })();
-  const hash = createHash("sha256");
-  hash.update("tweakers-variant-generation-v2\0");
-  const visit = (entryPath: string, name: string): void => {
-    const stat = lstatSync(entryPath);
-    const mode = permissionBits(stat);
-    hash.update(name).update("\0").update(String(mode)).update("\0");
-    if (stat.isDirectory()) {
-      hash.update("directory\0");
-      for (const entry of readdirSync(entryPath, { withFileTypes: true }).sort((left, right) => (
-        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
-      ))) {
-        visit(join(entryPath, entry.name), name ? `${name}/${entry.name}` : entry.name);
-      }
-      return;
-    }
-    if (stat.isFile()) {
-      hash.update("file\0").update(readFileSync(entryPath));
-      return;
-    }
-    if (stat.isSymbolicLink()) {
-      hash.update("symlink\0").update(readlinkSync(entryPath));
-      return;
-    }
-    throw new Error(`Variant generation contains an unsupported entry: ${entryPath}`);
-  };
-  visit(path, "");
-  return { kind, mode: permissionBits(root), sha256: hash.digest("hex") };
-}
 
 function assertFingerprint(value: unknown, label: string): asserts value is VariantGenerationFingerprint {
   if (!value || typeof value !== "object") throw new Error(`${label} is not an object.`);
@@ -2874,7 +2880,7 @@ function fsyncGeneration(path: string, deps: Pick<CreateVariantDeps, "onDurableB
   visit(path);
 }
 
-function expectedPromotionEntries(userRoot: string, target: string, id: string): Array<Pick<VariantPromotionJournalEntry,
+function expectedPromotionEntries(userRoot: string, target: string, id: string, candidate?: string): Array<Pick<VariantPromotionJournalEntry,
   "name" | "source" | "destination" | "archive" | "failed">> {
   const resolvedRoot = resolve(userRoot);
   const resolvedTarget = resolve(target);
@@ -2912,12 +2918,23 @@ function expectedPromotionEntries(userRoot: string, target: string, id: string):
     },
     {
       name: "app",
-      source: join(dirname(resolvedTarget), `.${basename(resolvedTarget)}.candidate-${id}.app`),
+      source: candidate ?? join(dirname(resolvedTarget), `.${basename(resolvedTarget)}.candidate-${id}.app`),
       destination: resolvedTarget,
       archive: join(archiveRoot, "app", basename(resolvedTarget)),
       failed: join(failedRoot, "app", basename(resolvedTarget)),
     },
   ];
+}
+
+function assertPromotionCandidatePath(userRoot: string, target: string, id: string, candidate: string): void {
+  if (candidate === join(dirname(target), `.${basename(target)}.candidate-${id}.app`)) return;
+  const managerRoot = dirname(dirname(userRoot));
+  const suffix = relative(join(managerRoot, "doctor", "jobs"), candidate);
+  if (userRoot !== join(managerRoot, "variants", "tweakers")
+    || !/^[a-f0-9-]{36}\/candidate\/Tweakers\.app$/.test(suffix)) {
+    throw new Error("Variant promotion candidate is outside its exact managed staging paths");
+  }
+  assertNoSymlinkPathWithin(managerRoot, candidate, "Reviewed promotion candidate");
 }
 
 function expectedActiveReceiptEntry(userRoot: string, id: string): Pick<VariantPromotionActiveReceiptEntry,
@@ -2997,6 +3014,37 @@ function expectedActiveReceipt(journal: Pick<VariantPromotionJournal,
   };
 }
 
+/** Strict, read-only census for historical reconciliation. Labels alone are not proof. */
+export function inspectTerminalVariantPromotionEvidence(
+  userRoot: string,
+  target: string,
+  documents: readonly { name: string; rawText: string }[],
+  activeRawText: string,
+): { activeId: string; activeReceiptSha256: string; journals: { id: string; version: number; phase: string; sha256: string }[] } {
+  const journals = documents.map(document => {
+    const value = parseManagerStrictJsonObject(document.rawText, { maxBytes: 1024 * 1024, label: "Historical promotion journal" });
+    assertVariantPromotionJournal(value, userRoot, target);
+    if (document.name !== `${value.id}.json` || !["committed", "recovered"].includes(value.phase)) {
+      throw new Error("Historical census contains an unbound or nonterminal promotion journal");
+    }
+    return { journal: value, rawText: document.rawText };
+  });
+  if (journals.length === 0 || new Set(journals.map(item => item.journal.id)).size !== journals.length) {
+    throw new Error("Historical promotion census is empty or repeats an identity");
+  }
+  const active = parseManagerStrictJsonObject(activeRawText, { maxBytes: 1024 * 1024, label: "Historical active receipt" });
+  const current = journals.find(item => item.journal.id === active.id);
+  if (!current || current.journal.phase !== "committed" || !activeReceiptEquals(active, expectedActiveReceipt(current.journal))) {
+    throw new Error("Historical active receipt is not exactly linked to a committed promotion");
+  }
+  return {
+    activeId: current.journal.id,
+    activeReceiptSha256: createHash("sha256").update(activeRawText).digest("hex"),
+    journals: journals.map(({ journal, rawText }) => ({ id: journal.id, version: journal.version, phase: journal.phase,
+      sha256: createHash("sha256").update(rawText).digest("hex") })),
+  };
+}
+
 function assertVariantPromotionJournal(
   value: unknown,
   userRoot: string,
@@ -3004,6 +3052,7 @@ function assertVariantPromotionJournal(
 ): asserts value is VariantPromotionJournal {
   assertExactObjectKeys(value, [
     "version", "id", "userRoot", "target", "candidate", "buildRoot", "phase", "entries", "activeReceipt",
+    ...((value as VariantPromotionJournal)?.acceptedBackendTransition ? ["acceptedBackendTransition"] : []),
   ], "Variant promotion journal");
   const journal = value as Record<string, unknown>;
   if ((journal.version !== VARIANT_PROMOTION_JOURNAL_VERSION
@@ -3018,6 +3067,13 @@ function assertVariantPromotionJournal(
     throw new Error("Variant promotion journal has an unsupported schema.");
   }
   assertVariantPromotionId(journal.id);
+  if (journal.acceptedBackendTransition !== undefined) {
+    const binding = journal.acceptedBackendTransition as AcceptedBackendTransitionJournalBinding;
+    assertExactObjectKeys(binding, ["lane", "operationId"], "Backend transition journal binding");
+    assertAcceptedSharedNativeBackendTransitionShape(binding.lane);
+    if (!isManagerOperationId(binding.operationId) || binding.lane.identity.target !== journal.target
+      || binding.lane.identity.userRoot !== journal.userRoot) throw new Error("Backend transition journal identity changed");
+  }
   if (!isCanonicalAbsolutePath(journal.userRoot)
     || !isCanonicalAbsolutePath(journal.target)
     || !isCanonicalAbsolutePath(journal.candidate)
@@ -3027,11 +3083,11 @@ function assertVariantPromotionJournal(
     || !variantPromotionPhaseIsKnown(journal.phase)) {
     throw new Error("Variant promotion journal does not match its exact recovery binding.");
   }
-  if (journal.buildRoot !== join(journal.userRoot, "builds", journal.id)
-    || journal.candidate !== join(dirname(journal.target), `.${basename(journal.target)}.candidate-${journal.id}.app`)) {
+  if (journal.buildRoot !== join(journal.userRoot, "builds", journal.id)) {
     throw new Error("Variant promotion journal candidate or build root is unexpected.");
   }
-  const expectedEntries = expectedPromotionEntries(journal.userRoot, journal.target, journal.id);
+  assertPromotionCandidatePath(journal.userRoot, journal.target, journal.id, journal.candidate);
+  const expectedEntries = expectedPromotionEntries(journal.userRoot, journal.target, journal.id, journal.candidate);
   if (journal.entries.length !== expectedEntries.length) {
     throw new Error("Variant promotion journal is missing a required replacement entry.");
   }
@@ -3205,8 +3261,9 @@ function activeArtifact(journal: VariantPromotionJournal): VariantPromotionArtif
 
 function recoverVariantPromotionJournal(
   journal: VariantPromotionJournal,
-  deps: Pick<CreateVariantDeps, "onDurableBoundary"> = {},
+  deps: Pick<CreateVariantDeps, "onDurableBoundary" | "backendTransitionPort"> = {},
 ): void {
+  backendTransitionJournal(journal, deps)?.assertRollbackAllowed();
   if (existsNoFollow(join(journal.buildRoot, "runtime-repair"))) {
     throw new Error("Unresolved forward runtime repair requires its exact repair operation; rollback is held.");
   }
@@ -3217,6 +3274,114 @@ function recoverVariantPromotionJournal(
   for (const entry of [...journal.entries].reverse()) {
     restoreVariantPromotionArtifact({ label: entry.name, ...entry }, deps);
   }
+}
+
+function backendTransitionJournal(journal: VariantPromotionJournal, deps: Pick<CreateVariantDeps, "backendTransitionPort"> = {}, beforePhase?: () => void): AcceptedBackendTransitionJournal | undefined {
+  return journal.acceptedBackendTransition ? new AcceptedBackendTransitionJournal({
+    journalPath: variantPromotionJournalPath(journal.userRoot, journal.id), buildRoot: journal.buildRoot,
+    promotionId: journal.id, binding: journal.acceptedBackendTransition,
+    ...(deps.backendTransitionPort ? {port: deps.backendTransitionPort} : {}),
+    ...(beforePhase ? {beforePhase} : {}),
+  }) : undefined;
+}
+
+/** Idempotent forward replay of exactly the immutable prepared generations. */
+function replayAcceptedBackendTransition(journal: VariantPromotionJournal, deps: CreateVariantDeps): void {
+  const admission = () => assertAcceptedBackendTransitionResumeAdmission(journal.target, deps);
+  const transition = backendTransitionJournal(journal, deps, admission);
+  if (!transition) throw new Error("Forward replay requires accepted backend transition authority");
+  assertJournalFilesystemPathsAreNoFollow(journal);
+  admission();
+  for (const entry of journal.entries) {
+    if (existsNoFollow(entry.source)) {
+      assertArtifactPresent(entry.source, entry.desired, `${entry.name} forward source before begin`);
+      if (existsNoFollow(entry.destination)) assertArtifactPresent(entry.destination, entry.previous!, `${entry.name} forward prior before begin`);
+    } else assertArtifactPresent(entry.destination, entry.desired, `${entry.name} forward destination before begin`);
+    if (existsNoFollow(entry.archive)) assertArtifactPresent(entry.archive, entry.previous!, `${entry.name} forward archive before begin`);
+  }
+  transition.execute("validate");
+  transition.execute("begin");
+  const phase = (value: string) => { admission(); journal.phase = value;
+    writeVariantPromotionJournal(variantPromotionJournalPath(journal.userRoot, journal.id), journal, deps);
+    if (deps.crashAfterJournalPhase?.(value)) throw new SimulatedVariantProcessDeath(value); };
+  for (const entry of journal.entries) {
+    if (existsNoFollow(entry.failed)) throw new Error("Forward replay found an app-only rollback generation");
+    const source = existsNoFollow(entry.source), destination = existsNoFollow(entry.destination), archive = existsNoFollow(entry.archive);
+    if (!source) {
+      assertArtifactPresent(entry.destination, entry.desired, `${entry.name} forward destination`);
+      if (entry.hadDestination) assertArtifactPresent(entry.archive, entry.previous!, `${entry.name} forward archive`);
+      else if (archive) throw new Error("Forward replay found an unexpected prior archive");
+      continue;
+    }
+    assertArtifactPresent(entry.source, entry.desired, `${entry.name} forward source`);
+    if (entry.hadDestination) {
+      if (archive) { assertArtifactPresent(entry.archive, entry.previous!, `${entry.name} forward archive`);
+        if (destination) throw new Error("Forward replay found conflicting source and destination generations"); }
+      else { assertArtifactPresent(entry.destination, entry.previous!, `${entry.name} prior forward destination`);
+        phase(`${entry.name}:archive-planned`); ensurePrivateDirectory(dirname(entry.archive), deps);
+        admission();
+        durableRename(entry.destination, entry.archive, deps); phase(`${entry.name}:archived`); }
+    } else if (destination || archive) throw new Error("Forward replay found an unexpected destination generation");
+    phase(`${entry.name}:promote-planned`); ensureDestinationParent(entry.destination, deps);
+    admission();
+    durableRename(entry.source, entry.destination, deps); assertArtifactPresent(entry.destination, entry.desired, `${entry.name} forward promoted`);
+    phase(`${entry.name}:promoted`);
+  }
+  // Includes every artifact, not just resolver bytes, before finish removes launch blocking.
+  for (const entry of journal.entries) assertArtifactPresent(entry.destination, entry.desired, `${entry.name} forward active generation`);
+  transition.finishPromoted(journal.target, join(journal.userRoot, "runtime"));
+  phase("app:promoted");
+}
+
+export function resumeDeferredAcceptedBackendTransition(input: {
+  userRoot: string; target: string; promotionId: string; operationId: string; expectedJournalSha256: string;
+}, deps: CreateVariantDeps = {}): DeferredTweakersVariantRefresh {
+  const {userRoot, target, promotionId, operationId} = input;
+  if (resolve(userRoot) !== userRoot || resolve(target) !== target || !isManagerOperationId(operationId)) throw new Error("Invalid forward recovery identity");
+  assertVariantPromotionId(promotionId);
+  assertAcceptedBackendTransitionResumeAdmission(target, deps);
+  const journalPath = variantPromotionJournalPath(userRoot, promotionId);
+  assertPrivateRegularFile(journalPath, "Forward recovery journal");
+  const raw = readFileSync(journalPath, "utf8");
+  if (createHash("sha256").update(raw).digest("hex") !== input.expectedJournalSha256) throw new Error("Forward recovery journal changed");
+  const journal: unknown = JSON.parse(raw);
+  assertVariantPromotionJournal(journal, userRoot, target);
+  if (journal.id !== promotionId || !journal.acceptedBackendTransition || journal.acceptedBackendTransition.operationId !== operationId
+    || ["committed", "recovered"].includes(journal.phase)) throw new Error("Forward recovery operation differs from accepted transition");
+  const lease = acquireVariantPromotionLock(userRoot, target, deps);
+  try {
+    const artifactRoot = resolve(deps.managerRoot?.() ?? canonicalTweakersManagerRoot((deps.home ?? homedir)()));
+    assertHistoricalManagerAdmission(artifactRoot, promotionId);
+    const capacity = inspectLocalArtifactCapacity(artifactRoot, target);
+    if (capacity.blockers.length || capacity.occupied > capacity.limit) throw new Error("Forward recovery requires reconciled local artifact capacity");
+    replayAcceptedBackendTransition(journal, deps);
+    assertAcceptedBackendTransitionResumeAdmission(target, deps);
+    const expected = stageIndependentTweakersRuntimeReadyExpectation({userRoot, operationId, promotionId, target,
+      appUserDataRoot: join(userRoot, "app-data"), codexHomeRoot: join(userRoot, "codex-home"),
+      accountsBrokerRoot: journal.acceptedBackendTransition.lane.identity.brokerRoot, deps});
+    let verified = false, settled = false;
+    return {target, userRoot, recoveryMode: "forward-only", runtimeReadyExpectation: expected,
+      verifyRuntimeReady(value, pid, token) { if (settled) throw new Error("Forward recovery is settled");
+        verifyIndependentTweakersRuntimeReadyReceipt(expected, value, pid, token);
+        assertIndependentTweakersRuntimeReadyExpectationAt(userRoot, expected);
+        persistManagerRuntimeAcceptance(resolve(deps.managerRoot?.() ?? canonicalTweakersManagerRoot((deps.home ?? homedir)())), expected, value, pid, token);
+        verified = true; },
+      commit() { if (settled || !verified) throw new Error("Forward recovery requires installed runtime acceptance");
+        commitPromotedVariantJournal(journal, journalPath, deps); settled = true; lease.release(); },
+      rollback() { throw new ForwardBackendTransitionRecoveryRequired(journalPath); },
+      retain() { if (!settled) { settled = true; lease.release(); } },
+    };
+  } catch (error) { lease.release(); throw new ForwardBackendTransitionRecoveryRequired(journalPath, error); }
+}
+
+/** The trusted recovery owner must retain both admission leases throughout replay. */
+export function assertAcceptedBackendTransitionResumeAdmission(target: string,
+  deps: Pick<CreateVariantDeps, "beforeRollback" | "targetProcessRunning">): void {
+  if (typeof deps.beforeRollback !== "function") throw new Error("Forward recovery requires current closed desktop and broker admission.");
+  const assertion: unknown = deps.beforeRollback();
+  if (assertion !== undefined) throw new Error("Forward recovery admission must be a synchronous assertion.");
+  const running = deps.targetProcessRunning ? deps.targetProcessRunning(target) : targetProcesses(target).length > 0;
+  if (running !== false) throw new Error("Forward recovery requires the exact desktop and helpers to be closed with known process state.");
 }
 
 function journalIdFromFileName(name: string): string | null {
@@ -3242,13 +3407,94 @@ function isExpectedJournalTemporaryFile(name: string): boolean {
   }
 }
 
+/** Finalize a retained ordinary promotion whose original process became ready after timeout.
+ * This never launches, stops, replaces, or replays an app/backend generation. */
+export async function acceptRetainedIndependentRuntimeReady(input: {
+  operationId: string; expectedPid: number; expectedProcessStartToken: string; expectedJournalSha256: string;
+}, deps: CreateVariantDeps = {}): Promise<{operationId: string; promotionId: string}> {
+  if (!isManagerOperationId(input.operationId) || !Number.isSafeInteger(input.expectedPid) || input.expectedPid <= 0
+    || !isProcessStartToken(input.expectedProcessStartToken) || !isSha256(input.expectedJournalSha256))
+    throw new Error("Invalid retained runtime acceptance identity");
+  const root = resolve(deps.managerRoot?.() ?? canonicalTweakersManagerRoot((deps.home ?? homedir)()));
+  const readEvidence = deps.retainedPromotionEvidence ?? readManagerRetainedPromotionEvidence;
+  const observe = deps.observeRetainedProcess ?? (await import("../alerts.js")).observeCodexMainProcess;
+  return withLocalOperation("accept retained runtime readiness", () => withLifecycleLock(lifecycleLockFile(root), "accept retained runtime readiness", async () => {
+    const evidence = readEvidence(root, input.operationId), {binding} = evidence;
+    if (evidence.journalSha256 !== input.expectedJournalSha256 || evidence.acceptedBackendTransition
+      || existsNoFollow(join(root, "transactions", "manager-recovery-bindings", `${input.operationId}.runtime-repair-head.json`)))
+      throw new Error("Retained acceptance requires the exact ordinary promotion");
+    const lease = acquireVariantPromotionLock(binding.userRoot, binding.target, deps);
+    try {
+      const current = readEvidence(root, input.operationId);
+      if (current.journalSha256 !== input.expectedJournalSha256) throw new Error("Retained promotion changed while acquiring ownership");
+      assertPrivateRegularFile(binding.journal.path, "Retained promotion journal");
+      const journal: unknown = JSON.parse(readFileSync(binding.journal.path, "utf8"));
+      assertVariantPromotionJournal(journal, binding.userRoot, binding.target);
+      if (journal.id !== binding.promotionId || journal.acceptedBackendTransition
+        || !["app:promoted", "active:archive-planned", "active:archived", "active:promote-planned", "active:promoted", "committed"].includes(journal.phase))
+        throw new Error("Retained promotion is not a complete ordinary generation");
+      assertJournalFilesystemPathsAreNoFollow(journal);
+      const assertProcess = () => {
+        const actual = observe(binding.target);
+        if (!actual || actual.pid !== input.expectedPid || actual.startedAtRaw !== input.expectedProcessStartToken || !actual.visibleWindow)
+          throw new Error("Retained runtime process identity changed");
+      };
+      const settle = (assertCurrent: () => void) => {
+        if (deps.settleRetainedPromotion) {
+          if (!deps.settleRetainedPromotion(root, input.operationId)) throw new Error("Retained promotion settlement failed");
+        } else {
+          if (!managerOperationRecoveryIsVerified(root, input.operationId)) throw new Error("Retained promotion has no durable runtime acceptance");
+          settleVerifiedManagerRecoveryOperations(root, undefined, undefined, {}, {operationId: input.operationId, beforeSettlement: assertCurrent});
+          if (new ManagerOperationStore(root).read(input.operationId)?.phase !== "completed") throw new Error("Retained promotion settlement failed");
+        }
+      };
+      assertProcess();
+      const path = independentTweakersRuntimeReadyExpectationPath(binding.userRoot);
+      assertPrivateRegularFile(path, "Retained runtime-ready expectation");
+      const expected: unknown = JSON.parse(readFileSync(path, "utf8"));
+      assertIndependentTweakersRuntimeReadyExpectation(expected);
+      if (expected.schemaVersion !== INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION
+        || expected.operationId !== input.operationId || expected.promotionId !== journal.id || expected.appRoot !== binding.target
+        || expected.runtimeFingerprint !== binding.generation.runtimeFingerprint
+        || expected.activePromotionReceiptSha256 !== binding.generation.activeReceiptSha256)
+        throw new Error("Retained runtime expectation differs from its operation binding");
+      const receipt = readIndependentTweakersRuntimeReadyReceipt(binding.userRoot);
+      const assertReady = () => {
+        assertProcess();
+        assertIndependentTweakersRuntimeReadyExpectationAt(binding.userRoot, expected);
+        if (JSON.stringify(readIndependentTweakersRuntimeReadyReceipt(binding.userRoot)) !== JSON.stringify(receipt)
+          || readRuntimeReadyPromotionReceiptSha256({userRoot: binding.userRoot, target: binding.target, promotionId: journal.id}) !== expected.activePromotionReceiptSha256)
+          throw new Error("Retained runtime readiness evidence changed");
+        verifyIndependentTweakersRuntimeReadyReceipt(expected, receipt, input.expectedPid, input.expectedProcessStartToken);
+      };
+      assertReady();
+      if (journal.phase === "committed") {
+        settle(assertReady);
+        return {operationId: input.operationId, promotionId: journal.id};
+      }
+      for (const entry of journal.entries) {
+        assertArtifactPresent(entry.destination, entry.desired, `${entry.name} retained active generation`);
+        if (entry.hadDestination) assertArtifactPresent(entry.archive, entry.previous!, `${entry.name} retained rollback generation`);
+      }
+      assertReady();
+      (deps.persistRetainedAcceptance ?? persistRequiredManagerRuntimeAcceptance)(root, expected, receipt, input.expectedPid, input.expectedProcessStartToken);
+      commitPromotedVariantJournal(journal, binding.journal.path, deps, assertReady);
+      settle(assertReady);
+      // Keep the original challenge as recovery evidence; the next normal update owns its cleanup.
+      return {operationId: input.operationId, promotionId: journal.id};
+    } finally { lease.release(); }
+  }));
+}
+
 /** Complete only the exact promoted generation; also handles interrupted receipt renames. */
-function commitPromotedVariantJournal(journal: VariantPromotionJournal, path: string, deps: CreateVariantDeps): void {
+function commitPromotedVariantJournal(journal: VariantPromotionJournal, path: string, deps: CreateVariantDeps, beforeMutation?: () => void): void {
+  backendTransitionJournal(journal, deps)?.assertCommitReady(journal.target, join(journal.userRoot, "runtime"));
   assertJournalFilesystemPathsAreNoFollow(journal);
   const assertGenerations = () => {
     for (const entry of journal.entries) assertArtifactPresent(entry.destination, entry.desired, `${entry.name} active generation`);
   };
   const phase = (value: string) => {
+    beforeMutation?.();
     journal.phase = value;
     writeVariantPromotionJournal(path, journal, deps);
     if (deps.crashAfterJournalPhase?.(value)) throw new SimulatedVariantProcessDeath(value);
@@ -3262,6 +3508,7 @@ function commitPromotedVariantJournal(journal: VariantPromotionJournal, path: st
       assertArtifactPresent(entry.destination, entry.previous, "active receipt before archive");
       phase("active:archive-planned");
       ensurePrivateDirectory(dirname(entry.archive), deps);
+      beforeMutation?.();
       durableRename(entry.destination, entry.archive, deps);
       phase("active:archived");
     }
@@ -3269,6 +3516,7 @@ function commitPromotedVariantJournal(journal: VariantPromotionJournal, path: st
     if (existsNoFollow(entry.destination)) throw new Error("Conflicting active receipt during commit");
     phase("active:promote-planned");
     ensurePrivateDirectory(dirname(entry.failed), deps);
+    beforeMutation?.();
     durableRename(entry.source, entry.destination, deps);
     phase("active:promoted");
   }
@@ -3276,6 +3524,53 @@ function commitPromotedVariantJournal(journal: VariantPromotionJournal, path: st
   if (entry.hadDestination) assertArtifactPresent(entry.archive, entry.previous!, "retained prior active receipt");
   assertGenerations();
   phase("committed");
+  reconcilePromotedAppRegistration(journal, deps);
+  scheduleGenerationRetentionAfterPromotion(journal, deps);
+}
+
+/**
+ * Best-effort post-commit retention of superseded generations. It is deferred
+ * until this promotion's lifecycle and operation owners finish; it never
+ * affects the commit and never runs for test or non-canonical roots.
+ */
+function scheduleGenerationRetentionAfterPromotion(journal: VariantPromotionJournal, deps: CreateVariantDeps): void {
+  if (deps.reconcileAppRegistration || resolve(journal.target) !== INDEPENDENT_TWEAKERS_TARGET) return;
+  try {
+    const root = resolve(journal.userRoot, "..", "..");
+    void import("../generation-retention.js")
+      .then((retention) => retention.scheduleGenerationRetention(root, "variant promotion committed"))
+      .catch(() => { /* Retention never affects the committed promotion. */ });
+  } catch { /* Retention never affects the committed promotion. */ }
+}
+
+const INDEPENDENT_TWEAKERS_TARGET = "/Applications/Tweakers.app";
+
+/**
+ * Best-effort post-commit identity cleanup. Stale LaunchServices entries for
+ * retired candidates share the live bundle identifier and can make the Dock
+ * show the wrong copy or the upstream ChatGPT icon. Never affects the commit.
+ */
+function reconcilePromotedAppRegistration(journal: VariantPromotionJournal, deps: CreateVariantDeps): void {
+  const app = journal.entries.find((entry) => entry.name === "app");
+  if (!app) return;
+  try {
+    if (deps.reconcileAppRegistration) {
+      deps.reconcileAppRegistration(app.destination);
+      return;
+    }
+    if ((deps.platform?.() ?? process.platform) !== "darwin" || resolve(app.destination) !== INDEPENDENT_TWEAKERS_TARGET) return;
+    const result = reconcileVariantLaunchServices({ appRoot: app.destination, bundleId: TWEAKERS_VARIANT_BUNDLE_ID });
+    // The embedded Manager shares one identifier across every retired runtime
+    // generation; stale copies keep the pre-rename "Tweakers Doctor" name.
+    const manager = reconcileVariantLaunchServices({
+      appRoot: join(app.destination, "Contents", "Resources", "tweakers", "native", "Tweakers Manager.app"),
+      bundleId: `${TWEAKERS_VARIANT_BUNDLE_ID}.doctor`,
+    });
+    const failed = [...result.failed, ...manager.failed];
+    if (failed.length) console.warn(kleur.yellow(`Tweakers app registration cleanup was incomplete: ${failed.map((failure) => failure.path).join(", ")}`));
+  } catch (error) {
+    console.warn(kleur.yellow(`Tweakers app registration cleanup was skipped: ${String((error as Error)?.message ?? error)}`));
+  }
 }
 
 export interface CombinedTweakersAppRepair {
@@ -3472,7 +3767,7 @@ export function prepareDeferredTweakersRuntimeRepair(
     assertArtifactPresent(combined.sourceAppRoot, combined.expectedSourceAppFingerprint, "combined repair signed source app");
     if (backendHash(combined.sourceAppRoot) !== combined.expectedResolverBinarySha256) throw new Error("Combined repair signed backend fingerprint mismatch");
     verifyCreatedVariant(combined.sourceAppRoot, join(userRoot, "state.json"), join(userRoot, "app-data"),
-      join(userRoot, "codex-home"), brokerRoot, deps, true, target);
+      join(userRoot, "codex-home"), brokerRoot, deps, "configured", target);
     const state = JSON.parse(readFileSync(join(userRoot, "state.json"), "utf8"));
     assertCandidateAppSigningIdentity(combined.sourceAppRoot, join(userRoot, "state.json"), state.signingIdentityHash, candidateReceiptSignatureAdapter(deps));
     resolverAction("validate");
@@ -3484,6 +3779,9 @@ export function prepareDeferredTweakersRuntimeRepair(
     const journalPath = variantPromotionJournalPath(userRoot, pendingPromotionId);
     assertNoSymlinkPathWithin(userRoot, journalPath, "Runtime repair journal");
     assertPrivateRegularFile(journalPath, "Runtime repair journal");
+    const initialJournal: unknown = JSON.parse(readFileSync(journalPath, "utf8"));
+    assertVariantPromotionJournal(initialJournal, userRoot, target);
+    if (initialJournal.acceptedBackendTransition) throw new ForwardBackendTransitionRecoveryRequired(journalPath);
     const buildRoot = join(userRoot, "builds", pendingPromotionId);
     const chainRoot = join(buildRoot, "runtime-repair");
     const chain = readRuntimeRepairChain(options);
@@ -3526,7 +3824,10 @@ export function prepareDeferredTweakersRuntimeRepair(
       assertVariantPromotionJournal(journal, userRoot, target);
       assertJournalFilesystemPathsAreNoFollow(journal);
       if (journal.id !== pendingPromotionId || journal.phase !== "app:promoted") throw new Error("Runtime repair requires an app:promoted transaction");
-      for (const entry of journal.entries) assertArtifactPresent(entry.destination, entry.desired, `${entry.name} before runtime repair`);
+      for (const entry of journal.entries) {
+        if (entry.name === "config.json") assertPrivateRegularFile(entry.destination, "Runtime repair mutable configuration");
+        else assertArtifactPresent(entry.destination, entry.desired, `${entry.name} before runtime repair`);
+      }
       assertArtifactPresent(journal.activeReceipt.source, journal.activeReceipt.desired, "staged receipt before runtime repair");
       assertPrivateRegularFile(expectationPath, "Runtime repair old challenge");
       intent = { version: 2, priorRepairFingerprint: head?.fingerprint ?? null, request, journal: journalBytes,
@@ -3565,6 +3866,12 @@ export function prepareDeferredTweakersRuntimeRepair(
         fingerprintVariantGeneration(join(oldAppRoot, "Contents", "Resources", "app.asar")), "combined repair unchanged desktop archive");
     }
     for (const entry of original.entries.filter((entry) => entry.name !== "runtime" && !(combined && entry.name === "app"))) {
+      // Settings remain mutable during provisional operation, just as at commit.
+      // The fresh challenge below binds the restored/current enabled tweak set.
+      if (entry.name === "config.json") {
+        assertPrivateRegularFile(entry.destination, "Runtime repair mutable configuration");
+        continue;
+      }
       assertArtifactPresent(entry.destination, entry.desired, `${entry.name} during runtime repair`);
     }
     const oldRoot = existsNoFollow(priorRuntime) ? priorRuntime : runtime.destination;
@@ -3573,6 +3880,10 @@ export function prepareDeferredTweakersRuntimeRepair(
       throw new Error("Runtime repair old runtime challenge drift");
     }
     const repaired: VariantPromotionJournal = JSON.parse(intent.journal);
+    // Bind the current private settings into this repair, so further settings
+    // changes still fail closed before acceptance rather than using stale flags.
+    const repairedConfig = repaired.entries.find((entry) => entry.name === "config.json");
+    if (repairedConfig) repairedConfig.desired = fingerprintVariantGeneration(repairedConfig.destination);
     repaired.entries.find((entry) => entry.name === "runtime")!.desired = options.expectedSourceRuntimeFingerprint;
     if (combined) repaired.entries.find((entry) => entry.name === "app")!.desired = combined.expectedSourceAppFingerprint;
     repaired.activeReceipt.expected = expectedActiveReceipt(repaired);
@@ -3581,6 +3892,7 @@ export function prepareDeferredTweakersRuntimeRepair(
     const expectation: IndependentTweakersRuntimeReadyExpectation = {
       ...oldExpectation, operationId, activePromotionReceiptSha256: repaired.activeReceipt.desired.sha256,
       runtimeFingerprint: sourceEvidence.fingerprint.toLowerCase(), createdAt: intent.createdAt,
+      expectedTweakIds: expectedEnabledCandidateTweaks(join(userRoot, "config.json")),
     };
     assertIndependentTweakersRuntimeReadyExpectation(expectation);
     const current = JSON.parse(readFileSync(journalPath, "utf8"));
@@ -3605,6 +3917,16 @@ export function prepareDeferredTweakersRuntimeRepair(
     if (!String(currentPhase).startsWith("active:")) {
       if (active.hadDestination) assertArtifactPresent(active.destination, active.previous!, "prior active receipt during repair");
       else if (existsNoFollow(active.destination)) throw new Error("Unexpected active receipt during repair");
+    }
+    if (combined) {
+      const artifactRoot = resolve(deps.managerRoot?.() ?? canonicalTweakersManagerRoot((deps.home ?? homedir)()));
+      const capacity = inspectLocalArtifactCapacity(artifactRoot, target);
+      if (capacity.blockers.length || capacity.occupied > 2) throw new Error("Combined repair app capacity requires reconciliation before staging");
+      // A prepared source is already a local copy. A second staging copy needs
+      // its own free slot; never let a repair bypass the two-copy admission rule.
+      if (!existsNoFollow(priorApp) && !existsNoFollow(nextApp)) {
+        reserveLocalArtifact(artifactRoot, target, [nextApp]);
+      }
     }
     ensurePrivateDirectory(chainRoot, deps);
     if (repairRoot !== chainRoot) ensurePrivateDirectory(join(chainRoot, "operations"), deps);
@@ -3658,6 +3980,7 @@ export function prepareDeferredTweakersRuntimeRepair(
       }
       if (!existsNoFollow(nextRuntime)) {
         cpSync(sourceRuntimeRoot, nextRuntime, { recursive: true, dereference: false, errorOnExist: true, force: false });
+        preserveCopiedDirectoryModes(sourceRuntimeRoot, nextRuntime);
         fsyncGeneration(nextRuntime, deps);
       }
       assertArtifactPresent(nextRuntime, options.expectedSourceRuntimeFingerprint, "staged repair runtime");
@@ -3719,6 +4042,7 @@ export function prepareDeferredTweakersRuntimeRepair(
       verifyRuntimeReady(value, pid, processStartToken) {
         assertPending();
         verifyIndependentTweakersRuntimeReadyReceipt(expectation, value, pid, processStartToken);
+        persistManagerRuntimeAcceptance(dirname(dirname(userRoot)), expectation, value, pid, processStartToken);
         verified = true;
       },
       commit() {
@@ -3736,10 +4060,37 @@ export function prepareDeferredTweakersRuntimeRepair(
 }
 
 /** Recover an interrupted variant promotion only when its exact target is supplied by the caller. */
+/** Retain failed readiness evidence without leaving its old challenge active. */
+function archiveRecoveredRuntimeReadyEvidence(journal: VariantPromotionJournal, deps: Pick<CreateVariantDeps, "onDurableBoundary">): void {
+  for (const name of [INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_FILE, INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE]) {
+    const path = join(journal.userRoot, name);
+    if (!existsNoFollow(path)) continue;
+    assertPrivateRegularFile(path, "Recovered runtime-ready evidence");
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    if (value?.promotionId !== journal.id) continue;
+    if (name === INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_FILE) assertIndependentTweakersRuntimeReadyExpectation(value);
+    else assertIndependentTweakersRuntimeReadyReceipt(value);
+    if (value.appRoot !== journal.target || value.activePromotionReceiptSha256 !== journal.activeReceipt.desired.sha256) {
+      throw new Error("Recovered runtime-ready evidence has a different generation binding");
+    }
+    for (const entry of [...journal.entries, { name: "active receipt", ...journal.activeReceipt }]) {
+      if (entry.name === "config.json") continue; // User settings remain mutable.
+      if (entry.previous) assertArtifactPresent(entry.destination, entry.previous, `${entry.name} recovered generation`);
+      else if (existsNoFollow(entry.destination)) throw new Error("Recovered generation unexpectedly remains installed");
+    }
+    const archiveRoot = join(journal.buildRoot, "failed-promotion");
+    ensurePrivateDirectory(archiveRoot, deps);
+    const archive = join(archiveRoot, name);
+    if (existsNoFollow(archive)) throw new Error("Recovered runtime-ready archive already exists");
+    durableRename(path, archive, deps);
+  }
+}
+
 export function recoverInterruptedTweakersVariantPromotions(
   userRoot: string,
   expectedTarget?: string,
-  deps: Pick<CreateVariantDeps, "onDurableBoundary" | "targetProcessRunning"> = {},
+  deps: Pick<CreateVariantDeps, "onDurableBoundary" | "targetProcessRunning" | "managerRoot" | "home" | "backendTransitionPort"> = {},
+  expectedTransactionID?: string,
 ): void {
   const resolvedRoot = resolve(userRoot);
   const root = variantPromotionJournalRoot(resolvedRoot);
@@ -3771,32 +4122,82 @@ export function recoverInterruptedTweakersVariantPromotions(
     assertVariantPromotionJournal(journal, resolvedRoot, expectedTarget);
     assertJournalFilesystemPathsAreNoFollow(journal);
     if (journal.id !== id) throw new Error("Variant promotion journal file name does not match its transaction ID.");
-    if (journal.phase === "committed" || journal.phase === "recovered") continue;
+    if (expectedTransactionID !== undefined && journal.id !== expectedTransactionID) continue;
+    if (journal.phase === "committed") continue;
+    if(journal.phase==="app:promoted"&&journal.acceptedBackendTransition
+      &&(authenticateSupersededAcceptedRuntimeRepairPromotion(resolvedRoot,journal.id,journal.acceptedBackendTransition.operationId)
+        ||authenticateSettledAcceptedRuntimeRepairPromotion(resolvedRoot,journal.id,journal.acceptedBackendTransition.operationId)))continue;
+    if (journal.phase === "recovered") {
+      if (expectedTarget !== undefined) {
+        assertTargetNotRunning(expectedTarget, deps);
+        archiveRecoveredRuntimeReadyEvidence(journal, deps);
+      }
+      continue;
+    }
     if (expectedTarget === undefined) {
       throw new Error("An interrupted variant promotion requires an exact target path before recovery.");
     }
     assertTargetNotRunning(expectedTarget, deps);
+    if (journal.acceptedBackendTransition) {
+      try { backendTransitionJournal(journal, deps)!.assertRollbackAllowed(); }
+      catch (error) { throw new ForwardBackendTransitionRecoveryRequired(path, error); }
+    }
     recoverVariantPromotionJournal(journal, deps);
+    const artifactRoot=resolve(deps.managerRoot?.()??canonicalTweakersManagerRoot((deps.home??homedir)()));
+    if(existsSync(join(artifactRoot,"local-artifact-reservations.json")))reconcileLocalArtifactPromotion(artifactRoot,variantPromotionJournalPath(userRoot,journal.id),journal.entries.find(e=>e.name==="app")!,fingerprintVariantGeneration);
     journal.phase = "recovered";
     writeVariantPromotionJournal(path, journal, deps);
+    archiveRecoveredRuntimeReadyEvidence(journal, deps);
   }
 }
 
+/**
+ * Chromium's crash reporter daemonizes (parent pid 1) and can outlive the app
+ * by hours. Once no other process runs from the target, those detached
+ * reporters are the only thing left and would block every promotion. Retire
+ * them politely; anything else still running keeps promotion refused.
+ */
 function isExactTargetAppProcessRunning(target: string): boolean {
-  const result = spawnSync("/bin/ps", ["-axo", "command="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error("Unable to inspect the exact Tweakers target process before promotion.");
+  const crashReporter = /\/Helpers\/(?:browser_)?crashpad_handler(?:\s|$)/;
+  let running = targetProcesses(target);
+  const orphanedReporters = running.filter((entry) => entry.ppid === 1 && crashReporter.test(entry.command));
+  if (orphanedReporters.length === 0 || orphanedReporters.length !== running.length) return running.length > 0;
+  for (const reporter of orphanedReporters) { try { process.kill(reporter.pid, "SIGTERM"); } catch { /* already gone */ } }
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    running = targetProcesses(target);
+    if (running.length === 0) return false;
+    spawnSync("/bin/sleep", ["0.2"]);
   }
-  const exactRoot = `${resolve(target)}/`;
-  return `${result.stdout ?? ""}`.split("\n").some((line) => line.trimStart().startsWith(exactRoot));
+  return targetProcesses(target).length > 0;
 }
 
 function assertTargetNotRunning(target: string, deps: CreateVariantDeps): void {
   if ((deps.targetProcessRunning ?? isExactTargetAppProcessRunning)(target)) {
     throw new Error("Refusing variant promotion while the exact Tweakers target app or helper process is running.");
+  }
+}
+
+/** Compensation must not clear evidence or publications until current admission
+ * and a read-only census prove the exact desktop and helpers are closed. */
+export function assertDeferredTweakersVariantRollbackAdmission(
+  target: string,
+  deps: Pick<CreateVariantDeps, "beforeRollback" | "targetProcessRunning"> = {},
+): void {
+  if (resolve(target) === INDEPENDENT_TWEAKERS_TARGET) {
+    if (typeof deps.beforeRollback !== "function") {
+      throw new Error("Production deferred Tweakers rollback requires current closed desktop and broker admission.");
+    }
+    const assertion: unknown = deps.beforeRollback();
+    if (assertion !== undefined) {
+      throw new Error("Deferred Tweakers rollback admission must be a synchronous assertion.");
+    }
+  }
+  const running = deps.targetProcessRunning
+    ? deps.targetProcessRunning(target)
+    : targetProcesses(target).length > 0;
+  if (running !== false) {
+    throw new Error("Refusing deferred rollback while the exact Tweakers target app or helper process is running or its state is unknown.");
   }
 }
 
@@ -3812,6 +4213,8 @@ class VariantPromotion {
   readonly #journalPath: string;
   readonly #journal: VariantPromotionJournal;
   #committed = false;
+  get journalPath(): string { return this.#journalPath; }
+  assertRollbackAllowed(): void { backendTransitionJournal(this.#journal, this.options.deps)?.assertRollbackAllowed(); }
 
   constructor(private readonly options: VariantPromotionOptions) {
     assertVariantPromotionId(options.id);
@@ -3834,6 +4237,7 @@ class VariantPromotion {
       buildRoot: resolve(options.build.root),
       phase: "prepared",
       entries,
+      ...(options.acceptedBackendTransition ? {acceptedBackendTransition: options.acceptedBackendTransition} : {}),
     } satisfies Omit<VariantPromotionJournal, "activeReceipt">;
     const receipt = expectedActiveReceipt(base);
     const activePaths = expectedActiveReceiptEntry(base.userRoot, base.id);
@@ -3851,11 +4255,21 @@ class VariantPromotion {
     assertVariantPromotionJournal(this.#journal, options.userRoot, options.target);
     assertJournalFilesystemPathsAreNoFollow(this.#journal);
     this.persistPhase("prepared");
+    options.beforePublication?.(this.#journal);
+    backendTransitionJournal(this.#journal, options.deps)?.prepare();
+    updateLocalOperationPhase("promotion prepared",this.#journalPath);
+    bindLocalArtifactPromotion(options.artifactRoot,this.#journalPath,this.#journal.entries.find(e=>e.name==="app")!);
   }
 
   promote(): void {
     assertJournalFilesystemPathsAreNoFollow(this.#journal);
     assertTargetNotRunning(this.options.target, this.options.deps);
+    this.options.beforeCutover?.();
+    if (this.#journal.acceptedBackendTransition) for (const entry of this.#journal.entries) {
+      assertArtifactPresent(entry.source, entry.desired, `${entry.name} staged generation before resolver begin`);
+    }
+    backendTransitionJournal(this.#journal, this.options.deps)?.execute("begin");
+    this.options.deps.fault?.("backend-transition:begun");
     assertAccountsTransferRuntimeCompatible(this.options.build.runtime, accountsTransferBrokerRoots(this.options.userRoot, this.options.candidate));
     for (const [point, path] of [
       ["promotion:prepare:archive", this.#archiveRoot],
@@ -3866,6 +4280,12 @@ class VariantPromotion {
     }
     this.persistPhase("promoting");
     for (const entry of this.#journal.entries) this.replace(entry);
+    if (this.#journal.acceptedBackendTransition) for (const entry of this.#journal.entries) {
+      assertArtifactPresent(entry.destination, entry.desired, `${entry.name} active generation before resolver finish`);
+    }
+    backendTransitionJournal(this.#journal, this.options.deps)?.finishPromoted(this.options.target, join(this.options.userRoot, "runtime"));
+    this.options.deps.fault?.("backend-transition:finished");
+    reconcileLocalArtifactPromotion(this.options.artifactRoot,this.#journalPath,this.#journal.entries.find(e=>e.name==="app")!,fingerprintVariantGeneration);
   }
 
   commit(): void {
@@ -3880,6 +4300,7 @@ class VariantPromotion {
       assertTargetNotRunning(this.options.target, this.options.deps);
       recoverVariantPromotionJournal(this.#journal, this.options.deps);
       this.persistPhase("recovered");
+      reconcileLocalArtifactPromotion(this.options.artifactRoot,this.#journalPath,this.#journal.entries.find(e=>e.name==="app")!,fingerprintVariantGeneration);
       return [];
     } catch (error) {
       return [error];
@@ -3887,7 +4308,7 @@ class VariantPromotion {
   }
 
   private entries(): VariantPromotionJournalEntry[] {
-    return expectedPromotionEntries(this.options.userRoot, this.options.target, this.options.id).map((entry) => {
+    return expectedPromotionEntries(this.options.userRoot, this.options.target, this.options.id, this.options.candidate).map((entry) => {
       if (!existsNoFollow(entry.source)) throw new Error(`Variant build is missing ${entry.name}`);
       const hadDestination = existsNoFollow(entry.destination);
       return {
@@ -3963,8 +4384,9 @@ function verifyCreatedVariant(
   expectedCodexHomeRoot: string,
   expectedAccountsBrokerRoot: string,
   deps: CreateVariantDeps,
-  expectEnabled: boolean,
+  expectEnabled: boolean | "configured",
   expectedStateAppRoot = target,
+  allowLegacyUnusedDictionarySeal = false,
 ): void {
   const verified = (deps.verify ?? verifySignature)(target);
   if (!verified.ok) throw new Error(`Created variant failed signature verification: ${verified.output}`);
@@ -3973,7 +4395,8 @@ function verifyCreatedVariant(
       resourcesDir: join(appRoot, "Contents", "Resources"),
       metaPath: join(appRoot, "Contents", "Info.plist"),
       platform: "darwin",
-    });
+      electronBinary: resolveMacElectronFrameworkBinary(appRoot),
+    }, { allowLegacyUnusedSlot: allowLegacyUnusedDictionarySeal });
   }))(target);
   const plist = readPlist(join(target, "Contents", "Info.plist"));
   if (plist.CFBundleIdentifier !== TWEAKERS_VARIANT_BUNDLE_ID) {
@@ -4054,8 +4477,10 @@ function verifyCreatedVariant(
   }
   if (expectEnabled) {
     const config = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8")) as { tweaks?: Record<string, { enabled?: unknown }> };
-    if ([...REQUIRED_TWEAKERS_TWEAKS].some((id) => config.tweaks?.[id]?.enabled !== true && !(id === "co.tweakers.titlebar-controls" && config.tweaks?.[id]?.enabled === false))) {
-      throw new Error("Created variant did not enable every bundled tweak.");
+    if ([...REQUIRED_TWEAKERS_TWEAKS].some((id) => expectEnabled === "configured"
+      ? typeof config.tweaks?.[id]?.enabled !== "boolean"
+      : config.tweaks?.[id]?.enabled !== true && !(id === "co.tweakers.titlebar-controls" && config.tweaks?.[id]?.enabled === false))) {
+      throw new Error(expectEnabled === "configured" ? "Installed fallback has invalid tweak settings." : "Created variant did not enable every bundled tweak.");
     }
   }
 }
@@ -4139,9 +4564,261 @@ export function setDoctorCandidateTitlebarEnabled(packageRoot: string, expected:
 }
 
 function isSupportedEnabledTweakSet(value: unknown): boolean {
-  return sameSortedStringSet(value, [...REQUIRED_TWEAKERS_TWEAKS]) || sameSortedStringSet(value, [...REQUIRED_TWEAKERS_TWEAKS].filter(id => id !== "co.tweakers.titlebar-controls"));
+  return Array.isArray(value) && new Set(value).size === value.length
+    && value.every(id => typeof id === "string" && (REQUIRED_TWEAKERS_TWEAKS as ReadonlySet<string>).has(id));
 }
 function expectedEnabledCandidateTweaks(configPath: string): string[] {
+  assertPrivateRegularFile(configPath, "Independent Tweakers configuration");
   const config = JSON.parse(readFileSync(configPath, "utf8"));
-  return [...REQUIRED_TWEAKERS_TWEAKS].filter(id => id !== "co.tweakers.titlebar-controls" || config.tweaks?.[id]?.enabled !== false).sort();
+  if (!config || typeof config !== "object" || Array.isArray(config)
+    || !config.tweaks || typeof config.tweaks !== "object" || Array.isArray(config.tweaks)) {
+    throw new Error("Independent Tweakers configuration is invalid.");
+  }
+  return [...REQUIRED_TWEAKERS_TWEAKS].filter(id => {
+    const setting = config.tweaks[id];
+    if (!setting || typeof setting !== "object" || Array.isArray(setting)
+      || typeof setting.enabled !== "boolean") {
+      throw new Error("Independent Tweakers enabled tweak configuration is invalid.");
+    }
+    return setting?.enabled !== false;
+  }).sort();
+}
+
+/** A committed installation must independently prove the recovery closure before its older rollback retires. */
+export function verifyInstalledVariantFallback(root:string):{id:string;fingerprints:unknown;recoveryVerified:true} {
+  return verifyInstalledVariantFallbackWithRepair(root);
+}
+
+function verifyInstalledVariantFallbackWithRepair(root: string, prepareRepair?: { root: string }): {id:string;fingerprints:unknown;recoveryVerified:true} {
+  if(root!==canonicalTweakersManagerRoot())throw new Error("Fallback verification requires the canonical manager root");
+  const variant=join(root,"variants/tweakers"),app="/Applications/Tweakers.app";
+  const receipt=JSON.parse(readFileSync(join(variant,"transactions/variant-promotion/active.json"),"utf8"));
+  if(receipt.version===4) {
+    const originalPath=join(variant,"transactions","variant-promotion",`${receipt.id}.json`);
+    assertPrivateRegularFile(originalPath,"Installed repair original promotion journal");
+    const original=JSON.parse(readFileSync(originalPath,"utf8"));
+    assertVariantPromotionJournal(original,variant,app);
+    if(original.id!==receipt.id||original.phase!=="app:promoted"||!original.acceptedBackendTransition
+      ||!authenticateSettledAcceptedRuntimeRepairPromotion(variant,original.id,original.acceptedBackendTransition.operationId))
+      throw new Error("Installed repaired fallback is not committed and settled");
+    const child=readAuthenticatedAcceptedRuntimeRepair(original.acceptedBackendTransition.operationId);
+    if(!child||child.phase!=="committed"||JSON.stringify(child.effectiveActiveReceipt)!==JSON.stringify(receipt))
+      throw new Error("Installed repaired fallback receipt differs from authenticated child");
+  }
+  if((receipt.version!==3&&receipt.version!==4)||receipt.userRoot!==variant||receipt.target!==app||!Array.isArray(receipt.entries))throw new Error("Installed fallback has no committed generation receipt");
+  const expected=new Map([["app",app],["runtime",join(variant,"runtime")],["tweaks",join(variant,"tweaks")],["state.json",join(variant,"state.json")]]);
+  if(receipt.entries.length!==expected.size)throw new Error("Incomplete installed fallback receipt");
+  const fingerprints = [];
+  for(const entry of receipt.entries){
+    if(expected.get(entry.name)!==entry.path)throw new Error("Fallback receipt path changed");
+    expected.delete(entry.name);assertLocalExecutionPath(entry.path);assertFingerprint(entry.fingerprint,"Installed fallback");
+    const actual = fingerprintVariantGeneration(entry.path);
+    if(!fingerprintsMatch(actual,entry.fingerprint)) {
+      if(entry.name!=="app")throw new Error(`Variant promotion Installed fallback fingerprint changed: ${entry.path}`);
+      const binding: InstalledMetadataRepairBinding = {root,variantRoot:variant,target:app,promotionId:receipt.id,original:entry.fingerprint,inode:lstatSync(app).ino};
+      if(prepareRepair) {
+        // Publication below repeats this projection after signature/runtime/recovery verification.
+        prepareInstalledMetadataRepair(binding,prepareRepair.root);
+      } else if(!fingerprintsMatch(actual,verifyInstalledMetadataRepair(binding)))throw new Error("Installed metadata repair fingerprint changed");
+    }
+    fingerprints.push({...entry,fingerprint:actual});
+  }
+  // An installed fallback retains user toggle choices; fresh-install defaults
+  // are not an integrity requirement. The complete signed payload is checked.
+  verifyCreatedVariant(app,join(variant,"state.json"),join(variant,"app-data"),join(variant,"codex-home"),defaultTweakersAccountsBrokerRoot(),{},"configured",app,true);
+  const state=JSON.parse(readFileSync(join(variant,"state.json"),"utf8"));
+  assertCandidateAppSigningIdentity(app,join(variant,"state.json"),state.signingIdentityHash,candidateReceiptSignatureAdapter({}));
+  assertAccountsTransferRuntimeCompatible(join(variant,"runtime"),[defaultTweakersAccountsBrokerRoot()]);
+  if(!verifyProbedAccountsTransferRecovery(join(variant,"runtime")))throw new Error("Installed fallback recovery dependencies do not verify");
+  return {id:receipt.id,fingerprints,recoveryVerified:true};
+}
+
+/** Recover a completed alias repair without changing the original promotion receipts. */
+export async function recordInstalledVariantMetadataRepair(root: string, repairRoot: string): Promise<void> {
+  if(root!==canonicalTweakersManagerRoot())throw new Error("Metadata repair requires the canonical manager root");
+  await withLocalOperation("verify installed alias repair", async () => {
+    const variant=join(root,"variants/tweakers"),target="/Applications/Tweakers.app";
+    const lock=acquireVariantPromotionLock(variant,target,{});
+    try {
+      const receipt=JSON.parse(readFileSync(join(variant,"transactions/variant-promotion/active.json"),"utf8"));
+      const app=receipt.entries?.find((entry: {name:string})=>entry.name==="app");
+      if(!app)throw new Error("Installed app has no promotion fingerprint");
+      const reservation=readReservations(root).find(entry=>entry.state==="installed"&&entry.paths.length===1&&entry.paths[0]===target
+        &&entry.transactionRef===join(variant,"transactions/variant-promotion",`${receipt.id}.json`));
+      if(!reservation?.generationIdentity||!reservation.generationFingerprint||!fingerprintsMatch(reservation.generationFingerprint as VariantGenerationFingerprint,app.fingerprint))throw new Error("Metadata repair has no original installed artifact identity");
+      recordInstalledMetadataRepair({root,variantRoot:variant,target,promotionId:receipt.id,original:app.fingerprint,inode:reservation.generationIdentity.ino},repairRoot,
+        ()=>{verifyInstalledVariantFallbackWithRepair(root,{root:repairRoot});});
+      verifyInstalledVariantFallback(root);
+    } finally {lock.release();}
+  });
+}
+
+/** Reconcile a remount only after installation and any metadata repair verify. */
+export async function reconcileInstalledVariantArtifactIdentity(root: string): Promise<string[]> {
+  if(root!==canonicalTweakersManagerRoot())throw new Error("Artifact reconciliation requires the canonical manager root");
+  return withLocalOperation("reconcile verified installed artifact identity",async()=>{
+    const variant=join(root,"variants/tweakers"),target="/Applications/Tweakers.app";
+    const lock=acquireVariantPromotionLock(variant,target,{});
+    try {
+      verifyInstalledVariantFallback(root);
+      const receipt=JSON.parse(readFileSync(join(variant,"transactions/variant-promotion/active.json"),"utf8"));
+      const changed=reconcileArtifactDeviceIdentities(root,fingerprintVariantGeneration,(path,original)=>{
+        if(path!==target)throw new Error("Metadata repair is only valid for the installed app");
+        assertFingerprint(original,"Artifact original fingerprint");
+        return verifyInstalledMetadataRepair({root,variantRoot:variant,target,promotionId:receipt.id,original,inode:lstatSync(target).ino});
+      });
+      publishLocalArtifactSnapshot(root,inspectLocalArtifactCapacity(root,target));
+      return changed;
+    } finally {lock.release();}
+  });
+}
+
+/** A retained authenticated repair is history, not permission to accept a new generation. */
+export function assertTweakRefreshHistorySettled(
+  userRoot: string,
+  journal: { id: string; phase: string; acceptedBackendTransition?: { operationId: string } },
+  authenticateHistorical: (root: string, promotionId: string, operationId: string) => boolean = (root, promotionId, operationId) =>
+    authenticateSupersededAcceptedRuntimeRepairPromotion(root, promotionId, operationId)
+      || authenticateSettledAcceptedRuntimeRepairPromotion(root, promotionId, operationId),
+): void {
+  if (["committed", "recovered"].includes(journal.phase)) return;
+  if (journal.phase === "app:promoted" && journal.acceptedBackendTransition
+    && authenticateHistorical(userRoot, journal.id, journal.acceptedBackendTransition.operationId)) return;
+  throw new Error("Pending variant promotion must finish before a tweak refresh");
+}
+
+export function assertTweakRefreshHistoryDocumentSettled(
+  userRoot: string,
+  target: string,
+  document: { name: string; rawText: string },
+): void {
+  const journal = parseManagerStrictJsonObject(document.rawText, { maxBytes: 1024 * 1024, label: "Tweak refresh promotion journal" });
+  assertVariantPromotionJournal(journal, userRoot, target);
+  assertJournalFilesystemPathsAreNoFollow(journal);
+  if (document.name !== `${journal.id}.json`) throw new Error("Tweak refresh journal file name does not match its transaction ID");
+  assertTweakRefreshHistorySettled(userRoot, journal);
+}
+
+/** Publish only a reviewed tweak payload while retaining the exact verified app and runtime. */
+export async function promoteVerifiedTweakRefresh(input: {
+  managerRoot: string; sourceTweaks: string; expectedTweaksFingerprint: VariantGenerationFingerprint;
+  settingsRepair?: { sourceRuntime: string; files: Array<{
+    name: "preload.js" | "preload/settings-injector.js" | "preload/settings-injector.js.map";
+    before: VariantGenerationFingerprint; after: VariantGenerationFingerprint;
+  }> };
+}): Promise<{ id: string; target: string; rollback: string }> {
+  const root = input.managerRoot, target = "/Applications/Tweakers.app";
+  if (root !== canonicalTweakersManagerRoot()) throw new Error("Tweak refresh requires the canonical manager root");
+  assertFingerprint(input.expectedTweaksFingerprint, "Reviewed tweak payload");
+  assertLocalExecutionPath(input.sourceTweaks);
+  assertFingerprintAt(input.sourceTweaks, input.expectedTweaksFingerprint, "Reviewed tweak payload");
+  const variant = join(root, "variants/tweakers");
+  validateTweakRefreshOwners(join(variant, "tweaks"), input.sourceTweaks);
+  return withLocalOperation("promote verified tweak-only generation", async () => withLifecycleLock(lifecycleLockFile(root), "promote verified tweak-only generation", async () => {
+    assertLifecycleReceiptsIdle(root);
+    const lock = acquireVariantPromotionLock(variant, target, {});
+    let promotion: VariantPromotion | null = null;
+    try {
+      assertTargetNotRunning(target, {});
+      for (const name of readdirSync(variantPromotionJournalRoot(variant))) {
+        if (name === "active.json") continue;
+        const path = join(variantPromotionJournalRoot(variant), name);
+        assertPrivateRegularFile(path, "Variant promotion journal");
+        assertTweakRefreshHistoryDocumentSettled(variant, target, { name, rawText: readFileSync(path, "utf8") });
+      }
+      const fallback = verifyInstalledVariantFallback(root);
+      if (input.settingsRepair) {
+        const names = input.settingsRepair.files.map(file => file.name).sort();
+        if (JSON.stringify(names) !== JSON.stringify(["preload.js", "preload/settings-injector.js", "preload/settings-injector.js.map"])) throw new Error("Settings repair requires the exact compiled preload payload");
+        assertLocalExecutionPath(input.settingsRepair.sourceRuntime);
+        for (const file of input.settingsRepair.files) {
+          assertFingerprintAt(join(variant, "runtime", file.name), file.before, "Reviewed settings preimage");
+          assertFingerprintAt(join(input.settingsRepair.sourceRuntime, file.name), file.after, "Reviewed settings repair");
+        }
+      }
+      await prepareLocalArtifactSlot(root, target);
+      if (JSON.stringify(verifyInstalledVariantFallback(root)) !== JSON.stringify(fallback)) throw new Error("Installed fallback changed during preparation");
+      const id = randomUUID(), build = variantBuildPaths(join(variant, "builds", id));
+      const candidate = join(dirname(target), `.${basename(target)}.candidate-${id}.app`);
+      reserveLocalArtifact(root, target, [candidate, join(build.root, "failed-promotion/app/Tweakers.app")]);
+      ensurePrivateDirectory(build.root, {});
+      for (const [source, destination] of [
+        [target, candidate], [join(variant, "runtime"), build.runtime],
+        [join(variant, "state.json"), build.stateFile], [join(variant, "config.json"), build.configFile],
+      ]) copyReviewedVariantArtifact(source!, destination!, fingerprintVariantGeneration(source!));
+      copyReviewedVariantArtifact(input.sourceTweaks, build.tweaks, input.expectedTweaksFingerprint);
+      for (const file of input.settingsRepair?.files ?? []) {
+        const source = join(input.settingsRepair!.sourceRuntime, file.name);
+        const destination = join(build.runtime, file.name);
+        assertFingerprintAt(destination, file.before, "Settings candidate preimage");
+        unlinkSync(destination);
+        copyReviewedVariantArtifact(source, destination, file.after);
+      }
+      if (input.settingsRepair) {
+        unlinkSync(join(build.runtime, "accounts-transfer-recovery.v1.json"));
+        writeFileSync(join(build.runtime, "runtime-fingerprint.json"), `${JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(build.runtime) }, null, 2)}\n`);
+        if (!readRuntimeFingerprintEvidence(build.runtime)) throw new Error("Settings repair runtime fingerprint did not verify");
+        prepareProbedAccountsTransferRecovery(build.runtime, join(root, "accounts-recovery", id));
+      }
+      if (!verifyProbedAccountsTransferRecovery(build.runtime)) throw new Error("Candidate recovery dependencies did not verify");
+      assertFingerprintAt(input.sourceTweaks, input.expectedTweaksFingerprint, "Reviewed tweak payload before promotion");
+      if (JSON.stringify(verifyInstalledVariantFallback(root)) !== JSON.stringify(fallback)) throw new Error("Installed fallback changed before promotion");
+      verifyCreatedVariant(candidate, build.stateFile, join(variant, "app-data"), join(variant, "codex-home"), defaultTweakersAccountsBrokerRoot(), {}, "configured", target);
+      promotion = new VariantPromotion({ artifactRoot: root, build, userRoot: variant, target, candidate, id, deps: {} });
+      promotion.promote();
+      verifyCreatedVariant(target, join(variant, "state.json"), join(variant, "app-data"), join(variant, "codex-home"), defaultTweakersAccountsBrokerRoot(), {}, "configured");
+      promotion.commit();
+      return { id, target, rollback: join(variant, "previous", id, "app/Tweakers.app") };
+    } catch (error) {
+      const rollbackErrors = promotion?.rollback() ?? [];
+      if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "Tweak refresh rollback requires recovery");
+      throw error;
+    } finally { lock.release(); }
+  }));
+}
+
+/** Undo only the exact committed UI refresh after failed installed acceptance. */
+export async function rollbackVerifiedUiRefresh(id: string, expectedJournalSha256: string): Promise<void> {
+  assertVariantPromotionId(id);
+  if (!isSha256(expectedJournalSha256)) throw new Error("Rollback requires an exact journal hash");
+  const root = canonicalTweakersManagerRoot(), variant = join(root, "variants/tweakers"), target = "/Applications/Tweakers.app";
+  await withLocalOperation("restore verified UI fallback", async () => withLifecycleLock(lifecycleLockFile(root), "restore verified UI fallback", async () => {
+    assertLifecycleReceiptsIdle(root);
+    const lock = acquireVariantPromotionLock(variant, target, {});
+    try {
+      assertTargetNotRunning(target, {});
+      const path = variantPromotionJournalPath(variant, id), bytes = readFileSync(path);
+      if (createHash("sha256").update(bytes).digest("hex") !== expectedJournalSha256) throw new Error("Rollback journal changed");
+      const journal = JSON.parse(bytes.toString());
+      assertVariantPromotionJournal(journal, variant, target);
+      assertJournalFilesystemPathsAreNoFollow(journal);
+      if (journal.phase !== "committed") throw new Error("Rollback requires the exact committed refresh");
+      for (const entry of journal.entries) {
+        assertFingerprintAt(entry.destination, entry.desired, "Rejected active generation");
+        if (!entry.previous) throw new Error("Rollback has no prior generation");
+        assertFingerprintAt(entry.archive, entry.previous, "Retained fallback generation");
+      }
+      assertFingerprintAt(journal.activeReceipt.destination, journal.activeReceipt.desired, "Current receipt");
+      const runtime = journal.entries.find(entry => entry.name === "runtime")!;
+      if (!verifyProbedAccountsTransferRecovery(runtime.archive)) throw new Error("Retained recovery dependencies do not verify");
+      recoverVariantPromotionJournal(journal);
+      journal.phase = "recovered";
+      writeVariantPromotionJournal(path, journal, {});
+      reconcileLocalArtifactPromotion(root, path, journal.entries.find(entry => entry.name === "app")!, fingerprintVariantGeneration);
+      verifyInstalledVariantFallback(root);
+    } finally { lock.release(); }
+  }));
+}
+
+export function validateTweakRefreshOwners(current: string, source: string): void {
+  const owners = (root: string): string[] => readdirSync(root).filter(name => !name.startsWith(".")).map(name => {
+    const path = join(root, name);
+    if (!lstatSync(path).isDirectory() || lstatSync(path).isSymbolicLink()) throw new Error("Tweak refresh requires regular owned folders");
+    const manifestPath = join(path, "manifest.json");
+    if (!lstatSync(manifestPath).isFile() || lstatSync(manifestPath).isSymbolicLink()) throw new Error("Unsafe tweak refresh manifest");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (typeof manifest.id !== "string" || typeof manifest.version !== "string") throw new Error("Invalid tweak refresh manifest");
+    return `${name}\0${manifest.id}`;
+  }).sort();
+  if (JSON.stringify(owners(current)) !== JSON.stringify(owners(source))) throw new Error("Tweak refresh cannot change installed owners");
 }

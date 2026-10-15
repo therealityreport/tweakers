@@ -225,6 +225,12 @@ function bootstrapProtectedApp(options = {}) {
   // UI-on uses the same passed protected preflight as UI-off. Only after that
   // PASS may it load the digest-bound reviewed runtime before OpenAI main.
   loadReviewedRuntime(metadata, authorityRoot);
+  // Runtime lane selection and later login-shell collection cannot replace a
+  // backend whose exact bytes were authorized by the protected preflight.
+  process.env.CODEX_CLI_PATH = environment.CODEX_CLI_PATH;
+  Object.defineProperty(globalThis, "__tweakersVerifiedBackendPathV1", {
+    value: environment.CODEX_CLI_PATH, writable: false, configurable: false,
+  });
   if (typeof options.loadMain === "function") return options.loadMain(originalMain, receipt);
   return require(originalMain);
 }

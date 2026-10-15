@@ -20,9 +20,16 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       - run: node scripts/verify-release.mjs
       - run: npm run sync:tweaks -- --check
       - run: npm run check:public-history
+      - run: npm run check:tweak-catalog
+      - run: npm run audit -- --audit-level=high
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run typecheck:tests
       - run: npm test
       - run: npm run build
       - name: Verify committed fixed-action manager artifacts without signing
@@ -35,7 +42,7 @@ jobs:
             store/index.json \
             packages/installer/assets/runtime \
             ':(exclude)packages/installer/assets/runtime/native/tweaker_native_host.node' \
-            ':(exclude)packages/installer/assets/runtime/native/Tweakers Doctor.app/Contents/MacOS/Tweakers Doctor' \
+            ':(exclude)packages/installer/assets/runtime/native/Tweakers Manager.app/Contents/MacOS/Tweakers Manager' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/app-launcher/Tweakers App Launcher' \
             ':(exclude)packages/installer/assets/runtime/.manager-support/swap-helper/Tweakers Swap Helper.app/Contents/MacOS/Tweakers Swap Helper' \
             ':(exclude)packages/installer/assets/runtime/runtime-fingerprint.json' \

@@ -190,6 +190,8 @@ test("tweakerPaths reports paths without creating them", () => {
     selfUpdateStateFile: join(home, "self-update-state.json"),
     binDir: join(home, "bin"),
     logDir: join(home, "log"),
+    transactionRoot: join(home, "transactions", "app-install"),
+    transactionStateFile: join(home, "transactions", "app-install.json"),
   };
 
   try {
@@ -300,5 +302,7 @@ function fakeUserPaths(root: string): UserPaths {
     selfUpdateStateFile: join(root, "self-update-state.json"),
     binDir: join(root, "bin"),
     logDir: join(root, "log"),
+    transactionRoot: join(root, "transactions", "app-install"),
+    transactionStateFile: join(root, "transactions", "app-install.json"),
   };
 }

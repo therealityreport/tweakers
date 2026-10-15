@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,18 +14,38 @@ import {
   codexSourceTransactionPaths,
   createGitHubJsonFetcher,
   createProductionCodexSourceBuildAdapter,
+  signCodexSourceBackendPair,
   freezeCodexSourceCandidate,
   prepareCodexSourceCandidate,
+  probeInstalledBundledCodexVersion,
   readValidatedBundledDerivedArtifact,
   selectLastKnownGoodCodexSourceFallback,
   selectLastKnownGoodBundledFallback,
   type CodexSourceBuildEvidence,
 } from "../src/commands/codex-source.ts";
 import type { CodexDerivedReceipt, CodexResolutionCheckpoint } from "../src/codex-derived-receipt.ts";
+import type { GitHubJsonRequest } from "../src/codex-source-release.ts";
 
 const published = "2026-07-19T12:00:00.000Z";
 const commit = "a".repeat(40);
 const digest = (scope: string) => ({ algorithm: "sha256" as const, value: "d".repeat(64), scope });
+
+for (const layout of ["Contents/Resources/codex", "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"]) {
+  test(`bundled source version probe resolves the exact native backend layout ${layout}`, { skip: process.platform !== "darwin" }, () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-layout-probe-"));
+    try {
+      const app = join(root, "Codex.app");
+      mkdirSync(join(app, "Contents"), { recursive: true });
+      writeFileSync(join(app, "Contents/Info.plist"), '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.openai.codex</string><key>CFBundleName</key><string>Codex</string></dict></plist>');
+      const backend = join(app, layout);
+      mkdirSync(dirname(backend), { recursive: true });
+      writeFileSync(backend, '#!/bin/sh\nprintf "codex-cli 0.162.0-alpha.17.2\\n"\n');
+      chmodSync(backend, 0o755);
+      assert.equal(probeInstalledBundledCodexVersion(app), "0.162.0-alpha.17.2");
+      assert.throws(() => probeInstalledBundledCodexVersion(join(root, "Missing.app")), /Exact Codex app path/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
 
 test("source-derived Cargo work is thermally bounded while preserving its environment", () => {
   const env = codexSourceCargoEnvironment({
@@ -38,22 +58,56 @@ test("source-derived Cargo work is thermally bounded while preserving its enviro
   assert.equal(env.CARGO_BUILD_JOBS, "2");
 });
 
+test("source backend signing uses the distinct helper signer and rejects its posture failure", () => {
+  const identity = { name: "Developer ID Application: Example (ABCDEFGHIJ)", hash: "a".repeat(40), created: false };
+  const events: string[] = [];
+  const deps = {
+    signBackend: (path: string, received: typeof identity) => { assert.equal(received, identity); events.push(`backend:${path}`); },
+    signHelper: (path: string, received: typeof identity) => { assert.equal(received, identity); events.push(`helper:${path}`); },
+    assertHelperPosture: (path: string) => { events.push(`posture:${path}`); },
+  };
+  signCodexSourceBackendPair("/private/codex", "/private/codex-code-mode-host", identity, deps);
+  assert.deepEqual(events, ["backend:/private/codex", "helper:/private/codex-code-mode-host", "posture:/private/codex-code-mode-host"]);
+  assert.throws(() => signCodexSourceBackendPair("/private/codex", "/private/codex-code-mode-host", identity,
+    { ...deps, assertHelperPosture: () => { throw new Error("invalid helper posture"); } }), /invalid helper posture/);
+});
+
+test("ordinary source desktop staging rejects missing helper posture before candidate allocation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-helper-posture-"));
+  try {
+    const frontend = join(root, "frontend");
+    mkdirSync(frontend);
+    const backend = join(root, "codex"), helper = join(root, "codex-code-mode-host");
+    writeFileSync(backend, "backend fixture"); writeFileSync(helper, "unsigned helper fixture");
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const adapter = createProductionCodexSourceBuildAdapter({ transactionRoot: root, transactionId: "helper-posture",
+      frontendSourceApp: frontend, finalUserRoot: root, patchSeries: [fileURLToPath(import.meta.url)], dependencies: [], buildOnly: false });
+    const evidence = { compiledBackend: { binaryPath: backend, codeModeHostPath: helper },
+      candidateBinary: { version: "0.162.0-alpha.17.2", digests: [
+        { scope: "derived candidate binary", algorithm: "sha256", value: digest("backend fixture") },
+        { scope: "derived candidate code-mode helper", algorithm: "sha256", value: digest("unsigned helper fixture") },
+      ] } } as unknown as CodexSourceBuildEvidence;
+    assert.ok(adapter.stageDesktopCandidate);
+    await assert.rejects(() => adapter.stageDesktopCandidate!(evidence), /helper signing posture/);
+    assert.equal(existsSync(adapter.paths.candidateApp), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("CLI source resolution defaults to the exact installed desktop-bundled backend", async () => {
   const output: string[] = [];
   const result = await codexSource("resolve", { json: true }, {
     root: () => "/tmp/tweakers-codex-source-test",
     probeBundledVersion: () => "0.145.0-alpha.18",
-    fetchJson: async (request) => {
+    fetchJson: async <T = unknown>(request: GitHubJsonRequest) => {
       assert.equal(request.url.endsWith("/releases/tags/rust-v0.145.0-alpha.18"), true);
-      return { status: 200, data: release("rust-v0.145.0-alpha.18", true) };
+      return { status: 200, data: release("rust-v0.145.0-alpha.18", true) as T };
     },
     resolveTag: async (tag) => ({ tag, refSha: commit, tagObjectShas: [], peeledCommit: commit }),
     fetchNpmVersions: async () => ["0.145.0-alpha.18", "0.145.0-alpha.24"],
     now: () => published,
     print: (value) => output.push(value),
   });
-  assert.equal(result?.kind, "codex-source-resolution");
-  if (!result || result.kind !== "codex-source-resolution") return;
+  assert.ok(result && "kind" in result && result.kind === "codex-source-resolution");
   assert.equal(result.channel, "bundled");
   assert.equal(result.checkpoint.resolvedTag, "rust-v0.145.0-alpha.18");
   assert.equal(result.npm.status, "corroborated");
@@ -87,7 +141,7 @@ test("R1/R2 prepare and in-window R3 freeze keep the bundled tag commit exact", 
     ];
     let time = 0;
     const common = {
-      fetchJson: async () => ({ status: 200, data: release("rust-v0.145.0-alpha.18", true) }),
+      fetchJson: async <T = unknown>() => ({ status: 200, data: release("rust-v0.145.0-alpha.18", true) as T }),
       resolveTag: async (tag: string) => ({ tag, refSha: commit, tagObjectShas: [], peeledCommit: commit }),
       fetchNpmVersions: async () => ["0.145.0-alpha.18", "0.145.0-alpha.24"],
       now: () => times[Math.min(time++, times.length - 1)]!,

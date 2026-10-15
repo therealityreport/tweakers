@@ -22,6 +22,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { inspectLocalArtifactCapacity, readReservations, releaseEmptyLocalArtifactReservation } from "../src/local-artifacts";
+import { withLocalOperation } from "../src/local-operation";
 import { readPlist, writePlist } from "../src/plist";
 import {
   REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS,
@@ -39,12 +41,21 @@ import {
 } from "../src/macos-variant";
 import {
   createTweakersVariant,
+  acceptRetainedIndependentRuntimeReady,
+  validateTweakRefreshOwners,
+  assertTweakRefreshHistorySettled,
+  assertTweakRefreshHistoryDocumentSettled,
   copyReviewedVariantArtifact,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_EXPECTATION_KIND,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND,
   INDEPENDENT_TWEAKERS_RUNTIME_READY_SCHEMA_VERSION,
+  INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE,
+  assertDeferredTweakersVariantRollbackAdmission,
   prepareDeferredTweakersVariantRefresh,
   prepareDeferredTweakersRuntimeRepair,
+  resumeDeferredAcceptedBackendTransition,
+  assertAcceptedBackendTransitionResumeAdmission,
+  readRuntimeReadyPromotionReceiptSha256,
   readTweakersRuntimeRepairHead,
   fingerprintVariantGeneration,
   recoverInterruptedTweakersVariantPromotions,
@@ -164,8 +175,18 @@ test("runtime-ready proof binds process identity, Settings mount, exact broker a
       receipt.pid,
       receipt.processStartToken,
     ),
-    /invalid schema/,
+    /complete tweak set/,
   );
+  const enabled = BUNDLED_TWEAK_IDS.filter(id => !["co.tweakers.followup", "co.tweakers.user-questions"].includes(id));
+  assert.doesNotThrow(() => verifyIndependentTweakersRuntimeReadyReceipt(
+    { ...expectation, expectedTweakIds: enabled }, { ...receipt, initializedTweakIds: enabled }, receipt.pid, receipt.processStartToken,
+  ));
+  for (const ids of [[...enabled, enabled[0]], [...enabled, "unknown.tweak"]]) {
+    assert.throws(() => verifyIndependentTweakersRuntimeReadyReceipt(
+      { ...expectation, expectedTweakIds: enabled }, { ...receipt, initializedTweakIds: ids }, receipt.pid, receipt.processStartToken,
+    ), /invalid schema/);
+  }
+
 });
 
 test("runtime-ready proof requires the prepared global-v3 broker connection and rejects byte drift", () => {
@@ -287,6 +308,12 @@ test("verified runtime-ready evidence keeps its challenge through the pre-commit
   const root = mkdtempSync(join(tmpdir(), "tweakers-runtime-ready-interruption-"));
   try {
     const fixture = createFixture(root, "runtime-ready-interruption");
+    const configPath = join(fixture.userRoot, "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.tweaks ??= {};
+    config.tweaks["co.tweakers.followup"] = { enabled: false };
+    config.tweaks["co.tweakers.user-questions"] = { enabled: false };
+    writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
     const oldGeneration = activeGenerationSnapshot(fixture);
     const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
       source: fixture.source,
@@ -325,6 +352,19 @@ test("verified runtime-ready evidence keeps its challenge through the pre-commit
       observedAt: "2026-09-03T12:00:01.000Z",
     };
 
+    assert.deepEqual(expectation.expectedTweakIds, BUNDLED_TWEAK_IDS.filter(id => !["co.tweakers.followup", "co.tweakers.user-questions"].includes(id)).sort());
+    const currentConfig = readFileSync(configPath, "utf8");
+    const changedConfig = JSON.parse(currentConfig);
+    changedConfig.tweaks["co.tweakers.followup"].enabled = true;
+    writeFileSync(configPath, JSON.stringify(changedConfig));
+    assert.throws(() => deferred.verifyRuntimeReady(receipt, receipt.pid, receipt.processStartToken), /expectation changed/);
+    for (const malformed of [{}, undefined]) {
+      const missingFlag = JSON.parse(currentConfig);
+      missingFlag.tweaks["co.tweakers.projects"] = malformed;
+      writeFileSync(configPath, JSON.stringify(missingFlag));
+      assert.throws(() => deferred.verifyRuntimeReady(receipt, receipt.pid, receipt.processStartToken), /configuration is invalid/);
+    }
+    writeFileSync(configPath, currentConfig);
     deferred.verifyRuntimeReady(receipt, receipt.pid, receipt.processStartToken);
 
     assert.equal(existsSync(expectationPath), true, "verification alone must not consume the manager challenge");
@@ -356,9 +396,17 @@ test("forward runtime repair retains the provisional app, resumes a swap, and re
     deferred.retain();
     const journalPath = join(fixture.userRoot, "transactions", "variant-promotion", "forward-repair.json");
     const originalJournal = readFileSync(journalPath);
+    const configPath = join(fixture.userRoot, "config.json");
+    const restoredConfig = JSON.parse(readFileSync(configPath, "utf8"));
+    restoredConfig.tweaks["co.tweakers.account-switcher"].enabled = false;
+    restoredConfig.tweakUpdateChecks = { preserved: true };
+    writeFileSync(configPath, JSON.stringify(restoredConfig), { mode: 0o600 });
     const appBefore = fingerprintVariantGeneration(fixture.target);
     const sourceRuntimeRoot = join(root, "repaired-runtime");
     cpSync(join(fixture.userRoot, "runtime"), sourceRuntimeRoot, { recursive: true });
+    chmodSync(sourceRuntimeRoot, 0o700);
+    mkdirSync(join(sourceRuntimeRoot, "private-nested"), { mode: 0o700 });
+    writeFileSync(join(sourceRuntimeRoot, "private-nested", "state.js"), "private runtime payload", { mode: 0o600 });
     writeFileSync(join(sourceRuntimeRoot, "main.js"), "fixed startup handshake\n");
     writeFileSync(join(sourceRuntimeRoot, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(sourceRuntimeRoot) }));
     const options = {
@@ -383,8 +431,13 @@ test("forward runtime repair retains the provisional app, resumes a swap, and re
     const repaired = prepareDeferredTweakersRuntimeRepair(options, fixture.deps);
     assert.deepEqual(fingerprintVariantGeneration(fixture.target), appBefore);
     assert.equal(readFileSync(join(fixture.userRoot, "runtime", "main.js"), "utf8"), "fixed startup handshake\n");
+    assert.equal(lstatSync(join(fixture.userRoot, "runtime")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(fixture.userRoot, "runtime", "private-nested")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(fixture.userRoot, "runtime", "private-nested", "state.js")).mode & 0o777, 0o600);
     assert.throws(() => repaired.commit(), /accepted fresh runtime-ready/);
     const expectation = repaired.runtimeReadyExpectation;
+    assert.equal(expectation.expectedTweakIds.includes("co.tweakers.account-switcher"), false);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), restoredConfig);
     assert.notEqual(expectation.runtimeFingerprint, oldExpectation.runtimeFingerprint);
     assert.notEqual(expectation.activePromotionReceiptSha256, oldExpectation.activePromotionReceiptSha256);
     const receipt = {
@@ -487,110 +540,75 @@ test("successive runtime repairs chain legacy and v2 evidence without overwritin
   }
 });
 
-test("combined forward repair resumes app, runtime and resolver transitions before fresh acceptance", async () => {
-  for (const interrupted of ["resolver-blocked", "old-app-retained", "new-app-promoted", "old-runtime-retained", "resolver-published", "resolver-finished"]) {
-    const root = mkdtempSync(join(tmpdir(), "tweakers-combined-repair-"));
-    try {
-      const fixture = createFixture(root, "combined-repair");
-      const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
-        source: fixture.source, app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "initial-operation",
-      }, { ...fixture.deps, installApp: async (options) => {
-        await installRuntimeReadyCandidateFixture(options);
-        const statePath = options.candidateContext!.paths.stateFile;
-        const state = JSON.parse(readFileSync(statePath, "utf8"));
-        state.signingIdentityHash = fixture.signingHash;
-        writeFileSync(statePath, `${JSON.stringify(state)}\n`);
-        writeFileSync(join(options.app!, "Contents", "Resources", "codex"), "original backend\n", { mode: 0o755 });
-        const framework = join(options.app!, "Contents", "Frameworks", "RepairFixture.framework");
-        mkdirSync(join(framework, "Versions", "A"), { recursive: true });
-        writeFileSync(join(framework, "Versions", "A", "RepairFixture"), "framework fixture\n");
-        symlinkSync("A", join(framework, "Versions", "Current"));
-        symlinkSync("Versions/Current/RepairFixture", join(framework, "RepairFixture"));
-      } }));
-      const oldExpectation = deferred.runtimeReadyExpectation;
-      deferred.retain();
-      const journalPath = join(fixture.userRoot, "transactions", "variant-promotion", "combined-repair.json");
-      let priorRepairFingerprint: string | undefined;
-      if (interrupted === "resolver-blocked") {
-        const earlierSource = join(root, "earlier-runtime");
-        cpSync(join(fixture.userRoot, "runtime"), earlierSource, { recursive: true });
-        writeFileSync(join(earlierSource, "main.js"), "earlier runtime repair\n");
-        writeFileSync(join(earlierSource, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(earlierSource) }));
-        const earlier = prepareDeferredTweakersRuntimeRepair({ userRoot: fixture.userRoot, target: fixture.target,
-          pendingPromotionId: "combined-repair", operationId: "earlier-operation", sourceRuntimeRoot: earlierSource,
-          expectedSourceRuntimeFingerprint: fingerprintVariantGeneration(earlierSource),
-          expectedJournalSha256: createHash("sha256").update(readFileSync(journalPath)).digest("hex") }, fixture.deps);
-        earlier.retain();
-        priorRepairFingerprint = readTweakersRuntimeRepairHead({ userRoot: fixture.userRoot, target: fixture.target, pendingPromotionId: "combined-repair" })!.fingerprint;
-      }
-      const oldApp = fingerprintVariantGeneration(fixture.target);
-      const oldRuntime = fingerprintVariantGeneration(join(fixture.userRoot, "runtime"));
-      const sourceRuntimeRoot = join(root, "next-runtime");
-      const sourceAppRoot = join(root, "next-app.app");
-      cpSync(join(fixture.userRoot, "runtime"), sourceRuntimeRoot, { recursive: true });
-      cpSync(fixture.target, sourceAppRoot, { recursive: true, verbatimSymlinks: true });
-      chmodSync(join(sourceAppRoot, "Contents", "Resources", "tweakers"), 0o700);
-      writeFileSync(join(sourceRuntimeRoot, "main.js"), "combined runtime\n");
-      writeFileSync(join(sourceRuntimeRoot, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(sourceRuntimeRoot) }));
-      writeFileSync(join(sourceAppRoot, "Contents", "Resources", "codex"), "optimized backend\n");
-      const resolverSha = createHash("sha256").update("optimized backend\n").digest("hex");
-      const priorResolverSha = createHash("sha256").update("original backend\n").digest("hex");
-      const operationId = "combined-operation";
-      const options = { userRoot: fixture.userRoot, target: fixture.target, pendingPromotionId: "combined-repair", operationId,
-        ...(priorRepairFingerprint ? { expectedPriorRepairFingerprint: priorRepairFingerprint } : {}),
-        expectedJournalSha256: createHash("sha256").update(readFileSync(journalPath)).digest("hex"),
-        sourceRuntimeRoot, expectedSourceRuntimeFingerprint: fingerprintVariantGeneration(sourceRuntimeRoot),
-        combinedApp: { sourceAppRoot, expectedSourceAppFingerprint: fingerprintVariantGeneration(sourceAppRoot),
-          expectedResolverBinarySha256: resolverSha, resolverPlan: { fixture: "signed-plan" }, expectedResolverPlanFingerprint: `sha256:${"a".repeat(64)}` } };
-      const binding = { operationId, promotionId: options.pendingPromotionId, journalSha256: options.expectedJournalSha256,
-        priorRepairFingerprint: priorRepairFingerprint ?? null, appFingerprintSha256: options.combinedApp.expectedSourceAppFingerprint.sha256,
-        runtimeFingerprintSha256: options.expectedSourceRuntimeFingerprint.sha256 };
-      let blocked = false; let published = false; let completed = false; let registrationDrift = false;
-      const deps = { ...fixture.deps, runtimeRepairResolverPort: {
-        executeSharedNativeResolverTransitionAtRootV1(input: { action: "validate" | "begin" | "publish" | "finish" }) {
-          if (registrationDrift) return { state: "blocked", reason: "resolver CAS mismatch" };
-          if (input.action === "begin" && !completed) blocked = true;
-          if (input.action === "publish") { assert.ok(blocked || completed); published = true; }
-          if (input.action === "finish") { assert.ok(published); blocked = false; completed = true; }
-          return { state: { validate: "validated", begin: "begun", publish: "published", finish: "finished" }[input.action],
-            binding, priorResolverBinarySha256: priorResolverSha, resolverBinarySha256: resolverSha };
-        },
-      } };
-      assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, { ...deps, targetProcessRunning: () => true }), /target app.*running/);
-      assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, { ...deps, verify: () => ({ ok: false, output: "bad candidate signature" }) }), /signature/);
-      assert.throws(() => prepareDeferredTweakersRuntimeRepair({ ...options, combinedApp: { ...options.combinedApp, expectedResolverBinarySha256: "0".repeat(64) } }, deps), /backend fingerprint/);
-      registrationDrift = true;
-      assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, deps), /resolver CAS mismatch/);
-      registrationDrift = false;
-      assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, { ...deps,
-        fault(point) { if (point === `runtime-repair:${interrupted}`) throw new Error("combined interruption"); },
-      }), /combined interruption/);
-      assert.equal(blocked, interrupted !== "resolver-finished");
-      assert.throws(() => recoverInterruptedTweakersVariantPromotions(fixture.userRoot, fixture.target, fixture.deps), /forward runtime repair/);
-      const repair = prepareDeferredTweakersRuntimeRepair(options, deps);
-      assert.equal(blocked, false); assert.equal(published, true);
-      const repairRoot = join(fixture.userRoot, "builds", "combined-repair", "runtime-repair", "operations", operationId);
-      assert.deepEqual(fingerprintVariantGeneration(join(repairRoot, "prior-app.app")), oldApp);
-      assert.deepEqual(fingerprintVariantGeneration(join(repairRoot, "prior-runtime")), oldRuntime);
-      assert.deepEqual(fingerprintVariantGeneration(fixture.target), options.combinedApp.expectedSourceAppFingerprint);
-      assert.equal(lstatSync(join(fixture.target, "Contents", "Resources", "tweakers")).mode & 0o777, 0o700);
-      assert.equal(readlinkSync(join(fixture.target, "Contents", "Frameworks", "RepairFixture.framework", "Versions", "Current")), "A");
-      assert.equal(readlinkSync(join(fixture.target, "Contents", "Frameworks", "RepairFixture.framework", "RepairFixture")), "Versions/Current/RepairFixture");
-      assert.throws(() => repair.commit(), /accepted fresh runtime-ready/);
-      const expectation = repair.runtimeReadyExpectation;
-      const receipt: Record<string, unknown> = { ...expectation, kind: INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND,
-        pid: 518, processStartToken: "Thu Sep  3 08:00:03 2026", appearance: expectation.appearanceExpectation,
-        mainInitialized: true, preloadInitialized: true, settingsMounted: true, sharedHistoryBrokerState: "connected",
-        initializedTweakIds: [...expectation.expectedTweakIds], observedAt: "2026-09-03T12:00:04.000Z" };
-      delete receipt.appearanceExpectation; delete receipt.expectedTweakIds; delete receipt.createdAt;
-      assert.throws(() => repair.verifyRuntimeReady({ ...receipt, activePromotionReceiptSha256: oldExpectation.activePromotionReceiptSha256 }, 518, receipt.processStartToken as string), /receipt/);
-      repair.verifyRuntimeReady(receipt, 518, receipt.processStartToken as string);
-      repair.commit();
-      assert.equal(readJournalPhase(fixture, "combined-repair"), "committed");
-      assert.deepEqual(fingerprintVariantGeneration(fixture.target), options.combinedApp.expectedSourceAppFingerprint);
-      assert.deepEqual(fingerprintVariantGeneration(join(repairRoot, "prior-app.app")), oldApp);
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  }
+test("combined forward repair refuses extra app staging before resolver mutation when both slots are occupied", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-combined-repair-"));
+  try {
+    const fixture = createFixture(root, "combined-repair");
+    const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
+      source: fixture.source, app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "initial-operation",
+    }, { ...fixture.deps, installApp: async (options) => {
+      if (!options) throw new Error("Expected combined repair candidate options");
+      await installRuntimeReadyCandidateFixture(options);
+      const statePath = options.candidateContext!.paths.stateFile;
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      state.signingIdentityHash = fixture.signingHash;
+      writeFileSync(statePath, `${JSON.stringify(state)}\n`);
+      writeFileSync(join(options.app!, "Contents", "Resources", "codex"), "original backend\n", { mode: 0o755 });
+      const framework = join(options.app!, "Contents", "Frameworks", "RepairFixture.framework");
+      mkdirSync(join(framework, "Versions", "A"), { recursive: true });
+      writeFileSync(join(framework, "Versions", "A", "RepairFixture"), "framework fixture\n");
+      symlinkSync("A", join(framework, "Versions", "Current"));
+      symlinkSync("Versions/Current/RepairFixture", join(framework, "RepairFixture"));
+    } }));
+    deferred.retain();
+    const journalPath = join(fixture.userRoot, "transactions", "variant-promotion", "combined-repair.json");
+    const oldApp = fingerprintVariantGeneration(fixture.target);
+    const oldRuntime = fingerprintVariantGeneration(join(fixture.userRoot, "runtime"));
+    const sourceRuntimeRoot = join(root, "next-runtime");
+    const sourceAppRoot = join(root, "next-app.app");
+    cpSync(join(fixture.userRoot, "runtime"), sourceRuntimeRoot, { recursive: true });
+    cpSync(fixture.target, sourceAppRoot, { recursive: true, verbatimSymlinks: true });
+    chmodSync(join(sourceAppRoot, "Contents", "Resources", "tweakers"), 0o700);
+    writeFileSync(join(sourceRuntimeRoot, "main.js"), "combined runtime\n");
+    writeFileSync(join(sourceRuntimeRoot, "runtime-fingerprint.json"), JSON.stringify({ schemaVersion: 1, ...computeRuntimeFingerprint(sourceRuntimeRoot) }));
+    writeFileSync(join(sourceAppRoot, "Contents", "Resources", "codex"), "optimized backend\n");
+    const resolverSha = createHash("sha256").update("optimized backend\n").digest("hex");
+    const priorResolverSha = createHash("sha256").update("original backend\n").digest("hex");
+    const operationId = "combined-operation";
+    const options = { userRoot: fixture.userRoot, target: fixture.target, pendingPromotionId: "combined-repair", operationId,
+      expectedJournalSha256: createHash("sha256").update(readFileSync(journalPath)).digest("hex"),
+      sourceRuntimeRoot, expectedSourceRuntimeFingerprint: fingerprintVariantGeneration(sourceRuntimeRoot),
+      combinedApp: { sourceAppRoot, expectedSourceAppFingerprint: fingerprintVariantGeneration(sourceAppRoot),
+        expectedResolverBinarySha256: resolverSha, resolverPlan: { fixture: "signed-plan" }, expectedResolverPlanFingerprint: `sha256:${"a".repeat(64)}` } };
+    const binding = { operationId, promotionId: options.pendingPromotionId, journalSha256: options.expectedJournalSha256,
+      priorRepairFingerprint: null, appFingerprintSha256: options.combinedApp.expectedSourceAppFingerprint.sha256,
+      runtimeFingerprintSha256: options.expectedSourceRuntimeFingerprint.sha256 };
+    let blocked = false; let published = false; let completed = false; let registrationDrift = false;
+    const deps = { ...fixture.deps, runtimeRepairResolverPort: {
+      executeSharedNativeResolverTransitionAtRootV1(input: { action: "validate" | "begin" | "publish" | "finish" }) {
+        if (registrationDrift) return { state: "blocked", reason: "resolver CAS mismatch" };
+        if (input.action === "begin" && !completed) blocked = true;
+        if (input.action === "publish") { assert.ok(blocked || completed); published = true; }
+        if (input.action === "finish") { assert.ok(published); blocked = false; completed = true; }
+        return { state: { validate: "validated", begin: "begun", publish: "published", finish: "finished" }[input.action],
+          binding, priorResolverBinarySha256: priorResolverSha, resolverBinarySha256: resolverSha };
+      },
+    } };
+    assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, { ...deps, targetProcessRunning: () => true }), /target app.*running/);
+    assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, { ...deps, verify: () => ({ ok: false, output: "bad candidate signature" }) }), /signature/);
+    assert.throws(() => prepareDeferredTweakersRuntimeRepair({ ...options, combinedApp: { ...options.combinedApp, expectedResolverBinarySha256: "0".repeat(64) } }, deps), /backend fingerprint/);
+    registrationDrift = true;
+    assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, deps), /resolver CAS mismatch/);
+    registrationDrift = false;
+    assert.throws(() => prepareDeferredTweakersRuntimeRepair(options, deps), /capacity blocked \(2\/2\)/i);
+    assert.equal(blocked, false); assert.equal(published, false); assert.equal(completed, false);
+    assert.equal(createHash("sha256").update(readFileSync(journalPath)).digest("hex"), options.expectedJournalSha256);
+    assert.deepEqual(fingerprintVariantGeneration(fixture.target), oldApp);
+    assert.deepEqual(fingerprintVariantGeneration(join(fixture.userRoot, "runtime")), oldRuntime);
+    const repairRoot = join(fixture.userRoot, "builds", "combined-repair", "runtime-repair", "operations", operationId);
+    assert.equal(existsSync(join(repairRoot, "intent.json")), false);
+    assert.equal(existsSync(join(repairRoot, "next-app.app")), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("runtime-ready commit is impossible before verification and removes the challenge only after durable commit", async () => {
@@ -641,6 +659,291 @@ test("runtime-ready commit is impossible before verification and removes the cha
     assert.equal(existsSync(join(fixture.userRoot, "runtime-ready-expectation.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a deferred commit failure preserves provisional publication and readiness for caller retention", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-deferred-commit-retain-"));
+  try {
+    const id = "deferred-commit-retain", fixture = createFixture(root, id);
+    const journal = join(fixture.userRoot, "transactions", "variant-promotion", `${id}.json`);
+    const descriptor = join(root, "manager-publication.json"), environment = join(root, "manager-environment.json");
+    let failCommit = false, managerRestores = 0, environmentRestores = 0;
+    const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
+      source: fixture.source, app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "manager-operation",
+    }, {
+      ...fixture.deps, installApp: installRuntimeReadyCandidateFixture,
+      publishManagerDescriptor() {
+        writeFileSync(descriptor, "provisional Manager publication\n", { mode: 0o600 });
+        return { restoreOnFailure() { managerRestores++; writeFileSync(descriptor, "old Manager publication\n"); } };
+      },
+      bootstrapManagerEnvironment(input) {
+        const publication = fixture.deps.bootstrapManagerEnvironment!(input);
+        writeFileSync(environment, "provisional Manager environment\n", { mode: 0o600 });
+        return { ...publication, restoreOnFailure() { environmentRestores++; writeFileSync(environment, "old Manager environment\n"); } };
+      },
+      onDurableBoundary(path) {
+        if (failCommit && path === `${journal}.tmp`) throw new Error("injected deferred journal commit failure");
+      },
+    }));
+    const expectation = deferred.runtimeReadyExpectation;
+    const receipt: Record<string, unknown> = {
+      ...expectation, kind: INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND, pid: 516,
+      processStartToken: "Thu Sep  3 08:00:04 2026", appearance: expectation.appearanceExpectation,
+      mainInitialized: true, preloadInitialized: true, settingsMounted: true, sharedHistoryBrokerState: "connected",
+      initializedTweakIds: [...expectation.expectedTweakIds], observedAt: "2026-09-03T12:00:05.000Z",
+    };
+    delete receipt.appearanceExpectation; delete receipt.expectedTweakIds; delete receipt.createdAt;
+    deferred.verifyRuntimeReady(receipt, receipt.pid as number, receipt.processStartToken as string);
+    const ready = join(fixture.userRoot, INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE);
+    writeFileSync(ready, JSON.stringify(receipt), { mode: 0o600 });
+    const before = activeGenerationSnapshot(fixture), journalBefore = readFileSync(journal);
+    const expectationPath = join(fixture.userRoot, "runtime-ready-expectation.json");
+    const evidence = [descriptor, environment, expectationPath, ready].map(path => readFileSync(path));
+    failCommit = true;
+
+    assert.throws(() => deferred.commit(), /injected deferred journal commit failure/);
+
+    assert.deepEqual(activeGenerationSnapshot(fixture), before);
+    assert.deepEqual(readFileSync(journal), journalBefore);
+    assert.notEqual(readJournalPhase(fixture, id), "committed");
+    [descriptor, environment, expectationPath, ready].forEach((path, index) => assert.deepEqual(readFileSync(path), evidence[index]));
+    assert.equal(managerRestores, 0); assert.equal(environmentRestores, 0);
+    assert.doesNotThrow(() => deferred.retain(), "commit failure must leave the handle available for retention");
+    assert.equal(existsSync(expectationPath), true); assert.deepEqual(activeGenerationSnapshot(fixture), before);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("production deferred rollback requires current synchronous admission before census or compensation", () => {
+  const target = "/Applications/Tweakers.app", order: string[] = [];
+  const targetProcessRunning = (observed: string) => { assert.equal(observed, target); order.push("census"); return false; };
+  const compensate = (deps: Parameters<typeof assertDeferredTweakersVariantRollbackAdmission>[1]) => {
+    assertDeferredTweakersVariantRollbackAdmission(target, deps);
+    order.push("compensation");
+  };
+  assert.throws(() => compensate({ targetProcessRunning }), /requires current closed desktop and broker admission/);
+  assert.equal(order.length, 0);
+  assert.throws(() => compensate({ targetProcessRunning, beforeRollback() { order.push("admission refused"); throw new Error("current admission unavailable"); } }), /current admission unavailable/);
+  assert.deepEqual(order, ["admission refused"]);
+  order.length = 0;
+  assert.throws(() => compensate({ targetProcessRunning, beforeRollback: () => Promise.resolve() }), /synchronous assertion/);
+  assert.equal(order.length, 0);
+  compensate({ targetProcessRunning, beforeRollback() { order.push("admission"); } });
+  assert.deepEqual(order, ["admission", "census", "compensation"]);
+});
+
+test("actual forward resume requires synchronous held admission before reading or mutating journal evidence", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-forward-admission-")));
+  try {
+    const input = {userRoot: root, target: join(root, "Tweakers.app"), promotionId: "11111111-1111-4111-8111-111111111111",
+      operationId: "22222222-2222-4222-8222-222222222222", expectedJournalSha256: "a".repeat(64)};
+    const events: string[] = [];
+    const census = () => {events.push("census"); return false;};
+    assert.throws(() => resumeDeferredAcceptedBackendTransition(input, {targetProcessRunning: census}), /requires current closed/);
+    assert.equal(events.length, 0);
+    assert.throws(() => resumeDeferredAcceptedBackendTransition(input, {targetProcessRunning: census,
+      beforeRollback() {events.push("refused"); throw new Error("held lease lost");}}), /held lease lost/);
+    assert.deepEqual(events, ["refused"]); events.length = 0;
+    assert.throws(() => resumeDeferredAcceptedBackendTransition(input, {targetProcessRunning: census,
+      beforeRollback: () => Promise.resolve()}), /synchronous assertion/);
+    assert.equal(events.length, 0);
+    // Held admission reaches the exact-journal check, which fails because this
+    // fixture intentionally has no journal. It cannot create recovery output.
+    assert.throws(() => resumeDeferredAcceptedBackendTransition(input, {targetProcessRunning: census,
+      beforeRollback() {events.push("held");}}), /regular non-symlink file/);
+    assert.deepEqual(events, ["held", "census"]); events.length = 0;
+    for (const state of [true, undefined] as const) {
+      assert.throws(() => resumeDeferredAcceptedBackendTransition(input, {beforeRollback() {events.push("held");},
+        targetProcessRunning() {events.push("appearance"); return state as boolean;}}), /known process state/);
+    }
+    let held = true;
+    const deps = {beforeRollback() {if (!held) throw new Error("held lease lost");}, targetProcessRunning: census};
+    assert.doesNotThrow(() => assertAcceptedBackendTransitionResumeAdmission(input.target, deps));
+    held = false;
+    assert.throws(() => assertAcceptedBackendTransitionResumeAdmission(input.target, deps), /held lease lost/);
+    assert.deepEqual(readdirSync(root), []);
+  } finally {rmSync(root, {recursive: true, force: true});}
+});
+
+test("late ordinary readiness commits only the same verified live generation and supports crash retry", async (t) => {
+  for (const mode of ["success", "pid", "birth", "binding", "broker", "config", "artifact", "lock", "process-drift", "missing-binding", "after-acceptance", "active:archived", "active:promoted", "committed"] as const) {
+    await t.test(mode, async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-late-ready-")));
+      try {
+        const id = "late-ready", operationId = "22222222-2222-4222-8222-222222222222", fixture = await establishCommittedFixture(root);
+        fixture.deps.id = () => id;
+        const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({source: fixture.source,
+          app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: operationId},
+          {...fixture.deps, installApp: installRuntimeReadyCandidateFixture}));
+        const expected = deferred.runtimeReadyExpectation;
+        const receipt: Record<string, unknown> = {...expected, kind: INDEPENDENT_TWEAKERS_RUNTIME_READY_KIND,
+          pid: 513, processStartToken: "Thu Sep  3 08:00:00 2026", appearance: expected.appearanceExpectation,
+          mainInitialized: true, preloadInitialized: true, settingsMounted: true, sharedHistoryBrokerState: "connected",
+          initializedTweakIds: expected.expectedTweakIds, observedAt: new Date().toISOString()};
+        delete receipt.appearanceExpectation; delete receipt.expectedTweakIds; delete receipt.createdAt;
+        const ready = join(fixture.userRoot, "runtime-ready.json"), journalPath = join(fixture.userRoot, "transactions/variant-promotion", id + ".json");
+        writeFileSync(ready, JSON.stringify(receipt), {mode: 0o600});
+        const originalJournal = readFileSync(journalPath);
+        const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+        let settled = 0, observations = 0, crash = true;
+        const dependencies: NonNullable<Parameters<typeof acceptRetainedIndependentRuntimeReady>[1]> = {...fixture.deps,
+          retainedPromotionEvidence() {
+            const raw = readFileSync(journalPath), journal = JSON.parse(raw.toString());
+            return {journalSha256: sha(raw), committed: journal.phase === "committed", acceptedBackendTransition: false,
+              binding: {schemaVersion: 1, kind: "tweakers-manager-recovery-binding", operationId, promotionId: id,
+                target: fixture.target, userRoot: fixture.userRoot,
+                generation: {appSha256: journal.entries.find((e: {name: string}) => e.name === "app").desired.sha256,
+                  runtimeFingerprint: expected.runtimeFingerprint, activeReceiptSha256: expected.activePromotionReceiptSha256},
+                journal: {path: journalPath, identitySha256: "a".repeat(64)}, receiptRefs: [], dependencyPaths: [], createdAt: expected.createdAt}};
+          },
+          // Canonical Manager sidecars are tested with their real filesystem below in manager-recovery-evidence.test.
+          // This transaction fixture owns a temporary app path, so isolate that persistence boundary explicitly.
+          ...(mode === "missing-binding" ? {} : {persistRetainedAcceptance() {
+            if (mode === "after-acceptance" && crash) throw new Error("simulated process death after acceptance");
+          }}),
+          observeRetainedProcess() { observations++; return {pid: mode === "pid" || (mode === "process-drift" && observations > 2) ? 999 : 513,
+            startedAtRaw: mode === "birth" ? "different-birth" : receipt.processStartToken as string, visibleWindow: true}; },
+          settleRetainedPromotion() {assert.equal(readJournalPhase(fixture, id), "committed"); settled++; return true;},
+          crashAfterJournalPhase(phase) {return crash && phase === mode;},
+        };
+        if (mode !== "lock") deferred.retain();
+        if (mode === "binding") writeFileSync(ready, JSON.stringify({...receipt, operationId: "other-operation"}));
+        if (mode === "broker") writeFileSync(join(expected.accountsBrokerRoot, "account-router-config.json"), "{}");
+        if (mode === "config") writeFileSync(join(fixture.userRoot, "config.json"), "{}");
+        if (mode === "artifact") writeFileSync(join(fixture.target, "changed"), "changed");
+        const invoke = () => acceptRetainedIndependentRuntimeReady({operationId, expectedPid: 513,
+          expectedProcessStartToken: receipt.processStartToken as string, expectedJournalSha256: sha(readFileSync(journalPath))}, dependencies);
+        if (["success", "after-acceptance", "active:archived", "active:promoted", "committed"].includes(mode)) {
+          if (mode !== "success") {await assert.rejects(invoke(), /simulated process death/); assert.equal(settled, 0); crash = false;}
+          await invoke(); assert.equal(settled, 1); assert.equal(readJournalPhase(fixture, id), "committed");
+          await invoke(); assert.equal(settled, 2, "committed retry retains original challenge and process proof");
+          assert.deepEqual(JSON.parse(readFileSync(ready, "utf8")), receipt);
+        } else {
+          await assert.rejects(invoke()); assert.equal(settled, 0);
+          assert.deepEqual(readFileSync(journalPath), originalJournal, "refusal cannot mutate publication");
+          if (mode === "lock") deferred.retain();
+        }
+      } finally {rmSync(root, {recursive: true, force: true});}
+    });
+  }
+});
+
+test("runtime-ready replay binds the exact receipt before and after active rename and committed phase", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-ready-active-replay-")));
+  try {
+    const id = "active-ready-replay", fixture = createFixture(root, id);
+    const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({source: fixture.source,
+      app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "ready-replay-operation"},
+      {...fixture.deps, installApp: installRuntimeReadyCandidateFixture}));
+    deferred.retain();
+    const journalPath = join(fixture.userRoot, "transactions", "variant-promotion", `${id}.json`);
+    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+    const entry = journal.activeReceipt, expected = deferred.runtimeReadyExpectation.activePromotionReceiptSha256;
+    const input = {userRoot: fixture.userRoot, target: fixture.target, promotionId: id};
+    assert.equal(readRuntimeReadyPromotionReceiptSha256(input), expected, "before active rename uses staged exact receipt");
+    // A rename may be durable while its next journal phase is not.
+    if (entry.hadDestination) {mkdirSync(dirname(entry.archive), {recursive: true}); renameSync(entry.destination, entry.archive);}
+    renameSync(entry.source, entry.destination);
+    for (const phase of ["active:promote-planned", "active:promoted", "committed"]) {
+      journal.phase = phase; writeFileSync(journalPath, JSON.stringify(journal), {mode: 0o600});
+      assert.equal(readRuntimeReadyPromotionReceiptSha256(input), expected, phase);
+    }
+    const receipt = readFileSync(entry.destination);
+    writeFileSync(entry.destination, JSON.stringify({...entry.expected, id: "other-promotion"}));
+    assert.throws(() => readRuntimeReadyPromotionReceiptSha256(input), /fingerprint|generation|differs/);
+    writeFileSync(entry.destination, receipt);
+    // Presence of a wrong staged receipt cannot fall back to a valid published receipt.
+    writeFileSync(entry.source, "wrong staged receipt", {mode: 0o600});
+    assert.throws(() => readRuntimeReadyPromotionReceiptSha256(input), /fingerprint|generation|differs/);
+    rmSync(entry.source);
+    journal.phase = "recovered"; writeFileSync(journalPath, JSON.stringify(journal));
+    assert.throws(() => readRuntimeReadyPromotionReceiptSha256(input), /identity differs/);
+  } finally {rmSync(root, {recursive: true, force: true});}
+});
+
+test("deferred rollback refuses running or unknown target state before clearing any fixture evidence", async () => {
+  for (const state of ["running", "unknown", "error"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "tweakers-deferred-rollback-refusal-"));
+    try {
+      const fixture = createFixture(root, `rollback-${state}`);
+      let rollbackGate = false, managerRestores = 0, environmentRestores = 0;
+      const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
+        source: fixture.source, app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "manager-operation",
+      }, {
+        ...fixture.deps, installApp: installRuntimeReadyCandidateFixture,
+        targetProcessRunning(target) {
+          assert.equal(target, fixture.target);
+          if (!rollbackGate) return false;
+          if (state === "error") throw new Error("target census unavailable");
+          return state === "running" ? true : undefined as unknown as boolean;
+        },
+        publishManagerDescriptor: () => ({ restoreOnFailure() { managerRestores++; } }),
+        bootstrapManagerEnvironment(input) {
+          return { ...fixture.deps.bootstrapManagerEnvironment!(input), restoreOnFailure() { environmentRestores++; } };
+        },
+      }));
+      const ready = join(fixture.userRoot, INDEPENDENT_TWEAKERS_RUNTIME_READY_RECEIPT_FILE);
+      writeFileSync(ready, "retained readiness evidence\n", { mode: 0o600 });
+      const before = snapshot(root);
+      rollbackGate = true;
+
+      assert.throws(() => deferred.rollback(), state === "error" ? /target census unavailable/ : /running or its state is unknown/);
+
+      assert.deepEqual(snapshot(root), before, `${state} refusal must preserve every file, mode, and journal`);
+      assert.equal(managerRestores, 0); assert.equal(environmentRestores, 0);
+      assert.doesNotThrow(() => deferred.retain(), "refusal must leave the handle available for retention");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("interrupted recovery archives only its bound readiness challenge and resumes terminal cleanup", async () => {
+  for (const binding of ["matching", "unrelated", "drifted"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "tweakers-recovery-ready-evidence-"));
+    try {
+      const fixture = await establishCommittedFixture(root);
+      fixture.deps.id = () => "recovery-ready";
+      const before = activeGenerationSnapshot(fixture);
+      const deferred = await withoutVariantStatusOutput(() => prepareDeferredTweakersVariantRefresh({
+        source: fixture.source, app: fixture.target, userRoot: fixture.userRoot, runtimeReadyOperationId: "recovery-operation",
+      }, { ...fixture.deps, installApp: installRuntimeReadyCandidateFixture }));
+      const path = join(fixture.userRoot, "runtime-ready-expectation.json");
+      const expectation = deferred.runtimeReadyExpectation;
+      const value = { ...expectation,
+        ...(binding === "unrelated" ? { promotionId: "other-promotion" } : {}),
+        ...(binding === "drifted" ? { activePromotionReceiptSha256: "0".repeat(64) } : {}),
+      };
+      writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+      const original = readFileSync(path);
+      deferred.retain();
+      const recover = () => recoverInterruptedTweakersVariantPromotions(fixture.userRoot, fixture.target, fixture.deps, "recovery-ready");
+      if (binding === "drifted") {
+        assert.throws(recover, /different generation binding/);
+        assert.deepEqual(readFileSync(path), original);
+        writeFileSync(path, JSON.stringify(expectation));
+        const activePath = join(fixture.userRoot, "transactions/variant-promotion/active.json");
+        const active = readFileSync(activePath);
+        writeFileSync(activePath, "{}");
+        assert.throws(recover, /active receipt recovered generation/);
+        assert.equal(existsSync(path), true);
+        rmSync(activePath);
+        assert.throws(recover, /active receipt recovered generation/);
+        assert.equal(existsSync(path), true);
+        writeFileSync(activePath, active, { mode: 0o600 });
+        recover(); // The journal is already recovered; finish the interrupted cleanup.
+      } else recover();
+      assert.deepEqual(activeGenerationSnapshot(fixture), before);
+      const journal = JSON.parse(readFileSync(join(fixture.userRoot, "transactions/variant-promotion/recovery-ready.json"), "utf8"));
+      assert.equal(journal.phase, "recovered");
+      const archive = join(journal.buildRoot, "failed-promotion/runtime-ready-expectation.json");
+      if (binding === "unrelated") {
+        assert.deepEqual(readFileSync(path), original);
+        assert.equal(existsSync(archive), false);
+      } else {
+        assert.equal(existsSync(path), false);
+        assert.deepEqual(JSON.parse(readFileSync(archive, "utf8")), expectation);
+        recover();
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
 
@@ -721,7 +1024,7 @@ interface PromotionFixture {
   managerEnvironmentBootstraps: Array<{ sourceRoot: string; destinationRoot: string }>;
   officialApp: string;
   signingHash: string;
-  deps: Parameters<typeof refreshTweakersVariant>[1];
+  deps: NonNullable<Parameters<typeof refreshTweakersVariant>[1]>;
 }
 
 type Snapshot =
@@ -737,7 +1040,8 @@ function stageBundledTweaksFixture(root: string): void {
   }
 }
 
-function installCandidateFixture(options: CandidateInstallOptions): void {
+function installCandidateFixture(options?: CandidateInstallOptions): void {
+  if (!options) throw new Error("Expected candidate install options");
   const candidate = options.app!;
   const paths = options.candidateContext!.paths;
   const identity = options.macAppIdentity!;
@@ -804,7 +1108,8 @@ function installCandidateFixture(options: CandidateInstallOptions): void {
   })}\n`);
 }
 
-async function installRuntimeReadyCandidateFixture(options: CandidateInstallOptions): Promise<void> {
+async function installRuntimeReadyCandidateFixture(options?: CandidateInstallOptions): Promise<void> {
+  if (!options) throw new Error("Expected runtime-ready candidate install options");
   installCandidateFixture(options);
   await asar.createPackage(
     options.candidateContext!.paths.runtime,
@@ -1057,6 +1362,12 @@ async function refreshFixture(fixture: PromotionFixture): Promise<void> {
 async function establishCommittedFixture(root: string): Promise<PromotionFixture> {
   const fixture = createFixture(root, "prior-generation");
   await refreshFixture(fixture);
+  // This verified fixture becomes the fallback; retire its obsolete mock app
+  // before constructing the next generation (receipts remain for recovery tests).
+  rmSync(join(fixture.userRoot, "previous", "prior-generation", "app"), {recursive:true});
+    for (const reservation of readReservations(fixture.deps.managerRoot!())) {
+      if (reservation.state !== "retired" && !reservation.paths.some(existsSync)) releaseEmptyLocalArtifactReservation(fixture.deps.managerRoot!(), reservation.id);
+    }
   return {
     ...fixture,
     deps: {
@@ -1122,6 +1433,10 @@ test("every durable promotion journal phase recovers deterministically without c
   try {
     const discovery = createFixture(discoveryRoot, "prior-generation");
     await refreshFixture(discovery);
+    rmSync(join(discovery.userRoot, "previous", "prior-generation", "app"), {recursive:true});
+    for (const reservation of readReservations(discovery.deps.managerRoot!())) {
+      if (reservation.state !== "retired" && !reservation.paths.some(existsSync)) releaseEmptyLocalArtifactReservation(discovery.deps.managerRoot!(), reservation.id);
+    }
     await withoutVariantStatusOutput(() => refreshTweakersVariant({
       source: discovery.source,
       app: discovery.target,
@@ -1421,6 +1736,48 @@ test("candidate build failure never invokes manager quiescence", async () => {
   }
 });
 
+test("ordinary cutover reauthenticates registration after manager quiescence and preserves the live generation on drift", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-registration-cutover-"));
+  try {
+    const fixture = createFixture(root, "registration-cutover");
+    await withLocalOperation("registration cutover fixture", async () => {
+    const oldGeneration = activeGenerationSnapshot(fixture);
+    const broker = join(fixture.managerRoot, "tweak-data", "co.tweakers.account-switcher");
+    await assert.rejects(refreshTweakersVariant({source: fixture.source, app: fixture.target, userRoot: fixture.userRoot}, {
+      ...fixture.deps,
+      backendTransitionPort: {
+        readSharedNativeModeAtRootV1(input) {
+          assert.equal(input.stateRoot, broker);
+          return {state: "ready", fingerprint: `sha256:${"a".repeat(64)}`, document: {
+            resolverBinarySha256: "b".repeat(64), resolverProtocol: "official-bundled-v1"}};
+        },
+        prepareSharedNativeResolverTransitionAtRootV1() {throw new Error("ordinary refresh cannot prepare a resolver transition");},
+        executeSharedNativeResolverTransitionAtRootV1() {throw new Error("ordinary refresh cannot execute a resolver transition");},
+      },
+      beforePromotion() {
+        writeFileSync(join(broker, "shared-native-mode.v1.json"), "newly published private fixture", {mode: 0o600});
+      },
+    }), /registration changed before promotion/);
+    assert.deepEqual(activeGenerationSnapshot(fixture), oldGeneration);
+    assert.equal(readJournalPhase(fixture, "registration-cutover"), "recovered");
+    const failedCandidate = join(fixture.userRoot, "builds", "registration-cutover", "failed-candidate.app");
+    const retained = readReservations(fixture.managerRoot).find(entry => entry.paths.includes(failedCandidate));
+    assert.ok(retained, "failed candidate retains the same capacity reservation at its actual path");
+    assert.equal(inspectLocalArtifactCapacity(fixture.managerRoot, fixture.target).occupied, 2);
+    // Retire only the settled disposable fixture payload before allocating a
+    // retry. The two-copy rule remains enforced during failure and recovery.
+    rmSync(failedCandidate, {recursive: true});
+    releaseEmptyLocalArtifactReservation(fixture.managerRoot, retained.id);
+    // Only remove this test's simulated registration; restore the original
+    // absence before proving that the settled transaction permits a retry.
+    rmSync(join(broker, "shared-native-mode.v1.json"));
+    await withoutVariantStatusOutput(() => refreshTweakersVariant({source: fixture.source, app: fixture.target, userRoot: fixture.userRoot},
+      {...fixture.deps, id: () => "registration-retry"}));
+    assertNewActiveGeneration(fixture, "registration-retry");
+    }, join(root, "test-local-operation"));
+  } finally {rmSync(root, {recursive: true, force: true});}
+});
+
 test("the owner-private transaction lock serializes concurrent refresh entries before a second candidate mutates", async () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-variant-lock-concurrent-"));
   try {
@@ -1445,24 +1802,24 @@ test("the owner-private transaction lock serializes concurrent refresh entries b
     await firstAtInstall;
 
     let secondCloneCount = 0;
-    await assert.rejects(
-      refreshTweakersVariant({ source: fixture.source, app: fixture.target, userRoot: fixture.userRoot }, {
-        ...fixture.deps,
-        id: () => "lock-second",
-        cloneApp: (_source, candidate) => {
-          secondCloneCount += 1;
-          mkdirSync(candidate, { recursive: true });
-        },
-      }),
-      /variant transaction is already active/,
-    );
-    assert.equal(secondCloneCount, 0, "the rejected contender never reached candidate creation");
+    let secondSettled = false;
+    const second = refreshTweakersVariant({ source: fixture.source, app: fixture.target, userRoot: fixture.userRoot }, {
+      ...fixture.deps,
+      id: () => "lock-second",
+      cloneApp: () => { secondCloneCount += 1; throw new Error("unexpected second clone"); },
+    }).then(() => { secondSettled = true; return null; }, error => { secondSettled = true; return error; });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(secondSettled, false, "the contender waits for the execution owner");
+    assert.equal(secondCloneCount, 0, "the waiting contender never reached candidate creation");
     assert.deepEqual(activeGenerationSnapshot(fixture), oldGeneration, "the active generation stays untouched while held");
     assert.equal(existsSync(variantTransactionLockPaths(fixture).projection), true);
     assert.equal(existsSync(variantTransactionLockPaths(fixture).record), true);
 
     allowFirstInstall();
     await first;
+    const secondError = await second;
+    assert.match(String(secondError), /capacity blocked/);
+    assert.equal(secondCloneCount, 0, "the completed first build fills capacity before the contender stages");
     assertNewActiveGeneration(fixture, "lock-first");
     assert.equal(existsSync(variantTransactionLockPaths(fixture).projection), false);
     assert.equal(existsSync(variantTransactionLockPaths(fixture).record), false);
@@ -1627,7 +1984,7 @@ test("candidate-only packages a bound Tweakers identity without mutating product
   }
 });
 
-test("candidate-only seals a disabled Doctor titlebar choice and rejects staged config drift", async () => {
+test("candidate-only preserves disabled Doctor tweaks and rejects staged config drift", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-variant-candidate-titlebar-disabled-")));
   try {
     const fixture = createFixture(root, "candidate-titlebar-disabled");
@@ -1639,13 +1996,15 @@ test("candidate-only seals a disabled Doctor titlebar choice and rejects staged 
       candidateOnly: true,
       output,
       doctorTitlebarEnabled: false,
-      doctorConfiguration: { display: {density: "compact"}, tweaks: Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map(id => [id, {enabled: true, savedPreference: "preserved"}])) },
+      doctorConfiguration: { display: {density: "compact"}, tweaks: Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map(id => [id, {enabled: !["co.tweakers.followup", "co.tweakers.user-questions"].includes(id), savedPreference: "preserved"}])) },
     }, fixture.deps));
 
     assert.doesNotThrow(() => verifyTweakersVariantCandidateReceipt(output, candidateVerificationOptions(output, fixture)));
     const configPath = join(output, "config.json");
     const config = JSON.parse(readFileSync(configPath, "utf8")) as { tweaks: Record<string, { enabled?: boolean }> };
     assert.equal(config.tweaks["co.tweakers.titlebar-controls"]?.enabled, false);
+    assert.equal(config.tweaks["co.tweakers.followup"]?.enabled, false);
+    assert.equal(config.tweaks["co.tweakers.user-questions"]?.enabled, false);
     assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).display, {density: "compact"});
     assert.equal(JSON.parse(readFileSync(configPath, "utf8")).tweaks["co.tweakers.titlebar-controls"].savedPreference, "preserved");
     assert.match(JSON.parse(readFileSync(join(output, "state.json"), "utf8")).doctorConfigurationSha256, /^[a-f0-9]{64}$/);
@@ -1703,7 +2062,7 @@ test("promotion preserves mutable preferences and account/login homes outside th
     assert.equal(config.tweaks?.["co.tweakers.account-switcher"]?.preferredAccount, "saved-account");
     assert.equal(config.tweaks?.["example.third-party"]?.privateSetting, "keep-me");
     assert.equal(config.tweaks?.["example.third-party"]?.enabled, false);
-    for (const id of BUNDLED_TWEAK_IDS) assert.equal(config.tweaks?.[id]?.enabled, true, id);
+    for (const id of BUNDLED_TWEAK_IDS) assert.equal(config.tweaks?.[id]?.enabled, id !== "co.tweakers.account-switcher", id);
     preservedRoots.forEach((path, index) => assert.deepEqual(snapshot(path), preservedSnapshots[index], path));
 
     const activeReceipt = JSON.parse(readFileSync(
@@ -1896,8 +2255,13 @@ test("candidate-only default sealed source observes the cache read-only on succe
       },
     }));
 
-    assert.equal(reads, 2, "the sealed source is observed before and after clone without a lease");
+    assert.equal(reads, 3, "the sealed source is checked before backend resolution, before allocation, and after clone");
     assert.deepEqual(snapshot(environmentRoot), cacheBefore, "candidate-only never writes the sealed environment cache");
+
+    rmSync(output, {recursive:true});
+    for (const reservation of JSON.parse(readFileSync(join(fixture.managerRoot, "local-artifact-reservations.json"), "utf8")).reservations) {
+      releaseEmptyLocalArtifactReservation(fixture.managerRoot, reservation.id);
+    }
 
     const failingOutput = join(root, "sealed-default-clone-failure");
     await assert.rejects(
@@ -1921,7 +2285,7 @@ test("candidate-only default sealed source observes the cache read-only on succe
       /injected raw clone failure/,
     );
     assert.equal(existsSync(failingOutput), false);
-    assert.equal(reads, 3, "a clone failure never retries through a cache-mutating source route");
+    assert.equal(reads, 5, "a clone failure stops after the two pre-allocation checks without retrying through a mutating source route");
     assert.deepEqual(snapshot(environmentRoot), cacheBefore, "clone failure leaves the sealed environment cache byte-for-byte unchanged");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -2052,6 +2416,10 @@ test("candidate-only exclusive publication and failed-evidence races never overw
     assert.deepEqual(snapshot(fixture.userRoot), userRootBefore);
 
     const failedOutput = join(root, "candidate-retention-output");
+    rmSync(failed, {recursive:true});
+    for (const reservation of JSON.parse(readFileSync(join(fixture.managerRoot, "local-artifact-reservations.json"), "utf8")).reservations) {
+      releaseEmptyLocalArtifactReservation(fixture.managerRoot, reservation.id);
+    }
     const failedScratch = join(root, ".candidate-retention-output.candidate-candidate-failure-race");
     const racedFailed = join(root, ".candidate-retention-output.candidate-failed-candidate-failure-race");
     let racedFailedIdentity: { dev: number; ino: number } | null = null;
@@ -2269,5 +2637,79 @@ test("reviewed artifact copy preserves nested private directory modes and relati
     chmodSync(join(source, "private", "data"), 0o600);
     writeFileSync(join(source, "private", "data"), "tampered");
     assert.throws(() => copyReviewedVariantArtifact(source, join(root, "tampered-copy"), expected), /Copied candidate artifact changed: runtime/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+ test("tweak-only refresh requires the same installed folder and manifest owners", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweak-refresh-owners-"));
+  try {
+    for (const name of ["current", "source"]) {
+      mkdirSync(join(root, name, "example"), { recursive: true });
+      writeFileSync(join(root, name, "example/manifest.json"), JSON.stringify({ id: "co.example.test", version: "1.0.0" }));
+    }
+    validateTweakRefreshOwners(join(root, "current"), join(root, "source"));
+    writeFileSync(join(root, "source/example/manifest.json"), JSON.stringify({ id: "co.example.other", version: "1.0.1" }));
+    assert.throws(() => validateTweakRefreshOwners(join(root, "current"), join(root, "source")), /cannot change installed owners/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("historical journal census requires strict terminal schemas and exact active linkage", async () => {
+  const { inspectTerminalVariantPromotionEvidence } = await import("../src/commands/create-variant.js");
+  const root = mkdtempSync(join(tmpdir(), "tweakers-historical-journal-"));
+  try {
+    const fixture = createFixture(root, "historical-census");
+    await refreshFixture(fixture);
+    const directory = join(fixture.userRoot, "transactions", "variant-promotion");
+    const rawText = readFileSync(join(directory, "historical-census.json"), "utf8");
+    const active = readFileSync(join(directory, "active.json"), "utf8");
+    const observe = (journalText = rawText, activeText = active, name = "historical-census.json") =>
+      inspectTerminalVariantPromotionEvidence(fixture.userRoot, fixture.target, [{ name, rawText: journalText }], activeText);
+    assert.equal(observe().activeId, "historical-census");
+    const journal = JSON.parse(rawText);
+    assert.throws(() => observe(JSON.stringify({ ...journal, phase: "prepared" })), /nonterminal/);
+    assert.throws(() => observe(JSON.stringify({ ...journal, phase: "recovered" })), /committed/);
+    assert.throws(() => observe(JSON.stringify({ ...journal, unexpected: true })), /schema/);
+    assert.throws(() => observe(rawText, JSON.stringify({ ...JSON.parse(active), id: "unrelated" })), /linked/);
+    assert.throws(() => observe(rawText, active, "unrelated.json"), /unbound/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("tweak refresh distinguishes authenticated retained repair history from pending work", () => {
+  const root = "/test/variant", promotionId = "historical-promotion", operationId = "historical-operation";
+  const binding = { operationId };
+  const calls: string[][] = [];
+  const authenticated = (...args: string[]) => { calls.push(args); return true; };
+  for (const phase of ["committed", "recovered"]) assertTweakRefreshHistorySettled(root, { id: promotionId, phase }, authenticated);
+  assert.equal(calls.length, 0);
+  assertTweakRefreshHistorySettled(root, { id: promotionId, phase: "app:promoted", acceptedBackendTransition: binding }, authenticated);
+  assert.deepEqual(calls, [[root, promotionId, operationId]], "authentication binds the exact history identity");
+  assert.throws(() => assertTweakRefreshHistorySettled(root, { id: promotionId, phase: "app:promoted" }, authenticated), /Pending variant/);
+  assert.throws(() => assertTweakRefreshHistorySettled(root, { id: promotionId, phase: "app:promoted", acceptedBackendTransition: binding }, () => false), /Pending variant/);
+  assert.throws(() => assertTweakRefreshHistorySettled(root, { id: promotionId, phase: "app:promoted", acceptedBackendTransition: binding }, () => { throw new Error("tampered settlement"); }), /tampered settlement/);
+  for (const phase of ["prepared", "active:promoted", "unrecognized"]) {
+    assert.throws(() => assertTweakRefreshHistorySettled(root, { id: promotionId, phase, acceptedBackendTransition: binding }, authenticated), /Pending variant/);
+  }
+  assert.equal(calls.length, 1, "other phases cannot borrow historical authentication");
+});
+
+
+test("tweak refresh validates complete journal identity before accepting terminal history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-refresh-history-"));
+  try {
+    const fixture = createFixture(root, "refresh-history");
+    await refreshFixture(fixture);
+    const rawText = readFileSync(join(fixture.userRoot, "transactions/variant-promotion/refresh-history.json"), "utf8");
+    const journal = JSON.parse(rawText);
+    const check = (value = rawText, name = "refresh-history.json", home = fixture.userRoot, target = fixture.target) =>
+      assertTweakRefreshHistoryDocumentSettled(home, target, { name, rawText: value });
+    check();
+    assert.throws(() => check("{bad json"));
+    assert.throws(() => check(JSON.stringify({ ...journal, unexpected: true })));
+    assert.throws(() => check(rawText, "foreign.json"), /file name/);
+    assert.throws(() => check(rawText, "refresh-history.json", join(root, "foreign-home")));
+    assert.throws(() => check(rawText, "refresh-history.json", fixture.userRoot, join(root, "foreign.app")));
+    assert.throws(() => check(JSON.stringify({ ...journal, phase: "prepared" })), /Pending variant/);
+    assert.equal(readFileSync(join(fixture.userRoot, "transactions/variant-promotion/refresh-history.json"), "utf8"), rawText);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

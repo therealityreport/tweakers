@@ -1,3 +1,5 @@
+import { ownEntrypoint } from "../../../scripts/owned-entrypoint.mjs";
+await ownEntrypoint(import.meta.url);
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 

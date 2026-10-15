@@ -1,11 +1,18 @@
 {
   "id": "co.tweakers.followup",
   "name": "Codex Follow-up",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "githubRepo": "therealityreport/tweakers",
   "description": "Context-aware next-step prompts for Codex conversations.",
   "author": "hulibrands",
-  "tags": ["followups", "productivity"],
+  "tags": [
+    "followups",
+    "productivity"
+  ],
   "scope": "both",
-  "permissions": ["settings", "ipc"]
+  "permissions": [
+    "settings",
+    "ipc"
+  ],
+  "minRuntime": ">=1.0.0"
 }

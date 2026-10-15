@@ -1,3 +1,4 @@
+import { consolidateTweakTopics } from "../tweak-topic-migration";
 /**
  * Built-in "Tweak Manager" — auto-injected by the runtime, not a user tweak.
  * Lists discovered tweaks with enable toggles, opens the tweaks dir, links
@@ -10,10 +11,13 @@ import { ipcRenderer } from "electron";
 import { registerSection } from "./settings-injector";
 
 export async function mountManager(): Promise<void> {
-  const tweaks = (await ipcRenderer.invoke("tweaker:list-tweaks")) as Array<{
+  const listed = (await ipcRenderer.invoke("tweaker:list-tweaks")) as Array<{
     manifest: { id: string; name: string; version: string; description?: string };
     entryExists: boolean;
+    enabled: boolean;
   }>;
+  const suppressed = consolidateTweakTopics(listed, localStorage);
+  const tweaks = listed.filter(tweak => !suppressed.has(tweak.manifest.id));
   const paths = (await ipcRenderer.invoke("tweaker:user-paths")) as {
     userRoot: string;
     tweaksDir: string;

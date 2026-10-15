@@ -24,6 +24,8 @@ import {
 } from "./account-history-adoption.js";
 import {
   CANONICAL_HISTORY_FILE,
+  SHARED_HISTORY_CAPACITY_PROJECTION_FILE,
+  SHARED_HISTORY_CAPACITY_RECEIPT_FILE,
   inspectSharedHistoryCapacityReceipt,
   inspectSharedHistoryRollback,
   migrateSharedHistoryV2ToGlobalV3,
@@ -39,8 +41,8 @@ import {
 } from "./commands/create-variant.js";
 import { readHeaderHash } from "./asar.js";
 import { readRuntimeFingerprintEvidence } from "./runtime-fingerprint.js";
+import { configuredIndependentTweakerIds } from "./account-router-status.js";
 import {
-  REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS,
   TWEAKERS_VARIANT_BUNDLE_ID,
   TWEAKERS_ORIGINAL_EXECUTABLE,
 } from "./macos-variant.js";
@@ -1129,7 +1131,11 @@ function sealTweakersPromotion(
     fail("tweakers-promotion-fingerprint-mismatch");
   }
   const value = readPrivateJson(path, MAX_PRIVATE_FILE_BYTES, "tweakers-promotion-receipt");
-  assertCurrentTweakersRuntimeReadyReceipt(value, expectedAppRoot, expectedBrokerRoot);
+  const configuredIds = configuredIndependentTweakerIds(readPrivateJson(
+    join(dirname(path), "config.json"), MAX_PRIVATE_FILE_BYTES, "tweakers-configuration",
+  ));
+  if (!configuredIds) fail("invalid-tweakers-configuration");
+  assertCurrentTweakersRuntimeReadyReceipt(value, expectedAppRoot, expectedBrokerRoot, configuredIds);
   return {
     receipt,
     operationId: value.operationId,
@@ -1917,7 +1923,7 @@ function assertMigrationResultShape(value: unknown): asserts value is SharedHist
   if (!isRecord(value) || !hasExactKeys(value, [
     "status", "transactionId", "sourceFingerprint", "candidateFingerprint", "conversationCount", "segmentCount",
     "sharedSkillsFingerprint", "sharedSkillsTrustedRoots", "sharedSkillsTrustedRootsFingerprint", "sharedPluginsFingerprint",
-    "sharedPluginInventoryFingerprint", "sharedPluginExclusionsFingerprint", "sharedPluginIds", "sharedPluginPackages", "nextAction",
+    "sharedPluginInventoryFingerprint", "sharedPluginExclusionsFingerprint", "sharedPluginIds", "sharedPluginPackages", "capacity", "nextAction",
   ])
     || !["dry-run", "adoption-required", "migrated", "already-published", "collision-quarantined", "recovered"].includes(String(value.status))
     || !(typeof value.transactionId === "string" || value.transactionId === null)
@@ -1933,15 +1939,48 @@ function assertMigrationResultShape(value: unknown): asserts value is SharedHist
     || !isFingerprintOrNull(value.sharedPluginExclusionsFingerprint)
     || !isStringSet(value.sharedPluginIds)
     || !isSharedPluginPackageArray(value.sharedPluginPackages)
+    || !(value.capacity === null || isMigrationCapacityPreview(value.capacity))
     || ![
-      "apply-offline-migration", "initialize-v2-adoption-first", "complete-v2-adoption-first",
-      "activate-remains-user-confirmed", "inspect-retained-evidence", "none",
+      "apply-offline-migration", "prepare-adoption-first", "initialize-v2-adoption-first", "complete-v2-adoption-first",
+      "capacity-exceeded", "activate-remains-user-confirmed", "inspect-retained-evidence", "none",
     ].includes(String(value.nextAction))) {
     fail("invalid-migrated-result");
   }
   const packages = value.sharedPluginPackages as readonly { pluginId: string; version: string }[];
   const ids = value.sharedPluginIds as readonly string[];
   if (!sameStringArray(ids, packages.map((entry) => entry.pluginId))) fail("invalid-migrated-result");
+}
+
+function isMigrationCapacityPreview(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "version", "withinCapacity", "caps", "projection", "counts", "margins", "receiptFingerprint", "reviewOutput",
+  ]) || value.version !== 1 || typeof value.withinCapacity !== "boolean"
+    || !isFingerprintOrNull(value.receiptFingerprint)) return false;
+  const caps=value.caps,projection=value.projection,counts=value.counts,margins=value.margins;
+  const byteFields=["snapshotBytes","journalBytes","conversations","sourceEvidenceBytes"];
+  if (!isRecord(caps) || !hasExactKeys(caps,byteFields) || byteFields.some(key=>!isNonNegativeInteger(caps[key]))
+    || !isRecord(margins) || !hasExactKeys(margins,byteFields)
+    || byteFields.some(key=>typeof margins[key]!=="number" || !Number.isSafeInteger(margins[key]))
+    || !isRecord(counts) || !hasExactKeys(counts,["conversations","segments","turns","fullConversations","partialConversations"])
+    || Object.values(counts).some(entry=>!isNonNegativeInteger(entry))
+    || Number(counts.fullConversations)+Number(counts.partialConversations)!==counts.conversations
+    || !isRecord(projection) || !hasExactKeys(projection,["snapshot","journal","sourceEvidence"])) return false;
+  for (const key of ["snapshot","journal","sourceEvidence"]) {
+    const entry=projection[key];
+    if (!isRecord(entry) || !hasExactKeys(entry,["bytes","sha256"])
+      || !isNonNegativeInteger(entry.bytes) || !isFingerprint(entry.sha256)) return false;
+  }
+  const capNumbers=caps as Record<string,number>,marginNumbers=margins as Record<string,number>,countNumbers=counts as Record<string,number>;
+  if (marginNumbers.snapshotBytes!==capNumbers.snapshotBytes-(projection.snapshot as {bytes:number}).bytes
+    || marginNumbers.journalBytes!==capNumbers.journalBytes-(projection.journal as {bytes:number}).bytes
+    || marginNumbers.conversations!==capNumbers.conversations-countNumbers.conversations
+    || marginNumbers.sourceEvidenceBytes!==capNumbers.sourceEvidenceBytes-(projection.sourceEvidence as {bytes:number}).bytes
+    || value.withinCapacity!==byteFields.every(key=>(margins[key] as number)>=0)) return false;
+  if (value.reviewOutput!==null && (!isRecord(value.reviewOutput)
+    || !hasExactKeys(value.reviewOutput,["projectionFile","receiptFile"])
+    || value.reviewOutput.projectionFile!==SHARED_HISTORY_CAPACITY_PROJECTION_FILE
+    || value.reviewOutput.receiptFile!==SHARED_HISTORY_CAPACITY_RECEIPT_FILE)) return false;
+  return true;
 }
 
 function assertRollbackViewShape(value: unknown): asserts value is SharedHistoryRollbackView {
@@ -2556,6 +2595,7 @@ function assertCurrentTweakersRuntimeReadyReceipt(
   value: unknown,
   expectedAppRoot: string,
   expectedBrokerRoot: string,
+  configuredIds: readonly string[],
 ): asserts value is CurrentTweakersRuntimeReadyReceipt {
   if (!isRecord(value) || !hasExactKeys(value, [
     "schemaVersion", "kind", "operationId", "promotionId", "activePromotionReceiptSha256", "pid", "processStartToken",
@@ -2584,7 +2624,7 @@ function assertCurrentTweakersRuntimeReadyReceipt(
     || receipt.preloadInitialized !== true
     || receipt.settingsMounted !== true
     || receipt.sharedHistoryBrokerState !== "blocked"
-    || !hasExactIndependentTweakersTweakIds(receipt.initializedTweakIds)
+    || !hasExactIndependentTweakersTweakIds(receipt.initializedTweakIds, configuredIds)
     || !isCanonicalTimestamp(receipt.observedAt)) {
     fail("invalid-tweakers-promotion-binding");
   }
@@ -2985,8 +3025,7 @@ function isRuntimeReadyProcessToken(value: unknown): value is string {
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function hasExactIndependentTweakersTweakIds(value: unknown): value is readonly string[] {
-  const expected = [...REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS].sort(compareCodeUnits);
+function hasExactIndependentTweakersTweakIds(value: unknown, expected: readonly string[]): value is readonly string[] {
   return Array.isArray(value)
     && value.length === expected.length
     && value.every((entry, index) => entry === expected[index]);

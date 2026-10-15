@@ -12,8 +12,9 @@ exports.discoverTweaks = discoverTweaks;
  */
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
+const tweakers_sdk_1 = require("@therealityreport/tweakers-sdk");
 const ENTRY_CANDIDATES = ["index.js", "index.cjs", "index.mjs"];
-function discoverTweaks(tweaksDir) {
+function discoverTweaks(tweaksDir, options = {}) {
     if (!(0, node_fs_1.existsSync)(tweaksDir))
         return [];
     const out = [];
@@ -32,41 +33,66 @@ function discoverTweaks(tweaksDir) {
         const manifestPath = (0, node_path_1.join)(dir, "manifest.json");
         if (!(0, node_fs_1.existsSync)(manifestPath))
             continue;
-        let manifest;
+        let value;
         try {
-            manifest = JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf8"));
+            value = JSON.parse((0, node_fs_1.readFileSync)(manifestPath, "utf8"));
         }
         catch {
+            options.onInvalid?.(dir, "manifest is unreadable or invalid JSON");
             continue;
         }
-        if (!isValidManifest(manifest))
+        const validation = (0, tweakers_sdk_1.validateTweakManifest)(value);
+        if (!validation.ok) {
+            options.onInvalid?.(dir, validation.errors.map((issue) => `${issue.path}: ${issue.message}`).join("; "));
             continue;
+        }
+        const manifest = value;
+        if (options.runtimeVersion && manifest.minRuntime && !supportsMinimumRuntime(options.runtimeVersion, manifest.minRuntime)) {
+            options.onInvalid?.(dir, `requires runtime ${manifest.minRuntime}; current runtime is ${options.runtimeVersion}`);
+            continue;
+        }
         const entry = resolveEntry(dir, manifest);
-        if (!entry)
+        if (!entry) {
+            options.onInvalid?.(dir, "entry must be a readable file inside the tweak directory");
             continue;
+        }
         out.push({ dir, entry, manifest });
     }
-    return out;
-}
-function isValidManifest(m) {
-    if (!m.id || !m.name || !m.version || !m.githubRepo)
+    const counts = new Map();
+    for (const tweak of out)
+        counts.set(tweak.manifest.id, (counts.get(tweak.manifest.id) ?? 0) + 1);
+    return out.filter((tweak) => {
+        if (counts.get(tweak.manifest.id) === 1)
+            return true;
+        options.onInvalid?.(tweak.dir, `duplicate tweak id: ${tweak.manifest.id}`);
         return false;
-    if (!/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(m.githubRepo))
-        return false;
-    if (m.scope && !["renderer", "main", "both"].includes(m.scope))
-        return false;
-    return true;
+    });
 }
 function resolveEntry(dir, m) {
-    if (m.main) {
-        const p = (0, node_path_1.join)(dir, m.main);
-        return (0, node_fs_1.existsSync)(p) ? p : null;
-    }
-    for (const c of ENTRY_CANDIDATES) {
-        const p = (0, node_path_1.join)(dir, c);
-        if ((0, node_fs_1.existsSync)(p))
-            return p;
+    for (const name of m.main ? [m.main] : ENTRY_CANDIDATES) {
+        if ((0, node_path_1.isAbsolute)(name) || name.includes("\\") || name.split("/").includes(".."))
+            return null;
+        const entry = (0, node_path_1.resolve)(dir, name);
+        try {
+            const within = (0, node_path_1.relative)((0, node_fs_1.realpathSync)(dir), (0, node_fs_1.realpathSync)(entry));
+            if (!within || within === ".." || within.startsWith(`..${node_path_1.sep}`) || (0, node_path_1.isAbsolute)(within))
+                return null;
+            if ((0, node_fs_1.statSync)(entry).isFile())
+                return entry;
+        }
+        catch { /* Missing or unreadable entries do not poison sibling discovery. */ }
     }
     return null;
+}
+function supportsMinimumRuntime(current, minimum) {
+    const parse = (value) => /^(?:>=\s*)?v?(\d+)\.(\d+)\.(\d+)$/.exec(value.trim())?.slice(1).map(Number);
+    const available = parse(current), required = parse(minimum);
+    if (!available || !required)
+        return false;
+    for (let index = 0; index < 3; index++) {
+        if (available[index] !== required[index])
+            return available[index] > required[index];
+    }
+    return true;
 }
 //# sourceMappingURL=tweak-discovery.js.map

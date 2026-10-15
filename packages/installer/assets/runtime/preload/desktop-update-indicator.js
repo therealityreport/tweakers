@@ -27,6 +27,7 @@ function startDesktopUpdateIndicator() {
     let current = null;
     let indicator = null;
     let warningTimer = null;
+    let renderFrame = null;
     const warnedIdentities = new Set();
     const removeIndicator = () => {
         indicator?.remove();
@@ -101,7 +102,19 @@ function startDesktopUpdateIndicator() {
         render();
     };
     electron_1.ipcRenderer.on(UPDATE_CHANGED_CHANNEL, onChanged);
-    const observer = new MutationObserver(render);
+    const observer = new MutationObserver((records) => {
+        if (!current || !(0, desktop_update_indicator_state_1.shouldShowDesktopUpdateIndicator)(current))
+            return;
+        if (indicator && !indicator.isConnected) {
+            if (renderFrame === null)
+                renderFrame = requestAnimationFrame(() => { renderFrame = null; render(); });
+            return;
+        }
+        const relevant = records.some((record) => [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].some((node) => node instanceof Element && (node.matches("[aria-label],nav,aside,footer")
+            || node.querySelector("[aria-label],nav,aside,footer") !== null)));
+        if (relevant && renderFrame === null)
+            renderFrame = requestAnimationFrame(() => { renderFrame = null; render(); });
+    });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     void electron_1.ipcRenderer.invoke("tweaker:get-codex-desktop-update")
         .then((value) => onChanged(undefined, value))
@@ -109,6 +122,8 @@ function startDesktopUpdateIndicator() {
     return () => {
         electron_1.ipcRenderer.removeListener(UPDATE_CHANGED_CHANNEL, onChanged);
         observer.disconnect();
+        if (renderFrame !== null)
+            cancelAnimationFrame(renderFrame);
         removeIndicator();
     };
 }

@@ -42,15 +42,15 @@ test("40-entry lifecycle stress: deterministic discovery and isolated outcomes",
     }
 
     const discovered = discoverTweaks(root);
-    assert.equal(discovered.length, 40);
+    assert.equal(discovered.length, 38, "conflicting duplicate IDs are excluded by discovery");
     assert.deepEqual(
       discovered.map((entry) => basename(entry.dir)),
       discovered.map((entry) => basename(entry.dir)).toSorted((a, b) => a.localeCompare(b)),
     );
 
     const duplicateIds = new Set(
-      discovered
-        .map((entry) => entry.manifest.id)
+      specs
+        .map((entry) => entry.id)
         .filter((id, index, ids) => ids.indexOf(id) !== index),
     );
     const outcomes = new Map<string, TweakLifecycleStatus | "duplicate">();

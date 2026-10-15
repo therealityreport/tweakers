@@ -213,6 +213,7 @@ function migratedResult(
     candidateFingerprint: SHA,
     conversationCount: 1,
     segmentCount: 1,
+    capacity: null,
     sharedSkillsFingerprint: SHA,
     sharedSkillsTrustedRoots,
     sharedSkillsTrustedRootsFingerprint: SHA,
@@ -313,6 +314,7 @@ function publishMigratedFixture(context: OfflineMigrationLauncherContextV1): Sha
     candidateFingerprint: manifest.fingerprint,
     conversationCount: 1,
     segmentCount: 1,
+    capacity: null,
     sharedSkillsFingerprint: sharedSkills.fingerprint,
     sharedSkillsTrustedRoots: context.migration.sharedSkillsRoots,
     sharedSkillsTrustedRootsFingerprint: trustedRootsFingerprint,
@@ -546,6 +548,9 @@ class Fixture {
     privateFile(this.sharedPluginInventory, `${JSON.stringify({ version: 1, plugins: [FIXTURE_PLUGIN] })}\n`);
     privateFile(this.additionalInventory, '{"version":1,"skills":[]}\n');
     privateFile(this.capacityReceipt, FIXTURE_CAPACITY_RECEIPT);
+    privateFile(join(this.root, "config.json"), JSON.stringify({ tweaks: Object.fromEntries(
+      REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map((id) => [id, { enabled: true }]),
+    ) }));
     this.writePromotionReceipt();
   }
 
@@ -844,7 +849,7 @@ test("the one-shot runner performs two independent zero-writer censuses, commits
     },
   });
 
-  assert.equal(result.state, "migrated");
+  assert.equal(result.state, "migrated", result.reason ?? undefined);
   assert.equal(censuses, 2);
   assert.equal(migrations, 1);
   assert.equal(existsSync(join(fixture.launcherRoot, OFFLINE_MIGRATION_LAUNCHER_TERMINAL_RESULT_FILE)), true);
@@ -906,7 +911,7 @@ test("sealed manager generation, inventories, and the exact current independent 
   );
 });
 
-test("only the exact v5 runtime-ready receipt with normalized appearance, all 11 required tweaks, and an absent pre-migration broker can be sealed", () => {
+test("only the exact v5 runtime-ready receipt with normalized appearance, configured enabled tweaks, and an absent pre-migration broker can be sealed", () => {
   const legacy = new Fixture();
   legacy.writePromotionReceipt({ schemaVersion: 3 });
   assert.throws(
@@ -932,6 +937,35 @@ test("only the exact v5 runtime-ready receipt with normalized appearance, all 11
     () => prepareFixture(missingRequiredTweak.input()),
     /invalid-tweakers-promotion-binding/,
   );
+
+  const disabledFollowup = new Fixture();
+  const tweaks = Object.fromEntries(REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.map((id) => [id, { enabled: true }]));
+  privateFile(join(disabledFollowup.root, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: false } } }));
+  disabledFollowup.writePromotionReceipt({
+    initializedTweakIds: REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS.filter((id) => id !== "co.tweakers.followup"),
+  });
+  assert.doesNotThrow(() => prepareFixture(disabledFollowup.input()));
+  privateFile(join(disabledFollowup.root, "config.json"), JSON.stringify({ tweaks }));
+  assert.throws(
+    () => armFixture(disabledFollowup.launcherRoot, { launchctl: new FakeLaunchctl() }),
+    /invalid-tweakers-promotion-binding/,
+    "enabled-setting drift after prepare invalidates the sealed receipt",
+  );
+
+  const duplicateTweak = new Fixture();
+  duplicateTweak.writePromotionReceipt({ initializedTweakIds: [
+    ...REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS,
+    REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS[0],
+  ] });
+  assert.throws(() => prepareFixture(duplicateTweak.input()), /invalid-tweakers-promotion-binding/);
+
+  const malformedConfig = new Fixture();
+  privateFile(join(malformedConfig.root, "config.json"), JSON.stringify({ tweaks: { ...tweaks, "co.tweakers.followup": { enabled: "false" } } }));
+  assert.throws(() => prepareFixture(malformedConfig.input()), /invalid-tweakers-configuration/);
+  const missingSetting = { ...tweaks };
+  delete missingSetting["co.tweakers.followup"];
+  privateFile(join(malformedConfig.root, "config.json"), JSON.stringify({ tweaks: missingSetting }));
+  assert.throws(() => prepareFixture(malformedConfig.input()), /invalid-tweakers-configuration/);
 
   const wrongBrokerRoot = new Fixture();
   wrongBrokerRoot.writePromotionReceipt({ accountsBrokerRoot: join(wrongBrokerRoot.root, "different-global-root") });
@@ -1083,7 +1117,7 @@ test("active writers wait for a deliberate zero-writer window before the attempt
     inspectRollback: () => v3Rollback(),
   };
   const migrated = runManagerWorker(context, launchctl, dependencies);
-  assert.equal(migrated.state, "migrated");
+  assert.equal(migrated.state, "migrated", migrated.reason ?? undefined);
   assert.equal(censuses, 3, "one active and two spaced zero-writer observations");
   assert.equal(migrations, 1);
   assert.equal(existsSync(join(fixture.launcherRoot, OFFLINE_MIGRATION_LAUNCHER_WAITING_FILE)), true);
@@ -1176,11 +1210,11 @@ test("a published v3 root whose rollback view is not v3-safe is retained for man
       migrations += 1;
       return publishMigratedFixture(context);
     },
-    inspectRollback: () => ({ ...v3Rollback(), legacySqliteFlattened: true }),
+    inspectRollback: () => ({ ...v3Rollback(), legacySqliteFlattened: true }) as unknown as SharedHistoryRollbackView,
   });
   assert.equal(migrations, 1);
   assert.equal(result.state, "manual-recovery-required");
-  assert.equal(result.phase, "rollback-verification");
+  assert.equal(result.phase, "rollback-verification", result.reason ?? undefined);
   assert.equal(existsSync(fixture.globalRoot), true, "the launcher retains v3 evidence; it never restores a v2-incompatible layout");
 });
 
@@ -1199,7 +1233,7 @@ test("the generated plist manager argv is the exact positive internal worker con
     migrate: () => publishMigratedFixture(context),
     inspectRollback: () => v3Rollback(),
   });
-  assert.equal(result.state, "migrated");
+  assert.equal(result.state, "migrated", result.reason ?? undefined);
   assert.equal(existsSync(context.plistPath), false);
   assert.equal(launchctl.labels.size, 0);
 });
@@ -1593,7 +1627,7 @@ test("inspection rejects forged migrated terminal results, rollback bindings, an
       migrate: () => publishMigratedFixture(context),
       inspectRollback: () => v3Rollback(),
     });
-    assert.equal(result.state, "migrated");
+    assert.equal(result.state, "migrated", result.reason ?? undefined);
     const terminalPath = join(fixture.launcherRoot, OFFLINE_MIGRATION_LAUNCHER_TERMINAL_RESULT_FILE);
     const terminal = JSON.parse(readFileSync(terminalPath, "utf8")) as Record<string, unknown>;
     scenario.mutate(terminal, fixture);
@@ -1625,6 +1659,7 @@ test("symlinked identity inputs are rejected and the CLI only accepts explicit l
     inspectCapacityReceipt: fixtureCapacityReceiptInspector,
     print: (line) => printed.push(line),
   });
+  assert.ok("migration" in prepared);
   assert.equal(prepared.transactionId, APPROVED_TRANSACTION);
   assert.equal(prepared.migration.legacyDefinitionsRoot, cliFixture.legacyCodexRoot);
   assert.equal(prepared.migration.capacityReceiptPath, cliFixture.capacityReceipt);
@@ -1638,6 +1673,7 @@ test("symlinked identity inputs are rejected and the CLI only accepts explicit l
     runtimeReadyProbe: fixtureRuntimeReadyProbe,
     inspectCapacityReceipt: fixtureCapacityReceiptInspector,
   });
+  assert.ok("migration" in explicitPrepared);
   assert.equal(explicitPrepared.migration.legacyDefinitionsRoot, explicitCliFixture.legacyDefinitionsRoot);
   assert.throws(
     () => offlineMigrationLauncherCommand("unexpected", { "launcher-root": cliFixture.launcherRoot }),

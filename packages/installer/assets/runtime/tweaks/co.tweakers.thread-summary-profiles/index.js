@@ -1,4 +1,7 @@
 "use strict";
+// Generated compatibility entry. Edit the owning tweak's lib/thread-summary-profiles.js instead.
+// The runtime suppresses this legacy ID only after successful owner-settings migration.
+"use strict";
 
 const OWNER = "co.tweakers.thread-summary-profiles";
 const STYLE_ID = "tweaker-thread-summary-profiles-style";
@@ -20,7 +23,7 @@ const helpers = {
 };
 
 module.exports = {
-  start(api) {
+  start(api, options = {}) {
     if (api?.process === "main" || typeof document === "undefined") return;
     const state = {
       api,
@@ -45,7 +48,16 @@ module.exports = {
       for (const page of state.pageRenders) page.refresh?.();
       schedule(state);
     };
-    const disposeHost = api.react?.host?.observe?.(["thread-context", "projects"], refresh);
+    let lastHostElements = null;
+    let lastIdentityKeys = null;
+    const disposeHost = api.react?.host?.observe?.(["thread-context", "projects"], (snapshots) => {
+      const elements = (snapshots || []).flatMap((snapshot) => snapshot.matches || []).map((match) => match.element);
+      const identityKeys = JSON.stringify(findSummaryPanels(document).map((panel) => privateIdentityKey(resolveProjectIdentity(api, panel))));
+      if (lastIdentityKeys === identityKeys && lastHostElements?.length === elements.length && elements.every((element, index) => element === lastHostElements[index])) return;
+      lastIdentityKeys = identityKeys;
+      lastHostElements = elements;
+      refresh();
+    });
     state.observer = disposeHost ? { disconnect: disposeHost } : null;
     if (typeof window !== "undefined") {
       for (const type of ["popstate", "hashchange", "tweaker:projects-revision"]) {
@@ -53,11 +65,11 @@ module.exports = {
         state.listeners.push(() => window.removeEventListener?.(type, refresh));
       }
     }
-    state.page = api.settings?.registerPage?.({
+    state.page = options.integrated ? null : api.settings?.registerPage?.({
       id: "thread-summary-profiles",
       title: "Thread Summary Profiles",
       description: "Read-only, sanitized connection profiles for the active thread project.",
-      iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 3.5h12v13H4z" stroke="currentColor" stroke-width="1.5"/><path d="M7 7h6M7 10h6M7 13h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+      iconSvg: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="icon-sm inline-block shrink-0 align-middle" aria-hidden="true"><path d="M4 3.5h12v13H4z" stroke="currentColor" stroke-width="1.5"/><path d="M7 7h6M7 10h6M7 13h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
       render(root) { return renderProfilesPage(state, root); },
     });
     schedule(state);
@@ -197,7 +209,9 @@ function renderProfilesState(state) {
   const current = state?.state || "loading";
   if (current === "loading") return { state: current, text: "Loading profiles…", hidden: false, rows: [] };
   if (current === "empty") return { state: current, text: "No profiles configured for this project.", hidden: false, rows: [] };
-  if (current === "error") return { state: current, text: String(state?.error || "Profiles unavailable."), hidden: false, rows: [] };
+  // IPC errors may include private account or filesystem details. Keep the
+  // visible failure state truthful without rendering arbitrary provider text.
+  if (current === "error") return { state: current, text: "Profiles unavailable.", hidden: false, rows: [] };
   const rows = Array.isArray(state?.rows) ? state.rows : [];
   return {
     state: "ready",

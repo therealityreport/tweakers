@@ -164,11 +164,29 @@ function fixtureInput(): ManagedMcpCanaryRunInput {
       declarationFingerprint: `sha256:${"e".repeat(64)}`,
       catalogSha256: `sha256:${"a".repeat(64)}`,
       artifactSha256: ["b".repeat(64)],
+      artifacts: [],
       representativeTool: "ping",
       representativeArguments: {},
     }],
     trustedRunnerExpectedSha256: "f".repeat(64),
     trustedAdapterExpectedSha256: sha256TrustedManagedMcpAppServerAdapterSource(),
+    rustLifecycleTests: {
+      schemaVersion: 1,
+      kind: "codex-rust-lifecycle-tests",
+      sourceCommit: "a".repeat(40),
+      patchedTreeSha256: "b".repeat(64),
+      cargoLockSha256: "c".repeat(64),
+      command: ["cargo", "test", "--locked"],
+      exitCode: 0,
+      passedTests: ["managed_mcp_lifecycle"],
+      stdoutFile: `${root}/rust-lifecycle.stdout`,
+      stdoutSha256: "d".repeat(64),
+      stderrFile: `${root}/rust-lifecycle.stderr`,
+      stderrSha256: "e".repeat(64),
+      candidateBinarySha256: "c".repeat(64),
+      startedAt: "2026-07-20T11:58:00.000Z",
+      completedAt: "2026-07-20T11:59:00.000Z",
+    },
   };
 }
 
@@ -176,3 +194,22 @@ function monotonicClock(): () => string {
   let value = Date.parse("2026-07-20T12:00:00.000Z");
   return () => new Date(value++).toISOString();
 }
+
+
+test("JSONL transport contains broken pipes, rejects pending work, and still closes its owned child", async () => {
+  const emitter = new EventEmitter();
+  const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+  let killed = false;
+  const child = Object.assign(emitter, { pid: 4321, stdin, stdout, stderr,
+    kill: () => { killed = true; emitter.emit("exit", null, "SIGKILL"); return true; } }) as never;
+  const transport = createJsonlManagedMcpAppServerTransport(child);
+  const pending = transport.request("initialize", {}, 5000);
+  const rejection = assert.rejects(pending, /pipe|EPIPE/);
+  try {
+    assert.doesNotThrow(() => stdin.emit("error", Object.assign(new Error("broken pipe EPIPE"), { code: "EPIPE" })));
+    await rejection;
+    await assert.rejects(transport.request("model/list", {}), /pipe|EPIPE/);
+    await transport.terminate();
+    assert.equal(killed, true, "a broken input pipe is not proof that the child exited");
+  } finally { emitter.emit("exit", 1, null); await rejection.catch(() => {}); }
+});

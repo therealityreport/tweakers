@@ -8,6 +8,7 @@ import test from "node:test";
 import { userPaths } from "../src/paths";
 import {
   bootstrapCanonicalManagerEnvironmentSnapshot,
+  canonicalNativeSourceBinding,
   createEnvironmentSelection,
   createProtectedEnvironmentSelection,
   createEnvironmentProfileRegistry,
@@ -1093,6 +1094,105 @@ test("existing canonical manager metadata fails closed when its stored build dif
   }
 });
 
+test("canonical manager bootstrap reconciles a stale version only when it matches the sealed registered source", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-registered-source-"));
+  const sourceRoot = join(root, "unused-legacy");
+  const destinationRoot = join(root, "canonical");
+  try {
+    const observed = {...trustedProfileEvidence("stable"), officialBackendFingerprint: "a".repeat(64)};
+    const loadNative: typeof testEnvironmentLoader = (input, deps = {}) => loadEnvironmentState(input, {
+      ...deps, inspectProfile: profile => profile.releaseProfile === "stable" ? observed : trustedProfileEvidence(profile.releaseProfile),
+    });
+    const base = createEnvironmentProfileRegistry({
+      stableDesktopPath: "/Applications/ChatGPT.app",
+      alphaDesktopPath: "/Applications/ChatGPT (Beta).app",
+      environmentRoot: destinationRoot,
+      stableEvidence: { ...observed, officialVersion: "26.707.1", officialBuild: "7000", officialBackendVersion: "old-backend", officialBackendFingerprint: "b".repeat(64) },
+      alphaEvidence: trustedProfileEvidence("alpha"),
+    });
+    const selection = createEnvironmentSelection({
+      profile: base.profiles.stable,
+      appExperience: "chatgpt",
+      requestedAt: "2026-09-03T07:00:00.000Z",
+      appliedAt: "2026-09-03T07:00:00.000Z",
+    });
+    publishEnvironmentSnapshot(
+      join(destinationRoot, "environment-registry.json"),
+      join(destinationRoot, "environment-selection.json"),
+      { ...base, selected: selection, lastKnownWorkingSelection: selection },
+      selection,
+    );
+    const registryBefore = readFileSync(join(destinationRoot, "environment-registry.json"));
+    const selectionBefore = readFileSync(join(destinationRoot, "environment-selection.json"));
+    const expectedOfficialSource = {
+      version: observed.officialVersion!,
+      build: observed.officialBuild!,
+      teamIdentifier: observed.teamIdentifier!,
+      designatedRequirement: observed.designatedRequirement!,
+    };
+
+    assert.throws(
+      () => bootstrapCanonicalManagerEnvironmentSnapshot({
+        sourceRoot,
+        destinationRoot,
+        expectedOfficialSource: { ...expectedOfficialSource, build: "wrong-build" },
+      }, {
+        loadState: loadNative,
+        validateOfficial: acceptTestOfficialSelection,
+      }),
+      /does not match the sealed registered source/,
+    );
+    assert.deepEqual(readFileSync(join(destinationRoot, "environment-registry.json")), registryBefore);
+
+    const downloadedSource = {...expectedOfficialSource, version: "newer-downloaded-version", build: "99999"};
+    const nativeBinding = canonicalNativeSourceBinding(join(destinationRoot, "doctor", "download", "ChatGPT.app"), downloadedSource,
+      () => ({version: observed.officialVersion!, build: observed.officialBuild!, backendFingerprint: observed.officialBackendFingerprint}));
+    assert.deepEqual(nativeBinding, {...expectedOfficialSource, nativeBackendFingerprint: observed.officialBackendFingerprint}, "download identity stays separate from independently observed native identity");
+    assert.throws(() => canonicalNativeSourceBinding("/download/ChatGPT.app", downloadedSource, () => ({version: null, build: null, backendFingerprint: null})), /identity is unavailable/);
+    assert.throws(() => bootstrapCanonicalManagerEnvironmentSnapshot({sourceRoot, destinationRoot, expectedOfficialSource},
+      {loadState: loadNative, validateOfficial: acceptTestOfficialSelection}), /officialBackendVersion does not match/, "an unbound backend change still fails closed");
+    assert.throws(() => bootstrapCanonicalManagerEnvironmentSnapshot({sourceRoot, destinationRoot,
+      expectedOfficialSource: {...nativeBinding, nativeBackendFingerprint: "c".repeat(64)}},
+      {loadState: loadNative, validateOfficial: acceptTestOfficialSelection}), /does not match the sealed registered source/, "native backend drift before validation cannot publish");
+    assert.deepEqual(readFileSync(join(destinationRoot, "environment-registry.json")), registryBefore);
+    const publication = bootstrapCanonicalManagerEnvironmentSnapshot({
+      sourceRoot,
+      destinationRoot,
+      expectedOfficialSource: nativeBinding,
+    }, {
+      loadState: loadNative,
+      validateOfficial: acceptTestOfficialSelection,
+    });
+    assert.equal(publication.bootstrapped, true);
+    assert.equal(
+      readEnvironmentProfileRegistry(publication.registryFile)!.profiles.stable.officialVersion,
+      observed.officialVersion,
+    );
+    assert.equal(
+      readEnvironmentProfileRegistry(publication.registryFile)!.profiles.stable.officialBuild,
+      observed.officialBuild,
+    );
+    assert.equal(readEnvironmentProfileRegistry(publication.registryFile)!.profiles.stable.officialBackendVersion, observed.officialBackendVersion);
+    assert.equal(readEnvironmentProfileRegistry(publication.registryFile)!.profiles.stable.officialBackendFingerprint, observed.officialBackendFingerprint);
+    assert.deepEqual(readEnvironmentSelection(publication.selectionFile), selection);
+    assert.deepEqual(canonicalNativeSourceBinding("/Applications/ChatGPT.app", expectedOfficialSource), expectedOfficialSource);
+    const nativeRegistry = readFileSync(publication.registryFile);
+    const downloadedBinding = canonicalNativeSourceBinding(join(destinationRoot, "doctor", "jobs", "download", "ChatGPT.app"),
+      downloadedSource, () => ({version: observed.officialVersion!, build: observed.officialBuild!, backendFingerprint: observed.officialBackendFingerprint}));
+    assert.deepEqual(downloadedBinding, nativeBinding, "candidate download cannot replace native desktop authority");
+    const unchangedNative = bootstrapCanonicalManagerEnvironmentSnapshot({sourceRoot, destinationRoot, expectedOfficialSource: downloadedBinding},
+      {loadState: loadNative, validateOfficial: acceptTestOfficialSelection});
+    assert.equal(unchangedNative.bootstrapped, false);
+    assert.deepEqual(readFileSync(publication.registryFile), nativeRegistry, "native profile remains independently verified and unchanged");
+
+    publication.restoreOnFailure();
+    assert.deepEqual(readFileSync(publication.registryFile), registryBefore);
+    assert.deepEqual(readFileSync(publication.selectionFile), selectionBefore);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("canonical manager bootstrap accepts deliberately cleared official backend evidence and revalidates it live", () => {
   const root = mkdtempSync(join(tmpdir(), "tweaker-canonical-environment-backend-unknown-"));
   const sourceRoot = join(root, "unused-legacy");
@@ -1457,5 +1557,17 @@ test("status inspection never executes an untrusted isolated managed-Alpha binar
     assert.equal(existsSync(markerFile), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("official environment accepts only known bundled CLI layouts in its exact desktop", () => {
+  const desktop = "/Applications/ChatGPT.app";
+  const backend = join(desktop, "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+  const input = { stableDesktopPath: desktop, alphaDesktopPath: "/Applications/ChatGPT Alpha.app", environmentRoot: "/tmp/tweakers-environment-layout" };
+  const registry = createEnvironmentProfileRegistry({ ...input, stableEvidence: { ...trustedProfileEvidence("stable"), officialBackendPath: backend, backendPath: backend } });
+  assert.equal(registry.profiles.stable.backendPath, backend);
+  for (const invalid of ["/tmp/codex", join(desktop, "Contents/Resources/other/codex")]) {
+    assert.throws(() => createEnvironmentProfileRegistry({ ...input, stableEvidence: { officialBackendPath: invalid } }), /exact desktop/);
   }
 });

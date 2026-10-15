@@ -432,6 +432,19 @@ export function independentTweakersLiveHealthPath(userRoot: string): string {
   return join(resolve(userRoot), INDEPENDENT_TWEAKERS_LIVE_HEALTH_FILE);
 }
 
+/** Only configured exclusions reduce the bundled readiness requirement. */
+export function configuredIndependentTweakerIds(config: unknown): string[] | null {
+  if (!isRecord(config) || !isRecord(config.tweaks)) return null;
+  const tweaks = config.tweaks;
+  const enabled: string[] = [];
+  for (const id of REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS) {
+    const entry = tweaks[id];
+    if (!isRecord(entry) || typeof entry.enabled !== "boolean") return null;
+    if (entry.enabled) enabled.push(id);
+  }
+  return enabled.sort();
+}
+
 /**
  * This is intentionally a current-process observation, not a durable success
  * receipt.  A well-formed old file remains stale evidence and must never be
@@ -450,7 +463,16 @@ export function inspectIndependentTweakersLiveHealth(
   } catch {
     return { state: "invalid", health: null };
   }
-  if (!isIndependentTweakersLiveHealthV1(value)) return { state: "invalid", health: null };
+  let configuredIds: string[] | null = null;
+  try {
+    const configPath = join(resolve(userRoot), "config.json");
+    if (isPrivateRegularFile(configPath, 256 * 1024)) {
+      configuredIds = configuredIndependentTweakerIds(JSON.parse(readFileSync(configPath, "utf8")) as unknown);
+    }
+  } catch {
+    return { state: "invalid", health: null };
+  }
+  if (!configuredIds || !isIndependentTweakersLiveHealthV1(value, configuredIds)) return { state: "invalid", health: null };
   const health = value;
   const expectedAppRoot = resolve(options.expectedAppRoot ?? INDEPENDENT_TWEAKERS_APP_ROOT);
   const expectedAccountsBrokerRoot = resolve(
@@ -1126,7 +1148,7 @@ function isBrokerBrowserEvidence(value: unknown): value is AccountRouterBrokerEv
     && (value.observed === (value.observedAt !== null));
 }
 
-function isIndependentTweakersLiveHealthV1(value: unknown): value is IndependentTweakersLiveHealthV1 {
+function isIndependentTweakersLiveHealthV1(value: unknown, configuredIds: readonly string[]): value is IndependentTweakersLiveHealthV1 {
   if (!isRecord(value) || !hasExactKeys(value, [
     "schemaVersion", "kind", "pid", "processStartToken", "appRoot", "bundleId", "appAsarHeaderHash", "appSignatureSha256",
     "runtimeFingerprint", "appUserDataRoot", "codexHomeRoot", "accountsBrokerRoot", "accountsBrokerConfigSha256",
@@ -1148,7 +1170,7 @@ function isIndependentTweakersLiveHealthV1(value: unknown): value is Independent
     && (value.sharedHistoryBrokerState === "connected" || value.sharedHistoryBrokerState === "blocked")
     && ((value.sharedHistoryBrokerState === "connected" && isSha256(value.accountsBrokerConfigSha256))
       || (value.sharedHistoryBrokerState === "blocked" && value.accountsBrokerConfigSha256 === null))
-    && isExactRequiredIndependentTweakerIds(value.initializedTweakIds)
+    && isExactRequiredIndependentTweakerIds(value.initializedTweakIds, configuredIds)
     && Array.isArray(value.lifecycleFailures)
     && value.lifecycleFailures.length <= 128
     && value.lifecycleFailures.every(isIndependentTweakersLifecycleFailure)
@@ -1205,8 +1227,7 @@ function isFiniteNumberOrNull(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value));
 }
 
-function isExactRequiredIndependentTweakerIds(value: unknown): value is string[] {
-  const expected = [...REQUIRED_INDEPENDENT_TWEAKERS_TWEAK_IDS].sort();
+function isExactRequiredIndependentTweakerIds(value: unknown, expected: readonly string[]): value is string[] {
   return Array.isArray(value)
     && value.length === expected.length
     && value.every(isTweakId)

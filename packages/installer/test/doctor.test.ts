@@ -184,13 +184,44 @@ function refreshValidationComparisonFingerprint(comparison: DoctorSourceComparis
   comparison.fingerprint = validationSha(validationCanonical(payload));
 }
 
-function attachValidationBackend(evidence: DoctorSourceEvidence, mode: "valid" | "invalid-model" | "wrong-home" | "invalid-account" | "invalid-threads"): void {
+function attachValidationBackend(evidence: DoctorSourceEvidence, mode: "valid" | "invalid-model" | "wrong-home" | "invalid-account" | "invalid-threads" | "missing-requirements" | "invalid-requirements" | "invalid-config" | "invalid-origins"): void {
   const path = join(evidence.appPath, evidence.backend.path);
   const source = `#!/usr/bin/env node
 if (!process.argv.includes('cli_auth_credentials_store="ephemeral"')) process.exit(7);
+if (!process.argv.includes('mcp_oauth_credentials_store="file"')) process.exit(8);
+if (process.argv[2] !== '-c' || process.argv[3] !== 'features.code_mode_host=true' || process.argv[4] !== 'app-server' || process.argv[5] !== '--analytics-default-enabled') process.exit(9);
+const mode=${JSON.stringify(mode)};
+const fs=require('node:fs');
+const path=require('node:path');
+const startupObservation=path.resolve(path.dirname(process.argv[1]),'../..')+'.startup.json';
+let startupPhase=0;
 let buffered='';
 process.stdin.setEncoding('utf8');
-process.stdin.on('data',chunk=>{buffered+=chunk;let lines=buffered.split('\\n');buffered=lines.pop();for(const line of lines){if(!line)continue;const message=JSON.parse(line);let result;if(message.method==='initialize')result={codexHome:${JSON.stringify(mode)}==='wrong-home'?'/wrong':process.env.CODEX_HOME,platformFamily:'unix',platformOs:'macos',userAgent:'fixture'};else if(message.method==='model/list')result={data:${JSON.stringify(mode)}==='invalid-model'?[{}]:[{defaultReasoningEffort:'medium',description:'Fixture',displayName:'Fixture',hidden:false,id:'fixture',isDefault:true,model:'fixture',supportedReasoningEfforts:[{description:'Medium',reasoningEffort:'medium'}]}],nextCursor:null};else if(message.method==='account/read')result={account:${JSON.stringify(mode)}==='invalid-account'?{}:null,requiresOpenaiAuth:true};else if(message.method==='thread/list'||message.method==='thread/loaded/list')result={data:${JSON.stringify(mode)}==='invalid-threads'?[{}]:[],nextCursor:null};else continue;process.stdout.write(JSON.stringify({id:message.id,result})+'\\n')}});
+process.stdin.on('data',chunk=>{buffered+=chunk;let lines=buffered.split('\\n');buffered=lines.pop();for(const line of lines){
+if(!line)continue;
+const message=JSON.parse(line);let result;
+if(message.method==='initialize')result={codexHome:mode==='wrong-home'?'/wrong':process.env.CODEX_HOME,platformFamily:'unix',platformOs:'macos',userAgent:'fixture'};
+else if(message.method==='initialized'){startupPhase=1;continue;}
+else if(message.method==='configRequirements/read'){
+  if(startupPhase!==1||JSON.stringify(message.params)!=='{}')process.exit(10);
+  startupPhase=2;
+  result=mode==='missing-requirements'?{}:{requirements:mode==='invalid-requirements'?[]:null};
+}
+else if(message.method==='config/read'){
+  if(startupPhase!==2||JSON.stringify(message.params)!=='{"includeLayers":false}')process.exit(11);
+  startupPhase=3;
+  fs.writeFileSync(startupObservation,JSON.stringify({argv:process.argv.slice(2),method:message.method,params:message.params}));
+  result={config:mode==='invalid-config'?[]:{},origins:mode==='invalid-origins'?null:{}};
+}
+else if(message.method==='model/list'){
+  if(startupPhase!==3)process.exit(12);
+  result={data:mode==='invalid-model'?[{}]:[{defaultReasoningEffort:'medium',description:'Fixture',displayName:'Fixture',hidden:false,id:'fixture',isDefault:true,model:'fixture',supportedReasoningEfforts:[{description:'Medium',reasoningEffort:'medium'}]}],nextCursor:null};
+}
+else if(message.method==='account/read')result={account:mode==='invalid-account'?{}:null,requiresOpenaiAuth:true};
+else if(message.method==='thread/list'||message.method==='thread/loaded/list')result={data:mode==='invalid-threads'?[{}]:[],nextCursor:null};
+else continue;
+process.stdout.write(JSON.stringify({id:message.id,result})+'\\n')
+}});
 `;
   writeFileSync(path, source, { mode: 0o700 });
   chmodSync(path, 0o700);
@@ -312,6 +343,14 @@ test("doctor validation binds exact evidence and passes representative package c
     assert.equal(report.checks.find((entry) => entry.id === "window-services-patch")?.state, "passed");
     assert.equal(report.checks.find((entry) => entry.id === "model-selection-patch"), undefined);
     assert.equal(report.checks.find((entry) => entry.id === "accounts-native-patch")?.state, "failed");
+    const disabled = await collectDoctorValidation({
+      before, after, comparison, accountsEnabled: false,
+      outputRoot: join(root, "disabled-output"), tweakersSourceRoot: join(import.meta.dirname, "../../.."),
+    });
+    assert.equal(disabled.checks.find(entry => entry.id === "accounts-native-patch")?.state, "passed");
+    assert.match(disabled.checks.find(entry => entry.id === "accounts-native-patch")!.summary, /Accounts is disabled/);
+    assert.deepEqual(disabled.checks.filter(entry => entry.id !== "accounts-native-patch").map(({artifacts, ...entry}) => entry),
+      report.checks.filter(entry => entry.id !== "accounts-native-patch").map(({artifacts, ...entry}) => entry));
     assert.equal(report.checks.find((entry) => entry.id === "after-backend-protocol-smoke")?.state, "unsupported");
     assert.equal(existsSync(join(root, "output", "doctor-validation.json")), true);
   } finally {
@@ -387,6 +426,12 @@ test("doctor validation backend probe binds isolated home and validates retained
     assert.equal(invalidModel?.state, "failed");
     assert.match(invalidModel?.summary ?? "", /ModelListResponse fields/);
     assert.ok(invalidModel?.commands[0]?.argv.includes('cli_auth_credentials_store="ephemeral"'));
+    assert.ok(invalidModel?.commands[0]?.argv.includes('mcp_oauth_credentials_store="file"'));
+    assert.deepEqual(invalidModel?.commands[0]?.argv.slice(1, 5), ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"]);
+    const observedStartup = JSON.parse(readFileSync(`${after.appPath}.startup.json`, "utf8"));
+    assert.deepEqual(observedStartup.argv.slice(0, 4), ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"]);
+    assert.equal(observedStartup.method, "config/read");
+    assert.deepEqual(observedStartup.params, { includeLayers: false });
 
     attachValidationBackend(after, "wrong-home");
     comparison = validationComparison(before, after);
@@ -399,14 +444,16 @@ test("doctor validation backend probe binds isolated home and validates retained
     const wrongHome = report.checks.find((entry) => entry.id === "after-backend-protocol-smoke");
     assert.equal(wrongHome?.state, "failed");
     assert.match(wrongHome?.summary ?? "", /isolated CODEX_HOME/);
-    for (const mode of ["invalid-account", "invalid-threads"] as const) {
+    for (const mode of ["invalid-account", "invalid-threads", "missing-requirements", "invalid-requirements", "invalid-config", "invalid-origins"] as const) {
       attachValidationBackend(after, mode);
       const probeComparison = validationComparison(before, after);
       probeComparison.requiredChecks = ["backend-version-and-app-server-compatibility"];
       refreshValidationComparisonFingerprint(probeComparison);
       const failed = await collectDoctorValidation({before, after, comparison: probeComparison, outputRoot: join(root, mode), tweakersSourceRoot: join(import.meta.dirname, "../../..")});
       assert.equal(failed.checks.find(entry => entry.id === "after-backend-protocol-smoke")?.state, "failed");
-      assert.match(failed.checks.find(entry => entry.id === "after-backend-protocol-smoke")?.summary ?? "", mode === "invalid-account" ? /account\/read/ : /thread\/loaded\/list/);
+      const expected = mode === "invalid-account" ? /account\/read/ : mode === "invalid-threads" ? /thread\/loaded\/list/
+        : mode === "missing-requirements" || mode === "invalid-requirements" ? /configRequirements\/read/ : /config\/read/;
+      assert.match(failed.checks.find(entry => entry.id === "after-backend-protocol-smoke")?.summary ?? "", expected);
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -462,6 +509,12 @@ test("doctor candidate fingerprints bind reachable implementation and payload in
       "import { candidate } from '../candidate.js';",
       "export function createTweakersVariantCandidateOnly() { return candidate(); }",
       "export function createTweakersVariant() { return 'promotion-v1'; }",
+      "export function resumeDeferredAcceptedBackendTransition() { return 'resume-v1'; }",
+      "export function replayAcceptedBackendTransition() { return 'replay-v1'; }",
+      "export function assertAcceptedBackendTransitionResumeAdmission() { return 'admission-v1'; }",
+      "export function stageIndependentTweakersRuntimeReadyExpectation() { return 'expectation-v1'; }",
+      "export function readRuntimeReadyPromotionReceiptSha256() { return 'receipt-v1'; }",
+      "export function commitPromotedVariantJournal() { return 'commit-v1'; }",
       "export function unusedUiPreview() { return 'unused-ui-v1'; }",
     ].join("\n"));
     writeFileSync(join(modules, "candidate.js"), [
@@ -478,6 +531,11 @@ test("doctor candidate fingerprints bind reachable implementation and payload in
       "export function assertDoctorCompatibility() { return 'assertion'; }",
     ].join("\n"));
     writeFileSync(join(modules, "doctor-approval.js"), "export function consumeDoctorCandidateApproval() { return 'approval'; }\n");
+    writeFileSync(join(modules, "shared-native-backend-transition.js"), [
+      "export function sealAcceptedSharedNativeBackendTransition() { return 'sealed'; }",
+      "export function assertAcceptedSharedNativeBackendTransitionClosure() { return 'closure'; }",
+      "export class AcceptedBackendTransitionJournal {}",
+    ].join("\n"));
     writeFileSync(join(modules, "manager-action-adapter.js"), "export function createSealedTweakersManagerActionAdapter() { return 'adapter'; }\n");
     writeFileSync(join(runtime, "payload.js"), "payload-v1\n");
 
@@ -485,10 +543,28 @@ test("doctor candidate fingerprints bind reachable implementation and payload in
     const baselineConstruction = doctorCodeScopeFingerprint(modules, constructionEntries);
     const baselineScopes = doctorImplementationScopes(modules, runtime);
 
+    const brokerLoader = 'export function createSealedTweakersManagerActionAdapter() { return require(join(assets.root,"packages","installer","assets","runtime","account-router","broker-socket.js")); }';
+    writeFileSync(join(modules, "manager-action-adapter.js"), brokerLoader);
+    const brokerScopes = doctorImplementationScopes(modules, runtime);
+    assert.equal(brokerScopes.construction, baselineScopes.construction);
+    assert.notEqual(brokerScopes.promotion, baselineScopes.promotion, "closed-app broker admission must be bound to promotion");
+    writeFileSync(join(runtime, "payload.js"), "broker-payload-changed\n");
+    assert.notEqual(doctorImplementationScopes(modules, runtime).promotion, brokerScopes.promotion, "dynamic runtime bytes remain bound");
+    writeFileSync(join(runtime, "payload.js"), "payload-v1\n");
+    writeFileSync(join(modules, "manager-action-adapter.js"), brokerLoader.replace("broker-socket.js", "unknown.js"));
+    assert.throws(() => doctorImplementationScopes(modules, runtime), /Unbound dynamic scoped loader/);
+    writeFileSync(join(modules, "manager-action-adapter.js"), "export function createSealedTweakersManagerActionAdapter() { return 'adapter'; }\n");
+
     writeFileSync(join(modules, "commands", "create-variant.js"), [
       "import { candidate } from '../candidate.js';",
       "export function createTweakersVariantCandidateOnly() { return candidate(); }",
       "export function createTweakersVariant() { return 'promotion-v1'; }",
+      "export function resumeDeferredAcceptedBackendTransition() { return 'resume-v1'; }",
+      "export function replayAcceptedBackendTransition() { return 'replay-v1'; }",
+      "export function assertAcceptedBackendTransitionResumeAdmission() { return 'admission-v1'; }",
+      "export function stageIndependentTweakersRuntimeReadyExpectation() { return 'expectation-v1'; }",
+      "export function readRuntimeReadyPromotionReceiptSha256() { return 'receipt-v1'; }",
+      "export function commitPromotedVariantJournal() { return 'commit-v1'; }",
       "export function unusedUiPreview() { return 'unused-ui-v2'; }",
     ].join("\n"));
     assert.equal(doctorCodeScopeFingerprint(modules, constructionEntries), baselineConstruction, "unreachable UI declarations must not invalidate construction");
@@ -525,6 +601,12 @@ test("doctor candidate fingerprints bind reachable implementation and payload in
       "import { candidate } from '../candidate.js';",
       "export function createTweakersVariantCandidateOnly() { return candidate(); }",
       "export function createTweakersVariant() { return 'promotion-v2'; }",
+      "export function resumeDeferredAcceptedBackendTransition() { return 'resume-v1'; }",
+      "export function replayAcceptedBackendTransition() { return 'replay-v1'; }",
+      "export function assertAcceptedBackendTransitionResumeAdmission() { return 'admission-v1'; }",
+      "export function stageIndependentTweakersRuntimeReadyExpectation() { return 'expectation-v1'; }",
+      "export function readRuntimeReadyPromotionReceiptSha256() { return 'receipt-v1'; }",
+      "export function commitPromotedVariantJournal() { return 'commit-v1'; }",
       "export function unusedUiPreview() { return 'unused-ui-v2'; }",
     ].join("\n"));
     const promotionChanged = doctorImplementationScopes(modules, runtime);
@@ -535,11 +617,11 @@ test("doctor candidate fingerprints bind reachable implementation and payload in
 
     mkdirSync(join(runtime, "native"), { recursive: true });
     const baselinePayload = doctorCandidatePayloadFingerprint(runtime);
-    mkdirSync(join(runtime, "native", "Tweakers Doctor.app"), { recursive: true });
-    writeFileSync(join(runtime, "native", "Tweakers Doctor.app", "ignored"), "ignored-v1\n");
+    mkdirSync(join(runtime, "native", "Tweakers Manager.app"), { recursive: true });
+    writeFileSync(join(runtime, "native", "Tweakers Manager.app", "ignored"), "ignored-v1\n");
     writeFileSync(join(runtime, "runtime-fingerprint.json"), "metadata-v1\n");
     assert.equal(doctorCandidatePayloadFingerprint(runtime), baselinePayload, "native Doctor app and self-describing runtime metadata are excluded from candidate payload");
-    writeFileSync(join(runtime, "native", "Tweakers Doctor.app", "ignored"), "ignored-v2\n");
+    writeFileSync(join(runtime, "native", "Tweakers Manager.app", "ignored"), "ignored-v2\n");
     writeFileSync(join(runtime, "runtime-fingerprint.json"), "metadata-v2\n");
     assert.equal(doctorCandidatePayloadFingerprint(runtime), baselinePayload);
 

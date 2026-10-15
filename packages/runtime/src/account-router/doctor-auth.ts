@@ -20,7 +20,7 @@ function authority(root: string, secret: Buffer) {
   const source = readNativeHistoryRecoveryAuthorityV1(root, config, secret);
   const companion = readNativeAuthBindingAuthorityV1(root, source, secret);
   const accounts = source.accounts.map((entry, index) => {
-    const home = companion?.document.accounts.find(a => a.opaqueAccountId === entry.opaqueAccountId)?.authHome ?? entry.codexHome;
+    const home = companion?.accounts.find(a => a.opaqueAccountId === entry.opaqueAccountId)?.authHome ?? entry.codexHome;
     const bytes = readNativeAuthPrivateFileV1(join(home, "auth.json"));
     let valid = false;
     try { readNativeExternalTokensV1(home, entry, secret); valid = true; } catch { /* Only this credential is repairable. */ }
@@ -29,7 +29,7 @@ function authority(root: string, secret: Buffer) {
   });
   const metadata = ["account-router-config.json", "native-history-source.v1.json", "native-auth-binding.v1.json", "native-storage-identities.v2.json"]
     .map(name => [name, existsSync(join(root, name)) ? digest(readNativeAuthPrivateFileV1(join(root, name)).toString("base64")) : null]);
-  return { config, accounts, fingerprint: digest({ metadata, accounts: accounts.map(a => [a.entry.opaqueAccountId, a.home, a.fingerprint]) }) };
+  return { config, accounts, fingerprint: digest({ metadata, authBindingFingerprint: companion?.fingerprint ?? null, accounts: accounts.map(a => [a.entry.opaqueAccountId, a.home, a.fingerprint]) }) };
 }
 export function inspectNativeAuthenticationAtRoot(root: string): DoctorAuthInspection {
   const secret = readAccountsBrokerSecret(root);

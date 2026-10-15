@@ -78,6 +78,42 @@ test("discoverTweaks skips invalid JSON manifests", () => {
   });
 });
 
+test("malformed manifests cannot hide a valid sibling", () => {
+  withTempDir((root) => {
+    for (const [name, value] of [["a-null", null], ["b-array", []], ["c-number", 7]] as const) {
+      const dir = join(root, name);
+      mkdirSync(dir);
+      writeFileSync(join(dir, "manifest.json"), JSON.stringify(value));
+      writeFileSync(join(dir, "index.js"), "module.exports = {};");
+    }
+    const valid = writeTweak(root, "valid", validManifest("com.example.valid"));
+    writeFileSync(join(valid, "index.js"), "module.exports = {};");
+    assert.deepEqual(discoverTweaks(root).map((t) => t.manifest.id), ["com.example.valid"]);
+  });
+});
+
+test("duplicate IDs exclude every conflicting owner and preserve other tweaks", () => {
+  withTempDir((root) => {
+    for (const name of ["first", "second", "valid"]) {
+      const dir = writeTweak(root, name, validManifest(name === "valid" ? "com.example.valid" : "com.example.duplicate"));
+      writeFileSync(join(dir, "index.js"), "module.exports = {};");
+    }
+    assert.deepEqual(discoverTweaks(root).map((t) => t.manifest.id), ["com.example.valid"]);
+  });
+});
+
+test("entry paths cannot escape their tweak through traversal or symlinks", () => {
+  withTempDir((root) => {
+    writeFileSync(join(root, "outside.js"), "module.exports = {};");
+    writeTweak(root, "traversal", { ...validManifest("com.example.traversal"), main: "../outside.js" });
+    const linked = writeTweak(root, "linked", validManifest("com.example.linked"));
+    symlinkSync(join(root, "outside.js"), join(linked, "index.js"));
+    const directory = writeTweak(root, "directory", { ...validManifest("com.example.directory"), main: "entry" });
+    mkdirSync(join(directory, "entry"));
+    assert.deepEqual(discoverTweaks(root), []);
+  });
+});
+
 test("discoverTweaks skips manifests missing required fields", () => {
   withTempDir((root) => {
     const tweak = writeTweak(root, "missing-name", {

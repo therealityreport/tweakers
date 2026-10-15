@@ -1,3 +1,4 @@
+import { doctorSourceFile } from "./doctor-baseline.js";
 import { assertDoctorModelExecutionAllowed } from "./doctor-review-execution.js";
 import type { DoctorChangeReportV1 } from "@therealityreport/tweakers-sdk";
 import { spawnSync } from "node:child_process";
@@ -540,7 +541,7 @@ function sourceExcerpts(input: DoctorSourceReviewInput, targets: ReviewTarget[],
         let bytes: Buffer | null = null;
         try {
           if (target.artifact === "asar_member") {
-            const archive = join(evidence.appPath, "Contents", "Resources", "app.asar");
+            const archive = doctorSourceFile(evidence.appPath, "Contents/Resources/app.asar");
             let reader = readers.get(archive);
             if (!reader) {
               reader = openReviewAsar(archive);
@@ -548,7 +549,7 @@ function sourceExcerpts(input: DoctorSourceReviewInput, targets: ReviewTarget[],
             }
             bytes = reader.read(path);
           } else if (target.artifact === "shipped_file") {
-            const absolute = join(evidence.appPath, ...path.split("/"));
+            const absolute = doctorSourceFile(evidence.appPath, path);
             const stat = lstatSync(absolute);
             if (stat.isSymbolicLink()) bytes = Buffer.from(`symlink:${readlinkSync(absolute)}`);
             else if (stat.isFile()) bytes = readFileSync(absolute);

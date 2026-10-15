@@ -34,10 +34,10 @@ test("native host is copied to the deterministic candidate resource path before 
     const runtime = join(root, "runtime");
     mkdirSync(join(runtime, "native"), { recursive: true });
     writeFileSync(join(runtime, "native", "tweaker_native_host.node"), "signed-host-bytes");
-    const doctorRelative = join("Tweakers Doctor.app", "Contents", "MacOS", "Tweakers Doctor");
-    mkdirSync(join(runtime, "native", "Tweakers Doctor.app", "Contents", "MacOS"), { recursive: true });
+    const doctorRelative = join("Tweakers Manager.app", "Contents", "MacOS", "Tweakers Manager");
+    mkdirSync(join(runtime, "native", "Tweakers Manager.app", "Contents", "MacOS"), { recursive: true });
     writeFileSync(join(runtime, "native", doctorRelative), "doctor-helper-bytes");
-    const sealedDoctor = join(runtime, "native", "Tweakers Doctor.app");
+    const sealedDoctor = join(runtime, "native", "Tweakers Manager.app");
     const outside = join(root, "outside");
     writeFileSync(outside, "must-not-change", { mode: 0o400 });
     symlinkSync(outside, join(sealedDoctor, "external-link"));
@@ -52,12 +52,12 @@ test("native host is copied to the deterministic candidate resource path before 
     assert.equal(readFileSync(staged, "utf8"), "signed-host-bytes");
     assert.equal(readFileSync(join(app, "Contents", "Resources", "tweakers", "native", doctorRelative), "utf8"), "doctor-helper-bytes");
     assert.equal(lstatSync(join(app, "Contents", "Resources", "tweakers", "native", doctorRelative)).mode & 0o777, 0o700, "candidate code is writable for re-signing and retains execute permission");
-    assert.equal(lstatSync(join(app, "Contents", "Resources", "tweakers", "native", "Tweakers Doctor.app")).mode & 0o200, 0o200);
+    assert.equal(lstatSync(join(app, "Contents", "Resources", "tweakers", "native", "Tweakers Manager.app")).mode & 0o200, 0o200);
     assert.equal(lstatSync(join(runtime, "native", doctorRelative)).mode & 0o777, 0o500, "sealed source stays unchanged");
     assert.equal(lstatSync(outside).mode & 0o777, 0o400, "copied symlinks cannot chmod external targets");
   } finally {
     for (const part of ["", join("Contents", "MacOS")]) {
-      const sealed = join(root, "runtime", "native", "Tweakers Doctor.app", part);
+      const sealed = join(root, "runtime", "native", "Tweakers Manager.app", part);
       if (existsSync(sealed)) chmodSync(sealed, 0o700);
     }
     rmSync(root, { recursive: true, force: true });

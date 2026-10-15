@@ -1,3 +1,4 @@
+import { readNativeStorageHomeV1 } from "../../src/account-router/native-storage";
 import { inspectNativeAuthenticationAtRoot, reconnectNativeAuthenticationAtRoot } from "../../src/account-router/doctor-auth";
 import { NATIVE_AUTH_BINDING_FILE_V1, prepareNativeAuthBindingV1, publishPreparedNativeAuthBindingV1 } from "../../src/account-router/native-auth-binding";
 import assert from "node:assert/strict";
@@ -15,6 +16,8 @@ import {
   nativeHistoryAuthIdentityHmacV1,
   nativeHistoryThreadReadContextV1,
   observeNativeHistoryWritersV1,
+  observeNativeAccountOperationWritersV1,
+  observeNativeExecutionHomeOperationWritersV1,
   observeNativeThreadWriterV1,
   observeNativeThreadWritersV1,
   readAndPreflightNativeHistorySourceStaticV1,
@@ -49,7 +52,7 @@ function opaque(secret: Buffer, raw: string): OpaqueAccountId {
   return `ar_${createHmac("sha256", secret).update(`account-router:v1:${raw}`, "utf8").digest("base64url")}` as OpaqueAccountId;
 }
 
-function nativeFixture(): NativeFixture {
+function nativeFixture(homeLayout?: string): NativeFixture {
   const stateRoot = realpathSync(mkdtempSync(join(tmpdir(), "native-history-state-")));
   const homesRoot = realpathSync(mkdtempSync(join(tmpdir(), "native-history-homes-")));
   chmodSync(stateRoot, 0o700);
@@ -77,7 +80,7 @@ function nativeFixture(): NativeFixture {
   const codexHomes: string[] = [];
   const sqliteHomes: string[] = [];
   const accountSources = accounts.map((account, index) => {
-    const codexHome = join(homesRoot, "accounts", account, "codex-home");
+    const codexHome = homeLayout && index === 0 ? join(homesRoot, homeLayout) : join(homesRoot, "accounts", account, "codex-home");
     const sqliteHome = join(homesRoot, "accounts", account, "sqlite-home");
     mkdirSync(codexHome, { recursive: true, mode: 0o700 });
     mkdirSync(sqliteHome, { recursive: true, mode: 0o700 });
@@ -264,6 +267,96 @@ test("runtime writer census handles fixed-width macOS commands and unknown numer
   assert.deepEqual(raced, { ok: false, reason: "writer_census_failed", foreignPids: [] }, "a process-table/open-file race remains inconclusive");
 });
 
+for (const scenario of [
+  { name: "desktop own DB and socket", safe: true },
+  { name: "desktop config.toml", file: "config.toml" },
+  { name: "unrelated process", writer: 704 },
+  { name: "native ~/.codex", home: ".codex" },
+  { name: "other home", home: "other/codex-home" },
+  { name: "lookalike executable", exe: "/Applications/Tweakers.app.evil/Contents/MacOS/Tweakers" },
+  { name: "desktop PID reused", reused: 701 },
+  { name: "bridge PID reused", reused: 702 },
+  { name: "identity unavailable", unavailable: true },
+  { name: "broken parent chain", broken: true },
+]) test(`account operation desktop exemption: ${scenario.name}`, () => {
+  const fixture = nativeFixture(scenario.home ?? "Library/Application Support/Tweakers/variants/tweakers/codex-home");
+  const preflight = readAndPreflightNativeHistorySourceStaticV1(fixture.stateRoot, fixture.config, fixture.secret);
+  assert.equal(preflight.state, "ready"); if (preflight.state !== "ready") return;
+  const executable = scenario.exe ?? "/Applications/Tweakers.app/Contents/MacOS/Tweakers";
+  const rows = [
+    psRow(process.pid, 702, "node", "node broker"), psRow(702, scenario.broken ? 1 : 701, "node", "node bridge"),
+    psRow(701, 1, executable, executable), psRow(703, process.pid, "codex", "codex app-server"),
+    psRow(704, 1, executable, executable),
+  ].join("\n");
+  let identityReads = 0;
+  const spawn = ((command: string, args: string[]) => {
+    if (command === "/usr/sbin/lsof") return censusResult(
+      (scenario.file ? [scenario.file] : ["sqlite/codex-dev.db", "sqlite/codex-dev.db-wal", "sqlite/codex-dev.db-shm", "ipc/ipc.sock"])
+        .map(file => `p${scenario.writer ?? 701}\nf4\nau\nn${join(fixture.codexHomes[0]!, file)}\n`).join(""));
+    if (args.includes("pid=,ppid=,lstart=,comm=")) {
+      identityReads++;
+      if (scenario.unavailable) return censusResult("");
+      return censusResult([[process.pid, 702, "node"], [702, 701, "node"], [701, 1, executable]].map(([pid, ppid, exe]) =>
+        `${pid} ${ppid} Fri Sep 25 12:00:${identityReads > 1 && scenario.reused === pid ? "01" : "00"} 2026 ${exe}`).join("\n"));
+    }
+    return censusResult(rows);
+  }) as typeof spawnSync;
+  const observation = observeNativeAccountOperationWritersV1(preflight.binding, fixture.accounts[0]!, 703, {
+    spawn, uid: () => 501, home: () => fixture.homesRoot,
+  });
+  assert.equal(observation.ok, scenario.safe === true);
+  if (!scenario.safe) assert.deepEqual(observation.foreignPids, [scenario.writer ?? 701]);
+});
+
+test("published execution-home operations isolate config writers and retain original-root fences", () => {
+  const fixture = nativeFixture();
+  const account = fixture.accounts[0]!;
+  const home = join(fixture.stateRoot, "accounts", account, "execution-home");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  privateWrite(join(home, "auth.json"), JSON.stringify({ tokens: { account_id: fixture.rawAccounts[0], access_token: "synthetic" } }));
+  const source = readFileSync(join(fixture.stateRoot, "native-history-source.v1.json"));
+  publishPreparedNativeAuthBindingV1(prepareNativeAuthBindingV1({ ...fixture,
+    expectedSourceFingerprint: `sha256:${createHash("sha256").update(source).digest("hex")}`,
+    accounts: [{ opaqueAccountId: account, authHome: home }],
+  }));
+  const ready = readAndPreflightNativeHistorySourceStaticV1(fixture.stateRoot, fixture.config, fixture.secret);
+  assert.equal(ready.state, "ready"); if (ready.state !== "ready") return;
+  let opens = `p701\nf4\nau\nn${join(fixture.codexHomes[0]!, "config.toml")}\n`;
+  const rows = [psRow(701, 1, "codex", "codex app-server"), psRow(702, process.pid, "codex", "codex app-server"),
+    psRow(703, 702, "node", "node plugin"), psRow(704, process.pid, "codex", "codex app-server")].join("\n");
+  const deps = { spawn: ((command: string) => censusResult(command === "/bin/ps" ? rows : opens)) as typeof spawnSync, uid: () => 501 };
+  const observe = () => observeNativeExecutionHomeOperationWritersV1(ready.binding, account, 702, deps);
+  assert.equal(observe().ok, true, "original native writer does not own execution config");
+  assert.equal(observeNativeAccountOperationWritersV1(ready.binding, account, 702, deps).ok, false, "legacy root remains fenced");
+  for (const pid of [702, 703, 704, 701]) {
+    opens = `p${pid}\nf4\nau\nn${join(home, "config.toml")}\n`;
+    assert.equal(observe().ok, pid === 702 || pid === 703, `writer ${pid}`);
+  }
+  assert.equal(observeNativeExecutionHomeOperationWritersV1(ready.binding, fixture.accounts[1]!, 702, deps).ok, false);
+  assert.equal(observeNativeExecutionHomeOperationWritersV1(ready.binding, account, 0, deps).reason, "writer_census_failed");
+  assert.equal(observeNativeExecutionHomeOperationWritersV1(ready.binding, account, 702, {
+    ...deps, spawn: (() => ({ ...censusResult(""), status: 1 })) as typeof spawnSync,
+  }).reason, "writer_census_failed");
+  opens = `p702\nf4\nau\nn${join(home, "config.toml")}\n`;
+  const drifting = { ...deps, spawn: ((command: string) => {
+    if (command === "/usr/sbin/lsof") chmodSync(home, 0o755);
+    return censusResult(command === "/bin/ps" ? rows : opens);
+  }) as typeof spawnSync };
+  assert.equal(observeNativeExecutionHomeOperationWritersV1(ready.binding, account, 702, drifting).reason, "source_drift");
+  chmodSync(home, 0o700);
+  renameSync(home, home + "-prior"); symlinkSync(home + "-prior", home);
+  assert.equal(observe().reason, "source_drift");
+});
+
+test("execution-home operations reject an unpublished home", () => {
+  const fixture = nativeFixture();
+  const ready = readAndPreflightNativeHistorySourceStaticV1(fixture.stateRoot, fixture.config, fixture.secret);
+  assert.equal(ready.state, "ready"); if (ready.state !== "ready") return;
+  assert.equal(observeNativeExecutionHomeOperationWritersV1(ready.binding, fixture.accounts[0]!, 702, {
+    spawn: (() => { throw new Error("must not census an unsigned home"); }) as typeof spawnSync,
+  }).reason, "source_drift");
+});
+
 test("native handoff sanitizer accepts omitted full itemsView and rejects unsafe item types", () => {
   const accepted = nativeHistoryThreadReadContextV1({ thread: {
     id: "native-thread",
@@ -432,4 +525,18 @@ for (const isolated of [false, true]) test(`Doctor reconnect preserves both iden
   assert.equal(readAndPreflightNativeHistorySourceStaticV1(f.stateRoot, f.config, f.secret).state, "ready");
   assert.deepEqual(readFileSync(join(f.stateRoot, "native-history-source.v1.json")), source);
   assert.deepEqual(readFileSync(join(f.codexHomes[1]!, "auth.json")), other);
+});
+
+
+test("native Storage reads the signed metadata home and rejects invalid bindings", () => {
+  const f = nativeFixture();
+  privateWrite(join(f.stateRoot, "account-router-config.json"), JSON.stringify(f.config));
+  privateWrite(join(f.stateRoot, "control-secret.v1"), f.secret);
+  assert.equal(readNativeStorageHomeV1(f.stateRoot), f.codexHomes[0]);
+  assert.notEqual(f.codexHomes[0], f.codexHomes[1]);
+  const path = join(f.stateRoot, "native-history-source.v1.json");
+  const source = JSON.parse(readFileSync(path, "utf8"));
+  source.metadataAccountId = f.accounts[1];
+  privateWrite(path, JSON.stringify(source));
+  assert.throws(() => readNativeStorageHomeV1(f.stateRoot), /unavailable/);
 });

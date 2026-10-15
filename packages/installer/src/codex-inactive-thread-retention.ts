@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { parse } from "acorn";
 import { RendererPatchDeclined, type RendererPatchApplication } from "./renderer-patch-outcome.js";
 
 const JAVASCRIPT_MODULE_EXTENSION = /\.[cm]?js$/i;
@@ -25,10 +26,13 @@ const TELEMETRY_PAYLOAD_WINDOW = 400;
  * Marks our own edit. Detecting "already patched" by looking for the bounded
  * values instead would misread a bundle that legitimately ships them upstream.
  */
-export const CODEX_INACTIVE_THREAD_RETENTION_MARKER = "__tweaker_inactive_thread_retention__";
+export const CODEX_INACTIVE_THREAD_RETENTION_MARKER = "__tweaker_inactive_thread_retention_v2__";
+const LEGACY_RETENTION_MARKER = "__tweaker_inactive_thread_retention__";
+const KEEP_ACTIVITY_MARKER = "__tweaker_keep_chat_activity_v2__";
+const UNSUBSCRIBE_ACTIVITY_MARKER = "__tweaker_recheck_chat_activity_v2__";
 
-const BOUNDED_INACTIVE_TTL_SECONDS = 60;
-const BOUNDED_INACTIVE_OWNER_CACHE = 0;
+export const BOUNDED_INACTIVE_TTL_SECONDS = 300;
+export const BOUNDED_INACTIVE_OWNER_CACHE = 2;
 
 const IDENTIFIER_SOURCE = "[$A-Za-z_][$A-Za-z0-9_]*";
 
@@ -42,6 +46,7 @@ export interface CodexInactiveThreadRetentionPatch {
 
 export interface CodexInactiveThreadRetentionAppPatch extends RendererPatchApplication {
   strategy?: CodexInactiveThreadRetentionPatch["strategy"];
+  relativePaths?: string[];
 }
 
 interface RetentionBindings {
@@ -59,9 +64,8 @@ interface NumericBinding {
 
 /**
  * Bound Codex's inactive-owner retention policy without touching the
- * surrounding active, in-progress, or follower safeguards. The returned source
- * differs only in the inactive TTL, the inactive-owner cache limit, and our
- * marker comment.
+ * active, in-progress, pending-input, or follower safeguards. Recheck activity
+ * immediately before native unsubscribe, and keep all in-progress turns loaded.
  *
  * Returns null when this file does not carry the policy at all. Throws
  * {@link RendererPatchDeclined} when the policy is present but no longer
@@ -91,6 +95,11 @@ export function patchCodexInactiveThreadRetentionSource(
   const ownerCache = soleOwnerCacheBinding(source, bindings.ownerCacheName);
 
   const markerCount = source.split(CODEX_INACTIVE_THREAD_RETENTION_MARKER).length - 1;
+  const legacyCount = source.split(LEGACY_RETENTION_MARKER).length - 1;
+  if (legacyCount > 1 || (legacyCount && markerCount)) throw new Error("Conflicting retention policy markers");
+  if (legacyCount && (ttl.value !== 60 || ownerCache.value !== 0 || !source.includes(`/*${LEGACY_RETENTION_MARKER}*/`))) {
+    throw new Error("Legacy retention marker is attached to an unbounded policy");
+  }
   if (markerCount > 1) {
     throw new Error(
       `Codex inactive-thread retention marker appears ${markerCount} times; refusing an ambiguous renderer change`,
@@ -102,11 +111,15 @@ export function patchCodexInactiveThreadRetentionSource(
         "Codex inactive-thread retention marker is attached to an unbounded policy; refusing an ambiguous renderer change",
       );
     }
+    if (patchCodexInactiveThreadActivitySource(source, telemetryAnchor).changed) {
+      throw new Error("Retention policy marker lacks verified activity safeguards");
+    }
     return { source, changed: false, strategy: "already-patched" };
   }
 
   const observed = { ttlSeconds: ttl.value, ownerCache: ownerCache.value };
-  const patched = rewriteBindings(source, ttl, ownerCache);
+  const bounded = rewriteBindings(source, ttl, ownerCache).replace(`/*${LEGACY_RETENTION_MARKER}*/`, "");
+  const patched = patchCodexInactiveThreadActivitySource(bounded, telemetryAnchor).source;
 
   // Re-read our own output through the same discovery path. A matcher loose
   // enough to hit the wrong site fails here rather than shipping.
@@ -118,13 +131,13 @@ export function patchCodexInactiveThreadRetentionSource(
   return { source: patched, changed: true, strategy: "telemetry-key-discovery", observed };
 }
 
-/** Patch exactly one verified inactive-thread policy in an extracted app tree. */
+/** Verify every policy carrier before writing either main or renderer output. */
 export function patchCodexInactiveThreadRetentionInExtractedApp(
   appDir: string,
   anchorOverrides: ReadonlyMap<string, string> = new Map(),
 ): CodexInactiveThreadRetentionAppPatch {
-  const rendererRoot = resolve(appDir, RENDERER_ROOT);
-  const candidates = collectJavaScriptFiles(rendererRoot);
+  const scopes = [RENDERER_ROOT, ".vite/build"].filter(scope => existsSync(resolve(appDir, scope)));
+  const candidates = scopes.flatMap(scope => collectJavaScriptFiles(resolve(appDir, scope)));
   const inspected: Array<{
     path: string;
     source: string;
@@ -149,25 +162,88 @@ export function patchCodexInactiveThreadRetentionInExtractedApp(
 
   const matches = inspected.filter((candidate) => candidate.patch);
   if (matches.length === 0) return { status: "not-applicable", scannedFiles: candidates.length };
-  if (matches.length > 1) {
-    throw new Error(
-      `Codex inactive-thread retention patch matched ${matches.length} renderer files; refusing an ambiguous renderer change`,
+  for (const scope of scopes) {
+    const scoped = matches.filter(candidate => relative(appDir, candidate.path).startsWith(scope + "/"));
+    if (scoped.length !== 1) throw new Error(
+      `Codex inactive-thread retention patch matched ${scoped.length} files in ${scope}; refusing missing or ambiguous policy coverage`,
     );
   }
 
   const selected = matches[0];
   if (!selected?.patch) throw new Error("Codex inactive-thread retention patch lost its selected renderer candidate");
-  if (selected.patch.changed) writeFileSync(selected.path, selected.patch.source);
+  for (const candidate of matches) if (candidate.patch?.changed) writeFileSync(candidate.path, candidate.patch.source);
   const observed = selected.patch.observed;
   return {
-    status: selected.patch.changed ? "patched" : "already-patched",
+    status: matches.some(candidate => candidate.patch?.changed) ? "patched" : "already-patched",
     relativePath: relative(appDir, selected.path),
+    relativePaths: matches.map(candidate => relative(appDir, candidate.path)),
     scannedFiles: candidates.length,
     strategy: selected.patch.strategy,
     ...(observed
-      ? { detail: `bounded upstream ttl ${observed.ttlSeconds}s and owner cache ${observed.ownerCache}` }
+      ? { detail: `bounded upstream ttl ${observed.ttlSeconds}s and owner cache ${observed.ownerCache}; verified ${matches.length} policy carriers and activity safeguards` }
       : {}),
   };
+}
+
+type PolicyNode = { type: string; start: number; end: number; [key: string]: any };
+
+/** Fixed native-method edits; an optional Doctor selector never supplies code. */
+export function patchCodexInactiveThreadActivitySource(source: string, telemetryAnchor = RETENTION_TELEMETRY_ANCHOR): { source: string; changed: boolean } {
+  const nodes: PolicyNode[] = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    const node = value as PolicyNode;
+    if (typeof node.type === "string") nodes.push(node);
+    for (const [key, child] of Object.entries(node)) if (!["start", "end", "loc"].includes(key)) visit(child);
+  };
+  try { visit(parse(source, { ecmaVersion: "latest", sourceType: "module" })); }
+  catch { throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native chat retention source is not valid JavaScript" }); }
+  const anchorIndex = source.indexOf(telemetryAnchor);
+  const carriers = nodes.filter(node => ["ClassExpression", "ClassDeclaration"].includes(node.type) && node.start < anchorIndex && node.end > anchorIndex);
+  if (carriers.length !== 1) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Retention event does not identify one native policy class" });
+  const methods = carriers[0]!.body.body as PolicyNode[];
+  const method = (name: string): PolicyNode => {
+    const matches = methods.filter(node => node.type === "MethodDefinition" && !node.computed && node.key.name === name);
+    if (matches.length !== 1) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: `Native retention method ${name} is missing or ambiguous` });
+    return matches[0]!.value;
+  };
+  const keep = method("shouldKeepConversationLoaded"), unsubscribe = method("unsubscribeInactiveConversation");
+  const parameter = (node: PolicyNode): string => {
+    if (node.params.length !== 1 || node.params[0].type !== "Identifier") throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native retention parameter changed" });
+    return node.params[0].name;
+  };
+  const conversationParam = parameter(keep), idParam = parameter(unsubscribe);
+  const keepReturn = keep.body.body[0] as PolicyNode;
+  if (keep.body.body.length !== 1 || keepReturn?.type !== "ReturnStatement" || !keepReturn.argument) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native retention activity predicate changed" });
+  const comparisons = nodes.filter(node => node.start >= keepReturn.start && node.end <= keepReturn.end && node.type === "BinaryExpression" && node.operator === "===" && (node.right?.value === "inProgress" || node.right?.type === "TemplateLiteral" && node.right.expressions.length === 0 && node.right.quasis[0]?.value.cooked === "inProgress") && node.left?.type === "ChainExpression" && node.left.expression?.property?.name === "status");
+  const inProgress = [...new Set(comparisons.map(node => source.slice(node.start, node.end)))];
+  if (inProgress.length !== 1) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native retention lacks one verifiable in-progress turn predicate" });
+  const latest = unsubscribe.body.body.flatMap((node: PolicyNode) => node.type === "VariableDeclaration" ? node.declarations : []).filter((node: PolicyNode) => node.id?.type === "Identifier" && node.init?.type === "CallExpression" && source.slice(node.init.callee.start, node.init.callee.end) === "this.params.threadStore.getConversation" && node.init.arguments?.[0]?.name === idParam);
+  if (latest.length !== 1) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native unsubscribe lacks one latest-conversation lookup" });
+  const conversationName = latest[0].id.name;
+  const guards = unsubscribe.body.body.filter((node: PolicyNode) => node.type === "IfStatement" && source.slice(node.test.start, node.test.end).includes(`this.params.streamState.ownsConversationHistoryStream(${idParam})`) && source.slice(node.test.start, node.test.end).includes(`${conversationName}?.resumeState`));
+  const guard = guards[0] as PolicyNode;
+  const add = unsubscribe.body.body.find((node: PolicyNode) => node.type === "ExpressionStatement" && source.slice(node.start, node.end).startsWith(`this.unsubscribingConversationIds.add(${idParam})`));
+  if (guards.length !== 1 || !add || latest[0].start > guard.start || guard.end > add.start || nodes.some(node => node.type === "AwaitExpression" && node.start >= unsubscribe.start && node.start < add.start)) throw new RendererPatchDeclined({ reasonCode: "layout-drift", message: "Native unsubscribe ordering or ownership guard changed" });
+  const keepCount = source.split(KEEP_ACTIVITY_MARKER).length - 1, unsubscribeCount = source.split(UNSUBSCRIBE_ACTIVITY_MARKER).length - 1;
+  const keepPrefix = `return/*${KEEP_ACTIVITY_MARKER}*/${conversationParam}.requests?.length>0||${inProgress[0]}||(`;
+  const unsubscribeSuffix = `||this.hasActiveConversationView(${idParam})||this.hasOwnedStreamFollowers(${idParam})||this.shouldKeepConversationLoaded(${conversationName})/*${UNSUBSCRIBE_ACTIVITY_MARKER}*/)`;
+  if (keepCount || unsubscribeCount) {
+    const returned = source.slice(keepReturn.start, keepReturn.end);
+    const head = source.slice(guard.start, guard.consequent.start).trim();
+    if (keepCount !== 1 || unsubscribeCount !== 1 || !returned.startsWith(keepPrefix) || !head.endsWith(unsubscribeSuffix)) throw new Error("Native retention activity markers lack their exact guards");
+    return { source, changed: false };
+  }
+  const edits = [
+    { start: keepReturn.start, end: keepReturn.end, text: `${keepPrefix}${source.slice(keepReturn.argument.start, keepReturn.argument.end)});` },
+    { start: guard.test.start, end: guard.test.end, text: `(${source.slice(guard.test.start, guard.test.end)})${unsubscribeSuffix.slice(0, -1)}` },
+  ].sort((a, b) => b.start - a.start);
+  let patched = source;
+  for (const edit of edits) patched = patched.slice(0, edit.start) + edit.text + patched.slice(edit.end);
+  const verified = patchCodexInactiveThreadActivitySource(patched, telemetryAnchor);
+  if (verified.changed) throw new Error("Native retention activity guards failed verification");
+  return { source: patched, changed: true };
 }
 
 /**
@@ -199,7 +275,12 @@ function discoverRetentionBindings(source: string, anchorIndex: number): Retenti
 
 /** The TTL is written as `<seconds>*1e3`; accept any integer, pin the shape. */
 function soleTtlBinding(source: string, name: string): NumericBinding {
-  return soleNumericBinding(source, name, /^\s*(\d+)\s*\*\s*1e3/, "ttlMs");
+  return soleNumericBinding(source, name, /^\s*(?:(\d+)\s*\*\s*1e3|(\d+(?:e[+-]?\d+)))(?![\d.])/i, "ttlMs", (match) => {
+    if (match[1]) return { value: Number(match[1]), valueText: match[1] };
+    const milliseconds = Number(match[2]);
+    return Number.isFinite(milliseconds) && milliseconds % 1_000 === 0
+      ? { value: milliseconds / 1_000, valueText: match[2]! } : null;
+  });
 }
 
 function soleOwnerCacheBinding(source: string, name: string): NumericBinding {
@@ -219,6 +300,8 @@ function soleNumericBinding(
   name: string,
   valuePattern: RegExp,
   label: string,
+  select: (match: RegExpExecArray) => { value: number; valueText: string } | null = (match) => match[1]
+    ? { value: Number(match[1]), valueText: match[1] } : null,
 ): NumericBinding {
   const assignments = [
     ...source.matchAll(new RegExp(`(?<![$A-Za-z0-9_])${escapeRegExp(name)}\\s*=(?![=>])`, "g")),
@@ -240,8 +323,8 @@ function soleNumericBinding(
 
   const valueStart = assignmentIndex + assignment[0].length;
   const value = valuePattern.exec(source.slice(valueStart, valueStart + 64));
-  const valueText = value?.[1];
-  if (!value || !valueText) {
+  const selected = value ? select(value) : null;
+  if (!value || !selected) {
     throw new RendererPatchDeclined({
       reasonCode: "layout-drift",
       message: `Codex inactive-thread retention ${label} binding (${name}) is no longer a plain numeric assignment; refusing an unverified renderer change`,
@@ -250,9 +333,9 @@ function soleNumericBinding(
 
   return {
     name,
-    value: Number(valueText),
-    valueIndex: valueStart + value[0].indexOf(valueText),
-    valueText,
+    value: selected.value,
+    valueIndex: valueStart + value[0].indexOf(selected.valueText),
+    valueText: selected.valueText,
   };
 }
 
@@ -262,7 +345,7 @@ function rewriteBindings(source: string, ttl: NumericBinding, ownerCache: Numeri
     {
       index: ttl.valueIndex,
       length: ttl.valueText.length,
-      text: `${BOUNDED_INACTIVE_TTL_SECONDS}`,
+      text: /e/i.test(ttl.valueText) ? `${BOUNDED_INACTIVE_TTL_SECONDS}*1e3` : `${BOUNDED_INACTIVE_TTL_SECONDS}`,
     },
     {
       index: ownerCache.valueIndex,

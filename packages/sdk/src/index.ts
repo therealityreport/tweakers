@@ -7,6 +7,8 @@
  */
 
 export * from "./promotion-policy.js";
+export * from "./accepted-backend-transition-contract.js";
+export * from "./accepted-runtime-repair-contract.js";
 
 export interface TweakManifest {
   /** Reverse-DNS-ish unique id, e.g. "com.you.my-tweak". */
@@ -88,7 +90,8 @@ export type TweakPermission =
   | "native-helper"
   | "screen-capture"
   | "accessibility"
-  | "global-shortcut";
+  | "global-shortcut"
+  | "backend-hooks";
 
 export const VALID_TWEAK_SCOPES = ["renderer", "main", "both"] as const;
 
@@ -109,6 +112,7 @@ export const VALID_TWEAK_PERMISSIONS = [
   "screen-capture",
   "accessibility",
   "global-shortcut",
+  "backend-hooks",
 ] as const;
 
 export interface TweakManifestIssue {
@@ -296,6 +300,11 @@ export interface Tweak {
  * receive whichever half is active in the current process.
  */
 export interface TweakApi {
+  /** Resources and cancellation for this activation, including failed startup. */
+  lifecycle?: {
+    signal: AbortSignal;
+    add(dispose: () => void | Promise<void>): () => Promise<void>;
+  };
   /** Manifest as parsed from disk. Read-only. */
   manifest: Readonly<TweakManifest>;
   /** Per-tweak persistent KV store, scoped to this tweak's id. */
@@ -317,6 +326,37 @@ export interface TweakApi {
   codex?: CodexApi;
   /** Renderer-only: data bridge for guarded native Accounts slots. */
   accountsNative?: AccountsNativeApi;
+  /** Renderer-only: the real Codex RPC services, with no replacement recorder. */
+  nativeCapture?: NativeCaptureApi;
+  /** Main-only: isolated, bounded hooks. Requires backend-hooks permission. */
+  backend?: BackendModsApi;
+}
+
+export interface BackendHookOptions {
+  /** A module inside this tweak directory, executed in a dedicated worker. */
+  entry: string;
+  exportName: string;
+  kind: "observe" | "transform";
+}
+export interface BackendModsApi {
+  register(options: BackendHookOptions): Promise<{ dispose(): Promise<void> }>;
+  diagnostics(): Array<{ id: string; kind: "observe" | "transform"; pending: number; failed: boolean }>;
+}
+/** Observers receive only turn/item notifications, never authentication traffic. */
+export interface BackendModEvent { method: string; params: unknown }
+/** A transform returns a partial update. All other request fields stay native-owned. */
+export interface BackendModRequest {
+  method: "turn/start" | "turn/steer";
+  params: { input: ReadonlyArray<Readonly<Record<string, unknown>>>; model?: string | null; effort?: string | null; summary?: string | null };
+}
+
+export interface NativeCaptureApi {
+  appshots: {
+    getState(): Promise<Record<string, unknown>>;
+    setHotkey(hotkey: "DoubleCommand" | null): Promise<unknown>;
+  };
+  /** Read-only here; recording and privacy settings stay with the native plugin. */
+  computerHistory: { getState(): Promise<Record<string, unknown>> };
 }
 
 export type AccountsNativeRequestSurface = "profile" | "apps" | "plugins" | "mcp" | "usage";

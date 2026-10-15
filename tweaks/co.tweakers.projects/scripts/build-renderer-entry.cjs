@@ -20,6 +20,7 @@ const MODULE_FILES = Object.freeze([
   "lib/native-project-menu.js",
   "lib/sidebar.js",
   "lib/settings.js",
+  "lib/thread-summary-profiles.js",
   "lib/entry.js",
 ]);
 
@@ -87,17 +88,34 @@ function renderRendererEntry() {
   ].join("\n");
 }
 
+
+function renderCompatibilityEntries() {
+  return Object.entries({"co.tweakers.thread-summary-profiles": "lib/thread-summary-profiles.js"}).map(([folder, source]) => ({
+    path: path.resolve(ROOT, "..", folder, "index.js"),
+    source: [
+      '"use strict";',
+      "// Generated compatibility entry. Edit the owning tweak's " + source + " instead.",
+      "// The runtime suppresses this legacy ID only after successful owner-settings migration.",
+      sourceFor(source),
+    ].join("\n"),
+  }));
+}
+
 function checkRendererEntry() {
   const expected = renderRendererEntry();
   const actual = fs.readFileSync(ENTRY, "utf8");
   if (actual !== expected) {
     throw new Error("Projects index.js is stale; run node tweaks/co.tweakers.projects/scripts/build-renderer-entry.cjs");
   }
+  for (const entry of renderCompatibilityEntries()) {
+    if (fs.readFileSync(entry.path, "utf8") !== entry.source) throw new Error("Legacy compatibility entry is stale: " + entry.path);
+  }
   return true;
 }
 
 function writeRendererEntry() {
   fs.writeFileSync(ENTRY, renderRendererEntry());
+  for (const entry of renderCompatibilityEntries()) fs.writeFileSync(entry.path, entry.source);
 }
 
 if (require.main === module) {
@@ -107,6 +125,7 @@ if (require.main === module) {
 
 module.exports = {
   MODULE_FILES,
+  renderCompatibilityEntries,
   renderRendererEntry,
   checkRendererEntry,
   writeRendererEntry,

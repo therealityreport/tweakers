@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ProcessInfo } from "../src/commands/debug";
 import {
   createSealedIndependentRefreshExecutorForTest,
+  createSealedIndependentBackendRecoveryExecutorForTest,
+  createSealedAcceptedRuntimeRepairExecutorForTest,
+  createSealedAcceptedRuntimeRepairApprovalExecutorForTest,
+  createSealedNativeReplacementExecutorForTest,
+  prepareIndependentStartupCapture,
   ManagerActionAdapterError,
   TweakersManagerActionAdapter,
   type InjectedRefreshExecutionInput,
@@ -15,11 +20,31 @@ import type { DeferredTweakersVariantRefresh } from "../src/commands/create-vari
 import type { TweakersManagerActionIdV1 } from "../src/manager-contract";
 import { ManagerOperationStore } from "../src/manager-operation-store";
 import { createTweakersManagerStatusSnapshot, managerStatusPaths } from "../src/manager-status";
+import { ForwardBackendTransitionRecoveryRequired } from "../src/shared-native-backend-transition.js";
+import type { ManagerRecoveryBindingV1 } from "../src/manager-recovery-evidence.js";
 
 const REQUEST_ID = "018f0d36-4c08-7a3e-9c1d-123456789abc";
 const FIRST_OPERATION = "018f0d36-4c08-7a3e-9c1d-123456789abd";
 const SECOND_OPERATION = "018f0d36-4c08-7a3e-9c1d-123456789abe";
 const NOW = "2026-08-27T23:00:00.000Z";
+
+test("independent startup capture consumes a private request without granting acceptance", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "startup-capture-")));
+  try {
+    const directory = join(root, "doctor", "startup-diagnostics"), request = join(directory, "request.json");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(request, JSON.stringify({ version: 1, kind: "tweakers-native-startup-capture-request", requestId: REQUEST_ID, target: "/Applications/Tweakers.app" }), { mode: 0o600 });
+    const streams = prepareIndependentStartupCapture(root);
+    assert.equal(existsSync(request), false);
+    for (const file of Object.values(streams)) { const s = lstatSync(file); assert.equal(s.mode & 0o777, 0o600); assert.equal(s.size, 0); }
+    assert.equal(lstatSync(dirname(streams.stdout)).mode & 0o777, 0o700);
+    const capture = JSON.parse(readFileSync(join(dirname(streams.stdout), "capture.json"), "utf8"));
+    assert.equal(capture.operationId, null); assert.equal(capture.promotionId, null);
+    assert.equal(capture.kind, "tweakers-native-startup-diagnostics");
+    assert.equal(existsSync(join(root, "variants", "tweakers", "runtime-ready.json")), false);
+    assert.throws(() => prepareIndependentStartupCapture(root), /ENOENT/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 const FUTURE = "2026-08-27T23:05:00.000Z";
 const EXECUTABLE = { state: "resolved" as const, path: "/fixed/Tweakers Manager Launcher", sha256: "a".repeat(64) };
 const REGISTERED_SOURCE_GENERATION = "018f0d36-4c08-7a3e-9c1d-123456789aff";
@@ -550,8 +575,205 @@ test("sealed independent refresh validates recovery before quiescence and reuses
       /source-bound validated Accounts recovery receipt/,
     );
     assert.deepEqual(blockedEvents, ["sealed-runtime", "verify-source-recovery"]);
+
+    // Unknown/active legacy work must fail before any lifecycle interruption.
+    reopened = false;
+    const guardedEvents: string[] = [];
+    const guarded = createSealedIndependentRefreshExecutorForTest(() => root, {
+      ...lifecycle,
+      reserveCutover: async () => { guardedEvents.push("reserve"); throw new Error("broker activity is not proven idle"); },
+      quit: () => { guardedEvents.push("quit"); },
+      signal: () => { guardedEvents.push("signal"); },
+      prepareAccountContinuity: () => { guardedEvents.push("continuity"); return {state:"ready" as const,reason:"already-current" as const}; },
+    });
+    await assert.rejects(() => guarded({operationId: SECOND_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST}), /not proven idle/);
+    assert.deepEqual(guardedEvents, ["reserve"]);
+
+    // A process racing admission is refused without signals and releases it.
+    let raced = false;
+    const raceEvents: string[] = [];
+    const race = createSealedIndependentRefreshExecutorForTest(() => root, {
+      ...lifecycle,
+      reserveCutover: async () => { raced = true; return {async release() {raceEvents.push("release");}}; },
+      observe: () => raced ? processObservation({pid: 999, visibleWindow: true}) : null,
+      quit: () => {raceEvents.push("quit");}, signal: () => {raceEvents.push("signal");},
+    });
+    await assert.rejects(() => race({operationId: SECOND_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST}), /appeared during closed-app cutover/);
+    assert.deepEqual(raceEvents, ["release"]);
+
+    const failureEvents: string[] = [];
+    const failedPromotion = createSealedIndependentRefreshExecutorForTest(() => root, {
+      ...lifecycle,
+      reserveCutover: async () => ({async release() {failureEvents.push("release");}}),
+      async refresh(_request, _execution, _authority, beforePromotion) {
+        await beforePromotion(); throw new Error("promotion failed after admission");
+      },
+    });
+    await assert.rejects(() => failedPromotion({operationId: SECOND_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST}), /promotion failed after admission/);
+    assert.deepEqual(failureEvents, ["release"]);
+
+    const acceptanceEvents: string[] = [];
+    reopened = false;
+    const failedAcceptance = createSealedIndependentRefreshExecutorForTest(() => root, {
+      ...lifecycle,
+      reserveCutover: async () => ({async release() {acceptanceEvents.push("release");}}),
+      async refresh(request, execution, _authority, beforePromotion) {
+        await beforePromotion();
+        return fakeDeferredRefresh(request.userRoot, execution.operationId, acceptanceEvents, new Error("readiness failed"));
+      },
+      quit: () => {acceptanceEvents.push("quit");}, signal: () => {acceptanceEvents.push("signal");},
+    });
+    await assert.rejects(() => failedAcceptance({operationId: SECOND_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST}), /rollback\/reopen path was incomplete/);
+    assert.deepEqual(acceptanceEvents, ["release", "retain"]);
+
+    // Main exit is not broker closure. Compensation needs fresh admission.
+    for (const brokerClosed of [false, true]) {
+      reopened = false;
+      const recoveryEvents: string[] = [];
+      let reservations = 0;
+      const afterExit = createSealedIndependentRefreshExecutorForTest(() => root, {
+        ...lifecycle,
+        reserveCutover: async () => {
+          recoveryEvents.push(`reserve:${++reservations}`);
+          if (reservations > 1 && !brokerClosed) throw new Error("broker still active after desktop exit");
+          return {async release() {recoveryEvents.push("release");}};
+        },
+        async refresh(request, execution, _authority, beforePromotion, beforeRollback) {
+          await beforePromotion();
+          const handle = fakeDeferredRefresh(request.userRoot, execution.operationId, recoveryEvents);
+          const rollback = handle.rollback.bind(handle);
+          handle.rollback = () => {beforeRollback(); rollback();};
+          return handle;
+        },
+        readRuntimeReady: () => {reopened = false; throw new Error("readiness failed after desktop exit");},
+        quit: () => {throw new Error("must not quit any desktop");},
+        signal: () => {throw new Error("must not signal any process");},
+      });
+      await assert.rejects(() => afterExit({operationId: SECOND_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST}));
+      assert.deepEqual(recoveryEvents, brokerClosed
+        ? ["reserve:1", "release", "reserve:2", "rollback", "release"]
+        : ["reserve:1", "release", "reserve:2", "retain"]);
+    }
+
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted backend refresh retains forward recovery through publication, canary and commit failures", async () => {
+  const root = fixtureRoot();
+  try {
+    for (const stage of ["publication", "candidate-recovery", "canary", "commit"] as const) {
+      const events: string[] = [];
+      let reopened = false;
+      let recoveryReads = 0;
+      const lifecycle = {
+        reserveCutover: async () => { events.push("reserve"); return { async release() { events.push("release"); } }; },
+        observe: () => reopened ? processObservation({ pid: 513, visibleWindow: true }) : null,
+        quit: () => { throw new Error("forward recovery must not quit"); },
+        relatedPids: () => [], listProcesses: () => [],
+        signal: () => { throw new Error("forward recovery must not signal"); },
+        reopen: () => { reopened = true; events.push("reopen"); },
+        async refresh(request: { userRoot: string }, execution: { operationId: string }, _authority: string, beforePromotion: () => Promise<void>) {
+          await beforePromotion();
+          if (stage === "publication") throw new ForwardBackendTransitionRecoveryRequired(join(request.userRoot, "journal.json"));
+          const handle = fakeDeferredRefresh(request.userRoot, execution.operationId, events,
+            stage === "canary" ? new Error("canary failed") : undefined);
+          handle.rollback = () => { events.push("forbidden-rollback"); throw new Error("must not compensate"); };
+          if (stage === "commit") handle.commit = () => { throw new Error("commit failed"); };
+          return { ...handle, recoveryMode: "forward-only" as const };
+        },
+        readRuntimeReady: () => ({ operationId: FIRST_OPERATION }), now: () => 0, async sleep() {},
+        sealedAccountsRuntimeRoot: () => join(root, "sealed-runtime"),
+        verifyAccountsTransferRecovery: () => ++recoveryReads !== 2 || stage !== "candidate-recovery",
+        prepareAccountContinuity: () => ({ state: "ready" as const, reason: "already-current" as const }),
+      };
+      const execute = createSealedIndependentRefreshExecutorForTest(() => root, lifecycle);
+      await assert.rejects(() => execute({ operationId: FIRST_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION,
+        sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST }));
+      assert.deepEqual(events, stage === "publication" ? ["reserve", "release"]
+        : stage === "candidate-recovery" ? ["reserve", "retain", "release"]
+        : stage === "canary" ? ["reserve", "release", "reopen", "retain"]
+        : ["reserve", "release", "reopen", "runtime-ready:513", "retain"]);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("trusted backend recovery binds the original operation and holds admission through replay", async () => {
+  const root = fixtureRoot();
+  try {
+    const binding: ManagerRecoveryBindingV1 = { schemaVersion: 1, kind: "tweakers-manager-recovery-binding", operationId: FIRST_OPERATION,
+      promotionId: SECOND_OPERATION, userRoot: join(root, "variants", "tweakers"), target: "/Applications/Tweakers.app",
+      generation: { appSha256: "a".repeat(64), runtimeFingerprint: "b".repeat(64), activeReceiptSha256: "c".repeat(64) },
+      journal: { path: join(root, "journal.json"), identitySha256: "d".repeat(64) }, receiptRefs: [], dependencyPaths: [], createdAt: NOW };
+    for (const scenario of ["success", "admission-denied", "evidence-drift", "appearing-process", "canary-failure", "already-committed"] as const) {
+      const events: string[] = [];
+      let held = false, reopened = false, appeared = false, reads = 0;
+      const lifecycle = {
+        reserveCutover: async () => {
+          events.push("reserve"); if (scenario === "admission-denied") throw new Error("broker not closed");
+          held = true; return { async release() { held = false; events.push("release"); } };
+        },
+        observe: () => appeared ? processObservation({ pid: 999, visibleWindow: true }) : reopened ? processObservation({ pid: 513, visibleWindow: true }) : null,
+        quit: () => { throw new Error("must not quit"); }, relatedPids: () => [], listProcesses: () => [],
+        signal: () => { throw new Error("must not signal"); },
+        reopen: () => { assert.equal(held, false); reopened = true; events.push("reopen"); },
+        async refresh(): Promise<DeferredTweakersVariantRefresh> { throw new Error("must not create a new promotion"); },
+        readRuntimeReady: () => ({ operationId: FIRST_OPERATION }), now: () => 0, async sleep() {},
+        sealedAccountsRuntimeRoot: () => join(root, "sealed-runtime"), verifyAccountsTransferRecovery: () => true,
+        prepareAccountContinuity: () => ({ state: "ready" as const, reason: "already-current" as const }),
+      };
+      const execute = createSealedIndependentBackendRecoveryExecutorForTest(() => root, lifecycle, {
+        readEvidence(managerRoot, id) {
+          assert.equal(managerRoot, root); assert.equal(id, FIRST_OPERATION);
+          return { binding, journalSha256: scenario === "evidence-drift" && ++reads > 1 ? "f".repeat(64) : "e".repeat(64),
+            committed: scenario === "already-committed" };
+        },
+        async resume(input, managerRoot, assertClosedAdmission) {
+          assert.equal(held, true); assert.equal(managerRoot, root);
+          assert.deepEqual(input, { userRoot: binding.userRoot, target: binding.target, promotionId: binding.promotionId,
+            operationId: FIRST_OPERATION, expectedJournalSha256: "e".repeat(64) });
+          if (scenario === "appearing-process") appeared = true;
+          assertClosedAdmission(); events.push("replay");
+          return { ...fakeDeferredRefresh(binding.userRoot, FIRST_OPERATION, events,
+            scenario === "canary-failure" ? new Error("canary failed") : undefined), recoveryMode: "forward-only" as const };
+        },
+        settle(managerRoot, id) { assert.equal(managerRoot, root); assert.equal(id, FIRST_OPERATION); events.push("settle"); return true; },
+      });
+      if (scenario === "success" || scenario === "already-committed") await execute(FIRST_OPERATION);
+      else await assert.rejects(() => execute(FIRST_OPERATION));
+      assert.deepEqual(events, scenario === "success" ? ["reserve", "replay", "release", "reopen", "runtime-ready:513", "commit", "settle"]
+        : scenario === "already-committed" ? ["settle"] : scenario === "admission-denied" ? ["reserve"]
+        : scenario === "canary-failure" ? ["reserve", "replay", "release", "reopen", "retain"] : ["reserve", "release"]);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("accepted runtime repair Manager replays accepted proof and each active rename gap under closed admission without a relaunch or compensation",async()=>{
+  for(const phase of ["acceptance:verified","active:archive-planned","active:archived","active:promote-planned","active:promoted","committed"] as const) {
+    for(const scenario of ["success","admission-denied","appearing-process","proof-drift","settlement-failure"] as const) {
+      let held=false,appeared=false;const events:string[]=[];
+      const lifecycle={reserveCutover:async()=>{events.push("reserve");if(scenario==="admission-denied")throw new Error("broker not closed");held=true;return{async release(){held=false;events.push("release");}};},
+        observe:()=>appeared?processObservation({pid:999,visibleWindow:true}):null,relatedPids:()=>[],
+        quit(){assert.fail("must not quit");},signal(){assert.fail("must not signal");},reopen(){assert.fail("accepted gaps must not relaunch");},
+        listProcesses:()=>[],async refresh():Promise<DeferredTweakersVariantRefresh>{assert.fail("must not stage a new promotion");},
+        readRuntimeReady:()=>null,now:()=>0,async sleep(){},sealedAccountsRuntimeRoot:()=>"/unused",verifyAccountsTransferRecovery:()=>true,
+        prepareAccountContinuity:()=>({state:"ready" as const,reason:"already-current" as const})};
+      const verify=()=>{assert.equal(held,true);events.push("verify");if(scenario==="proof-drift")throw new Error("immutable acceptance signature changed");};
+      const executor=createSealedAcceptedRuntimeRepairExecutorForTest(lifecycle,{
+        readAcceptedRuntimeRepairRecord:()=>({publication:{phase},root:"/private/fixed-child"}) as any,
+        readAuthenticatedAcceptedRuntimeRepair:()=>{verify();return{phase:"committed"} as any;},
+        finishAcceptedRuntimeRepairFromRetainedAcceptance(id,guard){assert.equal(id,FIRST_OPERATION);if(scenario==="appearing-process")appeared=true;guard();verify();events.push("publish");},
+        settleAcceptedRuntimeRepair(id){assert.equal(id,FIRST_OPERATION);assert.equal(held,true);events.push("settle");return scenario!=="settlement-failure";},
+        resumeAcceptedRuntimeRepair(){assert.fail("durable acceptance must use exact closed replay");},
+      });
+      if(scenario==="success"||phase==="committed"&&scenario==="appearing-process")await executor(FIRST_OPERATION);
+      else await assert.rejects(()=>executor(FIRST_OPERATION));
+      assert.equal(held,false);
+      assert.equal(events.filter(event=>event==="reserve").length,1,"no re-reservation/compensation after failure");
+      if(scenario!=="admission-denied")assert.equal(events.at(-1),"release");
+      if(scenario==="proof-drift")assert.equal(events.includes("settle"),false);
+    }
   }
 });
 
@@ -591,7 +813,7 @@ test("sealed independent refresh stops only captured exact-path helpers before r
       prepareAccountContinuity: () => ({ state: "ready", reason: "already-current" }),
     });
 
-    await execute({ operationId: FIRST_OPERATION });
+    await execute({ operationId: FIRST_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST });
     assert.deepEqual(events, [
       "refresh:/Applications/Tweakers.app<-sealed-default-source",
       "signal:5691:SIGTERM",
@@ -653,7 +875,7 @@ test("sealed independent refresh retains helper identity when quitting reparents
       prepareAccountContinuity: () => ({ state: "ready", reason: "already-current" }),
     });
 
-    await execute({ operationId: FIRST_OPERATION });
+    await execute({ operationId: FIRST_OPERATION, sourceGenerationId: REGISTERED_SOURCE_GENERATION, sourceReceiptDigest: REGISTERED_SOURCE_RECEIPT_DIGEST });
     assert.deepEqual(events, [
       "refresh:/Applications/Tweakers.app<-sealed-default-source",
       "quit:/Applications/Tweakers.app:412",
@@ -937,6 +1159,45 @@ test("sealed independent refresh gives a newly visible Tweakers renderer a full 
   });
 });
 
+test("sealed independent refresh waits for signed native preparation before accepting delayed real readiness", async () => {
+  await assertSealedIndependentRefreshLifecycle({
+    operationId: FIRST_OPERATION,
+    running: false,
+    reopenObservations: Array.from({ length: 706 }, () => ({ pid: 513, visibleWindow: true })),
+    runtimeReadyAfterMs: 176_250,
+    runtimeReadyTimeoutMs: 660_000,
+    expectedOutcome: "rebuilt-independent-tweakers",
+    expectedEvents: ["refresh:/Applications/Tweakers.app<-sealed-default-source", "reopen:/Applications/Tweakers.app", "runtime-ready:513", "commit"],
+    expectedProofPrefix: ["513:true"],
+    expectedSleepCalls: 705,
+  });
+});
+
+test("sealed independent refresh keeps the ordinary deadline without a verified preparation extension", async () => {
+  await assertSealedIndependentRefreshLifecycle({
+    operationId: FIRST_OPERATION,
+    running: false,
+    reopenObservations: Array.from({ length: 242 }, () => ({ pid: 513, visibleWindow: true })),
+    runtimeReadyAfterMs: 176_250,
+    expectedOutcome: "recovery-required",
+    expectedEvents: ["refresh:/Applications/Tweakers.app<-sealed-default-source", "reopen:/Applications/Tweakers.app", "quit:/Applications/Tweakers.app:513", "rollback"],
+    expectedProofPrefix: ["513:true"],
+    expectedSleepCalls: 240,
+  });
+});
+
+test("sealed independent refresh rejects an unbounded preparation deadline before reopening", async () => {
+  await assertSealedIndependentRefreshLifecycle({
+    operationId: FIRST_OPERATION,
+    running: false,
+    runtimeReadyTimeoutMs: 660_001,
+    expectedOutcome: "recovery-required",
+    expectedEvents: ["refresh:/Applications/Tweakers.app<-sealed-default-source", "rollback"],
+    expectedProofPrefix: [],
+    expectedSleepCalls: 0,
+  });
+});
+
 test("sealed independent refresh leaves Tweakers closed after an incomplete rollback", async () => {
   await assertSealedIndependentRefreshLifecycle({
     operationId: SECOND_OPERATION,
@@ -973,7 +1234,7 @@ test("deployment refresh executors are exact-targeted and cannot share a generic
     source,
     /createSealedTweakersManagerActionAdapter[\s\S]*?createSealedIndependentRefreshExecutor\(userRoot\)[\s\S]*?executeRefreshIndependent\(input[\s\S]*?executeIndependentRefresh\(input, timing\)/,
   );
-  assert.match(source, /createSealedIndependentRefreshExecutor[\s\S]*?const managerUserRoot = userRoot\(\)[\s\S]*?refresh\(refreshInput, execution, managerUserRoot, beforePromotion\)[\s\S]*?reopenAndProveIndependentTweakers/);
+  assert.match(source, /createSealedIndependentRefreshExecutor[\s\S]*?const managerUserRoot = userRoot\(\)[\s\S]*?refresh\(refreshInput, execution, managerUserRoot, beforePromotion, beforeRollback\)[\s\S]*?reopenAndProveIndependentTweakers/);
   assert.match(source, /quiesceIndependentTweakers[\s\S]*?relatedPids\(INDEPENDENT_TWEAKERS_APP\)[\s\S]*?lifecycle\.quit\(INDEPENDENT_TWEAKERS_APP, observed\.pid\)[\s\S]*?"SIGTERM"[\s\S]*?"SIGKILL"[\s\S]*?relatedPids\(INDEPENDENT_TWEAKERS_APP\)/);
   assert.match(source, /reopenAndProveIndependentTweakers[\s\S]*?observed\.pid !== previous\.pid[\s\S]*?processStartToken !== previous\.startedAtRaw[\s\S]*?runtimeReadyDeadline \?\?=[\s\S]*?deferred\.verifyRuntimeReady[\s\S]*?await lifecycle\.sleep\(INDEPENDENT_REOPEN_PROOF_POLL_MS\)/);
   assert.match(source, /createSealedIndependentRefreshLifecycle[\s\S]*?prepareDeferredTweakersVariantRefresh\(\{[\s\S]*?runtimeReadyOperationId: execution\.operationId,[\s\S]*?environmentAuthoritySourceRoot: \(\) => sourceAuthorityRoot,[\s\S]*?beforePromotion: async \(\{ target, userRoot \}\)[\s\S]*?target !== input\.app[\s\S]*?userRoot !== input\.userRoot/);
@@ -983,8 +1244,8 @@ test("deployment refresh executors are exact-targeted and cannot share a generic
   );
   assert.match(independentExecutorSource, /const refreshInput: IndependentRefreshInput = \{[\s\S]*?app: INDEPENDENT_TWEAKERS_APP,[\s\S]*?userRoot: join\(managerUserRoot, "variants", "tweakers"\)/);
   assert.doesNotMatch(independentExecutorSource, /\bsource\s*:/);
-  assert.match(source, /reopen: openAndActivateCodex/);
-  assert.doesNotMatch(source, /reopen: openCodex/);
+  assert.match(source, /reopen\(app: string\): void \{[\s\S]*?if \(app !== INDEPENDENT_TWEAKERS_APP\) throw[\s\S]*?openAndActivateCodex\(app,/);
+  assert.doesNotMatch(source, /reopen: openAndActivateCodex|reopen: openCodex|\bopenCodex\(app/);
   assert.doesNotMatch(source, /independentRefreshLifecycleForTest/);
   assert.match(source, /refresh\.injected[\s\S]*?injected-chatgpt-patch/);
   assert.match(source, /refresh\.independent[\s\S]*?independent-tweakers-patch/);
@@ -1112,6 +1373,8 @@ async function assertSealedIndependentRefreshLifecycle(input: {
   reopenError?: Error;
   reopenObservations?: Array<TestProcessObservation | null>;
   runtimeReady?: unknown | null;
+  runtimeReadyAfterMs?: number;
+  runtimeReadyTimeoutMs?: number;
   runtimeReadyError?: Error;
   continuityError?: Error;
   continuityDeferred?: boolean;
@@ -1183,8 +1446,10 @@ async function assertSealedIndependentRefreshLifecycle(input: {
       },
       readRuntimeReady(): unknown | null {
         if (currentReopenObservation === null) return null;
+        if (input.runtimeReadyAfterMs !== undefined && now < input.runtimeReadyAfterMs) return null;
         return input.runtimeReady === undefined ? { operationId: input.operationId } : input.runtimeReady;
       },
+      ...(input.runtimeReadyTimeoutMs !== undefined ? { runtimeReadyTimeoutMs: () => input.runtimeReadyTimeoutMs! } : {}),
       now(): number {
         return now;
       },
@@ -1309,6 +1574,10 @@ function fakeDeferredRefresh(
       if (settled) throw new Error("fixture refresh was already finalized");
       settled = true;
       events.push("commit");
+    },
+    retain(): void {
+      if (settled) throw new Error("fixture refresh was already finalized");
+      settled = true; events.push("retain");
     },
     rollback(): void {
       if (settled) throw new Error("fixture refresh was already finalized");
@@ -1440,3 +1709,43 @@ function readyRegisteredOfficialSource() {
 async function assertAdapterError(body: () => Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(body, (error: unknown) => error instanceof ManagerActionAdapterError && error.code === code);
 }
+
+test("accepted runtime repair Manager fences actual successor approval publication and preserves unfenced V1 compatibility",async()=>{
+  for(const scenario of ["v1","success","admission-denied","desktop-present","broker-present","appearance-before-write","approval-failed"] as const) {
+    let held=false,appeared=false;const events:string[]=[];
+    const lifecycle={reserveCutover:async()=>{events.push("reserve");if(scenario==="admission-denied")throw new Error("broker admission denied");held=true;
+      return{async release(){held=false;events.push("release");}};},
+      observe:()=>scenario==="desktop-present"||appeared?processObservation({pid:999,visibleWindow:true}):null,
+      relatedPids:()=>scenario==="broker-present"?[555]:[]};
+    const execute=createSealedAcceptedRuntimeRepairApprovalExecutorForTest(lifecycle as any,{
+      acceptedRuntimeRepairApprovalRequiresClosedAdmission(id,fp){assert.equal(id,FIRST_OPERATION);assert.equal(fp,"sha256:"+"a".repeat(64));events.push("classify");return scenario!=="v1";},
+      approveAcceptedRuntimeRepair(id,fp,guard){assert.equal(id,FIRST_OPERATION);assert.equal(fp,"sha256:"+"a".repeat(64));
+        if(scenario==="v1"){assert.equal(held,false);assert.equal(guard,undefined);events.push("write");return{} as any;}
+        assert.equal(held,true);assert.ok(guard);if(scenario==="appearance-before-write")appeared=true;
+        guard();if(scenario==="approval-failed")throw new Error("signed review drift");events.push("write");return{} as any;},
+    });
+    if(scenario==="v1"||scenario==="success")await execute(FIRST_OPERATION,"sha256:"+"a".repeat(64));
+    else await assert.rejects(execute(FIRST_OPERATION,"sha256:"+"a".repeat(64)));
+    assert.equal(held,false);
+    assert.deepEqual(events,scenario==="v1"?["classify","write"]:scenario==="success"?["classify","reserve","write","release"]:
+      scenario==="admission-denied"?["classify","reserve"]:["classify","reserve","release"]);
+  }
+});
+
+test("native replacement fences the actual handoff and always releases desktop and broker admission",async()=>{
+  for(const scenario of ["success","admission-denied","desktop-present","broker-present","appearance-before-move","retirement-failed"] as const) {
+    let held=false,appeared=false;const events:string[]=[];
+    const lifecycle={reserveCutover:async()=>{events.push("reserve");if(scenario==="admission-denied")throw new Error("broker admission denied");held=true;
+      return{async release(){held=false;events.push("release");}};},
+      observe:()=>scenario==="desktop-present"||appeared?processObservation({pid:999,visibleWindow:true}):null,
+      relatedPids:()=>scenario==="broker-present"?[555]:[]};
+    const execute=createSealedNativeReplacementExecutorForTest(lifecycle as any,{
+      async prepareAcceptedRuntimeNativeReplacement(id,guard){assert.equal(id,FIRST_OPERATION);assert.equal(held,true);
+        if(scenario==="appearance-before-move")appeared=true;guard();
+        if(scenario==="retirement-failed")throw new Error("old app custody changed");
+        events.push("move");return{operationId:id,promotionId:SECOND_OPERATION,outcome:"superseded",retiredApp:"/Trash/exact",nativeBackendSha256:"a".repeat(64)};},
+    });
+    if(scenario==="success")await execute(FIRST_OPERATION);else await assert.rejects(execute(FIRST_OPERATION));
+    assert.equal(held,false);assert.deepEqual(events,scenario==="success"?["reserve","move","release"]:scenario==="admission-denied"?["reserve"]:["reserve","release"]);
+  }
+});

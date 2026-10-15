@@ -1,3 +1,4 @@
+import { nativeCaptureBridge } from "./native-capture";
 /**
  * Renderer preload entry. Runs in an isolated world before Codex's page JS.
  * Responsibilities:
@@ -68,12 +69,15 @@ function desktopWorkerForViewChannel(workerId: string): string {
 // Codex's renderer is sandboxed (sandbox: true), so `require("node:fs")` is
 // unavailable. We forward log lines to main via IPC; main writes the file.
 function fileLog(stage: string, extra?: unknown): void {
+  const bootDetail = /^(?:preload entry|browser UI host bridge installed|react hook installed|boot start|desktop update indicator started|settings injector started|tweak host started|manager mounted|boot complete)$/.test(stage);
   const msg = `[tweaker preload] ${stage}${
     extra === undefined ? "" : " " + safeStringify(extra)
   }`;
   try {
-    console.error(msg);
+    if (bootDetail) console.debug(msg);
+    else console.error(msg);
   } catch {}
+  if (bootDetail) return;
   try {
     ipcRenderer.send("tweaker:preload-log", "info", msg);
   } catch {}
@@ -90,11 +94,14 @@ fileLog("preload entry", { url: location.href });
 
 // React values stay in the page. This transport exposes only the reviewed
 // account data operations and a receipt-bound initialization handshake.
-try {
-  accountsNativeBridge.setCompatibility(ipcRenderer.sendSync("tweaker:accounts-native-compatibility"));
-  contextBridge.exposeInMainWorld("__tweakersAccountsTransportV1", accountsNativeTransport);
-} catch {
-  accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts native initialization failed.", hookSetSha256: "" });
+if (isTweakerUiDocument(location.href)) {
+  try {
+    accountsNativeBridge.setCompatibility(ipcRenderer.sendSync("tweaker:accounts-native-compatibility"));
+    contextBridge.exposeInMainWorld("__tweakersAccountsTransportV1", accountsNativeTransport);
+    contextBridge.exposeInMainWorld("__tweakersNativeCaptureV1", nativeCaptureBridge.transport);
+  } catch {
+    accountsNativeBridge.setCompatibility({ compatible: false, reason: "Accounts native initialization failed.", hookSetSha256: "" });
+  }
 }
 
 const promotionAttempt = promotionRendererAuthorizationAttempt(location.href);
@@ -225,9 +232,48 @@ function promotionRendererStorageSelfTest(nonce: string): "pass" | "fail" {
   }
 }
 
+function isTweakerUiDocument(href: string): boolean {
+  try {
+    const url = new URL(href);
+    return url.protocol === "app:" && url.hostname === "-"
+      && !url.username && !url.password && !url.port
+      && ["/index.html", "/detached-window.html"].includes(url.pathname)
+      && url.searchParams.get("initialRoute") !== "/avatar-overlay";
+  } catch { return false; }
+}
+
 async function boot() {
+  // The session preload also runs in checkout, authentication and sandbox
+  // documents. Those do not own tweak settings, storage or renderer handlers.
+  if (!isTweakerUiDocument(location.href)) return;
+  subscribeReload();
   fileLog("boot start", { readyState: document.readyState });
   try {
+    const nativeDescriptor = await ipcRenderer.invoke("tweaker:native-services-descriptor") as { asset: string; exportName: string } | null;
+    if (nativeDescriptor) {
+      contextBridge.executeInMainWorld({
+        func: (descriptor: { asset: string; exportName: string }) => {
+          const entry = document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/"]');
+          const url = entry ? new URL(descriptor.asset, entry.src) : new URL(`/assets/${descriptor.asset}`, location.href);
+          void import(url.href).then((module) => {
+            const services = () => {
+              const value = module[descriptor.exportName];
+              if (!value) throw new Error("Native Codex services are still starting");
+              return value;
+            };
+            const bridge = (globalThis as unknown as { __tweakersNativeCaptureV1?: { register(value: unknown): boolean } }).__tweakersNativeCaptureV1;
+            bridge?.register({
+              appshots: {
+                getState: () => services().appshot.getState(),
+                setHotkey: (hotkey: string | null) => services().appshot.setHotkey(hotkey),
+              },
+              computerHistory: { getState: () => services().chronicle.getState() },
+            });
+          }).catch(error => console.warn("[tweaker] Native capture services unavailable:", error));
+        },
+        args: [nativeDescriptor],
+      });
+    }
     startDesktopUpdateIndicator();
     fileLog("desktop update indicator started");
     startSettingsInjector();
@@ -236,27 +282,62 @@ async function boot() {
     fileLog("tweak host started");
     await mountManager();
     fileLog("manager mounted");
-    subscribeReload();
     fileLog("boot complete");
   } catch (e) {
     fileLog("boot FAILED", String((e as Error)?.stack ?? e));
     console.error("[tweaker] preload boot failed:", e);
+  } finally {
+    bootingTweaks = false;
+    if (reloadPending) requestTweakReload();
   }
 }
 
 // Hot reload: gated behind a small in-flight lock so a flurry of fs events
 // doesn't reentrantly tear down the host mid-load.
 let reloading: Promise<void> | null = null;
+let reloadPending = false;
+let bootingTweaks = true;
+let storeLifecycleHeld = false;
+let storeLifecycleOperation: string | null = null;
 function subscribeReload(): void {
-  ipcRenderer.on("tweaker:tweaks-changed", () => {
-    if (reloading) return;
+  ipcRenderer.on("tweaker:tweaks-changed", requestTweakReload);
+  ipcRenderer.on("tweaker:store-lifecycle", async (_event, request) => {
+    if (!request || typeof request.operationId !== "string" || typeof request.instanceToken !== "string"
+      || typeof request.tweakId !== "string" || !["shutdown", "activate"].includes(request.phase)) return;
+    let ok = false, error: string | undefined;
+    try {
+      if (bootingTweaks) throw new Error("Renderer startup is still in flight");
+      if (storeLifecycleOperation && storeLifecycleOperation !== request.operationId) throw new Error("Another store operation owns this renderer");
+      storeLifecycleOperation = request.operationId;
+      storeLifecycleHeld = true;
+      if (reloading) await reloading;
+      if (request.phase === "shutdown") await teardownTweakHost();
+      else {
+        await startTweakHost(request.tweakId);
+        await mountManager();
+        storeLifecycleHeld = false;
+        storeLifecycleOperation = null;
+      }
+      ok = true;
+    } catch (cause) { error = String((cause as Error)?.message ?? cause); }
+    ipcRenderer.send("tweaker:store-lifecycle-ack", {
+      operationId: request.operationId, instanceToken: request.instanceToken, phase: request.phase, ok, error,
+    });
+  });
+}
+function requestTweakReload(): void {
+    reloadPending = true;
+    if (reloading || bootingTweaks || storeLifecycleHeld) return;
     reloading = (async () => {
       const focusSnapshot = captureTweakReloadFocus(document);
       try {
         console.info("[tweaker] hot-reloading tweaks");
-        teardownTweakHost();
-        await startTweakHost();
-        await mountManager();
+        do {
+          reloadPending = false;
+          await teardownTweakHost();
+          await startTweakHost();
+          await mountManager();
+        } while (reloadPending);
       } catch (e) {
         console.error("[tweaker] hot reload failed:", e);
       } finally {
@@ -266,7 +347,6 @@ function subscribeReload(): void {
         reloading = null;
       }
     })();
-  });
 }
 
 function installBrowserUiHostBridge(): void {

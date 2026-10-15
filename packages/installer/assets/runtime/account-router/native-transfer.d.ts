@@ -118,14 +118,26 @@ export type NativeCatalogReconcileResultV1 = {
     scanned: number;
     projected: number;
     collisions: number;
+    capacity: {
+        threads: number;
+        max: number;
+    };
 } | {
     state: "collision";
     scanned: number;
     projected: number;
     collisions: number;
+    capacity: {
+        threads: number;
+        max: number;
+    };
 } | {
     state: "busy" | "unsupported" | "collision" | "unavailable";
     reason: string;
+    capacity?: {
+        threads: number;
+        max: number;
+    };
 };
 export interface NativeTransferInputV1 {
     operationId: string;
@@ -277,6 +289,7 @@ export declare class NativeTransferCoordinatorV1 {
     private readonly resumedGenerationProofs;
     private capability;
     private capabilityInFlight;
+    private capabilityProbedAt;
     private document;
     private readonly accounts;
     private readonly accountHomeIdentities;

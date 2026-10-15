@@ -83,6 +83,7 @@ export interface McpLifecycleManifest {
       detached_wrapper: string;
       exact_standalone_app_server: string;
       standalone_orphan: string;
+      tweakers_keyboard_monitor?: "registered_owner_exit";
       claude_idle: string;
     };
   };
@@ -818,6 +819,7 @@ function validateManifest(raw: unknown): McpLifecycleManifest {
     || !isRecord(policy.lane_modes)
     || typeof policy.lane_modes.detached_wrapper !== "string"
     || typeof policy.lane_modes.exact_standalone_app_server !== "string"
+    || (policy.lane_modes.tweakers_keyboard_monitor !== undefined && policy.lane_modes.tweakers_keyboard_monitor !== "registered_owner_exit")
     || typeof policy.lane_modes.standalone_orphan !== "string"
     || typeof policy.lane_modes.claude_idle !== "string") {
     throw new McpLifecycleInstallError("MCP lifecycle manifest policy is invalid");
@@ -858,6 +860,8 @@ function validateManifest(raw: unknown): McpLifecycleManifest {
         detached_wrapper: policy.lane_modes.detached_wrapper,
         exact_standalone_app_server: policy.lane_modes.exact_standalone_app_server,
         standalone_orphan: policy.lane_modes.standalone_orphan,
+        ...(policy.lane_modes.tweakers_keyboard_monitor === "registered_owner_exit"
+          ? { tweakers_keyboard_monitor: "registered_owner_exit" as const } : {}),
         claude_idle: policy.lane_modes.claude_idle,
       },
     },

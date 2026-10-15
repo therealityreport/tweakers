@@ -380,28 +380,28 @@ test("coordinator metadata restore never fails the refresh", async () => {
 test("refresh validates before quitting and always reopens after promotion starts", async () => {
   const calls: string[] = [];
   await runRefreshWorkflow({
-    prepare: () => calls.push("prepare"),
-    quit: () => calls.push("quit"),
-    promote: () => calls.push("promote"),
-    reopen: () => calls.push("reopen"),
+    prepare: () => { calls.push("prepare"); },
+    quit: () => { calls.push("quit"); },
+    promote: () => { calls.push("promote"); },
+    reopen: () => { calls.push("reopen"); },
   });
   assert.deepEqual(calls, ["prepare", "quit", "promote", "reopen"]);
 
   const failedBeforeQuit: string[] = [];
   await assert.rejects(runRefreshWorkflow({
     prepare: () => { failedBeforeQuit.push("prepare"); throw new Error("invalid"); },
-    quit: () => failedBeforeQuit.push("quit"),
-    promote: () => failedBeforeQuit.push("promote"),
-    reopen: () => failedBeforeQuit.push("reopen"),
+    quit: () => { failedBeforeQuit.push("quit"); },
+    promote: () => { failedBeforeQuit.push("promote"); },
+    reopen: () => { failedBeforeQuit.push("reopen"); },
   }), /invalid/);
   assert.deepEqual(failedBeforeQuit, ["prepare"]);
 
   const failedPromotion: string[] = [];
   await assert.rejects(runRefreshWorkflow({
-    prepare: () => failedPromotion.push("prepare"),
-    quit: () => failedPromotion.push("quit"),
+    prepare: () => { failedPromotion.push("prepare"); },
+    quit: () => { failedPromotion.push("quit"); },
     promote: () => { failedPromotion.push("promote"); throw new Error("rollback"); },
-    reopen: () => failedPromotion.push("reopen"),
+    reopen: () => { failedPromotion.push("reopen"); },
   }), /rollback/);
   assert.deepEqual(failedPromotion, ["prepare", "quit", "promote", "reopen"]);
 });

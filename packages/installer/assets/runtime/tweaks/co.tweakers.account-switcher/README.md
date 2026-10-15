@@ -1,6 +1,6 @@
 # Accounts
 
-`co.tweakers.account-switcher` 0.10.1 revises the existing Accounts feature with
+`co.tweakers.account-switcher` revises the existing Accounts feature with
 quota-based routing, automatic safe failover, native remote pairing, and pooled
 or selected-account activity. The menu follows the upstream subscription-router
 layout while retaining Tweakers setup and recovery controls.
@@ -72,4 +72,4 @@ existing homes, prepares native locks and settings, and verifies each desktop in
 sequence. Bulk history adoption is not required for native in-place history.
 
 Usage Limit Resets Tracker remains the owner of observed usage/reset history.
-Upstream attribution is in [the retained MIT license](../../docs/accounts-upstream-LICENSE.txt).
+Upstream attribution is in [the retained MIT license](https://github.com/therealityreport/tweakers/blob/main/docs/accounts-upstream-LICENSE.txt).

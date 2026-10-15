@@ -75,7 +75,7 @@ test("prepare-account-history requires an explicit approved link root", () => {
 });
 
 test("--dry-run overrides --apply and exact source roots are preserved", () => {
-  let captured: PrivateHistoryNormalizationInput | null = null;
+  const captured: PrivateHistoryNormalizationInput[] = [];
   prepareAccountHistoryCommand({
     apply: true,
     "dry-run": true,
@@ -85,17 +85,17 @@ test("--dry-run overrides --apply and exact source roots are preserved", () => {
   }, {
     userRoot: () => "/private/user-root",
     execute(input) {
-      captured = input;
+      captured.push(input);
       return DRY_RUN_RESULT;
     },
     print: () => undefined,
   });
-  assert.equal(captured?.apply, false);
-  assert.equal(captured?.sourceCodexRoot, "/private/source-codex");
-  assert.equal(captured?.sourceSqliteRoot, "/private/source-sqlite");
-  assert.equal(captured?.snapshotRoot, "/private/user-root/private-account-history-source-v1");
-  assert.equal(captured?.allowedLinkRoot, "/private/archive");
-  assert.equal(captured?.appPath, "/Applications/Tweakers.app");
+  assert.equal(captured[0]?.apply, false);
+  assert.equal(captured[0]?.sourceCodexRoot, "/private/source-codex");
+  assert.equal(captured[0]?.sourceSqliteRoot, "/private/source-sqlite");
+  assert.equal(captured[0]?.snapshotRoot, "/private/user-root/private-account-history-source-v1");
+  assert.equal(captured[0]?.allowedLinkRoot, "/private/archive");
+  assert.equal(captured[0]?.appPath, "/Applications/Tweakers.app");
 });
 
 test("explicit roots must already be exact absolute paths", () => {

@@ -6,8 +6,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { validateTweakManifest } from "../../sdk/src/index";
-import promotionHealth from "../../runtime/src/promotion-health";
-import rendererStorage from "../../runtime/src/renderer-storage";
+import * as promotionHealth from "../../runtime/src/promotion-health";
+import * as rendererStorage from "../../runtime/src/renderer-storage";
 import { readDevSnapshotReceipt } from "../src/commands/dev-sync";
 import {
   inspectUserQuestionsSource,
@@ -45,7 +45,7 @@ test("canonical manifest, package, lifecycle, broker, and source proof stay at o
   const validation = validateTweakManifest(manifest);
   assert.equal(validation.ok, true, JSON.stringify(validation.errors));
   assert.equal(manifest.id, USER_QUESTIONS_TWEAK_ID);
-  assert.equal(manifest.version, "1.0.0");
+  assert.equal(manifest.version, "1.0.3");
   assert.equal(tweakPackage.version, manifest.version);
   assert.equal(manifest.scope, "both");
   assert.deepEqual(broker.REQUIRED_BROKER_PERMISSIONS, ["ipc", "network"]);

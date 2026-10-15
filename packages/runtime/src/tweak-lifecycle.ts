@@ -124,11 +124,13 @@ export function lifecycleRecordKey(process: TweakProcess, id: string): string {
  * runtime historically stored it unbound, silently breaking `this`-based main
  * cleanup for `scope: "both"` tweaks (followup).
  */
-export function bindMainTweakStop<T extends { stop?: (...args: unknown[]) => unknown }>(
+export function bindMainTweakStop<T extends object>(
   tweak: T | null | undefined,
-): T["stop"] | undefined {
-  if (!tweak || typeof tweak.stop !== "function") return tweak?.stop;
-  return tweak.stop.bind(tweak) as T["stop"];
+): T extends { stop: infer F } ? F extends (...args: never[]) => unknown ? OmitThisParameter<F> | undefined : undefined : undefined;
+export function bindMainTweakStop(tweak: object | null | undefined): ((...args: unknown[]) => unknown) | undefined {
+  const stop = tweak && "stop" in tweak ? tweak.stop : undefined;
+  if (typeof stop !== "function") return undefined;
+  return stop.bind(tweak);
 }
 
 /**
@@ -173,10 +175,10 @@ export function recoverInterruptedTweaks(
 
 export interface ReloadTweaksDeps {
   logInfo(message: string): void;
-  stopAllMainTweaks(): void;
+  stopAllMainTweaks(): void | Promise<void>;
   clearTweakModuleCache(): void;
   loadAllMainTweaks(): void | Promise<void>;
-  broadcastReload(): void;
+  broadcastReload(): void | Promise<void>;
 }
 
 export interface SetTweakEnabledAndReloadDeps extends ReloadTweaksDeps {
@@ -189,28 +191,31 @@ export function isMainProcessTweakScope(scope: TweakScope | undefined): boolean 
 
 let reloadSequence: Promise<void> = Promise.resolve();
 
+/** All lifecycle and source publication changes share this queue. */
+export function enqueueTweakLifecycle<T>(run: () => Promise<T>): Promise<T> {
+  const operation = reloadSequence.then(run, run);
+  reloadSequence = operation.then(() => {}, () => {});
+  return operation;
+}
+
 export function loadTweaksInitially(
   deps: Pick<ReloadTweaksDeps, "loadAllMainTweaks">,
 ): Promise<void> {
   const run = async (): Promise<void> => {
     await deps.loadAllMainTweaks();
   };
-  const operation = reloadSequence.then(run, run);
-  reloadSequence = operation.catch(() => {});
-  return operation;
+  return enqueueTweakLifecycle(run);
 }
 
 export function reloadTweaks(reason: string, deps: ReloadTweaksDeps): Promise<void> {
   const run = async (): Promise<void> => {
     deps.logInfo(`reloading tweaks (${reason})`);
-    deps.stopAllMainTweaks();
+    await deps.stopAllMainTweaks();
     deps.clearTweakModuleCache();
     await deps.loadAllMainTweaks();
-    deps.broadcastReload();
+    await deps.broadcastReload();
   };
-  const operation = reloadSequence.then(run, run);
-  reloadSequence = operation.catch(() => {});
-  return operation;
+  return enqueueTweakLifecycle(run);
 }
 
 export async function setTweakEnabledAndReload(
@@ -218,9 +223,15 @@ export async function setTweakEnabledAndReload(
   enabled: unknown,
   deps: SetTweakEnabledAndReloadDeps,
 ): Promise<true> {
-  const normalizedEnabled = !!enabled;
-  deps.setTweakEnabled(id, normalizedEnabled);
-  deps.logInfo(`tweak ${id} enabled=${normalizedEnabled}`);
-  await reloadTweaks("enabled-toggle", deps);
-  return true;
+  return enqueueTweakLifecycle(async () => {
+    const normalizedEnabled = !!enabled;
+    deps.setTweakEnabled(id, normalizedEnabled);
+    deps.logInfo(`tweak ${id} enabled=${normalizedEnabled}`);
+    deps.logInfo("reloading tweaks (enabled-toggle)");
+    await deps.stopAllMainTweaks();
+    deps.clearTweakModuleCache();
+    await deps.loadAllMainTweaks();
+    await deps.broadcastReload();
+    return true as const;
+  });
 }

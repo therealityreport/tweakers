@@ -1,5 +1,77 @@
 # Architecture
 
+## Source packages and ownership
+
+The root workspace has seven source packages. `tweaks/` is canonical tweak
+source, `store/index.json` is synchronized catalog data, and
+`packages/installer/assets/runtime/` is generated output.
+
+| Package | Responsibility |
+| --- | --- |
+| `packages/installer` | CLI adapters, environment and desktop transactions, candidate validation, promotion, recovery evidence, and the sealed manager service. |
+| `packages/runtime` | Main-process bootstrap, tweak discovery and lifecycle, Accounts transport, store transactions, and renderer preload/Settings integration. |
+| `packages/sdk` | Shared public tweak APIs, manifests, contracts, and common primitives. |
+| `packages/loader` | The small injected `loader.cjs` bootstrap in the desktop bundle. |
+| `packages/native-host` | macOS native modules, app and manager launchers, and directory/process coordination helpers. |
+| `packages/mcp-lifecycle` | Canonical MCP lifecycle assets, templates, and source/package checks. |
+| `packages/switcher` | Legacy standalone mode switcher kept for compatibility and migration tests. |
+
+The separate **Menu Bar** application owns the current menu-bar host, manager
+discovery, and host trust records. Tweakers publishes its sealed manager
+descriptor through `packages/installer/src/manager-descriptor.ts` under
+`~/Library/Application Support/Menu Bar/manager-descriptors/`. That publisher
+does not own or change Menu Bar's trust decision. `packages/switcher` is not
+the current manager host.
+
+## Receipt and process observation boundaries
+
+`packages/installer/src/desktop-update-receipt.ts` owns the schema-v1 desktop
+receipt types, validator, historical selection normalization, and reader.
+`desktop-update-transaction.ts` keeps compatibility exports and owns the
+transaction and durable writer. `lifecycle-lock.ts` reads desktop receipts from
+the leaf and environment receipts from the existing
+`manager-environment-action.ts` leaf. Reading lifecycle gates does not import
+either transaction coordinator.
+
+`packages/installer/src/process-observation.ts` exposes
+`observeExactTargetProcesses(target)`. It reads the process census and matches
+commands that start under the resolved app path. Census failure rejects the
+observation. This service does not stop processes, wait for exit, or change
+lifecycle state. Promotion and recovery callers own those decisions.
+
+## Recoverable store replacement
+
+`packages/runtime/src/store-transaction.ts` owns filesystem publication and
+reconciliation for store installs. It stages a replacement on the same
+filesystem, hashes the old and new trees, records durable intent, and calls
+the supplied lifecycle ports before publication and activation. Policy for
+catalog metadata, permissions, and approval remains with its caller.
+
+The journal and backup remain under the sibling
+`.<tweaks-directory-name>-store-transactions/` directory. Failed activation
+requires proof that the replacement stopped before prior files can return.
+An uncertain lifecycle outcome keeps the journal and lock, and blocks
+admission. Fresh startup reconciliation restores only supported, verified
+filesystem states. Malformed or unattributable evidence blocks discovery;
+it does not silently delete the transaction.
+
+## Exact manager recovery evidence
+
+`packages/installer/src/manager-recovery-evidence.ts` binds recovery to one
+manager operation and promotion journal. The immutable binding records the
+operation and promotion IDs, exact user root and app target, app generation
+hash, runtime fingerprint, active receipt hash, journal identity hash, receipt
+references, and dependency paths. The journal identity hash excludes its
+changing phase; the rest of its identity remains bound.
+
+A terminal operation phase alone does not prove recovery. Verification compares
+the exact bound journal and filesystem generations. A committed promotion also
+requires its matching schema-v3 runtime-ready receipt with main, preload, and
+Settings initialization. A recovered promotion requires the prior generations
+or proven absence and no readiness receipt for the abandoned operation.
+The operation-local binding remains the authority for reconciliation;
+unrelated newer receipts cannot release an older operation's hold.
+
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                                Codex.app                                │
@@ -18,7 +90,7 @@
                   loader.cjs requires runtime/main.js
                                  ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│  <user-data-dir>/tweaker/                                        │
+│  <Tweakers user root>/                                                  │
 │  ├─ runtime/                                                            │
 │  │   ├─ main.js          — main process; hooks BrowserWindow            │
 │  │   ├─ preload.js       — bundled preload (renderer side)              │
@@ -44,7 +116,8 @@ The renderer only receives cached metadata (`latestVersion`, `releaseUrl`, `upda
 ## Boot sequence
 
 1. User launches Codex.app.
-2. macOS verifies the (re-signed) ad-hoc signature → Gatekeeper allows launch.
+2. macOS verifies the re-signed app. A promotable candidate uses Tweakers'
+   stable local signing identity.
 3. The desktop runtime reads `Info.plist` → checks asar integrity hash.
    - The hash now matches the patched asar, so this passes.
    - On older Electron-style bundles, the `EnableEmbeddedAsarIntegrityValidation`
@@ -65,13 +138,13 @@ The renderer only receives cached metadata (`latestVersion`, `releaseUrl`, `upda
 8. Our preload:
    - Installs a React DevTools-shaped global hook (so we can fiber-walk later).
    - Asks main for the tweak list and user paths over IPC.
-   - For each renderer-scoped tweak, `require()`s its entry and calls `start(api)`.
+   - For each renderer-scoped tweak, requests its source through IPC, evaluates
+     it with `new Function` in the preload, and calls `start(api)`.
    - Starts the Settings injector (MutationObserver waiting for the Settings dialog).
    - Mounts the built-in Tweak Manager section.
-9. When the user opens Settings, our injector:
-   - Detects the Radix `[role="dialog"]` matching "Settings".
-   - Appends a "Tweaks" tab to the dialog's `[role="tablist"]`.
-   - Creates a sibling content panel that shows registered sections when the tab is clicked, and hides itself when other tabs are clicked.
+9. When the user opens Settings, the preload finds the Settings sidebar, inserts
+   a Tweakers navigation group, and mounts registered pages in the Settings
+   content area.
 
 ## Why these choices
 
@@ -81,11 +154,14 @@ The fuse alone would let us swap in a new asar, but Codex's asar is large (~115 
 
 ### Why local re-signing instead of disabling SIP?
 
-Re-signing is local-only, reversible, and doesn't compromise system security. On macOS, Tweaker creates and reuses a per-machine "Tweaker Local Signing" identity so privacy grants have a stable signer across repair runs. Users can still opt into ad-hoc signing with `--no-local-signing`. We never touch SIP, hardened runtime, or kernel-level protections.
+Re-signing is local-only, reversible, and doesn't compromise system security.
+The promotable macOS candidate uses a stable local signing identity; ad-hoc
+signing is limited to explicit candidate-only validation. We never touch SIP,
+hardened runtime, or kernel-level protections.
 
 ### Why a preload, not source-patching the React tree?
 
-Codex is a Vite/Rollup build with a single entry chunk and no module registry exposed at runtime — there's no `webpackChunk` trick. String-patching the minified output is brittle (every Codex release changes the build). Preload + DOM observation is decoupled from Codex's bundle structure: we only depend on stable affordances (Radix attributes, `[role="dialog"]`, etc.), so most Codex updates just work.
+Codex is a Vite/Rollup build with a single entry chunk and no module registry exposed at runtime — there's no `webpackChunk` trick. String-patching the minified output is brittle (every Codex release changes the build). Preload + DOM observation uses Settings sidebar and content-area structure; the injector must be checked when upstream markup changes.
 
 ### Why a separate runtime in user-dir?
 
@@ -128,13 +204,12 @@ and relaunches. The in-app App Mode control (Settings → Config, tweaker mode
 only) confirms in the renderer and then hands the same CLI off via a launchd
 job so the helper survives the app quitting and the bundle swap.
 
-The persistent menu-bar switcher exposes mode changes in both modes. While
-Tweakers mode is active, it also offers **Reload Tweakers with Latest Changes**.
-That action resolves the registered development checkout and starts
-`refresh-local --source development`: the checkout is built and a disposable
-candidate is validated while ChatGPT stays open, then the app is quit only for
-the transactional promotion and relaunch. A failed promotion restores the
-previous working payload.
+The legacy standalone switcher remains for compatibility. The current menu-bar
+surface belongs to Menu Bar and invokes Tweakers' sealed manager actions.
+Development refresh resolves the registered checkout and validates the candidate
+before final promotion. Cutover follows the lifecycle admission locks and exact
+target process evidence. Failed acceptance preserves recovery material and
+potentially active processes until their state is proved.
 
 Mode discipline:
 

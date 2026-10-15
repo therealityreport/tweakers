@@ -394,3 +394,21 @@ function rejectingAdapter(): TweakersManagerActionAdapter {
     for (const args of [[command], [command, "--request-id", REQUEST_ID, "--json", "--app", "/tmp/other.app"], [command, "--request-id", "invalid", "--json"]]) assert.throws(() => parseTweakersManagerArguments(args));
   }
 });
+
+test("accepted runtime repair Doctor dispatch rejects unknown roots workers and malformed envelopes before fixed action execution",async()=>{
+  for(const input of [
+    {kind:"tweakers-accepted-runtime-repair-action",version:1,action:"recover",operationId:OPERATION_ID,root:"/foreign"},
+    {kind:"tweakers-accepted-runtime-repair-action",version:1,action:"scan",operationId:OPERATION_ID,worker:"/foreign"},
+    {kind:"tweakers-accepted-runtime-repair-action",version:1,action:"approve",jobId:OPERATION_ID,reportFingerprint:"forged"},
+    {kind:"tweakers-accepted-runtime-repair-action",version:1,action:"publish",operationId:OPERATION_ID},
+  ]) {
+    const output:string[]=[];
+    const result=await runTweakersManagerCli(["doctor-action","--request-id",REQUEST_ID,"--json"],{
+      executable:()=>EXECUTABLE,userRoot:()=>"/private/fixed-manager",adapter:rejectingAdapter(),
+      readStdin:()=>Buffer.from(JSON.stringify(input)),write:line=>output.push(line),
+    });
+    assert.equal(result,64);assert.equal(output.length,1);
+    const response=JSON.parse(output[0]!);assert.equal(response.requestId,REQUEST_ID);
+    assert.match(response.error.message,/fixed repair/);
+  }
+});

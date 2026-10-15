@@ -354,7 +354,20 @@ async function download(url: string, target: string): Promise<void> {
     headers: githubRequestHeaders(githubToken()),
   });
   if (!res.ok || !res.body) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  await pipeline(res.body, createWriteStream(target));
+  const reader = res.body.getReader();
+  async function* chunks() {
+    let complete = false;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) { complete = true; return; }
+        yield next.value;
+      }
+    } finally {
+      try { if (!complete) await reader.cancel(); } finally { reader.releaseLock(); }
+    }
+  }
+  await pipeline(chunks(), createWriteStream(target));
 }
 
 async function fetchReleaseText(url: string): Promise<string | null> {

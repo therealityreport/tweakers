@@ -20,7 +20,10 @@ const tweaks = [
 test("all eleven canonical Tweakers register one purpose-built settings page", () => {
   const icons = new Set<string>();
   for (const folder of tweaks) {
-    const source = readFileSync(resolve(process.cwd(), "tweaks", folder, "index.js"), "utf8");
+    // Owner entry modules register the page; embedded compatibility children
+    // retain their own standalone pages but disable them in integrated mode.
+    const entry = ["ui-improvements", "co.tweakers.projects"].includes(folder) ? "lib/entry.js" : "index.js";
+    const source = readFileSync(resolve(process.cwd(), "tweaks", folder, entry), "utf8");
     const registrations = source.match(/registerPage(?:\?\.)?\s*\(\s*\{/g) || [];
     assert.equal(registrations.length, 1, `${folder} should register exactly one page`);
     assert.match(source, /iconSvg\s*:/, `${folder} should supply a distinct settings icon`);

@@ -43,6 +43,12 @@ export {
   prepareNativeHistoryActivationContext,
   armNativeHistoryActivationLaunchAgent,
 } from "./native-history-activation.js";
+// Post-change baseline maintenance imports the same closed-app admission guard
+// from the sealed generation. This adds no launcher command or renderer action.
+export { reserveClosedIndependentTweakersCutover } from "./manager-action-adapter.js";
+export { prepareManagedAccountContinuityPrelaunch } from "./account-continuity-prelaunch.js";
+export { prepareDeferredTweakersVariantRefresh } from "./commands/create-variant.js";
+export { withLocalOperation } from "./local-operation.js";
 
 import {
   PORTABLE_DESKTOP_PRELAUNCH_MANAGER_RUN_COMMAND,
@@ -309,10 +315,20 @@ export async function runTweakersManagerCli(
     });
     if (parsed.command === "manager-open" || parsed.command === "doctor-status" || parsed.command === "doctor-action" || parsed.command === "doctor-open" || parsed.command === "doctor-run") {
       if (executable.state !== "resolved") throw managerCliError("invalid_request", "Doctor requires the verified manager launcher");
+      const actionInput=parsed.command==="doctor-action"
+        ? parseManagerStrictJsonObject((dependencies.readStdin??(()=>readFileSync(0)))(),{maxBytes:64*1024,label:"Doctor action"}):undefined;
+      if(actionInput?.kind==="tweakers-accepted-runtime-repair-action") {
+        // Original and delegated custody are independently verified by the
+        // fixed repair APIs. The envelope supplies no roots/workers/scopes.
+        const {runSealedAcceptedRuntimeRepairDoctorAction}=await import("./manager-action-adapter.js");
+        const result=await runSealedAcceptedRuntimeRepairDoctorAction(actionInput);
+        writeJson(write,{...(result as Record<string,unknown>),requestId:parsed.requestId});
+        return 0;
+      }
       const doctor = await import("./doctor-actions.js");
       const report = await doctor.runDoctorManagerCommand({ command: parsed.command, requestId: parsed.requestId,
         root: boundUserRoot, executable, ...(parsed.command === "manager-open" ? { section: parsed.section } : {}), input: parsed.command === "doctor-action"
-          ? parseManagerStrictJsonObject((dependencies.readStdin ?? (() => readFileSync(0)))(), { maxBytes: 64 * 1024, label: "Doctor action" }) : undefined });
+          ? actionInput : undefined });
       writeJson(write, { ...report, requestId: parsed.requestId });
       return 0;
     }

@@ -159,7 +159,7 @@ test("enrollment interruption uses signed original identities after a device ren
   const f = fixture(t, false), raw = "new-enrollment", account = opaque(f.secret, raw);
   const accountRoot = join(f.root, "accounts", account), home = join(accountRoot, "codex-home"), sqlite = join(accountRoot, "sqlite-home");
   mkdirSync(home, { recursive: true, mode: 0o700 }); mkdirSync(sqlite, { mode: 0o700 }); write(join(home, "auth.json"), { tokens: { account_id: raw } });
-  const draft = { opaqueAccountId: account, accountRootRelativePath: `accounts/${account}`, codexHomeIdentity: identity(home), sqliteHomeIdentity: identity(sqlite), authIdentityHmac: nativeHistoryAuthIdentityHmacV1(raw, f.secret) as `hmac-sha256:${string}` };
+  const draft = { opaqueAccountId: account, accountRootRelativePath: `accounts/${account}` as const, codexHomeIdentity: identity(home), sqliteHomeIdentity: identity(sqlite), authIdentityHmac: nativeHistoryAuthIdentityHmacV1(raw, f.secret) as `hmac-sha256:${string}` };
   const intent = prepareNativeEnrollmentIdentityIntentV2({ stateRoot: f.root, secret: f.secret, account: draft, issuedAt: f.config.updatedAt });
   // Model a prior boot's signed device numbers while keeping its volume and file identities.
   intent.account.codexHomeIdentity.device -= 2; intent.account.sqliteHomeIdentity.device -= 2;

@@ -71,7 +71,9 @@ test("independent bootstrap publishes v5 readiness only after exact broker autho
   assert.match(publisher, /requestRuntimeReadyBrokerConnection/);
   assert.match(publisher, /scheduleIndependentTweakersLiveHealthCapture/);
   assert.match(publisher, /brokerAuthorityExpectation: brokerAuthority/);
-  assert.match(publisher, /schemaVersion: 5/);
+  assert.match(publisher, /\.\.\.acceptedRuntimeRepairReadinessFields\(expectation\)/);
+  assert.doesNotMatch(publisher, /schemaVersion: \d/);
+  assert.match(mainSource, /import \{[^}]*\bacceptedRuntimeRepairReadinessFields\b[^}]*\} from "@therealityreport\/tweakers-sdk"/);
   assert.match(publisher, /runtimeReadyAppearanceBinding\(independentTweakersLiveHealth\.appearance\)/);
   assert.match(publisher, /independentTweakersLiveHealth\.appearance\.windowId !== primary\.id/);
   assert.match(publisher, /sameRuntimeReadyAppearanceBinding\(appearance, expectation\.appearanceExpectation\)/);
@@ -90,7 +92,7 @@ test("independent bootstrap publishes v5 readiness only after exact broker autho
 
   const lifecycleHealth = extractFunctionBody(mainSource, "exactLifecycleHealth");
   assert.match(lifecycleHealth, /record\?\.attemptId === lifecycleAttemptId \? record\.status : undefined/);
-  assert.match(lifecycleHealth, /if \(status === "ready"\) continue/);
+  assert.match(lifecycleHealth, /processKind === "renderer" && derivedVariant \? rendererTweakReady\(tweak.manifest.id\) : status === "ready"/);
 
   const authority = extractFunctionBody(mainSource, "currentRuntimeReadyBrokerAuthorityExpectation");
   assert.match(authority, /lstatSync\(accountsBrokerRoot\)/);
@@ -213,6 +215,8 @@ test("stale prior-run lifecycle records cannot satisfy current runtime readiness
     "isTweakEnabled",
     "lifecycleJournal",
     "lifecycleAttemptId",
+    "derivedVariant",
+    "rendererTweakReady",
     compiled,
   ) as (
     runtimeReadyMainInitialized: boolean,
@@ -221,6 +225,8 @@ test("stale prior-run lifecycle records cannot satisfy current runtime readiness
     isTweakEnabled: (id: string) => boolean,
     lifecycleJournal: { records: Record<string, { status: "ready"; attemptId: string }> },
     lifecycleAttemptId: string,
+    derivedVariant?: boolean,
+    rendererTweakReady?: (id: string) => boolean,
   ) => () => string[] | null;
   const expectedTweakIds = Array.from({ length: 11 }, (_, index) => `co.test.tweak-${index}`);
   const tweakState = {
@@ -243,6 +249,10 @@ test("stale prior-run lifecycle records cannot satisfy current runtime readiness
     readIds(true, true, tweakState, enabled, { records: currentRecords }, "current-run")(),
     [...expectedTweakIds].sort((left, right) => left.localeCompare(right)),
   );
+  assert.equal(readIds(true, true, tweakState, enabled, { records: currentRecords }, "current-run", true, () => false)(), null,
+    "a derived window needs current-frame readiness even when its journal says ready");
+  assert.deepEqual(readIds(true, true, tweakState, enabled, { records: staleRecords }, "current-run", true, () => true)(), [...expectedTweakIds].sort((left, right) => left.localeCompare(right)),
+    "current-frame readiness supersedes historical renderer records");
 });
 
 test("reserved shared-history target mapping stays sender-bound and returns only public handles", () => {
@@ -496,9 +506,9 @@ test("derived Tweakers mode blocks generic mutation while preserving only refres
   const reapply = extractHandlerBody(mainSource, "tweaker:reapply-tweakers");
   assert.match(reapply, /"refresh\.independent"/);
   assert.match(reapply, /"refresh\.injected"/);
-  assert.match(reapply, /readTweakersManagerStatus\(\)/);
-  assert.match(reapply, /readTweakersManagerOfficialSourceRegistration\(\)/);
-  assert.match(reapply, /startTweakersManagerOfficialSourceRegistration\(\)/);
+  assert.match(reapply, /await readTweakersManagerStatusAsync\(\)/);
+  assert.match(reapply, /await readTweakersManagerOfficialSourceRegistrationAsync\(\)/);
+  assert.match(reapply, /await startTweakersManagerOfficialSourceRegistrationAsync\(\)/);
   assert.match(reapply, /registrationRequired: true/);
   assert.match(reapply, /nextAction: "refresh\.independent"/);
   assert.match(reapply, /blocked: true/);
@@ -539,7 +549,7 @@ test("independent Settings read only manager state and never fall back to legacy
 
   const managerStatus = extractFunctionBody(mainSource, "independentManagerStatusProjection");
   assert.match(managerStatus, /if \(!derivedVariant\)/);
-  assert.match(managerStatus, /readTweakersManagerStatus\(\)/);
+  assert.match(managerStatus, /await readTweakersManagerStatusAsync\(\)/);
   assert.match(managerStatus, /INDEPENDENT_MANAGER_STARTUP_REASON/);
   assertCallOrder(managerStatus, ["independentManagerStatusDeferredForRuntimeReady", "readTweakersManagerStatus"]);
   assert.match(managerStatus, /read-only until manager authority is restored/);
@@ -630,17 +640,32 @@ test("Manager IPC uses the independent sender guard and an exact section allowli
   assert.match(managerOpen, /isExactIndependentTweakersPrimaryMainFrame\(event\.sender, event\.senderFrame\)/);
   assert.match(managerOpen, /section === undefined \? "overview" : section/);
   assert.match(managerOpen, /isTweakersManagerSection\(selectedSection\)/);
-  assert.match(managerOpen, /openTweakersManager\(selectedSection\)/);
-  assert.match(doctorOpen, /openTweakersDoctor\(\)/);
+  assert.match(managerOpen, /await openTweakersManagerAsync\(selectedSection\)/);
+  assert.match(doctorOpen, /await openTweakersDoctorAsync\(\)/);
 });
 
-test("official ChatGPT owns native Sparkle while health and independent processes use only the inert wrapper", () => {
+test("official ChatGPT owns native Sparkle while health and independent processes use only the inert wrapper", async () => {
   const configure = extractFunctionBody(mainSource, "configureCodexSparkleForProcess");
   assert.match(configure, /if \(healthCheckOnly\) \{[\s\S]*?configureCodexSparkleBridge\(createHealthProbeCodexSparkleBridgeOptions\(\)\)/);
   assert.match(configure, /else if \(derivedVariant\)/);
-  assert.match(configure, /requestManualCheck: \(\) => \{ const report = readTweakersDoctor\(\); runTweakersDoctorAction\(\{ schemaVersion: 1, action: "scan", fingerprint: report\.fingerprint \}\); openTweakersManager\("updates"\); \}/);
-  assert.match(configure, /onUpdateAvailable: \(\) => \{ try \{ const report = readTweakersDoctor\(\); runTweakersDoctorAction\(\{ schemaVersion: 1, action: "scan", scanTrigger: "available_update", fingerprint: report\.fingerprint \}\); \}/);
-  assert.match(configure, /requestInstall: \(\) => openTweakersManager\("updates"\)/);
+  let options: any;
+  const calls: string[] = [];
+  let rejectStatus!: (error: Error) => void;
+  const body = transpileModule(configure, { compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.ESNext } }).outputText;
+  new Function("healthCheckOnly", "derivedVariant", "configureCodexSparkleBridge", "createHealthProbeCodexSparkleBridgeOptions", "openTweakersManagerAsync", "readTweakersDoctor", "runTweakersDoctorAction", "setImmediate", "installIndependentStartupRecovery", "dialog", body)(
+    false, true, (value: unknown) => { options = value; }, () => ({}),
+    async (section: string) => { calls.push(`open:${section}`); },
+    () => new Promise((_resolve, reject) => { rejectStatus = reject; }),
+    () => calls.push("scan"), () => {}, () => {}, {},
+  );
+  const pending = options.requestManualCheck();
+  assert.deepEqual(calls, ["open:updates"], "navigation precedes any awaited status or maintenance");
+  await Promise.resolve();
+  rejectStatus(new Error("status unavailable"));
+  await assert.rejects(pending, /status unavailable/);
+  assert.deepEqual(calls, ["open:updates"], "a failed status does not dispatch a scan or prevent navigation");
+  assert.equal(typeof options.onUpdateAvailable, "function");
+  assert.match(configure, /requestInstall: \(\) => \{ void openTweakersManagerAsync\("updates"\)\.catch/);
   assert.doesNotMatch(configure, /requestBackgroundCheck|prepareForInstall|onFeedCaptured/);
   const hook = extractFunctionBody(mainSource, "installSparkleUpdateHook");
   assert.match(hook, /!healthCheckOnly && !derivedVariant/);
@@ -748,7 +773,7 @@ test("Sparkle update mode cannot be staged by Tweakers", () => {
 test("environment runtime proof is emitted only for injected ChatGPT launches", () => {
   assert.match(
     mainSource,
-    /if \(!healthCheckOnly && !derivedVariant\) writeEnvironmentRuntimeProof\(\);/,
+    /if \(!healthCheckOnly && !derivedVariant\) \{\s*void app\.whenReady\(\)\.then\(\(\) => setImmediate\(writeEnvironmentRuntimeProof\)\);\s*\}/,
   );
   const writer = extractFunctionBody(mainSource, "writeEnvironmentRuntimeProof");
   assert.match(writer, /managed-runtime/);
@@ -816,9 +841,9 @@ test("Codex version snapshots report the exact measured active backend separatel
   assert.match(body, /versionChannel: codexVersionChannel\(activeCliProbe\.version\)/);
   assert.match(body, /source: activeCliSource/);
   assert.match(body, /resolveTerminalCodexBinary/);
-  assert.match(body, /loginShellPath: terminalCodexFromLoginShell\(\)/);
+  assert.match(body, /loginShellPath: await terminalCodexFromLoginShell\(\)/);
   const loginShellProbe = extractFunctionBody(mainSource, "terminalCodexFromLoginShell");
-  assert.match(loginShellProbe, /spawnSync\(shellPath, \["-lic", "command -v codex"\]/);
+  assert.match(loginShellProbe, /execFile\(shellPath, \["-lic", "command -v codex"\]/);
   assert.match(loginShellProbe, /timeout: 5_000/);
   assert.match(body, /terminalCli:\s*\{/);
   assert.match(body, /version: terminalProbe\?\.version \?\? null/);

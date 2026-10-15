@@ -11,9 +11,12 @@ const node_path_1 = require("node:path");
 const node_net_1 = require("node:net");
 const node_perf_hooks_1 = require("node:perf_hooks");
 const codex_app_server_parent_1 = require("../codex-app-server-parent");
+const desktop_app_tools_1 = require("./desktop-app-tools");
+const startup_policy_1 = require("./startup-policy");
 const broker_host_1 = require("./broker-host");
 const broker_socket_1 = require("./broker-socket");
 const config_1 = require("./config");
+const shared_native_mode_1 = require("./shared-native-mode");
 const protocol_1 = require("./protocol");
 const redaction_1 = require("./redaction");
 const app_server_mux_1 = require("./app-server-mux");
@@ -27,7 +30,7 @@ exports.ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS = 20_000;
  */
 async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
     const started = node_perf_hooks_1.performance.now();
-    const deadline = started + exports.ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS;
+    let deadline = started + exports.ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS;
     const diagnostic = (stage, code) => {
         process.stderr.write(`Tweakers Accounts bridge: ${JSON.stringify({ stage, code, elapsedMs: Math.round(node_perf_hooks_1.performance.now() - started) })}\n`);
     };
@@ -49,9 +52,39 @@ async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
         process.exitCode = 1;
         return;
     }
+    deadline = started + (0, shared_native_mode_1.sharedNativePluginPreparationTimeoutV1)(parsed.stateRoot, secret, exports.ACCOUNTS_BROKER_STARTUP_TIMEOUT_MS);
     const clientKind = process.env.TWEAKERS_DERIVED_VARIANT === "1" ? "tweakers" : "chatgpt";
+    let desktopAppTools = null;
+    if (process.env[desktop_app_tools_1.DESKTOP_APP_TOOLS_CONTEXT_ENV] !== undefined) {
+        try {
+            desktopAppTools = (0, desktop_app_tools_1.parseDesktopAppToolsContext)(process.env[desktop_app_tools_1.DESKTOP_APP_TOOLS_CONTEXT_ENV]);
+        }
+        catch {
+            diagnostic("identity", "unavailable");
+            secret.fill(0);
+            process.exitCode = 1;
+            return;
+        }
+    }
+    let startupPolicy = null;
+    if (process.env[codex_app_server_parent_1.ACCOUNTS_STARTUP_POLICY_ENV] !== undefined) {
+        try {
+            const value = JSON.parse(process.env[codex_app_server_parent_1.ACCOUNTS_STARTUP_POLICY_ENV]);
+            if (clientKind !== "tweakers" || !(0, startup_policy_1.verifyStartupPolicyHandshake)(secret, value))
+                throw new Error("unavailable");
+            startupPolicy = value;
+            if (desktopAppTools)
+                throw new Error("unavailable");
+        }
+        catch {
+            diagnostic("identity", "unavailable");
+            secret.fill(0);
+            process.exitCode = 1;
+            return;
+        }
+    }
     let identity = desktopBrokerIdentityFromEnvironment();
-    if (!identity && process.env[codex_app_server_parent_1.ACCOUNTS_BROKER_IDENTITY_FD_ENV] === "3") {
+    if (!startupPolicy && !identity && process.env[codex_app_server_parent_1.ACCOUNTS_BROKER_IDENTITY_FD_ENV] === "3") {
         try {
             identity = await readBrokerDesktopIdentityBootstrap(new node_net_1.Socket({ fd: 3, readable: true, writable: false }), Math.max(0, deadline - node_perf_hooks_1.performance.now()));
         }
@@ -60,7 +93,7 @@ async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
     // Random bridge identities would disconnect the app-server task from the
     // renderer that is allowed to confirm a handoff and receive reverse tools.
     // A v3 child without the main-bound identity must fail closed.
-    if (!identity) {
+    if (!startupPolicy && !identity) {
         diagnostic("identity", node_perf_hooks_1.performance.now() >= deadline ? "deadline_exceeded" : "unavailable");
         secret.fill(0);
         process.exitCode = 1;
@@ -71,10 +104,40 @@ async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
         root: parsed.stateRoot,
         secret,
         clientKind,
-        rendererRef: identity.rendererRef,
-        appToolsRef: identity.appToolsRef,
+        ...(desktopAppTools ? { desktopAppTools } : {}),
+        ...(startupPolicy ? { startupPolicyHandshake: startupPolicy }
+            : { rendererRef: identity.rendererRef, appToolsRef: identity.appToolsRef }),
     };
-    const bridge = await connectAccountsBrokerForStartup(clientOptions, writeDesktop, deadline, () => startOwner(parsed));
+    const startupSession = startupPolicy ? new startup_policy_1.StartupPolicySessionV1() : null;
+    let pendingStartupId = null;
+    let activeBridge = null;
+    const receive = (message) => {
+        if (startupSession) {
+            if (!startupPolicy || !(0, startup_policy_1.verifyStartupPolicyHandshake)(secret, startupPolicy) || pendingStartupId === null
+                || !("id" in message) || message.id !== pendingStartupId || "method" in message
+                || Object.hasOwn(message, "result") === Object.hasOwn(message, "error")
+                || Object.keys(message).some(key => !["jsonrpc", "id", "result", "error"].includes(key))
+                || (Object.hasOwn(message, "jsonrpc") && message.jsonrpc !== "2.0")
+                || ("error" in message && (!(0, types_1.isPlainRecord)(message.error) || !Number.isSafeInteger(message.error.code) || typeof message.error.message !== "string"))) {
+                startupSession.fail();
+                activeBridge?.close();
+                return;
+            }
+            pendingStartupId = null;
+            startupSession.complete(!("error" in message) || !message.error);
+        }
+        writeDesktop(message);
+        if (startupSession?.state === "failed")
+            activeBridge?.close();
+    };
+    const bridge = await connectAccountsBrokerForStartup(clientOptions, receive, deadline, () => startOwner(parsed));
+    activeBridge = bridge;
+    if (startupSession?.state === "failed") {
+        bridge?.close();
+        secret.fill(0);
+        process.exitCode = 1;
+        return;
+    }
     if (!bridge) {
         diagnostic("connect", "deadline_exceeded");
         secret.fill(0);
@@ -86,8 +149,28 @@ async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
     input.on("line", (line) => {
         const message = (0, protocol_1.parseJsonRpcLine)(line);
         if (!message) {
+            if (startupSession) {
+                startupSession.fail();
+                process.exitCode = 1;
+                input.close();
+                bridge.close();
+                return;
+            }
             writeDesktop((0, redaction_1.redactedRouterError)(null, "invalid_request"));
             return;
+        }
+        if (startupSession) {
+            if (!startupPolicy || !(0, startup_policy_1.verifyStartupPolicyHandshake)(secret, startupPolicy) || !startupSession.prepare(message)) {
+                startupSession.fail();
+                process.exitCode = 1;
+                input.close();
+                bridge.close();
+                return;
+            }
+            if ("id" in message)
+                pendingStartupId = message.id;
+            else
+                startupSession.complete(true);
         }
         if (!bridge.send(message)) {
             process.exitCode = 1;
@@ -96,12 +179,13 @@ async function runAccountsBrokerAppServerCli(argv = process.argv.slice(2)) {
     });
     const shutdown = () => {
         input.close();
+        process.stdin.destroy();
         bridge?.close();
         secret.fill(0);
     };
     // A closed broker transport must become a visible app-server failure. Never
     // leave native requests waiting on a bridge that can no longer answer them.
-    void bridge.whenClosed.then(() => { process.exitCode = 1; shutdown(); });
+    void bridge.whenClosed.then(() => { process.exitCode = startupSession?.completed ? 0 : 1; shutdown(); });
     input.once("close", shutdown);
     process.once("SIGTERM", shutdown);
     process.once("SIGINT", shutdown);
@@ -139,7 +223,7 @@ function startOwner(parsed) {
     if (!(0, node_fs_1.existsSync)(entrypoint))
         return;
     const environment = {};
-    for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
+    for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE", "NODE_EXTRA_CA_CERTS"]) {
         if (typeof process.env[key] === "string")
             environment[key] = process.env[key];
     }

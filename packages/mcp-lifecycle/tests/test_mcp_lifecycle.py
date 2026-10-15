@@ -73,6 +73,116 @@ class AppServerMatchingTests(unittest.TestCase):
         self.assertTrue(reaper.is_chrome_devtools_mcp_root(rp))
 
 
+class NativeBundledAppServerTests(unittest.TestCase):
+    paths = tuple(sorted(lifecycle.NESTED_APP_SERVER_PATHS))
+
+    def proc(self, pid, ppid, executable, args, *, birth=None):
+        return lifecycle.ProcessInfo(
+            pid=pid, ppid=ppid, uid=501, rss_kib=1024, state="S",
+            age_seconds=7200, cpu_seconds=0.0, executable=executable,
+            args=args, birth=birth or f"native-{pid}",
+        )
+
+    def app_server(self, path, tail="", *, ppid=1, birth=None):
+        return self.proc(11, ppid, path, f"{path} app-server {tail}", birth=birth)
+
+    def test_exact_nested_native_paths_are_recognized(self):
+        self.assertEqual(2, len(self.paths))
+        for path in self.paths:
+            with self.subTest(path=path):
+                self.assertTrue(lifecycle.is_codex_app_server(self.app_server(path)))
+                self.assertFalse(lifecycle.is_codex_app_server(self.app_server(path + ".old")))
+                self.assertFalse(lifecycle.is_codex_app_server(self.app_server(path.replace("/Applications/", "/tmp/"))))
+
+    def test_detached_nested_stdio_forms_are_eligible_for_classification(self):
+        for path in self.paths:
+            for tail in ("", "--analytics-default-enabled", "--listen stdio://", "--listen=stdio://", "--stdio"):
+                with self.subTest(path=path, tail=tail):
+                    self.assertTrue(lifecycle.is_exact_standalone_app_server(self.app_server(path, tail)))
+
+    def test_detached_nested_listener_and_ambiguous_transport_forms_are_protected(self):
+        rejected = (
+            "--listen ws://127.0.0.1:4500", "--listen=ws://127.0.0.1:4500",
+            "--listen unix://", "--listen=unix:///tmp/codex.sock", "--listen off",
+            "--listen", "--listen=", "--listen --stdio", "--listen 'stdio://",
+            "--listen stdio:// --listen=stdio://", "--stdio --listen stdio://",
+            "--stdio --stdio", "--stdio=true",
+        )
+        for path in self.paths:
+            for tail in rejected:
+                with self.subTest(path=path, tail=tail):
+                    self.assertFalse(lifecycle.is_exact_standalone_app_server(self.app_server(path, tail)))
+            spoofed = self.proc(11, 1, path, "/tmp/codex app-server --stdio")
+            self.assertFalse(lifecycle.is_exact_standalone_app_server(spoofed))
+
+    def test_live_native_owner_and_helpers_are_observed_and_never_actionable(self):
+        for path in self.paths:
+            with self.subTest(path=path):
+                app_name = "ChatGPT" if "/ChatGPT.app/" in path else "Codex"
+                ui_path = f"/Applications/{app_name}.app/Contents/MacOS/{app_name}"
+                ui = self.proc(2, 1, ui_path, app_name)
+                server = self.app_server(path, ppid=2)
+                helper = self.proc(
+                    12, 11, f"/Applications/{app_name}.app/Contents/SharedSupport/"
+                    "SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+                    "SkyComputerUseClient event-stream mcp",
+                )
+                snapshot = {p.pid: p for p in (ui, server, helper)}
+                trees = lifecycle.classify_codex_trees(snapshot, uid=501)
+                self.assertEqual(["ui_owned"], [tree.ownership for tree in trees])
+                first, state = lifecycle.advance_lifecycle_state(trees, {}, 1_000)
+                later, _state = lifecycle.advance_lifecycle_state(trees, state, 50_000)
+                self.assertFalse(first[0].actionable)
+                self.assertFalse(later[0].actionable)
+                topology = lifecycle.classify_mcp_topology(snapshot, uid=501)
+                self.assertEqual({"ui_owned": 1}, topology.ownership_counts)
+
+    def test_detached_nested_grace_and_identity_change_preserve_safety(self):
+        path = self.paths[0]
+        server = self.app_server(path)
+        tree = lifecycle.classify_codex_trees({11: server}, uid=501)[0]
+        pending, state = lifecycle.advance_lifecycle_state([tree], {}, 1_000)
+        self.assertEqual("idle_pending", pending[0].state)
+        early, _state = lifecycle.advance_lifecycle_state([tree], state, 1_599)
+        self.assertFalse(early[0].actionable)
+        eligible, _state = lifecycle.advance_lifecycle_state([tree], state, 1_600)
+        self.assertTrue(eligible[0].actionable)
+        reused = self.app_server(path, birth="new-process")
+        changed_tree = lifecycle.classify_codex_trees({11: reused}, uid=501)[0]
+        changed, _state = lifecycle.advance_lifecycle_state([changed_tree], state, 1_600)
+        self.assertFalse(changed[0].actionable)
+
+    def test_nested_listener_descendants_block_detached_tree_cleanup(self):
+        legacy = "/Applications/ChatGPT.app/Contents/Resources/codex"
+        outer = self.proc(10, 1, legacy, f"{legacy} app-server")
+        for path in self.paths:
+            for tail in ("--listen ws://127.0.0.1:4500", "--listen unix://", "--listen off"):
+                with self.subTest(path=path, tail=tail):
+                    listener = self.app_server(path, tail, ppid=10)
+                    self.assertFalse(lifecycle._is_runtime(listener))
+                    snapshot = {p.pid: p for p in (outer, listener)}
+                    trees = lifecycle.classify_codex_trees(snapshot, uid=501)
+                    _first, state = lifecycle.advance_lifecycle_state(trees, {}, 1_000)
+                    later, state = lifecycle.advance_lifecycle_state(trees, state, 1_600)
+                    self.assertEqual("blocked_active_work", later[0].state)
+                    self.assertFalse(later[0].actionable)
+                    clean = {outer.pid: outer}
+                    clean_tree = lifecycle.classify_codex_trees(clean, uid=501)[0]
+                    _pending, prior = lifecycle.advance_lifecycle_state([clean_tree], {}, 1_000)
+                    snapshots = iter((clean, snapshot))
+                    signals = []
+                    instance = reaper.Reaper(
+                        snapshot_provider=lambda: next(snapshots), clock=lambda: 1_600,
+                        signal_sender=lambda pid, sig: signals.append((pid, sig)),
+                        sleeper=lambda _seconds: None,
+                    )
+                    instance.plan_detached_wrappers(prior)
+                    self.assertEqual(1, len(instance.detached_plans))
+                    signaled, _tags = instance.execute_detached()
+                    self.assertEqual(0, signaled)
+                    self.assertEqual([], signals)
+
+
 class ProcessSnapshotTests(unittest.TestCase):
     def test_kernel_executable_path_replaces_lossy_ps_comm(self):
         node = str(Path.home() / ".nvm" / "versions" / "node" / "v22.18.0" / "bin" / "node")
@@ -1038,6 +1148,41 @@ class SharedLifecycleTests(unittest.TestCase):
         self.assertEqual("detached_wrapper", status["lifecycle_lane"])
         self.assertEqual("observation_only", status["lane_mode"])
 
+    def test_attached_opt_in_without_session_evidence_only_reports_unavailable(self):
+        ui = self.proc(2, 1, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "ChatGPT")
+        helper = self.proc(
+            20, 11,
+            "/Applications/ChatGPT.app/Contents/SharedSupport/"
+            "SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+            "SkyComputerUseClient event-stream mcp", cpu=0.0,
+        )
+        snapshot = {process.pid: process for process in (
+            ui, self.wrapper(ppid=2), self.app_server(), helper,
+        )}
+        signals = []
+        with mock.patch.object(reaper.os, "getuid", return_value=self.uid):
+            instance = reaper.Reaper(
+                snapshot_provider=lambda: snapshot.copy(), clock=lambda: 1_600,
+                signal_sender=lambda pid, sig: signals.append((pid, sig)),
+                sleeper=lambda _: None,
+            )
+            instance.plan_detached_wrappers({})
+            status = reaper.lifecycle_status_payload(
+                instance, "automatic", attached_cleanup_opt_in=True,
+            )
+            self.assertEqual((0, 0, {}), instance.execute())
+        self.assertEqual([], signals)
+        self.assertEqual("observed", status["trees"][0]["state"])
+        self.assertEqual(0, status["attached_cleanup"]["signaled"])
+        self.assertEqual("evidence_unavailable", status["attached_cleanup"]["state"])
+        self.assertIn("active-request", status["attached_cleanup"]["reason"])
+        self.assertEqual(
+            "disabled",
+            reaper.lifecycle_status_payload(instance, "status", attached_cleanup_opt_in=False)[
+                "attached_cleanup"
+            ]["state"],
+        )
+
     def test_gsd_pi_requires_the_exact_entrypoint_signature(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "gsd-pi" / "packages" / "mcp-server" / "dist"
@@ -1624,7 +1769,7 @@ class SharedLifecycleTests(unittest.TestCase):
         encoded = json.dumps(status)
         self.assertNotIn("NODE_OPTIONS", encoded)
         self.assertNotIn("raw_argv", encoded)
-        self.assertEqual(2, status["schema_version"])
+        self.assertEqual(3, status["schema_version"])
         self.assertEqual("strict-detached-v5", status["cleanup_policy_version"])
         self.assertEqual(lifecycle.MATCHER_REGISTRY_VERSION, status["matcher_registry_version"])
         self.assertEqual("automatic", status["lane_modes"]["exact_standalone_app_server"])
@@ -2096,6 +2241,54 @@ class SoftBlockerLifecycleTests(unittest.TestCase):
         self.assertEqual("idle_pending", pending[0].state)
         self.assertEqual(1_060, pending[0].idle_since)
 
+
+
+class TweakersKeyboardMonitorTests(unittest.TestCase):
+    def test_registered_owner_exit_is_the_only_keyboard_signal_path(self):
+        from dataclasses import replace
+        main = lifecycle.ProcessInfo(710, 1, os.getuid(), 0, "S", 30, 0,
+            "/Applications/Tweakers.app/Contents/MacOS/Tweakers Electron", "Tweakers", "main-birth")
+        helper = lifecycle.ProcessInfo(711, 710, os.getuid(), 0, "S", 20, 0,
+            "/Applications/Tweakers.app/Contents/Resources/native/bare-modifier-monitor", "monitor --key DoubleCommand", "helper-birth")
+        current = {710: main, 711: helper}
+        signals = []
+        receipts = []
+        instance = reaper.Reaper(snapshot_provider=lambda: current.copy(), signal_sender=lambda pid, sig: signals.append((pid, sig)), sleeper=lambda _: None, receipt_writer=lambda _, value: receipts.append(value))
+        instance.lifecycle_snapshot = current.copy()
+        instance.plan_keyboard_monitors({})
+        self.assertEqual(len(instance.keyboard_records), 1)
+        self.assertEqual(instance.keyboard_plans, [])
+        prior = instance.lifecycle_state.copy()
+        orphan = replace(helper, ppid=1)
+        cases = [
+            ({711: orphan}, prior, True),
+            ({711: orphan}, {}, False),
+            ({710: main, 711: helper}, prior, False),
+            ({710: replace(main, birth="reused"), 711: orphan}, prior, False),
+            ({712: replace(main, pid=712), 711: orphan}, prior, False),
+            ({711: replace(orphan, birth="reused")}, prior, False),
+            ({711: replace(orphan, executable=helper.executable.replace("Tweakers.app", "ChatGPT.app"))}, prior, False),
+            ({}, prior, False),
+        ]
+        for snapshot, state, expected in cases:
+            with self.subTest(snapshot=snapshot, expected=expected):
+                current = snapshot
+                instance.lifecycle_snapshot = current.copy()
+                instance.plan_keyboard_monitors(state)
+                signals.clear()
+                count = instance.execute_keyboard_monitors()
+                self.assertEqual(count, int(expected))
+                if expected:
+                    self.assertTrue(receipts[-1]["action_id"].startswith("keyboard-"))
+                    self.assertTrue(receipts[-1]["tree_key"].startswith("tweakers-keyboard-monitor:"))
+                self.assertEqual(bool(signals), expected)
+        current = {711: orphan}
+        instance.lifecycle_snapshot = current.copy()
+        instance.plan_keyboard_monitors(prior)
+        current = {711: replace(orphan, birth="changed-after-plan")}
+        signals.clear()
+        self.assertEqual(instance.execute_keyboard_monitors(), 0)
+        self.assertEqual(signals, [])
 
 if __name__ == "__main__":
     unittest.main()

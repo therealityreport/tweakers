@@ -1,8 +1,15 @@
+import { type BrokerAdmissionStageV1 } from "./admission-diagnostics";
+import { type SharedPreparationStageV1 } from "./shared-plugin-ledger";
+import { type DesktopAppToolsContextV1 } from "./desktop-app-tools";
+import { type StartupPolicyHandshakeV1 } from "./startup-policy";
 import { type ChildProcess } from "node:child_process";
 import { type Socket } from "node:net";
 import { type BrokerChildV1 } from "./broker";
 import { type NativeBrowserContextV1 } from "./broker-socket";
-import type { BrokerClientKind, JsonRpcMessage, JsonRpcResponse, OpaqueAccountId, OpaqueAppToolsRef, OpaqueRendererRef, RouterConfigV3 } from "./types";
+import type { BrokerClientKind, BrokerQuotaErrorCode, BrokerHandshakeV1, JsonRpcMessage, JsonRpcResponse, OpaqueAccountId, OpaqueAppToolsRef, OpaqueRendererRef, RouterConfigV3 } from "./types";
+import { type ProcessTreeAccessV1 } from "./owned-process-tree";
+/** Present while the Accounts tweak is disabled: shared history stays, automatic routing stops. */
+export declare const ACCOUNTS_ROUTING_SUSPENDED_FILE = "accounts-routing-suspended.v1.json";
 export declare const ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE = "accounts-broker-app.v1.sock";
 export declare const ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES: number;
 export declare const ENROLLMENT_MATERIALIZATION_JOURNAL_FILE = "enrollment-materialization.v1.json";
@@ -34,11 +41,14 @@ export interface AccountsBrokerOwnerOptionsV1 {
     onStartupStage?: (event: AccountsBrokerStartupEvent) => void;
 }
 export interface AccountsBrokerStartupEvent {
-    stage: "election" | "probe" | "recovery" | "connect";
-    code: "started" | "ready" | "unavailable" | "failed" | "invalid_probe_input" | "spawn_failed" | "initialize_failed" | "paginated_history_missing" | "writer_lock_missing" | "probe_timeout" | "probe_failed";
+    stage: "election" | "probe" | "recovery" | "connect" | "child";
+    code: "started" | "ready" | "unavailable" | "failed" | "invalid_probe_input" | "spawn_failed" | "initialize_failed" | "paginated_history_missing" | "writer_lock_missing" | "probe_timeout" | "probe_failed" | BrokerChildInitializationOutcome;
     elapsedMs: number;
+    preparationStage?: SharedPreparationStageV1;
+    admissionStage?: BrokerAdmissionStageV1;
 }
 interface AppClient {
+    desktopAppTools: DesktopAppToolsContextV1 | null;
     rendererRef: OpaqueRendererRef;
     appToolsRef: OpaqueAppToolsRef;
     clientKind: BrokerClientKind;
@@ -60,7 +70,16 @@ export declare class AccountsBrokerOwnerV1 {
     private readonly args;
     private broker;
     private readonly children;
+    private readonly retiringEnrollmentChildren;
     private readonly clients;
+    private readonly desktopAppToolsBindings;
+    private readonly threadAppToolsBindings;
+    private readonly officialDesktopConfigs;
+    private readonly desktopThreadConfigs;
+    private readonly appToolsRebindingTasks;
+    private readonly appToolsRebindObservations;
+    private readonly startupPolicyClients;
+    private readonly startupPolicyNonces;
     private readonly pendingDesktop;
     private readonly pendingChild;
     private readonly pendingBrokerChild;
@@ -111,14 +130,27 @@ export declare class AccountsBrokerOwnerV1 {
     private nativeLegacyProjects;
     private nativeLegacyProjectsReady;
     private nativeLegacyProjectRefresh;
+    private readonly nativeProjectPages;
+    private nativeProjectSnapshotRead;
+    private nativeProjectAuthorityGeneration;
+    private readonly nativeProjectAuthorities;
+    private readonly nativeProjectAuthRevisions;
+    private readonly nativeProjectAuthorityRefreshes;
     private nativeHistoryDegraded;
     private nonce;
     private closed;
+    private closePromise;
+    private readonly desktopQueues;
+    private readonly nativeThreadChecks;
     private appServer;
     private appConnections;
     private controlClose;
     private brokerClose;
     private sweepTimer;
+    private idleOwnerSince;
+    private nextMaintenanceAt;
+    private maintenancePending;
+    private managerExecutionCount;
     private readonly enrollmentMaterializationFaultAt;
     private readonly onReservationAcquired;
     private readonly recoveryCompatibilityPreflight;
@@ -136,9 +168,19 @@ export declare class AccountsBrokerOwnerV1 {
     private inventoryRefresh;
     private inventoryFreshUntil;
     private inventoryFreshKey;
+    private officialPluginLedger;
+    private officialPluginGeneration;
+    private officialPluginLedgerModeFingerprint;
+    private readonly officialPluginServices;
+    private officialPluginPreparation;
+    private readonly officialPluginSessionNonces;
+    private readonly officialPluginServiceChildren;
     private readonly modelEligibleRequests;
     private readonly modelCatalogs;
     private remoteRestoreStarted;
+    private nativeProbePromise;
+    private nativeRecoveryPromise;
+    private readonly nativeStartupHolds;
     private readonly startupStarted;
     private readonly onStartupStage;
     constructor(config: RouterConfigV3, stateRoot: string, secret: Buffer, command: string, args: readonly string[], options?: AccountsBrokerOwnerOptionsV1);
@@ -171,12 +213,17 @@ export declare class AccountsBrokerOwnerV1 {
     private readonly remoteModes;
     private remoteReconciliationPending;
     private readonly nativeTransferHeldAccounts;
+    private readonly nativeTransferSpawnAuthority;
     private readonly nativeRetirementHandoffs;
     private readonly nativeContinuityDeferred;
     private readonly nativeContinuityReasons;
     start(): Promise<void>;
+    /** Idle shutdown uses authenticated consumers and work state, never CPU or PPID. */
+    maintainOwner(now?: number): Promise<void>;
+    private reportAdmissionFailure;
     private reportStartup;
     close(): Promise<void>;
+    private closeOwnedResources;
     /** Exact-ID resolver used only by the authenticated owner-private socket. */
     mapNativeTargets(rendererRef: OpaqueRendererRef, request: NativeSharedHistoryMapRequestV1): NativeSharedHistoryMapResultV1;
     /** Main-only selected-home context; no credential or account identity leaves the owner. */
@@ -246,6 +293,7 @@ export declare class AccountsBrokerOwnerV1 {
     private requestBrokerChild;
     /** Feature replay is itself part of readiness, so it uses this protocol-ready seam without recursively awaiting readiness. */
     private requestInitializedBrokerChild;
+    private isRegisteredRequestChild;
     /**
      * NativeProjectLinks has no direct child access.  Its reads and tiny
      * idempotent imports/updates pass through the same source fence as every
@@ -264,9 +312,32 @@ export declare class AccountsBrokerOwnerV1 {
     private retireEnrollmentHelper;
     private startAppServerSocket;
     private serveAppClient;
+    /** No renderer registration, task ownership, reverse tools, or pool warming. */
+    private receiveStartupPolicy;
+    private startupPolicyBindingSafe;
+    private releaseStartupPolicyChild;
+    private stopStartupPolicyChild;
     private receiveDesktop;
-    /** Main/preload-only aggregate read; account and source home come from the signed owner binding. */
+    private processDesktop;
+    private readOfficialDesktopAccount;
+    private desktopAppToolsParams;
+    /** A loaded resume silently ignores changed config unless its last subscriber
+     * has detached. Prove idle, detach, then require native teardown evidence
+     * before accepting a new desktop binding; a successful RPC alone is not proof. */
+    private ensureDesktopAppToolsBinding;
+    private desktopThreadParams;
+    private recordThreadAppToolsBinding;
+    /** Saved reads never acquire/initialize an account child or start an authentication helper. */
+    private readNativeProjectSnapshot;
+    private hasNativeProjectAuthority;
+    private setNativeProjectAuthority;
+    /** An account event retires every proof/probe from the preceding auth revision. */
+    private invalidateNativeProjectAuthority;
+    /** Current app-server authentication status; no token refresh or helper. Remote validity is checked separately by usage/sign-in. */
+    private refreshNativeProjectAuthority;
+    /** Main/preload-only aggregate read; the signed owner chooses every source path. */
     private readDesktopProjects;
+    private readDesktopNativeProject;
     /** Convert only a known logical alias back to its sealed native root. */
     private nativeRootThreadId;
     /**
@@ -358,6 +429,17 @@ export declare class AccountsBrokerOwnerV1 {
     private resolveNativeLegacyProjectListCursor;
     private createNativeLegacyProjectListCursor;
     private accountForRequest;
+    private catalogCapacityLevel;
+    /** The session catalog has a hard thread cap; say so before it silently stops. */
+    private reportCatalogCapacity;
+    private routingSuspendedCache;
+    /**
+     * Local projects and sessions are shared history, not an Accounts feature,
+     * so the broker keeps serving them when the Accounts tweak is off. The tweak
+     * toggle only controls automatic routing between subscriptions; the desktop
+     * main process publishes that choice as a marker file in the broker root.
+     */
+    private routingSuspended;
     private accountNeedsContinuationHandoff;
     private selectContinuationTarget;
     /**
@@ -399,11 +481,43 @@ export declare class AccountsBrokerOwnerV1 {
     /** The only PIDs allowed to retain bound native-home files are this owner and its children. */
     private nativeOwnedPids;
     /** Binding drift blocks new dispatch; a foreign thread never terminates unrelated work. */
+    /**
+     * The patched backend validates a reserved bundled marketplace source
+     * against its overlay root, but the desktop stages that folder under its own
+     * CODEX_HOME. Mirror the desktop's staged folder into the overlay's managed
+     * location and point the request there, so `openai-bundled` registers
+     * without changing the backend. Anything else passes through unchanged.
+     */
+    private stageSharedBundledMarketplace;
+    /**
+     * In shared mode the backend reports bundled plugins inherited from the
+     * native base as current and skips installing them, but the desktop reads
+     * plugin files straight from its own CODEX_HOME plugin cache. Copy any
+     * inherited version the account home lacks (and point its `latest` link at
+     * the copy) so both sides see the same files. Never touches the native base.
+     */
+    private mirrorInheritedBundledPlugins;
     private nativeAccountBinding;
     private nativeHistoryWritersSafe;
     private sharedNativeMode;
+    private officialNativeMode;
+    private officialExecutionHome;
+    private officialAccountInventory;
+    private officialAccountPlan;
+    private officialPluginSession;
+    private officialPluginUpstream;
+    /** Async admission preparation does not start an account child or touch native files. */
+    private prepareOfficialPluginServices;
+    private ensureOfficialPluginLedger;
+    private prepareOfficialPluginServicesNow;
+    private officialNativeMutationAllowed;
+    private officialThreadParams;
+    private officialPluginParams;
+    private officialPluginResponse;
     private nativeAccountOperationSafe;
     private nativeThreadConflict;
+    /** Share only simultaneous observations; never authorize from a completed cached clearance. */
+    private nativeThreadConflictAsync;
     /** Synchronous account lease: no callback can interleave capture, preparation and spawn. */
     private prepareAccountContinuity;
     private initializeChild;
@@ -418,6 +532,7 @@ export declare class AccountsBrokerOwnerV1 {
     private warmEnabledChildren;
     private broadcastFeatureEnablement;
     private deferForModelCatalog;
+    private retryInvalidatedModelCatalog;
     private readAccountModels;
     private deferUntilChildReady;
     private isolatedAuthHome;
@@ -450,12 +565,21 @@ export declare class AccountsBrokerOwnerV1 {
     private forwardContinuation;
     private sendDesktop;
 }
+type BrokerChildInitializationOutcome = "ready" | "initialize_timeout" | "protocol_error" | "transport_failed" | "authentication_failed" | "child_exited" | "cancelled";
+interface BrokerChildInitializationContext {
+    params: Record<string, unknown>;
+    client: AppClient | null;
+    isCurrent: () => boolean;
+}
 export declare class BrokerProcessChild implements BrokerChildV1 {
     readonly opaqueAccountId: OpaqueAccountId;
-    private readonly child;
     private readonly onMessage;
     private readonly onClose;
     private readonly authenticate?;
+    private readonly onInitialization?;
+    private readonly treeAccess;
+    private child;
+    private preparation;
     readonly remoteControlDisabled: true;
     private lines;
     private expectedTermination;
@@ -463,28 +587,46 @@ export declare class BrokerProcessChild implements BrokerChildV1 {
     private closed;
     private readonly closedPromise;
     private resolveClosed;
+    private ownedRootPromise;
+    private capturedTree;
+    private stopPromise;
+    private ownershipReleased;
+    private retentionReported;
     private initialization;
     private settleInitialization;
     private initializationTimer;
     private initializationFingerprint;
+    private initializationContext;
     private initializedResult;
     private initializedReady;
+    private failedInitialization;
     initializationClient: AppClient | null;
+    preparationFailureStage?: SharedPreparationStageV1;
     private protocolReady;
     private readonly privateRequests;
     private readonly initializeId;
-    constructor(opaqueAccountId: OpaqueAccountId, child: ChildProcess, onMessage: (message: JsonRpcMessage) => void, onClose: (expectedTermination: boolean) => void, authenticate?: ((child: BrokerProcessChild) => Promise<boolean>) | undefined);
+    constructor(opaqueAccountId: OpaqueAccountId, process: ChildProcess | (() => Promise<ChildProcess>), onMessage: (message: JsonRpcMessage) => void, onClose: (expectedTermination: boolean, ownershipRetained?: boolean) => void, authenticate?: ((child: BrokerProcessChild, initialization: BrokerChildInitializationContext) => Promise<boolean>) | undefined, onInitialization?: ((code: BrokerChildInitializationOutcome | "started") => void) | undefined, treeAccess?: ProcessTreeAccessV1);
+    /** A pending projection owns this child slot until it settles without a writer. */
+    get preparationCurrent(): boolean;
+    whenPrepared(): Promise<boolean>;
+    private attachProcess;
+    private releaseOwnership;
+    private reportRetainedOwnership;
     /** The owner records only direct source children; census expands this tree itself. */
     get pid(): number | undefined;
     get ready(): boolean;
     get initializeResult(): unknown;
-    initialize(params: Record<string, unknown>, client: AppClient): Promise<boolean>;
+    get initializationFailure(): BrokerQuotaErrorCode | undefined;
+    initialize(params: Record<string, unknown>, client: AppClient | null, authorized?: () => boolean): Promise<boolean>;
+    private startInitialization;
     /** Owner-private bootstrap RPCs; never routed through renderer correlation. */
     requestPrivate(method: string, params: unknown, timeoutMs?: number): Promise<JsonRpcResponse | null>;
+    private reportInitialization;
     private finishInitialization;
     send(message: JsonRpcMessage): void;
     terminate(_reason: "idle" | "shutdown" | "capacity" | "disabled"): void;
     terminateAndWait(): Promise<boolean>;
+    private stopOwnedTree;
     whenClosed(): Promise<void>;
 }
 /** Owner command environment: account-local homes plus a forced disable bit. */
@@ -495,12 +637,21 @@ export declare function runAccountsBrokerOwnerCli(argv?: string[]): Promise<void
 export declare function createBrokerStartupDiagnostics(root: string): (event: AccountsBrokerStartupEvent) => void;
 /** Observe fatal exits without changing Node's termination or replay behavior. */
 export declare function installBrokerTerminationDiagnostics(root: string): void;
+interface AppHandshakeFrame {
+    version: 1;
+    kind: "handshake";
+    handshake: BrokerHandshakeV1;
+    desktopAppTools?: DesktopAppToolsContextV1;
+    desktopAppToolsProof?: string;
+}
 export interface AccountsBrokerAppServerClientOptions {
+    desktopAppTools?: DesktopAppToolsContextV1 | null;
     root: string;
     secret: Buffer;
     clientKind: BrokerClientKind;
-    rendererRef: OpaqueRendererRef;
-    appToolsRef: OpaqueAppToolsRef;
+    rendererRef?: OpaqueRendererRef;
+    appToolsRef?: OpaqueAppToolsRef;
+    startupPolicyHandshake?: StartupPolicyHandshakeV1;
     /** Startup callers cap each handshake by their remaining monotonic budget. */
     timeoutMs?: number;
 }
@@ -513,6 +664,12 @@ export interface AccountsBrokerAppServerConnection {
 export declare function connectAccountsBrokerAppServerClient(options: AccountsBrokerAppServerClientOptions, onMessage: (message: JsonRpcMessage) => void): Promise<AccountsBrokerAppServerConnection>;
 export declare function createBrokerAppRendererRef(secret: Buffer): OpaqueRendererRef;
 export declare function createBrokerAppToolsRef(secret: Buffer): OpaqueAppToolsRef;
+export declare function createDesktopAppToolsProof(secret: Buffer, handshake: BrokerHandshakeV1, context: DesktopAppToolsContextV1): string;
+export declare function verifyDesktopAppToolsProof(secret: Buffer, frame: AppHandshakeFrame): boolean;
 /** Last CLI override wins; strip earlier credential-store overrides defensively. */
 export declare function credentialStoreArgs(args: readonly string[], store: "ephemeral" | "file"): string[];
+/** Account-only helpers must not consult the OS-wide MCP credential store. Their
+ * private homes contain no MCP credentials; real conversation children retain
+ * the user's configured MCP storage policy. */
+export declare function isolatedAuthHelperArgs(args: readonly string[], official?: boolean): string[];
 export {};

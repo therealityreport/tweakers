@@ -24,7 +24,7 @@ export function addDoctorTitlebarOptions(report: DoctorChangeReportV1, job: Doct
   try { const v = JSON.parse(readFileSync(installedConfigPath, "utf8")).tweaks?.[TWEAK_ID]?.enabled; if (typeof v === "boolean") before = v; } catch { /* Unknown is visible. */ }
   const overrides = [true, false].map(enabled => { const id = `${TWEAK_ID}:${enabled ? "enabled" : "disabled"}`; return { id, label: `${enabled ? "Enable" : "Disable"} Titlebar Controls`, verificationFingerprint: titlebarOverrideFingerprint(job, id) }; });
   const change = { id: TITLEBAR_CHANGE_ID, area: "Tweakers adaptation", title: "Titlebar Controls setting", before: before === null ? "Installed setting could not be verified." : `Titlebar Controls is ${before ? "enabled" : "disabled"}.`,
-    after: `The candidate has Titlebar Controls ${after ? "enabled" : "disabled"}. A selected setting must be checked in the isolated preview before installation.`,
+    after: `The candidate has Titlebar Controls ${after ? "enabled" : "disabled"}. Standalone previews are disabled; guarded installation verifies the candidate at startup.`,
     status: "inferred_from_code" as const, technicalOnly: false, evidence: [{ artifact: "Tweakers configuration", path: "config.json", beforeSha256: null, afterSha256: null, kind: "static" as const, detail: "Signed candidate configuration and bundled tweak identity; not native interaction evidence." }], dependencies: [], compatibility: [], overrides };
   report.changes = [...report.changes.filter(c => c.id !== TITLEBAR_CHANGE_ID), change];
 }

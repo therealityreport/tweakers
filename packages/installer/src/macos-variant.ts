@@ -20,6 +20,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { readPlist, writePlist, type Plist } from "./plist.js";
+import { captureOfficialBundledBackendClosure, assertOfficialBundledBackendSigningClosure, isPreservedOfficialBundledBackendPath,
+  type OfficialBundledBackendClosure, type NativeBundledBackendSignaturePort } from "./native-bundled-backend.js";
 import {
   TWEAKERS_VARIANT_USER_DATA_CONFIG,
   TWEAKERS_VARIANT_CODEX_HOME_CONFIG,
@@ -128,7 +130,8 @@ export function defaultTweakersVariantIdentity(
  * Give a locally signed Tweakers copy its own LaunchServices identity. The
  * official OpenAI app must keep com.openai.codex and its original signature.
  */
-export function applyMacAppIdentity(appRoot: string, identity: MacAppIdentity): string[] {
+export function applyMacAppIdentity(appRoot: string, identity: MacAppIdentity, officialBundledBackend?: OfficialBundledBackendClosure,
+  nativeSignatures?: NativeBundledBackendSignaturePort): string[] {
   const mainInfo = join(appRoot, "Contents", "Info.plist");
   if (!existsSync(mainInfo)) throw new Error(`Variant app is missing Info.plist: ${mainInfo}`);
   if (!existsSync(identity.iconSourcePath)) {
@@ -145,7 +148,11 @@ export function applyMacAppIdentity(appRoot: string, identity: MacAppIdentity): 
     assertExactAbsolutePath(path, `Variant ${label} path`);
   }
 
-  const infoPaths = collectInfoPlists(join(appRoot, "Contents"));
+  // The supplied CLI is its own signed code bundle. Rewriting even its plist
+  // changes the native resource closure and invalidates its original signature.
+  const nativeClosure=officialBundledBackend??captureOfficialBundledBackendClosure(appRoot,nativeSignatures);
+  if(nativeClosure)assertOfficialBundledBackendSigningClosure(appRoot,nativeClosure,nativeSignatures);
+  const infoPaths = collectInfoPlists(join(appRoot, "Contents")).filter(path=>!isPreservedOfficialBundledBackendPath(appRoot,path,nativeClosure));
   assertOpenAIRuntimeIdentitiesAreRewriteable(appRoot, infoPaths);
 
   const resources = join(appRoot, "Contents", "Resources");
@@ -165,6 +172,9 @@ export function applyMacAppIdentity(appRoot: string, identity: MacAppIdentity): 
       dirty = setValue(value, "CFBundleIdentifier", identity.bundleId) || dirty;
       dirty = setValue(value, "CFBundleName", identity.displayName) || dirty;
       dirty = setValue(value, "CFBundleDisplayName", identity.displayName) || dirty;
+      // Upstream aliases such as "Codex" let name-based app lookup launch this
+      // variant instead of the official app, even with distinct bundle IDs.
+      dirty = deleteValue(value, "CFBundleAlternateNames") || dirty;
       // Keep Owl's native product/data identity distinct from the Tweakers
       // manager while LSEnvironment supplies the absolute profile path before
       // the packaged bootstrap requests Electron's single-instance lock.
@@ -229,7 +239,7 @@ export function applyMacAppIdentity(appRoot: string, identity: MacAppIdentity): 
       changed.push(path);
     }
   }
-  assertNoResidualOpenAIRuntimeIdentities(appRoot);
+  assertNoResidualOpenAIRuntimeIdentities(appRoot,nativeClosure,nativeSignatures);
   return changed;
 }
 
@@ -401,13 +411,16 @@ function writeOwnerOnlyPathConfig(path: string, value: string): void {
 }
 
 /**
- * No unknown OpenAI runtime identifier may survive a derived bundle. dSYM
- * Info.plists are the sole allowed residue because they are symbol metadata,
- * not launchable bundle metadata, and the narrow path check proves that fact.
+ * Host runtime identities must be independent. Signed supplied CLI resources
+ * keep their own native identity; exact closure verification precedes that
+ * bounded exception. dSYM metadata is independently proven non-runtime data.
  */
-export function assertNoResidualOpenAIRuntimeIdentities(appRoot: string): void {
+export function assertNoResidualOpenAIRuntimeIdentities(appRoot: string, officialBundledBackend?: OfficialBundledBackendClosure,
+  nativeSignatures?: NativeBundledBackendSignaturePort): void {
+  const nativeClosure=officialBundledBackend??captureOfficialBundledBackendClosure(appRoot,nativeSignatures);
+  if(nativeClosure)assertOfficialBundledBackendSigningClosure(appRoot,nativeClosure,nativeSignatures);
   for (const path of collectInfoPlists(join(appRoot, "Contents"))) {
-    if (isProvenNonRuntimeDsymMetadata(appRoot, path)) continue;
+    if (isProvenNonRuntimeDsymMetadata(appRoot, path)||isPreservedOfficialBundledBackendPath(appRoot,path,nativeClosure)) continue;
     const plist = readPlist(path);
     const bundleId = typeof plist.CFBundleIdentifier === "string" ? plist.CFBundleIdentifier : "";
     if (bundleId.startsWith("com.openai.")) {

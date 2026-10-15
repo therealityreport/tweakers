@@ -27,6 +27,7 @@ class FakeElement extends FakeNode {
     child.isConnected = this.isConnected;
     return child;
   }
+  contains(node) { return node === this || this.children.some((child) => child.contains?.(node)); }
   append(...children) { for (const child of children) this.appendChild(child); }
   remove() {
     if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
@@ -89,6 +90,17 @@ function withFakeDom(run) {
     global.window = previous.window;
   }
 }
+
+test("Rich Blocks discovers current native assistant markdown without message IDs", () => {
+  const assistant = new FakeElement("div");
+  assistant.setAttribute("data-markdown-text-style", "assistant-message");
+  const user = new FakeElement("div");
+  user.setAttribute("data-role", "user");
+  const root = { querySelectorAll(selector) {
+    return selector.includes('[data-markdown-text-style="assistant-message"]') ? [assistant, user] : [user];
+  } };
+  assert.deepEqual(tweak.collectRichBlockRoots(root), [assistant]);
+});
 
 test("Rich Blocks v1 normalizes key/value input to one canonical pair schema", () => {
   const payload = tweak.parseRichPayload({
@@ -190,5 +202,63 @@ test("rendering uses textContent for an unknown extension fallback", () => {
     const block = tweak.renderBlock({ kind: "new_kind", text: "<script>not HTML</script>" });
     assert.equal(block.textContent, "<script>not HTML</script>");
     assert.equal(block.children.length, 0);
+  });
+});
+
+
+test("rich blocks without an HTML id reuse their unchanged DOM mount", () => {
+  withFakeDom(() => {
+    for (const dataId of [null, "native-message-1"]) {
+      const message = new FakeElement("article");
+      message.id = "";
+      message.isConnected = true;
+      if (dataId) message.setAttribute("data-message-id", dataId);
+      const payload = {version: 1, blocks: [{kind: "text", text: "Stable"}]};
+      const first = tweak.reconcileRichBlock(message, payload);
+      assert.ok(first);
+      assert.equal(first.host.getAttribute("data-tweakers-host-surface-owned"), "true");
+      for (let i = 0; i < 5; i++) assert.equal(tweak.reconcileRichBlock(message, payload), first);
+      assert.equal(message.children.length, 1);
+      const updated = tweak.reconcileRichBlock(message, {version: 1, blocks: [{kind: "text", text: "Changed"}]});
+      assert.notEqual(updated, first);
+      assert.equal(message.children.length, 1);
+      assert.match(updated.host.textContent, /Changed/);
+      tweak.reconcileRichBlock(message, null);
+      assert.equal(message.children.length, 0);
+    }
+  });
+});
+
+
+test("Rich Blocks merges nested assistant roots and excludes owned descendants", () => {
+  const child = { id: "", closest: () => null };
+  const owned = { id: "owned", closest: () => ({}) };
+  const outer = { id: "assistant", contains: (node) => node === child, closest: () => null };
+  assert.deepEqual(tweak.mergeRichBlockRoots([outer], [child, owned, outer]), [outer]);
+});
+
+
+test("Rich Blocks retires child mount when a streamed ancestor becomes recognized", () => {
+  withFakeDom(({ document, flushFrames }) => {
+    const outer = new FakeElement("article"), child = new FakeElement("div");
+    outer.isConnected = true; outer.append(child);
+    child.setAttribute("data-rich-payload", JSON.stringify({ version: 1, blocks: [{ kind: "text", text: "One" }] }));
+    let roots = [child], observed;
+    document.querySelectorAll = () => roots;
+    const api = { storage: { get: () => true }, react: { host: {
+      observe(_topics, callback) { observed = callback; return () => {}; },
+      query: () => roots.map((element) => ({ element })),
+    } }, settings: { registerPage: () => ({ unregister() {} }) } };
+    const instance = {};
+    require("../index.js").start.call(instance, api); flushFrames();
+    const oldMount = tweak.getRichBlockMount(child);
+    assert.ok(oldMount?.host);
+    roots = [outer, child]; observed(); flushFrames();
+    assert.equal(tweak.getRichBlockMount(child), null);
+    assert.equal(oldMount.host.isConnected, false);
+    assert.ok(tweak.getRichBlockMount(outer)?.host);
+    assert.equal(tweak.getState(instance).mounts.size, 1);
+    assert.equal(outer.querySelectorAll("[data-tweakers-host-surface-owned]").length, 1);
+    require("../index.js").stop.call(instance);
   });
 });

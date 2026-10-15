@@ -27,3 +27,7 @@ ignored unless their generation still owns the mounted panel.
 The focused suite uses fake DOM and IPC behavior tests for start/stop, partial
 host contexts, revision reloads, stale races, and cleanup. It does not prove a
 fresh Codex host selector or visible Electron rendering.
+
+## Consolidated ownership
+
+Projects now owns this behavior through the Thread Summary Profiles toggle. The runtime migrates explicit settings before startup and suppresses this legacy tweak only after a successful destination write. Old data is retained. This compatibility entry remains usable if migration fails or the destination owner is disabled. Edit the owning tweak source module; its entry builder writes this compatibility entry.

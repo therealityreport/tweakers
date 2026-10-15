@@ -10,6 +10,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -97,6 +98,21 @@ const EMPTY_STATE: ManagedCodexCliState = { schemaVersion: 1, current: null, pre
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const RECEIPT_FILE = "receipt.json";
 const ALLOWED_ASSET = "codex-package-aarch64-apple-darwin.tar.gz";
+
+/** Resolve the physical executable, never the vendor's bin/codex launcher. */
+export function resolveBundledCodexBinary(resourcesPath: string): string {
+  for (const relativePath of ["codex", join("codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex")]) {
+    const binary = join(resourcesPath, relativePath);
+    let stat;
+    try { stat = lstatSync(binary); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(binary) !== join(realpathSync(resourcesPath), relativePath)) {
+      throw new Error("Bundled Codex backend must be a regular file without symlink traversal outside its layout");
+    }
+    return binary;
+  }
+  throw new Error("Supported bundled Codex backend is missing");
+}
 
 export function deriveCodexCliPaths(home: string, activeUserRoot?: string): CodexCliPaths {
   const root = join(activeUserRoot ?? join(resolve(home), "Library", "Application Support", "Tweakers"), "codex-cli");

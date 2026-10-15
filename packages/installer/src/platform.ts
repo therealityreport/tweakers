@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, cpSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync, cpSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -493,4 +493,24 @@ function isExecutableFile(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+
+/** Known vendor layouts; derived bundles retain their explicit legacy slot. bin/codex is only a launcher. */
+export const BUNDLED_CODEX_BACKEND_PATHS = [
+  "Contents/Resources/codex",
+  "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+] as const;
+export function resolveBundledCodexBackend(appRoot: string): string {
+  for (const relativePath of BUNDLED_CODEX_BACKEND_PATHS) {
+    const path = join(appRoot, relativePath);
+    let stat;
+    try { stat = lstatSync(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(path) !== join(realpathSync(appRoot), relativePath)) {
+      throw new Error("Bundled Codex backend must be a regular file without symlink traversal outside its layout");
+    }
+    return path;
+  }
+  throw new Error("Supported bundled Codex backend is missing");
 }

@@ -1,16 +1,22 @@
 {
   "id": "co.tweakers.appshots",
   "name": "AppShots",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "githubRepo": "therealityreport/tweakers",
-  "description": "Capture the frontmost window and attach a PNG plus Accessibility context to the active composer.",
+  "description": "Use authentic native Codex AppShots and view native Computer History status.",
   "author": {
     "name": "Tweakers"
   },
   "homepage": "https://github.com/therealityreport/tweakers",
-  "tags": ["capture", "composer", "shortcut"],
-  "scope": "both",
+  "tags": [
+    "capture",
+    "composer",
+    "shortcut"
+  ],
+  "scope": "renderer",
   "main": "index.js",
   "minRuntime": ">=1.1.0",
-  "permissions": ["settings", "ipc", "screen-capture", "accessibility", "global-shortcut"]
+  "permissions": [
+    "settings"
+  ]
 }

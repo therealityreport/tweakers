@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { cloneOrCopyDirectoryPreservingModes } from "./fs-copy.js";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { cloneOrCopyDirectoryPreservingModes, isMacOsJunkName } from "./fs-copy.js";
 import { computeRuntimeFingerprint, readRuntimeFingerprintEvidence } from "./runtime-fingerprint.js";
+import { assertLocalExecutionPath } from "./local-artifacts.js";
 import { TWEAKERS_VARIANT_ACCOUNTS_BROKER_CONFIG } from "./macos-variant-bindings.js";
 
 const TWEAK_ID = "co.tweakers.account-switcher";
@@ -206,4 +207,121 @@ export function verifyProbedAccountsTransferRecovery(runtimeRoot: string): boole
     encoding: "utf8", timeout: 10000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"],
   });
   return result.status === 0 && result.stdout === "verified" && readRuntimeFingerprintEvidence(runtimeRoot)?.fingerprint === before.fingerprint;
+}
+
+/** Validate only the exact accepted tree, or its maintained Accounts recovery addition.
+ * The projection is bound before any candidate module is loaded. Returned evidence
+ * always describes the complete observed tree, never the accepted projection.
+ */
+export function assertAcceptedAccountsRecoveryRuntime(
+  runtimeRoot: string,
+  authority: { fingerprint: string; fileCount: number; documentSha256: string },
+): { fingerprint: string; fileCount: number; documentSha256: string } {
+  const fail: (reason: string) => never = (reason: string): never => { throw new Error(`Accepted transition generated runtime changed: ${reason}`); };
+  if (!/^[a-f0-9]{64}$/.test(authority.fingerprint)
+    || !/^[a-f0-9]{64}$/.test(authority.documentSha256)
+    || !Number.isSafeInteger(authority.fileCount) || authority.fileCount < 1) fail("invalid baseline authority");
+  const before = captureAcceptedRecoveryRuntime(runtimeRoot);
+  const documentSha256 = sha(before.document);
+  let document: { schemaVersion?: unknown; fingerprint?: unknown; fileCount?: unknown };
+  try { document = JSON.parse(before.document.toString("utf8")); }
+  catch { return fail("invalid fingerprint document"); }
+  if (document?.schemaVersion !== 1 || document.fingerprint !== before.fingerprint || document.fileCount !== before.fileCount) {
+    fail("complete runtime document does not match its bytes");
+  }
+  const observed = { fingerprint: before.fingerprint, fileCount: before.fileCount, documentSha256 };
+  if (before.fingerprint === authority.fingerprint && before.fileCount === authority.fileCount
+    && documentSha256 === authority.documentSha256) return observed;
+  if (!before.marker || before.projection.fingerprint !== authority.fingerprint
+    || before.projection.fileCount !== authority.fileCount || before.fileCount !== authority.fileCount + 1) {
+    fail("only the root recovery marker may be added to the accepted baseline");
+  }
+  const canonicalDocument = JSON.stringify({ schemaVersion: 1, fingerprint: before.fingerprint, fileCount: before.fileCount }) + "\n";
+  if (before.document.toString("utf8") !== canonicalDocument) fail("derived runtime document is not the exact published document");
+  let marker: { sourceRuntimeFingerprint?: unknown; sourceRuntimeFileCount?: unknown; recoveryRuntimeRoot?: unknown };
+  try { marker = JSON.parse(before.marker.toString("utf8")); }
+  catch { return fail("invalid recovery marker"); }
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)
+    || Object.keys(marker).sort().join(",") !== "readerVersion,recoveryFingerprint,recoveryRuntimeRoot,runtimeSourceRetirementSha256,runtimeTransferSha256,sourceRetirementReaderVersion,sourceRuntimeFileCount,sourceRuntimeFingerprint,supportedSourceRetirementVersions,supportedTransferVersions,validationSha256,verifiedAt,version"
+    || marker.sourceRuntimeFingerprint !== authority.fingerprint || marker.sourceRuntimeFileCount !== authority.fileCount
+    || typeof marker.recoveryRuntimeRoot !== "string") fail("recovery source claims differ from accepted authority");
+  const recoveryRoot = marker.recoveryRuntimeRoot as string;
+  // Inspect both trees without loading either tree's modules. The maintained
+  // verifier checks reader semantics, validation hashes and recovery projection.
+  assertLocalExecutionPath(recoveryRoot);
+  const recoveryBefore = captureAcceptedRecoveryRuntime(recoveryRoot, true);
+  if (!verifyProbedAccountsTransferRecovery(runtimeRoot)) fail("maintained recovery verification failed");
+  const after = captureAcceptedRecoveryRuntime(runtimeRoot);
+  assertLocalExecutionPath(recoveryRoot);
+  const recoveryAfter = captureAcceptedRecoveryRuntime(recoveryRoot, true);
+  if (before.identity !== after.identity || recoveryBefore.identity !== recoveryAfter.identity) {
+    fail("runtime or recovery evidence changed during verification");
+  }
+  return observed;
+}
+
+interface AcceptedRecoveryRuntimeSnapshot {
+  fingerprint: string;
+  fileCount: number;
+  projection: { fingerprint: string; fileCount: number };
+  document: Buffer;
+  marker: Buffer | null;
+  identity: string;
+}
+
+/** Private, fixed-purpose projection: no caller-selected exclusions. */
+function captureAcceptedRecoveryRuntime(root: string, privateRecovery = false): AcceptedRecoveryRuntimeSnapshot {
+  const unsafe = (): never => { throw new Error("Accepted transition generated runtime changed: linked or unsafe runtime evidence"); };
+  if (!isAbsolute(root) || resolve(root) !== root || realpathSync(root) !== root) unsafe();
+  const rootStatus = lstatSync(root);
+  if (!rootStatus.isDirectory() || rootStatus.isSymbolicLink()) unsafe();
+  if (privateRecovery && (typeof process.getuid !== "function" || rootStatus.uid !== process.getuid()
+    || (rootStatus.mode & 0o077) !== 0)) {
+    throw new Error("Accepted transition generated runtime changed: recovery root must be owner-private");
+  }
+  // Fail before traversing an alleged recovery directory without its required
+  // bounded regular document; the marker cannot redirect a scan to another home.
+  const documentPath = join(root, "runtime-fingerprint.json");
+  const documentStatus = lstatSync(documentPath);
+  if (!documentStatus.isFile() || documentStatus.isSymbolicLink() || documentStatus.nlink !== 1
+    || documentStatus.size < 1 || documentStatus.size > 16 * 1024 || realpathSync(documentPath) !== documentPath) unsafe();
+  const rootFd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const full = createHash("sha256"), projection = createHash("sha256"), identity = createHash("sha256");
+  let fileCount = 0, projectionCount = 0, document: Buffer | null = null, marker: Buffer | null = null;
+  const statusIdentity = (status: NonNullable<ReturnType<typeof lstatSync>>) => `${status.dev}:${status.ino}:${status.uid}:${status.gid}:${status.mode}:${status.nlink}:${status.size}:${status.mtimeMs}:${status.ctimeMs}`;
+  const walk = (directory: string): void => {
+    const prior = lstatSync(directory);
+    if (!prior.isDirectory() || prior.isSymbolicLink() || realpathSync(directory) !== directory) unsafe();
+    identity.update(`directory:${relative(root, directory)}:${statusIdentity(prior)}\0`);
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name), name = relative(root, path), status = lstatSync(path);
+      if (status.isSymbolicLink() || realpathSync(path) !== path) unsafe();
+      if (status.isDirectory()) { walk(path); continue; }
+      if (!status.isFile() || status.nlink !== 1) unsafe();
+      if (isMacOsJunkName(entry.name)) continue;
+      if ((name === "runtime-fingerprint.json" || name === RECOVERY_FILE) && status.size > 16 * 1024) unsafe();
+      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let bytes: Buffer;
+      try {
+        if (statusIdentity(status) !== statusIdentity(fstatSync(fd))) unsafe();
+        bytes = readFileSync(fd);
+        if (statusIdentity(status) !== statusIdentity(fstatSync(fd))
+          || statusIdentity(status) !== statusIdentity(lstatSync(path)) || realpathSync(path) !== path) unsafe();
+      } finally { closeSync(fd); }
+      identity.update(`file:${name}:${statusIdentity(status)}:${sha(bytes!)}\0`);
+      if (name === "runtime-fingerprint.json") { document = bytes!; continue; }
+      full.update(name); full.update("\0"); full.update(bytes!); full.update("\0"); fileCount++;
+      if (name === RECOVERY_FILE) { marker = bytes!; continue; }
+      projection.update(name); projection.update("\0"); projection.update(bytes!); projection.update("\0"); projectionCount++;
+    }
+    if (statusIdentity(prior) !== statusIdentity(lstatSync(directory)) || realpathSync(directory) !== directory) unsafe();
+  };
+  try {
+    if (statusIdentity(rootStatus) !== statusIdentity(fstatSync(rootFd))) unsafe();
+    walk(root);
+    if (!document || statusIdentity(rootStatus) !== statusIdentity(fstatSync(rootFd))
+      || statusIdentity(rootStatus) !== statusIdentity(lstatSync(root)) || realpathSync(root) !== root) unsafe();
+    return { fingerprint: full.digest("hex"), fileCount, projection: { fingerprint: projection.digest("hex"), fileCount: projectionCount },
+      document: document!, marker, identity: identity.digest("hex") };
+  } finally { closeSync(rootFd); }
 }

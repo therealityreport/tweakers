@@ -1,10 +1,11 @@
 {
   "scripts": {
-    "build": "node -e \"\""
+    "build": "node ../../scripts/local-work.mjs workspace-build loader"
   },
   "name": "@therealityreport/tweakers-loader",
   "version": "1.0.0",
   "private": true,
   "description": "Tiny stub injected into app.asar; bootstraps the runtime from the user dir.",
-  "main": "loader.cjs"
+  "main": "loader.cjs",
+  "tweakersBuildCommand": "node -e \"\""
 }

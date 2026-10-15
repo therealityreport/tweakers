@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { prepareOfficialUpdateSource, performDirectOfficialUpdate, type DirectOfficialUpdateDeps } from "../src/official-update-download";
+import { prepareOfficialUpdateSource, performDirectOfficialUpdate, reconcileDirectOfficialUpdateDebris, type DirectOfficialUpdateDeps } from "../src/official-update-download";
+import { writeDoctorPrivateJson } from "../src/doctor-store";
+import { lstatSync } from "node:fs";
+import { failedOfficialSourceJournalPath, reconcileFailedOfficialSource } from "../src/artifact-maintenance";
+import { readReservations } from "../src/local-artifacts";
 import type { EnvironmentSelection } from "../src/environment-profile";
 
 const LATEST = { marketingVersion: "26.818.32112", build: "6933" };
@@ -58,8 +62,12 @@ function fetchServing(bytes: Buffer, contentLength: string | null = String(bytes
   })) as unknown as typeof fetch;
 }
 
-function passingDeps(events: string[], overrides: Partial<DirectOfficialUpdateDeps> = {}): DirectOfficialUpdateDeps {
+function passingDeps(f: ReturnType<typeof fixture>, events: string[], overrides: Partial<DirectOfficialUpdateDeps> = {}): DirectOfficialUpdateDeps {
+  mkdirSync(join(f.root,"artifact-state"),{recursive:true,mode:0o700});
+  chmodSync(join(f.root,"artifact-state"),0o700);
   return {
+    artifactRoot: () => join(f.root, "artifact-state"),
+    installedTweakersPath: () => join(f.root, "Tweakers.app"),
     verifySignature: () => ({ ok: true, output: "" }),
     signatureInfo: () => ({
       ok: true,
@@ -78,7 +86,7 @@ function passingDeps(events: string[], overrides: Partial<DirectOfficialUpdateDe
 }
 
 function fixture(): { root: string; live: string; zip: Buffer; cleanup(): void } {
-  const root = mkdtempSync(join(tmpdir(), "direct-update-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "direct-update-")));
   const source = join(root, "source");
   mkdirSync(source, { recursive: true });
   writeApp(join(source, "ChatGPT.app"));
@@ -103,7 +111,7 @@ test("a verified appcast enclosure installs directly: download, verify, quit, sw
   try {
     const events: string[] = [];
     const installed = await performDirectOfficialUpdate(input(f), {
-      ...passingDeps(events),
+      ...passingDeps(f, events),
       fetch: fetchServing(f.zip),
     });
 
@@ -123,7 +131,7 @@ test("Sparkle's install-on-quit result wins: an already-current disk version ski
   const f = fixture();
   try {
     const events: string[] = [];
-    const deps = passingDeps(events, {
+    const deps = passingDeps(f, events, {
       quitApp: () => {
         events.push("quit");
         // Sparkle finishes its staged install the moment the app exits.
@@ -137,6 +145,57 @@ test("Sparkle's install-on-quit result wins: an already-current disk version ski
   } finally { f.cleanup(); }
 });
 
+test("direct update retry reconciles only journaled pre-cutover debris", () => {
+  const f = fixture();
+  try {
+    const artifactRoot = join(f.root,"artifact-state");
+    mkdirSync(artifactRoot,{mode:0o700});
+    const workRoot = join(f.root,"work");
+    const stagedSibling = `${f.live}.tweakers-direct-staged`;
+    const previousSibling = `${f.live}.tweakers-direct-previous`;
+    mkdirSync(workRoot);
+    writeApp(stagedSibling);
+    const appStat = lstatSync(f.live), workStat = lstatSync(workRoot), stagedStat = lstatSync(stagedSibling);
+    const journal = {version:1, appPath:f.live, workRoot, stagedSibling, previousSibling, latest:LATEST,
+      appIdentity:{dev:appStat.dev,ino:appStat.ino}, workIdentity:{dev:workStat.dev,ino:workStat.ino},
+      stagedIdentity:{dev:stagedStat.dev,ino:stagedStat.ino}, phase:"staged"};
+    writeDoctorPrivateJson(join(artifactRoot,"direct-official-update.json"), journal);
+    reconcileDirectOfficialUpdateDebris(artifactRoot,f.live,workRoot);
+    assert.equal(existsSync(workRoot),false);
+    assert.equal(existsSync(stagedSibling),false);
+    assert.equal(existsSync(f.live),true);
+    assert.equal(existsSync(join(artifactRoot,"direct-official-update.json")),false);
+
+    mkdirSync(workRoot);
+    writeApp(stagedSibling);
+    writeApp(previousSibling);
+    writeDoctorPrivateJson(join(artifactRoot,"direct-official-update.json"), journal);
+    assert.throws(()=>reconcileDirectOfficialUpdateDebris(artifactRoot,f.live,workRoot),/manual reconciliation/);
+    assert.equal(existsSync(previousSibling),true,"possible rollback remains intact");
+    assert.equal(existsSync(stagedSibling),true,"ambiguous candidate remains intact");
+  } finally { f.cleanup(); }
+});
+
+test("direct update retry clears a completed journal after rechecking the installed signature", () => {
+  const f = fixture();
+  try {
+    const artifactRoot = join(f.root,"artifact-state"), workRoot = join(f.root,"work");
+    mkdirSync(artifactRoot,{mode:0o700});
+    mkdirSync(workRoot);
+    const before = lstatSync(f.live), work = lstatSync(workRoot);
+    const journal = {version:1,appPath:f.live,workRoot,stagedSibling:`${f.live}.tweakers-direct-staged`,
+      previousSibling:`${f.live}.tweakers-direct-previous`,latest:LATEST,
+      appIdentity:{dev:before.dev,ino:before.ino},workIdentity:{dev:work.dev,ino:work.ino},phase:"completed"};
+    writeDoctorPrivateJson(join(artifactRoot,"direct-official-update.json"),journal);
+    rmSync(f.live,{recursive:true});
+    writeApp(f.live);
+    reconcileDirectOfficialUpdateDebris(artifactRoot,f.live,workRoot,passingDeps(f,[]).signatureInfo!);
+    assert.equal(existsSync(workRoot),false);
+    assert.equal(existsSync(join(artifactRoot,"direct-official-update.json")),false);
+    assert.equal(existsSync(f.live),true);
+  } finally {f.cleanup();}
+});
+
 test("every failure past the quit still reopens the app, and an abort stops before the quit", async () => {
   const f = fixture();
   try {
@@ -145,7 +204,7 @@ test("every failure past the quit still reopens the app, and an abort stops befo
     let polls = 0;
     await assert.rejects(
       performDirectOfficialUpdate(input(f), {
-        ...passingDeps(stuck, { isAppRunning: () => { polls += 1; return true; } }),
+        ...passingDeps(f, stuck, { isAppRunning: () => { polls += 1; return true; } }),
         fetch: fetchServing(f.zip),
       }),
       /did not quit/,
@@ -160,7 +219,7 @@ test("every failure past the quit still reopens the app, and an abort stops befo
     await assert.rejects(
       performDirectOfficialUpdate(
         { ...input(f), shouldAbort: () => true },
-        { ...passingDeps(aborted), fetch: fetchServing(f.zip) },
+        { ...passingDeps(f, aborted), fetch: fetchServing(f.zip) },
       ),
       /aborted before touching the live app/,
     );
@@ -173,7 +232,7 @@ test("every failure past the quit still reopens the app, and an abort stops befo
     await assert.rejects(
       performDirectOfficialUpdate(
         { ...input(f), shouldAbort: () => { consults += 1; return consults > 1; } },
-        { ...passingDeps(lateAbort), fetch: fetchServing(f.zip) },
+        { ...passingDeps(f, lateAbort), fetch: fetchServing(f.zip) },
       ),
       /aborted before touching the live app/,
     );
@@ -187,25 +246,34 @@ test("the direct install refuses untrusted, mismatched, or oversized archives be
   try {
     const liveBefore = readFileSync(join(f.live, "Contents", "Info.plist"), "utf8");
     const events: string[] = [];
+    const clearFailedPreparation = async () => {
+      const artifactRoot=join(f.root,"artifact-state"), trash=join(f.root,"Trash");
+      mkdirSync(trash,{recursive:true,mode:0o700});
+      const active=readReservations(artifactRoot).filter(item=>item.state!=="retired"&&item.paths.some(path=>path.endsWith("/extracted/ChatGPT.app")&&existsSync(path)));
+      assert.equal(active.length,1);
+      await reconcileFailedOfficialSource(artifactRoot,active[0]!.id,true,trash);
+    };
 
     await assert.rejects(
       performDirectOfficialUpdate(input(f), {
-        ...passingDeps(events),
+        ...passingDeps(f, events),
         fetch: fetchServing(f.zip),
         signatureInfo: () => ({ ok: true, adHoc: false, teamIdentifier: "NOTOPENAI", authority: [], output: "" }),
       }),
       /not signed by OpenAI Team/,
     );
+    await clearFailedPreparation();
     await assert.rejects(
       performDirectOfficialUpdate(
         { ...input(f), latest: { marketingVersion: "27.0.0", build: "9999" } },
-        { ...passingDeps(events), fetch: fetchServing(f.zip) },
+        { ...passingDeps(f, events), fetch: fetchServing(f.zip) },
       ),
       /does not match the signed appcast item/,
     );
+    await clearFailedPreparation();
     await assert.rejects(
       performDirectOfficialUpdate(input(f), {
-        ...passingDeps(events),
+        ...passingDeps(f, events),
         fetch: fetchServing(f.zip, String(64 * 1024 * 1024 * 1024)),
       }),
       /exceeds the size bound/,
@@ -213,14 +281,14 @@ test("the direct install refuses untrusted, mismatched, or oversized archives be
     await assert.rejects(
       performDirectOfficialUpdate(
         { ...input(f), enclosureUrl: "http://insecure.example.com/app.zip" },
-        { ...passingDeps(events), fetch: fetchServing(f.zip) },
+        { ...passingDeps(f, events), fetch: fetchServing(f.zip) },
       ),
       /transport must be HTTPS/,
     );
     // A redirect may not downgrade the transport either.
     await assert.rejects(
       performDirectOfficialUpdate(input(f), {
-        ...passingDeps(events),
+        ...passingDeps(f, events),
         fetch: (async () => ({
           ok: true,
           status: 302,
@@ -234,7 +302,7 @@ test("the direct install refuses untrusted, mismatched, or oversized archives be
     await assert.rejects(
       performDirectOfficialUpdate(
         { ...input(f), enclosureLength: f.zip.byteLength + 1000 },
-        { ...passingDeps(events), fetch: fetchServing(f.zip) },
+        { ...passingDeps(f, events), fetch: fetchServing(f.zip) },
       ),
       /length does not match/,
     );
@@ -250,11 +318,49 @@ test("Doctor preparation validates and retains upstream without quitting or repl
   try {
     const events: string[] = [];
     const before = readFileSync(join(f.live, "Contents", "Info.plist"), "utf8");
-    const staged = await prepareOfficialUpdateSource(input(f), { ...passingDeps(events), fetch: fetchServing(f.zip) });
+    const staged = await prepareOfficialUpdateSource(input(f), { ...passingDeps(f, events), fetch: fetchServing(f.zip) });
     assert.deepEqual(events, []);
     assert.equal(readFileSync(join(f.live, "Contents", "Info.plist"), "utf8"), before);
     assert.ok(existsSync(staged));
     assert.ok(readFileSync(join(staged, "Contents", "Info.plist"), "utf8").includes(LATEST.build));
     assert.ok(existsSync(join(f.root, "work")), "Caller owns retained preparation output");
   } finally { f.cleanup(); }
+});
+
+test("invalid extracted official source stays reserved until explicit journaled Trash reconciliation", async () => {
+  const f=fixture();
+  try {
+    const artifactRoot=join(f.root,"artifact-state"), workRoot=join(f.root,"failed-upstream");
+    const events:string[]=[];
+    await assert.rejects(prepareOfficialUpdateSource({...input(f),workRoot},{
+      ...passingDeps(f,events),fetch:fetchServing(f.zip),
+      signatureInfo:()=>({ok:true,adHoc:false,teamIdentifier:"WRONG",authority:[],output:""}),
+    }),/not signed by OpenAI Team/);
+    const source=join(workRoot,"extracted","ChatGPT.app");
+    assert.equal(existsSync(source),true);
+    const active=readReservations(artifactRoot).filter(item=>item.state!=="retired"&&item.paths.includes(source));
+    assert.equal(active.length,1);
+    const journal=failedOfficialSourceJournalPath(artifactRoot,active[0]!.id);
+    assert.equal(JSON.parse(readFileSync(journal,"utf8")).phase,"failed");
+    const trash=join(f.root,"Trash");mkdirSync(trash,{mode:0o700});
+    const preview=await reconcileFailedOfficialSource(artifactRoot,active[0]!.id,false,trash);
+    assert.equal(preview.eligible,true);
+    assert.equal(existsSync(source),true);
+    // Simulate a crash after the durable receipt and atomic Trash move, before
+    // the reservation and journal were marked reconciled.
+    const prior=JSON.parse(readFileSync(journal,"utf8"));
+    const destination=join(trash,`Tweakers-failed-source-${active[0]!.id}`);
+    writeDoctorPrivateJson(join(artifactRoot,"artifact-archives","failed-official-sources",`${active[0]!.id}.json`),{
+      version:1,kind:"failed-official-source-retirement",reservationId:active[0]!.id,
+      original:workRoot,destination,identity:prior.identity,phase:"prepared"});
+    writeDoctorPrivateJson(journal,{...prior,phase:"prepared"});
+    renameSync(workRoot,destination);
+    const applied=await reconcileFailedOfficialSource(artifactRoot,active[0]!.id,true,trash);
+    assert.equal(applied.retired,true);
+    assert.equal(existsSync(source),false);
+    assert.equal(readReservations(artifactRoot).find(item=>item.id===active[0]!.id)?.state,"retired");
+    const receipt=JSON.parse(readFileSync(join(artifactRoot,"artifact-archives","failed-official-sources",`${active[0]!.id}.json`),"utf8"));
+    assert.equal(receipt.phase,"retired");
+    assert.equal(existsSync(receipt.destination),true);
+  }finally{f.cleanup();}
 });

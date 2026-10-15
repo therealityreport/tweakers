@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,9 +8,11 @@ import {
   createCodexCliManager,
   deriveCodexCliPaths,
   mutateCodexFeature,
+  resolveBundledCodexBinary,
   validateArchiveEntries,
   type CodexCliManagerDependencies,
   type CodexCliRelease,
+  type CodexFeatureMutationDependencies,
 } from "../src/codex-cli-manager";
 
 const RELEASE: CodexCliRelease = {
@@ -21,6 +23,37 @@ const RELEASE: CodexCliRelease = {
   digest: "a".repeat(64),
   architecture: "aarch64-apple-darwin",
 };
+
+test("bundled backend resolves the supplied nested executable and preserves a physical legacy backend", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-bundled-cli-")));
+  try {
+    assert.throws(() => resolveBundledCodexBinary(root), /backend is missing/);
+    const nested = join(root, "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex");
+    mkdirSync(join(nested, ".."), { recursive: true });
+    writeFileSync(nested, "native");
+    assert.equal(resolveBundledCodexBinary(root), nested);
+    writeFileSync(join(root, "codex"), "legacy");
+    assert.equal(resolveBundledCodexBinary(root), join(root, "codex"));
+    rmSync(join(root, "codex"));
+    symlinkSync(nested, join(root, "codex"));
+    assert.throws(() => resolveBundledCodexBinary(root), /regular file/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("bundled backend rejects nested links, parent traversal and executable directories", () => {
+  for (const kind of ["file-link", "parent-link", "directory"]) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-bundled-cli-")));
+    try {
+      const resources = join(root, "resources"), parent = join(resources, "codex-cli", "CodexCLI.app", "Contents", "MacOS");
+      mkdirSync(parent, { recursive: true });
+      const nested = join(parent, "codex"), outside = join(root, "outside");
+      if (kind === "file-link") { writeFileSync(outside, "outside"); symlinkSync(outside, nested); }
+      else if (kind === "directory") mkdirSync(nested);
+      else { mkdirSync(outside); writeFileSync(join(outside, "codex"), "outside"); rmSync(parent, { recursive: true }); symlinkSync(outside, parent); }
+      assert.throws(() => resolveBundledCodexBinary(resources), /regular file/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
 
 test("derives every managed path under the Tweakers-owned root", () => {
   const paths = deriveCodexCliPaths("/Users/example");
@@ -281,7 +314,7 @@ test("bootstrap preserves unmanaged override, clears bundled, applies validated 
     await manager.installBeta();
     const valid = applyManagedCodexCliLaneAtBootstrap({ lane: "beta", home, env, validateManagedBinary: () => ({ valid: true }) });
     assert.equal(valid.effectiveLane, "beta");
-    assert.ok(env.CODEX_CLI_PATH?.startsWith(deriveCodexCliPaths(home).root));
+    assert.ok(String(env.CODEX_CLI_PATH).startsWith(deriveCodexCliPaths(home).root));
 
     const failures: string[] = [];
     const invalid = applyManagedCodexCliLaneAtBootstrap({ lane: "beta", home, env, validateManagedBinary: () => ({ valid: false, error: "signature invalid at /secret/path" }), persistFailure: (message) => failures.push(message) });
@@ -294,7 +327,7 @@ test("bootstrap preserves unmanaged override, clears bundled, applies validated 
 
 test("feature mutation refreshes, exact-matches mutable entries, and executes without a shell", async () => {
   const calls: unknown[][] = [];
-  const deps = {
+  const deps: CodexFeatureMutationDependencies = {
     inventory: async () => [{ name: "responses_websockets", stage: "experimental" as const, enabled: false }],
     execFile: async (...args: unknown[]) => { calls.push(args); },
   };

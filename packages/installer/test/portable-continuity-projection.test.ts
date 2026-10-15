@@ -7,6 +7,7 @@ import {
   mergePortableEndpointProjections,
   nativeThreadInventoryFingerprint,
   type NativeThreadInventoryV1,
+  type PortableContinuityLedgerV2,
   type PortableEndpointStateV1,
 } from "../src/portable-continuity-projection.ts";
 
@@ -69,7 +70,7 @@ function endpoint(endpointKey: typeof SOURCE | typeof DESTINATION, overrides: Pa
   };
 }
 
-function merge(source: PortableEndpointStateV1, destination: PortableEndpointStateV1, ledger = null) {
+function merge(source: PortableEndpointStateV1, destination: PortableEndpointStateV1, ledger: PortableContinuityLedgerV2 | null = null) {
   return mergePortableEndpointProjections({ source, destination, options: OPTIONS, ledger, observedAt: NOW });
 }
 

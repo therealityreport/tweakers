@@ -138,9 +138,8 @@ export async function repairWithOutcome(
   // Independent installations use Doctor's read-only update review. The legacy
   // watcher repair must never replace or interrupt native Codex on their behalf.
   if (isWatcherRepair(opts) && existsSync(join(userPaths().root, "variants", "tweakers", "state.json")) && existsSync("/Applications/Tweakers.app")) {
-    // Repair is not update discovery. Only an explicit check or a consumed
-    // available-update signal may start independent Doctor analysis.
-    return { status: "deferred", reason: "independent-doctor-review" };
+    const { scanIndependentNativeUpdateFromWatcher } = await import("../independent-native-update.js");
+    return scanIndependentNativeUpdateFromWatcher(userPaths().root);
   }
   const preliminaryPaths = userPaths();
   assertInstallerUpdateQuarantineClear(preliminaryPaths.root, "repair");

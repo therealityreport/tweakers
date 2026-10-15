@@ -31,9 +31,12 @@ export function patchAccountsNativeMainSources(sources: ReadonlyMap<string, stri
   edit("\"workspace-root-options\":async({canonicalizeRoots:e,hostId:t,signal:r})=>{let i=",
     "\"workspace-root-options\":async({canonicalizeRoots:e,hostId:t,signal:r})=>{if(t===`local`)await __twAccountsDesktopProjects.ensure(this);let i=");
   edit("async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();let r=",
-    "async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();await __twAccountsDesktopProjects.ensureBackend(this,t);e.throwIfAborted();let r=");
+    "async initializeProjects(e){await Promise.allSettled(this.pendingProjectWrites.values()),e.throwIfAborted();let t=await this.connection.codexHome();e.throwIfAborted();if(await __twAccountsDesktopProjects.ensureBackend(this,t))return;e.throwIfAborted();let r=");
   edit("await f2(this.pendingProjectWrites,e,async()=>{r.throwIfAborted(),this.projectSupport===`supported`&&(await t(r),r.throwIfAborted())",
     "await f2(this.pendingProjectWrites,e,async()=>{r.throwIfAborted(),await __twAccountsDesktopProjects.ensureWrite(this),r.throwIfAborted(),this.projectSupport===`supported`&&(await t(r),r.throwIfAborted())");
+  const metadataLock = /async withProjectMetadataLock\((e,t,[a-z])\)\{/g;
+  if ([...main!.matchAll(metadataLock)].length !== 1) throw new Error("Native project metadata lock anchor changed.");
+  main = main!.replace(metadataLock, (anchor) => anchor + "await __twAccountsDesktopProjects.ensureWrite(this);");
   edit("getInitialSidebarBootstrap(){let e=this.threadCatalogSyncManager;",
     "getInitialSidebarBootstrap(){void __twAccountsDesktopProjects.ensure(this.fetchHandler).catch(()=>{});let e=this.threadCatalogSyncManager;");
   edit("async function Rre({appServerConnection:e,", "async function Rre({codexHome:__twAccountsHome,appServerConnection:e,");

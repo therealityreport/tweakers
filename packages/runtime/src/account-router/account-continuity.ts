@@ -26,7 +26,6 @@ import {
   readSync,
   renameSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
   type Stats,
@@ -416,6 +415,8 @@ export interface EnsureAccountContinuityEnrollmentResultV1 {
 export interface AccountContinuityWriteEvidenceV1 {
   /** The host's same-account lease already proved this and holds through spawn. */
   readonly accountChildAbsent: boolean;
+  /** Private active shared-projection ownership; never grants a child or HTTP request. */
+  readonly pluginProjectionOwner?: string;
   /** Supply for native in-place homes only. It is called twice before a write. */
   readonly nativeWriterCensus?: () => "zero" | "running" | "unknown";
 }
@@ -1486,18 +1487,17 @@ function sharedAccountConfigRoot(stateRoot: string): string {
 
 function assertSafeOwnerDirectory(path: string, create = false): void {
   const resolved = resolve(path);
-  if (existsSync(resolved)) {
-    const stat = lstatSync(resolved);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid?.() !== undefined && stat.uid !== process.getuid?.()) || (stat.mode & 0o022) !== 0) {
-      throw new Error("account continuity refused an unsafe directory");
-    }
-  } else {
+  if (!existsSync(resolved)) {
     if (!create) throw new Error("account continuity directory is missing");
     mkdirSync(resolved, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   }
-  chmodSync(resolved, PRIVATE_DIRECTORY_MODE);
-  const checked = statSync(resolved);
-  if (!checked.isDirectory() || (process.getuid?.() !== undefined && checked.uid !== process.getuid?.()) || (checked.mode & 0o077) !== 0) {
+  const stat = lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid?.() !== undefined && stat.uid !== process.getuid?.()) || (stat.mode & 0o022) !== 0) {
+    throw new Error("account continuity refused an unsafe directory");
+  }
+  if ((stat.mode & 0o7777) !== PRIVATE_DIRECTORY_MODE) chmodSync(resolved, PRIVATE_DIRECTORY_MODE);
+  const checked = lstatSync(resolved);
+  if (!checked.isDirectory() || checked.isSymbolicLink() || (process.getuid?.() !== undefined && checked.uid !== process.getuid?.()) || (checked.mode & 0o7777) !== PRIVATE_DIRECTORY_MODE) {
     throw new Error("account continuity directory is not owner-private");
   }
 }
@@ -1556,12 +1556,17 @@ function readSafeRegularFile(path: string, maxBytes: number, allowEmpty: boolean
 }
 
 function atomicWriteFile(path: string, bytes: Buffer, mode: number, requireExistingSafe = false): void {
+  atomicWriteBoundedFile(path, bytes, mode, MAX_CAPABILITY_TOTAL_BYTES, requireExistingSafe);
+}
+
+function atomicWriteBoundedFile(path: string, bytes: Buffer, mode: number, maxBytes: number, requireExistingSafe = false, directoryBatch?: PluginDirectorySyncBatch): void {
   const parent = dirname(path);
-  assertSafeOwnerDirectory(parent);
-  if (bytes.byteLength > MAX_CAPABILITY_TOTAL_BYTES) throw new Error("account continuity refused an oversized write");
+  if (directoryBatch) directoryBatch.prepare(parent);
+  else assertSafeOwnerDirectory(parent);
+  if (bytes.byteLength > maxBytes) throw new Error("account continuity refused an oversized write");
   if (existsSync(path)) {
-    if (requireExistingSafe) assertSafeRegularFile(path, Math.max(MAX_CONFIG_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, false);
-    else assertSafeRegularFile(path, Math.max(MAX_METADATA_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, true);
+    if (requireExistingSafe) assertSafeRegularFile(path, maxBytes, true, false);
+    else assertSafeRegularFile(path, maxBytes, true, true);
   }
   const temporary = join(parent, `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
   let descriptor: number | undefined;
@@ -1571,11 +1576,14 @@ function atomicWriteFile(path: string, bytes: Buffer, mode: number, requireExist
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    chmodSync(temporary, mode);
-    assertSafeRegularFile(temporary, Math.max(MAX_CONFIG_BYTES, MAX_CAPABILITY_TOTAL_BYTES), true, mode === PRIVATE_FILE_MODE);
+    if ((assertSafeRegularFile(temporary, maxBytes, true, false).mode & 0o7777) !== mode) chmodSync(temporary, mode);
+    assertSafeRegularFile(temporary, maxBytes, true, mode === PRIVATE_FILE_MODE);
+    directoryBatch?.assertUnchanged(parent);
     renameSync(temporary, path);
-    chmodSync(path, mode);
-    fsyncDirectory(parent);
+    directoryBatch?.assertUnchanged(parent);
+    if ((assertSafeRegularFile(path, maxBytes, true, mode === PRIVATE_FILE_MODE).mode & 0o7777) !== mode) chmodSync(path, mode);
+    if (directoryBatch) directoryBatch.assertUnchanged(parent);
+    else fsyncDirectory(parent);
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
     if (existsSync(temporary)) {
@@ -2008,7 +2016,11 @@ function pluginPrivateContainer(name: string): boolean {
     || value.endsWith(".sqlite");
 }
 
-function scanPluginPackage(root: string): PluginSourceFileV1[] {
+function stockPrivatePluginContainer(name: string): boolean {
+  return [".plugin-data", ".codex-remote-plugin-install.json", ".credentials.json", ".auth.json", "mcp_oauth.json", "mcp-oauth.json", "credentials.toml", "auth.toml"].includes(name.toLowerCase());
+}
+
+function scanPluginPackage(root: string, stockDefinitionsOnly = false): PluginSourceFileV1[] {
   assertSafeCapabilityDirectory(root);
   const canonicalRoot = realpathSync(root);
   const files: PluginSourceFileV1[] = [];
@@ -2016,7 +2028,7 @@ function scanPluginPackage(root: string): PluginSourceFileV1[] {
   const visit = (directory: string, prefix: string, depth: number): void => {
     if (depth > 64) throw new Error("plugin package exceeds maximum depth");
     for (const name of readdirSync(directory).sort()) {
-      if (name === ".DS_Store" || pluginPrivateContainer(name)) continue;
+      if (name === ".DS_Store" || pluginPrivateContainer(name) || (stockDefinitionsOnly && stockPrivatePluginContainer(name))) continue;
       if (!isSafePluginSegment(name)) throw new Error("unsafe plugin package path");
       const path = join(directory, name);
       const relativePath = prefix ? `${prefix}/${name}` : name;
@@ -2027,7 +2039,8 @@ function scanPluginPackage(root: string): PluginSourceFileV1[] {
         const target = realpathSync(path);
         const targetRelative = relative(canonicalRoot, target);
         if (isAbsolute(linkTarget) || !targetRelative || targetRelative.startsWith(`..${sep}`) || targetRelative === ".."
-          || targetRelative.split(sep).some(pluginPrivateContainer)) throw new Error("plugin package link escapes its definition tree");
+          || targetRelative.split(sep).some(pluginPrivateContainer)
+          || (stockDefinitionsOnly && targetRelative.split(sep).some(stockPrivatePluginContainer))) throw new Error("plugin package link escapes its definition tree");
         files.push({ path: relativePath, bytes: 0, fingerprint: sha256Json({ linkTarget }), linkTarget });
         continue;
       }
@@ -2073,7 +2086,7 @@ function compareNativePluginVersions(left: string, right: string): number {
   return lexical(a[5] ?? "", b[5] ?? "");
 }
 
-function scanPluginCache(source: string, enabledIds?: ReadonlySet<string>): PluginSourcePackageV1[] {
+function scanPluginCache(source: string, enabledIds?: ReadonlySet<string>, stockDefinitionsOnly = false): PluginSourcePackageV1[] {
   assertSafeCapabilityDirectory(source);
   const packages: PluginSourcePackageV1[] = [];
   const selectedRegistries = enabledIds ? new Set([...enabledIds].map((id) => id.split("@")[1])) : undefined;
@@ -2092,7 +2105,7 @@ function scanPluginCache(source: string, enabledIds?: ReadonlySet<string>): Plug
         && /^[A-Za-z0-9_.+-]+$/.test(entry.name) && entry.name !== "." && entry.name !== "..").map((entry) => entry.name).sort(compareNativePluginVersions);
       const version = versions.includes("local") ? "local" : versions.at(-1);
       if (!version) continue;
-      const files = scanPluginPackage(join(nameRoot, version));
+      const files = scanPluginPackage(join(nameRoot, version), stockDefinitionsOnly);
       if (!files.length) throw new Error("empty plugin package is not a sealed inventory entry");
       packages.push({ id, registry, name, version, files, fingerprint: sha256Json({ id, version, files }), bytes: files.reduce((total, file) => total + file.bytes, 0) });
     }
@@ -2114,6 +2127,73 @@ function pluginInventoryFingerprint(generation: number, plugins: readonly Shared
   });
 }
 
+/** Only unpublished package writes defer directory flushes; file data is still synced per write. */
+class PluginDirectorySyncBatch {
+  private readonly directories = new Map<string, Pick<Stats, "dev" | "ino" | "uid">>();
+  private readonly containingDirectory: string;
+
+  constructor(destination: string) {
+    let containing = dirname(resolve(destination));
+    while (!lstatIfPresent(containing)) {
+      const parent = dirname(containing);
+      if (parent === containing) throw new Error("plugin copy containing directory is missing");
+      containing = parent;
+    }
+    this.containingDirectory = containing;
+    this.remember(containing);
+  }
+
+  private remember(path: string): void {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid?.() !== undefined && stat.uid !== process.getuid?.())
+      || (stat.mode & 0o077) !== 0) throw new Error("plugin copy directory is not owner-private");
+    const prior = this.directories.get(path);
+    if (prior && (stat.dev !== prior.dev || stat.ino !== prior.ino || stat.uid !== prior.uid)) throw new Error("plugin copy directory identity changed");
+    if (!prior) this.directories.set(path, { dev: stat.dev, ino: stat.ino, uid: stat.uid });
+  }
+
+  assertUnchanged(path: string): void {
+    let current = resolve(path);
+    if (current !== this.containingDirectory && !safeResolvedChild(this.containingDirectory, current)) throw new Error("plugin copy directory escapes its staging tree");
+    for (;;) {
+      if (!this.directories.has(current)) throw new Error("plugin copy directory lacks custody");
+      this.remember(current);
+      if (current === this.containingDirectory) return;
+      current = dirname(current);
+    }
+  }
+
+  prepare(path: string): void {
+    const current = resolve(path);
+    if (this.directories.has(current)) this.assertUnchanged(current);
+    else {
+      if (!safeResolvedChild(this.containingDirectory, current)) throw new Error("plugin copy directory escapes its staging tree");
+      this.prepare(dirname(current));
+    }
+    if (current !== this.containingDirectory) assertSafeOwnerDirectory(current, true);
+    this.remember(current);
+    this.assertUnchanged(current);
+  }
+
+  flush(): void {
+    const paths = [...this.directories.keys()].sort((a, b) => b.split(sep).length - a.split(sep).length || a.localeCompare(b));
+    for (const path of paths) {
+      this.assertUnchanged(path);
+      const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const actual = fstatSync(descriptor), expected = this.directories.get(path)!;
+        if (!actual.isDirectory() || actual.dev !== expected.dev || actual.ino !== expected.ino || actual.uid !== expected.uid
+          || (actual.mode & 0o077) !== 0) throw new Error("plugin copy directory identity changed before flush");
+        // Preserve fsyncDirectory's best-effort directory-sync policy, but never swallow custody failures.
+        try { fsyncSync(descriptor); } catch { /* file data already synced; some filesystems decline directory fsync */ }
+        this.assertUnchanged(path);
+      } finally { closeSync(descriptor); }
+    }
+    // A later parent flush must not hide replacement of an already-flushed child.
+    for (const path of paths) this.assertUnchanged(path);
+  }
+}
+
 function copyPluginPackage(
   source: string,
   destination: string,
@@ -2122,26 +2202,35 @@ function copyPluginPackage(
   afterFile?: () => void,
 ): void {
   assertSafeCapabilityDirectory(source);
-  assertSafeOwnerDirectory(destination, true);
+  const directoryBatch = new PluginDirectorySyncBatch(destination);
+  directoryBatch.prepare(destination);
   for (const file of files) {
     const target = join(destination, ...file.path.split("/"));
-    assertSafeOwnerDirectory(dirname(target), true);
+    directoryBatch.prepare(dirname(target));
     if (file.linkTarget !== undefined) symlinkSync(file.linkTarget, target);
     else {
       const bytes = readSafeRegularFile(join(source, ...file.path.split("/")), MAX_PLUGIN_BYTES, true, false);
       if (!bytes || sha256(bytes) !== file.fingerprint) throw new Error("plugin source changed before immutable copy");
-      try { atomicWriteFile(target, bytes, file.executable ? 0o700 : PRIVATE_FILE_MODE); } finally { bytes.fill(0); }
+      try { atomicWriteBoundedFile(target, bytes, file.executable ? 0o700 : PRIVATE_FILE_MODE, MAX_PLUGIN_BYTES, false, directoryBatch); } finally { bytes.fill(0); }
     }
     afterFile?.();
   }
   const seal = (path: string): void => {
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) return;
-    if (stat.isDirectory()) { for (const entry of readdirSync(path)) seal(join(path, entry)); chmodSync(path, 0o500); }
-    else if (stat.isFile()) chmodSync(path, stat.mode & 0o111 ? 0o500 : 0o400);
-    else throw new Error("unsafe plugin seal artifact");
+    if (stat.isDirectory()) {
+      directoryBatch.assertUnchanged(path);
+      for (const entry of readdirSync(path)) seal(join(path, entry));
+      directoryBatch.assertUnchanged(path);
+      if ((lstatSync(path).mode & 0o7777) !== 0o500) chmodSync(path, 0o500);
+    } else if (stat.isFile()) {
+      const checked = assertSafeRegularFile(path, MAX_PLUGIN_BYTES, true, true);
+      const mode = stat.mode & 0o111 ? 0o500 : 0o400;
+      if ((checked.mode & 0o7777) !== mode) chmodSync(path, mode);
+    } else throw new Error("unsafe plugin seal artifact");
   };
   if (immutable) seal(destination);
+  directoryBatch.flush();
 }
 
 function pluginGenerationArtifactFingerprint(manifest: SharedPluginsManifestV1, cache: string): Sha256 | null {
@@ -2435,17 +2524,19 @@ const PLUGIN_PROJECTIONS_FILE = "plugin-projections.v1.json";
 const PLUGIN_PROJECTION_INTENT_FILE = "plugin-projection-intent.v1.json";
 type PluginProjectionEntry = { version: string; fingerprint: Sha256 };
 
-function pluginNameFingerprint(path: string, id: string, entry: PluginProjectionEntry): Sha256 | null {
+function pluginNameFingerprint(path: string, id: string, entry: PluginProjectionEntry, stockOnly = false): Sha256 | null {
   try {
     assertSafeCapabilityDirectory(path);
-    const names = readdirSync(path);
+    // Finder metadata is outside the versioned payload and carries no custody.
+    // Ignore only a regular file; links, directories and unknown entries still fail.
+    const names = readdirSync(path).filter(name => name !== ".DS_Store" || !lstatSync(join(path, name)).isFile());
     if (names.length !== 1 || names[0] !== entry.version) return null;
-    return sha256Json({ id, version: entry.version, files: scanPluginPackage(join(path, entry.version)) });
+    return sha256Json({ id, version: entry.version, files: scanPluginPackage(join(path, entry.version), stockOnly) });
   } catch { return null; }
 }
 
 /** Add mutable account copies; existing or edited native packages stay local. */
-function preparePluginPackages(input: AccountConfigPrepareInputV1, accountRoot: string): boolean {
+function preparePluginPackages(input: Pick<AccountConfigPrepareInputV1, "account" | "plugins" | "apply" | "writeEvidence"> & { sourcePaths?: Readonly<Record<string, string>>; strict?: boolean }, accountRoot: string): boolean {
   const raw = readPrivateJson(accountRoot, PLUGIN_PROJECTIONS_FILE);
   if (raw !== null && (!isRecord(raw) || raw.version !== 1 || raw.opaqueAccountId !== input.account.opaqueAccountId || !isRecord(raw.entries))) {
     throw new Error("invalid plugin projection receipt");
@@ -2472,11 +2563,11 @@ function preparePluginPackages(input: AccountConfigPrepareInputV1, accountRoot: 
     const before = pending.before as PluginProjectionEntry | null;
     const after = pending.after as unknown as PluginProjectionEntry;
     const backup = join(transaction, "backup");
-    if (pluginNameFingerprint(target, id, after) === after.fingerprint) {
+    if (pluginNameFingerprint(target, id, after, input.strict) === after.fingerprint) {
       entries[id] = after; save();
-    } else if (!lstatIfPresent(target) && before && pluginNameFingerprint(backup, id, before) === before.fingerprint) {
+    } else if (!lstatIfPresent(target) && before && pluginNameFingerprint(backup, id, before, input.strict) === before.fingerprint) {
       renameSync(backup, target);
-    } else if ((before && pluginNameFingerprint(target, id, before) === before.fingerprint) || (!before && !lstatIfPresent(target))) {
+    } else if ((before && pluginNameFingerprint(target, id, before, input.strict) === before.fingerprint) || (!before && !lstatIfPresent(target))) {
       // No publication happened; discard only the private staged copy.
     } else throw new Error("plugin projection recovery requires inspection");
     rmSync(transaction, { recursive: true, force: true });
@@ -2494,25 +2585,29 @@ function preparePluginPackages(input: AccountConfigPrepareInputV1, accountRoot: 
     }
     const prior = entries[plugin.id];
     const present = lstatIfPresent(target);
-    if (present && (!prior || pluginNameFingerprint(target, plugin.id, prior) !== prior.fingerprint)) continue;
+    if (present && (!prior || pluginNameFingerprint(target, plugin.id, prior, input.strict) !== prior.fingerprint)) {
+      if (input.strict) throw new Error("stock plugin projection refused modified or unowned account package");
+      continue;
+    }
     if (present && prior?.version === plugin.version && prior.fingerprint === plugin.fingerprint) continue;
     ready = false;
     if (!input.apply) continue;
     assertWriteEvidence(input.writeEvidence);
     assertSafeOwnerDirectory(join(root, registry!), true);
     const after = { version: plugin.version, fingerprint: plugin.fingerprint };
-    const source = join(input.plugins.root, registry!, name!, plugin.version);
-    const files = scanPluginPackage(source);
+    const source = input.sourcePaths?.[plugin.id] ?? join(input.plugins.root, registry!, name!, plugin.version);
+    const files = scanPluginPackage(source, Boolean(input.sourcePaths));
     if (sha256Json({ id: plugin.id, version: plugin.version, files }) !== plugin.fingerprint) throw new Error("shared plugin package changed");
     const transactionName = `.tweakers-plugins-${randomBytes(8).toString("hex")}`;
     const transaction = join(resolve(input.account.codexHome), transactionName);
     mkdirSync(transaction, { mode: PRIVATE_DIRECTORY_MODE });
     const candidate = join(transaction, "candidate");
     copyPluginPackage(source, join(candidate, plugin.version), files, false);
-    if (pluginNameFingerprint(candidate, plugin.id, after) !== plugin.fingerprint) throw new Error("account plugin copy failed verification");
-    atomicWritePrivateJson(accountRoot, PLUGIN_PROJECTION_INTENT_FILE, { id: plugin.id, transaction: transactionName, before: present ? prior : null, after });
+    if (pluginNameFingerprint(candidate, plugin.id, after, input.strict) !== plugin.fingerprint) throw new Error("account plugin copy failed verification");
+    atomicWritePrivateJson(accountRoot, PLUGIN_PROJECTION_INTENT_FILE, { id: plugin.id, transaction: transactionName, before: present ? prior : null, after,
+      ...(input.writeEvidence?.pluginProjectionOwner ? { projectionOwner: input.writeEvidence.pluginProjectionOwner } : {}) });
     assertWriteEvidence(input.writeEvidence);
-    if (present ? pluginNameFingerprint(target, plugin.id, prior!) !== prior!.fingerprint : lstatIfPresent(target) !== null) throw new Error("account plugin changed before publication");
+    if (present ? pluginNameFingerprint(target, plugin.id, prior!, input.strict) !== prior!.fingerprint : lstatIfPresent(target) !== null) throw new Error("account plugin changed before publication");
     if (present) renameSync(target, join(transaction, "backup"));
     renameSync(candidate, target);
     fsyncDirectory(dirname(target));
@@ -4579,4 +4674,444 @@ export function captureIdleAccountChangesBeforeSpawn(input: IdleAccountChangesCa
   } catch (error) {
     return { state: "blocked", reason: error instanceof Error ? error.message : "idle account change capture failed" };
   }
+}
+
+/** Nonsecret definitions only; no user policy, auth store or enabled settings. */
+export function selectNonsecretDefinitionTreeV1(tree: TomlTableV1): TomlTableV1 {
+  const selected = selectSharedTomlTree(tree, DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1);
+  return Object.fromEntries(["marketplaces", "marketplace", "mcp_servers"].filter(key => selected[key] !== undefined)
+    .map(key => [key, selected[key]!]));
+}
+
+/** Supported Codex -c assignments, using the same lossless TOML data model. */
+function inlineTomlOverrideValueV1(node: TomlNodeV1): TomlDataValueV1 {
+  if (isTomlTable(node)) return { type: "inline-table", entries: Object.fromEntries(Object.entries(node).map(([key, child]) => [key, inlineTomlOverrideValueV1(child)])) };
+  if (node.type === "inline-table") return { type: "inline-table", entries: Object.fromEntries(Object.entries(node.entries).map(([key, child]) => [key, inlineTomlOverrideValueV1(child)])) };
+  if (node.type === "array-table") return { type: "array", values: node.entries.map(entry => inlineTomlOverrideValueV1(entry)) };
+  if (node.type === "array") return { type: "array", values: node.values.map(inlineTomlOverrideValueV1) };
+  return node;
+}
+
+export function renderTomlConfigOverridesV1(tree: TomlTableV1, rootTables = false): string[] {
+  // Native CLI splits override paths on dots without TOML key unquoting.
+  // Put special plugin IDs inside a TOML table value, never in the CLI path.
+  if (rootTables) return Object.entries(tree).map(([key, node]) => `${key}=${renderTomlValue(inlineTomlOverrideValueV1(node))}`);
+  return [...flattenTomlLeaves(tree).values()].map(({ path, value }) => {
+    if (!isTomlDataValue(value)) throw new Error("invalid stock configuration override");
+    return `${renderTomlPath(path)}=${renderTomlValue(value)}`;
+  });
+}
+
+// Exact public publisher MCP documents, verified by the integration owner at:
+// https://raw.githubusercontent.com/openai/plugins/0722921d5542fc593105c27bd52630babd8b8c2a/plugins/gmail/.mcp.json
+// https://raw.githubusercontent.com/openai/plugins/0722921d5542fc593105c27bd52630babd8b8c2a/plugins/google-drive/.mcp.json
+// These are static OAuth application definitions (RFC 8252 section 8.5), not
+// account tokens. Any change falls back to the strict credential checks below.
+const PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1 = Object.freeze({
+  gmail: "b80ebfce75a3e6ed85b6cc7a0528569ec6a551fbd38c3df91b98a5ff85075a29",
+  "google-drive": "6ca6c73630d09520915831a55c15cefcab7810f960de6def47e405207f2f8397",
+});
+/** Bump the guard revision on classification changes; signed custody must then be reclassified. */
+export const OFFICIAL_PLUGIN_DEFINITION_POLICY_FINGERPRINT_V1: Sha256 = sha256Json({
+  strictGuardRevision: "nonsecret-definition-json-v2-complete-public-oauth-pins",
+  publicOAuthMcpCanonicalPins: PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1,
+});
+
+export function assertNonsecretDefinitionJsonV1(value: unknown): void {
+  if (isRecord(value) && Object.keys(value).length === 1 && Object.prototype.hasOwnProperty.call(value, "mcpServers") && isRecord(value.mcpServers)) {
+    const names = Object.keys(value.mcpServers), name = names[0];
+    if (names.length === 1 && (name === "gmail" || name === "google-drive") && isRecord(value.mcpServers[name])
+      && sha256Json(value) === `sha256:${PINNED_PUBLIC_OAUTH_MCP_DOCUMENTS_V1[name]}`) return;
+  }
+  assertNonsecretDefinitionJsonValueV1(value);
+}
+
+/** Recursive checks never apply the complete-document publisher exception. */
+function assertNonsecretDefinitionJsonValueV1(value: unknown): void {
+  const referenceValue = (child: unknown): boolean => typeof child === "string" && /^(?:(?:Bearer|Basic)\s+)?(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)$/i.test(child);
+  const credentialKey = (key: string): boolean => {
+    const normalized = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+    return credentialShaped(normalized) || /(?:^|[_-])private[_-]?key(?:$|[_-])/i.test(normalized);
+  };
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const child = value[index], flag = typeof child === "string" ? /^--?([^=\s]+)$/.exec(child) : null;
+      const next = value[index + 1];
+      if (flag && credentialKey(flag[1]!) && typeof next === "string" && next !== "" && !next.startsWith("-") && !referenceValue(next)) throw new Error("plugin definition contains account-local authorization");
+      assertNonsecretDefinitionJsonValueV1(child);
+    }
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      // Environment references and declarative OAuth objects are definitions.
+      // Literal credential leaves never enter another account's package.
+      if (/(?:env|environment)(?:_|-)?(?:vars?|variables?)$/i.test(key)
+        && (typeof child === "string" ? /^[A-Za-z_][A-Za-z0-9_]*$/.test(child) : Array.isArray(child) && child.every(item => typeof item === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(item)))) continue;
+      if (key === "env_http_headers") {
+        if (!isRecord(child) || Object.values(child).some(name => typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error("plugin definition contains account-local authorization");
+        continue;
+      }
+      const reference = referenceValue(child);
+      const authKind = ["auth", "oauth"].includes(key.toLowerCase()) && ["oauth", "oAuth", "none"].includes(String(child));
+      const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+      const numericTokenBudget = typeof child === "number" && Number.isFinite(child)
+        && /^(?:(?:[a-z0-9]+[_-])*tokens?[_-](?:budget|limit|count)|max[_-](?:(?:input|output|total)[_-])?tokens)$/i.test(normalizedKey);
+      if (credentialKey(key) && !numericTokenBudget && !isRecord(child) && !Array.isArray(child) && !reference && !authKind
+        && child !== null && child !== false && child !== "") throw new Error("plugin definition contains account-local authorization");
+      if (!reference && !authKind) assertNonsecretDefinitionJsonValueV1(child);
+    }
+  } else if (typeof value === "string") {
+    const assignment = /^(?:--?)?([^=\s]+)\s*=\s*(.*)$/.exec(value.trim());
+    const literalScheme = [...value.matchAll(/\b(?:Bearer|Basic)\s+(\S+)/ig)].some(match => !referenceValue(match[1]));
+    if ((assignment && credentialKey(assignment[1]!) && assignment[2] !== "" && !referenceValue(assignment[2]))
+      || literalScheme || /-----BEGIN (?:[A-Z ]+)?PRIVATE KEY-----/i.test(value)) throw new Error("plugin definition contains account-local authorization");
+    const urlText = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/i.exec(value)?.[0];
+    if (urlText) {
+      try {
+        const url = new URL(urlText);
+        if (url.username || url.password || [...url.searchParams].some(([key, child]) => credentialKey(key) && child !== "" && !referenceValue(child))) throw new Error("plugin definition contains account-local authorization");
+      } catch (error) {
+        if (error instanceof Error && error.message === "plugin definition contains account-local authorization") throw error;
+      }
+    }
+  }
+}
+
+const OFFICIAL_PLUGIN_MANIFEST_PATHS_V1 = [".codex-plugin/plugin.json", ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"] as const;
+const OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1 = "https://agent-plugins.org/schemas/";
+const OFFICIAL_AGENT_PLUGIN_SCHEMA_V1 = `${OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1}1.0.0/plugin.schema.json`;
+const OFFICIAL_PLUGIN_WITHHELD_REASON_V1 = "Plugin definition is unsafe to share; its native installation remains unchanged.";
+export function officialPluginDefinitionWithheldReasonV1(error: unknown): string | null {
+  return error instanceof SyntaxError || error instanceof Error && ["plugin definition contains account-local authorization", "unsafe MCP definition reference", "unsafe MCP definition declaration", "unsafe plugin definition", "unsafe plugin manifest"].includes(error.message) ? OFFICIAL_PLUGIN_WITHHELD_REASON_V1 : null;
+}
+function officialPluginMcpDeclarationsV1(manifest: unknown): unknown[] {
+  if (!isRecord(manifest)) throw new Error("unsafe plugin manifest");
+  // The maintained native legacy parser recognizes camelCase string/object
+  // declarations. Arrays and other unknown metadata do not name files.
+  const declared = manifest.mcpServers;
+  if (typeof declared === "string") return declared.startsWith("./") ? [declared] : [];
+  return isRecord(declared) ? [declared] : [];
+}
+function officialAgentPluginManifestV1(manifest: unknown): boolean {
+  if (!isRecord(manifest) || typeof manifest.$schema !== "string" || !manifest.$schema.startsWith(OFFICIAL_AGENT_PLUGIN_SCHEMA_PREFIX_V1)) return false;
+  if (manifest.$schema !== OFFICIAL_AGENT_PLUGIN_SCHEMA_V1) throw new Error("unsafe plugin manifest");
+  return true;
+}
+function officialPluginDefinitionPathV1(source: string, relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (isAbsolute(normalized) || !safeResolvedChild(source, normalized) || normalized.split("/").some(part => !part || part === "." || part === ".." || pluginPrivateContainer(part) || stockPrivatePluginContainer(part))) throw new Error("unsafe MCP definition reference");
+  return normalized;
+}
+function assertNonsecretPluginDefinitions(source: string, files: readonly PluginSourceFileV1[]): void {
+  const byPath = new Map(files.map(file => [file.path, file]));
+  const checked = new Set<string>();
+  const readDefinition = (relativePath: string): unknown => {
+    const normalized = officialPluginDefinitionPathV1(source, relativePath);
+    const file = byPath.get(normalized);
+    // A declared file must be in the complete public package, never omitted
+    // private data or an unresolved link.
+    if (!file || file.linkTarget !== undefined) throw new Error("unsafe MCP definition reference");
+    const bytes = readSafeRegularFile(join(source, ...normalized.split("/")), MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin definition");
+    try {
+      const value: unknown = JSON.parse(bytes.toString("utf8"));
+      assertNonsecretDefinitionJsonV1(value); checked.add(normalized); return value;
+    } finally { bytes.fill(0); }
+  };
+  for (const path of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+    if (!byPath.has(path)) continue;
+    const manifest = readDefinition(path);
+    for (const declaration of officialPluginMcpDeclarationsV1(manifest)) {
+      if (typeof declaration === "string") readDefinition(declaration);
+      else assertNonsecretDefinitionJsonV1(declaration);
+    }
+  }
+  if (byPath.has("plugin.json")) {
+    const rootManifest = readDefinition("plugin.json");
+    // Agent Plugins have fixed components. Root mcpServers is unknown
+    // metadata, including in unrelated portable SDK manifests.
+    if (officialAgentPluginManifestV1(rootManifest) && byPath.has("mcp.json")) readDefinition("mcp.json");
+  }
+  for (const file of files) {
+    if (file.linkTarget !== undefined || checked.has(file.path)) continue;
+    const name = basename(file.path);
+    if (![".mcp.json", "mcp.json", "plugin.json", "config.json"].includes(name) && !name.endsWith(".toml")) continue;
+    const bytes = readSafeRegularFile(join(source, ...file.path.split("/")), MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin definition");
+    try {
+      const text = bytes.toString("utf8");
+      if (name.endsWith(".toml")) {
+        const tree = parseLosslessTomlDocument(text).tree;
+        assertNonsecretDefinitionJsonV1(tomlThreadConfigOverridesV1(tree, true));
+      } else assertNonsecretDefinitionJsonV1(JSON.parse(text));
+    } finally { bytes.fill(0); }
+  }
+}
+
+/** Same public package boundary for the single store-owned source watcher. */
+export function officialPluginSourceChangeRelevantV1(relativePath: string): boolean {
+  return relativePath.replace(/\\/g, "/").split("/").every(part => part !== ".DS_Store"
+    && (part === ".codex-remote-plugin-install.json" || (!pluginPrivateContainer(part) && !stockPrivatePluginContainer(part))));
+}
+
+/** Use the existing target-owned journal/copy primitive; never link a native cache. */
+export function projectOfficialPluginPackagesV1(input: {
+  stateRoot: string; sourceHome: string; account: AccountContinuityAccountV1;
+  plugins: readonly { id: string; version: string | null }[]; writeEvidence: AccountContinuityWriteEvidenceV1;
+  canonical?: boolean; generation?: number;
+  custody?: readonly { id: string; version: string; path: string; digest: string }[];
+}): boolean {
+  const expected = join(resolve(input.stateRoot), "accounts", input.account.opaqueAccountId, "execution-home");
+  if (resolve(input.account.codexHome) !== expected || resolve(input.sourceHome) === expected) throw new Error("stock plugin projection requires a Tweakers-owned account home");
+  if (input.account.accountStateRoot && resolve(input.account.accountStateRoot) !== dirname(expected)) throw new Error("stock plugin projection receipt requires the exact owned account root");
+  assertSafePrivateDirectoryReadOnly(expected);
+  assertWriteEvidence(input.writeEvidence);
+  if (!input.custody) readOfficialPluginHttpServersV1(input.sourceHome, input.plugins, true);
+  const root = join(resolve(input.sourceHome), "plugins", "cache");
+  const packages = input.custody ? input.custody.map(packageEntry => {
+    const snapshot = captureOfficialPluginPackageV1(packageEntry.path);
+    if (snapshot.digest !== packageEntry.digest || !isSafePluginId(packageEntry.id) || !isSafePluginSegment(packageEntry.version)) throw new Error("sealed stock package custody changed");
+    const [name, registry] = packageEntry.id.split("@");
+    return { id: packageEntry.id, name: name!, registry: registry!, version: packageEntry.version, files: snapshot.files, bytes: snapshot.files.reduce((n, file) => n + file.bytes, 0) };
+  }) : input.plugins.length ? scanPluginCache(root, new Set(input.plugins.map(plugin => plugin.id)), true) : [];
+  const selected: SharedPluginInventoryEntryV1[] = [];
+  const sourcePaths: Record<string, string> = {};
+  for (const plugin of input.plugins) {
+    const entry = packages.find(candidate => candidate.id === plugin.id);
+    if (!entry || (plugin.version !== null && entry.version !== plugin.version)) throw new Error("stock inventory package is missing or changed");
+    const source = input.custody?.find(packageEntry => packageEntry.id === plugin.id)?.path ?? join(root, entry.registry, entry.name, entry.version);
+    assertNonsecretPluginDefinitions(source, entry.files);
+    const alias = input.canonical === false ? officialLocalPluginIdV1(entry.id) : entry.id;
+    sourcePaths[alias] = source;
+    selected.push({ id: alias, version: entry.version, fingerprint: sha256Json({ id: alias, version: entry.version, files: entry.files }), fileCount: entry.files.length, bytes: entry.bytes });
+  }
+  const generation = input.generation ?? 1;
+  const plugins: SharedPluginsManifestV1 = { version: 1, generation, plugins: selected, root, fingerprint: pluginInventoryFingerprint(generation, selected) };
+  const accountRoot = accountStateRoot(input.stateRoot, input.account);
+  assertSafeOwnerDirectory(accountRoot, true);
+  return preparePluginPackages({ account: input.account, plugins, apply: true, writeEvidence: input.writeEvidence, sourcePaths, strict: true }, accountRoot);
+}
+
+/** Native local packages use their manifest version; source cache versions remain source identities. */
+export function officialLocalPluginExecutionVersionV1(source: string, sourceVersion: string): string {
+  if (!isSafePluginSegment(sourceVersion)) throw new Error("invalid plugin source version");
+  for (const relative of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+    const path = join(source, relative);
+    if (!lstatIfPresent(path)) continue;
+    const bytes = readSafeRegularFile(path, MAX_CONFIG_BYTES, true, false);
+    if (!bytes) throw new Error("unsafe plugin manifest");
+    const manifest: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!isRecord(manifest)) throw new Error("unsafe plugin manifest");
+    if (!Object.prototype.hasOwnProperty.call(manifest, "version")) return sourceVersion;
+    if (typeof manifest.version !== "string" || !isSafePluginSegment(manifest.version)) throw new Error("unsafe plugin execution version");
+    return manifest.version;
+  }
+  return sourceVersion;
+}
+
+export interface OfficialPluginLayoutChangeV1 { id: string; beforeVersion: string; afterVersion: string; digest: string }
+
+/** Metadata-only adoption of an exact signed payload already moved to its native manifest version. */
+export function reconcileOfficialPluginLayoutReceiptV1(input: {
+  stateRoot: string; account: AccountContinuityAccountV1; changes: readonly OfficialPluginLayoutChangeV1[]; unchanged: readonly { id: string; version: string; digest: string }[];
+  apply: boolean; before?: unknown; authorize: () => boolean; writeEvidence: AccountContinuityWriteEvidenceV1;
+}): { before: unknown; after: unknown } {
+  const home = resolve(input.account.codexHome), root = join(resolve(input.stateRoot), "accounts", input.account.opaqueAccountId);
+  if (home !== join(root, "execution-home") || input.account.accountStateRoot && resolve(input.account.accountStateRoot) !== root) throw new Error("layout reconciliation requires the owned account home");
+  assertSafePrivateDirectoryReadOnly(home);
+  const current = readPrivateJson(root, PLUGIN_PROJECTIONS_FILE), before = input.before ?? current;
+  if (!isRecord(before) || before.version !== 1 || before.opaqueAccountId !== input.account.opaqueAccountId || !isRecord(before.entries)
+    || readPrivateJson(root, PLUGIN_PROJECTION_INTENT_FILE) !== null) throw new Error("layout receipt is unavailable or has a pending projection");
+  const beforeEntries = before.entries;
+  const entries: Record<string, PluginProjectionEntry> = {};
+  for (const [id, value] of Object.entries(beforeEntries)) {
+    if (!isSafePluginId(id) || !isRecord(value) || typeof value.version !== "string" || !isSafePluginSegment(value.version) || !isSha256(value.fingerprint)) throw new Error("invalid layout receipt entry");
+    entries[id] = { version: value.version, fingerprint: value.fingerprint };
+  }
+  const seen = new Set<string>();
+  const validate = (change: OfficialPluginLayoutChangeV1, unchanged = false) => {
+    if (!isSafePluginId(change.id) || !isSafePluginSegment(change.beforeVersion) || !isSafePluginSegment(change.afterVersion)
+      || (!unchanged && change.beforeVersion === change.afterVersion) || !isSha256(change.digest)) throw new Error("invalid layout change");
+    const [name, market] = change.id.split("@"), parent = join(home, "plugins/cache", market!, name!);
+    assertSafePrivateDirectoryReadOnly(home);
+    for (const path of [join(home, "plugins"), join(home, "plugins/cache"), join(home, "plugins/cache", market!), parent]) assertSafeCapabilityDirectory(path);
+    const names = readdirSync(parent);
+    if (names.length !== 1 || names[0] !== change.afterVersion) throw new Error("layout reconciliation requires one exact version");
+    const path = join(parent, change.afterVersion), snapshot = captureOfficialPluginPackageV1(path);
+    if (snapshot.digest !== change.digest || (!unchanged && officialLocalPluginExecutionVersionV1(path, change.beforeVersion) !== change.afterVersion)) throw new Error("layout payload or manifest differs");
+    const old = beforeEntries[change.id];
+    if (!isRecord(old) || old.version !== change.beforeVersion || old.fingerprint !== sha256Json({ id: change.id, version: change.beforeVersion, files: snapshot.files })) throw new Error("layout receipt does not own the unchanged payload");
+    return { version: change.afterVersion, fingerprint: sha256Json({ id: change.id, version: change.afterVersion, files: snapshot.files }) };
+  };
+  for (const entry of input.unchanged) {
+    if (seen.has(entry.id)) throw new Error("duplicate layout package"); seen.add(entry.id);
+    validate({ id: entry.id, beforeVersion: entry.version, afterVersion: entry.version, digest: entry.digest }, true);
+  }
+  for (const change of input.changes) {
+    if (seen.has(change.id)) throw new Error("duplicate layout change"); seen.add(change.id);
+    entries[change.id] = validate(change);
+  }
+  if (!seen.size) throw new Error("empty layout reconciliation");
+  const after = { ...before, entries };
+  if (sha256Json(current) !== sha256Json(before) && sha256Json(current) !== sha256Json(after)) throw new Error("layout receipt changed outside the recorded transition");
+  if (input.apply) {
+    assertWriteEvidence(input.writeEvidence);
+    for (const entry of input.unchanged) validate({ id: entry.id, beforeVersion: entry.version, afterVersion: entry.version, digest: entry.digest }, true);
+    for (const change of input.changes) validate(change);
+    if (!input.authorize() || sha256Json(readPrivateJson(root, PLUGIN_PROJECTIONS_FILE)) !== sha256Json(current)) throw new Error("layout reconciliation authority changed");
+    if (sha256Json(current) !== sha256Json(after)) atomicWritePrivateJson(root, PLUGIN_PROJECTIONS_FILE, after);
+  }
+  return { before, after };
+}
+
+/** Bounded nonsecret package custody; caller owns destination and mutation authority. */
+export function captureOfficialPluginPackageV1(source: string) {
+  const files = scanPluginPackage(source, true);
+  assertNonsecretPluginDefinitions(source, files);
+  return { files, digest: sha256Json(files) };
+}
+
+export function copyOfficialPluginPackageV1(source: string, destination: string, expectedDigest: string): void {
+  const snapshot = captureOfficialPluginPackageV1(source);
+  if (snapshot.digest !== expectedDigest || lstatIfPresent(destination)) throw new Error("stock package custody changed or destination is occupied");
+  assertSafeOwnerDirectory(dirname(destination), true);
+  copyPluginPackage(source, destination, snapshot.files, false);
+  if (captureOfficialPluginPackageV1(destination).digest !== expectedDigest
+    || captureOfficialPluginPackageV1(source).digest !== expectedDigest) throw new Error("stock package custody changed during copy");
+}
+
+/** Inspect only declared MCP JSON definitions; package code and credentials are not loaded. */
+export function readOfficialPluginHttpServersV1(home: string, plugins?: readonly { id: string; version: string | null }[], rejectSecrets = false, includeStdio = false): Array<{ pluginId: string; name: string }> {
+  const config = readAccountConfig(home);
+  const configuredPlugins = getTomlNode(config.tree, ["plugins"]);
+  const configured = Object.keys(isTomlInlineTable(configuredPlugins) ? configuredPlugins.entries : configuredPlugins ?? {});
+  const selected = plugins ?? configured.map(id => ({ id, version: null }));
+  const output: Array<{ pluginId: string; name: string }> = [];
+  for (const plugin of selected) {
+    if (!isSafePluginId(plugin.id)) throw new Error("invalid installed plugin id");
+    const [name, registry] = plugin.id.split("@");
+    const nameRoot = join(home, "plugins", "cache", registry!, name!);
+    if (!lstatIfPresent(nameRoot)) continue;
+    assertSafeCapabilityDirectory(nameRoot);
+    const versions = readdirSync(nameRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && isSafePluginSegment(entry.name)).map(entry => entry.name).sort(compareNativePluginVersions);
+    const version = plugin.version ?? (versions.includes("local") ? "local" : versions.at(-1));
+    if (!version || !isSafePluginSegment(version)) continue;
+    const packageRoot = join(nameRoot, version);
+    assertSafeCapabilityDirectory(packageRoot);
+    const readDefinition = (relativePath: string, required = false): unknown => {
+      const normalized = officialPluginDefinitionPathV1(packageRoot, relativePath), path = join(packageRoot, ...normalized.split("/"));
+      if (!lstatIfPresent(path)) { if (required) throw new Error("unsafe MCP definition reference"); return undefined; }
+      let parent = packageRoot;
+      for (const part of normalized.split("/").slice(0, -1)) {
+        parent = join(parent, part);
+        const stat = lstatSync(parent);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || stat.mode & 0o022) throw new Error("unsafe MCP definition reference");
+      }
+      const bytes = readSafeRegularFile(path, MAX_CONFIG_BYTES, true, false);
+      if (!bytes) throw new Error("unsafe plugin definition");
+      try { const value: unknown = JSON.parse(bytes.toString("utf8")); if (rejectSecrets) assertNonsecretDefinitionJsonV1(value); return value; } finally { bytes.fill(0); }
+    };
+    const definitions: unknown[] = [readDefinition(".mcp.json"), readDefinition("mcp.json")];
+    const rootManifest = readDefinition("plugin.json");
+    if (rootManifest !== undefined) officialAgentPluginManifestV1(rootManifest);
+    for (const manifestPath of OFFICIAL_PLUGIN_MANIFEST_PATHS_V1) {
+      const manifest = readDefinition(manifestPath);
+      if (manifest === undefined) continue;
+      for (const declaration of officialPluginMcpDeclarationsV1(manifest)) {
+        if (rejectSecrets && typeof declaration !== "string") assertNonsecretDefinitionJsonV1(declaration);
+        definitions.push(typeof declaration === "string" ? readDefinition(declaration, true) : declaration);
+      }
+    }
+    for (const definition of definitions) {
+      if (!isRecord(definition)) continue;
+      const servers = isRecord(definition.mcpServers) ? definition.mcpServers : isRecord(definition.mcp_servers) ? definition.mcp_servers : definition;
+      for (const [serverName, server] of Object.entries(servers)) {
+        if (isRecord(server) && (typeof server.url === "string" || (includeStdio && typeof server.command === "string")) && !output.some(entry => entry.pluginId === plugin.id && entry.name === serverName)) output.push({ pluginId: plugin.id, name: serverName });
+      }
+    }
+  }
+  return output;
+}
+
+/** Unsafe declarations are withheld independently; unrelated filesystem drift still blocks admission. */
+export function officialPluginDefinitionBlocksV1(home: string, plugins: readonly { id: string; version: string | null }[]): Record<string, string> {
+  const blocked: Record<string, string> = {};
+  for (const plugin of plugins) {
+    try { readOfficialPluginHttpServersV1(home, [plugin], true); }
+    catch (error) {
+      const reason = officialPluginDefinitionWithheldReasonV1(error);
+      if (!reason) throw error;
+      blocked[plugin.id] = reason;
+    }
+  }
+  return blocked;
+}
+
+/** Source-only inventory. Configured disabled entries remain installed definitions. */
+export function readOfficialInstalledPluginSnapshotV1(home: string): {
+  plugins: Array<{ id: string; enabled: boolean; version: string | null }>;
+  configFingerprint: Sha256; fingerprint: Sha256;
+} {
+  assertSafeCapabilityDirectory(home);
+  const before = readAccountConfig(home);
+  const configuredNode = getTomlNode(before.tree, ["plugins"]);
+  const configured = isTomlInlineTable(configuredNode) ? configuredNode.entries : isTomlTable(configuredNode) ? configuredNode : {};
+  const ids = Object.keys(configured).sort();
+  if (ids.length > 4096 || ids.some(id => !isSafePluginId(id))) throw new Error("invalid installed source plugin configuration");
+  const cache = join(home, "plugins", "cache");
+  const readPackages = () => lstatIfPresent(cache) ? scanPluginCache(cache, new Set(ids), true) : [];
+  const first = readPackages(), second = readPackages();
+  if (before.fingerprint !== readAccountConfig(home).fingerprint || stableJson(first) !== stableJson(second)) throw new Error("source plugin snapshot changed during read");
+  const plugins = ids.map(id => {
+    const node = configured[id];
+    const settings = isTomlInlineTable(node) ? node.entries : isTomlTable(node) ? node : {};
+    const enabled = settings.enabled;
+    if (enabled !== undefined && (!isTomlScalar(enabled) || enabled.type !== "boolean")) throw new Error("invalid installed source plugin enablement");
+    return { id, enabled: enabled === undefined ? true : (enabled as Extract<TomlScalarV1, { type: "boolean" }>).value,
+      version: first.find(plugin => plugin.id === id)?.version ?? null };
+  });
+  return { plugins, configFingerprint: before.fingerprint,
+    fingerprint: sha256Json({ configFingerprint: before.fingerprint, packages: first.map(({ id, version, fingerprint }) => ({ id, version, fingerprint })), plugins }) };
+}
+
+
+/** Stable local namespace outside stock remote reconciliation ownership. */
+export function officialLocalPluginIdV1(id: string): string {
+  if (!isSafePluginId(id)) throw new Error("invalid shared plugin identity");
+  const [name, marketplace] = id.split("@");
+  return `${name}@tweakers-shared-${createHash("sha256").update(marketplace!).digest("hex").slice(0, 16)}`;
+}
+
+/** Policies belong to the selected account; authorization values never become CLI arguments. */
+export function nonsecretPluginPolicyV1(value: TomlNodeV1 | undefined): TomlTableV1 {
+  const tree = isTomlInlineTable(value) ? value.entries : isTomlTable(value) ? value : {};
+  const selected: Record<string, TomlNodeV1> = {};
+  for (const { path, value: child } of flattenTomlLeaves(tree).values()) {
+    if (!path.some(credentialShaped) && !containsLiteralAuthorization(child)) setTomlNode(selected, path, child);
+  }
+  return selected;
+}
+
+/** JSON values for the stock thread config override map, preserving policy leaves. */
+export function tomlThreadConfigOverridesV1(tree: TomlTableV1, rootTables = false): Record<string, unknown> {
+  const value = (node: TomlDataValueV1): unknown => {
+    switch (node.type) {
+      case "string": case "boolean": return node.value;
+      case "integer": { const number = Number(node.value); if (!Number.isSafeInteger(number)) throw new Error("stock thread override integer is not JSON-safe"); return number; }
+      case "float": return Number(node.value);
+      case "datetime": return node.value;
+      case "array": return node.values.map(value);
+      case "inline-table": return Object.fromEntries(Object.entries(node.entries).map(([key, child]) => {
+        if (!isTomlDataValue(child)) throw new Error("unsupported stock inline policy");
+        return [key, value(child)];
+      }));
+      case "array-table": throw new Error("unsupported stock array policy");
+    }
+  };
+  if (rootTables) return Object.fromEntries(Object.entries(tree).map(([key, node]) => [key, value(inlineTomlOverrideValueV1(node))]));
+  return Object.fromEntries([...flattenTomlLeaves(tree).values()].map(({ path, value: node }) => {
+    if (!isTomlDataValue(node)) throw new Error("invalid stock thread policy");
+    return [renderTomlPath(path), value(node)];
+  }));
 }

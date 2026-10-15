@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { readFile as readFileAsync, readdir as readdirAsync, stat as statAsync } from "node:fs/promises";
 import {
   chmodSync,
   existsSync,
@@ -143,10 +144,12 @@ export interface RuntimeFingerprintEvidence {
 export function getWatcherHealth(
   userRoot: string,
   probeDependencies: WatcherHealthProbeDependencies = {},
+  observedRuntimeFingerprints?: RuntimeFingerprintSet,
+  effectiveConfig?: () => Record<string, unknown>,
 ): WatcherHealth {
   const checks: WatcherHealthCheck[] = [];
   const state = readJson<InstallerState>(join(userRoot, "state.json"));
-  const config = normalizeRuntimeConfig(readJson<RuntimeConfig & Record<string, unknown>>(join(userRoot, "config.json")) ?? {});
+  const config = normalizeRuntimeConfig(effectiveConfig ? effectiveConfig() : readJson<RuntimeConfig & Record<string, unknown>>(join(userRoot, "config.json")) ?? {});
   const selfUpdate = readJson<SelfUpdateState>(join(userRoot, "self-update-state.json"));
 
   checks.push({
@@ -206,7 +209,7 @@ export function getWatcherHealth(
     checks.push(watcherLogCheck());
   }
 
-  const runtime = classifyRuntimeFingerprints({
+  const runtime = classifyRuntimeFingerprints(observedRuntimeFingerprints ?? {
     generated: readRuntimeFingerprint(
       state.sourceRoot ? join(state.sourceRoot, "packages", "installer", "assets", "runtime") : "",
     ),
@@ -235,9 +238,31 @@ export function getAndPublishWatcherHealth(
   userRoot: string,
   probeDependencies: WatcherHealthProbeDependencies = {},
   publisherDependencies: WatcherHealthPublisherDependencies = {},
+  effectiveConfig?: () => Record<string, unknown>,
 ): WatcherHealth {
-  const health = getWatcherHealth(userRoot, probeDependencies);
-  publishWatcherHealthSnapshot(userRoot, health, publisherDependencies);
+  const health = getWatcherHealth(userRoot, probeDependencies, undefined, effectiveConfig);
+  if (!effectiveConfig) publishWatcherHealthSnapshot(userRoot, health, publisherDependencies);
+  return health;
+}
+
+/** Routine UI health avoids a synchronous walk of every runtime file. */
+export async function getAndPublishWatcherHealthAsync(
+  userRoot: string,
+  probeDependencies: WatcherHealthProbeDependencies = {},
+  publisherDependencies: WatcherHealthPublisherDependencies = {},
+  effectiveConfig?: () => Record<string, unknown>,
+): Promise<WatcherHealth> {
+  const state = readJson<InstallerState>(join(userRoot, "state.json"));
+  const roots = [
+    state?.sourceRoot ? join(state.sourceRoot, "packages", "installer", "assets", "runtime") : "",
+    join(userRoot, "managed-runtime", "current", "packages", "installer", "assets", "runtime"),
+    join(userRoot, "runtime"),
+  ];
+  const [generated, managed, active] = await Promise.all(roots.map(async (root) => (
+    (await readRuntimeFingerprintEvidenceAsync(root))?.fingerprint ?? null
+  )));
+  const health = getWatcherHealth(userRoot, probeDependencies, { generated, managed, active }, effectiveConfig);
+  if (!effectiveConfig) publishWatcherHealthSnapshot(userRoot, health, publisherDependencies);
   return health;
 }
 
@@ -593,7 +618,7 @@ function withWatcherRegistry(
   const repairPlist = join(launchdDirectory, `${LAUNCHD_LABEL}.plist`);
   const lifecycleStatus = readWatcherStatus(
     join(lifecycleDirectory, "codex-mcp-lifecycle-status.json"),
-    [1, 2],
+    [1, 2, 3],
     "v1",
     readJsonDocument,
   );
@@ -725,7 +750,7 @@ function lifecycleProbe(
     policyVersion: status.policyVersion,
     deferredReason: null,
     error: status.error,
-    supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2] : [3],
+    supportedStatusSchemas: label.endsWith("idle-reaper") ? [1, 2, 3] : [3],
     legacyStatusSchemaVersion: status.legacyStatusSchemaVersion,
   };
 }
@@ -772,7 +797,9 @@ function readWatcherStatus(
   const error = schemaVersion === null
     ? "status schema missing or invalid"
     : !supportedSchemas.includes(schemaVersion)
-      ? `unsupported status schema: ${schemaVersion}`
+      ? requireGuardV3 && schemaVersion === 1
+        ? "legacy Guard status schema 1 lacks the v3 observation-only authority contract; repair the Guard service"
+        : `unsupported status schema: ${schemaVersion}`
       : generatedAt === null
         ? "status timestamp missing or invalid"
         : !job || typeof jobOK !== "boolean"
@@ -928,6 +955,33 @@ function commandsMatch(plist: string, loadedCommand: string): boolean {
   return expected.length > 0 && (observed.includes(expected) || expected.includes(observed));
 }
 
+const runtimeFingerprintCache = new Map<string, { signature: string; actual: RuntimeFingerprintEvidence }>();
+const pendingRuntimeFingerprints = new Map<string, Promise<RuntimeFingerprintEvidence | null>>();
+
+export function readRuntimeFingerprintEvidenceAsync(root: string): Promise<RuntimeFingerprintEvidence | null> {
+  const pending = pendingRuntimeFingerprints.get(root);
+  if (pending) return pending;
+  const work = (async () => {
+    if (!root) return null;
+    const value = readJson<{ schemaVersion?: number; fingerprint?: unknown; fileCount?: unknown }>(join(root, RUNTIME_FINGERPRINT_FILE));
+    if (value?.schemaVersion !== 1 || typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/i.test(value.fingerprint)
+      || !Number.isInteger(value.fileCount) || Number(value.fileCount) < 0) return null;
+    try {
+      const signature = await runtimeSourceSignatureAsync(root);
+      const cached = runtimeFingerprintCache.get(root);
+      const actual = cached?.signature === signature ? cached.actual : await computeRuntimeFingerprintAsync(root);
+      if (await runtimeSourceSignatureAsync(root) !== signature) { runtimeFingerprintCache.delete(root); return null; }
+      const currentManifest = readJson<{ schemaVersion?: number; fingerprint?: unknown; fileCount?: unknown }>(join(root, RUNTIME_FINGERPRINT_FILE));
+      if (currentManifest?.schemaVersion !== value.schemaVersion || currentManifest?.fingerprint !== value.fingerprint || currentManifest?.fileCount !== value.fileCount) return null;
+      runtimeFingerprintCache.set(root, { signature, actual });
+      return actual.fingerprint === value.fingerprint && actual.fileCount === value.fileCount ? actual : null;
+    } catch { return null; }
+  })();
+  pendingRuntimeFingerprints.set(root, work);
+  void work.finally(() => { if (pendingRuntimeFingerprints.get(root) === work) pendingRuntimeFingerprints.delete(root); });
+  return work;
+}
+
 export function readRuntimeFingerprintEvidence(root: string): RuntimeFingerprintEvidence | null {
   if (!root) return null;
   const value = readJson<{ schemaVersion?: number; fingerprint?: unknown; fileCount?: unknown }>(
@@ -941,13 +995,58 @@ export function readRuntimeFingerprintEvidence(root: string): RuntimeFingerprint
     || Number(value.fileCount) < 0
   ) return null;
   try {
-    const actual = computeRuntimeFingerprint(root);
+    const signature = runtimeSourceSignature(root);
+    const cached = runtimeFingerprintCache.get(root);
+    const actual = cached?.signature === signature ? cached.actual : computeRuntimeFingerprint(root);
+    if (cached?.signature !== signature) {
+      if (runtimeSourceSignature(root) === signature) runtimeFingerprintCache.set(root, { signature, actual });
+      else runtimeFingerprintCache.delete(root);
+    }
     return actual.fingerprint === value.fingerprint && actual.fileCount === value.fileCount
       ? actual
       : null;
   } catch {
     return null;
   }
+}
+
+/** File identity changes invalidate the cache even when the runtime root mtime does not. */
+function runtimeSourceSignature(runtimeRoot: string): string {
+  const hash = createHash("sha256");
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === ".DS_Store") continue;
+      const path = join(directory, entry.name);
+      const name = relative(runtimeRoot, path);
+      if (name === RUNTIME_FINGERPRINT_FILE) continue;
+      if (entry.isDirectory()) walk(path);
+      else if (entry.isFile()) {
+        const stat = statSync(path);
+        hash.update(`${name}\0${stat.dev}\0${stat.ino}\0${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0`);
+      }
+    }
+  };
+  walk(runtimeRoot);
+  return hash.digest("hex");
+}
+
+async function runtimeSourceSignatureAsync(runtimeRoot: string): Promise<string> {
+  const hash = createHash("sha256");
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of (await readdirAsync(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === ".DS_Store") continue;
+      const path = join(directory, entry.name);
+      const name = relative(runtimeRoot, path);
+      if (name === RUNTIME_FINGERPRINT_FILE) continue;
+      if (entry.isDirectory()) await walk(path);
+      else if (entry.isFile()) {
+        const stat = await statAsync(path);
+        hash.update(`${name}\0${stat.dev}\0${stat.ino}\0${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0`);
+      }
+    }
+  };
+  await walk(runtimeRoot);
+  return hash.digest("hex");
 }
 
 function readRuntimeFingerprint(root: string): string | null {
@@ -980,6 +1079,29 @@ function computeRuntimeFingerprint(runtimeRoot: string): { fingerprint: string; 
   };
 
   walk(runtimeRoot);
+  return { fingerprint: hash.digest("hex"), fileCount };
+}
+
+async function computeRuntimeFingerprintAsync(runtimeRoot: string): Promise<RuntimeFingerprintEvidence> {
+  const hash = createHash("sha256");
+  let fileCount = 0;
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of (await readdirAsync(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === ".DS_Store") continue;
+      const path = join(directory, entry.name);
+      const name = relative(runtimeRoot, path);
+      if (name === RUNTIME_FINGERPRINT_FILE) continue;
+      if (entry.isDirectory()) await walk(path);
+      else if (entry.isFile()) {
+        fileCount += 1;
+        hash.update(name);
+        hash.update("\0");
+        hash.update(await readFileAsync(path));
+        hash.update("\0");
+      }
+    }
+  };
+  await walk(runtimeRoot);
   return { fingerprint: hash.digest("hex"), fileCount };
 }
 

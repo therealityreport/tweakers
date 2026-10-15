@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants,
   copyFileSync,
   existsSync,
   fsyncSync,
+  fstatSync,
   lstatSync,
   linkSync,
   mkdirSync,
@@ -14,6 +16,7 @@ import {
   realpathSync,
   unlinkSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -23,34 +26,41 @@ import {
   readCodexDerivedReceipt,
   type CodexDerivedReceipt,
   type CodexRustLifecycleTestEvidence,
+  type CodexBackendClosureEvidence,
+  type CodexGeneratedRuntimeEvidence,
+  type SignatureEvidence,
 } from "../codex-derived-receipt.js";
 import { CODEX_RELEASE_REPOSITORY, parseCodexReleaseTag } from "../codex-source-release.js";
 import { assertInternalStoragePath } from "../internal-storage.js";
-import type { AcceptedPrebuiltCodexBuildReceipt, PrebuiltCodexArchitecture } from "../prebuilt-combined-candidate.js";
+import { canonicalTweakersManagerRoot } from "../manager-descriptor.js";
+import { assertAcceptedBackendClosure, readAcceptedBuildReceipt, type AcceptedPrebuiltCodexBuildReceipt, type PrebuiltCodexArchitecture } from "../prebuilt-combined-candidate.js";
+import { signatureInfo, verifyCodeModeHostSigningPosture, verifySignature } from "../codesign.js";
+import { readRuntimeFingerprintEvidence, RUNTIME_FINGERPRINT_FILE } from "../runtime-fingerprint.js";
 import {
   CODEX_SOURCE_BUILD_COMMAND,
   CODEX_SOURCE_RUST_TEST_COMMAND,
   codexSourceTransactionPaths,
+  readPreparedSourceCandidate,
+  CODEX_SOURCE_REQUIRED_RUST_TESTS,
+  inspectRustSourceIdentity,
 } from "./codex-source.js";
+
+import { qualifiedRustShape, revalidateQualifiedRustTests, parseExactRustProof, verifyV8BuildInputs } from "../qualified-rust-evidence.js";
 
 const CODEX_GIT_URL = "https://github.com/openai/codex.git" as const;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const TRANSACTION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 
-const REQUIRED_RUST_LIFECYCLE_TESTS = [
-  "connection_manager::tests::deferred_shutdown_does_not_ignite_never_started_servers",
-  "connection_manager::tests::cancelled_startup_never_reaches_the_transport",
-  "connection_manager::tests::shutdown_continues_after_caller_is_aborted",
-  "connection_manager::tests::capture_binding_exposes_cached_tools_before_startup",
-  "connection_manager::tests::cancelling_startup_does_not_disable_a_ready_client",
-  "connection_manager::tests::shutdown_cancels_pending_tool_listing",
-] as const;
+const REQUIRED_RUST_LIFECYCLE_TESTS = CODEX_SOURCE_REQUIRED_RUST_TESTS;
 
 export type CodexBuildAttestationAction = "review" | "accept";
 
 export interface CodexBuildAttestationCliOptions {
   transaction?: string;
+  sourceCandidatePath?: string;
+  sourceCandidate?: string;
+  "source-candidate"?: string;
   derivedReceipt?: string;
   "derived-receipt"?: string;
   reviewManifest?: string;
@@ -69,10 +79,8 @@ export interface CodexBuildReviewManifest {
     uid: number;
     username: string;
   };
-  derivedReceipt: {
-    path: string;
-    sha256: string;
-  };
+  buildEvidence: { kind: "prepared-source" | "frozen-derived"; path: string; sha256: string };
+  verification: AcceptedPrebuiltCodexBuildReceipt["verification"];
   upstream: {
     repository: typeof CODEX_GIT_URL;
     tag: string;
@@ -101,7 +109,10 @@ export interface CodexBuildReviewManifest {
     sha256: string;
     version: string;
     architecture: PrebuiltCodexArchitecture;
+    signature: SignatureEvidence;
   };
+  closure: CodexBackendClosureEvidence;
+  runtime: CodexGeneratedRuntimeEvidence;
 }
 
 export interface CodexBuildReviewTestReceipt {
@@ -170,12 +181,23 @@ export interface CodexBuildAttestationDependencies {
   probeBinaryVersion(path: string): string;
   probeBinaryArchitecture(path: string): PrebuiltCodexArchitecture | null;
   probeToolchain(): { rustc: string; cargo: string };
+  probeSignature(path: string): SignatureEvidence | null;
+  verifyCodeModeHostPosture(path: string): boolean;
+  /** Fixed durable authority root; only deterministic fixtures override this. */
+  canonicalAcceptedAuthorityUserRoot(): string;
   /** Test-only deterministic fault seam; production never supplies it. */
   fault?(point: string): void;
 }
 
+type AttestedBuildEvidence = Pick<CodexDerivedReceipt,
+  "source" | "candidateBinary" | "rustLifecycleTests" | "backendClosure" | "generatedRuntime" | "version"> & {
+    resolution: Pick<CodexDerivedReceipt["resolution"], "peeledCommit" | "normalizedVersion" | "resolvedTag" | "checkpoints">;
+    canary?: CodexDerivedReceipt["canary"];
+  };
+
 interface InspectedBuild {
-  receipt: CodexDerivedReceipt;
+  evidenceKind: CodexBuildReviewManifest["buildEvidence"]["kind"];
+  verification: CodexBuildReviewManifest["verification"];
   receiptPath: string;
   receiptSha256: string;
   transactionId: string;
@@ -184,12 +206,17 @@ interface InspectedBuild {
   source: CodexBuildReviewManifest["source"];
   build: CodexBuildReviewManifest["build"];
   binary: CodexBuildReviewManifest["binary"];
+  closure: CodexBackendClosureEvidence;
+  runtime: CodexGeneratedRuntimeEvidence;
   rustEvidenceBytes: Buffer;
-  canaryEvidenceBytes: Buffer;
+  canaryEvidenceBytes: Buffer | null;
 }
 
 interface AttestationPaths {
+  /** The original receipt-derived source root, never the authority destination. */
   userRoot: string;
+  authorityUserRoot: string;
+  durableAuthority: boolean;
   transactionRoot: string;
   evidenceRoot: string;
   rustEvidence: string;
@@ -211,6 +238,14 @@ const defaultDependencies: CodexBuildAttestationDependencies = {
     rustc: execFileSync("rustc", ["-vV"], { encoding: "utf8", timeout: 10_000 }),
     cargo: execFileSync("cargo", ["-V"], { encoding: "utf8", timeout: 10_000 }),
   }),
+  probeSignature: path => {
+    const identity = signatureInfo(path);
+    if (!identity.ok || !verifySignature(path).ok) return null;
+    return { identity: identity.authority[0] ?? (identity.adHoc ? "ad-hoc" : "local identity"),
+      teamIdentifier: identity.teamIdentifier, designatedRequirement: null };
+  },
+  verifyCodeModeHostPosture: verifyCodeModeHostSigningPosture,
+  canonicalAcceptedAuthorityUserRoot: canonicalTweakersManagerRoot,
 };
 
 export function codexBuildAttestation(
@@ -223,10 +258,12 @@ export function codexBuildAttestation(
   const result = action === "review"
     ? reviewCodexBuild({
         transactionId: requireOption(options.transaction, "--transaction"),
-        derivedReceiptPath: requireOption(
-          options.derivedReceipt ?? options["derived-receipt"],
-          "--derived-receipt",
-        ),
+        ...(options.sourceCandidatePath ?? options.sourceCandidate ?? options["source-candidate"] ? {
+          sourceCandidatePath: options.sourceCandidatePath ?? options.sourceCandidate ?? options["source-candidate"],
+        } : {}),
+        ...(options.derivedReceipt ?? options["derived-receipt"] ? {
+          derivedReceiptPath: options.derivedReceipt ?? options["derived-receipt"],
+        } : {}),
       }, deps)
     : acceptCodexBuild({
         reviewManifestPath: requireOption(
@@ -243,19 +280,29 @@ export function codexBuildAttestation(
 }
 
 export function reviewCodexBuild(
-  input: { transactionId: string; derivedReceiptPath: string },
+  input: { transactionId: string; derivedReceiptPath?: string; sourceCandidatePath?: string;
+    /** Internal issuance option; not a source relocation or a CLI-selected root. */
+    acceptedAuthorityUserRoot?: string },
   dependencyOverrides: Partial<CodexBuildAttestationDependencies> = {},
 ): CodexBuildReviewResult {
   const deps = { ...defaultDependencies, ...dependencyOverrides };
   requireTransactionId(input.transactionId);
-  const receiptPath = requireExactInternalFile(input.derivedReceiptPath, "Derived build receipt");
-  const paths = attestationPathsForReceipt(receiptPath, input.transactionId);
-  ensureOwnerPrivateDirectory(paths.transactionRoot, deps);
-  ensureOwnerPrivateDirectory(paths.evidenceRoot, deps);
+  if (Boolean(input.derivedReceiptPath) === Boolean(input.sourceCandidatePath)) {
+    throw new Error("Build review requires exactly one derived receipt or prepared source candidate");
+  }
+  const receiptPath = requireExactInternalFile(input.derivedReceiptPath ?? input.sourceCandidatePath!, "Build evidence");
+  const authorityRoot = input.acceptedAuthorityUserRoot === undefined ? undefined
+    : requireCanonicalAcceptedAuthorityUserRoot(input.acceptedAuthorityUserRoot, deps);
+  const paths = attestationPathsForReceipt(receiptPath, input.transactionId, authorityRoot);
+  if (authorityRoot !== undefined && authorityRoot === paths.userRoot) {
+    throw new Error("Explicit durable authority requires a distinct source root; same-root issuance uses the default flow");
+  }
+  ensureAttestationDirectory(paths, paths.transactionRoot, deps);
+  ensureAttestationDirectory(paths, paths.evidenceRoot, deps);
   const inspected = inspectDerivedBuild(receiptPath, input.transactionId, paths, deps);
 
-  writeImmutableFile(paths.rustEvidence, inspected.rustEvidenceBytes, 0o600, deps, "rust-evidence");
-  writeImmutableFile(paths.canaryEvidence, inspected.canaryEvidenceBytes, 0o600, deps, "canary-evidence");
+  writeImmutableFile(paths.rustEvidence, inspected.rustEvidenceBytes, 0o600, deps, "rust-evidence", paths);
+  if (inspected.canaryEvidenceBytes) writeImmutableFile(paths.canaryEvidence, inspected.canaryEvidenceBytes, 0o600, deps, "canary-evidence", paths);
   const tests = reviewTestReceipts(paths, inspected);
 
   let reviewedAt = deps.now();
@@ -270,7 +317,7 @@ export function reviewCodexBuild(
   }
   const manifest = createReviewManifest(inspected, tests, reviewedAt);
   const bytes = jsonBytes(manifest);
-  writeImmutableFile(paths.reviewManifest, bytes, 0o600, deps, "review-manifest");
+  writeImmutableFile(paths.reviewManifest, bytes, 0o600, deps, "review-manifest", paths);
   const persisted = readReviewManifest(paths.reviewManifest);
   if (!isDeepStrictEqual(persisted, manifest)) {
     throw new Error("Existing review manifest conflicts with the freshly verified build evidence");
@@ -298,20 +345,17 @@ export function acceptCodexBuild(
     throw new Error("Release-owner acceptance is not bound to the exact reviewed manifest SHA-256");
   }
   const manifest = readReviewManifest(manifestPath);
-  const paths = attestationPathsForReceipt(manifest.derivedReceipt.path, manifest.transactionId);
-  if (manifestPath !== paths.reviewManifest) {
-    throw new Error("Build review manifest is outside its derived transaction acceptance directory");
-  }
-  ensureOwnerPrivateDirectory(paths.transactionRoot, deps);
-  ensureOwnerPrivateDirectory(paths.evidenceRoot, deps);
+  const paths = attestationPathsForManifest(manifestPath, manifest, deps);
+  ensureAttestationDirectory(paths, paths.transactionRoot, deps);
+  ensureAttestationDirectory(paths, paths.evidenceRoot, deps);
   const owner = currentOwner(deps);
   if (!isDeepStrictEqual(manifest.owner, owner)) {
     throw new Error("Build review manifest belongs to a different local release owner");
   }
 
-  const inspected = inspectDerivedBuild(manifest.derivedReceipt.path, manifest.transactionId, paths, deps);
-  writeImmutableFile(paths.rustEvidence, inspected.rustEvidenceBytes, 0o600, deps, "rust-evidence");
-  writeImmutableFile(paths.canaryEvidence, inspected.canaryEvidenceBytes, 0o600, deps, "canary-evidence");
+  const inspected = inspectDerivedBuild(manifest.buildEvidence.path, manifest.transactionId, paths, deps);
+  writeImmutableFile(paths.rustEvidence, inspected.rustEvidenceBytes, 0o600, deps, "rust-evidence", paths);
+  if (inspected.canaryEvidenceBytes) writeImmutableFile(paths.canaryEvidence, inspected.canaryEvidenceBytes, 0o600, deps, "canary-evidence", paths);
   const expectedManifest = createReviewManifest(
     inspected,
     reviewTestReceipts(paths, inspected),
@@ -321,7 +365,13 @@ export function acceptCodexBuild(
     throw new Error("Build evidence changed after the reviewed manifest was issued");
   }
 
-  copyImmutableFile(inspected.binary.sourcePath, paths.acceptedBinary, 0o700, deps, "accepted-binary");
+  copyImmutableFile(inspected.binary.sourcePath, paths.acceptedBinary, 0o700, deps, "accepted-binary", paths);
+  copyImmutableFile(inspected.closure.codeModeHost.path, join(paths.transactionRoot, "codex-code-mode-host"), 0o700, deps, "accepted-helper", paths);
+  for (const resource of inspected.closure.resources) {
+    const destination = join(paths.transactionRoot, "resources", resource.relativePath);
+    ensureAttestationDirectory(paths, dirname(destination), deps);
+    copyImmutableFile(resource.sourcePath, destination, 0o600, deps, "accepted-resource", paths);
+  }
   if (sha256File(paths.acceptedBinary) !== inspected.binary.sha256
     || deps.probeBinaryVersion(paths.acceptedBinary) !== inspected.binary.version
     || deps.probeBinaryArchitecture(paths.acceptedBinary) !== "arm64") {
@@ -336,7 +386,12 @@ export function acceptCodexBuild(
     throw new Error("Acceptance timestamp cannot be in the future");
   }
   const acceptedReceipt = createAcceptedReceipt(manifest, acceptedAt);
-  writeImmutableFile(paths.acceptedReceipt, jsonBytes(acceptedReceipt), 0o600, deps, "accepted-receipt");
+  assertAcceptedBackendClosure(acceptedReceipt, {
+    probeArchitecture: deps.probeBinaryArchitecture,
+    verifyBackendSignature: (path, expected) => isDeepStrictEqual(deps.probeSignature(path), expected),
+    verifyCodeModeHostPosture: deps.verifyCodeModeHostPosture,
+  });
+  writeImmutableFile(paths.acceptedReceipt, jsonBytes(acceptedReceipt), 0o600, deps, "accepted-receipt", paths);
   const persistedAccepted = readAcceptedReceipt(paths.acceptedReceipt);
   if (!isDeepStrictEqual(persistedAccepted, acceptedReceipt)) {
     throw new Error("Existing accepted-build receipt conflicts with the exact reviewed manifest");
@@ -357,7 +412,7 @@ export function acceptCodexBuild(
       architecture: "arm64",
     },
   };
-  writeImmutableFile(paths.acceptanceRecord, jsonBytes(acceptanceRecord), 0o600, deps, "acceptance-record");
+  writeImmutableFile(paths.acceptanceRecord, jsonBytes(acceptanceRecord), 0o600, deps, "acceptance-record", paths);
   const persistedRecord = readJsonFile(paths.acceptanceRecord, "Acceptance record") as unknown;
   if (!isDeepStrictEqual(persistedRecord, acceptanceRecord)) {
     throw new Error("Existing acceptance record conflicts with the exact reviewed decision");
@@ -385,15 +440,41 @@ function inspectDerivedBuild(
   paths: AttestationPaths,
   deps: CodexBuildAttestationDependencies,
 ): InspectedBuild {
-  const exactReceipt = requireExactInternalFile(receiptPath, "Derived build receipt");
-  const readable = readCodexDerivedReceipt(exactReceipt);
-  if (!readable || readable.schemaVersion !== CODEX_DERIVED_RECEIPT_SCHEMA_VERSION) {
-    throw new Error("Accepted-build review requires a schema-v2 codex-derived receipt");
-  }
-  const receipt = readable;
-  if (receipt.transactionId !== transactionId || receipt.phase !== "canary-passed"
-    || receipt.channel !== "bundled" || receipt.error !== null || receipt.supersededBy !== null) {
-    throw new Error("Derived build is not the exact green, frozen bundled transaction requested for review");
+  const exactReceipt = requireExactInternalFile(receiptPath, "Build evidence");
+  const sourcePaths = codexSourceTransactionPaths(paths.userRoot, transactionId);
+  const preparedSource = exactReceipt === sourcePaths.candidateStateFile;
+  let receipt: AttestedBuildEvidence;
+  let frozenReceipt: CodexDerivedReceipt | undefined;
+  let expectedBinary: string;
+  let expectedHelper: string;
+  if (preparedSource) {
+    const candidate = readPreparedSourceCandidate(exactReceipt, transactionId);
+    if (candidate.channel !== "bundled" || candidate.sourceRoot !== sourcePaths.sourceRoot
+      || !candidate.evidence.compiledBackend || candidate.cycle.checkpoints.length !== 2) {
+      throw new Error("Source review requires the exact canonical bundled R1/R2 compiled transaction");
+    }
+    const r2 = candidate.cycle.checkpoints[1]!;
+    receipt = { ...candidate.evidence, version: r2.normalizedVersion,
+      resolution: { ...r2, checkpoints: candidate.cycle.checkpoints } };
+    expectedBinary = join(sourcePaths.sourceRoot, "codex-rs", "target", "release", "codex");
+    expectedHelper = join(sourcePaths.sourceRoot, "codex-rs", "target", "release", "codex-code-mode-host");
+    if (candidate.evidence.compiledBackend.binaryPath !== expectedBinary
+      || candidate.evidence.compiledBackend.codeModeHostPath !== expectedHelper) {
+      throw new Error("Compiled output paths are outside the canonical source transaction");
+    }
+  } else {
+    const readable = readCodexDerivedReceipt(exactReceipt);
+    if (!readable || readable.schemaVersion !== CODEX_DERIVED_RECEIPT_SCHEMA_VERSION) {
+      throw new Error("Accepted-build review requires a schema-v2 codex-derived receipt");
+    }
+    if (readable.transactionId !== transactionId || readable.phase !== "canary-passed"
+      || readable.channel !== "bundled" || readable.error !== null || readable.supersededBy !== null) {
+      throw new Error("Derived build is not the exact green, frozen bundled transaction requested for review");
+    }
+    receipt = readable;
+    frozenReceipt = readable;
+    expectedBinary = join(sourcePaths.candidateApp, "Contents", "Resources", "codex");
+    expectedHelper = join(sourcePaths.candidateApp, "Contents", "Resources", "codex-code-mode-host");
   }
   if (receipt.source.repository !== CODEX_RELEASE_REPOSITORY
     || receipt.source.checkoutCommit !== receipt.resolution.peeledCommit
@@ -410,7 +491,6 @@ function inspectDerivedBuild(
     throw new Error("Derived build release identity changed across R1, R2, or R3");
   }
 
-  const sourcePaths = codexSourceTransactionPaths(paths.userRoot, transactionId);
   const sourceRoot = requireExactInternalDirectory(sourcePaths.sourceRoot, "Patched Codex source checkout");
   if (deps.git(["remote", "get-url", "origin"], sourceRoot).trim() !== CODEX_GIT_URL) {
     throw new Error("Patched source checkout does not use the exact official OpenAI Codex repository URL");
@@ -452,6 +532,14 @@ function inspectDerivedBuild(
     || receipt.source.patchSeriesDigest.scope !== "patch series") {
     throw new Error("Derived receipt lacks the exact reviewed patch-series hash");
   }
+  if (!Array.isArray(receipt.source.patchSeriesFiles)) throw new Error("Build evidence lacks exact ordered patch inputs");
+  const patchHash = createHash("sha256");
+  for (const [index, patch] of receipt.source.patchSeriesFiles.entries()) {
+    const file = requireExactInternalFile(patch.path, "Reviewed patch input");
+    if (sha256File(file) !== patch.sha256) throw new Error("Reviewed patch input changed after compilation");
+    patchHash.update(String(index)).update("\0").update(readFileSync(file)).update("\0");
+  }
+  if (patchHash.digest("hex") !== receipt.source.patchSeriesDigest.value) throw new Error("Reviewed patch-series bytes differ from build evidence");
   const cargoLockPath = requireExactInternalFile(join(sourceRoot, "codex-rs", "Cargo.lock"), "Cargo.lock");
   const cargoLockSha256 = sha256File(cargoLockPath);
   const lockDigest = exactNamedSha256(receipt.source.lockfileDigests, "Cargo.lock", "Cargo.lock");
@@ -467,14 +555,13 @@ function inspectDerivedBuild(
   }
   const toolchainText = `rustc:\n${toolchain.rustc.trim()}\n\ncargo:\n${toolchain.cargo.trim()}`;
 
-  const expectedBinary = join(sourcePaths.candidateApp, "Contents", "Resources", "codex");
   const binaryPath = requireExactInternalFile(expectedBinary, "Frozen source-derived backend");
-  if (!receipt.canary || receipt.canary.candidatePath !== binaryPath) {
+  if (!preparedSource && (!receipt.canary || receipt.canary.candidatePath !== binaryPath)) {
     throw new Error("Derived canary is not bound to the frozen source-derived backend path");
   }
   const binarySha256 = sha256File(binaryPath);
   const candidateDigest = exactNamedSha256(receipt.candidateBinary.digests, "derived candidate binary", "Candidate binary");
-  if (candidateDigest !== binarySha256 || receipt.canary.candidateSha256 !== binarySha256) {
+  if (candidateDigest !== binarySha256 || (!preparedSource && receipt.canary?.candidateSha256 !== binarySha256)) {
     throw new Error("Frozen backend hash differs across the receipt, canary, and file");
   }
   const binaryVersion = deps.probeBinaryVersion(binaryPath);
@@ -486,12 +573,55 @@ function inspectDerivedBuild(
     || receipt.candidateBinary.platform !== "darwin") {
     throw new Error("Frozen backend is not the exact arm64 macOS build recorded by the derived receipt");
   }
+  const binarySignature = deps.probeSignature(binaryPath);
+  if (!binarySignature || !isDeepStrictEqual(binarySignature, receipt.candidateBinary.signature)) {
+    throw new Error("Frozen backend signature differs from the derived receipt");
+  }
+  const closure = receipt.backendClosure;
+  if (!closure || closure.codeModeHost.path !== expectedHelper
+    || exactNamedSha256(receipt.candidateBinary.digests, "derived candidate code-mode helper", "Code-mode helper") !== closure.codeModeHost.sha256) {
+    throw new Error("Derived receipt lacks the exact backend/helper resource closure");
+  }
+  assertAcceptedBackendClosure({ binary: { path: binaryPath, sha256: binarySha256, signature: binarySignature,
+    version: binaryVersion, architecture }, closure }, {
+    probeArchitecture: deps.probeBinaryArchitecture,
+    verifyBackendSignature: (path, expected) => isDeepStrictEqual(deps.probeSignature(path), expected),
+    verifyCodeModeHostPosture: deps.verifyCodeModeHostPosture,
+  });
+  const runtime = receipt.generatedRuntime;
+  if (!runtime || !isDeepStrictEqual(readRuntimeFingerprintEvidence(runtime.sourceRoot), { fingerprint: runtime.fingerprint, fileCount: runtime.fileCount })
+    || sha256File(requireExactInternalFile(join(runtime.sourceRoot, RUNTIME_FINGERPRINT_FILE), "Generated runtime fingerprint")) !== runtime.documentSha256) {
+    throw new Error("Derived receipt lacks exact verified generated runtime evidence");
+  }
 
   const rustEvidence = assertRustEvidence(receipt.rustLifecycleTests, receipt, binarySha256);
-  const canaryEvidenceBytes = assertCanaryEvidence(receipt, binaryPath, binarySha256);
+  if (rustEvidence.schemaVersion === 2) {
+    if (!preparedSource || rustEvidence.origin.userRoot !== paths.userRoot
+      || rustEvidence.origin.transactionId === transactionId || !receipt.source.v8BuildInputs) throw new Error("Qualified Rust origin requires canonical source successor and V8 evidence");
+    const sourceIdentity = inspectRustSourceIdentity(sourceRoot, receipt.source.patchSeriesFiles!.map(f => f.path), (args, cwd) => deps.git(args, cwd!));
+    const original = revalidateQualifiedRustTests({ userRoot: paths.userRoot,
+      reuse: { transactionId: rustEvidence.origin.transactionId, acceptQualificationSha256: rustEvidence.origin.qualification.sha256 },
+      source: sourceIdentity, rustc: toolchain.rustc, command: CODEX_SOURCE_RUST_TEST_COMMAND,
+      requiredTests: CODEX_SOURCE_REQUIRED_RUST_TESTS,
+      inspectPriorSource: root => inspectRustSourceIdentity(root, receipt.source.patchSeriesFiles!.map(f => f.path), (args, cwd) => deps.git(args, cwd!)) });
+    if (rustEvidence.origin.qualification.path !== original.reference.path
+      || !isDeepStrictEqual(rustEvidence.origin.timing, original.qualification.timing)
+      || !isDeepStrictEqual(rustEvidence.origin.priorToolchain, original.qualification.priorToolchain)
+      || !isDeepStrictEqual(rustEvidence.origin.observations, original.qualification.observations)
+      || rustEvidence.stdoutSha256 !== original.qualification.logs.stdout.sha256
+      || rustEvidence.stderrSha256 !== original.qualification.logs.stderr.sha256
+      || !isDeepStrictEqual(rustEvidence.passedTests, original.passedTests)) throw new Error("Qualified origin projection drifted");
+  }
+  if (receipt.source.v8BuildInputs) {
+    const actual = verifyV8BuildInputs({ verificationPath: receipt.source.v8BuildInputs.verification.path,
+      acceptVerificationSha256: receipt.source.v8BuildInputs.verification.sha256 }, sourceRoot, receipt.source.checkoutCommit, deps.git);
+    if (!isDeepStrictEqual(actual, receipt.source.v8BuildInputs)) throw new Error("V8 release dependency closure drifted");
+  }
+  const canaryEvidenceBytes = preparedSource ? null : assertCanaryEvidence(frozenReceipt!, binaryPath, binarySha256);
   const owner = currentOwner(deps);
   return {
-    receipt,
+    evidenceKind: preparedSource ? "prepared-source" : "frozen-derived",
+    verification: { level: preparedSource ? "source-verified" : "isolated-canary", installedAcceptance: "required" },
     receiptPath: exactReceipt,
     receiptSha256: sha256File(exactReceipt),
     transactionId,
@@ -519,7 +649,10 @@ function inspectDerivedBuild(
       sha256: binarySha256,
       version: binaryVersion,
       architecture: "arm64",
+      signature: binarySignature,
     },
+    closure,
+    runtime,
     rustEvidenceBytes: jsonBytes(rustEvidence),
     canaryEvidenceBytes,
   };
@@ -527,17 +660,17 @@ function inspectDerivedBuild(
 
 function assertRustEvidence(
   evidence: CodexRustLifecycleTestEvidence | undefined,
-  receipt: CodexDerivedReceipt,
+  receipt: AttestedBuildEvidence,
   binarySha256: string,
 ): CodexRustLifecycleTestEvidence {
-  if (!evidence || evidence.schemaVersion !== 1 || evidence.kind !== "codex-rust-lifecycle-tests"
+  if (!evidence || (evidence.schemaVersion !== 1 && !qualifiedRustShape(evidence)) || evidence.kind !== "codex-rust-lifecycle-tests"
     || evidence.sourceCommit !== receipt.source.checkoutCommit
     || evidence.patchedTreeSha256 !== receipt.source.treeDigest.value
     || evidence.cargoLockSha256 !== exactNamedSha256(receipt.source.lockfileDigests, "Cargo.lock", "Cargo.lock")
     || JSON.stringify(evidence.command) !== JSON.stringify(CODEX_SOURCE_RUST_TEST_COMMAND)
     || evidence.exitCode !== 0 || evidence.candidateBinarySha256 !== binarySha256
-    || !validTimestamp(evidence.startedAt) || !validTimestamp(evidence.completedAt)
-    || Date.parse(evidence.startedAt) > Date.parse(evidence.completedAt)
+    || (evidence.schemaVersion === 1 && (!validTimestamp(evidence.startedAt) || !validTimestamp(evidence.completedAt)
+      || Date.parse(evidence.startedAt) > Date.parse(evidence.completedAt)))
     || REQUIRED_RUST_LIFECYCLE_TESTS.some((name) => !evidence.passedTests.includes(name))) {
     throw new Error("Derived receipt lacks complete successful Rust lifecycle test evidence");
   }
@@ -546,6 +679,12 @@ function assertRustEvidence(
   if (sha256File(stdout) !== evidence.stdoutSha256 || sha256File(stderr) !== evidence.stderrSha256) {
     throw new Error("Rust lifecycle test output changed after the derived build was frozen");
   }
+  const observedPassed = [...`${readFileSync(stdout, "utf8")}\n${readFileSync(stderr, "utf8")}`
+    .matchAll(/^test\s+([^\s]+)\s+\.\.\.\s+ok\s*$/gm)].map(match => match[1]!);
+  if (REQUIRED_RUST_LIFECYCLE_TESTS.some(name => !observedPassed.includes(name))) {
+    throw new Error("Rust test logs do not report all required backend isolation and lifecycle proofs");
+  }
+  if (evidence.schemaVersion === 2) parseExactRustProof(readFileSync(stdout, "utf8"), readFileSync(stderr, "utf8"), REQUIRED_RUST_LIFECYCLE_TESTS);
   return evidence;
 }
 
@@ -594,12 +733,15 @@ function createReviewManifest(
     transactionId: inspected.transactionId,
     reviewedAt,
     owner: inspected.owner,
-    derivedReceipt: { path: inspected.receiptPath, sha256: inspected.receiptSha256 },
+    buildEvidence: { kind: inspected.evidenceKind, path: inspected.receiptPath, sha256: inspected.receiptSha256 },
+    verification: inspected.verification,
     upstream: inspected.upstream,
     source: inspected.source,
     build: inspected.build,
     tests,
     binary: inspected.binary,
+    closure: inspected.closure,
+    runtime: inspected.runtime,
   };
 }
 
@@ -612,13 +754,13 @@ function reviewTestReceipts(paths: AttestationPaths, inspected: InspectedBuild):
       sha256: sha256File(paths.rustEvidence),
       status: "passed",
     },
-    {
-      name: "managed MCP integration canary",
+    ...(inspected.canaryEvidenceBytes ? [{
+      name: "managed MCP integration canary" as const,
       command: `tweaker codex-source canary-pass --transaction-id ${inspected.transactionId}`,
       path: paths.canaryEvidence,
       sha256: sha256File(paths.canaryEvidence),
-      status: "passed",
-    },
+      status: "passed" as const,
+    }] : []),
   ];
 }
 
@@ -627,15 +769,26 @@ function createAcceptedReceipt(
   acceptedAt: string,
 ): AcceptedPrebuiltCodexBuildReceipt {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "tweakers-prebuilt-codex-build",
     status: "accepted",
     acceptedAt,
+    upstream: manifest.upstream,
+    verification: manifest.verification,
+    closure: {
+      ...manifest.closure,
+      codeModeHost: { ...manifest.closure.codeModeHost, path: join(dirname(manifest.binary.acceptedPath), "codex-code-mode-host") },
+      resources: manifest.closure.resources.map(resource => ({ ...resource,
+        sourcePath: join(dirname(manifest.binary.acceptedPath), "resources", resource.relativePath),
+      })),
+    },
+    runtime: manifest.runtime,
     source: {
       commit: manifest.upstream.commit,
       tree: manifest.source.treeSha256,
       cargoLockSha256: manifest.source.cargoLockSha256,
       reviewedDiffSha256: manifest.source.reviewedDiffSha256,
+      patchSeriesSha256: manifest.source.patchSeriesSha256,
     },
     build: {
       command: manifest.build.command,
@@ -653,27 +806,30 @@ function createAcceptedReceipt(
       sha256: manifest.binary.sha256,
       version: manifest.binary.version,
       architecture: "arm64",
+      signature: manifest.binary.signature,
     },
   };
 }
 
-function attestationPathsForReceipt(receiptPath: string, transactionId: string): AttestationPaths {
+function attestationPathsForReceipt(receiptPath: string, transactionId: string, authorityUserRoot?: string): AttestationPaths {
   requireTransactionId(transactionId);
   const exactReceipt = resolve(receiptPath);
-  if (!isAbsolute(receiptPath) || exactReceipt !== receiptPath
-    || basename(exactReceipt) !== `${transactionId}.json`
-    || basename(dirname(exactReceipt)) !== "receipts"
-    || basename(dirname(dirname(exactReceipt))) !== "codex-source") {
-    throw new Error("Derived receipt must use the canonical codex-source receipt path for its transaction");
+  const prepared = basename(exactReceipt) === "candidate.json";
+  const userRoot = prepared ? dirname(dirname(dirname(dirname(exactReceipt)))) : dirname(dirname(dirname(exactReceipt)));
+  const expected = prepared ? codexSourceTransactionPaths(userRoot, transactionId).candidateStateFile
+    : join(userRoot, "codex-source", "receipts", `${transactionId}.json`);
+  if (!isAbsolute(receiptPath) || exactReceipt !== receiptPath || exactReceipt !== expected) {
+    throw new Error("Build evidence must use the canonical codex-source path for its transaction");
   }
-  const userRoot = dirname(dirname(dirname(exactReceipt)));
   if (basename(userRoot) === "codex-plusplus") {
     throw new Error("New accepted-build authority cannot be issued from the archived codex-plusplus data root");
   }
-  const transactionRoot = join(userRoot, "codex-source", "accepted", transactionId);
+  const transactionRoot = join(authorityUserRoot ?? userRoot, "codex-source", "accepted", transactionId);
   const evidenceRoot = join(transactionRoot, "test-evidence");
   return {
     userRoot,
+    authorityUserRoot: authorityUserRoot ?? userRoot,
+    durableAuthority: authorityUserRoot !== undefined,
     transactionRoot,
     evidenceRoot,
     rustEvidence: join(evidenceRoot, "rust-lifecycle.json"),
@@ -683,6 +839,74 @@ function attestationPathsForReceipt(receiptPath: string, transactionId: string):
     acceptedReceipt: join(transactionRoot, "accepted-build.json"),
     acceptanceRecord: join(transactionRoot, "acceptance.json"),
   };
+}
+
+function attestationPathsForManifest(manifestPath: string, manifest: CodexBuildReviewManifest,
+  deps: CodexBuildAttestationDependencies): AttestationPaths {
+  const original = attestationPathsForReceipt(manifest.buildEvidence.path, manifest.transactionId);
+  if (manifestPath === original.reviewManifest) return original;
+  const authorityRoot = requireCanonicalAcceptedAuthorityUserRoot(deps.canonicalAcceptedAuthorityUserRoot(), deps);
+  const durable = attestationPathsForReceipt(manifest.buildEvidence.path, manifest.transactionId, authorityRoot);
+  if (manifestPath !== durable.reviewManifest) {
+    throw new Error("Build review manifest is outside its source-default or canonical durable acceptance directory");
+  }
+  return durable;
+}
+
+function requireCanonicalAcceptedAuthorityUserRoot(root: string, deps: CodexBuildAttestationDependencies): string {
+  if (!isAbsolute(root) || resolve(root) !== root || root !== deps.canonicalAcceptedAuthorityUserRoot()) {
+    throw new Error("Accepted authority requires the exact canonical Tweakers Manager root");
+  }
+  assertInternalStoragePath(root, "Durable accepted authority");
+  // The installed Manager root must already exist. Do not create or chmod its
+  // ancestors, and reject a linked or foreign-owned chain before allocation.
+  let ancestor = root;
+  const uid = deps.effectiveUid();
+  if (uid === null) throw new Error("Accepted authority owner is unavailable");
+  for (;;) {
+    const status = lstatSync(ancestor);
+    if (!status.isDirectory() || status.isSymbolicLink() || realpathSync(ancestor) !== ancestor
+      || (status.uid !== uid && status.uid !== 0)) {
+      throw new Error("Durable accepted authority ancestor is linked, noncanonical or foreign-owned");
+    }
+    if (ancestor === root && (status.uid !== uid || (status.mode & 0o077) !== 0)) {
+      throw new Error("Durable accepted authority root must already be owner-private");
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  return root;
+}
+
+function ensureAttestationDirectory(paths: AttestationPaths, path: string, deps: CodexBuildAttestationDependencies): void {
+  if (!paths.durableAuthority) return ensureOwnerPrivateDirectory(path, deps);
+  requireCanonicalAcceptedAuthorityUserRoot(paths.authorityUserRoot, deps);
+  const suffix = relative(paths.authorityUserRoot, path);
+  if (!suffix || suffix.startsWith("..") || isAbsolute(suffix)) throw new Error("Durable attestation directory escaped its authority root");
+  const components = suffix.split("/");
+  const uid = deps.effectiveUid();
+  const directories = components.map((_, index) => join(paths.authorityUserRoot, ...components.slice(0, index + 1)));
+  const validate = (directory: string) => {
+    const status = lstatSync(directory);
+    if (!status.isDirectory() || status.isSymbolicLink() || realpathSync(directory) !== directory
+      || status.uid !== uid || (status.mode & 0o077) !== 0) {
+      throw new Error("Durable attestation ancestor must be an unlinked owner-private directory");
+    }
+  };
+  // Validate every existing descendant before creating any missing directory.
+  for (const directory of directories) {
+    try { validate(directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  for (const directory of directories) {
+    validate(dirname(directory));
+    if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
+    validate(directory);
+  }
 }
 
 function ensureOwnerPrivateDirectory(path: string, deps: CodexBuildAttestationDependencies): void {
@@ -723,7 +947,9 @@ function writeImmutableFile(
   mode: number,
   deps: CodexBuildAttestationDependencies,
   faultLabel: string,
+  paths: AttestationPaths,
 ): void {
+  if (paths.durableAuthority) ensureAttestationDirectory(paths, dirname(path), deps);
   assertInternalStoragePath(path, "Immutable build attestation artifact");
   if (existsSync(path)) {
     const status = lstatSync(path);
@@ -737,15 +963,21 @@ function writeImmutableFile(
     return;
   }
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  const authority = paths.durableAuthority ? retainDurableTemporaryAuthority(paths, temporary, deps) : null;
   let descriptor: number | null = null;
+  let succeeded = false;
   try {
     descriptor = openSync(temporary, "wx", mode);
+    authority?.bindTemporary(descriptor);
     writeFileSync(descriptor, bytes);
     fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = null;
+    if (!authority) {
+      closeSync(descriptor);
+      descriptor = null;
+    }
     chmodSync(temporary, mode);
     deps.fault?.(`${faultLabel}:after-temp-fsync`);
+    authority?.assertCurrent();
     try {
       linkSync(temporary, path);
     } catch (error) {
@@ -753,11 +985,18 @@ function writeImmutableFile(
     }
     fsyncDirectory(dirname(path));
     assertOwnerPrivateFile(path, deps, "Published immutable artifact");
+    succeeded = true;
   } finally {
-    if (descriptor !== null) {
-      try { closeSync(descriptor); } catch { /* best-effort cleanup after the primary failure */ }
+    try {
+      // Durable temporaries remain private evidence, including on success.
+      // There is no pathname delete sink after validation or rejection.
+      if (!authority && succeeded && existsSync(temporary)) unlinkSync(temporary);
+    } finally {
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* keep the primary failure */ }
+      }
+      authority?.close();
     }
-    if (existsSync(temporary)) unlinkSync(temporary);
   }
 }
 
@@ -767,7 +1006,9 @@ function copyImmutableFile(
   mode: number,
   deps: CodexBuildAttestationDependencies,
   faultLabel: string,
+  paths: AttestationPaths,
 ): void {
+  if (paths.durableAuthority) ensureAttestationDirectory(paths, dirname(destination), deps);
   const exactSource = requireExactInternalFile(source, "Reviewed backend source");
   if (existsSync(destination)) {
     requireExactInternalFile(destination, "Accepted backend");
@@ -778,12 +1019,21 @@ function copyImmutableFile(
     return;
   }
   const temporary = join(dirname(destination), `.${basename(destination)}.${process.pid}.${Date.now()}.tmp`);
+  const authority = paths.durableAuthority ? retainDurableTemporaryAuthority(paths, temporary, deps) : null;
+  let descriptor: number | null = null;
+  let succeeded = false;
   try {
     copyFileSync(exactSource, temporary, 1);
     chmodSync(temporary, mode);
-    const descriptor = openSync(temporary, "r");
-    try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    descriptor = openSync(temporary, authority ? constants.O_RDONLY | constants.O_NOFOLLOW : "r");
+    authority?.bindTemporary(descriptor);
+    fsyncSync(descriptor);
+    if (!authority) {
+      closeSync(descriptor);
+      descriptor = null;
+    }
     deps.fault?.(`${faultLabel}:after-temp-fsync`);
+    authority?.assertCurrent();
     try {
       linkSync(temporary, destination);
     } catch (error) {
@@ -791,8 +1041,73 @@ function copyImmutableFile(
     }
     fsyncDirectory(dirname(destination));
     assertOwnerPrivateFile(destination, deps, "Published accepted backend");
+    succeeded = true;
   } finally {
-    if (existsSync(temporary)) unlinkSync(temporary);
+    try {
+      if (!authority && succeeded && existsSync(temporary)) unlinkSync(temporary);
+    } finally {
+      if (descriptor !== null) {
+        try { closeSync(descriptor); } catch { /* keep the primary failure */ }
+      }
+      authority?.close();
+    }
+  }
+}
+
+/** Retain original directory and temporary identities through publication; close without deletion. */
+function retainDurableTemporaryAuthority(paths: AttestationPaths, temporary: string,
+  deps: CodexBuildAttestationDependencies): {
+    bindTemporary(descriptor: number): void; assertCurrent(): void; close(): void;
+  } {
+  const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+  const rootDescriptor = openSync(paths.authorityUserRoot, directoryFlags);
+  let parentDescriptor: number | null = null;
+  try {
+    parentDescriptor = openSync(dirname(temporary), directoryFlags);
+    const retainedParent = parentDescriptor;
+    const rootIdentity = fstatSync(rootDescriptor);
+    const parentIdentity = fstatSync(retainedParent);
+    let temporaryDescriptor: number | null = null;
+    let temporaryIdentity: Stats | null = null;
+    const same = (observed: Stats, expected: Stats) => observed.dev === expected.dev
+      && observed.ino === expected.ino && observed.uid === expected.uid;
+    const assertDirectory = (path: string, descriptor: number, expected: Stats) => {
+      const observed = lstatSync(path);
+      if (!observed.isDirectory() || observed.isSymbolicLink() || !same(observed, expected)
+        || !same(fstatSync(descriptor), expected)) throw new Error("Durable publication directory identity changed");
+    };
+    const assertCurrent = () => {
+      // Check identities first: no allocation may occur in a replacement tree.
+      assertDirectory(paths.authorityUserRoot, rootDescriptor, rootIdentity);
+      assertDirectory(dirname(temporary), retainedParent, parentIdentity);
+      ensureAttestationDirectory(paths, dirname(temporary), deps);
+      if (temporaryDescriptor !== null && temporaryIdentity) {
+        const observed = lstatSync(temporary);
+        if (!observed.isFile() || observed.isSymbolicLink() || !same(observed, temporaryIdentity)
+          || !same(fstatSync(temporaryDescriptor), temporaryIdentity)
+          || observed.uid !== deps.effectiveUid() || (observed.mode & 0o077) !== 0) {
+          throw new Error("Durable publication temporary identity changed");
+        }
+      }
+    };
+    assertCurrent();
+    return {
+      bindTemporary(descriptor) {
+        temporaryDescriptor = descriptor;
+        temporaryIdentity = fstatSync(descriptor);
+        assertCurrent();
+      },
+      assertCurrent,
+      close() {
+        for (const descriptor of [retainedParent, rootDescriptor]) {
+          try { closeSync(descriptor); } catch { /* keep the primary failure */ }
+        }
+      },
+    };
+  } catch (error) {
+    if (parentDescriptor !== null) { try { closeSync(parentDescriptor); } catch { /* keep the primary failure */ } }
+    try { closeSync(rootDescriptor); } catch { /* keep the primary failure */ }
+    throw error;
   }
 }
 
@@ -801,8 +1116,11 @@ function readReviewManifest(path: string): CodexBuildReviewManifest {
   if (!isRecord(value) || value.schemaVersion !== 1 || value.kind !== "tweakers-codex-build-review"
     || !TRANSACTION_ID_RE.test(String(value.transactionId)) || !validTimestamp(value.reviewedAt)
     || !isRecord(value.owner) || !Number.isSafeInteger(value.owner.uid) || typeof value.owner.username !== "string"
-    || !isRecord(value.derivedReceipt) || typeof value.derivedReceipt.path !== "string"
-    || !SHA256_RE.test(String(value.derivedReceipt.sha256))
+    || !isRecord(value.buildEvidence) || typeof value.buildEvidence.path !== "string"
+    || !["prepared-source", "frozen-derived"].includes(String(value.buildEvidence.kind))
+    || !SHA256_RE.test(String(value.buildEvidence.sha256))
+    || !isRecord(value.verification) || value.verification.installedAcceptance !== "required"
+    || value.verification.level !== (value.buildEvidence.kind === "prepared-source" ? "source-verified" : "isolated-canary")
     || !isRecord(value.upstream) || value.upstream.repository !== CODEX_GIT_URL
     || typeof value.upstream.tag !== "string" || typeof value.upstream.commit !== "string"
     || !isRecord(value.source) || !isRecord(value.build) || !Array.isArray(value.tests)
@@ -813,14 +1131,7 @@ function readReviewManifest(path: string): CodexBuildReviewManifest {
 }
 
 function readAcceptedReceipt(path: string): AcceptedPrebuiltCodexBuildReceipt {
-  const value = readJsonFile(path, "Accepted-build receipt");
-  if (!isRecord(value) || value.schemaVersion !== 1 || value.kind !== "tweakers-prebuilt-codex-build"
-    || value.status !== "accepted" || !validTimestamp(value.acceptedAt)
-    || !isRecord(value.source) || !isRecord(value.build) || !Array.isArray(value.tests)
-    || !isRecord(value.binary)) {
-    throw new Error("Accepted-build receipt schema is invalid");
-  }
-  return value as unknown as AcceptedPrebuiltCodexBuildReceipt;
+  return readAcceptedBuildReceipt(path, new Date("9999-12-31T23:59:59.999Z"));
 }
 
 function existingAcceptedAt(path: string): string | null {

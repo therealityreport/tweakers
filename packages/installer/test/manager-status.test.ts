@@ -555,7 +555,25 @@ test("status retains historical desktop-update records for diagnostics without a
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("status releases only a proven pre-refresh Tweakers quiescence conflict for a fresh retry", () => {
+test("only exact timing-backed prepublication failures release a legacy operation", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-manager-prepublication-"));
+  const operationId = "018f0d36-4c08-7a3e-9c1d-123456789abf";
+  try {
+    const store = new ManagerOperationStore(root);
+    const phases = { ...refreshTimingDetail().phases };
+    for (const phase of ["source-validation", "quiesce-promote", "runtime-ready-wait"] as const) {
+      phases[phase] = { state: "skipped", startedAt: null, completedAt: null, durationMs: null, reason: "Not reached." };
+    }
+    const timing: ManagerRefreshTimingEvidenceV1 = { schemaVersion: 1, phases };
+    const record = { ...recoveryRequiredIndependentRefreshRecord(operationId, "Copied candidate artifact changed: runtime"), timing };
+    store.create(record);
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, null);
+    store.replace({ ...record, error: `${record.error}\nCause: rollback failed` });
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, operationId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("legacy refresh diagnostics and unrelated recovered journals remain unresolved", () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-manager-status-"));
   const operationId = "018f0d36-4c08-7a3e-9c1d-123456789abf";
   try {
@@ -582,8 +600,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(retryable.status.operations.activeOperationId, null);
-    assert.equal(retryable.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(retryable.status.operations.activeOperationId, operationId);
+    assert.equal(retryable.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
     assert.equal(store.read(operationId)?.phase, "recovery-required", "status must preserve the diagnostic record");
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
@@ -594,8 +612,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(missingPackagedRuntime.status.operations.activeOperationId, null);
-    assert.equal(missingPackagedRuntime.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(missingPackagedRuntime.status.operations.activeOperationId, operationId);
+    assert.equal(missingPackagedRuntime.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -605,8 +623,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(missingSealedLoader.status.operations.activeOperationId, null);
-    assert.equal(missingSealedLoader.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(missingSealedLoader.status.operations.activeOperationId, operationId);
+    assert.equal(missingSealedLoader.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -616,8 +634,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(rolledBackLegacyRuntimeReadyTimeout.status.operations.activeOperationId, null);
-    assert.equal(rolledBackLegacyRuntimeReadyTimeout.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(rolledBackLegacyRuntimeReadyTimeout.status.operations.activeOperationId, operationId);
+    assert.equal(rolledBackLegacyRuntimeReadyTimeout.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -627,8 +645,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(rolledBackRuntimeReadyTimeout.status.operations.activeOperationId, null);
-    assert.equal(rolledBackRuntimeReadyTimeout.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(rolledBackRuntimeReadyTimeout.status.operations.activeOperationId, operationId);
+    assert.equal(rolledBackRuntimeReadyTimeout.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -638,8 +656,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(redundantManagerRepublish.status.operations.activeOperationId, null);
-    assert.equal(redundantManagerRepublish.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(redundantManagerRepublish.status.operations.activeOperationId, operationId);
+    assert.equal(redundantManagerRepublish.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -649,8 +667,27 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(clearedBackendEvidence.status.operations.activeOperationId, null);
-    assert.equal(clearedBackendEvidence.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(clearedBackendEvidence.status.operations.activeOperationId, operationId);
+    assert.equal(clearedBackendEvidence.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
+
+    store.replace(recoveryRequiredIndependentRefreshRecord(
+      operationId,
+      "Canonical manager official ChatGPT officialVersion does not match the revalidated app",
+    ));
+    const reconciledRegisteredVersion = createTweakersManagerStatusSnapshot({
+      ...statusInput(root),
+      enabledActionIds: ["refresh.independent"],
+    }, fixedDependencies());
+    assert.equal(reconciledRegisteredVersion.status.operations.activeOperationId, operationId);
+    assert.equal(reconciledRegisteredVersion.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
+
+    store.replace(recoveryRequiredIndependentRefreshRecord(operationId,
+      "Canonical manager official ChatGPT does not match the sealed registered source"));
+    const downloadedSourceMismatch = createTweakersManagerStatusSnapshot({
+      ...statusInput(root), enabledActionIds: ["refresh.independent"],
+    }, fixedDependencies());
+    assert.equal(downloadedSourceMismatch.status.operations.activeOperationId, operationId);
+    assert.equal(downloadedSourceMismatch.actions.find(action => action.actionId === "refresh.independent")?.available, false);
 
     store.replace(recoveryRequiredIndependentRefreshRecord(
       operationId,
@@ -673,8 +710,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(recoveredRollback.status.operations.activeOperationId, null);
-    assert.equal(recoveredRollback.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(recoveredRollback.status.operations.activeOperationId, operationId);
+    assert.equal(recoveredRollback.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     writeFixture(join(root, "variants", "tweakers", "runtime-ready.json"), JSON.stringify({
       schemaVersion: 3,
@@ -685,8 +722,8 @@ test("status releases only a proven pre-refresh Tweakers quiescence conflict for
       ...statusInput(root),
       enabledActionIds: ["refresh.independent"],
     }, fixedDependencies());
-    assert.equal(laterRuntimeReadyReceipt.status.operations.activeOperationId, null);
-    assert.equal(laterRuntimeReadyReceipt.actions.find((action) => action.actionId === "refresh.independent")?.available, true);
+    assert.equal(laterRuntimeReadyReceipt.status.operations.activeOperationId, operationId);
+    assert.equal(laterRuntimeReadyReceipt.actions.find((action) => action.actionId === "refresh.independent")?.available, false);
 
     writeFixture(join(root, "variants", "tweakers", "runtime-ready.json"), JSON.stringify({
       schemaVersion: 3,
@@ -966,7 +1003,7 @@ test("Accounts recovery preflight failure releases only an entirely unstarted op
   try {
     const store = new ManagerOperationStore(root);
     const record = recoveryRequiredIndependentRefreshRecord(id, "Independent Tweakers refresh requires a source-bound validated Accounts recovery receipt in the sealed runtime.");
-    const timing = refreshTimingDetail();
+    const timing = { ...refreshTimingDetail(), phases: { ...refreshTimingDetail().phases } };
     for (const key of Object.keys(timing.phases) as Array<keyof typeof timing.phases>) timing.phases[key] = { state: "skipped", startedAt: null, completedAt: null, durationMs: null, reason: "No phase started." };
     store.create({ ...record, timing });
     const path = join(store.paths.root, `${id}.json`);
@@ -982,13 +1019,13 @@ test("Accounts recovery preflight failure releases only an entirely unstarted op
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("candidate copy failure permits retry only with proven unstarted cutover", () => {
+for (const failure of ["Copied candidate artifact changed", "Refusing variant promotion while the exact Tweakers target app or helper process is running."]) test(`precutover failure permits retry only with proven unstarted cutover: ${failure}`, () => {
   const root = mkdtempSync(join(tmpdir(), "tweakers-manager-copy-"));
   const id = "018f0d36-4c08-7a3e-9c1d-123456789abd";
   try {
     const store = new ManagerOperationStore(root);
-    const record = recoveryRequiredIndependentRefreshRecord(id, "Copied candidate artifact changed");
-    const timing = refreshTimingDetail();
+    const record = recoveryRequiredIndependentRefreshRecord(id, failure);
+    const timing = { ...refreshTimingDetail(), phases: { ...refreshTimingDetail().phases } };
     for (const key of Object.keys(timing.phases) as Array<keyof typeof timing.phases>) timing.phases[key] = { state: "skipped", startedAt: null, completedAt: null, durationMs: null, reason: "No phase started." };
     timing.phases["patch-stage"] = { state: "failed", startedAt: "2026-09-16T20:00:00.000Z", completedAt: "2026-09-16T20:00:00.000Z", durationMs: 0, reason: null };
     store.create({ ...record, timing });
@@ -1001,4 +1038,62 @@ test("candidate copy failure permits retry only with proven unstarted cutover", 
     store.replace({ ...record });
     assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.activeOperationId, id);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("retained Manager history crosses 64 records without invalidating its own prepared action", () => {
+  const root = mkdtempSync(join(tmpdir(), "tweakers-manager-history-"));
+  try {
+    const store = new ManagerOperationStore(root);
+    const id = (index: number) => `018f0d36-4c08-7a3e-9c1d-${String(index).padStart(12, "0")}`;
+    const terminal = (index: number): TweakersManagerPreparedOperationV1 => ({
+      ...consumedEnvironmentCancelRecord(id(index)), phase: "cancelled", consumedAt: null,
+      cancelledAt: NOW, completedAt: null, outcome: "cancelled", error: null,
+    });
+    for (let index = 1; index <= 64; index++) store.create(terminal(index));
+    const original = directorySnapshot(root);
+    const before = createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies());
+    assert.equal(before.status.operations.state, "valid");
+    const next = { ...terminal(65), phase: "prepared" as const, cancelledAt: null, outcome: null };
+    store.create(next);
+    const during = createTweakersManagerStatusSnapshot({ ...statusInput(root), excludeOperationId: next.operationId }, fixedDependencies());
+    assert.equal(during.stateToken, before.stateToken, "own publication is the sole excluded input, including at the old count boundary");
+    const visible = createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies());
+    assert.equal(visible.status.operations.state, "valid");
+    assert.equal(visible.status.operations.activeOperationId, next.operationId);
+    store.replace(terminal(65));
+    const completed = createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies());
+    assert.equal(completed.status.operations.state, "valid");
+    assert.equal(completed.status.operations.activeOperationId, null);
+    assert.notEqual(completed.stateToken, before.stateToken, "retained terminal history still participates in the token");
+    for (const [path, value] of original) assert.deepEqual(directorySnapshot(root).find(row => row[0] === path), [path, value]);
+    writeFileSync(store.file(id(65)), "{malformed");
+    assert.equal(createTweakersManagerStatusSnapshot(statusInput(root), fixedDependencies()).status.operations.state, "malformed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("retained Manager history remains bounded before record reads", () => {
+  const root = "/virtual/tweakers-history-limit", paths = managerStatusPaths(root);
+  let operationReads = 0;
+  const snapshot = createTweakersManagerStatusSnapshot(statusInput(root), {
+    ...fixedDependencies(),
+    readDirectory: path => path === paths.managerOperationRoot
+      ? { state: "present", entries: Array.from({ length: 1025 }, (_, i) => `018f0d36-4c08-7a3e-9c1d-${String(i).padStart(12, "0")}.json`) }
+      : { state: "missing" },
+    readText: path => { if (path.startsWith(paths.managerOperationRoot + "/")) operationReads++; return { state: "missing" }; },
+  });
+  assert.equal(snapshot.status.operations.state, "malformed");
+  assert.match(snapshot.status.operations.problem ?? "", /maximum 1024/);
+  assert.equal(operationReads, 0);
+});
+
+
+test("retained Manager history does not hide an invalid filename when no operation is excluded", () => {
+  const root = "/virtual/tweakers-history-name", paths = managerStatusPaths(root);
+  const snapshot = createTweakersManagerStatusSnapshot(statusInput(root), {
+    ...fixedDependencies(), readText: () => ({ state: "missing" }),
+    readDirectory: path => path === paths.managerOperationRoot ? { state: "present", entries: ["undefined.json"] } : { state: "missing" },
+  });
+  assert.equal(snapshot.status.operations.state, "malformed");
+  assert.match(snapshot.status.operations.problem ?? "", /filename is invalid/);
 });

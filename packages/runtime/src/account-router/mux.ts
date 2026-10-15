@@ -1750,7 +1750,7 @@ export class AccountRouterMux {
       jsonrpc: "2.0",
       id: `quota:${child.opaqueAccountId}:${++this.quotaProbeNonce}`,
       method: kind === "account" ? "account/read" : "account/rateLimits/read",
-      params: {},
+      params: kind === "account" ? {} : null,
     };
     try {
       const issued = this.dispatchToChild(request, child, { quotaProbe: kind, scope: `quota-${kind}` });

@@ -51,9 +51,37 @@ const normalLaunch = !healthCheckOnly && !runOriginalMainDuringHealth;
 const pairedOriginalMainHealthLaunch = healthCheckOnly
   && runOriginalMainDuringHealth
   && validHealthUserRoot;
+const acceptanceConfig = process.env.TWEAKERS_ACCEPTANCE_CONFIG_FILE;
+// A launch-only settings override never changes the packaged data-root binding.
+// Reject it before optional-overlay recovery could continue a native launch.
+if (acceptanceConfig !== undefined) validateAcceptanceConfigLaunch();
 let runtimeInitialized = false;
 let runtimeBootstrapError = null;
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
+
+function validateAcceptanceConfigLaunch() {
+  const reject = () => { throw new Error("Acceptance configuration launch is invalid"); };
+  if (!normalLaunch || !independentTweakers || !userRoot || !acceptanceConfig
+    || !path.isAbsolute(userRoot) || path.resolve(userRoot) !== userRoot
+    || !path.isAbsolute(acceptanceConfig) || path.resolve(acceptanceConfig) !== acceptanceConfig) reject();
+  const parts = path.relative(path.join(userRoot, "acceptance"), acceptanceConfig).split(/[\\/]/);
+  if (parts.length !== 2 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parts[0])
+    || parts[1] !== "config.json") reject();
+  const uid = process.getuid && process.getuid();
+  if (uid === undefined || fs.constants.O_NOFOLLOW === undefined) reject();
+  for (const [index, directory] of [userRoot, path.join(userRoot, "acceptance"), path.dirname(acceptanceConfig)].entries()) {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid
+      || fs.realpathSync(directory) !== directory || (index > 0 && (stat.mode & 0o777) !== 0o700)) reject();
+  }
+  const fd = fs.openSync(acceptanceConfig, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd);
+    const named = fs.lstatSync(acceptanceConfig);
+    if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600
+      || stat.size > 1024 * 1024 || named.isSymbolicLink() || stat.dev !== named.dev || stat.ino !== named.ino) reject();
+  } finally { fs.closeSync(fd); }
+}
 
 function isIndependentTweakersBundle() {
   // productName is rewritten inside app.asar and remains available even when
@@ -208,6 +236,7 @@ safe("init", () => {
     Module.globalPaths.push(path.join(runtimeDir, "node_modules"));
     process.env.TWEAKERS_USER_ROOT = userRoot;
     process.env.TWEAKERS_RUNTIME = runtimeDir;
+    if (acceptanceConfig !== undefined) process.env.TWEAKERS_ACCEPTANCE_CONFIG_FILE = acceptanceConfig;
     // Legacy aliases remain for already-patched Tweaker installs.
     process.env.TWEAKER_USER_ROOT = userRoot;
     process.env.TWEAKER_RUNTIME = runtimeDir;
@@ -239,6 +268,29 @@ if (normalLaunch && independentTweakers && !runtimeInitialized) {
 } else if (normalLaunch || (pairedOriginalMainHealthLaunch && runtimeInitialized)) {
   if (normalLaunch && !independentTweakers && !runtimeInitialized) {
     showChatGPTOverlayUnavailable();
+  }
+  // Current vendor builds resolve a nested CodexCLI.app. Keep a registered
+  // legacy backend when present; supplied-native packages use the nested file.
+  // Bind after runtime initialization, before vendor modules cache CLI paths.
+  if (independentTweakers && typeof process.resourcesPath === "string") {
+    let backend;
+    for (const relative of ["codex", path.join("codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex")]) {
+      const candidate = path.join(process.resourcesPath, relative);
+      let stat;
+      try { stat = fs.lstatSync(candidate); }
+      catch (error) { if (error.code === "ENOENT") continue; throw error; }
+      if (!stat.isFile() || stat.isSymbolicLink()
+        || fs.realpathSync(candidate) !== path.join(fs.realpathSync(process.resourcesPath), relative)) {
+        throw new Error("Independent Tweakers registered backend is unavailable");
+      }
+      backend = candidate;
+      break;
+    }
+    if (!backend) throw new Error("Independent Tweakers registered backend is unavailable");
+    process.env.CODEX_CLI_PATH = backend;
+    Object.defineProperty(globalThis, "__tweakersVerifiedBackendPathV1", {
+      value: backend, writable: false, configurable: false,
+    });
   }
   require("./" + originalMain);
 }

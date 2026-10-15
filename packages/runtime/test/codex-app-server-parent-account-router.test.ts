@@ -13,6 +13,7 @@ import {
   buildAccountsBrokerBlockedArgs,
   ACCOUNTS_BROKER_IDENTITY_FD_ENV,
   ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS,
+  ACCOUNTS_STARTUP_POLICY_ENV,
   CODEX_APP_SERVER_PARENT_SOURCE,
   installCodexAppServerParent,
   resolveAccountsAuthorityMode,
@@ -35,9 +36,99 @@ import { createInitialRouterState } from "../src/account-router/state-store";
 import { ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, type RouterConfig, type RouterConfigV2, type RouterConfigV3 } from "../src/account-router/types";
 import { publishHistoryAdoptionEvidence } from "./account-router/history-adoption-fixtures";
 import { readBrokerDesktopIdentityBootstrap } from "../src/account-router/broker-app-server";
+import { createStartupPolicyAuthorization, createStartupPolicyHandshake } from "../src/account-router/startup-policy";
+import { DESKTOP_APP_TOOLS_CONTEXT_ENV, parseDesktopAppToolsContext } from "../src/account-router/desktop-app-tools";
 
 const accountA = `ar_${"A".repeat(43)}`;
 const accountB = `ar_${"B".repeat(43)}`;
+
+test("broker desktop captures its own complete native MCP at spawn and strips inherited context", () => {
+  const staged = stagedBrokerConfig();
+  const command = "/Applications/Tweakers.app/Contents/Resources/codex";
+  const captured: Array<{ child: ChildProcess; context: unknown }> = [];
+  const calls: Array<{ args: unknown; options: any }> = [];
+  const childProcess: MutableChildProcessModule = { spawn: ((_command, args, options) => {
+    calls.push({ args, options }); return new EventEmitter() as ChildProcess;
+  }) as SpawnFunction };
+  const manifest = { mcpServers: { codex_app: {
+    command: "./scripts/launch_codex_app_tools_mcp", args: ["./server.mjs"], cwd: ".", enabled: false,
+    default_tools_approval_mode: "approve", tools: { create_thread: { approval_mode: "prompt" } },
+    env_vars: ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_BROWSER_USE_NODE_PATH", "CODEX_ELECTRON_RESOURCES_PATH", "CODEX_CLI_PATH"],
+  } } };
+  const installation = installCodexAppServerParent({ childProcess,
+    onDesktopAppToolsContext: (child, context) => { captured.push({ child, context }); },
+    resourcesPath: "/Applications/Tweakers.app/Contents/Resources", platform: "darwin", pathExists: () => true,
+    readDesktopAppToolsManifest: () => JSON.stringify(manifest),
+    accountRouter: { configPath: staged.configPath, brokerRoot: dirname(staged.configPath),
+      brokerEntrypointPath: "/private/runtime/broker-app-server.js", pathExists: () => true,
+      resolveBrokerDesktopIdentity: () => ({ rendererRef: `br_${"a".repeat(43)}`, appToolsRef: `bt_${"b".repeat(43)}` }) },
+  });
+  try {
+    for (const pipe of [undefined, "/private/tmp/desktop-1.sock", "/private/tmp/desktop-2.sock"]) {
+      childProcess.spawn(command, ["app-server", "-c", 'mcp_servers."codex_app".enabled=true', "-c", 'mcp_servers.context7.enabled=true'], { stdio: "pipe", env: {
+        [DESKTOP_APP_TOOLS_CONTEXT_ENV]: "forged", ...(pipe ? { CODEX_APP_TOOLS_PIPE_PATH: pipe } : {}),
+      } });
+      const env = calls.at(-1)!.options.env;
+      assert.deepEqual(calls.at(-1)!.args, buildAccountsBrokerAppServerArgs("/private/runtime/broker-app-server.js", staged.configPath,
+        command, ["app-server", "-c", 'mcp_servers.context7.enabled=true']));
+      if (!pipe) assert.equal(env[DESKTOP_APP_TOOLS_CONTEXT_ENV], undefined);
+      else {
+        const context = parseDesktopAppToolsContext(env[DESKTOP_APP_TOOLS_CONTEXT_ENV]);
+        assert.equal(context.definition.env.CODEX_APP_TOOLS_PIPE_PATH, pipe);
+        assert.equal(context.definition.enabled, true);
+        assert.deepEqual(context.definition.tools, manifest.mcpServers.codex_app.tools);
+        assert.deepEqual(captured.at(-1)!.context, context, "main signer receives the exact broker handshake context");
+      }
+    }
+    assert.throws(() => childProcess.spawn(command, ["app-server"], { stdio: "pipe", env: { CODEX_APP_TOOLS_PIPE_PATH: "relative" } }), /unavailable/);
+    assert.equal(calls.length, 3, "invalid native pipe fails before a bridge is spawned");
+    assert.equal(captured.length, 2, "absent and invalid pipes never create signing context");
+  } finally { installation.uninstall(); }
+});
+
+test("startup parent replaces inherited authority only during the main-owned broker scope", () => {
+  const staged = stagedBrokerConfig();
+  const handshake = createStartupPolicyHandshake(Buffer.alloc(32, 3), createStartupPolicyAuthorization("parent-startup-session-1"));
+  for (const [secondaryVariant, active] of [[true, true], [true, false], [false, true]]) {
+    const calls: Array<{ args: unknown; options: any }> = [];
+    let callbacks = 0;
+    const childProcess: MutableChildProcessModule = { spawn: ((_command, args, options) => {
+      calls.push({ args, options }); return new EventEmitter() as ChildProcess;
+    }) as SpawnFunction };
+    const installation = installCodexAppServerParent({
+      childProcess, resourcesPath: "/Applications/Tweakers.app/Contents/Resources", platform: "darwin", pathExists: () => true,
+      secondaryVariant,
+      startupPolicyHandshake: () => { callbacks++; return active ? handshake : null; },
+      accountRouter: { configPath: staged.configPath, brokerRoot: dirname(staged.configPath), brokerEntrypointPath: "/private/runtime/broker-app-server.js", pathExists: () => true },
+    });
+    try {
+      childProcess.spawn("/usr/local/bin/codex", ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"], { stdio: "pipe", env: { [ACCOUNTS_STARTUP_POLICY_ENV]: "forged-inherited-authority", [DESKTOP_APP_TOOLS_CONTEXT_ENV]: "forged-inherited-context" } });
+      const options = calls[0]!.options;
+      assert.equal(options.env[DESKTOP_APP_TOOLS_CONTEXT_ENV], undefined);
+      assert.equal(callbacks, secondaryVariant ? 1 : 0);
+      if (secondaryVariant && active) {
+        assert.deepEqual(JSON.parse(options.env[ACCOUNTS_STARTUP_POLICY_ENV]), handshake);
+        assert.equal(options.stdio, "pipe");
+        assert.equal(options.env[ACCOUNTS_BROKER_IDENTITY_FD_ENV], undefined);
+      } else {
+        assert.equal(options.env[ACCOUNTS_STARTUP_POLICY_ENV], undefined);
+        assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe", "pipe"]);
+        assert.equal(options.env[ACCOUNTS_BROKER_IDENTITY_FD_ENV], "3");
+      }
+    } finally { installation.uninstall(); }
+  }
+});
+
+test("startup parent refuses a direct backend fallback before spawning", () => {
+  let spawned = false;
+  const childProcess: MutableChildProcessModule = { spawn: (() => { spawned = true; return {} as ChildProcess; }) as SpawnFunction };
+  const installation = installCodexAppServerParent({ childProcess, resourcesPath: "/present", platform: "darwin", pathExists: () => true,
+    secondaryVariant: true, startupPolicyHandshake: () => createStartupPolicyHandshake(Buffer.alloc(32, 3), createStartupPolicyAuthorization("no-fallback-session-1")) });
+  try {
+    assert.throws(() => childProcess.spawn("/usr/local/bin/codex", ["app-server"], { stdio: "pipe" }), /authenticated shared broker/);
+    assert.equal(spawned, false);
+  } finally { installation.uninstall(); }
+});
 
 function opaque(secret: Buffer, raw: string): `ar_${string}` {
   return `ar_${createHmac("sha256", secret).update(`account-router:v1:${raw}`, "utf8").digest("base64url")}`;

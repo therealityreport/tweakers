@@ -31,6 +31,7 @@ function emptyState() {
 }
 
 function finiteNumber(value) {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
   const number = typeof value === "number" ? value : Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -73,9 +74,11 @@ function accountsContextWithinByteBound(value) {
 function safeAccountContextLabel(value) {
   if (typeof value !== "string") return null;
   const compact = value.replace(/\s+/g, " ").trim().slice(0, 80);
-  // Accounts labels are presentation-only. Reject values that could contain
-  // credentials or an email identity before Usage Tracker retains them.
-  if (!compact || /(?:bearer|token|cookie|credential|password|secret|@)/i.test(compact)) return null;
+  // Accounts may present a masked email as the subscription label. Keep that
+  // recognizable label in renderer memory, but reject an unmasked address.
+  const maskedEmail = /^[A-Za-z0-9]{1,3}[•*]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(compact);
+  if (!compact || /(?:bearer|token|cookie|credential|password|secret)/i.test(compact)
+    || (compact.includes("@") && !maskedEmail)) return null;
   return compact;
 }
 
@@ -383,7 +386,10 @@ function recordObservation(inputState, rawObservation, now = new Date(), context
 
   const next = cloneState(state);
   const previous = previousEntry?.last || null;
-  const change = isConfirmedReset(previous, observation);
+  // Painted native cards do not establish subscription ownership. A different
+  // account can replace the same card; that must never manufacture a reset.
+  const change = observation.key.startsWith("native-unattributed:")
+    ? { confirmed: false } : isConfirmedReset(previous, observation);
   const pendingUsedAt = Date.parse(state.resetCredits.pendingUsedAt || "");
   const observedAt = Date.parse(observation.observedAt);
   const usedCredit = context.usedCredit || (Number.isFinite(pendingUsedAt) && Number.isFinite(observedAt)
@@ -523,9 +529,59 @@ function observationFromElement(element, now = new Date()) {
   }, now);
 }
 
+const NATIVE_USAGE_PROGRESS = 'progress[aria-label="Usage remaining"], progress[aria-label="Monthly usage remaining"]';
+const OWNED_USAGE_CONTENT = '[data-tweakers-usage-settings], [data-tweakers-usage-account-selector], [data-tweakers-analytics-observed-resets], [data-tweaker-usage-reset]';
+
+function nativeProgressObservation(progress, now = new Date()) {
+  if (!progress?.matches?.(NATIVE_USAGE_PROGRESS)
+    || progress.closest?.(`${OWNED_USAGE_CONTENT}, [hidden], [aria-hidden="true"]`)) return null;
+  const max = finiteNumber(progress.getAttribute("max"));
+  const remaining = finiteNumber(progress.getAttribute("value"));
+  if (max !== 100 || remaining === null || remaining < 0 || remaining > 100) return null;
+  let card = progress.parentElement;
+  for (let depth = 0; card && depth < 6; depth += 1, card = card.parentElement) {
+    if (/^(BODY|HTML)$/.test(card.tagName || "") || card.matches?.(OWNED_USAGE_CONTENT)) return null;
+    const bars = [...card.querySelectorAll("progress, [role=\"progressbar\"]")];
+    if (bars.length !== 1 || bars[0] !== progress) return null;
+    const text = String(card.textContent || "");
+    if (text.length > 512) return null;
+    const leaves = [...card.querySelectorAll("span, div, label")]
+      .filter(node => !node.children?.length
+        && !node.closest?.(`${OWNED_USAGE_CONTENT}, [hidden], [aria-hidden="true"]`))
+      .map(node => String(node.textContent || "").trim());
+    const labels = leaves.filter(label => /^(Weekly|Daily|Monthly|5[- ]hour)(?: usage)? limit$/i.test(label));
+    const percentages = leaves.flatMap(text => [...text.matchAll(/(\d+(?:\.\d+)?)%\s*(?:left|remaining)\b/gi)]);
+    if (labels.length > 1 || percentages.length > 1) return null;
+    if (labels.length !== 1 || percentages.length !== 1) continue;
+    const displayed = Number(percentages[0][1]);
+    if (displayed !== Math.round(remaining)) return null;
+    const period = /^5[- ]hour/i.test(labels[0]) ? "five-hour" : labels[0].split(/\s/)[0].toLowerCase();
+    return normalizeObservation({
+      key: `native-unattributed:${period}`,
+      label: `${labels[0]} · subscription unknown`,
+      limit: 100, remaining: displayed, used: 100 - displayed,
+      // A relative countdown is not an observed reset timestamp.
+      resetAt: null, observedAt: now,
+    }, now);
+  }
+  return null;
+}
+
+function deduplicateObservations(observations) {
+  const byKey = new Map();
+  for (const observation of observations) {
+    if (!byKey.has(observation.key)) { byKey.set(observation.key, observation); continue; }
+    const previous = byKey.get(observation.key);
+    if (!previous || previous.label !== observation.label || previous.limit !== observation.limit
+      || previous.remaining !== observation.remaining || previous.resetAt !== observation.resetAt) byKey.set(observation.key, null);
+  }
+  return [...byKey.values()].filter(Boolean);
+}
+
 function collectDisplayedObservations(root, now = new Date()) {
   if (!root?.querySelectorAll) return [];
   const selectors = [
+    NATIVE_USAGE_PROGRESS,
     "[data-usage-limit-key]",
     "[data-usage-limit]",
     "[data-testid*='usage' i]",
@@ -538,7 +594,10 @@ function collectDisplayedObservations(root, now = new Date()) {
   for (const selector of selectors) {
     for (const element of root.querySelectorAll(selector)) elements.add(element);
   }
-  return [...elements].map((element) => observationFromElement(element, now)).filter(Boolean);
+  return [...elements].filter(element => !element.closest?.(OWNED_USAGE_CONTENT))
+    .map((element) => element.matches?.(NATIVE_USAGE_PROGRESS)
+      ? nativeProgressObservation(element, now)
+      : element.querySelector?.(NATIVE_USAGE_PROGRESS) ? null : observationFromElement(element, now)).filter(Boolean);
 }
 
 function annotateObservation(observation, estimate, instance) {
@@ -583,9 +642,15 @@ function hasConcreteNativeUsageContent(element) {
 
 function nativeUsageSelectorTarget(matches) {
   if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
+    // The reviewed Analytics bundle mounts an empty Accounts native slot in
+    // Top chats Header.actions. Its explicit history-context marker identifies
+    // the same route; the slot has no usage descendants to inspect.
+    const analyticsContext = Array.from(document.querySelectorAll('[data-tweakers-usage-account]'))
+      .filter((element) => element?.isConnected !== false && !isSidebarUsageElement(element));
     const slots = Array.from(document.querySelectorAll('[data-tweakers-native-surface="usage"]'))
       .filter((element) => element?.isConnected !== false && typeof element.append === "function"
-        && !isSidebarUsageElement(element) && hasConcreteNativeUsageContent(element));
+        && !isSidebarUsageElement(element)
+        && (hasConcreteNativeUsageContent(element) || analyticsContext.length === 1));
     if (slots.length === 1) return slots[0];
   }
   const dialogs = [...new Set((Array.isArray(matches) ? matches : [])
@@ -612,6 +677,47 @@ function removeNativeUsageSelectors(instance) {
 function pruneNativeUsageSelectors(instance) {
   for (const node of [...(instance.nativeAccountSelectors || [])]) {
     if (!node || node.isConnected === false) instance.nativeAccountSelectors.delete(node);
+  }
+}
+
+function renderAnalyticsObservedResets(instance) {
+  if (typeof document === "undefined") return;
+  const targets = document.querySelectorAll?.('[data-tweakers-analytics-observed-resets="true"]') || [];
+  const events = [...(instance.state?.history || [])].slice(-5).reverse();
+  const revision = JSON.stringify(events.map((event) => [event.key, event.observedAt, event.cause]));
+  for (const target of targets) {
+    if (target.dataset.tweakersObservedResetsRevision === revision) continue;
+    target.replaceChildren();
+    target.dataset.tweakersObservedResetsRevision = revision;
+    const section = document.createElement("section");
+    section.className = "flex flex-col gap-2 rounded-lg border border-token-border p-3";
+    const title = document.createElement("div");
+    title.className = "text-sm font-medium text-token-text-primary";
+    title.textContent = "Observed resets on this Mac";
+    const note = document.createElement("div");
+    note.className = "text-sm text-token-text-secondary";
+    note.textContent = "These are local counter transitions, not provider plan-usage history. Older observations were not assigned to a subscription.";
+    section.append(title, note);
+    if (!events.length) {
+      const empty = document.createElement("div");
+      empty.className = "text-sm text-token-text-secondary";
+      empty.textContent = "No resets have been observed yet.";
+      section.append(empty);
+    } else {
+      for (const event of events) {
+        const row = document.createElement("div");
+        row.className = "flex items-start justify-between gap-3 text-sm";
+        const label = document.createElement("span");
+        label.className = "min-w-0 text-token-text-primary";
+        label.textContent = `${event.label} · ${new Date(event.observedAt).toLocaleString()}`;
+        const cause = document.createElement("span");
+        cause.className = "shrink-0 text-token-text-secondary";
+        cause.textContent = resetCauseLabel(event.cause);
+        row.append(label, cause);
+        section.append(row);
+      }
+    }
+    target.append(section);
   }
 }
 
@@ -708,6 +814,7 @@ function renderNativeUsageAccountSelector(instance, context) {
 
 function renderSettings(root, instance) {
   root.replaceChildren();
+  root.setAttribute("data-tweakers-usage-settings", "true");
   root.className = "flex flex-col gap-4";
   root.appendChild(renderAccountsUsageContext(instance));
   const live = document.createElement("div");
@@ -752,7 +859,7 @@ function renderSettings(root, instance) {
       label.textContent = entry.label;
       const value = document.createElement("div");
       value.className = "text-token-text-secondary text-sm";
-      value.textContent = `${entry.last.remaining} remaining · ${formatResetDisplay(estimateNextReset(instance.state, entry.last.key))}`;
+      value.textContent = `${entry.last.remaining}${entry.last.key.startsWith("native-unattributed:") ? "% left" : " remaining"} · ${formatResetDisplay(estimateNextReset(instance.state, entry.last.key))}`;
       row.append(label, value);
       card.appendChild(row);
     }
@@ -998,6 +1105,7 @@ function startTracker(api, instance) {
         renderSettings(root, instance);
         return () => {
           if (instance.settingsRoot === root) instance.settingsRoot = null;
+          root.removeAttribute("data-tweakers-usage-settings");
           root.replaceChildren();
         };
       },
@@ -1005,7 +1113,7 @@ function startTracker(api, instance) {
   }
 
   const scan = () => {
-    if (instance.scanning) return;
+    if (instance.stopped || instance.scanning) return;
     instance.scanning = true;
     try {
       pruneBadges(instance);
@@ -1013,9 +1121,10 @@ function startTracker(api, instance) {
       let observed = 0;
       const semantic = api.react?.host?.query?.("usage") || [];
       refreshNativeUsageAccountSelectors(instance, semantic);
-      const observations = semantic.length
+      renderAnalyticsObservedResets(instance);
+      const observations = deduplicateObservations(semantic.length
         ? semantic.flatMap((match) => collectDisplayedObservations(match.element, new Date()))
-        : collectDisplayedObservations(document, new Date());
+        : collectDisplayedObservations(document, new Date()));
       const inventory = semantic.length
         ? semantic.map((match) => collectResetInventory(match.element, new Date())).find(Boolean) || null
         : collectResetInventory(document, new Date());
@@ -1053,7 +1162,7 @@ function startTracker(api, instance) {
   instance.emptyScans = 0;
   instance.scan = scan;
   const disposeHost = api.react?.host?.observe?.(["usage"], () => {
-    if (instance.scanQueued) return;
+    if (instance.stopped || instance.scanQueued) return;
     instance.scanQueued = true;
     queueMicrotask(() => {
       instance.scanQueued = false;
@@ -1062,6 +1171,7 @@ function startTracker(api, instance) {
   });
   instance.observer = disposeHost ? { disconnect: disposeHost } : null;
   api.react?.waitForElement?.("[data-usage-limit-key], [data-testid*='usage' i]", 5000).then(scan).catch(() => {});
+  api.react?.waitForElement?.('[data-tweakers-analytics-observed-resets="true"]', 60_000).then(scan).catch(() => {});
   scan();
 }
 
@@ -1136,9 +1246,12 @@ module.exports.__test = {
   parseDisplayedValues,
   observationFromElement,
   collectDisplayedObservations,
+  nativeProgressObservation,
+  deduplicateObservations,
   formatExpiration,
   resetCauseLabel,
   pruneBadges,
+  renderAnalyticsObservedResets,
   normalizeAccountsContext,
   safeAccountContextQuota,
   safeAccountId,

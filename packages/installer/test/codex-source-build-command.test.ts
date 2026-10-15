@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   codexSource,
+  codexSourceReleaseBuildTimeoutMs,
   codexSourceTransactionPaths,
   freezeCodexSourceCandidate,
   prepareCodexSourceCandidate,
@@ -21,11 +22,45 @@ import {
   type LockedDependencyEvidence,
 } from "../src/codex-derived-receipt.ts";
 import type { ManagedMcpStageEvidence } from "../src/managed-mcp-packages.ts";
+import type { GitHubJsonRequest } from "../src/codex-source-release.ts";
 
 const now = "2026-07-19T12:05:00.000Z";
 const closesAt = "2026-07-19T12:10:00.000Z";
 const bundledVersion = "0.145.0-alpha.18";
 const commit = "a".repeat(40);
+
+test("internal release timeout keeps the default and bounded owner-selected budgets", () => {
+  const hour = 60 * 60 * 1_000;
+  assert.equal(codexSourceReleaseBuildTimeoutMs(), hour);
+  for (const value of [hour, 2 * hour, 3 * hour]) assert.equal(codexSourceReleaseBuildTimeoutMs(value), value);
+  for (const value of [hour - 1, 3 * hour + 1, hour + 0.5, NaN, Infinity, -Infinity, null, "7200000"]) {
+    assert.throws(() => codexSourceReleaseBuildTimeoutMs(value as number), /integer between 60 minutes and 3 hours/);
+  }
+});
+
+test("invalid release timeout fails before source preparation or staging", async () => {
+  const fixture = createFixture(); const events: string[] = [];
+  try {
+    await assert.rejects(() => codexSource("build", { ...buildOptions(fixture), releaseBuildTimeoutMs: 0 },
+      dependencies(fixture.root, { events })), /releaseBuildTimeoutMs/);
+    assert.deepEqual(events, []);
+    assert.equal(existsSync(join(fixture.root, "codex-source")), false);
+  } finally { fixture.remove(); }
+});
+
+test("internal release timeout reaches the production adapter with its exact default or override", async () => {
+  const hour = 60 * 60 * 1_000;
+  for (const value of [undefined, 2 * hour]) {
+    const fixture = createFixture();
+    try {
+      const deps = dependencies(fixture.root), original = deps.production!.createBuildAdapter;
+      let captured: number | undefined;
+      deps.production!.createBuildAdapter = input => { captured = input.releaseBuildTimeoutMs; return original(input); };
+      await codexSource("build", { ...buildOptions(fixture), buildOnly: true, releaseBuildTimeoutMs: value }, deps);
+      assert.equal(captured, value ?? hour);
+    } finally { fixture.remove(); }
+  }
+});
 
 test("codex-source build is reachable, defaults to bundled, stages exact MCP evidence, and stops prepared", async () => {
   const fixture = createFixture();
@@ -40,8 +75,7 @@ test("codex-source build is reachable, defaults to bundled, stages exact MCP evi
     });
     const result = await codexSource("build", buildOptions(fixture), deps);
 
-    assert.equal(result?.kind, "codex-source-build");
-    if (!result || result.kind !== "codex-source-build") return;
+    assert.ok(result && "kind" in result && result.kind === "codex-source-build");
     assert.equal(result.status, "prepared");
     assert.equal(result.channel, "bundled");
     assert.equal(result.liveMutation, false);
@@ -118,6 +152,51 @@ test("full fleet manifest solely owns Chrome and Playwright runtime package dest
   }
 });
 
+test("desktop capacity failure preserves completed source evidence before staging", async () => {
+  const fixture = createFixture();
+  try {
+    const deps = dependencies(fixture.root);
+    const original = deps.production!.createBuildAdapter;
+    deps.production!.createBuildAdapter = input => ({
+      ...original(input),
+      stageDesktopCandidate: async () => {
+        const paths = codexSourceTransactionPaths(input.transactionRoot, input.transactionId);
+        const source = JSON.parse(readFileSync(paths.candidateStateFile, "utf8"));
+        assert.equal(source.kind, "codex-source-candidate");
+        assert.equal(source.evidence.source.checkoutCommit, commit);
+        assert.equal(existsSync(paths.candidateApp), false);
+        throw new Error("desktop capacity unavailable");
+      },
+    });
+    await assert.rejects(() => codexSource("build", buildOptions(fixture), deps), /desktop capacity unavailable/);
+    const paths = codexSourceTransactionPaths(fixture.root, "tx-build");
+    assert.equal(existsSync(paths.candidateStateFile), true);
+    assert.equal(existsSync(paths.receiptFile), false);
+    assert.equal(existsSync(paths.candidateApp), false);
+  } finally { fixture.remove(); }
+});
+
+test("build-only returns source proof without reserving or staging a desktop", async () => {
+  const fixture = createFixture();
+  try {
+    const deps = dependencies(fixture.root);
+    const original = deps.production!.createBuildAdapter;
+    deps.production!.createBuildAdapter = input => ({
+      ...original(input),
+      stageDesktopCandidate: async () => { throw new Error("must not stage a desktop"); },
+    });
+    deps.production!.stageManagedMcpPackages = () => { throw new Error("must not stage Chrome or Playwright"); };
+    deps.production!.prepareManagedMcpLifecycle = () => { throw new Error("must not prepare fleet"); };
+    const { chromePluginRoot: _chrome, playwrightPluginRoot: _playwright, ...options } = buildOptions(fixture);
+    const result = await codexSource("build", { ...options, buildOnly: true }, deps);
+    assert.ok(result && "kind" in result && result.kind === "codex-source-build");
+    assert.equal(result.buildOnly, true);
+    assert.equal(result.evidence?.source.checkoutCommit, commit);
+    assert.equal(existsSync(result.paths.candidateStateFile), true);
+    assert.equal(existsSync(result.paths.candidateApp), false);
+  } finally { fixture.remove(); }
+});
+
 test("codex-source build derives and enforces the current same-channel downgrade and identity floor", async () => {
   for (const scenario of [
     { currentVersion: "0.145.0-alpha.19", currentCommit: "b".repeat(40), expected: /downgrade refused/ },
@@ -146,7 +225,7 @@ test("prepared build binds the repository-owned runner and cannot advance withou
   try {
     const deps = dependencies(fixture.root);
     const built = await codexSource("build", buildOptions(fixture), deps);
-    assert.equal(built?.kind, "codex-source-build");
+    assert.ok(built && "kind" in built && built.kind === "codex-source-build");
     const paths = codexSourceTransactionPaths(fixture.root, "tx-build");
     const state = JSON.parse(readFileSync(paths.candidateStateFile, "utf8")) as {
       evidence?: { trustedCanaryRunner?: { sourcePath?: string; sha256?: string } };
@@ -157,7 +236,6 @@ test("prepared build binds the repository-owned runner and cannot advance withou
       writeFileSync(fixture.canaryEvidence, evidence);
       await assert.rejects(() => codexSource("canary-pass", {
         transactionId: "tx-build",
-        canaryEvidence: fixture.canaryEvidence,
       }, deps), /source-derived canary candidate must exist/i);
     }
     await assert.rejects(() => codexSource("freeze", {
@@ -195,11 +273,9 @@ test("CLI-shaped kebab-case source options reach the same prepared build path", 
       "playwright-plugin-root": fixture.playwright,
       "transaction-id": "tx-kebab",
     }, dependencies(fixture.root));
-    assert.equal(result?.kind, "codex-source-build");
-    if (result?.kind === "codex-source-build") {
-      assert.equal(result.transactionId, "tx-kebab");
-      assert.equal(result.status, "prepared");
-    }
+    assert.ok(result && "kind" in result && result.kind === "codex-source-build");
+    assert.equal(result.transactionId, "tx-kebab");
+    assert.equal(result.status, "prepared");
   } finally {
     fixture.remove();
   }
@@ -230,9 +306,9 @@ test("bundled control is re-probed at R2 and R3 instead of freezing a stale desk
       sourceRoot: join(fixture.root, "changing-source"),
       transactionId: "tx-changing-r2",
     }, {
-      fetchJson: async (request) => {
+      fetchJson: async <T = unknown>(request: GitHubJsonRequest) => {
         const tag = request.url.split("/tags/")[1];
-        return { status: 200, data: release(tag ? decodeURIComponent(tag) : `rust-v${bundledVersion}`) };
+        return { status: 200, data: release(tag ? decodeURIComponent(tag) : `rust-v${bundledVersion}`) as T };
       },
       resolveTag: async (tag) => ({ tag, refSha: commit, tagObjectShas: [], peeledCommit: commit }),
       fetchNpmVersions: async () => versions,
@@ -275,9 +351,9 @@ test("bundled control is re-probed at R2 and R3 instead of freezing a stale desk
       },
       receiptFile: join(fixture.root, "codex-source", "receipts", "tx-changing-r3.json"),
     }, {
-      fetchJson: async (request) => {
+      fetchJson: async <T = unknown>(request: GitHubJsonRequest) => {
         const tag = request.url.split("/tags/")[1];
-        return { status: 200, data: release(tag ? decodeURIComponent(tag) : "rust-v0.145.0-alpha.24") };
+        return { status: 200, data: release(tag ? decodeURIComponent(tag) : "rust-v0.145.0-alpha.24") as T };
       },
       resolveTag: async (tag) => ({ tag, refSha: commit, tagObjectShas: [], peeledCommit: commit }),
       fetchNpmVersions: async () => versions,
@@ -304,6 +380,34 @@ test("build rejects external-volume inputs before production staging", async () 
     fixture.remove();
   }
 });
+
+test("qualified source reuse is passed through fresh stock preparation and preserves owner input", async () => {
+  const fixture = createFixture(); const events: string[] = [];
+  try {
+    const deps = dependencies(fixture.root, { events });
+    const reuseRustTests = { transactionId: "prior-tx", acceptQualificationSha256: "a".repeat(64) };
+    const verifiedV8Inputs = { verificationPath: join(fixture.root, "verification.json"), acceptVerificationSha256: "b".repeat(64) };
+    const originalFactory = deps.production!.createBuildAdapter; let captured: unknown;
+    deps.production!.createBuildAdapter = input => { captured = { reuse: input.reuseRustTests, v8: input.verifiedV8Inputs }; return originalFactory(input); };
+    const result = await codexSource("build", { ...buildOptions(fixture), buildOnly: true, reuseRustTests, verifiedV8Inputs }, deps);
+    assert.deepEqual(captured, { reuse: reuseRustTests, v8: verifiedV8Inputs });
+    assert.deepEqual(events, ["parity", "adapter", "checkout", "build"]);
+    assert.ok(result && "buildOnly" in result && result.buildOnly);
+  } finally { fixture.remove(); }
+});
+for (const scenario of ["full flow", "same transaction", "missing V8 chain"] as const) {
+  test(`qualified source reuse rejects ${scenario} before staging`, async () => {
+    const fixture = createFixture(); const events: string[] = [];
+    try {
+      const options = buildOptions(fixture);
+      await assert.rejects(() => codexSource("build", { ...options, buildOnly: scenario !== "full flow",
+        reuseRustTests: { transactionId: scenario === "same transaction" ? options.transactionId! : "prior", acceptQualificationSha256: "a".repeat(64) },
+        ...(scenario === "missing V8 chain" ? {} : { verifiedV8Inputs: { verificationPath: join(fixture.root, "verification.json"), acceptVerificationSha256: "b".repeat(64) } }),
+      }, dependencies(fixture.root, { events })), /distinct build-only successor/);
+      assert.deepEqual(events, []);
+    } finally { fixture.remove(); }
+  });
+}
 
 interface Fixture {
   root: string;
@@ -413,7 +517,7 @@ function dependencies(
       hooks.onProbe?.(app);
       return bundledVersion;
     },
-    fetchJson: async () => ({ status: 200, data: release() }),
+    fetchJson: async <T = unknown>() => ({ status: 200, data: release() as T }),
     resolveTag: async (tag) => ({ tag, refSha: commit, tagObjectShas: [], peeledCommit: commit }),
     fetchNpmVersions: async () => [bundledVersion, "0.145.0-alpha.24"],
     now: () => now,
@@ -453,6 +557,7 @@ function managedPackage(name: string, version: string, seed: string, command: st
     packageLockSha256: hash("package-lock"),
     dependencyGraphDigestSha256: hash("dependency-graph"),
     wrapperSha256: hash("wrapper"),
+    runtimeTreeDigestSha256: hash("runtime-tree"),
     routes: [{
       routeId,
       owner: "plugin",

@@ -19,6 +19,14 @@ export function lifecycleLockFile(userRoot: string): string {
   return join(userRoot, "transactions", "lifecycle.lock");
 }
 
+/**
+ * Run detached follow-up work without inheriting a caller's lifecycle lease.
+ * A borrowed lease must never outlive the owner that acquired it.
+ */
+export function outsideLifecycleContext<T>(run: () => T): T {
+  return lifecycleContext.exit(run);
+}
+
 export function currentLifecycleOperation(): string | null {
   return lifecycleContext.getStore()?.operation ?? null;
 }

@@ -512,3 +512,112 @@ test("all-account quota refreshes coalesce per account and preserve successful c
   assert.equal(rows.find((row) => row.opaqueAccountId === accountA)?.refreshState, "idle");
   assert.equal(rows.find((row) => row.opaqueAccountId === accountB)?.refreshState, "error");
 });
+
+test("renderer transport release is idempotent and either channel order preserves its live peer", () => {
+  for (const reverse of [false, true]) {
+    const broker = new AccountsBrokerV1({accounts: [{opaqueAccountId: accountA, enabled: true}], secret});
+    assert.equal(broker.handshake(handshake(rendererA, appToolsA, "a".repeat(32))).ok, true);
+    const releases = [broker.retainRendererTransport(rendererA), broker.retainRendererTransport(rendererA)];
+    if (reverse) releases.reverse();
+    releases[0]!(); releases[0]!();
+    assert.equal(broker.status().registeredClients.length, 1);
+    releases[1]!();
+    assert.equal(broker.status().registeredClients.length, 0);
+    broker.close();
+  }
+});
+
+test("authenticated async work stays active after its final transport closes and clears on failure", async () => {
+  const broker = new AccountsBrokerV1({accounts: [{opaqueAccountId: accountA, enabled: true}], secret});
+  assert.equal(broker.handshake(handshake(rendererA, appToolsA, "a".repeat(32))).ok, true);
+  const release = broker.retainRendererTransport(rendererA);
+  let reject!: (error: Error) => void;
+  const work = broker.withActiveOperation(() => new Promise<never>((_, fail) => { reject = fail; }));
+  release();
+  assert.equal(broker.status().registeredClients.length, 0);
+  assert.equal(broker.hasActiveOperations(), true);
+  reject(new Error("fixture failure"));
+  await assert.rejects(work, /fixture failure/);
+  assert.equal(broker.hasActiveOperations(), false);
+  broker.close();
+});
+
+
+test("typed account failures preserve display facts, invalidate capacity and recover the same task owner", async () => {
+  for (const errorCode of ["authentication", "connection"] as const) {
+    let recovered = false;
+    let reconnectSettled = false;
+    const cached = { plan: "plus", identifierMasked: "a****@example.invalid", avatarUrl: null };
+    const fresh = { plan: "pro", identifierMasked: "a****@example.invalid", avatarUrl: null };
+    const broker = new AccountsBrokerV1({
+      accounts: [{ opaqueAccountId: accountA, enabled: true, safeProfile: cached, assignedTaskCount: 922 },
+        { opaqueAccountId: accountB, enabled: true, safeProfile: cached, assignedTaskCount: 28 }], secret,
+      onEnrollmentSettled: (enrollment) => {
+        if (enrollment.kind === "reconnect" && enrollment.state === "complete") reconnectSettled = true;
+      },
+      onDeviceAction: async (action) => {
+        if (action.kind === "device.start") return { outcome: "accepted", value: { loginId: "private-login", userCode: "ABCD-EFGH", verificationUrl: "https://auth.openai.com/device" } };
+        if (action.kind === "device.status") { recovered = true; return { outcome: "accepted", value: { success: true } }; }
+        if (action.kind !== "profile.read" && action.kind !== "quota.read") return { outcome: "rejected" };
+        if (recovered && errorCode === "authentication" && action.opaqueAccountId === accountA) {
+          assert.equal(reconnectSettled, true, "completed reconnect must release its helper before authentication probes");
+        }
+        if (action.opaqueAccountId === accountA && !recovered) return { outcome: "rejected", errorCode } as any;
+        return { outcome: "accepted", value: action.kind === "profile.read" ? fresh : {
+          freshness: "fresh", remainingPercent: 70, resetAt: "2099-01-01T00:00:00.000Z", shortWindowPressure: 0, resetCredits: 0,
+        } };
+      },
+    });
+    broker.handshake(handshake(rendererA, appToolsA, "typed-health".padEnd(32, "h")));
+    const taskRef = `bt_${"h".repeat(43)}` as OpaqueTaskRef;
+    broker.registerTask({ taskRef, conversationId: conversationA, opaqueAccountId: accountA, ownerRendererRef: rendererA });
+    setQuota(broker, accountA); setQuota(broker, accountB);
+    try {
+      await invoke(broker, rendererA, "failed-profile", "profile.read");
+      await new Promise<void>((done) => setImmediate(done));
+      await invoke(broker, rendererA, "failed-quota", "quota.read");
+      const failed = broker.pool().accounts.find((a) => a.opaqueAccountId === accountA)!;
+      assert.equal(failed.state, errorCode === "authentication" ? "reauth_required" : "unhealthy");
+      assert.deepEqual(failed.safeProfile, cached, "a transient read cannot erase verified display facts");
+      assert.equal(broker.quota().find((q) => q.opaqueAccountId === accountA)?.freshness, "stale");
+      assert.equal(broker.quota().find((q) => q.opaqueAccountId === accountA)?.errorCode, errorCode);
+      assert.equal(broker.pool().accounts.find((a) => a.opaqueAccountId === accountB)?.state, "ready");
+      assert.equal(broker.quota().find((q) => q.opaqueAccountId === accountB)?.freshness, "fresh");
+      if (errorCode === "authentication") {
+        const start = await invoke(broker, rendererA, "recover-start", "reconnect.start", { opaqueAccountId: accountA });
+        assert.equal(start.ok, true);
+        if (!start.ok) throw new Error("reconnect did not start");
+        const result = await invoke(broker, rendererA, "recover-status", "reconnect.status", { enrollmentRef: (start.result as any).enrollmentRef });
+        assert.equal(result.ok && (result.result as any).state, "complete");
+      } else {
+        recovered = true;
+        await invoke(broker, rendererA, "retry-quota", "quota.read", { opaqueAccountId: accountA });
+        await invoke(broker, rendererA, "retry-profile", "profile.read");
+      }
+      await new Promise<void>((done) => setImmediate(done));
+      const ready = broker.pool().accounts.find((a) => a.opaqueAccountId === accountA)!;
+      assert.equal(ready.state, "ready"); assert.deepEqual(ready.safeProfile, fresh);
+      assert.equal(broker.quota().find((q) => q.opaqueAccountId === accountA)?.remainingPercent, 70);
+      assert.equal(broker.quota().find((q) => q.opaqueAccountId === accountA)?.freshness, "fresh");
+      assert.equal(ready.assignedTaskCount, 923); assert.equal(broker.taskOwnership(taskRef)?.opaqueAccountId, accountA);
+    } finally { broker.close(); }
+  }
+});
+
+
+test("child admission diagnostics distinguish pool refusal and factory exceptions without changing failure", () => {
+  const reasons: string[] = [];
+  const broker = new AccountsBrokerV1({ secret, accounts: [{ opaqueAccountId: accountA, enabled: true }],
+    onChildAdmissionFailure: reason => { reasons.push(reason); throw new Error("diagnostic observer failure"); },
+    childFactory: { create: () => { throw new Error("private token and path"); } },
+  });
+  assert.equal(broker.acquireChild(accountB), null);
+  assert.equal(broker.acquireChild(accountA), null);
+  const lease = broker.reserveStartupChild(accountA)!;
+  assert.ok(lease);
+  assert.equal(broker.reserveStartupChild(accountA), null);
+  assert.equal(broker.acquireChild(accountA), null);
+  assert.equal(lease.acquire(), null);
+  assert.equal(lease.release(), true);
+  assert.deepEqual(reasons, ["pool-account", "pool-factory-exception", "pool-lease", "pool-lease", "pool-factory-exception"]);
+});

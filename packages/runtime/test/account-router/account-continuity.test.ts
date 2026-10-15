@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 import {
   ACCOUNT_SCOPED_CAPABILITY_MUTATION_METHODS_V1,
@@ -12,6 +13,8 @@ import {
   bootstrapSharedPluginsManifest,
   captureIdleAccountChangesBeforeSpawn,
   captureUnmaterializedNativeChangesBeforeSpawn,
+  captureOfficialPluginPackageV1,
+  copyOfficialPluginPackageV1,
   isAccountScopedCapabilityMutationV1,
   loadAccountContinuitySharedSourceProvenanceV1,
   loadAccountCapabilityOverrides,
@@ -344,6 +347,178 @@ test("native plugin inventory copies active packages, inherits updates, and pres
   assert.equal(readFileSync(join(secondaryName, "0.2.0", "SKILL.md"), "utf8"), "Account's local edit\n");
 });
 
+test("package writer copies and seals a complete 9 MiB public binary dependency without importing auth", t => {
+  const { stateRoot, primary } = fixture(t);
+  privateWrite(join(primary.codexHome, "config.toml"), '[plugins."large@test"]\nenabled=true\n');
+  const source = privateDirectory(join(primary.codexHome, "plugins", "cache", "test", "large", "1.0.0"));
+  for (const path of [".codex-plugin", "assets", "skills/tool", "hooks"]) privateDirectory(join(source, path));
+  privateWrite(join(source, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "large", version: "1.0.0", mcpServers: "./.mcp.json", skills: "./skills", hooks: "./hooks/hooks.json" }));
+  privateWrite(join(source, ".mcp.json"), JSON.stringify({ mcpServers: { large: { command: "node", args: ["./mcp.js"] } } }));
+  privateWrite(join(source, "mcp.js"), "// Public fixture dependency: assets/dependency.bin\n");
+  privateWrite(join(source, "skills", "tool", "SKILL.md"), "# Tool\nUse assets/dependency.bin through mcp.js.\n");
+  privateWrite(join(source, "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "./hooks/start.sh" }] }] } }));
+  privateWrite(join(source, "hooks", "start.sh"), "#!/bin/sh\n# Public dependency: assets/dependency.bin\nexit 0\n");
+  chmodSync(join(source, "hooks", "start.sh"), 0o700);
+  const binary = Buffer.alloc(9 * 1024 * 1024, 0x5a), binaryPath = join(source, "assets", "dependency.bin");
+  writeFileSync(binaryPath, binary, { mode: 0o600 });
+  symlinkSync("dependency.bin", join(source, "assets", "current.bin"));
+  privateWrite(join(source, "auth.json"), "synthetic account-only auth store");
+  const sourceInode = lstatSync(binaryPath).ino, expected = captureOfficialPluginPackageV1(source);
+  const sealed = bootstrapSharedPluginsManifest(stateRoot, primary.codexHome, 1, true);
+  assert.ok(sealed?.root, "a complete package dependency over 8 MiB must be copied");
+  const copied = join(sealed.root, "test", "large", "1.0.0");
+  assert.equal(readFileSync(join(copied, "assets", "dependency.bin")).equals(binary), true);
+  assert.equal(readFileSync(join(copied, "assets", "current.bin")).equals(binary), true);
+  assert.equal(lstatSync(join(copied, "assets", "dependency.bin")).mode & 0o777, 0o400);
+  assert.equal(lstatSync(join(copied, "hooks", "start.sh")).mode & 0o777, 0o500);
+  assert.equal(lstatSync(copied).mode & 0o777, 0o500);
+  assert.equal(captureOfficialPluginPackageV1(copied).digest, expected.digest);
+  assert.equal(existsSync(join(copied, "auth.json")), false);
+  assert.equal(lstatSync(binaryPath).ino, sourceInode);
+  assert.equal(readFileSync(binaryPath).equals(binary), true);
+  assert.equal(lstatSync(binaryPath).mode & 0o777, 0o600);
+  symlinkSync(join(primary.codexHome, "AGENTS.md"), join(source, "escaped-link"));
+  assert.throws(() => captureOfficialPluginPackageV1(source), /link escapes its definition tree/);
+});
+
+test("package writer bound leaves private configuration and capability budgets unchanged", async t => {
+  await t.test("configuration remains bounded", child => {
+    const { stateRoot, primary, secondary } = fixture(child);
+    privateWrite(join(primary.codexHome, "config.toml"), "#" + "x".repeat(2 * 1024 * 1024));
+    const boot = bootstrapAccountContinuity({ stateRoot, primaryOpaqueAccountId: ACCOUNT_A, accounts: [primary, secondary], schema: DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1, apply: true });
+    assert.equal(boot.state, "blocked");
+  });
+  await t.test("private capabilities retain the 8 MiB total bound", child => {
+    const { stateRoot, primary, secondary } = fixture(child), skills = privateDirectory(join(primary.codexHome, "skills"));
+    for (let index = 0; index < 17; index++) privateWrite(join(skills, `public-${index}.md`), "x".repeat(512 * 1024));
+    const boot = bootstrapAccountContinuity({ stateRoot, primaryOpaqueAccountId: ACCOUNT_A, accounts: [primary, secondary], schema: DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1, apply: true });
+    assert.equal(boot.state, "blocked");
+    assert.match(boot.reason ?? "", /capability tree exceeds its bounded size/);
+  });
+});
+
+test("package writer batches nested directory flushes after every file sync and sealing", t => {
+  const { stateRoot, primary } = fixture(t);
+  privateWrite(join(primary.codexHome, "config.toml"), '[plugins."batch@test"]\nenabled=true\n');
+  const source = privateDirectory(join(primary.codexHome, "plugins", "cache", "test", "batch", "1.0.0"));
+  for (const relative of ["assets", "skills/tool", "hooks"]) privateDirectory(join(source, relative));
+  for (const relative of ["assets/a.bin", "assets/b.bin", "skills/tool/SKILL.md", "hooks/run.sh"]) privateWrite(join(source, relative), `Public ${relative}\n`);
+  chmodSync(join(source, "hooks/run.sh"), 0o700);
+  symlinkSync("a.bin", join(source, "assets/current.bin"));
+  const expected = captureOfficialPluginPackageV1(source), destination = join(stateRoot, "copied");
+  const descriptors = new Map<number, string>(), events: Array<{ path: string; directory: boolean; mode: number }> = [];
+  const originalOpen = fs.openSync, originalSync = fs.fsyncSync;
+  const open = t.mock.method(fs, "openSync", (...args: unknown[]) => {
+    const descriptor = Reflect.apply(originalOpen, fs, args) as number;
+    descriptors.set(descriptor, String(args[0])); return descriptor;
+  });
+  const sync = t.mock.method(fs, "fsyncSync", (descriptor: number) => {
+    const stat = fs.fstatSync(descriptor);
+    events.push({ path: descriptors.get(descriptor)!, directory: stat.isDirectory(), mode: stat.mode & 0o7777 });
+    originalSync(descriptor);
+  });
+  syncBuiltinESMExports();
+  try {
+    copyOfficialPluginPackageV1(source, destination, expected.digest);
+    assert.equal(captureOfficialPluginPackageV1(destination).digest, expected.digest);
+    const fileEvents = events.filter(event => !event.directory), directoryEvents = events.filter(event => event.directory);
+    assert.equal(fileEvents.length, 4, "every approved regular file still receives its own data fsync");
+    assert.equal(events.findIndex(event => event.directory), fileEvents.length, "no package directory flush precedes completion of file writes");
+    const expectedDirectories = [stateRoot, destination, join(destination, "assets"), join(destination, "skills"), join(destination, "skills/tool"), join(destination, "hooks")];
+    assert.deepEqual(directoryEvents.map(event => event.path).sort(), expectedDirectories.sort(), "nested directories and the containing directory each flush exactly once");
+    for (const event of directoryEvents) {
+      const parentIndex = directoryEvents.findIndex(parent => parent.path === dirname(event.path));
+      if (parentIndex !== -1) assert.ok(parentIndex > directoryEvents.indexOf(event), "directory flush order is bottom-up");
+    }
+    events.length = 0;
+    const sealed = bootstrapSharedPluginsManifest(stateRoot, primary.codexHome, 1, true);
+    assert.ok(sealed?.root);
+    const packageSuffix = `${sep}cache${sep}test${sep}batch${sep}1.0.0`;
+    const sealedFlushes = events.filter(event => event.directory && event.path.includes(packageSuffix));
+    assert.equal(sealedFlushes.length, 5);
+    assert.ok(sealedFlushes.every(event => event.mode === 0o500), "immutable package directories are sealed before their deferred flush");
+  } finally { sync.mock.restore(); open.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test("package writer refuses directory replacement during writes or deferred flush", async t => {
+  for (const phase of ["write", "flush", "after-child-flush"] as const) await t.test(phase, child => {
+    const { stateRoot, primary } = fixture(child), source = privateDirectory(join(primary.codexHome, "public-package"));
+    privateDirectory(join(source, "nested"));
+    privateWrite(join(source, "nested/a.bin"), "Public a\n"); privateWrite(join(source, "nested/b.bin"), "Public b\n");
+    const expected = captureOfficialPluginPackageV1(source), destination = join(stateRoot, "copied"), nested = join(destination, "nested");
+    const originalRename = fs.renameSync, originalSync = fs.fsyncSync;
+    let replaced = false;
+    const replace = () => {
+      replaced = true; originalRename(nested, join(destination, "displaced")); privateDirectory(nested);
+    };
+    const rename = child.mock.method(fs, "renameSync", (...args: unknown[]) => {
+      const result = Reflect.apply(originalRename, fs, args);
+      if (phase === "write" && !replaced && args[1] === join(nested, "a.bin")) replace();
+      return result;
+    });
+    const sync = child.mock.method(fs, "fsyncSync", (descriptor: number) => {
+      originalSync(descriptor);
+      const stat = fs.fstatSync(descriptor), containing = lstatSync(stateRoot);
+      if (!replaced && stat.isDirectory() && (phase === "flush"
+        || phase === "after-child-flush" && stat.dev === containing.dev && stat.ino === containing.ino)) replace();
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => copyOfficialPluginPackageV1(source, destination, expected.digest), /directory identity changed/);
+      assert.equal(replaced, true);
+      assert.deepEqual(readdirSync(nested), [], "the replacement directory cannot be adopted for subsequent writes");
+      assert.equal(captureOfficialPluginPackageV1(source).digest, expected.digest);
+    } finally { sync.mock.restore(); rename.mock.restore(); syncBuiltinESMExports(); }
+  });
+});
+
+test("package writer retains source drift rejection before deferred directory flush", t => {
+  const { stateRoot, primary } = fixture(t), source = privateDirectory(join(primary.codexHome, "public-package"));
+  privateWrite(join(source, "a.bin"), "Public a\n"); privateWrite(join(source, "b.bin"), "Public b\n");
+  const expected = captureOfficialPluginPackageV1(source), destination = join(stateRoot, "copied"), originalSync = fs.fsyncSync;
+  let changed = false, directoryFlushes = 0;
+  const sync = t.mock.method(fs, "fsyncSync", (descriptor: number) => {
+    originalSync(descriptor);
+    if (fs.fstatSync(descriptor).isDirectory()) directoryFlushes++;
+    else if (!changed) { changed = true; privateWrite(join(source, "b.bin"), "Changed public b\n"); }
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => copyOfficialPluginPackageV1(source, destination, expected.digest), /source changed before immutable copy/);
+    assert.equal(changed, true); assert.equal(directoryFlushes, 0);
+    assert.equal(existsSync(join(destination, "b.bin")), false);
+  } finally { sync.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test("package writer batching preserves private per-write flushes and exact mode correction", t => {
+  const { stateRoot, primary, secondary } = fixture(t), sharedRoot = privateDirectory(join(stateRoot, "shared-account-config"));
+  chmodSync(sharedRoot, 0o1700);
+  const descriptors = new Map<number, string>(), events: Array<{ path: string; directory: boolean }> = [];
+  const originalOpen = fs.openSync, originalSync = fs.fsyncSync, originalChmod = fs.chmodSync;
+  const corrections: Array<{ path: string; mode: unknown }> = [];
+  const open = t.mock.method(fs, "openSync", (...args: unknown[]) => {
+    const descriptor = Reflect.apply(originalOpen, fs, args) as number;
+    descriptors.set(descriptor, String(args[0])); return descriptor;
+  });
+  const sync = t.mock.method(fs, "fsyncSync", (descriptor: number) => {
+    events.push({ path: descriptors.get(descriptor)!, directory: fs.fstatSync(descriptor).isDirectory() }); originalSync(descriptor);
+  });
+  const chmod = t.mock.method(fs, "chmodSync", (...args: unknown[]) => {
+    corrections.push({ path: String(args[0]), mode: args[1] }); return Reflect.apply(originalChmod, fs, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const boot = bootstrapAccountContinuity({ stateRoot, primaryOpaqueAccountId: ACCOUNT_A, accounts: [primary, secondary], schema: DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1, apply: true });
+    assert.equal(boot.state, "ready", boot.reason);
+    const fileEvents = events.filter(event => !event.directory); assert.ok(fileEvents.length > 1);
+    for (let index = 0; index < events.length; index++) if (!events[index]!.directory) {
+      assert.deepEqual(events[index + 1], { path: dirname(events[index]!.path), directory: true }, "private atomic writes still flush their parent immediately");
+    }
+    assert.equal(lstatSync(sharedRoot).mode & 0o7777, 0o700, "special mode bits require correction");
+    assert.equal(corrections.filter(entry => entry.path === sharedRoot && entry.mode === 0o700).length, 1, "the proven exact mode avoids subsequent redundant chmods");
+  } finally { chmod.mock.restore(); sync.mock.restore(); open.mock.restore(); syncBuiltinESMExports(); }
+});
+
 test("primary linked skills supply immutable defaults without changing the linked source", (t) => {
   const { stateRoot, primary, secondary } = fixture(t);
   const skill = privateDirectory(join(stateRoot, "source-skill"));
@@ -604,7 +779,7 @@ test("shared native reference mode preserves homes and recovers exact signed cop
       const draft: Omit<RouterConfigV3, "fingerprint"> = {
         schemaVersion: 3, mode: "quota_aware", policy: "quota_aware_v2", generation: 1,
         protocolFingerprint: ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT, primaryOpaqueAccountId: primary.opaqueAccountId,
-        accounts: accounts.map((account) => ({ opaqueAccountId: account.opaqueAccountId, included: true, weight: 1, capabilityFingerprint: `sha256:${"a".repeat(64)}` })),
+        accounts: accounts.map((account, index) => ({ opaqueAccountId: account.opaqueAccountId, included: true, weight: 1, capabilityFingerprint: `sha256:${"a".repeat(64)}`, label: `Account ${index + 1}` })),
         updatedAt: "2026-09-09T14:00:00.000Z",
       };
       const config: RouterConfigV3 = { ...draft, fingerprint: routerConfigFingerprint(draft) };

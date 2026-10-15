@@ -36,6 +36,8 @@ const HASH = {
   diff: "c".repeat(64),
 };
 
+function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
 function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
@@ -51,11 +53,17 @@ function fixture() {
   writeFileSync(binaryPath, "accepted-binary");
   writeFileSync(join(runtimeRoot, "runtime-fingerprint.json"), "{}\n");
   const receipt: AcceptedPrebuiltCodexBuildReceipt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "tweakers-prebuilt-codex-build",
     status: "accepted",
+    verification: { level: "isolated-canary", installedAcceptance: "required" },
     acceptedAt: "2026-07-30T20:00:00.000Z",
+    upstream: { repository: "https://github.com/openai/codex.git", tag: "rust-v0.146.0-alpha.3.1", commit: "d".repeat(40) },
+    closure: { codeModeHost: { path: join(root, "codex-code-mode-host"), sha256: sha256Text("accepted-helper"), architecture: "arm64",
+      signature: { identity: "fixture-signing", teamIdentifier: null, designatedRequirement: null } }, resources: [] },
+    runtime: { sourceRoot: runtimeRoot, fingerprint: HASH.runtime, fileCount: 209, documentSha256: HASH.runtimeDocument },
     source: {
+      patchSeriesSha256: "f".repeat(64),
       commit: "d".repeat(40),
       tree: "e".repeat(40),
       cargoLockSha256: HASH.cargoLock,
@@ -76,9 +84,11 @@ function fixture() {
       path: binaryPath,
       sha256: HASH.binary,
       version: "0.146.0-alpha.3.1",
+      signature: { identity: "fixture-signing", teamIdentifier: null, designatedRequirement: null },
       architecture: "arm64",
     },
   };
+  writeFileSync(join(root, "codex-code-mode-host"), "accepted-helper");
   writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
   const input: PrebuiltCombinedCandidateInput = {
     transactionId: "combined-canary-001",
@@ -103,6 +113,8 @@ function fixture() {
     },
     probeVersion: () => receipt.binary.version,
     probeArchitecture: () => "arm64",
+    verifyBackendSignature: () => true,
+    verifyCodeModeHostPosture: () => true,
     sourceAppFingerprint: () => HASH.sourceApp,
     sourceAppBundleId: () => "com.openai.codex",
     runtimeEvidence: () => ({ fingerprint: HASH.runtime, fileCount: 209 }),
@@ -126,6 +138,7 @@ test("accepted receipt, binary, runtime, source app, and transaction ID produce 
     assert.equal(first.acceptedBuildReceipt.sha256, f.input.expectedReceiptSha256);
     assert.equal(first.acceptedBuildReceipt.sourceCommit, f.receipt.source.commit);
     assert.equal(first.acceptedBuildReceipt.sourceTree, f.receipt.source.tree);
+    assert.deepEqual(first.acceptedBuildReceipt.verification, f.receipt.verification);
     assert.equal(first.acceptedBuildReceipt.cargoLockSha256, HASH.cargoLock);
     assert.deepEqual(first.acceptedBuildReceipt.testEvidence, [{
       name: f.receipt.tests[0]!.name,
@@ -142,6 +155,18 @@ test("accepted receipt, binary, runtime, source app, and transaction ID produce 
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
+});
+
+test("accepted closure rejects helper posture even when signature, architecture and hashes match", () => {
+  const f = fixture();
+  try {
+    const observed: string[] = [];
+    assert.throws(() => validatePrebuiltCombinedCandidate(f.input, {
+      installerPayloadHash: HASH.installer, runtimeRoot: f.runtimeRoot, sourceAppRoot: f.sourceAppRoot,
+      now: new Date("2026-07-30T21:00:00.000Z"),
+    }, { ...f.dependencies, verifyCodeModeHostPosture: path => { observed.push(path); return false; } }), /helper signing posture/);
+    assert.deepEqual(observed, [f.receipt.closure.codeModeHost.path]);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("receipt, binary, version, architecture, runtime, and source-app mismatches fail closed", () => {
@@ -194,6 +219,30 @@ test("receipt, binary, version, architecture, runtime, and source-app mismatches
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
+});
+
+test("accepted authority rejects missing helpers, changed resources and changed generated runtime before staging", () => {
+  const f = fixture();
+  const context = { installerPayloadHash: HASH.installer, runtimeRoot: f.runtimeRoot, sourceAppRoot: f.sourceAppRoot,
+    now: new Date("2026-07-30T21:00:00.000Z") };
+  const writeReceipt = (value: unknown) => {
+    writeFileSync(f.receiptPath, JSON.stringify(value));
+    return { ...f.input, expectedReceiptSha256: sha256(f.receiptPath) };
+  };
+  try {
+    const missing = structuredClone(f.receipt) as any;
+    delete missing.closure;
+    assert.throws(() => validatePrebuiltCombinedCandidate(writeReceipt(missing), context, f.dependencies), /schema or evidence/);
+    writeFileSync(f.receipt.closure.codeModeHost.path, "mismatched-helper");
+    assert.throws(() => validatePrebuiltCombinedCandidate(writeReceipt(f.receipt), context, f.dependencies), /helper fingerprint/);
+    writeFileSync(f.receipt.closure.codeModeHost.path, "accepted-helper");
+    const wrongRuntime = structuredClone(f.receipt);
+    wrongRuntime.runtime.fingerprint = "0".repeat(64);
+    assert.throws(() => validatePrebuiltCombinedCandidate(writeReceipt(wrongRuntime), context, f.dependencies), /Generated runtime/);
+    const unsafe = structuredClone(f.receipt);
+    unsafe.closure.resources = [{ relativePath: "../outside", sourcePath: f.binaryPath, sha256: HASH.binary }];
+    assert.throws(() => validatePrebuiltCombinedCandidate(writeReceipt(unsafe), context, f.dependencies), /resource path is unsafe/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("prepare and promote CLI actions require the same complete caller-owned evidence", () => {
@@ -260,10 +309,12 @@ test("prepared candidate evidence binds embedded backend, reviewed runtime, cand
     ]) mkdirSync(path, { recursive: true });
     const embedded = join(candidateRoot, "Contents", "Resources", "codex");
     writeFileSync(embedded, "accepted-binary");
+    writeFileSync(join(candidateRoot, "Contents/Resources/codex-code-mode-host"), "accepted-helper");
     writeFileSync(join(candidateRuntimeRoot, "runtime-fingerprint.json"), "{}\n");
     writeFileSync(join(lastKnownGoodRuntimeRoot, "runtime-fingerprint.json"), "{}\n");
     writeFileSync(signedBackupMarker, '{"schemaVersion":1,"existed":true}\n');
     let embeddedDigest = HASH.binary;
+    let helperPosture = true;
     const dependencies: Partial<PrebuiltCombinedCandidateValidationDependencies> = {
       fingerprintFile: (path) => {
         if (path === embedded) return embeddedDigest;
@@ -272,6 +323,8 @@ test("prepared candidate evidence binds embedded backend, reviewed runtime, cand
       },
       probeVersion: () => authority.backend.version,
       probeArchitecture: () => "arm64",
+      verifyBackendSignature: () => true,
+      verifyCodeModeHostPosture: () => helperPosture,
       sourceAppBundleId: () => "com.openai.codex",
       sourceAppFingerprint: (path) => {
         if (path === candidateRoot) return HASH.candidateApp;
@@ -310,6 +363,10 @@ test("prepared candidate evidence binds embedded backend, reviewed runtime, cand
       paths,
       dependencies,
     ));
+
+    helperPosture = false;
+    assert.throws(() => assertPreparedPrebuiltCombinedCandidateEvidence(authority, prepared, paths, dependencies), /helper signing posture/);
+    helperPosture = true;
 
     embeddedDigest = "f".repeat(64);
     assert.throws(() => assertPreparedPrebuiltCombinedCandidateEvidence(

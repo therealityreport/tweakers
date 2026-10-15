@@ -28,7 +28,7 @@ const fail = () => { throw new Error("persistent storage identity unavailable");
 const safeDigest = (value) => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
 function authorityName(value) {
     return ["native-history-source.v1.json", "native-auth-binding.v1.json", "shared-native-mode.v1.json"].includes(value)
-        || /^accounts\/ar_[A-Za-z0-9_-]{16,128}\/native-history-enrollment-receipt\.v1\.json$/.test(value);
+        || /^accounts\/ar_[A-Za-z0-9_-]{16,128}\/(?:native-history-enrollment-receipt\.v1\.json|native-execution-home\.v1\/native-execution-home\.v1\.json)$/.test(value);
 }
 function privateRoot(path) {
     const s = (0, node_fs_1.lstatSync)(path);
@@ -76,10 +76,14 @@ function authorityEvidence(root, name, secret) {
     const mac = `hmac-sha256:${(0, node_crypto_1.createHmac)("sha256", secret).update("shared-native-mode:v1\0" + canonical(unsigned)).digest("hex")}`;
     if (typeof signed !== "string" || signed.length !== mac.length || !(0, node_crypto_1.timingSafeEqual)(Buffer.from(signed), Buffer.from(mac)))
         return fail();
-    // Existing resolver CAS validates the current binary separately. It may change
-    // only this field; the full signed root authority must remain identical.
+    if (unsigned.resolverProtocol !== "shared-native-overlay-v1" && unsigned.resolverProtocol !== "official-bundled-v1")
+        return fail();
+    // The signed resolver CAS binds the full protocol and binary independently.
+    // Normalize only the protocol for root authority: historical v2 fingerprints
+    // stay identical while an explicit stock transition preserves every root,
+    // source/account and retirement field. Keep the full byte digest as evidence.
     const { resolverBinarySha256: _resolver, ...rootAuthority } = unsigned;
-    return { fingerprint: digest("shared-native-root-authority:v2\0" + canonical(rootAuthority)), documentFingerprint };
+    return { fingerprint: digest("shared-native-root-authority:v2\0" + canonical({ ...rootAuthority, resolverProtocol: "shared-native-overlay-v1" })), documentFingerprint };
 }
 function signature(unsigned, secret) {
     if (secret.length !== 32)
@@ -161,7 +165,8 @@ function matchesPersistentDirectoryIdentity(input) {
         if (!capture && !generation)
             return a.dev === expected.device;
         const hasAuthority = generation?.document.anchors.some(entry => entry.authorityFile === input.authorityFile) ?? false;
-        const newOptionalAuthority = !hasAuthority && ["native-auth-binding.v1.json", "shared-native-mode.v1.json"].includes(input.authorityFile);
+        const newOptionalAuthority = !hasAuthority && (["native-auth-binding.v1.json", "shared-native-mode.v1.json"].includes(input.authorityFile)
+            || /^accounts\/ar_[A-Za-z0-9_-]{16,128}\/native-execution-home\.v1\/native-execution-home\.v1\.json$/.test(input.authorityFile));
         // New optional documents retain the original exact-device contract until
         // their writer publishes the complete authority's persistent anchors.
         if (!capture && generation && !anchor)

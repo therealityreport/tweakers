@@ -265,3 +265,31 @@ test("legacy desktop-update action projections are rejected before preparation o
   assert.throws(() => client.readStatus(), /incompatible public action projection/);
   assert.equal(prepared, false);
 });
+
+
+test("Doctor status uses asynchronous execution so a pending manager does not block navigation", async () => {
+  let finish!: (value: string) => void;
+  let opened = false;
+  const client = createTweakersManagerClient({
+    homeDirectory: () => HOME,
+    readText: () => DESCRIPTOR,
+    createId: () => "status-async",
+    execute: (executable) => {
+      assert.equal(executable, "/usr/bin/codesign");
+      return "";
+    },
+    executeAsync: (executable, args) => {
+      if (executable === "/usr/bin/codesign") return Promise.resolve("");
+      assert.equal(args[0], "doctor-status");
+      return new Promise(resolve => { finish = resolve; });
+    },
+    spawnDetached: (_executable, args) => { opened = args[0] === "manager-open"; },
+  });
+  const pending = client.readDoctor();
+  client.openManager("updates");
+  assert.equal(opened, true);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(typeof finish, "function", "Doctor status must reach asynchronous manager execution");
+  finish(JSON.stringify({ requestId: "wrong-request" }));
+  await assert.rejects(pending, /invalid (Doctor )?report/);
+});

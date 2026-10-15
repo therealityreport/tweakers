@@ -1,6 +1,12 @@
+import { ownEntrypoint } from "./owned-entrypoint.mjs";
+// Check mode is a pure reader; the npm wrapper validates a stable snapshot.
+if (!process.argv.includes("--check")) await ownEntrypoint(import.meta.url);
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { guardStableInputs } from "./read-only-inputs.mjs";
+const require = createRequire(import.meta.url);
 import {
   findGeneratedConflictCopies,
   publishGeneratedDirectorySync,
@@ -18,6 +24,7 @@ export function discoverCanonicalTweaks(root) {
     const manifestPath = join(sourceDir, "manifest.json");
     if (!existsSync(manifestPath)) continue;
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error(`${folder}: manifest must be an object`);
     for (const field of ["id", "name", "version", "githubRepo"]) {
       if (typeof manifest[field] !== "string" || !manifest[field].trim()) throw new Error(`${folder}: manifest.${field} is required`);
     }
@@ -62,6 +69,23 @@ export function syncTweaks(root, {
   deferCatalogWrite = false,
   publicationDependencies,
 } = {}) {
+  // Compile owner and compatibility entries through one deterministic interface.
+  for (const folder of ["co.tweakers.projects", "ui-improvements"]) {
+    const builderPath = join(root, "tweaks", folder, "scripts/build-renderer-entry.cjs");
+    if (!existsSync(builderPath)) continue;
+    const builder = require(builderPath);
+    const entries = [
+      { path: join(root, "tweaks", folder, "index.js"), source: builder.renderRendererEntry() },
+      ...(builder.renderCompatibilityEntries?.() ?? []),
+    ];
+    for (const entry of entries) {
+      if (!inside(join(root, "tweaks"), resolve(entry.path))) throw new Error("renderer builder entry escapes tweaks root");
+      if (!existsSync(entry.path) || readFileSync(entry.path, "utf8") !== entry.source) {
+        if (check) throw new Error(`tweak synchronization is stale: ${folder} renderer entry`);
+        writeFileSync(entry.path, entry.source);
+      }
+    }
+  }
   const catalogPath = join(root, "store", "index.json");
   const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
   const nextCatalog = synchronizedCatalog(root, catalog, now);
@@ -183,6 +207,9 @@ function inside(root, candidate) {
 const invoked = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invoked) {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const result = syncTweaks(root, { check: process.argv.includes("--check") });
+  const check = process.argv.includes("--check");
+  const stable = check ? guardStableInputs([join(root,"tweaks"),join(root,"store"),join(root,"packages/installer/assets/runtime")]) : null;
+  const result = syncTweaks(root, { check });
+  stable?.();
   console.log(`tweak synchronization ${result.changed ? "updated" : "current"}: ${result.count} tweak(s)`);
 }

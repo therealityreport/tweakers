@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
@@ -7,7 +7,7 @@ import { copyInstallerAssets } from "../packages/installer/scripts/copy-assets.m
 import { findGeneratedConflictCopies } from "./generated-assets.mjs";
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "tweakers-copy-assets-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tweakers-copy-assets-")));
   mkdirSync(join(root, "packages", "loader"), { recursive: true });
   mkdirSync(join(root, "packages", "runtime", "dist"), { recursive: true });
   mkdirSync(join(root, "packages", "installer", "assets", "runtime", "tweaks", "stale"), { recursive: true });
@@ -47,6 +47,7 @@ function fixture() {
   }));
   writeFileSync(join(root, "tweaks", "alpha", "index.js"), "module.exports = {};\n");
   writeFileSync(join(root, "store", "index.json"), `${JSON.stringify({ schemaVersion: 1, entries: [] }, null, 2)}\n`);
+  for (const name of ["installer", "runtime"]) writeFileSync(join(root, "packages", name, "package.json"), JSON.stringify({ name, dependencies: {} }));
   return root;
 }
 
@@ -194,4 +195,19 @@ test("copy-assets returns the exact private root when post-commit cleanup fails"
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test("managed runtime excludes development-only Electron declarations and desktop", () => {
+  const root=fixture();
+  try {
+    const electron=join(root,"node_modules/electron");
+    mkdirSync(join(electron,"dist/Electron.app/Contents/MacOS"),{recursive:true});
+    writeFileSync(join(electron,"dist/Electron.app/Contents/MacOS/Electron"),"vendor desktop");
+    writeFileSync(join(electron,"electron.d.ts"),"export declare const app: unknown;");
+    copyInstallerAssets(root);
+    const staged=join(root,"packages/installer/assets/managed-runtime/node_modules/electron");
+    assert.equal(existsSync(join(staged,"dist")),false);
+    assert.equal(existsSync(staged), false);
+  }finally{rmSync(root,{recursive:true,force:true});}
 });

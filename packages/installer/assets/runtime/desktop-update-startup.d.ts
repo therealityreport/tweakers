@@ -1,3 +1,4 @@
+import { readAcceptedRuntimeRepairBootstrap, readAcceptedRuntimeRepairHistoricalBootstrap, readSupersededNativeReplacementHistoricalBootstrap, type AcceptedRuntimeRepairBootstrapProjection } from "./accepted-runtime-repair-bootstrap";
 export interface DesktopUpdateStartupEvent {
     event: "desktop-update-startup-reconcile";
     result: "submitted" | "window-unavailable" | "failed";
@@ -44,6 +45,10 @@ export interface TweakersVariantBootstrapOptions {
      * to the physical archive bytes rather than Electron's unpacked view.
      */
     fileSystem?: TweakersVariantFilesystem;
+    /** Actual production verifier is always used unless a focused fixture supplies this seam. */
+    runtimeRepairVerifier?: typeof readAcceptedRuntimeRepairBootstrap;
+    runtimeRepairHistoricalVerifier?: typeof readAcceptedRuntimeRepairHistoricalBootstrap;
+    nativeReplacementHistoricalVerifier?: typeof readSupersededNativeReplacementHistoricalBootstrap;
 }
 export interface TweakersVariantFilesystem {
     existsSync(path: string): boolean;
@@ -69,7 +74,7 @@ export declare function fingerprintTweakersVariantGeneration(path: string, fileS
  * generation is not exactly committed and immutable. The broker calls this
  * after it has established the loader-provided user-root/runtime environment.
  */
-export declare function assertTweakersVariantBootstrap(options?: TweakersVariantBootstrapOptions): void;
+export declare function assertTweakersVariantBootstrap(options?: TweakersVariantBootstrapOptions): AcceptedRuntimeRepairBootstrapProjection | null;
 /**
  * Schedule one bounded startup reconciliation after Electron is ready. A
  * missing visible window or launcher failure is diagnostic evidence only; it

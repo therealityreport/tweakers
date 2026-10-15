@@ -212,9 +212,10 @@ test("recovery refuses live writers and restores only journaled postimages", (t)
       if (phase === "publishing" && ++publishingBoundaries === 2) throw new Error("simulated interruption after first rename");
     },
   };
-  if (preview.intentFingerprint === null || preview.precondition === null) throw new Error("fixture preview did not produce an apply proof");
+  const { intentFingerprint, precondition } = preview;
+  if (intentFingerprint === null || precondition === null) throw new Error("fixture preview did not produce an apply proof");
   assert.throws(() => applyPortableHandoff({
-    ...f.input, transactionId, apply: true, expectedIntentFingerprint: preview.intentFingerprint, precondition: preview.precondition,
+    ...f.input, transactionId, apply: true, expectedIntentFingerprint: intentFingerprint, precondition,
   }, interrupted), /simulated interruption/);
   assert.notDeepEqual(readFileSync(f.destinationGlobal), before, "the test interrupted after the first durable publish");
 

@@ -1,0 +1,4 @@
+/** Fixed owner-private reason codes. Never accept provider errors or account values. */
+export declare const BROKER_ADMISSION_STAGES_V1: readonly ["pool-lease", "pool-closed", "pool-account", "pool-factory", "pool-capacity", "pool-child-identity", "pool-factory-exception", "factory-handoff", "factory-native-binding", "factory-execution-home", "factory-service", "factory-history", "factory-continuity", "factory-arguments", "factory-mode", "factory-plan", "factory-resolver", "factory-child", "ledger-unavailable", "ledger-source", "ledger-hydration", "account-plan", "account-session", "service-create", "service-final-authority"];
+export type BrokerAdmissionStageV1 = typeof BROKER_ADMISSION_STAGES_V1[number];
+export declare function brokerAdmissionStageV1(value: unknown): BrokerAdmissionStageV1 | undefined;

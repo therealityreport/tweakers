@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV = exports.ACCOUNTS_BROKER_BLOCKED_SOURCE = exports.CODEX_APP_SERVER_PARENT_SOURCE = exports.ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS = exports.ACCOUNTS_BROKER_IDENTITY_FD_ENV = void 0;
+exports.SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV = exports.ACCOUNTS_BROKER_BLOCKED_SOURCE = exports.CODEX_APP_SERVER_PARENT_SOURCE = exports.ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS = exports.ACCOUNTS_BROKER_IDENTITY_FD_ENV = exports.ACCOUNTS_STARTUP_POLICY_ENV = void 0;
 exports.resolveAccountsAuthorityMode = resolveAccountsAuthorityMode;
 exports.isCodexAppServerSpawn = isCodexAppServerSpawn;
 exports.buildCodexAppServerParentArgs = buildCodexAppServerParentArgs;
@@ -13,6 +13,8 @@ const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const config_1 = require("./account-router/config");
 const app_server_mux_1 = require("./account-router/app-server-mux");
+const desktop_app_tools_1 = require("./account-router/desktop-app-tools");
+exports.ACCOUNTS_STARTUP_POLICY_ENV = "TWEAKERS_ACCOUNTS_STARTUP_POLICY_V1";
 const INSTALL_MARKER = Symbol.for("co.tweakers.codex-app-server-parent");
 exports.ACCOUNTS_BROKER_IDENTITY_FD_ENV = "TWEAKERS_ACCOUNTS_BROKER_IDENTITY_FD";
 exports.ACCOUNTS_BROKER_IDENTITY_TIMEOUT_MS = 20_000;
@@ -171,7 +173,7 @@ setTimeout(() => process.exit(1), 1000).unref();
 `;
 function buildAccountsBrokerBlockedArgs(reason = "unavailable") {
     const safe = /^[a-z_]{1,64}$/.test(reason) ? reason : "unavailable";
-    return ["-e", exports.ACCOUNTS_BROKER_BLOCKED_SOURCE.replace("broker: unavailable", `broker: ${safe}; Open Tweakers Doctor`)];
+    return ["-e", exports.ACCOUNTS_BROKER_BLOCKED_SOURCE.replace("broker: unavailable", `broker: ${safe}; Open Tweakers Manager → Doctor`)];
 }
 /**
  * A derived desktop has its own Codex configuration home, but OpenAI's main
@@ -257,15 +259,27 @@ function installCodexAppServerParent(options = {}) {
                 bundledNodePath,
                 defaultPathExists: pathExists,
             });
+            const startupPolicy = options.secondaryVariant ? options.startupPolicyHandshake?.() ?? null : null;
+            if (startupPolicy && router?.kind !== "broker") {
+                throw new Error("Startup policy requires the authenticated shared broker");
+            }
             const childArgs = router?.kind === "mux"
                 ? buildAccountRouterMuxArgs(router.entrypoint, router.configPath, command, appServerArgs, options.secondaryVariant ? options.secondaryVariantSharedSqliteHome : undefined)
                 : router?.kind === "broker"
-                    ? buildAccountsBrokerAppServerArgs(router.entrypoint, router.configPath, command, appServerArgs)
+                    ? buildAccountsBrokerAppServerArgs(router.entrypoint, router.configPath, command, (0, desktop_app_tools_1.stripDesktopAppToolsCliOverrides)(appServerArgs))
                     : router?.kind === "blocked"
                         ? buildAccountsBrokerBlockedArgs(router.reason)
                         : buildCodexAppServerParentArgs(command, appServerArgs);
             const spawnOptions = sanitizeParentSpawnOptions(maybeOptions, options.secondaryVariant === true, router?.kind === "broker" || router?.kind === "blocked", router?.kind === "broker" ? router.identity : null);
-            const bootstrapIdentity = router?.kind === "broker" && !router.identity;
+            if (startupPolicy)
+                spawnOptions.env[exports.ACCOUNTS_STARTUP_POLICY_ENV] = JSON.stringify(startupPolicy);
+            let desktopAppTools = null;
+            if (router?.kind === "broker" && !startupPolicy) {
+                desktopAppTools = (0, desktop_app_tools_1.captureDesktopAppToolsContext)(resourcesPath, maybeOptions?.env ?? process.env, options.readDesktopAppToolsManifest, command);
+                if (desktopAppTools)
+                    spawnOptions.env[desktop_app_tools_1.DESKTOP_APP_TOOLS_CONTEXT_ENV] = JSON.stringify(desktopAppTools);
+            }
+            const bootstrapIdentity = !startupPolicy && router?.kind === "broker" && !router.identity;
             if (bootstrapIdentity) {
                 // Native can start its app-server before creating the first window.
                 // Keep native stdin untouched while main binds the real renderer.
@@ -281,6 +295,8 @@ function installCodexAppServerParent(options = {}) {
                 childArgs,
                 spawnOptions,
             ]);
+            if (desktopAppTools)
+                options.onDesktopAppToolsContext?.(child, desktopAppTools);
             if (router?.kind === "blocked" && router.reason === "authentication_binding_invalid")
                 reportRecovery();
             if (router?.kind === "broker") {
@@ -303,6 +319,7 @@ function installCodexAppServerParent(options = {}) {
                     }
                 });
             }
+            options.onAppServerSpawn?.(child);
             installed.children.add(child);
             child.once?.("exit", () => installed.children.delete(child));
             child.once?.("error", () => installed.children.delete(child));
@@ -365,6 +382,8 @@ function accountRouterLaunch(options) {
 }
 function sanitizeParentSpawnOptions(options, secondaryVariant = false, brokerMode = false, brokerIdentity = null) {
     const env = { ...(options?.env ?? process.env) };
+    delete env[exports.ACCOUNTS_STARTUP_POLICY_ENV];
+    delete env[desktop_app_tools_1.DESKTOP_APP_TOOLS_CONTEXT_ENV];
     delete env.NODE_OPTIONS;
     if (secondaryVariant || brokerMode)
         env[exports.SECONDARY_VARIANT_REMOTE_CONTROL_DISABLED_ENV] = "1";

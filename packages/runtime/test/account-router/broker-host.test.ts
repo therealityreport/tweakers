@@ -3,7 +3,8 @@ import { readAndPreflightNativeHistorySourceStaticV1 } from "../../src/account-r
 import { bootstrapAccountContinuity, DEFAULT_ACCOUNT_CONTINUITY_SCHEMA_V1, prepareAccountConfigBeforeSpawn, loadSharedAccountBase } from "../../src/account-router/account-continuity";
 import { AccountsPreferencesStore } from "../../src/account-router/preferences";
 import { AccountModelCatalogsV1, requestedModelFromParamsV1 } from "../../src/account-router/models";
-import { installCodexAppServerParent, type MutableChildProcessModule, type SpawnFunction } from "../../src/codex-app-server-parent";
+import { captureDesktopAppToolsContext, type DesktopAppToolsContextV1 } from "../../src/account-router/desktop-app-tools";
+import { ACCOUNTS_STARTUP_POLICY_ENV, installCodexAppServerParent, type MutableChildProcessModule, type SpawnFunction } from "../../src/codex-app-server-parent";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -12,11 +13,90 @@ import { createServer } from "node:net";
 import { performance } from "node:perf_hooks";
 import { connectAccountsBrokerForStartup } from "../../src/account-router/broker-app-server";
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
-import { ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES, ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE, createBrokerStartupDiagnostics, AccountsBrokerOwnerV1, BrokerProcessChild, credentialStoreArgs, connectAccountsBrokerAppServerClient, type EnrollmentMaterializationFaultPointV1 } from "../../src/account-router/broker-host";
+
+test("official mapping reads inventory without rebuilding definition policy", () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const inventory = { schema_version: 1, native_base_root: "/fixture/native", plugins: [] };
+  let plans = 0, reads = 0;
+  Object.assign(host, {
+    officialNativeMode: () => ({}), officialExecutionHome: () => "/fixture/execution",
+    officialAccountInventory: () => { reads++; return { inventory, home: "/fixture/execution" }; },
+    officialAccountPlan: () => { plans++; return { inventory, plan: { withheldPlugins: {} } }; },
+  });
+  for (const method of ["app/list", "mcpServerStatus/list", "config/read", "skills/list"]) {
+    assert.deepEqual(host.officialPluginParams("account", method, {}), {});
+  }
+  for (const method of ["plugin/read", "skills/list", "hooks/list", "config/read"]) {
+    assert.deepEqual(host.officialPluginResponse("account", method, {}), {});
+  }
+  assert.equal(plans, 0, "ordinary reads must not rescan installed plugin definitions");
+  assert.equal(reads, 8, "every mapped request retains current inventory authority");
+  for (const method of ["plugin/list", "plugin/installed"]) host.officialPluginResponse("account", method, {});
+  assert.equal(plans, 2, "installed metadata retains withholding policy");
+  host.officialAccountInventory = () => null;
+  assert.throws(() => host.officialPluginParams("account", "config/read", {}), /authority unavailable/);
+  assert.throws(() => host.officialPluginResponse("account", "config/read", {}), /authority unavailable/);
+});
+
+test("official connection rows share one policy read and preserve OAuth isolation", async () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const child = {}, account = "fixture-account";
+  let plans = 0;
+  Object.assign(host, {
+    closed: false, children: new Map([[account, child]]), modelCatalogs: { revision: 1 },
+    connectionTargets: new Map(), secret: Buffer.alloc(32, 1),
+    requestBrokerChild: async () => ({ result: { data: [
+      { name: "isolated", status: "connected" }, { name: "ordinary", status: "connected" },
+    ] } }),
+    officialAccountPlan: () => { plans++; return { plan: { oauthIsolation: "blocked", blockedMcpNames: ["isolated"], withheldPlugins: {} } }; },
+  });
+  const result = await host.readProviderConnections(account, "mcp", child);
+  assert.equal(plans, 1);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].status, "unavailable");
+  assert.match(result[0].displayLabel, /OAuth storage needs isolation/);
+  assert.equal(result[1].status, "connected");
+  assert.equal(host.connectionTargets.size, 2);
+});
+
+test("runtime plugin ownership proof is opt-in, child-bound and cannot come from a backend", () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const child = { ready: true }, service = { verify: () => true, ledgerFingerprint: "current" };
+  let checks = 0;
+  const inventory = { plugins: [] };
+  Object.assign(host, {
+    stateRoot: "/fixture", officialNativeMode: () => ({}), officialExecutionHome: () => "/owned/execution-home",
+    officialAccountInventory: () => ({ inventory, home: "/owned/execution-home" }),
+    officialAccountPlan: () => ({ inventory, plan: { withheldPlugins: {} } }),
+    children: new Map([["account", child]]), officialPluginServices: new Map([["account", service]]),
+    officialPluginServiceChildren: new Map([[service, child]]), officialPluginGeneration: { fingerprint: "current" },
+    officialPluginLedger: { verifyAccountProjection: (input: any) => {
+      checks++; assert.equal(input.account, "account"); assert.equal(input.home, "/owned/execution-home");
+      assert.deepEqual(input.ids, ["documents", "pdf", "presentations", "spreadsheets", "template-creator"].map(name => `${name}@openai-primary-runtime`));
+      return [{ id: "documents@openai-primary-runtime", version: "native-version" }];
+    } },
+  });
+  const backend = { marketplaces: [], marketplaceLoadErrors: [], tweakersPluginOwnership: { policy: "forged" } };
+  assert.equal(host.officialPluginResponse("account", "plugin/list", backend).tweakersPluginOwnership, undefined);
+  assert.equal(checks, 0);
+  const result = host.officialPluginResponse("account", "plugin/list", backend, true);
+  assert.equal(result.tweakersPluginOwnership.policy, "follow-native");
+  assert.equal(result.tweakersPluginOwnership.plugins[0].version, "native-version");
+  assert.equal(checks, 1);
+  host.officialPluginServiceChildren.set(service, {});
+  assert.throws(() => host.officialPluginResponse("account", "plugin/list", backend, true), /ownership unavailable/);
+  host.officialNativeMode = () => null;
+  assert.equal(host.officialPluginResponse("account", "plugin/list", backend, true).tweakersPluginOwnership, undefined);
+  assert.deepEqual(host.officialPluginParams("account", "plugin/list", { tweakersRuntimeOwnership: true, cwds: [] }), { cwds: [] });
+});
+import { EventEmitter } from "node:events";
+import { createStartupPolicyAuthorization, createStartupPolicyHandshake } from "../../src/account-router/startup-policy";
+import { PassThrough } from "node:stream";
+import { ACCOUNTS_BROKER_APP_SERVER_MAX_FRAME_BYTES, ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE, createBrokerStartupDiagnostics, AccountsBrokerOwnerV1, BrokerProcessChild, credentialStoreArgs, isolatedAuthHelperArgs, connectAccountsBrokerAppServerClient, type EnrollmentMaterializationFaultPointV1 } from "../../src/account-router/broker-host";
 import { createOpaqueAppToolsRef, createOpaqueRendererRef, type BrokerDesktopIdentityBindingV1 } from "../../src/account-router/broker";
 import { AccountsBrokerManagerClientV1, AccountsBrokerSocketClientV1, accountsBrokerSocketPath } from "../../src/account-router/broker-socket";
 import { CanonicalHistoryStoreV1 } from "../../src/account-router/canonical-history";
@@ -34,8 +114,11 @@ import {
   sharedPluginsManifestForSource,
 } from "../../src/account-router/app-server-mux";
 import { RouterStateStore } from "../../src/account-router/state-store";
-import { parseNativeBrowserChildRequestV1, parseNativeRequestV1 } from "../../src/account-router/native-request";
-import type { AccountsBrokerV1 } from "../../src/account-router/broker";
+import { NativeTransferCoordinatorV1 } from "../../src/account-router/native-transfer";
+import { NativeProjectSnapshotReaderV1, NativeProjectSnapshotPagesV1, nativeProjectRpcRowV1 } from "../../src/account-router/native-project-snapshot";
+import { NativeLegacyProjectsV1 } from "../../src/account-router/native-legacy-projects";
+import { parseNativeBrowserChildRequestV1, parseNativeRequestV1, requestNativeUsageAnalyticsV1 } from "../../src/account-router/native-request";
+import { AccountsBrokerV1, createBrokerHandshakeProof } from "../../src/account-router/broker";
 import {
   ACCOUNT_ROUTER_PROTOCOL_FINGERPRINT,
   type BrokerEventV1,
@@ -43,7 +126,9 @@ import {
   type OpaqueAccountId,
   type OpaqueAppToolsRef,
   type OpaqueConnectionDefinitionRef,
+  type OpaqueConversationId,
   type OpaqueRendererRef,
+  type OpaqueTaskRef,
   type RouterConfigV3,
 } from "../../src/account-router/types";
 import { publishHistoryAdoptionEvidence } from "./history-adoption-fixtures";
@@ -77,13 +162,33 @@ test("startup diagnostics retain only bounded stage codes and timings", () => {
   chmodSync(root, 0o700);
   const record = createBrokerStartupDiagnostics(root);
   record({ stage: "probe", code: "private-secret", elapsedMs: 1 } as any);
+  record({ stage: "child", code: "initialize_timeout", elapsedMs: 30_000 });
   for (let index = 0; index < 20; index += 1) record({ stage: "probe", code: "probe_timeout", elapsedMs: index, secret: "private-secret" } as any);
   const files = readdirSync(root);
   assert.equal(files.length, 1);
   const bytes = readFileSync(join(root, files[0]!), "utf8");
   assert.equal(bytes.includes("private-secret"), false);
   assert.equal(JSON.parse(bytes).events.length, 16);
+  assert.deepEqual(JSON.parse(bytes).events[0], { stage: "child", code: "initialize_timeout", elapsedMs: 30_000 });
   assert.equal(lstatSync(join(root, files[0]!)).mode & 0o777, 0o600);
+  record({ stage: "child", code: "protocol_error", elapsedMs: 40_000, preparationStage: "client-session", secret: "private-secret" } as any);
+  record({ stage: "child", code: "protocol_error", elapsedMs: 40_001, preparationStage: "private-secret" } as any);
+  const terminal = JSON.parse(readFileSync(join(root, files[0]!), "utf8"));
+  assert.equal(terminal.events.length, 16);
+  assert.deepEqual(terminal.events.at(-1), { stage: "child", code: "protocol_error", elapsedMs: 40_000, preparationStage: "client-session" });
+  assert.equal(JSON.stringify(terminal).includes("private-secret"), false);
+});
+
+test("startup diagnostics prune old inactive records but keep the current owner", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-startup-retention-")));
+  chmodSync(root, 0o700);
+  for (let index = 0; index < 25; index += 1) {
+    writeFileSync(join(root, `broker-startup-999999-${index.toString(16).padStart(16, "0")}.json`), "{}", { mode: 0o600 });
+  }
+  createBrokerStartupDiagnostics(root)({ stage: "probe", code: "started", elapsedMs: 1 });
+  const files = readdirSync(root).filter((name) => name.startsWith("broker-startup-"));
+  assert.equal(files.length, 21);
+  assert.ok(files.some((name) => name.startsWith(`broker-startup-${process.pid}-`)));
 });
 
 test("startup connection retries stop at the remaining deadline and bound a stalled handshake", async () => {
@@ -164,6 +269,18 @@ test("native HTTP requests use only the selected account credentials and fixed u
     assert.equal(calls[0]!.init.redirect, "manual");
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(input), init: init ?? {} });
+      return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const analytics = await (owner as any).dispatchDeviceAction({
+      kind: "native.request", opaqueAccountId: fixture.accounts[1], surface: "usage", method: "usage.analytics.read",
+      params: { kind: "plan-history", days: 7 },
+    });
+    assert.deepEqual(analytics, { outcome: "accepted", value: { status: "unsupported", source: "plan_limit_history", value: null } });
+    const analyticsHeaders = calls[1]!.init.headers as Record<string, string>;
+    assert.equal(analyticsHeaders.authorization, "Bearer fixture-native-access-1");
+    assert.equal(analyticsHeaders["chatgpt-account-id"], fixture.rawAccounts[1]);
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
       return new Response(new Uint8Array(4 * 1024 * 1024 + 1), { status: 200 });
     }) as typeof fetch;
     const oversized = await (owner as any).dispatchDeviceAction({
@@ -171,7 +288,7 @@ test("native HTTP requests use only the selected account credentials and fixed u
       params: { verb: "GET", path: "/ps/plugins/installed", options: { parameters: { query: {} } } },
     });
     assert.deepEqual(oversized, { outcome: "ambiguous" }, "an unbounded provider body is rejected without exposing it");
-    assert.equal(calls.length, 2, "a rejected provider response is not retried");
+    assert.equal(calls.length, 3, "a rejected provider response is not retried");
   } finally {
     globalThis.fetch = originalFetch;
     await owner.close();
@@ -203,15 +320,136 @@ test("plugins native skills/list accepts only bounded canonical cwd parameters a
     assert.deepEqual(parseNativeBrowserChildRequestV1("plugin/list", { marketplaceKinds: ["local"] }),
       { method: "plugin/list", params: { marketplaceKinds: ["local"] } });
     assert.equal(parseNativeBrowserChildRequestV1("plugin/list", { marketplaceKinds: ["remote"] }), null);
-    const browserEdits = ["mcp_servers.node_repl", "mcp_servers.computer-use", "mcp_servers.cua_repl"].map((keyPath) =>
-      ({ keyPath, value: { command: "fixture" }, mergeStrategy: "replace" })).concat([
+    const browserEdits: Array<{ keyPath: string; value: { command: string } | null; mergeStrategy: string }> = [
+      ...["mcp_servers.node_repl", "mcp_servers.computer-use", "mcp_servers.cua_repl"].map((keyPath) =>
+        ({ keyPath, value: { command: "fixture" }, mergeStrategy: "replace" })),
         { keyPath: "shell_environment_policy.set.BROWSER_USE_AVAILABLE_BACKENDS", value: null, mergeStrategy: "replace" },
         { keyPath: "shell_environment_policy.set.NODE_REPL_TRUSTED_CODE_PATHS", value: null, mergeStrategy: "replace" },
-      ]);
+    ];
     assert.ok(parseNativeBrowserChildRequestV1("config/batchWrite", { edits: browserEdits, expectedVersion: null, filePath: null, reloadUserConfig: false }));
     assert.equal(parseNativeBrowserChildRequestV1("config/batchWrite", { edits: browserEdits.slice(1), expectedVersion: null, filePath: null, reloadUserConfig: false }), null);
     assert.deepEqual(await host.invokeNativeBrowserRequest(desktop.rendererRef, fixture.accounts[1], "plugin/list", { marketplaceKinds: ["local"] }), { ok: true });
   } finally { desktop?.close(); await owner.close(); }
+});
+
+test("usage analytics accepts only the fixed bounded read contract", () => {
+  const thread = { thread_id: "thread-a", created_at: "2026-09-18T00:00:00.000Z", descendant_thread_ids: ["thread-b"] };
+  assert.deepEqual(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "thread-usage", threads: [thread] } }), {
+    surface: "usage", method: "usage.analytics.read", params: { kind: "thread-usage", threads: [thread] },
+  });
+  assert.deepEqual(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "thread-usage", preferred_source: "query_v1", threads: [thread] } }), {
+    surface: "usage", method: "usage.analytics.read", params: { kind: "thread-usage", preferred_source: "query_v1", threads: [thread] },
+  });
+  assert.deepEqual(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "plan-history", days: 7 } }), {
+    surface: "usage", method: "usage.analytics.read", params: { kind: "plan-history", days: 7 },
+  });
+  assert.deepEqual(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: {
+    kind: "daily-history", start_date: "2026-09-17", end_date: "2026-09-23",
+  } })?.params, { kind: "daily-history", start_date: "2026-09-17", end_date: "2026-09-23" });
+  assert.deepEqual(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "credit-events" } })?.params,
+    { kind: "credit-events" });
+  assert.equal(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: {
+    kind: "daily-history", start_date: "2026-09-17", end_date: "2026-10-17",
+  } }), null, "daily reads cannot exceed the reviewed chart range");
+  assert.equal(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: {
+    kind: "daily-history", start_date: "2026-09-17", end_date: "2026-09-23", accountId: "other",
+  } }), null, "the renderer cannot supply an account override");
+  assert.equal(parseNativeRequestV1({ surface: "apps", method: "usage.analytics.read", params: { kind: "plan-history", days: 7 } }), null);
+  assert.equal(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "plan-history", days: 30 } }), null);
+  assert.equal(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: { kind: "thread-usage", preferred_source: "query_v2", threads: [thread] } }), null);
+  assert.equal(parseNativeRequestV1({ surface: "usage", method: "usage.analytics.read", params: {
+    kind: "thread-usage", threads: [{ ...thread, descendant_thread_ids: ["thread-a"] }],
+  } }), null, "overlapping task groups are rejected before provider access");
+});
+
+test("daily and credit history use the credentials of each selected account", async () => {
+  const fixture = createNativeFixture();
+  const originalFetch = globalThis.fetch;
+  const observed: Array<{ path: string; account: string | null }> = [];
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      const path = new URL(String(input)).pathname;
+      const account = headers.get("chatgpt-account-id");
+      observed.push({ path, account });
+      return new Response(JSON.stringify(path.endsWith("credit-usage-events") ? { events: [] }
+        : { units: "percent", data: [{ date: "2026-09-23", attribution: [{ value: account === fixture.rawAccounts[0] ? 12 : 49 }] }] }), { status: 200 });
+    }) as typeof fetch;
+    for (let index = 0; index < 2; index += 1) {
+      const home = join(fixture.homesRoot, "accounts", fixture.accounts[index]!, "codex-home");
+      const daily = await requestNativeUsageAnalyticsV1(home, { kind: "daily-history", start_date: "2026-09-17", end_date: "2026-09-23" });
+      const credits = await requestNativeUsageAnalyticsV1(home, { kind: "credit-events" });
+      assert.equal(daily.status, "full");
+      assert.equal(credits.status, "full");
+      assert.equal((daily.value as any).data[0].attribution[0].value, index === 0 ? 12 : 49);
+    }
+    assert.deepEqual(observed.map((entry) => entry.account), [fixture.rawAccounts[0], fixture.rawAccounts[0], fixture.rawAccounts[1], fixture.rawAccounts[1]]);
+    assert.deepEqual(observed.map((entry) => entry.path), [
+      "/backend-api/wham/usage/daily-token-usage-breakdown", "/backend-api/wham/usage/credit-usage-events",
+      "/backend-api/wham/usage/daily-token-usage-breakdown", "/backend-api/wham/usage/credit-usage-events",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("usage analytics preserves provider meaning and reuses an established legacy capability", async () => {
+  const fixture = createNativeFixture();
+  const codexHome = join(fixture.homesRoot, "accounts", fixture.accounts[1]!, "codex-home");
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ threads: [{ thread_id: "thread-a", estimated_usage_credits_micros: 2_500_000 }] }), { status: 200 });
+    }) as typeof fetch;
+    const legacy = await requestNativeUsageAnalyticsV1(codexHome, {
+      kind: "thread-usage", preferred_source: "query_v1",
+      threads: [{ thread_id: "thread-a", created_at: null, descendant_thread_ids: [] }],
+    });
+    assert.equal(legacy.status, "partial");
+    assert.equal((legacy.value as any).threads[0].balance_usage_credits, 2.5);
+    assert.deepEqual(calls, ["https://chatgpt.com/backend-api/wham/usage/thread_usage/query"], "a selected-account legacy capability never re-probes v2");
+
+    for (const [status, expected] of [[401, "authentication-error"], [429, "transient-error"], [500, "transient-error"]] as const) {
+      calls.length = 0;
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ error: "bounded" }), { status });
+      }) as typeof fetch;
+      const outcome = await requestNativeUsageAnalyticsV1(codexHome, {
+        kind: "thread-usage", threads: [{ thread_id: "thread-a", created_at: null, descendant_thread_ids: [] }],
+      });
+      assert.equal(outcome.status, expected);
+      assert.equal(calls.length, 1, `${status} must not fall through to another endpoint or account`);
+    }
+
+    calls.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ error: "missing" }), { status: 404 });
+    }) as typeof fetch;
+    const unsupported = await requestNativeUsageAnalyticsV1(codexHome, {
+      kind: "thread-usage", threads: [{ thread_id: "thread-a", created_at: null, descendant_thread_ids: [] }],
+    });
+    assert.equal(unsupported.status, "unsupported");
+    assert.deepEqual(calls.map((url) => url.split("/backend-api")[1]), ["/wham/usage/thread_usage/query_v2", "/wham/usage/thread_usage/query"]);
+
+    calls.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ error: "unavailable" }), { status: 503 });
+    }) as typeof fetch;
+    const unavailable = await requestNativeUsageAnalyticsV1(codexHome, {
+      kind: "thread-usage", preferred_source: "query_v1",
+      threads: Array.from({ length: 100 }, (_, index) => ({ thread_id: `thread-${index}`, created_at: null, descendant_thread_ids: [] })),
+    });
+    assert.equal(unavailable.status, "transient-error");
+    assert.equal(unavailable.value, null);
+    assert.ok(calls.length <= 8, "a provider outage has a bounded request budget");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 interface Fixture {
@@ -424,6 +662,10 @@ function createNativeFixture(): NativeFixture {
     issuedAt: "2026-09-05T12:00:00.000Z",
   };
   privateWrite(join(fixture.root, "native-history-source.v1.json"), JSON.stringify(signNativeHistorySourceV1(unsigned, fixture.secret)));
+  const metadataSource = accounts.find((account) => account.opaqueAccountId === unsigned.metadataAccountId)!;
+  // A cold native account still owns its saved project catalog. Match the
+  // provider fixture so saved reads exercise the same legacy membership join.
+  prepareNativeProjectDatabase(join(metadataSource.sqliteHome, "state_5.sqlite"), "INSERT INTO projects VALUES('project-source','Source','{}',0,0,0);");
   return { ...fixture, homesRoot };
 }
 
@@ -438,6 +680,221 @@ function enableNativeBalancedTokens(fixture: NativeFixture): void {
   fixture.config = { ...draft, fingerprint: routerConfigFingerprint(draft) };
   privateWrite(join(fixture.root, "account-router-config.json"), JSON.stringify(fixture.config));
 }
+
+function prepareNativeProjectDatabase(db: string, rows: string): void {
+  const result = spawnSync("/usr/bin/sqlite3", [db], { encoding: "utf8", input: `
+    CREATE TABLE IF NOT EXISTS _sqlx_migrations(version BIGINT PRIMARY KEY,description TEXT NOT NULL,success BOOLEAN NOT NULL,checksum BLOB NOT NULL);
+    INSERT OR IGNORE INTO _sqlx_migrations VALUES(59,'thread attachment reverse lookup',1,X'4297DFFB4FB308F0C665E4D126B7D2A96DB7BE48EB2E13C7E1245A5D95C4DF4E66D64E79AD00FEC26B0910436703090C');
+    CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,updated_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS project_roots(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position));
+    DELETE FROM project_roots;
+    DELETE FROM projects;
+    ${rows}
+  ` });
+  assert.equal(result.status, 0, result.stderr); chmodSync(db, 0o600);
+}
+
+/** Prototype-only auth fixtures must include constructor-owned authority state. */
+function nativeProjectAuthorityFixtureState() {
+  return { nativeProjectAuthorities: new Map(), nativeProjectAuthorityRefreshes: new Map(), nativeProjectAuthRevisions: new Map(),
+    nativeProjectAuthorityGeneration: 0, nativeProjectPages: new NativeProjectSnapshotPagesV1(), clients: new Map(),
+    modelCatalogs: new AccountModelCatalogsV1(async () => ({ data: [] })) };
+}
+
+function savedMetadataProjectsFixture(fixture: NativeFixture) {
+  const source = JSON.parse(readFileSync(join(fixture.root, "native-history-source.v1.json"), "utf8"));
+  const account = source.accounts.find((entry: { opaqueAccountId: string }) => entry.opaqueAccountId === source.metadataAccountId);
+  const db = join(account.sqliteHome, "state_5.sqlite"), global = join(account.codexHome, ".codex-global-state.json"), auth = join(account.codexHome, "auth.json");
+  prepareNativeProjectDatabase(db, `
+    INSERT INTO projects VALUES('project-source','Tweakers','{"appearance.color":"blue","custom":"kept"}',0,1700000000000,1700000456000),('project-second','Second','{}',1,1700000789000,1700000890000);
+    INSERT INTO project_roots VALUES('project-source',0,'/Users/thomashulihan/Projects/tweakers');
+  `);
+  const saved = JSON.parse(readFileSync(global, "utf8"));
+  saved["local-projects"] = { "legacy-source-project": { id: "legacy-source-project", name: "Tweakers", rootPaths: ["/Users/thomashulihan/Projects/tweakers"], createdAt: 10, updatedAt: 20 } };
+  saved["project-order"] = ["legacy-source-project", "project-second"]; saved["pinned-project-ids"] = ["legacy-source-project"];
+  privateWrite(global, JSON.stringify(saved));
+  return { db, global, auth, account: source.metadataAccountId as OpaqueAccountId };
+}
+
+test("bound saved project reads survive cold/failed-auth child and never grant write or launch auth", async () => {
+  const fixture = createNativeFixture(), files = savedMetadataProjectsFixture(fixture);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any, messages: any[] = [];
+  const binding = desktopBinding("tweakers", 1401);
+  const client = { rendererRef: createOpaqueRendererRef(fixture.secret, 1401, binding), appToolsRef: createOpaqueAppToolsRef(fixture.secret, 1401, binding), clientKind: "tweakers", outstanding: 0, socket: { destroy() {} } };
+  try {
+    await owner.start(); host.clients.set(client.rendererRef, client); host.sendDesktop = (_client: unknown, message: unknown) => messages.push(message);
+    const before = [files.db, files.global, files.auth].map((path) => readFileSync(path));
+    for (const failed of [false, true]) {
+      if (failed) host.children.set(files.account, { ready: false, initializationFailure: "authentication" });
+      const id = `saved-${failed}`;
+      await host.processDesktop(client, { jsonrpc: "2.0", id, method: "tweakers/desktopProjects/read", params: {} }, null, null);
+      const result = await waitForMessage(messages, (message) => responseFor([message], id) !== undefined, "saved projection missing") as any;
+      assert.equal(result.result.source, "saved_local"); assert.equal(result.result.access, "read_only");
+      assert.equal(result.result.values["local-projects"]["legacy-source-project"].metadata.custom, "kept");
+      assert.equal(result.result.values["local-projects"]["legacy-source-project"].createdAt, 1_700_000_000_000, "desktop read preserves saved milliseconds");
+      assert.deepEqual(result.result.values["local-projects"]["legacy-source-project"].rootPaths, ["/Users/thomashulihan/Projects/tweakers"]);
+      assert.deepEqual(result.result.values["pinned-project-ids"], ["legacy-source-project"]);
+      assert.deepEqual(result.result.values["thread-project-assignments"]["legacy-a"], { projectKind: "local", projectId: "legacy-source-project" });
+      host.children.delete(files.account);
+    }
+    assert.equal(host.children.size, 0); assert.equal(host.activeAuthHelpers.size, 0); assert.equal(host.authHelperQueued.size, 0);
+    await host.processDesktop(client, { jsonrpc: "2.0", id: "saved-list", method: "project/list", params: { cursor: null, limit: 1 } }, null, null);
+    const first = await waitForMessage(messages, (message) => responseFor([message], "saved-list") !== undefined, "saved list missing") as any;
+    assert.equal(first.result.data[0].id, "project-source"); assert.ok(first.result.nextCursor);
+    assert.equal(first.result.data[0].createdAt, 1_700_000_000, "ordinary native list exposes integer seconds");
+    await host.processDesktop(client, { jsonrpc: "2.0", id: "saved-read", method: "project/read", params: { projectId: "project-source" } }, null, null);
+    const read = await waitForMessage(messages, (message) => responseFor([message], "saved-read") !== undefined, "saved read missing") as any;
+    assert.equal(read.result.project.createdAt, 1_700_000_000, "ordinary native read exposes integer seconds"); assert.equal(read.result.project.metadata.custom, "kept");
+    assert.equal((await host.requestNativeProject(files.account, "project/read", { projectId: "project-source" })).project.createdAt, 1_700_000_000,
+      "NativeProjectLinks receives the same native RPC seconds");
+    await host.processDesktop(client, { jsonrpc: "2.0", id: "saved-write", method: "project/update", params: { projectId: "project-source", name: "Forbidden" } }, null, null);
+    assert.ok((responseFor(messages, "saved-write") as { error?: unknown })?.error);
+    assert.deepEqual([files.db, files.global, files.auth].map((path) => readFileSync(path)), before);
+    assert.equal(host.children.size, 0); assert.equal(host.nativeProjectAuthorities.size, 0);
+    const saved = JSON.parse(readFileSync(files.global, "utf8")); saved["pinned-project-ids"] = []; privateWrite(files.global, JSON.stringify(saved));
+    await host.processDesktop(client, { jsonrpc: "2.0", id: "stale-page", method: "project/list", params: { cursor: first.result.nextCursor, limit: 1 } }, null, null);
+    const stale = await waitForMessage(messages, (message) => responseFor([message], "stale-page") !== undefined, "stale cursor response missing") as any;
+    assert.ok(stale.error, "cached page refuses source drift");
+    const schema = spawnSync("/usr/bin/sqlite3", [files.db, "ALTER TABLE projects ADD COLUMN unsupported TEXT;"], { encoding: "utf8" }); assert.equal(schema.status, 0);
+    assert.equal(await new NativeProjectSnapshotReaderV1(host.nativeHistory).read(), null, "schema drift fails closed");
+  } finally { host.children.delete(files.account); await owner.close(); }
+});
+
+test("project authority transitions notify with identical values, and online pagination is complete", async () => {
+  const fixture = createNativeFixture(), files = savedMetadataProjectsFixture(fixture);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any, messages: any[] = [], methods: string[] = [];
+  let authenticated = true;
+  const child = { ready: true, requestPrivate: async (method: string, params: unknown) => {
+    methods.push(method); assert.deepEqual(params, { refreshToken: false }); return { jsonrpc: "2.0", id: "private", result: { account: { authenticated } } };
+  } };
+  try {
+    await owner.start(); host.sendDesktop = (_client: unknown, message: unknown) => messages.push(message);
+    host.clients.set("fake", { socket: { destroy() {} } });
+    const saved = await host.readNativeProjectSnapshot(); assert.equal(saved.desktop.access, "read_only");
+    const providerProjects = saved.projects.map((row: unknown) => nativeProjectRpcRowV1(row, "saved_local"));
+    host.children.set(files.account, child);
+    const pages: unknown[] = [];
+    host.requestInitializedBrokerChild = async (_account: unknown, _child: unknown, method: string, params: any) => {
+      assert.equal(method, "project/list"); pages.push(params.cursor);
+      return { result: { data: [providerProjects[params.cursor ? 1 : 0]], nextCursor: params.cursor ? null : "provider-page" } };
+    };
+    assert.equal(await host.refreshNativeProjectAuthority(files.account, child), true);
+    const online = await host.readNativeProjectSnapshot(); assert.equal(online.source, "app_server"); assert.equal(online.desktop.access, "read_write");
+    assert.deepEqual(online.projects, providerProjects); assert.deepEqual(online.desktop.values, saved.desktop.values); assert.deepEqual(pages, [null, "provider-page"]);
+    authenticated = false;
+    assert.equal(await host.refreshNativeProjectAuthority(files.account, child), false);
+    assert.equal((await host.readNativeProjectSnapshot()).desktop.access, "read_only");
+    const transitions = messages.filter((message) => message.method === "tweakers/desktopProjects/changed");
+    assert.deepEqual(transitions.map((message) => message.params.access), ["read_write", "read_only"]);
+    assert.ok(transitions[1].params.authorityGeneration > transitions[0].params.authorityGeneration);
+    assert.deepEqual(methods, ["account/read", "account/read"]);
+    let finishOldProbe!: (response: unknown) => void;
+    const old = { ready: true, requestPrivate: () => new Promise((resolve) => { finishOldProbe = resolve; }) };
+    host.children.set(files.account, old);
+    const oldProbe = host.refreshNativeProjectAuthority(files.account, old);
+    const replacement = { ready: true, requestPrivate: async () => ({ result: { account: { authenticated: true } } }) };
+    host.children.set(files.account, replacement);
+    assert.equal(await host.refreshNativeProjectAuthority(files.account, replacement), true);
+    const generation = host.nativeProjectAuthorityGeneration;
+    finishOldProbe({ error: { code: 401 } });
+    assert.equal(await oldProbe, false);
+    assert.equal(host.nativeProjectAuthorities.get(files.account).child, replacement, "late old auth cannot revoke replacement write authority");
+    assert.equal(host.nativeProjectAuthorityGeneration, generation);
+    host.requestInitializedBrokerChild = async () => ({ result: { data: saved.projects, nextCursor: "loop" } });
+    assert.equal((await host.readNativeProjectSnapshot()).source, "saved_local", "repeated provider cursor falls back to the complete saved snapshot");
+  } finally { host.children.delete(files.account); await owner.close(); }
+});
+
+test("desktop write preparation renews expired project authority and rejects auth or child drift", async () => {
+  const fixture = createNativeFixture(), files = savedMetadataProjectsFixture(fixture);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any, messages: any[] = [], methods: string[] = [];
+  const client = { rendererRef: "project-write", outstanding: 0, socket: { destroy() {} } };
+  let authenticated = true, replaceDuringProbe = false;
+  const child = { ready: true, requestPrivate: async (method: string, params: unknown) => {
+    methods.push(method); assert.deepEqual(params, { refreshToken: false });
+    if (replaceDuringProbe) host.children.set(files.account, { ready: true });
+    return { result: { account: { authenticated } } };
+  } };
+  const read = async (id: string, params: unknown) => {
+    host.readDesktopProjects(client, { jsonrpc: "2.0", id, method: "tweakers/desktopProjects/read", params });
+    return await waitForMessage(messages, (message) => responseFor([message], id) !== undefined, "project preparation response missing") as any;
+  };
+  try {
+    await owner.start(); host.clients.set(client.rendererRef, client);
+    host.sendDesktop = (_client: unknown, message: unknown) => messages.push(message);
+    const saved = await host.readNativeProjectSnapshot();
+    const data = saved.projects.map((row: unknown) => nativeProjectRpcRowV1(row, "saved_local"));
+    host.children.set(files.account, child);
+    host.remoteBlocksDesktop = () => false; host.nativeHistoryWritersSafe = () => true;
+    host.requestInitializedBrokerChild = async () => ({ result: { data, nextCursor: null } });
+    host.setNativeProjectAuthority(files.account, child);
+    host.nativeProjectAuthorities.get(files.account).expiresAt = Date.now() - 1;
+    assert.equal((await read("ordinary", {})).result.access, "read_only");
+    assert.deepEqual(methods, [], "read-only discovery never starts authentication");
+    assert.equal((await read("prepare", { prepareWrite: true })).result.access, "read_write");
+    assert.deepEqual(methods, ["account/read"]);
+    authenticated = false;
+    assert.ok((await read("signed-out", { prepareWrite: true })).error);
+    assert.equal(host.nativeProjectAuthorities.size, 0);
+    authenticated = true; replaceDuringProbe = true;
+    assert.ok((await read("changed-child", { prepareWrite: true })).error);
+    assert.equal(host.nativeProjectAuthorities.size, 0);
+    assert.ok((await read("invalid-flag", { prepareWrite: false })).error);
+    assert.equal(host.activeAuthHelpers.size, 0, "write preparation does not spawn authentication helpers");
+  } finally { host.children.delete(files.account); await owner.close(); }
+});
+
+test("account update rejects a pre-signout true probe until a fresh post-update success", async () => {
+  const fixture = createNativeFixture();
+  const preflight = readAndPreflightNativeHistorySourceStaticV1(fixture.root, fixture.config, fixture.secret);
+  assert.equal(preflight.state, "ready"); if (preflight.state !== "ready") return;
+  const account = preflight.binding.source.metadataAccountId, host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  Object.assign(host, nativeProjectAuthorityFixtureState(), { nativeHistory: preflight.binding, children: new Map(), closed: false });
+  const responses: Array<(response: unknown) => void> = [];
+  const child = { ready: true, requestPrivate: () => new Promise((resolve) => responses.push(resolve)) };
+  host.children.set(account, child);
+  const old = host.refreshNativeProjectAuthority(account, child); assert.equal(responses.length, 1);
+  host.routeChildNotification(account, { jsonrpc: "2.0", method: "account/updated", params: { account: null } }, child);
+  assert.equal(responses.length, 2, "account update issues a new revision-specific probe");
+  const fresh = host.nativeProjectAuthorityRefreshes.get(account).work;
+  responses[1]!({ result: { account: { authenticated: false } } }); assert.equal(await fresh, false);
+  responses[0]!({ result: { account: { authenticated: true } } }); assert.equal(await old, false);
+  assert.equal(host.nativeProjectAuthorities.size, 0, "late pre-update true cannot grant write authority");
+  const after = host.refreshNativeProjectAuthority(account, child); assert.equal(responses.length, 3);
+  responses[2]!({ result: { account: { authenticated: true } } }); assert.equal(await after, true);
+  assert.equal(host.nativeProjectAuthorities.get(account).child, child);
+  clearTimeout(host.nativeProjectAuthorities.get(account).timer);
+});
+
+test("authority expiry forces an identical-data read-only generation and fresh success restores writes", async (context) => {
+  const fixture = createNativeFixture(), files = savedMetadataProjectsFixture(fixture);
+  const preflight = readAndPreflightNativeHistorySourceStaticV1(fixture.root, fixture.config, fixture.secret);
+  assert.equal(preflight.state, "ready"); if (preflight.state !== "ready") return;
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any, messages: any[] = [];
+  Object.assign(host, nativeProjectAuthorityFixtureState(), { nativeHistory: preflight.binding, children: new Map(), closed: false,
+    sendDesktop: (_client: unknown, message: unknown) => messages.push(message) });
+  host.clients.set("fake", {});
+  const child = { ready: true, requestPrivate: async () => ({ result: { account: { authenticated: true } } }) };
+  host.children.set(files.account, child);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const source = preflight.binding.accounts.find((entry) => entry.opaqueAccountId === files.account)!;
+  const legacy = new NativeLegacyProjectsV1(fixture.root, source.codexHome, files.account);
+  const projects = [{ id: "project-source", name: "Tweakers", roots: [], metadata: { custom: "kept" }, createdAt: 1_700_000_000, updatedAt: 1_700_000_456 }];
+  assert.equal(await host.refreshNativeProjectAuthority(files.account, child), true);
+  const before = legacy.desktopProjection(projects, { access: "read_write", source: "app_server", authorityGeneration: host.nativeProjectAuthorityGeneration })!;
+  const revision = host.nativeProjectAuthRevisions.get(files.account) ?? 0;
+  context.mock.timers.tick(60_000);
+  assert.equal(host.nativeProjectAuthorities.size, 0); assert.equal(host.nativeProjectAuthRevisions.get(files.account), revision + 1);
+  const after = legacy.desktopProjection(projects, { access: "read_only", source: "app_server", authorityGeneration: host.nativeProjectAuthorityGeneration })!;
+  assert.deepEqual(after.values, before.values); assert.ok(after.authorityGeneration > before.authorityGeneration);
+  assert.equal(await host.refreshNativeProjectAuthority(files.account, child), true);
+  assert.deepEqual(messages.map((message) => message.params.access), ["read_write", "read_only", "read_write"]);
+  assert.ok(messages[2].params.authorityGeneration > messages[1].params.authorityGeneration);
+  context.mock.timers.reset();
+});
 
 test("Doctor review leases use fresh pooled capacity, stable correlation, and verified native homes", async () => {
   const fixture = createNativeFixture();
@@ -747,7 +1204,6 @@ function fixtureChildProgram(
     const turns = new Map();
     let delayedTokenUsage = null;
     let pluginListAttempts = 0;
-    const failedFeatureReplays = new Set();
     let buffered = "";
     const write = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
     const paged = ${JSON.stringify(paged)};
@@ -817,11 +1273,18 @@ function fixtureChildProgram(
       if (message.method === "account/rateLimitResetCredit/consume") return respond(message.id, { outcome: "reset" });
       if (message.method === "experimentalFeature/enablement/set") {
         try { fs.appendFileSync(path.join(root, "fixture-feature-enablement.log"), JSON.stringify({ account, params: message.params }) + "\\n", { mode: 0o600 }); } catch {}
-        if (message.params?.failOnce === true && !failedFeatureReplays.has(message.params.feature)) {
-          failedFeatureReplays.add(message.params.feature);
+        const enablement = message.params?.enablement;
+        if (!enablement || typeof enablement !== 'object' || Array.isArray(enablement) || Object.keys(message.params).length !== 1 || Object.values(enablement).some(value => typeof value !== 'boolean')) {
+          return write({ jsonrpc: '2.0', id: message.id, error: { code: 500, message: 'fixture contract failure' } });
+        }
+        const failureFile = path.join(root, 'fixture-feature-failure-' + account + '.json');
+        const failures = fs.existsSync(failureFile) ? JSON.parse(fs.readFileSync(failureFile, 'utf8')) : [];
+        const failedFeature = Object.keys(enablement).find(feature => failures.includes(feature));
+        if (failedFeature) {
+          fs.writeFileSync(failureFile, JSON.stringify(failures.filter(feature => feature !== failedFeature)), { mode: 0o600 });
           return write({ jsonrpc: "2.0", id: message.id, error: { code: 500, message: "fixture replay failure" } });
         }
-        return respond(message.id, { ok: true });
+        return respond(message.id, { enablement });
       }
       if (message.method === "model/list") {
         const cursor = message.params && message.params.cursor;
@@ -837,7 +1300,7 @@ function fixtureChildProgram(
         },
       });
       if (message.method === "account/login/start") {
-        if (account.startsWith("be_")) {
+        if (home.includes(path.sep + "enrollments" + path.sep)) {
           fs.mkdirSync(home, { recursive: true, mode: 0o700 });
           fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: "enrolled-fixture-account", refresh_token: "never-public" } }), { mode: 0o600 });
           fs.writeFileSync(path.join(home, "config.toml"), "", { mode: 0o600 });
@@ -869,10 +1332,14 @@ function fixtureChildProgram(
       if (message.method === "mcpServerStatus/list") return respond(message.id, { data: [{ name: "fixture-mcp", status: "connected" }] });
       if (message.method === "mcpServer/oauth/login") return respond(message.id, { authorizationUrl: "https://example.invalid/oauth?state=fixture-state" });
       if (message.method === "fixture/crash") return process.exit(17);
+      if (["thread/start", "thread/fork", "thread/resume"].includes(message.method) && message.params?.config?.["mcp_servers.codex_app"]) {
+        fs.appendFileSync(path.join(root, "fixture-desktop-tools.log"), JSON.stringify({ account, method: message.method, config: message.params.config }) + "\\n", { mode: 0o600 });
+      }
       if (message.method === "thread/start") {
         try { fs.appendFileSync(path.join(root, "fixture-child-thread-starts.log"), account + "\\n", { mode: 0o600 }); } catch {}
         return respond(message.id, { threadId: "fresh-" + account + "-" + message.id });
       }
+      if (message.method === "thread/resume" && message.params?.config?.["mcp_servers.codex_app"]) return respond(message.id, { threadId: message.params.threadId });
       if (message.method === "thread/fork") return respond(message.id, { threadId: "forked-" + account + "-" + message.id });
       if (message.method === "turn/start") {
         if (Array.isArray(message.params && message.params.input) && message.params.input.some((entry) => entry && entry.text === "ack then wait")) {
@@ -923,6 +1390,7 @@ async function connectDesktop(
   webContentsId: number,
   clientKind: "chatgpt" | "tweakers",
   session?: string,
+  desktopAppTools?: DesktopAppToolsContextV1,
 ): Promise<DesktopClient> {
   const binding = desktopBinding(clientKind, webContentsId, session);
   const rendererRef = createOpaqueRendererRef(fixture.secret, webContentsId, binding);
@@ -934,6 +1402,7 @@ async function connectDesktop(
     clientKind,
     rendererRef,
     appToolsRef,
+    ...(desktopAppTools ? { desktopAppTools } : {}),
   }, (message) => messages.push(message));
   bridge.send({ jsonrpc: "2.0", id: "fixture-initialize", method: "initialize", params: {
     clientInfo: { name: "fixture-desktop", version: "1" },
@@ -1057,30 +1526,35 @@ function responseFor(messages: readonly JsonRpcMessage[], id: string | number): 
 let generatedSchemaRoot: string | null = null;
 function assertGeneratedSchema(name: string, value: unknown): void {
   if (generatedSchemaRoot === null) {
-    const root = mkdtempSync(join(tmpdir(), "accounts-protocol-schema-"));
-    const isolatedHome = join(root, "home");
-    mkdirSync(isolatedHome, { mode: 0o700 });
-    const schemaRoot = join(root, "schema");
-    const binary = process.env.TWEAKERS_TEST_CODEX_BINARY
-      ?? join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "codex.cmd" : "codex");
-    const generated = spawnSync(binary, ["app-server", "generate-json-schema", "--experimental", "--out", schemaRoot], {
-      env: {
-        PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
-        HOME: isolatedHome,
-        CODEX_HOME: isolatedHome,
-        CODEX_SQLITE_HOME: isolatedHome,
-      },
-      encoding: "utf8", timeout: 30_000,
-    });
-    assert.equal(generated.status, 0, `isolated app-server schema generation failed: ${generated.error?.message ?? generated.stderr}`);
-    generatedSchemaRoot = schemaRoot;
+    const binary = process.env.TWEAKERS_TEST_CODEX_BINARY;
+    if (binary) {
+      const root = mkdtempSync(join(tmpdir(), "accounts-protocol-schema-"));
+      const isolatedHome = join(root, "home");
+      mkdirSync(isolatedHome, { mode: 0o700 });
+      const schemaRoot = join(root, "schema");
+      const generated = spawnSync(binary, ["app-server", "generate-json-schema", "--experimental", "--out", schemaRoot], {
+        env: {
+          PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
+          HOME: isolatedHome,
+          CODEX_HOME: isolatedHome,
+          CODEX_SQLITE_HOME: isolatedHome,
+        },
+        encoding: "utf8", timeout: 30_000,
+      });
+      assert.equal(generated.status, 0, `isolated app-server schema generation failed: ${generated.error?.message ?? generated.stderr}`);
+      generatedSchemaRoot = schemaRoot;
+    } else {
+      generatedSchemaRoot = join(__dirname, "..", "fixtures", "app-server-schema-v2");
+      assert.equal(existsSync(join(generatedSchemaRoot, "v2", "ThreadReadResponse.json")), true,
+        "controlled app-server schema fixture is missing; set TWEAKERS_TEST_CODEX_BINARY for isolated generation");
+    }
   }
   const path = join(generatedSchemaRoot, "v2", `${name}.json`);
   assert.equal(existsSync(path), true, `generated app-server schema missing: ${name}`);
   // Ajv is a root test dependency. Keeping this at the test boundary avoids
   // shipping a schema validator in the desktop runtime.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Ajv = require("ajv") as new (options?: unknown) => { compile(schema: unknown): (input: unknown) => boolean & { errors?: unknown } };
+  const Ajv = require("ajv") as new (options?: unknown) => { compile(schema: unknown): ((input: unknown) => boolean) & { errors?: unknown } };
   const validate = new Ajv({ allErrors: true, jsonPointers: true, unknownFormats: "ignore", logger: false }).compile(JSON.parse(readFileSync(path, "utf8")) as unknown);
   assert.equal(validate(value), true, `${name} rejected canonical response: ${JSON.stringify(validate.errors)}`);
 }
@@ -1122,6 +1596,123 @@ test("synchronized owner contenders reserve before recovery and the loser leaves
   } finally {
     releaseWinner();
     await winner.close();
+  }
+});
+
+test("connect completes during a slow native probe and pending accounts stay held through recovery", async () => {
+  const fixture = createNativeFixture();
+  const originalProbe = NativeTransferCoordinatorV1.prototype.probeCapability;
+  const originalPending = NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery;
+  let releaseProbe!: () => void;
+  const probeGate = new Promise<void>((resolvePromise) => { releaseProbe = resolvePromise; });
+  let pending = true;
+  const events: Array<{ stage: string; code: string }> = [];
+  NativeTransferCoordinatorV1.prototype.probeCapability = function () { return probeGate.then(() => {
+    const capability = { state: "ready", writerLockProtocol: "shared_thread_writer_locks_v1", paginatedHistory: true } as const;
+    (this as any).capability = capability;
+    return capability;
+  }); };
+  NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = () => pending
+    ? [{ operationId: "startup-held", threadId: "existing-a", sourceAccountId: fixture.accounts[0]!, targetAccountId: fixture.accounts[1]!, phase: "preparing" }]
+    : [];
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)],
+    { onStartupStage: (event) => events.push(event) });
+  (owner as any).recoverInterruptedNativeTransfers = async () => {
+    assert.equal((owner as any).nativeTransferHeldAccounts.has(fixture.accounts[0]), true);
+    assert.equal((owner as any).nativeTransferHeldAccounts.has(fixture.accounts[1]), true);
+    pending = false;
+  };
+  try {
+    await owner.start();
+    assert.equal(events.some((event) => event.stage === "connect" && event.code === "ready"), true);
+    assert.equal(events.some((event) => event.stage === "probe" && event.code === "ready"), false);
+    for (const account of fixture.accounts) {
+      assert.equal((owner as any).nativeTransferHeldAccounts.has(account), true);
+      assert.equal((owner as any).remoteBlocksDesktop(account), true);
+    }
+    releaseProbe();
+    await (owner as any).nativeRecoveryPromise;
+    assert.equal(events.some((event) => event.stage === "probe" && event.code === "ready"), true);
+    assert.equal(events.some((event) => event.stage === "recovery" && event.code === "ready"), true);
+    for (const account of fixture.accounts) assert.equal((owner as any).nativeTransferHeldAccounts.has(account), false);
+  } finally {
+    releaseProbe();
+    NativeTransferCoordinatorV1.prototype.probeCapability = originalProbe;
+    NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = originalPending;
+    await owner.close();
+  }
+});
+
+test("official startup settles the private probe before opening sockets and preserves failed recovery holds", async () => {
+  for (const supported of [true, false]) {
+    const fixture = createNativeFixture();
+    const originalProbe = NativeTransferCoordinatorV1.prototype.probeCapability;
+    const originalPending = NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery;
+    let releaseProbe!: () => void;
+    const gate = new Promise<void>(resolve => { releaseProbe = resolve; });
+    const events: Array<{ stage: string; code: string }> = [];
+    NativeTransferCoordinatorV1.prototype.probeCapability = function () { return gate.then(() => {
+      const capability = supported
+        ? { state: "ready", writerLockProtocol: "shared_thread_writer_locks_v1", paginatedHistory: true } as const
+        : { state: "unsupported", reason: "probe_timeout" } as const;
+      (this as any).capability = capability; return capability;
+    }); };
+    let pending = true;
+    NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = () => pending
+      ? [{ operationId: "startup-held", threadId: "existing-a", sourceAccountId: fixture.accounts[0]!, targetAccountId: fixture.accounts[1]!, phase: "preparing" }] : [];
+    const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+      ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)], { onStartupStage: event => events.push(event) });
+    const host = owner as any;
+    const initialize = host.initializeNativeRemote.bind(host), originalMode = host.officialNativeMode;
+    // Isolate the ordering contract from unrelated plugin materialization.
+    host.initializeNativeRemote = async () => { await initialize(); host.officialNativeMode = () => ({}); };
+    host.recoverInterruptedNativeTransfers = async () => { pending = false; };
+    const starting = owner.start();
+    try {
+      await waitForCondition(() => events.some(event => event.stage === "probe" && event.code === "started"), "probe did not start");
+      assert.equal(events.some(event => event.stage === "connect"), false);
+      assert.equal(host.children.size, 0, "no primary projection can run through unopened sockets");
+      for (const account of fixture.accounts) assert.equal(host.nativeTransferHeldAccounts.has(account), true);
+      releaseProbe(); await starting; host.officialNativeMode = originalMode;
+      await host.nativeRecoveryPromise;
+      const probeIndex = events.findIndex(event => event.stage === "probe" && event.code === (supported ? "ready" : "probe_timeout"));
+      assert.ok(probeIndex >= 0);
+      assert.ok(events.findIndex(event => event.stage === "connect" && event.code === "ready") > probeIndex);
+      assert.equal(host.closed, false);
+      for (const account of fixture.accounts) assert.equal(host.nativeTransferHeldAccounts.has(account), !supported);
+    } finally {
+      releaseProbe(); await starting.catch(() => {}); host.officialNativeMode = originalMode;
+      NativeTransferCoordinatorV1.prototype.probeCapability = originalProbe;
+      NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = originalPending;
+      await owner.close();
+    }
+  }
+});
+
+test("probe failure after connect retains pending transfer holds", async () => {
+  const fixture = createNativeFixture();
+  const originalProbe = NativeTransferCoordinatorV1.prototype.probeCapability;
+  const originalPending = NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery;
+  NativeTransferCoordinatorV1.prototype.probeCapability = async () => ({ state: "unsupported", reason: "probe_timeout" });
+  NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = () =>
+    [{ operationId: "startup-held", threadId: "existing-a", sourceAccountId: fixture.accounts[0]!, targetAccountId: fixture.accounts[1]!, phase: "preparing" }];
+  const events: Array<{ stage: string; code: string }> = [];
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)],
+    { onStartupStage: (event) => events.push(event) });
+  try {
+    await owner.start();
+    await (owner as any).nativeRecoveryPromise;
+    assert.equal(events.some((event) => event.stage === "connect" && event.code === "ready"), true);
+    assert.equal(events.some((event) => event.stage === "probe" && event.code === "probe_timeout"), true);
+    assert.equal(events.some((event) => event.stage === "recovery" && event.code === "failed"), true);
+    for (const account of fixture.accounts) assert.equal((owner as any).nativeTransferHeldAccounts.has(account), true);
+    assert.equal((owner as any).closed, false);
+  } finally {
+    NativeTransferCoordinatorV1.prototype.probeCapability = originalProbe;
+    NativeTransferCoordinatorV1.prototype.pendingTransfersForRecovery = originalPending;
+    await owner.close();
   }
 });
 
@@ -1648,7 +2239,7 @@ test("host holds an ineligible continuation, forwards it once to the replacement
 
     const confirmed = await control.invoke({ version: 1, requestId: "confirm", command: "handoff.confirm", params: { handoffRef: handoff.handoffRef } });
     assert.equal(confirmed.ok, true);
-    const toolRequest = await waitForMessage(origin.messages, (message) => "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id, "origin app-tools request missing") as { id: string | number };
+    const toolRequest = await waitForMessage(origin.messages, (message) => "id" in message && "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id, "origin app-tools request missing") as { id: string | number };
     assert.equal(other.messages.some((message) => "method" in message && message.method === "app-tools/request"), false, "another desktop cannot receive origin app tools");
     assert.equal(origin.send({ jsonrpc: "2.0", id: toolRequest.id, result: { approved: true } }), true);
     const forwarded = await waitForMessage(origin.messages, (message) => responseFor([message], "continue") !== undefined, "forwarded continuation response missing");
@@ -1664,7 +2255,7 @@ test("host holds an ineligible continuation, forwards it once to the replacement
     const returnHandoff = returnHandoffEvent.payload as { handoffRef: string };
     const returnConfirmed = await control.invoke({ version: 1, requestId: "return-confirm", command: "handoff.confirm", params: { handoffRef: returnHandoff.handoffRef } });
     assert.equal(returnConfirmed.ok, true);
-    const returnTool = await waitForMessage(origin.messages, (message) => "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id && message.id !== toolRequest.id, "return origin app-tools request missing") as { id: string | number };
+    const returnTool = await waitForMessage(origin.messages, (message) => "id" in message && "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id && message.id !== toolRequest.id, "return origin app-tools request missing") as { id: string | number };
     origin.send({ jsonrpc: "2.0", id: returnTool.id, result: { approved: true } });
     await waitForMessage(origin.messages, (message) => responseFor([message], "return-to-a") !== undefined, "return completion response missing");
     await waitForMessage(origin.messages, (message) => "method" in message && message.method === "turn/completed" && origin.messages.filter((entry) => "method" in entry && entry.method === "turn/completed").length >= 3, "return segment completion missing");
@@ -1814,6 +2405,8 @@ for (const failure of ["exit", "stdin", "stdout", "kill-error"] as const) test(`
     assert.equal(turn?.phase, "ambiguous");
   } finally {
     origin.close();
+    // A crashed child leaves nothing provable to signal. The owner must still
+    // close (without signalling orphans) so a later launch can elect a broker.
     await owner.close();
   }
 });
@@ -1980,7 +2573,7 @@ test("a nonportable continuation is rejected before destination dispatch with a 
     assert.equal(internals.broker.updateQuota({ opaqueAccountId: fixture.accounts[0]!, freshness: "fresh", remainingPercent: 80, resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: 0, resetCredits: 0 }), true);
     assert.equal(internals.broker.updateQuota({ opaqueAccountId: fixture.accounts[1]!, freshness: "fresh", remainingPercent: 0, resetAt: "2099-09-03T00:00:00.000Z", observedAt: Date.now(), shortWindowPressure: 100, resetCredits: 0 }), true);
     origin.send({ jsonrpc: "2.0", id: "safe-after-gap", method: "turn/start", params: { threadId: publicThreadId, input: [{ type: "text", text: "later safe source turn" }] } });
-    const laterTool = await waitForMessage(origin.messages, (message) => "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id, "later safe source tool request missing") as { id: string | number };
+    const laterTool = await waitForMessage(origin.messages, (message) => "id" in message && "method" in message && message.method === "app-tools/request" && message.id !== sourceTool.id, "later safe source tool request missing") as { id: string | number };
     origin.send({ jsonrpc: "2.0", id: laterTool.id, result: { approved: true } });
     await waitForMessage(origin.messages, (message) => responseFor([message], "safe-after-gap") !== undefined, "later safe source completion missing");
     const currentHistory = await control.invoke({ version: 1, requestId: "history-after-gap", command: "history.read" }) as { ok: boolean; result?: { conversation?: { availability?: string; historyWarning?: string | null } | null } };
@@ -2290,7 +2883,7 @@ test("native source keeps provider ids, exact owners, and legacy project rows", 
 
     tweaks.send({ jsonrpc: "2.0", id: "unknown-resume", method: "thread/resume", params: { threadId: "unknown-native" } });
     await waitForMessage(tweaks.messages, (message) => responseFor([message], "unknown-resume") !== undefined, "unknown native resume response missing");
-    assert.ok("error" in (responseFor(tweaks.messages, "unknown-resume") as Record<string, unknown>));
+    assert.ok("error" in (responseFor(tweaks.messages, "unknown-resume") as unknown as Record<string, unknown>));
     assert.equal(new RouterStateStore(fixture.root, fixture.config).snapshot().threadOwners["unknown-native"], undefined, "unknown mutation never chooses a fallback owner");
 
     // Manual primary is B, so this source sidebar project must be imported as
@@ -2570,12 +3163,22 @@ test("native paged and archived lists preserve exact rows without leaking child 
     assert.deepEqual(archived.result.data.map((row) => row.id).sort(), ["archived-a", "archived-b"]);
     assert.equal(archived.result.nextCursor, null);
 
+    const writerCensus = owner as unknown as {
+      nativeThreadConflictAsync: (threadId: string) => Promise<"clear" | "conflict" | "unknown">;
+    };
+    const originalWriterCensus = writerCensus.nativeThreadConflictAsync.bind(owner);
+    const observedThreadIds: string[] = [];
+    writerCensus.nativeThreadConflictAsync = async (threadId) => {
+      observedThreadIds.push(threadId);
+      return originalWriterCensus(threadId);
+    };
     client.send({ jsonrpc: "2.0", id: "native-archive-exact-owner", method: "thread/archive", params: { threadId: "archived-b" } });
     const archive = await waitForMessage(client.messages, (message) => responseFor([message], "native-archive-exact-owner") !== undefined, "native archive response missing", 15_000) as {
       result: { threadId: string; archivedBy: string };
     };
     assert.equal(archive.result.threadId, "archived-b");
     assert.equal(archive.result.archivedBy, fixture.accounts[1], "archive remains bound to the exact historical account");
+    assert.deepEqual(observedThreadIds, ["archived-b"], "one successful desktop mutation performs exactly one writer census");
   } finally {
     await client?.close();
     await owner.close();
@@ -2703,7 +3306,7 @@ test("partial native lists remain readable but cannot bind an owner or resume", 
     assert.equal((responseFor(client.messages, "partial-read") as { result: { thread: { id: string } } }).result.thread.id, "existing-a");
     client.send({ jsonrpc: "2.0", id: "partial-resume", method: "thread/resume", params: { threadId: "existing-a" } });
     await waitForMessage(client.messages, (message) => responseFor([message], "partial-resume") !== undefined, "partial resume response missing");
-    assert.ok("error" in (responseFor(client.messages, "partial-resume") as Record<string, unknown>));
+    assert.ok("error" in (responseFor(client.messages, "partial-resume") as unknown as Record<string, unknown>));
     assert.equal(new RouterStateStore(fixture.root, fixture.config).snapshot().threadOwners["existing-a"], undefined, "unsafe resume does not persist transient proof");
   } finally {
     await client?.close();
@@ -2917,24 +3520,76 @@ test("feature broadcasts serialize the latest value and cold-child readiness inc
     await owner.start();
     desktop = await connectDesktop(fixture, 945, "tweakers");
     for (const [id, enabled] of [["feature-1", true], ["feature-2", false], ["feature-3", true]] as const) {
-      desktop.send({ jsonrpc: "2.0", id, method: "experimentalFeature/enablement/set", params: { feature: "fixture", enabled } });
+      desktop.send({ jsonrpc: "2.0", id, method: "experimentalFeature/enablement/set", params: { enablement: { fixture: enabled } } });
     }
     for (const id of ["feature-1", "feature-2", "feature-3"]) {
       await waitForMessage(desktop.messages, (message) => responseFor([message], id) !== undefined, `feature response ${id} missing`);
     }
     assert.equal(host.featureEnablements.size, 1);
-    assert.equal(host.featureEnablements.get("fixture").enabled, true);
+    assert.equal(host.featureEnablements.get("fixture").enablement.fixture, true);
     const rows = readFileSync(join(fixture.root, "fixture-feature-enablement.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
     for (const account of fixture.accounts) {
-      assert.deepEqual(rows.filter((row) => row.account === account).map((row) => row.params.enabled), [true, false, true]);
+      assert.deepEqual(rows.filter((row) => row.account === account).map((row) => row.params.enablement.fixture), [true, false, true]);
     }
     assert.equal(await host.quiesceIdleAccount(fixture.accounts[1]), true);
     const cold = host.broker.acquireChild(fixture.accounts[1]);
     assert.equal(await host.initializeChild(cold), true, "a cold protocol handshake completes only after the latest feature replay");
-    host.featureEnablements.set("retry-fixture", { feature: "retry-fixture", enabled: true, failOnce: true });
+    writeFileSync(join(fixture.root, `fixture-feature-failure-${fixture.accounts[1]}.json`), JSON.stringify(["retry-fixture"]), { mode: 0o600 });
+    host.featureEnablements.set("retry-fixture", { enablement: { "retry-fixture": true } });
     host.featureRevision += 1;
     assert.equal(await host.initializeChild(cold), false, "a real failed replay keeps a protocol-ready child unavailable");
     assert.equal(await host.initializeChild(cold), true, "the next readiness attempt retries the failed replay without deadlock");
+  } finally { desktop?.close(); await owner.close(); }
+});
+
+test("feature maps merge partial updates, accept empty no-ops and reject malformed routing payloads", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  let desktop: DesktopClient | null = null;
+  try {
+    await owner.start();
+    desktop = await connectDesktop(fixture, 946, "tweakers");
+    const send = async (id: string, params: unknown) => {
+      desktop!.send({ jsonrpc: "2.0", id, method: "experimentalFeature/enablement/set", params } as JsonRpcMessage);
+      return await waitForMessage(desktop!.messages, message => responseFor([message], id) !== undefined, `feature response ${id} missing`) as { result?: unknown; error?: unknown };
+    };
+    assert.equal((await send("map-first", { enablement: { alpha: true, beta: false } })).error, undefined);
+    assert.equal((await send("map-second", { enablement: { alpha: false, gamma: true } })).error, undefined);
+    assert.equal(host.featureEnablements.size, 3);
+    assert.deepEqual(host.featureEnablements.get("alpha"), { enablement: { alpha: false } });
+    assert.deepEqual(host.featureEnablements.get("beta"), { enablement: { beta: false } });
+    assert.deepEqual(host.featureEnablements.get("gamma"), { enablement: { gamma: true } });
+    const logPath = join(fixture.root, "fixture-feature-enablement.log");
+    const beforeEmpty = readFileSync(logPath, "utf8"), revision = host.featureRevision;
+    assert.deepEqual((await send("map-empty", { enablement: {} })).result, { enablement: {} });
+    assert.equal(host.featureRevision, revision);
+    assert.equal(readFileSync(logPath, "utf8"), beforeEmpty, "empty map is not forwarded or replayed");
+    const rows = beforeEmpty.trim().split("\n").map(line => JSON.parse(line));
+    for (const account of fixture.accounts) {
+      assert.deepEqual(rows.filter(row => row.account === account).map(row => row.params), [
+        { enablement: { alpha: true, beta: false } }, { enablement: { alpha: false, gamma: true } },
+      ], "each included child receives the original partial map");
+    }
+    for (const [index, params] of [null, {}, [], { feature: "alpha", enabled: true },
+      { enablement: null }, { enablement: [] }, { enablement: { alpha: 1 } },
+      { enablement: { alpha: {} } }, { enablement: { alpha: true }, threadId: "forbidden" },
+      { enablement: { alpha: true }, accountId: "forbidden" },
+      { enablement: { ["x".repeat(65_536)]: true } },
+    ].entries()) {
+      assert.ok((await send(`map-invalid-${index}`, params)).error);
+    }
+    assert.equal(host.featureRevision, revision);
+    assert.equal(readFileSync(logPath, "utf8"), beforeEmpty, "invalid maps never reach a child");
+    assert.equal(await host.quiesceIdleAccount(fixture.accounts[1]), true);
+    const cold = host.broker.acquireChild(fixture.accounts[1]);
+    assert.equal(await host.initializeChild(cold), true);
+    const replay = readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line)).slice(rows.length);
+    assert.deepEqual(replay.map(row => row.params), [
+      { enablement: { alpha: false } }, { enablement: { beta: false } }, { enablement: { gamma: true } },
+    ], "cold child replays current values including features omitted by later updates");
+    assert.ok(replay.every(row => row.account === fixture.accounts[1]));
   } finally { desktop?.close(); await owner.close(); }
 });
 
@@ -2953,7 +3608,7 @@ test("feature acknowledgements bind the exact child and failed peers retain the 
     let replacement: any;
     host.requestBrokerChild = async (account: string, child: any, method: string, params: any) => {
       const response = await request(account, child, method, params);
-      if (method !== "experimentalFeature/enablement/set" || params.feature !== "replacement-race") return response;
+      if (method !== "experimentalFeature/enablement/set" || !Object.hasOwn(params.enablement, "replacement-race")) return response;
       if (account === fixture.accounts[0]) acknowledgeFirst();
       else {
         await firstAcknowledged;
@@ -2963,19 +3618,20 @@ test("feature acknowledgements bind the exact child and failed peers retain the 
       }
       return response;
     };
-    desktop.send({ jsonrpc: "2.0", id: "feature-replacement", method: "experimentalFeature/enablement/set", params: { feature: "replacement-race", enabled: true } });
+    desktop.send({ jsonrpc: "2.0", id: "feature-replacement", method: "experimentalFeature/enablement/set", params: { enablement: { "replacement-race": true } } });
     const response = await waitForMessage(desktop.messages, (message) => responseFor([message], "feature-replacement") !== undefined, "feature broadcast response missing") as { error?: unknown };
     assert.equal(response.error, undefined);
     host.requestBrokerChild = request;
     assert.ok(replacement);
     assert.equal(await host.initializeChild(replacement), true);
     const rows = readFileSync(join(fixture.root, "fixture-feature-enablement.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    assert.equal(rows.filter((row) => row.account === fixture.accounts[0] && row.params.feature === "replacement-race").length, 2,
+    assert.equal(rows.filter((row) => row.account === fixture.accounts[0] && Object.hasOwn(row.params.enablement, "replacement-race")).length, 2,
       "the replacement must replay the feature acknowledged by the old child");
-    desktop.send({ jsonrpc: "2.0", id: "feature-partial", method: "experimentalFeature/enablement/set", params: { feature: "failed-peer", enabled: true, failOnce: true } });
+    for (const account of fixture.accounts) writeFileSync(join(fixture.root, `fixture-feature-failure-${account}.json`), JSON.stringify(["failed-peer"]), { mode: 0o600 });
+    desktop.send({ jsonrpc: "2.0", id: "feature-partial", method: "experimentalFeature/enablement/set", params: { enablement: { "failed-peer": true } } });
     const partial = await waitForMessage(desktop.messages, (message) => responseFor([message], "feature-partial") !== undefined, "partial feature response missing") as { error?: unknown };
     assert.ok(partial.error, "the caller learns that the broadcast was not fully applied");
-    assert.equal(host.featureEnablements.get("failed-peer").enabled, true);
+    assert.equal(host.featureEnablements.get("failed-peer").enablement["failed-peer"], true);
     for (const account of fixture.accounts) {
       assert.equal(await host.initializeChild(host.broker.acquireChild(account)), true,
         "a peer retries the retained request before serving another operation");
@@ -3001,6 +3657,98 @@ test("fork responses use the returned fork conversation and model catalogs consu
     assert.deepEqual(catalog.data.map((row: { id: string }) => row.id), [`first-${fixture.accounts[0]}`, `second-${fixture.accounts[0]}`]);
     assert.equal(catalog.nextCursor, null);
   } finally { desktop?.close(); await owner.close(); }
+});
+
+test("authenticated desktop tools bridge carries native policy through fresh resume fork and reconnect", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const resources = "/Applications/Tweakers.app/Contents/Resources";
+  const context = captureDesktopAppToolsContext(resources, { CODEX_APP_TOOLS_PIPE_PATH: "/private/tmp/fixture-own-desktop.sock" },
+    () => JSON.stringify({ mcpServers: { codex_app: {
+      command: "./launch", args: ["./server.mjs"], cwd: ".", enabled: false,
+      env_vars: ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_BROWSER_USE_NODE_PATH", "CODEX_ELECTRON_RESOURCES_PATH", "CODEX_CLI_PATH"],
+      default_tools_approval_mode: "approve", tools: { create_thread: { approval_mode: "prompt" } },
+    } } }))!;
+  let desktop: DesktopClient | null = null;
+  try {
+    await owner.start();
+    desktop = await connectDesktop(fixture, 947, "tweakers", "desktop-tools-fixture-session", context);
+    const request = async (id: string, method: string, params: Record<string, unknown>) => {
+      desktop!.send({ jsonrpc: "2.0", id, method, params: { ...params,
+        config: { "mcp_servers.codex_app": { command: "renderer-forged", default_tools_approval_mode: "approve" } } } });
+      const response = await waitForMessage(desktop!.messages, message => responseFor([message], id) !== undefined, `${id} missing`) as any;
+      assert.equal(response.error, undefined); return response;
+    };
+    const start = await request("bound-start", "thread/start", {});
+    await request("bound-resume", "thread/resume", { threadId: start.result.threadId });
+    const fork = await request("bound-fork", "thread/fork", { threadId: start.result.threadId });
+    assert.notEqual(fork.result.threadId, start.result.threadId);
+    const previous = desktop;
+    desktop = await connectDesktop(fixture, 947, "tweakers", "desktop-tools-fixture-session", context);
+    await previous.whenClosed;
+    await request("bound-reconnect", "thread/resume", { threadId: fork.result.threadId });
+    const rows = readFileSync(join(fixture.root, "fixture-desktop-tools.log"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(rows.map(row => row.method), ["thread/start", "thread/resume", "thread/fork", "thread/resume"]);
+    for (const row of rows) assert.deepEqual(row.config["mcp_servers.codex_app"], context.definition,
+      "all native policies and main-owned environment survive renderer forgery and reconnect");
+  } finally { desktop?.close(); await owner.close(); }
+});
+
+test("model invalidation during writer census or desktop rebind retries before reserving or dispatching a turn", async () => {
+  const fixture = createNativeFixture();
+  const preflight = readAndPreflightNativeHistorySourceStaticV1(fixture.root, fixture.config, fixture.secret);
+  assert.equal(preflight.state, "ready"); if (preflight.state !== "ready") return;
+  const account = fixture.accounts[0]!, other = fixture.accounts[1]!;
+  for (const pauseAt of ["first-census", "desktop-rebind", "second-census"]) {
+    const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+    const client = { rendererRef: "renderer-model-census", clientKind: "tweakers", outstanding: 0 };
+    const request = { jsonrpc: "2.0" as const, id: `model-${pauseAt}`, method: "turn/start", params: { threadId: "existing-a", model: "selected-native" } };
+    let changed = false, censuses = 0, reservations = 0, writes = 0;
+    let release!: () => void, entered!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const catalogs = new AccountModelCatalogsV1(async candidate => ({ data: [{ id: candidate === other || !changed ? "selected-native" : "other-native" }] }));
+    const support = await catalogs.support("selected-native", fixture.accounts);
+    const child = { ready: true, send: () => { writes++; } }, retries: any[] = [], responses: any[] = [];
+    Object.assign(host, {
+      config: fixture.config, closed: false, nativeHistory: preflight.binding, children: new Map([[account, child]]),
+      clients: new Map([[client.rendererRef, client]]), initializingDesktopRequests: new Set(),
+      modelCatalogs: catalogs, modelCheckedRequests: new WeakMap([[request, catalogs.revision]]), modelEligibleRequests: new WeakMap([[request, support.eligible]]),
+      nativeProjectStartTranslations: new WeakMap(), automaticCapacityRefreshRequests: new Set(),
+      canonicalHistory: { conversationForPublicThreadId: () => null, hasActiveTurn: () => false,
+        beginTurn: () => { reservations++; return "turn-fixture"; }, markTurnDispatching: () => {} },
+      deferForNativePluginInventory: () => false, routeNativeProjectRequest: () => false, routeHistoryRead: () => false,
+      deferForAutomaticCapacityRefresh: () => false, nativeRootThreadId: () => "existing-a", accountForRequest: () => account,
+      logicalRoute: () => ({ opaqueAccountId: account, nativeThreadId: "existing-a", conversationId: "conversation-fixture" }),
+      remoteBlocksDesktop: () => false, store: { ownerOf: () => account }, ensureTask: () => "task-fixture",
+      accountNeedsContinuationHandoff: () => false, broker: { acquireChild: () => child, beginRun: () => true },
+      deferUntilChildReady: () => false, nativeHistoryWritersSafe: () => true,
+      nativeThreadConflictAsync: async () => {
+        censuses++;
+        if ((pauseAt === "first-census" && censuses === 1) || (pauseAt === "second-census" && censuses === 2)) { entered(); await resume; }
+        return "clear";
+      },
+      ensureDesktopAppToolsBinding: async () => { if (pauseAt === "desktop-rebind") { entered(); await resume; } return true; },
+      reserveBalancedTurn: () => { reservations++; return null; }, clientLabel: () => "Tweakers", publishConversation: () => {},
+      nonce: 0, addPendingDesktop: () => {},
+      receiveDesktop: (_client: unknown, queued: unknown) => retries.push(queued),
+      sendDesktop: (_client: unknown, response: unknown) => responses.push(response),
+    });
+    const pending = host.processDesktop(client, request, null, account);
+    await Promise.race([paused, pending.then(() => { throw new Error(`${pauseAt} request completed before the controlled pause`); })]);
+    changed = true; catalogs.invalidate(account); release(); await pending;
+    assert.deepEqual(retries, [request], `${pauseAt} queues the original request for fresh eligibility`);
+    assert.equal(reservations, 0, `${pauseAt} retains no turn reservation`);
+    assert.equal(writes, 0, `${pauseAt} sends no provider write`);
+    // Re-enter the actual catalog deferral, then let the refreshed result
+    // retry the actual account-selection path. A is now unsupported.
+    await host.processDesktop(client, request, null, account);
+    await waitForCondition(() => retries.length === 2, "fresh model eligibility did not retry");
+    await host.processDesktop(client, request, null, account);
+    assert.equal(responses[0]?.error?.data?.code, "capability_mismatch");
+    assert.equal(reservations, 0); assert.equal(writes, 0);
+  }
 });
 
 test("native section order is durable and scopes a foreign before-thread to the next local row", async () => {
@@ -3077,7 +3825,7 @@ test("initialization attestation stays with its requesting desktop and a failed 
       peer.send({ jsonrpc: "2.0", id: challenge.id, result: { token: "origin-proof" } });
       origin.send({ jsonrpc: "2.0", id: "early-account", method: "account/read", params: {} });
       if (complete) origin.send({ jsonrpc: "2.0", id: challenge.id, result: { token: "origin-proof" } });
-      const response = await waitForMessage(originMessages, message => responseFor([message], "early-account") !== undefined, "gated account response missing", 8_000) as { error?: unknown };
+      const response = await waitForMessage(originMessages, message => responseFor([message], "early-account") !== undefined, "gated account response missing", complete ? 8_000 : 32_000) as { error?: unknown };
       if (complete) {
         assert.equal(response.error, undefined);
         assert.deepEqual(readFileSync(marker, "utf8").trim().split("\n").map(line => JSON.parse(line)), [{ method: "account/read", ready: true }]);
@@ -3129,7 +3877,7 @@ test("the desktop stdio bridge preserves early initialization through identity b
     let identityReady = !delayedIdentity;
     const entrypoint = join(__dirname, "../../src/account-router/broker-app-server.ts");
     const childProcess: MutableChildProcessModule = { spawn: ((_command, args, options) =>
-      spawn(process.execPath, ["--import", "tsx", ...(args as string[])], options)) as SpawnFunction };
+      spawn(process.execPath, ["--import", "tsx", ...(args as string[])], options ?? {})) as SpawnFunction };
     const installation = installCodexAppServerParent({
       childProcess, resourcesPath: "/fixture", platform: "darwin", pathExists: () => true,
       accountRouter: { brokerRoot: fixture.root, brokerEntrypointPath: entrypoint,
@@ -3143,7 +3891,7 @@ test("the desktop stdio bridge preserves early initialization through identity b
       if (mode !== "owner") await ownerStarted;
       adapter = childProcess.spawn("/fixture/codex", ["app-server"], {
         cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, TWEAKERS_DERIVED_VARIANT: "1" },
+        env: { ...process.env, TWEAKERS_DERIVED_VARIANT: "1", CODEX_APP_TOOLS_PIPE_PATH: undefined },
       });
       const exited = new Promise<number | null>((resolvePromise) => adapter!.once("exit", resolvePromise));
       let initializationResponses = 0;
@@ -3233,6 +3981,155 @@ test("partial native installed plugin catalogs preserve cached rows as unavailab
 });
 
 
+test("cold primary initialization survives five seconds and retains a bounded terminal deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const outcome of ["ready", "initialize_timeout", "protocol_error", "child_exited"] as const) {
+    const processChild = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(), stdout: new PassThrough(), exitCode: null as number | null, signalCode: null,
+      kill(this: EventEmitter & { exitCode: number | null }) { this.exitCode = 0; this.emit("exit", 0, null); return true; },
+    });
+    const events: string[] = [];
+    const child = new BrokerProcessChild("ar_fixture" as OpaqueAccountId, processChild as unknown as ChildProcess,
+      () => {}, () => {}, undefined, (code) => { events.push(code); });
+    try {
+      const pending = child.initialize({ clientInfo: { name: "fixture", version: "1" } }, {} as any);
+      const request = JSON.parse(processChild.stdin.read().toString());
+      t.mock.timers.tick(6_000);
+      assert.deepEqual(events, ["started"]);
+      assert.equal(processChild.exitCode, null);
+      assert.equal(child.ready, false);
+      if (outcome === "ready" || outcome === "protocol_error") {
+        processChild.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id,
+          ...(outcome === "ready" ? { result: { userAgent: "fixture/1" } } : { error: { code: -1, message: "private-secret" } }),
+        }) + "\n");
+      } else if (outcome === "child_exited") processChild.kill();
+      else t.mock.timers.tick(24_000);
+      assert.equal(await pending, outcome === "ready");
+      assert.equal(child.ready, outcome === "ready");
+      assert.deepEqual(events, ["started", outcome]);
+      t.mock.timers.tick(30_000);
+      assert.deepEqual(events, ["started", outcome], "settled timer cannot report a second outcome");
+    } finally { processChild.kill(); processChild.stdin.destroy(); processChild.stdout.destroy(); }
+  }
+});
+
+test("deferred child keeps its lease and initialization deadline behind preparation", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const processChild = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(), stdout: new PassThrough(), exitCode: null as number | null, signalCode: null,
+    kill(this: EventEmitter & { exitCode: number | null }) { this.exitCode = 0; this.emit("exit", 0, null); return true; },
+  });
+  let release!: () => void;
+  const prepared = new Promise<void>(resolve => { release = resolve; });
+  const events: string[] = [];
+  const child = new BrokerProcessChild("ar_fixture" as OpaqueAccountId, async () => { await prepared; return processChild as unknown as ChildProcess; },
+    () => {}, () => {}, undefined, code => { events.push(code); });
+  try {
+    const pending = child.initialize({ clientInfo: { name: "fixture", version: "1" } }, null);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(events, []);
+    assert.equal(processChild.stdin.read(), null);
+    release(); assert.equal(await child.whenPrepared(), true);
+    const request = JSON.parse(processChild.stdin.read().toString());
+    assert.deepEqual(events, ["started"]);
+    processChild.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\n");
+    assert.equal(await pending, true);
+    assert.equal(child.ready, true);
+  } finally { processChild.kill(); processChild.stdin.destroy(); processChild.stdout.destroy(); }
+});
+
+test("cancelled deferred child retains ownership until preparation exits and never starts a process", async () => {
+  let release!: () => void;
+  const prepared = new Promise<void>(resolve => { release = resolve; });
+  let closed = false, spawned = false;
+  const child = new BrokerProcessChild("ar_fixture" as OpaqueAccountId, async () => {
+    await prepared;
+    if (!child.preparationCurrent) throw new Error("cancelled");
+    spawned = true; throw new Error("unexpected spawn");
+  }, () => {}, () => { closed = true; });
+  const initialized = child.initialize({}, null);
+  child.terminate("shutdown");
+  assert.equal(await initialized, false);
+  assert.equal(closed, false);
+  release();
+  assert.equal(await child.whenPrepared(), false);
+  assert.equal(await child.terminateAndWait(), true);
+  assert.equal(closed, true);
+  assert.equal(spawned, false);
+});
+
+test("cancelled preparation records its terminal stage after the worker settles", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-cancelled-preparation-"))); chmodSync(root, 0o700);
+  const record = createBrokerStartupDiagnostics(root);
+  for (let index = 0; index < 16; index++) record({ stage: "probe", code: "started", elapsedMs: index });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const child = new BrokerProcessChild("ar_fixture" as OpaqueAccountId, async () => {
+    await pending;
+    child.preparationFailureStage = "child-session";
+    throw new Error("private worker failure");
+  }, () => {}, () => {}, undefined, code => record({ stage: "child", code, elapsedMs: 30, preparationStage: child.preparationFailureStage }));
+  const initialized = child.initialize({}, null);
+  child.terminate("capacity");
+  assert.equal(await initialized, false);
+  release();
+  assert.equal(await child.whenPrepared(), false);
+  assert.equal(await child.terminateAndWait(), true);
+  const bytes = readFileSync(join(root, readdirSync(root)[0]!), "utf8");
+  const events = JSON.parse(bytes).events;
+  assert.equal(events.length, 16);
+  assert.deepEqual(events.at(-1), { stage: "child", code: "cancelled", elapsedMs: 30, preparationStage: "child-session" });
+  assert.equal(bytes.includes("private worker failure"), false);
+});
+
+test("official child factory consumes async projection and refuses spawn after renderer authority changes", async () => {
+  const fixture = createFixture();
+  const account = fixture.accounts[0]!;
+  const sourceHome = join(fixture.root, "native-source"); mkdirSync(sourceHome, { mode: 0o700 });
+  const executionHome = join(fixture.root, "accounts", account, "execution-home"); mkdirSync(executionHome, { mode: 0o700 });
+  const marker = join(fixture.root, "unexpected-spawn");
+  const script = join(fixture.root, "factory.cjs"); privateWrite(script, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'unexpected');`);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, [script]);
+  const host = owner as any;
+  const mode = { state: "ready", environment: {}, document: { resolverProtocol: "official-bundled-v1", nativeBase: { path: sourceHome },
+    resolverBinarySha256: createHash("sha256").update(readFileSync(process.execPath)).digest("hex") } };
+  const binding = { opaqueAccountId: account, codexHome: sourceHome, sqliteHome: sourceHome, authIdentityHmac: "fixture-binding" };
+  let begin!: () => void, release!: () => void;
+  const begun = new Promise<void>(resolve => { begin = resolve; });
+  const projection = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  let checkAuthority!: () => boolean;
+  Object.assign(host, {
+    nativeHistory: { accounts: [binding], source: { metadataAccountId: account } }, sharedNativeMode: () => mode, officialNativeMode: () => mode,
+    nativeAccountBinding: () => binding, nativeHistoryWritersSafe: () => true,
+    isolatedAuthHome: () => executionHome, officialExecutionHome: () => executionHome,
+    officialAccountPlan: () => ({ inventory: { schema_version: 1, native_base_root: sourceHome, plugins: [] } }),
+    officialPluginLedger: { project: () => { throw new Error("synchronous reprojection is forbidden"); },
+      projectAsync: async (input: { authorize: () => boolean }) => { calls++; checkAuthority = input.authorize; assert.equal(input.authorize(), true); begin(); await projection; } },
+    prepareOfficialPluginServices: async () => {},
+    broker: { accountRecoveryRevision: () => 0, retireFailedChild: () => {} },
+  });
+  host.officialPluginServices.set(account, { verify: () => true, baseUrl: "http://127.0.0.1:8765", childEnvironment: {}, close: async () => true });
+  const client = { rendererRef: "fixture-renderer" } as any;
+  host.clients.set(client.rendererRef, client);
+  const child = host.createChild(account) as BrokerProcessChild;
+  const initialized = child.initialize({ clientInfo: { name: "fixture", version: "1" } }, client);
+  await begun;
+  assert.equal(child.pid, undefined); assert.equal(host.children.get(account), child);
+  assert.equal(existsSync(marker), false);
+  host.clients.delete(client.rendererRef);
+  assert.equal(checkAuthority(), false);
+  host.closed = true;
+  assert.equal(checkAuthority(), false);
+  release();
+  assert.equal(await initialized, false);
+  assert.equal(await child.whenPrepared(), false);
+  assert.equal(child.preparationFailureStage, "client-session", "retain the first authority failure after later shutdown");
+  assert.equal(await child.terminateAndWait(), true);
+  assert.equal(calls, 1); assert.equal(existsSync(marker), false);
+  assert.equal(host.children.has(account), false);
+});
+
 test("direct child initialization gates provider readiness on private external login and account read", async () => {
   for (const accept of [true, false]) {
     const processChild = spawn(process.execPath, ["-e", `
@@ -3259,6 +4156,10 @@ test("direct child initialization gates provider readiness on private external l
     } finally { assert.equal(await child.terminateAndWait(), true); }
   }
   assert.deepEqual(credentialStoreArgs(["app-server", "-c", 'cli_auth_credentials_store="auto"'], "ephemeral"), ["app-server", "-c", 'cli_auth_credentials_store="ephemeral"']);
+  const configuredArgs = ["app-server", "-c", 'cli_auth_credentials_store="auto"', "--config=mcp_oauth_credentials_store=\"keyring\"", "-c", 'mcp_oauth_credentials_store="auto"', "-c", 'model="fixture"'];
+  assert.deepEqual(isolatedAuthHelperArgs(configuredArgs), ["app-server", "-c", 'model="fixture"', "-c", 'cli_auth_credentials_store="file"', "-c", 'mcp_oauth_credentials_store="file"']);
+  assert.ok(credentialStoreArgs(configuredArgs, "ephemeral").includes('--config=mcp_oauth_credentials_store="keyring"'));
+
 });
 
 test("isolated credential refresh is single-flight and reconnect publishes only matching successful auth", async () => {
@@ -3274,6 +4175,7 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
       const fs = require('node:fs'); const path = require('node:path');
       const ephemeral = process.argv.includes('cli_auth_credentials_store="ephemeral"');
       if (process.env.CODEX_HOME !== process.env.CODEX_SQLITE_HOME || (!ephemeral && !process.argv.includes('cli_auth_credentials_store="file"'))) process.exit(2);
+      if (!ephemeral && !process.argv.includes('mcp_oauth_credentials_store="file"')) process.exit(3);
       const home = process.env.CODEX_HOME; const auth = path.join(home, 'auth.json');
       let external = false;
       const reply = (m, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
@@ -3294,12 +4196,17 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
     const secret = Buffer.alloc(32, 11);
     const account = `ar_${createHmac("sha256", secret).update("account-router:v1:registered").digest("base64url")}` as OpaqueAccountId;
     const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
-    Object.assign(owner, { secret, command: process.execPath, args: [script], authRefreshes: new Map(), authHelperTails: new Map(), authHelperQueued: new Map(), activeAuthHelpers: new Map(), enrollmentHelpers: new Map(),
+    Object.assign(owner, { secret, command: process.execPath, args: [script], children: new Map(), authRefreshes: new Map(), authHelperTails: new Map(), authHelperQueued: new Map(), activeAuthHelpers: new Map(), enrollmentHelpers: new Map(), retiringEnrollmentChildren: new Set(),
+      modelCatalogs: new AccountModelCatalogsV1(async () => ({ data: [] })),
       desktopInitialization: { params: { clientInfo: { name: "fixture", version: "1" } }, client: {} },
       isolatedAuthHome: () => authHome,
       nativeAccountBinding: () => ({ opaqueAccountId: account, authIdentityHmac: nativeHistoryAuthIdentityHmacV1("registered", secret), codexHome: originalHome, sqliteHome: originalHome }),
       receiveChild: () => {},
     });
+    let releasePreparation!: () => void;
+    const preparation = new Promise<boolean>(resolve => { releasePreparation = () => resolve(true); });
+    const placeholder = { whenPrepared: () => preparation };
+    owner.children.set(account, placeholder);
     const serialOrder: string[] = [];
     const profileRead = owner.withAuthHelper(account, async (helper: BrokerProcessChild) => {
       serialOrder.push("profile-start");
@@ -3307,8 +4214,13 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
     });
     const first = owner.refreshIsolatedAuth(account); const second = owner.refreshIsolatedAuth(account);
     assert.equal(first, second);
+    await Promise.resolve();
+    assert.equal(owner.activeAuthHelpers.size, 0, "profile and refresh helpers wait outside the preparation lease");
+    assert.equal(owner.authHelperQueued.size, 0, "preparation waiters cannot deadlock the prior helper tail");
+    releasePreparation();
     assert.ok(await profileRead); assert.deepEqual(serialOrder, ["profile-start", "profile-done"]);
     assert.equal((await first)?.accessToken, "fresh"); assert.equal(readFileSync(join(authHome, "refresh-count"), "utf8"), "1");
+    owner.children.delete(account);
     const beforeReconnect = readFileSync(join(authHome, "auth.json"));
     const originalBinding = owner.nativeAccountBinding;
     if (originalReconnect) {
@@ -3331,15 +4243,31 @@ test("isolated credential refresh is single-flight and reconnect publishes only 
     owner.nativeAccountBinding = originalBinding;
     writeFileSync(join(authHome, "auth.json"), JSON.stringify({ tokens: { account_id: "registered", access_token: "expired", refresh_token: "refresh" } }), { mode: 0o600 });
     Object.assign(owner, {
-      stateRoot: root, nativeHistory: {}, nativeTransferHeldAccounts: new Set(), children: new Map(),
+      ...nativeProjectAuthorityFixtureState(), stateRoot: root, nativeHistory: { source: { metadataAccountId: account } }, nativeTransferHeldAccounts: new Set(), children: new Map(),
       prepareAccountContinuity: () => true, nativeHistoryWritersSafe: () => true,
-      failPendingForChild: () => {}, broker: { markChildUnavailable: () => {} },
+      failPendingForChild: () => {}, broker: { markChildUnavailable: () => {}, retireFailedChild: () => {}, accountRecoveryRevision: () => 0 },
     });
+    const startupParams = { clientInfo: { name: "codex_desktop", version: "1" }, capabilities: { experimentalApi: true, explicitGatewayOauth: true } };
+    owner.desktopInitialization = null;
     const startup = owner.createChild(account) as BrokerProcessChild;
     try {
-      assert.equal(await startup.initialize(owner.desktopInitialization.params, {} as any), true, "expired stored tokens refresh before external login and readiness");
+      assert.equal(await startup.initialize(startupParams, null), true, "pre-window expired tokens refresh without desktop initialization");
+      assert.equal(owner.desktopInitialization, null, "startup never grants renderer authority");
+      assert.equal(owner.activeAuthHelpers.size, 0, "helper exits before readiness");
       assert.equal(readFileSync(join(authHome, "refresh-count"), "utf8"), "11");
     } finally { await startup.terminateAndWait(); }
+    let releaseQueue!: () => void;
+    owner.authHelperTails.set(account, new Promise<void>(resolve => { releaseQueue = resolve; }));
+    let authorized = true;
+    const cancelled = owner.createChild(account) as BrokerProcessChild;
+    const initializing = cancelled.initialize(startupParams, null, () => authorized);
+    try {
+      await waitForCondition(() => owner.authHelperQueued.get(account) === 1, "startup refresh was not queued");
+      authorized = false; releaseQueue();
+      assert.equal(await initializing, false, "expired startup authority cannot start a queued helper");
+      assert.equal(readFileSync(join(authHome, "refresh-count"), "utf8"), "11");
+      assert.equal(owner.activeAuthHelpers.size, 0);
+    } finally { releaseQueue(); await cancelled.terminateAndWait(); }
     assert.deepEqual(readFileSync(join(originalHome, "auth.json")), original);
   }
 });
@@ -3350,7 +4278,7 @@ test("external refresh stays owner-private, rejects foreign identity and bounds 
   const child = { send: (value: unknown) => sent.push(value), terminate: () => { terminated += 1; } };
   const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
   Object.assign(owner, { secret, children: new Map([[account, child]]), pendingAuthRefreshRequests: new Map(),
-    broker: { markChildUnavailable: () => { unavailable += 1; } }, isolatedAuthHome: () => "/synthetic/auth-home",
+    broker: { markChildUnavailable: () => { unavailable += 1; }, accountRecoveryRevision: () => 0 }, isolatedAuthHome: () => "/synthetic/auth-home",
     nativeAccountBinding: () => ({ authIdentityHmac: nativeHistoryAuthIdentityHmacV1("registered", secret) }),
     refreshIsolatedAuth: async () => { refreshes += 1; return { accessToken: "private-synthetic-token", chatgptAccountId: "registered", chatgptPlanType: null }; },
   });
@@ -3580,4 +4508,890 @@ test("native credential drift returns recovery-required without killing the brok
     await new Promise(resolve => setTimeout(resolve, 150));
     assert.equal((owner as any).closed, true, "explicit recovery retires the idle owner");
   } finally { client?.close(); await manager.close(); await owner.close(); }
+});
+
+test("owner closes after consumer-free grace but preserves an active consumer", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  try {
+    await owner.start();
+    const socket = { destroy() {} };
+    (owner as any).appConnections.add(socket);
+    (owner as any).clients.set("authenticated-fixture", {socket});
+    // Skip maintenance I/O so this case isolates lifetime ownership.
+    (owner as any).nextMaintenanceAt = Number.MAX_SAFE_INTEGER;
+    await owner.maintainOwner(100_000);
+    assert.equal((owner as any).closed, false);
+    (owner as any).clients.delete("authenticated-fixture");
+    // An unauthenticated connection and configured remote mode are not consumers.
+    (owner as any).remoteModes.set(fixture.accounts[0], "enabled");
+    await owner.maintainOwner(105_000);
+    await owner.maintainOwner(124_999);
+    assert.equal((owner as any).closed, false);
+    await owner.maintainOwner(125_000);
+    assert.equal((owner as any).closed, true);
+  } finally { await owner.close(); }
+});
+
+
+test("failed child shutdown retains ownership until a bounded retry confirms exit", async () => {
+  for (const population of ["children", "enrollmentHelpers", "isolatedEnrollment", "activeAuthHelpers"]) {
+    const fixture = createFixture();
+    const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, []);
+    let released = 0, attempts = 0;
+    (owner as any).controlClose = async () => { released++; };
+    (owner as any).brokerClose = async () => { released++; };
+    const child = { terminate() {}, async terminateAndWait() { attempts++; return attempts > 1; } };
+    if (population === "enrollmentHelpers" || population === "isolatedEnrollment") {
+      (owner as any).enrollmentHelpers.set("survivor", {child, ...(population === "isolatedEnrollment" ? {
+        isolatedReconnect: {timer: setTimeout(() => {}, 1000), preimage: Buffer.from("private")},
+      } : {})});
+    } else (owner as any)[population].set("survivor", child);
+    const first = owner.close(), second = owner.close();
+    assert.equal(first, second);
+    await assert.rejects(first, /ownership is retained/);
+    assert.equal(attempts, 1);
+    assert.equal(released, 0);
+    await owner.close();
+    assert.equal(attempts, 2);
+    assert.equal(released, 2);
+  }
+});
+
+test("closed control-only consumer permits owner idle shutdown while detached operations remain protected", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const client = new AccountsBrokerSocketClientV1({root: fixture.root, secret: fixture.secret,
+    clientKind: "tweakers", rendererRef: createOpaqueRendererRef(fixture.secret, 998, desktopBinding("tweakers", 998)), appToolsRef: createOpaqueAppToolsRef(fixture.secret, 998, desktopBinding("tweakers", 998))});
+  try {
+    await owner.start();
+    assert.equal((await client.invoke({version: 1, requestId: "idle-profile", command: "profile.read"})).ok, true);
+    client.close();
+    const broker = (owner as any).broker as AccountsBrokerV1;
+    for (let i = 0; i < 100 && broker.status().registeredClients.length; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(broker.status().registeredClients.length, 0);
+    await owner.maintainOwner(100_000);
+    let finish!: () => void;
+    const work = broker.withActiveOperation(() => new Promise<void>(resolve => { finish = resolve; }));
+    (owner as any).nextMaintenanceAt = Number.MAX_SAFE_INTEGER;
+    await owner.maintainOwner(125_000);
+    assert.equal((owner as any).closed, false);
+    finish(); await work;
+    await owner.maintainOwner(130_000);
+    await owner.maintainOwner(150_000);
+    assert.equal((owner as any).closed, true);
+  } finally { client.close(); await owner.close(); }
+});
+
+test("pre-window startup policy uses no renderer authority and releases its child before normal desktop initialization", async () => {
+  const fixture = createFixture();
+  const program = fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!).replace(
+    'if (message.method === "fixture/initialization")',
+    `if (message.method === "configRequirements/read") return respond(message.id, { requirements: { application: { network: { enabled: true, domains: { "example.invalid": "allow" } } } } });
+     if (message.method === "config/read") return respond(message.id, { config: { model: "fixture" }, origins: {} });
+     if (message.method === "fixture/initialization")`);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", program]);
+  const host = owner as any;
+  const handshake = createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-session-fixture-1"));
+  const messages: JsonRpcMessage[] = [];
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  let desktop: DesktopClient | null = null;
+  try {
+    await owner.start();
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: handshake }, message => messages.push(message));
+    bridge.send({ id: "policy-init", method: "initialize", params: { clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" }, capabilities: { experimentalApi: true } } } as JsonRpcMessage);
+    const initialized = await waitForMessage(messages, message => responseFor([message], "policy-init") !== undefined, "startup initialize missing") as any;
+    assert.equal(initialized.error, undefined);
+    assert.equal(initialized.result.userAgent, "fixture");
+    assert.equal(host.clients.size, 0);
+    assert.equal(host.initializedDesktopClients.size, 0);
+    assert.equal(host.desktopInitialization, null);
+    assert.equal(host.children.size, 1, "startup does not warm the other account");
+    bridge.send({ method: "initialized" } as JsonRpcMessage);
+    bridge.send({ id: "policy-requirements", method: "configRequirements/read", params: {} } as JsonRpcMessage);
+    const requirements = await waitForMessage(messages, message => responseFor([message], "policy-requirements") !== undefined, "requirements missing") as any;
+    assert.deepEqual(requirements.result.requirements.application.network, { enabled: true, domains: { "example.invalid": "allow" } });
+    bridge.send({ id: "policy-config", method: "config/read", params: { includeLayers: false } } as JsonRpcMessage);
+    const config = await waitForMessage(messages, message => responseFor([message], "policy-config") !== undefined, "config missing") as any;
+    assert.deepEqual(config.result, { config: { model: "fixture" }, origins: {} });
+    await bridge.whenClosed;
+    assert.equal(host.startupPolicyClients.size, 0);
+    assert.equal(host.children.size, 0, "startup-only child is closed before final response");
+    await assert.rejects(connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: handshake }, () => {}), /unavailable/, "consumed startup capability cannot reconnect");
+    desktop = await connectDesktop(fixture, 1940, "tweakers");
+    assert.equal(host.clients.size, 1);
+    const child = host.broker.acquireChild(fixture.accounts[0]);
+    const negotiation = await host.requestBrokerChild(fixture.accounts[0], child, "fixture/initialization", {});
+    assert.deepEqual(negotiation.result.initializeParams.capabilities, { experimentalApi: true, requestAttestation: true, extensions: { "test.extension": {} } });
+    assert.equal(negotiation.result.initializeCount, 1);
+  } finally { bridge?.close(); desktop?.close(); await owner.close(); }
+});
+
+test("pre-window policy authenticates through the primary isolated store without registering a desktop", async () => {
+  const fixture = createNativeFixture();
+  const primary = fixture.config.primaryOpaqueAccountId;
+  const index = fixture.accounts.indexOf(primary);
+  const authHome = join(fixture.root, "startup-auth"); mkdirSync(authHome, { mode: 0o700 });
+  privateWrite(join(authHome, "auth.json"), JSON.stringify({ tokens: { account_id: fixture.rawAccounts[index], access_token: "fixture-token", refresh_token: "fixture-refresh" } }));
+  const program = nativeFixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!).replace(
+    'if (message.method === "fixture/initialization")',
+    `if (message.method === "account/read") return respond(message.id, { account: { type: "chatgpt", email: "fixture@example.invalid", planType: "plus" } });
+     if (message.method === "account/login/start") return respond(message.id, { type: "chatgptAuthTokens" });
+     if (message.method === "configRequirements/read") return respond(message.id, { requirements: {} });
+     if (message.method === "config/read") return respond(message.id, { config: { model: "fixture" } });
+     if (message.method === "fixture/initialization")`);
+  const script = join(fixture.root, "startup-fixture.cjs"); privateWrite(script, program);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, [script]);
+  const host = owner as any;
+  host.isolatedAuthHome = (account: OpaqueAccountId) => account === primary ? authHome : null;
+  const messages: JsonRpcMessage[] = [];
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  try {
+    await owner.start(); await host.nativeRecoveryPromise;
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers",
+      startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("isolated-startup-policy-session")) }, message => messages.push(message));
+    bridge.send({ id: "isolated-init", method: "initialize", params: { clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "1" }, capabilities: { experimentalApi: true } } } as JsonRpcMessage);
+    const initialized = await waitForMessage(messages, message => responseFor([message], "isolated-init") !== undefined, "isolated startup initialize missing") as any;
+    assert.equal(initialized.error, undefined);
+    assert.equal(host.desktopInitialization, null); assert.equal(host.clients.size, 0);
+    assert.deepEqual([...host.children.keys()], [primary]);
+    assert.equal(host.activeAuthHelpers.size, 0);
+    bridge.send({ method: "initialized" } as JsonRpcMessage);
+    for (const method of ["configRequirements/read", "config/read"]) {
+      bridge.send({ id: method, method, params: method === "config/read" ? { includeLayers: false } : {} } as JsonRpcMessage);
+      const response = await waitForMessage(messages, message => responseFor([message], method) !== undefined, "isolated policy response missing") as any;
+      assert.equal(response.error, undefined);
+    }
+    await bridge.whenClosed;
+    assert.equal(host.children.size, 0); assert.equal(host.startupPolicyClients.size, 0);
+    assert.equal(host.desktopInitialization, null); assert.equal(host.initializedDesktopClients.size, 0);
+  } finally { bridge?.close(); await owner.close(); }
+});
+
+test("pre-window startup returns a correlated redacted child-preparation failure and releases admission for a fresh initialize", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any, createChild = host.createChild;
+  const messages: JsonRpcMessage[] = [], recoveredMessages: JsonRpcMessage[] = [];
+  const privateFailure = "fixture-only private account token /private/fixture/plugin-package";
+  let refused = 0;
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  let recovered: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  host.createChild = () => { refused++; throw new Error(privateFailure); };
+  try {
+    await owner.start();
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers",
+      startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-refused-child-session-1")) }, message => messages.push(message));
+    bridge.send({ id: "refused-policy-init", method: "initialize", params: {
+      clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" },
+      capabilities: { experimentalApi: true },
+    } } as JsonRpcMessage);
+    const failure = await waitForMessage(messages, message => responseFor([message], "refused-policy-init") !== undefined,
+      "child preparation refusal must return its correlated initialize failure") as { id: string; error?: { data?: { code?: string } } };
+    assert.equal(failure.id, "refused-policy-init");
+    assert.equal(failure.error?.data?.code, "post_start_failure");
+    assert.equal(JSON.stringify(failure).includes(privateFailure), false);
+    assert.equal(JSON.stringify(failure).includes("/private/fixture"), false);
+    assert.equal(refused, 1);
+    assert.equal(existsSync(join(fixture.root, "fixture-child-starts.log")), false);
+    assert.equal(host.children.size, 0);
+    assert.equal(host.clients.size, 0); assert.equal(host.initializedDesktopClients.size, 0);
+    assert.equal(host.desktopInitialization, null);
+    assert.equal(host.broker.status().registeredClients.length, 0);
+    await bridge.whenClosed;
+    await waitForCondition(() => host.startupPolicyClients.size === 0, "refused startup session did not release admission");
+    host.createChild = createChild;
+    recovered = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers",
+      startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-refused-child-recovery-1")) }, message => recoveredMessages.push(message));
+    recovered.send({ id: "recovered-policy-init", method: "initialize", params: {
+      clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" },
+      capabilities: { experimentalApi: true },
+    } } as JsonRpcMessage);
+    const initialized = await waitForMessage(recoveredMessages, message => responseFor([message], "recovered-policy-init") !== undefined,
+      "fresh startup initialize was not admitted after child preparation failure") as { error?: unknown; result?: { userAgent?: string } };
+    assert.equal(initialized.error, undefined); assert.equal(initialized.result?.userAgent, "fixture");
+    assert.equal(existsSync(join(fixture.root, "fixture-child-starts.log")), true);
+    assert.equal(host.clients.size, 0); assert.equal(host.initializedDesktopClients.size, 0);
+    assert.equal(host.desktopInitialization, null);
+    recovered.close(); await recovered.whenClosed;
+    await waitForCondition(() => host.startupPolicyClients.size === 0 && host.children.size === 0, "recovered startup child did not close cleanly");
+  } finally { host.createChild = createChild; bridge?.close(); recovered?.close(); await owner.close(); }
+});
+
+test("startup transport rejects sign-out and writes before creating a backend child", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  try {
+    await owner.start();
+    for (const method of ["account/logout", "turn/start", "config/value/write", "experimentalFeature/enablement/set"]) {
+      const handshake = createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-session-forbidden-1"));
+      const bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: handshake }, () => {});
+      bridge.send({ id: "forbidden", method, params: method === "experimentalFeature/enablement/set" ? { enablement: { fixture: true } } : {} } as JsonRpcMessage);
+      await bridge.whenClosed;
+      assert.equal(host.children.size, 0);
+      assert.equal(host.clients.size, 0);
+      assert.equal(host.startupPolicyClients.size, 0);
+    }
+    assert.equal(existsSync(join(fixture.root, "fixture-child-starts.log")), false);
+  } finally { await owner.close(); }
+});
+
+test("cancelled startup keeps exclusive admission until its exact child has stopped", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  const messages: JsonRpcMessage[] = [];
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  let releaseStop: (() => void) | undefined;
+  const stopping = new Promise<void>(resolve => { releaseStop = resolve; });
+  let stopStarted = false;
+  try {
+    await owner.start();
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-cancel-session-1")) }, message => messages.push(message));
+    bridge.send({ id: "init", method: "initialize", params: { clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" }, capabilities: { experimentalApi: true } } } as JsonRpcMessage);
+    await waitForMessage(messages, message => responseFor([message], "init") !== undefined, "initialize missing");
+    const child = host.children.get(fixture.accounts[0]);
+    assert.ok(child);
+    assert.equal(host.broker.acquireChild(fixture.accounts[0]), null, "normal desktop cannot borrow startup-only child");
+    const terminate = child.terminateAndWait.bind(child);
+    child.terminateAndWait = async () => { stopStarted = true; await stopping; return terminate(); };
+    bridge.close();
+    await waitForCondition(() => stopStarted, "startup child stop was not requested");
+    assert.equal(host.broker.acquireChild(fixture.accounts[0]), null, "admission stays held after retirement while stop is pending");
+    assert.equal(host.startupPolicyClients.size, 1);
+    releaseStop!();
+    await waitForCondition(() => host.startupPolicyClients.size === 0, "startup lease was not released after proved stop");
+    assert.equal(host.children.size, 0);
+    assert.ok(host.broker.acquireChild(fixture.accounts[0]), "normal admission resumes after exact child closure");
+  } finally { releaseStop?.(); bridge?.close(); await owner.close(); }
+});
+
+test("startup rejects a primary-account binding change without forwarding config reads", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  const messages: JsonRpcMessage[] = [];
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  const primary = host.config.primaryOpaqueAccountId;
+  try {
+    await owner.start();
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-binding-session-1")) }, message => messages.push(message));
+    bridge.send({ id: "init", method: "initialize", params: { clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" }, capabilities: { experimentalApi: true } } } as JsonRpcMessage);
+    await waitForMessage(messages, message => responseFor([message], "init") !== undefined, "initialize missing");
+    bridge.send({ method: "initialized" } as JsonRpcMessage);
+    host.config.primaryOpaqueAccountId = fixture.accounts[1];
+    bridge.send({ id: "config", method: "configRequirements/read", params: {} } as JsonRpcMessage);
+    await bridge.whenClosed;
+    assert.equal(responseFor(messages, "config"), undefined);
+    await waitForCondition(() => host.startupPolicyClients.size === 0, "binding failure did not release the stopped child");
+    assert.equal(host.children.size, 0);
+  } finally { host.config.primaryOpaqueAccountId = primary; bridge?.close(); await owner.close(); }
+});
+
+test("startup borrows a ready desktop child without replacing or terminating it", async () => {
+  const fixture = createFixture();
+  const program = fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!).replace('if (message.method === "fixture/initialization")',
+    `if (message.method === "configRequirements/read") return respond(message.id, { requirements: null });
+     if (message.method === "config/read") return respond(message.id, { config: {}, origins: {} });
+     if (message.method === "fixture/initialization")`);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", program]);
+  const host = owner as any;
+  let desktop: DesktopClient | null = null;
+  let bridge: Awaited<ReturnType<typeof connectAccountsBrokerAppServerClient>> | null = null;
+  const messages: JsonRpcMessage[] = [];
+  try {
+    await owner.start(); desktop = await connectDesktop(fixture, 1941, "tweakers");
+    const child = host.children.get(fixture.accounts[0]);
+    assert.ok(child?.ready);
+    let stops = 0;
+    const stop = child.terminateAndWait.bind(child);
+    child.terminateAndWait = () => { stops++; return stop(); };
+    bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-borrowed-session-1")) }, message => messages.push(message));
+    bridge.send(startupInitializeFrame as JsonRpcMessage);
+    await waitForMessage(messages, message => responseFor([message], "init") !== undefined, "initialize missing");
+    bridge.send({ method: "initialized" } as JsonRpcMessage);
+    bridge.send({ id: "requirements", method: "configRequirements/read", params: {} } as JsonRpcMessage);
+    await waitForMessage(messages, message => responseFor([message], "requirements") !== undefined, "requirements missing");
+    bridge.send({ id: "config", method: "config/read", params: { includeLayers: false } } as JsonRpcMessage);
+    await waitForMessage(messages, message => responseFor([message], "config") !== undefined, "config missing");
+    await bridge.whenClosed;
+    assert.equal(host.children.get(fixture.accounts[0]), child);
+    assert.equal(child.ready, true);
+    assert.equal(stops, 0, "borrowed desktop child must remain alive");
+    assert.equal(host.clients.size, 1);
+    const negotiation = await child.requestPrivate("fixture/initialization", {});
+    assert.equal(negotiation.result.initializeCount, 1);
+  } finally { bridge?.close(); desktop?.close(); await owner.close(); }
+});
+
+test("startup capability expiry closes an idle connection without backend admission", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  try {
+    await owner.start();
+    const handshake = createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("startup-expiry-session-1", Date.now() - 29_700));
+    const bridge = await connectAccountsBrokerAppServerClient({ root: fixture.root, secret: fixture.secret, clientKind: "tweakers", startupPolicyHandshake: handshake }, () => {});
+    await bridge.whenClosed;
+    await waitForCondition(() => host.startupPolicyClients.size === 0, "expired scope remained admitted");
+    assert.equal(host.children.size, 0);
+    assert.equal(host.clients.size, 0);
+    assert.equal(existsSync(join(fixture.root, "fixture-child-starts.log")), false);
+  } finally { await owner.close(); }
+});
+
+async function startupCliFixture(input: string | null, respond: (message: any) => unknown, earlyResponse?: unknown, completeSequence = false): Promise<{ code: number | null; output: string; forwarded: any[] }> {
+  const fixture = createFixture();
+  const forwarded: any[] = [];
+  const sockets = new Set<Socket>();
+  const server = createServer(socket => {
+    sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", chunk => {
+      buffer += chunk;
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        const frame = JSON.parse(line);
+        if (frame.kind === "startup-policy-handshake") {
+          socket.write(JSON.stringify({ version: 1, kind: "handshake", ok: true }) + "\n");
+          if (earlyResponse !== undefined) socket.write(JSON.stringify({ version: 1, kind: "message", message: earlyResponse }) + "\n");
+        } else {
+          forwarded.push(frame.message);
+          const response = respond(frame.message);
+          if (response !== undefined) socket.write(JSON.stringify({ version: 1, kind: "message", message: response }) + "\n");
+          if (frame.message.method === "config/read") socket.end();
+        }
+      }
+    });
+  });
+  const socketPath = accountsBrokerSocketPath(fixture.root, ACCOUNTS_BROKER_APP_SERVER_SOCKET_FILE);
+  mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
+  await new Promise<void>(resolve => server.listen(socketPath, resolve));
+  chmodSync(socketPath, 0o600);
+  const entry = join(process.cwd(), "packages/runtime/src/account-router/broker-app-server.ts");
+  const args = ["--config", join(fixture.root, "account-router-config.json"), "--state-root", fixture.root, "--", process.execPath];
+  const code = `import { runAccountsBrokerAppServerCli } from ${JSON.stringify(entry)}; await runAccountsBrokerAppServerCli(${JSON.stringify(args)});`;
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, TWEAKERS_DERIVED_VARIANT: "1", [ACCOUNTS_STARTUP_POLICY_ENV]: JSON.stringify(createStartupPolicyHandshake(fixture.secret, createStartupPolicyAuthorization("cli-startup-session-1"))) } });
+  let output = "";
+  let pendingOutput = "";
+  child.stdout.on("data", chunk => {
+    output += chunk; pendingOutput += chunk;
+    let newline: number;
+    while ((newline = pendingOutput.indexOf("\n")) >= 0) {
+      const line = pendingOutput.slice(0, newline); pendingOutput = pendingOutput.slice(newline + 1);
+      if (!completeSequence) continue;
+      const response = JSON.parse(line);
+      if (response.id === "init") child.stdin.write(JSON.stringify({ method: "initialized" }) + "\n" + JSON.stringify({ id: "requirements", method: "configRequirements/read", params: {} }) + "\n");
+      if (response.id === "requirements") child.stdin.write(JSON.stringify({ id: "config", method: "config/read", params: { includeLayers: false } }) + "\n");
+    }
+  });
+  child.stderr.resume();
+  const timeout = setTimeout(() => child.kill("SIGKILL"), 8_000);
+  try {
+    if (input !== null) child.stdin.write(input);
+    const exit = await new Promise<number | null>(resolve => child.once("close", resolve));
+    return { code: exit, output, forwarded };
+  } finally {
+    clearTimeout(timeout); child.stdin.destroy();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}
+
+const startupInitializeFrame = { id: "init", method: "initialize", params: { clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "26.1007.30912" }, capabilities: { experimentalApi: true } } };
+
+test("startup CLI closes malformed, reverse and unmatched transports without forwarding rejected frames", async () => {
+  for (const input of ["invalid-json\n", "[]\n", '{"id":"init","result":{}}\n', '{"id":"write","method":"account/logout","params":{}}\n', '{"id":"config","method":"config/read","params":{"includeLayers":false}}\n']) {
+    const result = await startupCliFixture(input, () => undefined);
+    assert.equal(result.code, 1, input);
+    assert.equal(result.output, "", input);
+    assert.deepEqual(result.forwarded, [], input);
+  }
+  for (const response of [{ id: "init", method: "approval/request", params: {} }, { method: "notification", params: {} }, { id: "other", result: {} }, { id: "init", method: "approval/request", result: {} }, { id: "init", result: {}, error: { code: -1, message: "fixture" } }]) {
+    const result = await startupCliFixture(JSON.stringify(startupInitializeFrame) + "\n", () => response);
+    assert.equal(result.code, 1);
+    assert.equal(result.output, "", JSON.stringify(response));
+    assert.equal(result.forwarded.length, 1);
+  }
+  const early = await startupCliFixture(null, () => undefined, { id: null, result: {} });
+  assert.equal(early.code, 1);
+  assert.equal(early.output, "");
+  assert.deepEqual(early.forwarded, []);
+});
+
+test("startup CLI delivers only the successful four-message sequence and closes cleanly", async () => {
+  const input = JSON.stringify(startupInitializeFrame) + "\n";
+  const result = await startupCliFixture(input, message => message.method === "initialized" ? undefined : ({ id: message.id, result: message.method === "initialize" ? { userAgent: "fixture" } : message.method === "configRequirements/read" ? { requirements: null } : { config: {}, origins: {} } }), undefined, true);
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.forwarded.map(frame => frame.method), ["initialize", "initialized", "configRequirements/read", "config/read"]);
+  const responses = result.output.trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(responses.map(frame => frame.id), ["init", "requirements", "config"]);
+  assert.equal(responses[0].result.userAgent, "fixture");
+});
+
+
+test("private auth helper admission retains a writer until teardown is proved", async () => {
+  const account = `ar_${"a".repeat(43)}` as OpaqueAccountId;
+  for (const outcome of ["retained", "authority-changed", "owner-changed"] as const) {
+    const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+    let finish!: (value: boolean) => void;
+    const stopped = new Promise<boolean>(resolve => { finish = resolve; });
+    let attempts = 0, operations = 0, authorized = true;
+    const retained = { terminateAndWait: () => { attempts++; return stopped; } };
+    const replacement = {};
+    Object.assign(owner, { children: new Map(), enrollmentHelpers: new Map(), authHelperTails: new Map(), authHelperQueued: new Map(),
+      activeAuthHelpers: new Map([[account, retained]]), isolatedAuthHome: () => "/fixture/auth",
+      command: "/must-not-spawn", args: [],
+    });
+    const pending = owner.withAuthHelper(account, async () => { operations++; }, {
+      params: {}, client: null, isCurrent: () => authorized,
+    });
+    const settled = pending.then((value: unknown) => ({ value }), (error: Error) => ({ error }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1);
+    assert.equal(owner.activeAuthHelpers.get(account), retained);
+    if (outcome === "authority-changed") authorized = false;
+    if (outcome === "owner-changed") owner.activeAuthHelpers.set(account, replacement);
+    finish(outcome !== "retained");
+    const result = await settled;
+    if (outcome === "authority-changed") {
+      assert.deepEqual(result, { value: null });
+      assert.equal(owner.activeAuthHelpers.size, 0);
+    } else {
+      assert.equal("error" in result && result.error.constructor.name, "NativeAuthHelperBusyError");
+      assert.equal(owner.activeAuthHelpers.get(account), outcome === "retained" ? retained : replacement);
+    }
+    assert.equal(operations, 0);
+    assert.equal(owner.authHelperQueued.size, 0);
+  }
+});
+
+test("private auth helper retries retained teardown before starting the next writer", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-auth-retained-"))); chmodSync(root, 0o700);
+  const script = join(root, "helper.cjs");
+  writeFileSync(script, `require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+    const m=JSON.parse(line); if(m.id)process.stdout.write(JSON.stringify({id:m.id,result:{userAgent:'fixture/1'}})+'\\n');
+  });`, { mode: 0o600 });
+  const account = `ar_${"a".repeat(43)}` as OpaqueAccountId;
+  const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  let attempts = 0, released = false, operations = 0;
+  const retained = { terminateAndWait: async () => { attempts++; return released; } };
+  Object.assign(owner, { children: new Map(), enrollmentHelpers: new Map(), authHelperTails: new Map(), authHelperQueued: new Map(),
+    activeAuthHelpers: new Map([[account, retained]]), isolatedAuthHome: () => root,
+    officialNativeMode: () => false, command: process.execPath, args: [script],
+    desktopInitialization: { params: { clientInfo: { name: "fixture", version: "1" } }, client: null },
+  });
+  const operation = async (helper: BrokerProcessChild) => {
+    operations++; assert.equal(released, true); assert.notEqual(helper, retained);
+    return "accepted";
+  };
+  await assert.rejects(owner.withAuthHelper(account, operation), { name: "Error", message: "native authentication helper busy" });
+  assert.equal(owner.activeAuthHelpers.get(account), retained);
+  released = true;
+  try {
+    assert.equal(await owner.withAuthHelper(account, operation), "accepted");
+    assert.equal(attempts, 2); assert.equal(operations, 1);
+    assert.equal(owner.activeAuthHelpers.size, 0);
+  } finally {
+    for (const child of owner.activeAuthHelpers.values()) await child.terminateAndWait();
+  }
+});
+
+test("private auth helper failures reach account health before cleanup and permit bounded retry", async () => {
+  for (const failure of ["authentication", "connection"] as const) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-auth-health-"))); chmodSync(root, 0o700);
+    const authHome = join(root, "auth"); const originalHome = join(root, "original");
+    mkdirSync(authHome, { mode: 0o700 }); mkdirSync(originalHome, { mode: 0o700 });
+    writeFileSync(join(authHome, "auth.json"), JSON.stringify({ tokens: { account_id: "registered", access_token: "old", refresh_token: "refresh" } }), { mode: 0o600 });
+    const failed = join(root, "failure"); writeFileSync(failed, failure, { mode: 0o600 });
+    const script = join(root, "helper.cjs");
+    writeFileSync(script, `
+      const fs = require('node:fs'); const path = require('node:path');
+      const failed = path.join(process.env.CODEX_HOME, '..', 'failure');
+      const send = value => process.stdout.write(JSON.stringify(value)+'\\n');
+      require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+        const m = JSON.parse(line); if (!m.id) return;
+        if (m.method === 'initialize') return send({id:m.id,result:{userAgent:'fixture/1'}});
+        if (m.method === 'account/login/start') return send({id:m.id,result:{type:'chatgptAuthTokens'}});
+        if (m.method === 'account/read') {
+          const failure = fs.existsSync(failed) ? fs.readFileSync(failed,'utf8') : '';
+          if (failure) return send({id:m.id,error:{code:failure==='authentication'?401:503,message:'private-provider-detail'}});
+          return send({id:m.id,result:{account:{type:'chatgpt',email:'fixture@example.invalid',planType:'pro'}}});
+        }
+      });
+    `, { mode: 0o600 });
+    const secret = Buffer.alloc(32, 12);
+    const account = `ar_${createHmac("sha256", secret).update("account-router:v1:registered").digest("base64url")}` as OpaqueAccountId;
+    const peer = `ar_${"b".repeat(43)}` as OpaqueAccountId;
+    const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+    const events: string[] = [];
+    Object.assign(owner, { ...nativeProjectAuthorityFixtureState(), secret, command: process.execPath, args: [script], stateRoot: root, nativeHistory: { source: { metadataAccountId: account } },
+      authRefreshes: new Map(), authHelperTails: new Map(), authHelperQueued: new Map(), activeAuthHelpers: new Map(),
+      enrollmentHelpers: new Map(), retiringEnrollmentChildren: new Set(), nativeTransferHeldAccounts: new Set(), children: new Map(),
+      desktopInitialization: { params: { clientInfo: { name: "fixture", version: "1" } }, client: {} },
+      isolatedAuthHome: () => authHome,
+      nativeAccountBinding: () => ({ opaqueAccountId: account, authIdentityHmac: nativeHistoryAuthIdentityHmacV1("registered", secret), codexHome: originalHome, sqliteHome: originalHome }),
+      prepareAccountContinuity: () => true, nativeHistoryWritersSafe: () => true, failPendingForChild: () => {}, receiveChild: () => {},
+      reportStartup: (_stage: string, code: string) => events.push(code),
+    });
+    const broker = new AccountsBrokerV1({ accounts: [{opaqueAccountId:account,enabled:true},{opaqueAccountId:peer,enabled:true}], secret,
+      childFactory: { create: ({opaqueAccountId}) => owner.createChild(opaqueAccountId) } });
+    owner.broker = broker;
+    const child = broker.acquireChild(account) as BrokerProcessChild;
+    try {
+      assert.equal(await child.initialize(owner.desktopInitialization.params, {} as any), false);
+      assert.equal(child.initializationFailure, failure);
+      assert.equal(broker.pool().accounts[0].state, failure === "authentication" ? "reauth_required" : "unhealthy");
+      assert.equal(owner.nativeProjectAuthorities.size, 0, "failed authentication never grants project writes");
+      assert.equal(broker.pool().accounts[1].state, "ready");
+      assert.equal(events.includes(failure === "authentication" ? "authentication_failed" : "transport_failed"), true);
+      assert.equal(await child.terminateAndWait(), true);
+      assert.equal(broker.pool().accounts[0].state, failure === "authentication" ? "reauth_required" : "unhealthy", "normal cleanup retains the recorded failure");
+      if (failure === "connection") {
+        unlinkSync(failed);
+        const retry = broker.acquireChild(account, undefined, true) as BrokerProcessChild;
+        assert.ok(retry); assert.notEqual(retry, child);
+        assert.equal(await retry.initialize(owner.desktopInitialization.params, {} as any), true);
+        await retry.terminateAndWait();
+      }
+      assert.doesNotMatch(JSON.stringify(broker.pool()), /private-provider-detail|registered|access_token/);
+    } finally { await child.terminateAndWait(); broker.close(); }
+  }
+});
+
+test("a late startup authentication failure cannot overwrite verified reconnect or retain its dead child", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-reconnect-startup-"))); chmodSync(root, 0o700);
+  const authHome = join(root, "auth"), originalHome = join(root, "original");
+  mkdirSync(authHome, { mode: 0o700 }); mkdirSync(originalHome, { mode: 0o700 });
+  const waiting = join(root, "waiting"), release = join(root, "release");
+  const script = join(root, "child.cjs");
+  writeFileSync(script, `
+    const fs = require('node:fs'), path = require('node:path');
+    const root = path.dirname(process.env.CODEX_HOME);
+    const send = value => process.stdout.write(JSON.stringify(value)+'\\n');
+    require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+      const m=JSON.parse(line); if(!m.id) return;
+      if(m.method==='initialize') return send({id:m.id,result:{userAgent:'fixture/1'}});
+      if(m.method==='account/login/start') {
+        if(fs.existsSync(path.join(root,'release'))) return send({id:m.id,result:{type:'chatgptAuthTokens'}});
+        fs.writeFileSync(path.join(root,'waiting'),'1');
+        const timer=setInterval(()=>{if(fs.existsSync(path.join(root,'release'))){clearInterval(timer);send({id:m.id,error:{code:401,message:'expired old credentials'}})}},5);
+        return;
+      }
+      if(m.method==='account/read') return send({id:m.id,result:{account:{type:'chatgpt',email:'fixture@example.invalid',planType:'pro'}}});
+    });
+  `, { mode: 0o600 });
+  const secret = Buffer.alloc(32, 13), account = `ar_${"a".repeat(43)}` as OpaqueAccountId;
+  const owner = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  Object.assign(owner, { ...nativeProjectAuthorityFixtureState(), secret, command: process.execPath, args: [script], stateRoot: root, nativeHistory: { source: { metadataAccountId: account } },
+    children: new Map(), nativeTransferHeldAccounts: new Set(), receiveChild: () => {}, failPendingForChild: () => {},
+    desktopInitialization: { params: { clientInfo: { name: "fixture", version: "1" } }, client: {} },
+    isolatedAuthHome: () => authHome,
+    nativeAccountBinding: () => ({ codexHome: originalHome, sqliteHome: originalHome }),
+    prepareAccountContinuity: () => true, nativeHistoryWritersSafe: () => true, reportStartup: () => {},
+    refreshIsolatedAuth: async () => ({ accessToken: "fixture", chatgptAccountId: "registered", chatgptPlanType: "pro" }),
+  });
+  const freshProfile = { identifierMasked: "f****@example.invalid", plan: "pro", avatarUrl: null };
+  const broker = new AccountsBrokerV1({ accounts: [{ opaqueAccountId: account, enabled: true, assignedTaskCount: 922 }], secret,
+    childFactory: { create: ({opaqueAccountId}) => owner.createChild(opaqueAccountId) },
+    onDeviceAction: action => ({ outcome: "accepted", value: action.kind === "device.start"
+      ? { loginId: "fixture-login", userCode: "ABCD-EFGH", verificationUrl: "https://auth.openai.com/device" }
+      : action.kind === "device.status" ? { success: true } : action.kind === "profile.read" ? freshProfile
+        : { freshness: "fresh", remainingPercent: 70, resetAt: "2099-01-01T00:00:00.000Z", shortWindowPressure: 0, resetCredits: 0 } }),
+  });
+  owner.broker = broker;
+  const rendererRef = `br_${"r".repeat(43)}` as OpaqueRendererRef, appToolsRef = `bat_${"p".repeat(43)}` as OpaqueAppToolsRef;
+  const unsigned = { version: 1 as const, clientKind: "tweakers" as const, rendererRef, appToolsRef, nonce: "reconnect-overlap".padEnd(32, "x") };
+  assert.equal(broker.handshake({ ...unsigned, proof: createBrokerHandshakeProof(secret, unsigned) }).ok, true);
+  const taskRef = `bt_${"t".repeat(43)}` as OpaqueTaskRef;
+  broker.registerTask({ taskRef, conversationId: `lc_${"c".repeat(43)}` as OpaqueConversationId,
+    opaqueAccountId: account, ownerRendererRef: rendererRef });
+  const old = broker.acquireChild(account) as BrokerProcessChild;
+  const initializing = old.initialize(owner.desktopInitialization.params, {} as any);
+  let replacement: BrokerProcessChild | undefined;
+  try {
+    await waitForCondition(() => existsSync(waiting), "old child did not reach delayed external login");
+    const start = await broker.invoke(rendererRef, { version: 1, requestId: "overlap-start", command: "reconnect.start", params: { opaqueAccountId: account } });
+    assert.equal(start.ok, true); if (!start.ok) throw new Error("reconnect failed");
+    const recovered = await broker.invoke(rendererRef, { version: 1, requestId: "overlap-status", command: "reconnect.status", params: { enrollmentRef: (start.result as any).enrollmentRef } });
+    assert.equal(recovered.ok && (recovered.result as any).state, "complete");
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(broker.pool().accounts[0]?.state, "ready");
+    writeFileSync(release, "1");
+    assert.equal(await initializing, false); assert.equal(await old.terminateAndWait(), true);
+    assert.equal(broker.pool().accounts[0]?.state, "ready", "old startup failure must not undo verified recovery");
+    assert.deepEqual(broker.pool().accounts[0]?.safeProfile, freshProfile);
+    assert.equal(broker.quota()[0]?.freshness, "fresh");
+    assert.equal(broker.pool().accounts[0]?.assignedTaskCount, 923);
+    assert.equal(broker.taskOwnership(taskRef)?.opaqueAccountId, account);
+    replacement = broker.acquireChild(account) as BrokerProcessChild;
+    assert.ok(replacement); assert.notEqual(replacement, old, "failed old residency must be retired");
+    assert.equal(await replacement.initialize(owner.desktopInitialization.params, {} as any), true);
+    broker.markChildUnavailable(account, "authentication", { child: old, recoveryRevision: 0 });
+    broker.retireFailedChild(account, old, 0, "authentication");
+    assert.equal(broker.acquireChild(account), replacement, "old failure cannot remove a replacement resident");
+    assert.equal(broker.pool().accounts[0]?.state, "ready");
+    // Reverse token refresh can also outlive a successful reconnect.
+    owner.pendingAuthRefreshRequests = new Map();
+    let failRefresh!: (error: Error) => void;
+    owner.refreshIsolatedAuth = () => new Promise((_resolve, reject) => { failRefresh = reject; });
+    owner.routeChildRequest(account, replacement, { jsonrpc: "2.0", id: "old-refresh", method: "account/chatgptAuthTokens/refresh", params: { reason: "unauthorized", previousAccountId: null } });
+    const next = await broker.invoke(rendererRef, { version: 1, requestId: "next-start", command: "reconnect.start", params: { opaqueAccountId: account } });
+    assert.equal(next.ok, true); if (!next.ok) throw new Error("second reconnect failed");
+    await broker.invoke(rendererRef, { version: 1, requestId: "next-status", command: "reconnect.status", params: { enrollmentRef: (next.result as any).enrollmentRef } });
+    assert.equal(broker.beginRun(taskRef), true);
+    assert.equal(broker.pool().accounts[0]?.activeRunCount, 1);
+    failRefresh(new Error("old refresh connection failed"));
+    await new Promise<void>(done => setImmediate(done));
+    assert.equal(broker.pool().residentChildren, 1, "stale live refresh must keep residency before any reacquisition");
+    assert.equal(broker.pool().accounts[0]?.state, "active", "old reverse refresh must not undo verified recovery");
+    assert.equal(broker.pool().accounts[0]?.childState, "active");
+    assert.equal(broker.pool().accounts[0]?.activeRunCount, 1);
+    assert.equal(broker.taskOwnership(taskRef)?.activeRunCount, 1);
+    assert.equal(broker.quota()[0]?.freshness, "fresh");
+    assert.equal(broker.acquireChild(account), replacement);
+    assert.equal(broker.finishRun(taskRef), true);
+    assert.equal(broker.pool().accounts[0]?.state, "ready");
+    assert.equal(owner.pendingAuthRefreshRequests.size, 0);
+  } finally { writeFileSync(release, "1"); await old.terminateAndWait(); await replacement?.terminateAndWait(); broker.close(); }
+});
+
+test("frozen legacy pages do not resurrect a chat removed while its row is read", async () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const fanout = { key: "page", responses: [] as Array<{ response: { result: { data: unknown[] } } }>, nextAccount: 0, partial: false };
+  let member: string | null = "project";
+  let nextState: any;
+  Object.assign(host, {
+    nativeHistory: {}, nativeLegacyProjectsReady: true,
+    nativeLegacyProjects: { legacyNativeThreadIdsForProject: () => ["removed"], legacyPublicProjectIdForThread: () => member },
+    pendingHistory: new Map([["page", fanout]]),
+    nativeHistoryWritersSafe: () => true,
+    resolveNativeLegacyProjectListCursor: () => ({ legacyIds: ["removed"], legacyOffset: 0 }),
+    broker: { acquireChild: () => ({}) },
+    requestBrokerChild: async () => { member = null; return { result: { thread: { id: "removed", projectId: null } } }; },
+    nativeHistoryRowVisible: () => true,
+    createNativeLegacyProjectListCursor: (state: any) => { nextState = state; return "next"; },
+    dispatchNextHistoryFanout: () => {},
+  });
+  await host.dispatchNativeLegacyProjectRows(fanout, "account", { params: { projectId: "project", limit: 1 } }, "project");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fanout.responses[0].response.result.data, []);
+  assert.equal(nextState.legacyOffset, 1, "removed rows still consume their frozen offset");
+});
+
+test("lost plugin response authority settles desktop and private requests once without escaping", async () => {
+  const account = "ar_projection" as OpaqueAccountId;
+  const sent: any[] = [], requests: any[] = [];
+  const child = { ready: true, send: (message: any) => requests.push(message) };
+  const client = { outstanding: 1 };
+  let authority = true;
+  const host = Object.assign(Object.create(AccountsBrokerOwnerV1.prototype), {
+    closed: false, nonce: 0, nativeHistory: null,
+    children: new Map([[account, child]]), pendingDesktop: new Map(), pendingBrokerChild: new Map(),
+    automaticCapacityRefreshByChild: new Map(), automaticCapacityRefreshRequests: new Map(),
+    nativeHistoryWritersSafe: () => true, officialNativeMutationAllowed: () => true,
+    officialThreadParams: (_account: unknown, _method: unknown, params: unknown) => params,
+    officialPluginParams: (_account: unknown, _method: unknown, params: unknown) => params,
+    refreshSharedNativeRuntimes: async () => {}, resolveHistoryFanout: () => false,
+    officialPluginResponse: (_account: unknown, _method: unknown, result: unknown) => {
+      if (!authority) throw new Error("private-authority-details");
+      return result;
+    },
+    sendDesktop: (_client: unknown, response: unknown) => sent.push(response),
+  });
+  host.addPendingDesktop("desktop-child", { account, client, desktopId: "desktop", method: "config/read", conversationId: null, taskRef: null });
+  const privateResult = host.requestInitializedBrokerChild(account, child, "config/read", {});
+  assert.equal(requests.length, 1);
+  authority = false;
+  const desktopResponse = { jsonrpc: "2.0", id: "desktop-child", result: { secret: "unprojected-provider-data" } };
+  const privateResponse = { ...desktopResponse, id: requests[0].id };
+  assert.doesNotThrow(() => host.receiveChild(account, child, desktopResponse));
+  assert.doesNotThrow(() => host.receiveChild(account, child, privateResponse));
+  assert.equal(await privateResult, null);
+  host.receiveChild(account, child, desktopResponse);
+  host.receiveChild(account, child, privateResponse);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].error?.data?.code, "post_start_failure");
+  assert.equal(client.outstanding, 0);
+  assert.equal(host.pendingDesktop.size, 0);
+  assert.equal(host.pendingBrokerChild.size, 0);
+  assert.doesNotMatch(JSON.stringify(sent), /private-authority-details|unprojected-provider-data/);
+});
+
+test("official desktop account discovery releases the receive queue and settles a late helper once", async () => {
+  const fixture = createFixture();
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath,
+    ["-e", fixtureChildProgram(fixture.accounts[0]!, fixture.accounts[1]!)]);
+  const host = owner as any;
+  let desktop: DesktopClient | null = null;
+  let release!: (value: unknown) => void;
+  let entered = false, toolReply = false;
+  try {
+    await owner.start();
+    desktop = await connectDesktop(fixture, 949, "tweakers");
+    host.officialNativeMode = () => true;
+    host.isolatedAuthHome = () => fixture.root;
+    host.officialNativeMutationAllowed = () => true;
+    host.readOfficialDesktopAccount = () => { entered = true; return new Promise(resolve => { release = resolve; }); };
+    host.resolveChildRequest = () => { toolReply = true; };
+    desktop.send({ jsonrpc: "2.0", id: "routing-delayed", method: "account/read", params: {} });
+    await waitForCondition(() => entered, "routing helper did not start");
+    desktop.send({ jsonrpc: "2.0", id: "tool-response", result: {} });
+    await waitForCondition(() => toolReply, "account helper blocked the desktop tool reply");
+    const client = [...host.clients.values()][0] as any;
+    assert.equal(client.outstanding, 1);
+    host.failPendingForChild(fixture.accounts[0], host.children.get(fixture.accounts[0]));
+    await waitForMessage(desktop.messages, message => responseFor([message], "routing-delayed") !== undefined, "settlement missing");
+    assert.equal(client.outstanding, 0);
+    release({ result: { account: null } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(desktop.messages.filter(message => responseFor([message], "routing-delayed") !== undefined).length, 1);
+    assert.equal(client.outstanding, 0, "late helper must not settle or decrement twice");
+  } finally { release?.(null); desktop?.close(); await owner.close(); }
+});
+
+test("official desktop account discovery preserves provider routing and rejects stale or foreign authority", async () => {
+  const account = "ar_routing" as OpaqueAccountId, secret = Buffer.alloc(32, 23);
+  const client = { rendererRef: "renderer" }, child = { ready: true };
+  const service = { baseUrl: "https://127.0.0.1:4567/backend-api", verify: () => true };
+  const routing = { chatgptAccountId: "registered", backendOrigin: "https://regional.example.invalid", accountRoutingOverride: "us_cr" };
+  const response = { id: "private", result: { account: { type: "chatgpt", planType: "plus" }, workspaceRouting: routing, canCreateProjects: true } };
+  const makeOwner = () => Object.assign(Object.create(AccountsBrokerOwnerV1.prototype), {
+    secret, clients: new Map([[client.rendererRef, client]]), children: new Map([[account, child]]),
+    officialPluginServices: new Map([[account, service]]), nativeHistoryWritersSafe: () => true, accountForRequest: () => account,
+    officialPluginSession: () => ({ stamp: "current" }),
+    nativeAccountBinding: () => ({ authIdentityHmac: nativeHistoryAuthIdentityHmacV1("registered", secret) }),
+    requestBrokerChild: async (_account: unknown, _child: unknown, method: string) => {
+      assert.equal(_account, account); assert.equal(_child, child); assert.equal(method, "account/read");
+      return structuredClone(response);
+    },
+  });
+  const owner = makeOwner();
+  assert.deepEqual(await owner.readOfficialDesktopAccount(account, child, client, {}), response);
+  for (const workspaceRouting of [null, {}, { ...routing, chatgptAccountId: "foreign" },
+    { ...routing, backendOrigin: new URL(service.baseUrl).origin }, { ...routing, backendOrigin: "http://example.invalid" },
+    { ...routing, backendOrigin: "https://example.invalid/path" }, { ...routing, backendOrigin: "https://user@example.invalid" },
+    { ...routing, accountRoutingOverride: "unknown" }]) {
+    const owner = makeOwner(); owner.requestBrokerChild = async () => ({ ...response, result: { ...response.result, workspaceRouting } });
+    assert.equal(await owner.readOfficialDesktopAccount(account, child, client, {}), null);
+  }
+  for (const invalidate of [
+    (o: any) => { o.closed = true; }, (o: any) => { o.clients.clear(); }, (o: any) => { o.children.clear(); },
+    (o: any) => { o.officialPluginServices.set(account, { ...service }); },
+    (o: any) => { o.officialPluginSession = () => ({ stamp: "replaced" }); },
+    (o: any) => { o.nativeAccountBinding = () => ({ authIdentityHmac: "replaced" }); },
+    (o: any) => { o.nativeHistoryWritersSafe = () => false; },
+    (o: any) => { o.accountForRequest = () => "another"; },
+    (o: any) => { o.nativeHistory = {}; },
+  ]) {
+    const owner = makeOwner(); owner.requestBrokerChild = async () => { invalidate(owner); return response; };
+    assert.equal(await owner.readOfficialDesktopAccount(account, child, client, {}), null);
+  }
+  for (const unavailable of [null, { id: "private", error: { code: -1, message: "private" } }]) {
+    const owner = makeOwner(); owner.requestBrokerChild = async () => unavailable;
+    assert.equal(await owner.readOfficialDesktopAccount(account, child, client, {}), null);
+  }
+});
+
+
+test("preparation allowance cannot spawn a backend while strict service authority is blocked", async () => {
+  const fixture = createFixture();
+  const account = fixture.accounts[0]!;
+  const sourceHome = join(fixture.root, "native-source"); mkdirSync(sourceHome, { mode: 0o700 });
+  const executionHome = join(fixture.root, "accounts", account, "execution-home"); mkdirSync(executionHome, { mode: 0o700 });
+  const marker = join(fixture.root, "unexpected-spawn");
+  const script = join(fixture.root, "factory.cjs"); privateWrite(script, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'unexpected');`);
+  const owner = new AccountsBrokerOwnerV1(fixture.config, fixture.root, fixture.secret, process.execPath, [script]);
+  const host = owner as any;
+  const mode = { state: "ready", environment: {}, document: { resolverProtocol: "official-bundled-v1", nativeBase: { path: sourceHome },
+    resolverBinarySha256: createHash("sha256").update(readFileSync(process.execPath)).digest("hex") } };
+  const binding = { opaqueAccountId: account, codexHome: sourceHome, sqliteHome: sourceHome, authIdentityHmac: "fixture-binding" };
+  let begin!: () => void, release!: () => void;
+  const begun = new Promise<void>(resolve => { begin = resolve; });
+  const projection = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  let checkAuthority!: () => boolean;
+  Object.assign(host, {
+    nativeHistory: { accounts: [binding], source: { metadataAccountId: account } }, sharedNativeMode: () => mode, officialNativeMode: () => mode,
+    nativeAccountBinding: () => binding, nativeHistoryWritersSafe: () => true,
+    isolatedAuthHome: () => executionHome, officialExecutionHome: () => executionHome,
+    officialAccountPlan: () => ({ inventory: { schema_version: 1, native_base_root: sourceHome, plugins: [] } }),
+    officialPluginLedger: { project: () => { throw new Error("synchronous reprojection is forbidden"); },
+      projectAsync: async (input: { authorize: () => boolean }) => { calls++; checkAuthority = input.authorize; assert.equal(input.authorize(), true); begin(); await projection; } },
+    prepareOfficialPluginServices: async () => {},
+    broker: { accountRecoveryRevision: () => 0, retireFailedChild: () => {} },
+  });
+  let strict = true;
+  host.officialPluginServices.set(account, { verify: () => strict, verifyPreparation: () => true, baseUrl: "http://127.0.0.1:8765", childEnvironment: {}, close: async () => true });
+  const client = { rendererRef: "fixture-renderer" } as any;
+  host.clients.set(client.rendererRef, client);
+  const child = host.createChild(account) as BrokerProcessChild;
+  const initialized = child.initialize({ clientInfo: { name: "fixture", version: "1" } }, client);
+  await begun;
+  assert.equal(child.pid, undefined); assert.equal(host.children.get(account), child);
+  assert.equal(existsSync(marker), false);
+  strict = false;
+  assert.equal(checkAuthority(), true, "owned preparation may finish its in-flight publication");
+  release();
+  assert.equal(await initialized, false);
+  assert.equal(await child.whenPrepared(), false);
+  assert.equal(child.preparationFailureStage, "service-invalid", "strict service authority is required again before spawn");
+  assert.equal(await child.terminateAndWait(), true);
+  assert.equal(calls, 1); assert.equal(existsSync(marker), false);
+  assert.equal(host.children.has(account), false);
+});
+
+
+test("startup admission diagnostics retain final reasons without private fields after saturation", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "broker-admission-diagnostic-"))); chmodSync(root, 0o700);
+  const record = createBrokerStartupDiagnostics(root);
+  for (let index = 0; index < 16; index++) record({ stage: "probe", code: "started", elapsedMs: index });
+  record({ stage: "child", code: "unavailable", elapsedMs: 20, admissionStage: "factory-service", account: "private-account", error: "private-token" } as any);
+  record({ stage: "child", code: "unavailable", elapsedMs: 21, admissionStage: "private-token" } as any);
+  const bytes = readFileSync(join(root, readdirSync(root)[0]!), "utf8"), value = JSON.parse(bytes);
+  assert.equal(value.events.length, 16);
+  assert.deepEqual(value.events.at(-1), { stage: "child", code: "unavailable", elapsedMs: 20, admissionStage: "factory-service" });
+  assert.equal(bytes.includes("private-"), false);
+});
+
+test("synchronous child admission preserves original failure and reports only the failing gate", () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const events: any[] = [];
+  const original = new Error("private execution path");
+  Object.assign(host, { nativeTransferHeldAccounts: new Set(), children: new Map(), nativeHistory: null,
+    officialNativeMode: () => ({}), officialExecutionHome: () => { throw original; },
+    startupStarted: performance.now(), onStartupStage: (event: unknown) => events.push(event) });
+  assert.throws(() => host.createChild("private-account"), error => error === original);
+  assert.equal(events.at(-1).admissionStage, "factory-execution-home");
+  host.officialExecutionHome = () => "/fixture/execution";
+  host.officialPluginServices = new Map();
+  assert.throws(() => host.createChild("private-account"));
+  assert.equal(events.at(-1).admissionStage, "factory-service");
+  assert.equal(JSON.stringify(events).includes("private-"), false);
+});
+
+test("service preparation reports suppressed hydration and plan failures", async () => {
+  const host = Object.create(AccountsBrokerOwnerV1.prototype) as any;
+  const reasons: string[] = [];
+  const mode = { fingerprint: "mode", document: { sourceAccountId: "source", nativeBase: { path: "/fixture/native" } } };
+  const ledger = { verifyGeneration: () => true };
+  Object.assign(host, { ensureOfficialPluginLedger: async () => ledger, officialNativeMode: () => mode,
+    officialPluginLedgerModeFingerprint: "mode", nativeAccountBinding: () => ({ opaqueAccountId: "source", authIdentityHmac: "private-auth" }),
+    nativeHistoryWritersSafe: () => true, reportAdmissionFailure: (stage: string) => reasons.push(stage),
+    config: { accounts: [{ included: true, opaqueAccountId: "private-account" }] },
+    children: new Map(), activeAuthHelpers: new Map(), officialPluginServices: new Map(), officialPluginSessionNonces: new Map(),
+    officialExecutionHome: () => "/fixture/home", officialAccountPlan: () => null });
+  await host.prepareOfficialPluginServicesNow();
+  assert.deepEqual(reasons, ["ledger-hydration"]);
+  host.officialPluginGeneration = { fingerprint: "generation" };
+  await host.prepareOfficialPluginServicesNow();
+  assert.deepEqual(reasons, ["ledger-hydration", "account-plan"]);
 });

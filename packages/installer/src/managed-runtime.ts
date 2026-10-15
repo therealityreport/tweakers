@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   cpSync,
+  chmodSync,
+  symlinkSync,
+  lchmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -89,6 +92,7 @@ export function managedCliPath(userRoot: string): string {
 function fingerprintManagedRuntimeEntries(
   sourceRoot: string,
   allowlist: readonly string[],
+  include: (relativePath: string) => boolean = () => true,
 ): string {
   const root = resolve(sourceRoot);
   const hash = createHash("sha256");
@@ -99,6 +103,7 @@ function fingerprintManagedRuntimeEntries(
   const visit = (path: string): void => {
     const stat = lstatSync(path);
     const relativePath = relative(root, path);
+    if (!include(relativePath)) return;
     if (stat.isDirectory() && !stat.isSymbolicLink()) {
       add("directory", relativePath, stat.mode, Buffer.alloc(0));
       for (const entry of readdirSync(path).sort((left, right) => left.localeCompare(right))) {
@@ -126,7 +131,7 @@ function fingerprintManagedRuntimeEntries(
 
 /** Fingerprint every source entry that can enter a managed-runtime stage. */
 export function fingerprintManagedRuntimeSource(sourceRoot: string): string {
-  return fingerprintManagedRuntimeEntries(sourceRoot, MANAGED_RUNTIME_COPY_ALLOWLIST);
+  return fingerprintManagedRuntimeEntries(sourceRoot, MANAGED_RUNTIME_COPY_ALLOWLIST, includeStagedRuntimeEntry);
 }
 
 /**
@@ -179,6 +184,32 @@ export function fingerprintManagedRuntimeControlPlane(sourceRoot: string): strin
   );
 }
 
+/** Development-generated packages must not recursively package themselves or a desktop dependency. */
+function includeStagedRuntimeEntry(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  return !["node_modules/electron/dist", "packages/installer/assets/managed-runtime"].some(
+    excluded => normalized === excluded || normalized.startsWith(excluded + "/"),
+  );
+}
+
+function copyStagedRuntimeEntry(source: string, target: string, sourceRoot: string): void {
+  if (!includeStagedRuntimeEntry(relative(sourceRoot, source))) return;
+  const stat = lstatSync(source);
+  if (stat.isDirectory() && !stat.isSymbolicLink()) {
+    mkdirSync(target, { recursive: true });
+    for (const name of readdirSync(source)) {
+      if (!isMacOsJunkName(name)) copyStagedRuntimeEntry(join(source, name), join(target, name), sourceRoot);
+    }
+    chmodSync(target, stat.mode & 0o7777);
+  } else if (stat.isSymbolicLink()) {
+    symlinkSync(readlinkSync(source), target);
+    if (typeof lchmodSync === "function") lchmodSync(target, stat.mode & 0o7777);
+  } else {
+    cpSync(source, target, { verbatimSymlinks: true });
+    if (!stat.isSymbolicLink()) chmodSync(target, stat.mode & 0o7777);
+  }
+}
+
 /**
  * Materialize the managed-runtime allowlist into an explicit destination.
  *
@@ -198,14 +229,7 @@ export function stageManagedRuntime(
     if (!existsSync(source)) continue;
     const target = join(destination, relative);
     mkdirSync(dirname(target), { recursive: true });
-    const sourceStat = lstatSync(source);
-    if (sourceStat.isDirectory() && !sourceStat.isSymbolicLink()) {
-      // The generation fingerprint includes directory permissions. cpSync
-      // alone recreates private sealed directories using the process umask.
-      copyDirectoryPreservingModes(source, target);
-    } else {
-      cpSync(source, target, { recursive: true, verbatimSymlinks: true });
-    }
+    copyStagedRuntimeEntry(source, target, sourceRoot);
   }
   sanitizeManagedRuntimeSymlinks(destination);
   // Junk copied from a Finder-browsed source checkout must never enter a

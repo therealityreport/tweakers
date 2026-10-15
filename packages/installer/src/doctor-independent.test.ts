@@ -1,8 +1,8 @@
-import { doctorImplementationScopes } from "./doctor-implementation.js";
+import { doctorImplementationScopes, doctorCodeScopeFingerprint } from "./doctor-implementation.js";
 import { changelogEntryId, validateDoctorChangelog, changelogDecisionGroups } from "./doctor-changelog.js";
 import { doctorDigest } from "./doctor-store.js";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,7 +13,7 @@ import { inspectIndependentDoctor, parseDoctorAction, type DoctorIndependentInpu
 import { consumeDoctorCandidateApproval, assertDoctorReviewReady } from "./doctor-approval.js";
 import { canPrepareDoctorCandidate, doctorValidationReportFingerprint, type DoctorValidationReport } from "./doctor-validation.js";
 import type { ReviewDoctorSourceChangesResult } from "./doctor-review.js";
-import { doctorDirectory, readDoctorUpdateJob, writeDoctorPrivateJson, writeDoctorUpdateJob } from "./doctor-store.js";
+import { doctorDirectory, readDoctorPrivateJson, readDoctorUpdateJob, writeDoctorPrivateJson, writeDoctorUpdateJob } from "./doctor-store.js";
 import { collectDoctorUpstreamContext, setDoctorUpstreamDependenciesForTest } from "./doctor-upstream.js";
 import type { DoctorSourceEvidence } from "./doctor-evidence.js";
 
@@ -99,6 +99,15 @@ test("independent diagnosis stays read-only for missing target and unhealthy bro
     assert.match(report.findings.find(finding => finding.stage === "storage")!.detail, /cannot prove the previous volume UUID/);
     assert.deepEqual(readdirSync(root), []);
     const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const operationPath = join(root, "local-operation", "operation.json");
+    writeDoctorPrivateJson(operationPath, { version: 1, id, pid: process.pid, kind: "doctor status verification", state: "running", startedAt: new Date().toISOString() });
+    const observedOperation = await inspectIndependentDoctor(root, deps);
+    writeDoctorPrivateJson(operationPath, { version: 1, id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pid: process.pid, kind: "doctor command:doctor-action", state: "running", startedAt: new Date().toISOString() });
+    const nextOperation = await inspectIndependentDoctor(root, deps);
+    assert.notEqual(observedOperation.findings.at(-1)!.detail, nextOperation.findings.at(-1)!.detail);
+    assert.equal(observedOperation.fingerprint, nextOperation.fingerprint, "inspection/admission operation IDs cannot invalidate an unchanged action");
+    const changedTarget = await inspectIndependentDoctor(root, { ...deps, inputs: () => ({ ...input, build: "11" }) });
+    assert.notEqual(changedTarget.fingerprint, nextOperation.fingerprint, "real target changes still revoke the action");
     const job: import("./doctor-store.js").DoctorUpdateJobV1 = { schemaVersion: 1, workflowVersion: 2, trigger: "manual", id,
       pid: process.pid, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       nativeIdentity: fingerprint, installedIdentity: fingerprint, runtimeFingerprint: "changed-runtime", sourceGenerationId: null, sourceReceiptDigest: null, sourcePath: null,
@@ -109,6 +118,13 @@ test("independent diagnosis stays read-only for missing target and unhealthy bro
     assert.equal(stale.update.state, "review_required");
     assert.equal(stale.actions.find(action => action.id === "scan")?.enabled, false, "customization changes do not permit duplicate dispatch while the previous worker still runs");
     assert.equal(stale.update.execution?.status, "action_required", "customization changes require revalidation without discarding upstream evidence");
+    job.findings = [{ id: "independent.local-resources", stage: "candidate", severity: "warning", reason: "saved-evidence", title: "Saved finding", detail: "first", evidence: [] }];
+    writeDoctorUpdateJob(root, job);
+    const savedFinding = await inspectIndependentDoctor(root, deps);
+    job.findings[0]!.detail = "changed";
+    writeDoctorUpdateJob(root, job);
+    assert.notEqual((await inspectIndependentDoctor(root, deps)).fingerprint, savedFinding.fingerprint, "saved evidence with the same diagnostic ID stays bound");
+    job.findings = [];
     job.runtimeFingerprint = fingerprint; job.implementationScopes = doctorImplementationScopes(); job.pid = 2147483647;
     writeDoctorUpdateJob(root, job);
     const interrupted = await inspectIndependentDoctor(root, deps);
@@ -123,6 +139,32 @@ test("independent diagnosis stays read-only for missing target and unhealthy bro
     job.updatedAt = new Date(Date.now() - 31_000).toISOString();
     writeDoctorPrivateJson(join(root, "doctor", "update.json"), job);
     assert.match((await inspectIndependentDoctor(root, deps)).update.progress!, /interrupted/, "a missing launcher cannot remain running indefinitely");
+    const savedTestRoot = process.env.TWEAKERS_TEST_FALLBACK_ROOT;
+    const savedPreload = process.env.TWEAKERS_TEST_ROOT_PRELOAD;
+    try {
+      process.env.TWEAKERS_TEST_FALLBACK_ROOT = root;
+      process.env.TWEAKERS_TEST_ROOT_PRELOAD = "active";
+      writeDoctorPrivateJson(operationPath, {version: 1, id, pid: process.pid, kind: "doctor worker finishing", state: "running", startedAt: new Date().toISOString()});
+      job.result.state = "compatible"; job.result.phase = "candidate_verified"; job.result.candidateFingerprint = fingerprint;
+      writeDoctorUpdateJob(root, job);
+      const queued = await inspectIndependentDoctor(root, deps);
+      assert.equal(queued.update.phase, "verification_queued", "operation contention is not stale evidence");
+      assert.equal(queued.update.state, "checking");
+      assert.doesNotMatch(queued.update.progress!, /Scan again|changed/i);
+      assert.equal(queued.actions.find(action => action.id === "scan")?.enabled, false);
+      assert.equal(queued.actions.find(action => action.id === "update")?.enabled, false);
+      assert.equal(readDoctorUpdateJob(root)!.result.state, "compatible", "a busy read cannot revoke or rewrite saved validation");
+    } finally {
+      if (savedTestRoot === undefined) delete process.env.TWEAKERS_TEST_FALLBACK_ROOT; else process.env.TWEAKERS_TEST_FALLBACK_ROOT = savedTestRoot;
+      if (savedPreload === undefined) delete process.env.TWEAKERS_TEST_ROOT_PRELOAD; else process.env.TWEAKERS_TEST_ROOT_PRELOAD = savedPreload;
+    }
+    writeDoctorPrivateJson(join(root, "doctor", "update.json"), { schemaVersion: -1 });
+    const unreadable = await inspectIndependentDoctor(root, deps);
+    assert.equal(unreadable.update.phase, "revalidation_required");
+    assert.match(unreadable.update.progress!, /Update verification could not complete:/);
+    assert.ok(unreadable.findings.some(finding => finding.id === "independent.update.verification"));
+    assert.ok(unreadable.actions.find(action => action.id === "update")!.blockers.includes(unreadable.update.progress!));
+    assert.equal(unreadable.actions.find(action => action.id === "update")!.enabled, false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -147,7 +189,7 @@ test("refresh requires an unexpired operation-bound Doctor approval before inspe
 });
 
 
-test("duplicate watcher scans coalesce and unavailable worker cannot approve an update", () => {
+test("duplicate watcher scans coalesce and unavailable worker cannot approve an update", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-dispatch-")));
   let launches = 0;
   const worker = Object.assign(new EventEmitter(), { unref() {} });
@@ -156,24 +198,24 @@ test("duplicate watcher scans coalesce and unavailable worker cannot approve an 
   const deps = { inputs: () => input, spawn: (() => { launches++; return worker; }) as never };
   const executable = { state: "resolved" as const, path: "/fixture/manager", sha256: "a".repeat(64) };
   try {
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     const id = readDoctorUpdateJob(root)!.id;
-    startDoctorUpdateScan(root, executable, false, deps);
-    startDoctorUpdateScan(root, executable, true, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, true, deps);
     assert.equal(launches, 1);
     assert.equal(readDoctorUpdateJob(root)!.id, id);
     worker.emit("error", new Error("offline"));
     assert.equal(readDoctorUpdateJob(root)!.result.state, "review_required");
     assert.equal(readDoctorUpdateJob(root)!.result.candidateFingerprint, null);
     // An unchanged completed negative review is retained by the automatic watcher.
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     assert.equal(launches, 1);
     const completed = readDoctorUpdateJob(root)!;
     completed.result.handoff = "Old exhausted allowance";
     completed.result.usage = { inputTokens: 123, outputTokens: 45 };
     completed.result.reviewFingerprint = fingerprint;
     writeDoctorUpdateJob(root, completed);
-    startDoctorUpdateScan(root, executable, true, { ...deps, resumeOnly: true });
+    await startDoctorUpdateScan(root, executable, true, { ...deps, resumeOnly: true });
     const resumed = readDoctorUpdateJob(root)!;
     assert.equal(resumed.resumeOnly, true);
     assert.equal(resumed.result.handoff, null);
@@ -181,17 +223,108 @@ test("duplicate watcher scans coalesce and unavailable worker cannot approve an 
     assert.equal(resumed.result.reviewFingerprint, null);
     assert.equal(resumed.lastCompletedResult!.handoff, "Old exhausted allowance");
     worker.emit("error", new Error("offline"));
-    startDoctorUpdateScan(root, executable, true, deps);
+    await startDoctorUpdateScan(root, executable, true, deps);
     assert.equal(readDoctorUpdateJob(root)!.resumeOnly, true, "manual retry preserves the recovery's exact source instead of discovering another release");
     assert.equal(readDoctorUpdateJob(root)!.id, id);
     worker.emit("error", new Error("offline"));
     const job = readDoctorUpdateJob(root)!;
     job.nativeIdentity = `sha256:${"b".repeat(64)}`;
     writeDoctorUpdateJob(root, job);
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     assert.equal(launches, 4);
     assert.notEqual(readDoctorUpdateJob(root)!.id, id);
     assert.notEqual(readDoctorUpdateJob(root)!.resumeOnly, true, "a genuinely new job may discover its source");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("verification drift rechecks a retained candidate while construction drift supersedes it", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-implementation-drift-")));
+  const worker = Object.assign(new EventEmitter(), { unref() {} });
+  let launches = 0;
+  const input: DoctorIndependentInputs = { root, variantRoot: join(root, "variant"), runtimeRoot: join(root, "runtime"), brokerRoot: join(root, "broker"),
+    version: "1", build: "10", nativeVersion: "2", nativeBuild: "20", installedIdentity: fingerprint, nativeIdentity: fingerprint,
+    runtimeFingerprint: fingerprint, originalAsarHash: "b".repeat(64) };
+  const deps = { inputs: () => input, spawn: (() => { launches++; return worker; }) as never };
+  const executable = { state: "resolved" as const, path: "/fixture/manager", sha256: "a".repeat(64) };
+  try {
+    await startDoctorUpdateScan(root, executable, false, deps);
+    let prior = readDoctorUpdateJob(root)!;
+    prior.candidatePackage = join(doctorDirectory(root), "jobs", prior.id, "candidate");
+    mkdirSync(prior.candidatePackage, {recursive: true});
+    prior.candidateReceipt = {fixture: "receipt checked by the worker"} as never;
+    prior.result.state = "compatible";
+    prior.result.phase = "candidate_verified";
+    prior.result.reviewFingerprint = fingerprint;
+    prior.implementationScopes = { ...doctorImplementationScopes(), verification: `sha256:${"0".repeat(64)}` };
+    writeDoctorUpdateJob(root, prior);
+    await startDoctorUpdateScan(root, executable, true, deps);
+    const rechecking = readDoctorUpdateJob(root)!;
+    assert.equal(launches, 2);
+    assert.equal(rechecking.id, prior.id);
+    assert.equal(rechecking.candidatePackage, prior.candidatePackage);
+    assert.deepEqual(rechecking.candidateReceipt, prior.candidateReceipt);
+    assert.equal(rechecking.result.state, "checking");
+    assert.equal(rechecking.resumeOnly, true, "verification changes retain the exact source rather than downloading another release");
+    assert.equal(rechecking.result.candidateFingerprint, null);
+    assert.equal(rechecking.result.reviewFingerprint, null);
+    assert.equal(rechecking.result.compatibility, undefined);
+    assert.equal(rechecking.result.review, undefined);
+    assert.equal(rechecking.result.execution?.status, "running", "the store derives fresh execution state, never retains a ready approval");
+    assert.equal(rechecking.lastCompletedResult, undefined, "old successful verification cannot short-circuit the worker");
+    prior = rechecking;
+    prior.result.state = "fixes_required";
+    prior.result.phase = "needs_attention";
+    prior.implementationScopes = { ...doctorImplementationScopes(), construction: `sha256:${"0".repeat(64)}` };
+    writeDoctorUpdateJob(root, prior);
+
+    await startDoctorUpdateScan(root, executable, true, deps);
+    const fresh = readDoctorUpdateJob(root)!;
+    assert.equal(launches, 3);
+    assert.notEqual(fresh.id, prior.id);
+    assert.equal(fresh.predecessorId, prior.id);
+    assert.equal(fresh.result.candidateId, fresh.id);
+    assert.equal(fresh.result.candidateFingerprint, null);
+    assert.equal((readDoctorPrivateJson(join(doctorDirectory(root), "jobs", prior.id, "job.json")) as {supersededBy?: string}).supersededBy, fresh.id);
+    // Restoring the construction implementation after a rejected empty scan
+    // can resume the immediate retained candidate, but never its approval.
+    const historical = readDoctorPrivateJson(join(doctorDirectory(root), "jobs", prior.id, "job.json")) as typeof prior;
+    historical.implementationScopes = {...doctorImplementationScopes(), verification: `sha256:${"0".repeat(64)}`};
+    historical.sourcePath = join(root, "consumed-source.app");
+    historical.sourceGenerationId = "source-generation";
+    historical.sourceReceiptDigest = fingerprint;
+    historical.result.sourceFingerprint = fingerprint;
+    writeDoctorPrivateJson(join(doctorDirectory(root), "jobs", historical.id, "job.json"), historical);
+    fresh.result.state = "review_required"; fresh.result.phase = "needs_attention";
+    writeDoctorUpdateJob(root, fresh);
+    const registeredSource = () => ({state: "ready" as const, generationId: historical.sourceGenerationId,
+      receiptDigest: historical.sourceReceiptDigest, artifactPath: historical.sourcePath, sourceDigest: fingerprint});
+    await startDoctorUpdateScan(root, executable, true, {...deps, registeredSource: registeredSource as never});
+    const recovered = readDoctorUpdateJob(root)!;
+    assert.equal(launches, 4);
+    assert.equal(recovered.id, historical.id);
+    assert.equal(recovered.supersededBy, undefined);
+    assert.equal(recovered.resumeOnly, true);
+    assert.equal(recovered.candidatePackage, historical.candidatePackage);
+    assert.equal(recovered.result.sourceFingerprint, fingerprint);
+    assert.equal(recovered.result.candidateFingerprint, null);
+    assert.equal(recovered.result.compatibility, undefined);
+    assert.equal(recovered.lastCompletedResult, undefined);
+    assert.equal((readDoctorPrivateJson(join(doctorDirectory(root), "jobs", fresh.id, "job.json")) as typeof fresh).supersededBy, historical.id);
+    writeDoctorPrivateJson(join(doctorDirectory(root), "jobs", historical.id, "job.json"), historical);
+    writeDoctorUpdateJob(root, fresh);
+    await startDoctorUpdateScan(root, executable, true, {...deps, registeredSource: () => ({...registeredSource(), receiptDigest: "changed"}) as never});
+    assert.notEqual(readDoctorUpdateJob(root)!.id, historical.id, "changed source registration cannot recover the retained candidate");
+    historical.implementationScopes = doctorImplementationScopes();
+    historical.availableUpdateBuild = "20";
+    writeDoctorPrivateJson(join(doctorDirectory(root), "jobs", historical.id, "job.json"), historical);
+    writeDoctorUpdateJob(root, fresh);
+    await startDoctorUpdateScan(root, executable, false, {...deps, registeredSource: registeredSource as never,
+      trigger: "available_update", availableUpdateBuild: "20"});
+    const automaticRecovery = readDoctorUpdateJob(root)!;
+    assert.equal(automaticRecovery.id, historical.id, "an unchanged automatic update must dispatch recovered evidence");
+    assert.equal(automaticRecovery.result.state, "checking");
+    assert.equal(automaticRecovery.resumeOnly, true);
+    assert.equal(automaticRecovery.result.candidateFingerprint, null);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -202,7 +335,9 @@ test("the existing independent refresh entry point cannot rebuild around Doctor 
     await assert.rejects(createTweakersVariant({ source: join(root, "missing-source.app"), app: "/Applications/Tweakers.app", userRoot: join(root, "variant"), refresh: true }, {
       platform: () => "darwin", managerRoot: () => root, home: () => root,
     }), /approve the reviewed candidate/);
-    assert.deepEqual(readdirSync(root), []);
+    assert.deepEqual(readdirSync(root), ["Library"]);
+    const operation = readDoctorPrivateJson(join(root, "Library/Application Support/Tweakers/local-operation/operation.json")) as {state:string};
+    assert.equal(operation.state, "failed");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -294,6 +429,15 @@ test("adoption decisions persist, unknown changes require explicit acknowledgmen
     const interrupted = successor;
     // An oversized historical diagnostic without decisions must not hide an older refusal.
     writeDoctorPrivateJson(join(root, "doctor", "jobs", interrupted.id, "changes.json"), { legacyDiagnostic: "x".repeat(17 * 1024 * 1024) });
+    // Cleanup keeps compact adoption continuity while retiring the large job packet.
+    for (const previous of [job, interrupted]) {
+      const base = join(root, "doctor", "jobs", previous.id);
+      const decisions = readDoctorPrivateJson(join(base, "decisions.json"));
+      const body = { schemaVersion: 1, job: { id: previous.id, predecessorId: previous.predecessorId ?? null },
+        decisions, report: decisions ? readDoctorPrivateJson(join(base, "changes.json"), { maxBytes: 128 * 1024 * 1024 }) : null };
+      writeDoctorPrivateJson(join(root, "doctor", "adoption-history", `${previous.id}.json`), { ...body, fingerprint: doctorDigest(body) });
+      rmSync(base, { recursive: true });
+    }
     const following = { ...successor, id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", predecessorId: interrupted.id };
     writeDoctorUpdateJob(root, following);
     const regrouped = { ...report, jobId: following.id, implementationFingerprint: successor.runtimeFingerprint, changes: [change("regrouped", "unknown")], changelog: { schemaVersion: 1 as const, entries: [], unresolved: [{groupId: "regrouped", reason: "Regrouped evidence needs review"}] } };
@@ -309,7 +453,7 @@ test("adoption decisions persist, unknown changes require explicit acknowledgmen
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("new upstream scans queue during a worker and interrupted same-source scans keep their job identity", () => {
+test("new upstream scans queue during a worker and interrupted same-source scans keep their job identity", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-queue-")));
   const worker = new EventEmitter() as EventEmitter & { unref(): void }; worker.unref = () => {};
   let launches = 0;
@@ -318,21 +462,26 @@ test("new upstream scans queue during a worker and interrupted same-source scans
   const deps = { inputs: () => input, spawn: (() => { launches++; return worker; }) as never };
   const executable = { state: "resolved" as const, path: "/fixture/manager", sha256: "a".repeat(64) };
   try {
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     const first = readDoctorUpdateJob(root)!;
     input.nativeIdentity = `sha256:${"b".repeat(64)}`;
-    startDoctorUpdateScan(root, executable, false, deps);
+    const { withLocalOperation } = await import("./local-operation.js");
+    await withLocalOperation(`doctor:${first.id}`, async () => {
+      await startDoctorUpdateScan(root, executable, true, {...deps, inputs() { throw new Error("Do not fingerprint mutating outputs"); }});
+      assert.deepEqual(readDoctorPrivateJson(join(doctorDirectory(root), "queued-update.json")), {schemaVersion: 1, trigger: "manual"});
+    });
+    await startDoctorUpdateScan(root, executable, false, deps);
     assert.equal(launches, 1);
     assert.equal(readDoctorUpdateJob(root)!.id, first.id);
     const { result } = first;
     result.state = "review_required"; result.phase = "review_incomplete";
     writeDoctorUpdateJob(root, first);
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     const second = readDoctorUpdateJob(root)!;
     assert.notEqual(second.id, first.id);
     second.result.state = "review_required"; second.result.phase = "review_incomplete";
     writeDoctorUpdateJob(root, second);
-    startDoctorUpdateScan(root, executable, false, deps);
+    await startDoctorUpdateScan(root, executable, false, deps);
     assert.equal(readDoctorUpdateJob(root)!.id, second.id);
     assert.equal(launches, 3);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -614,4 +763,66 @@ test("candidate override advances the retained receipt binding without changing 
     assert.equal(inputs.overrides.length, 1);
     assert.throws(() => recordDoctorCandidateOverride(root, id, fingerprint, next, "stale"), /changed/);
   } finally { rmSync(root, {recursive: true, force: true}); }
+});
+
+
+test("construction scope follows named dynamic helpers and initialization without unrelated exports", () => {
+  const root = mkdtempSync(join(tmpdir(), "doctor-dynamic-scope-"));
+  try {
+    writeFileSync(join(root, "package-lock.json"), "{}");
+    writeFileSync(join(root, "entry.js"), 'export async function build() { const { inspect: inspectHelper } = await import("./helper.js"); return inspectHelper(); }');
+    writeFileSync(join(root, "helper.js"), 'export function inspect() { return 1; } export function promote() { return "old UI"; }');
+    const scoped = () => doctorCodeScopeFingerprint(root, [["entry", ["build"]]]);
+    const before = scoped();
+    const legacy = doctorCodeScopeFingerprint(root, [["entry", ["build"]]], true);
+    writeFileSync(join(root, "helper.js"), 'export function inspect() { return 1; } export function promote() { return "new UI"; }');
+    assert.equal(scoped(), before, "unconsumed promotion exports do not force app construction");
+    assert.notEqual(doctorCodeScopeFingerprint(root, [["entry", ["build"]]], true), legacy, "legacy equivalence must reproduce the original broad dependency binding");
+    writeFileSync(join(root, "helper.js"), 'export function inspect() { return 2; } export function promote() { return "new UI"; }');
+    assert.notEqual(scoped(), before, "consumed helper behavior is bound");
+    writeFileSync(join(root, "helper.js"), 'globalThis.init = 1; export function inspect() { return 1; } export function promote() { return "old UI"; }');
+    assert.notEqual(scoped(), before, "module initialization is bound");
+    writeFileSync(join(root, "entry.js"), 'export async function build() { const { inspect = () => 1 } = await import("./helper.js"); return inspect(); }');
+    assert.throws(scoped, /Unsupported scoped dynamic import binding/, "ambiguous bindings fail closed");
+  } finally { rmSync(root, {recursive: true, force: true}); }
+});
+
+
+test("status keeps polling a bound installation while the target is temporarily absent", async () => {
+  const { ManagerOperationStore } = await import("./manager-operation-store.js");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "doctor-cutover-status-")));
+  const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", operationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const now = new Date().toISOString();
+  try {
+    writeDoctorUpdateJob(root, { schemaVersion: 1, id, pid: process.pid, startedAt: now, updatedAt: now,
+      nativeIdentity: fingerprint, installedIdentity: fingerprint, runtimeFingerprint: fingerprint,
+      sourceGenerationId: null, sourceReceiptDigest: null, sourcePath: null, baselinePath: null,
+      candidatePackage: null, candidateReceipt: null, findings: [], result: { state: "compatible", phase: "candidate_verified", candidateId: id,
+        sourceFingerprint: null, tweakersFingerprint: fingerprint, candidateFingerprint: fingerprint, reviewFingerprint: fingerprint,
+        progress: "Ready", usage: null, handoff: null } });
+    writeDoctorPrivateJson(join(doctorDirectory(root), "update-operation.json"), { operationId, jobId: id });
+    const store = new ManagerOperationStore(root);
+    const operation: import("./manager-contract.js").TweakersManagerPreparedOperationV1 = {
+      schemaVersion: 1, kind: "tweakers-manager-operation", managerId: "com.thomashulihan.tweakers", protocolVersion: 1,
+      operationId, preparedRequestId: id, actionId: "refresh.independent",
+      moduleIdentity: { state: "resolved", path: "/fixed/Tweakers Manager Launcher", sha256: "a".repeat(64) },
+      boundStateToken: fingerprint, parameters: {}, parametersSha256: fingerprint, impact: "repair-app",
+      createdAt: now, expiresAt: new Date(Date.parse(now) + 60_000).toISOString(), phase: "consumed", consumedAt: now, cancelledAt: null, completedAt: null,
+      failedAt: null, recoveryRequiredAt: null, stateTokenInputsSha256: fingerprint, receiptChronologyRevision: fingerprint,
+      receiptSnapshot: [], receiptRefs: ["independent-tweakers-patch:1.0.0"], outcome: null, error: null,
+    };
+    store.create(operation);
+    const deps = { inputs: () => { throw new Error("target moving during atomic cutover"); } };
+    const during = await inspectIndependentDoctor(root, deps);
+    assert.equal(during.update.state, "checking");
+    assert.equal(during.update.phase, "updating");
+    assert.equal(during.actions.some(action => action.enabled), false);
+    store.replace({ ...operation, phase: "completed", completedAt: now, outcome: "completed" });
+    const missing = await inspectIndependentDoctor(root, deps);
+    assert.equal(missing.update.state, "review_required", "a terminal receipt alone cannot prove a missing installation is healthy");
+    assert.notEqual(missing.update.phase, "installed");
+    writeDoctorPrivateJson(join(doctorDirectory(root), "update-operation.json"), { operationId, jobId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" });
+    store.replace(operation);
+    assert.equal((await inspectIndependentDoctor(root, deps)).update.state, "review_required", "another job cannot keep this installation pending");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

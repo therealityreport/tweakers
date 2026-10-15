@@ -1,3 +1,7 @@
+import { resolveBundledCodexBackend } from "./platform.js";
+import { readDoctorUpdateJob, writeDoctorUpdateJob, writeDoctorPrivateJson } from "./doctor-store.js";
+import { withLocalOperation } from "./local-operation.js";
+import { readReservations, reserveLocalArtifact, relocateLocalArtifactReservation, moveReservedLocalArtifact } from "./local-artifacts.js";
 /**
  * Immutable, manager-owned copies of the currently verified stable ChatGPT
  * application.  This authority is intentionally separate from the
@@ -24,7 +28,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import type { Stats } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { readFileInAsar, readHeaderHash } from "./asar.js";
 import {
   createEnvironmentProfileRegistry,
@@ -45,9 +49,10 @@ import { isMacOsJunkName } from "./fs-copy.js";
 import { TWEAKERS_MANAGER_ID, type ManagerResolvedExecutableIdentityV1 } from "./manager-contract.js";
 import { parseManagerStrictJsonObject } from "./manager-strict-json.js";
 import { readPlist } from "./plist.js";
-import { acquireProcessLock, type ProcessLock } from "./process-lock.js";
+import { acquireProcessLock, processAlive, type ProcessLock } from "./process-lock.js";
 import { STABLE_DESKTOP_PATH } from "./environment-profile.js";
 import { cloneAppTree } from "./transaction.js";
+import { captureDoctorBaseline, doctorBaselineNeedsCliContextUpgrade, readDoctorBaseline } from "./doctor-baseline.js";
 
 export const OFFICIAL_SOURCE_SCHEMA_VERSION = 1 as const;
 export const OFFICIAL_SOURCE_KIND = "tweakers-stable-official-source" as const;
@@ -96,6 +101,7 @@ export interface OfficialSourceTrust {
 
 export interface OfficialSourceObservation {
   appPath: string;
+  backendRelativePath?: string;
   physicalPath: string;
   rootIdentity: OfficialSourcePathIdentity;
   bundleId: "com.openai.codex";
@@ -159,6 +165,8 @@ export interface RegisteredOfficialSourceStatus {
   generationId: string | null;
   receiptDigest: string | null;
   artifactPath: string | null;
+  baselinePath?: string;
+  constructionState?: "available" | "consumed";
   version: string | null;
   build: string | null;
   /** A fresh strict observation of the fixed live app, when one exists. */
@@ -283,6 +291,7 @@ export function observeStableOfficialSource(path = STABLE_DESKTOP_PATH): Officia
   const root = lstatSync(path);
   return {
     appPath: STABLE_DESKTOP_PATH,
+    backendRelativePath: relative(path, resolveBundledCodexBackend(path)),
     physicalPath,
     rootIdentity: pathIdentity(root, "Official ChatGPT source"),
     bundleId: "com.openai.codex",
@@ -305,6 +314,8 @@ export function observeStableOfficialSource(path = STABLE_DESKTOP_PATH): Officia
  * fixed source.  Any disagreement fails closed rather than falling back to a
  * mode cache or `/Applications/ChatGPT.app`. */
 export function readRegisteredOfficialSource(root: string): RegisteredOfficialSourceStatus {
+  const evidence = readEvidenceRegistrationStatus(root, true);
+  if (evidence) return evidence;
   const paths = officialSourcePaths(root);
   let candidate: OfficialSourceObservation | null = null;
   let candidateProblem: string | null = null;
@@ -389,21 +400,39 @@ export function readRegisteredOfficialSource(root: string): RegisteredOfficialSo
 /** Read a retained baseline without requiring the live desktop to remain on it. */
 export function findRetainedOfficialSourceForDoctor(root: string, expected: {
   version: string; build: string; originalAsarHash: string;
-}): { receipt: RegisteredOfficialSourceReceipt; receiptDigest: string } {
+}): { receipt: RegisteredOfficialSourceReceipt; receiptDigest: string; baselinePath: string } {
   const paths = officialSourcePaths(root);
-  assertPrivateDirectory(paths.generationsRoot, "Official-source generations root");
-  const matches: Array<{ receipt: RegisteredOfficialSourceReceipt; receiptDigest: string }> = [];
-  for (const id of readdirSync(paths.generationsRoot).sort()) {
+  if (existsSync(paths.generationsRoot)) assertPrivateDirectory(paths.generationsRoot, "Official-source generations root");
+  const matches: Array<{ receipt: RegisteredOfficialSourceReceipt; receiptDigest: string; baselinePath: string }> = [];
+  for (const id of (existsSync(paths.generationsRoot) ? readdirSync(paths.generationsRoot).sort() : [])) {
     if (!UUID.test(id)) continue;
     const bytes = readOptionalPrivateBytes(join(paths.generationsRoot, id, "receipt.json"), "Retained source receipt");
     if (!bytes) continue;
     const receipt = parseReceipt(bytes, paths, id);
     if (receipt.source.version !== expected.version || receipt.source.build !== expected.build
       || receipt.source.appAsarHeaderHash !== expected.originalAsarHash) continue;
+    const baselinePath = join(paths.sourceRoot, "baselines", id);
+    if (existsSync(baselinePath)) {
+      const baseline = readDoctorBaseline(baselinePath);
+      if (baseline.sourceReceiptSha256 !== sha256(bytes) || baseline.originalAppPath !== receipt.artifact.appPath) throw new Error("Doctor baseline provenance changed");
+      matches.push({receipt,receiptDigest:sha256(bytes),baselinePath});
+      continue;
+    }
     if (realpathSync(receipt.artifact.appPath) !== receipt.artifact.physicalPath
       || !sameSeal(sealOfficialSourceTree(receipt.artifact.appPath), receipt.artifact.treeSeal)) throw new Error("Doctor retained baseline changed");
     assertCloneMatchesOfficialReceipt(receipt.artifact.appPath, receipt.source, receipt.artifact.treeSeal);
-    matches.push({ receipt, receiptDigest: sha256(bytes) });
+    matches.push({ receipt, receiptDigest: sha256(bytes), baselinePath: receipt.artifact.appPath });
+  }
+  const baselines = join(paths.sourceRoot, "baselines");
+  for (const id of (existsSync(baselines) ? readdirSync(baselines).sort() : [])) {
+    if (!UUID.test(id) || matches.some(m => m.receipt.generationId === id)) continue;
+    const baselinePath = join(baselines,id);
+    const baseline = readDoctorBaseline(baselinePath, false);
+    const receipt = baseline.sourceReceipt as RegisteredOfficialSourceReceipt;
+    if (receipt.source?.version !== expected.version || receipt.source?.build !== expected.build || receipt.source?.appAsarHeaderHash !== expected.originalAsarHash) continue;
+    if (receipt.generationId !== id || baseline.sourceReceiptSha256 !== sha256(Buffer.from(JSON.stringify(receipt)))) throw new Error("Captured baseline provenance changed");
+    readDoctorBaseline(baselinePath);
+    matches.push({receipt,receiptDigest:baseline.sourceReceiptSha256,baselinePath});
   }
   if (!matches.length) throw new Error("Doctor cannot prove the source used by installed Tweakers");
   // Duplicate sealed copies of identical source bytes are equivalent; differing
@@ -427,6 +456,8 @@ export function readRegisteredOfficialSourceStatusProjection(
   root: string,
   dependencies: OfficialSourceStatusProjectionDependencies = {},
 ): RegisteredOfficialSourceStatus {
+  const evidence = readEvidenceRegistrationStatus(root, false);
+  if (evidence) return evidence;
   const paths = officialSourcePaths(root);
   const observeMetadata = dependencies.observeMetadata ?? observeOfficialSourceMetadata;
   try {
@@ -538,6 +569,11 @@ export function acquireRegisteredOfficialSourceLease(root: string): RegisteredOf
     if (status.state !== "ready" || status.generationId === null || status.receiptDigest === null) {
       throw new Error(status.problem ?? "No current sealed official source is available");
     }
+    const evidence = readEvidenceRegistration(root);
+    if (evidence) {
+      if (evidence.pointer.receiptDigest !== status.receiptDigest) throw new Error("Source registration changed while acquiring its lease");
+      return {receipt:evidence.receipt,pointer:evidence.pointer,receiptDigest:evidence.pointer.receiptDigest,release:()=>lock.release()};
+    }
     const pointerBytes = readOptionalPrivateBytes(paths.currentFile, "Official-source current pointer");
     if (pointerBytes === null) throw new Error("The official-source current pointer disappeared while acquiring its lease");
     const pointer = parsePointer(pointerBytes, paths);
@@ -611,6 +647,7 @@ export function registerStableOfficialSource(
     if (existsSync(stagingGeneration) || existsSync(join(paths.generationsRoot, generationId))) {
       throw new Error("Official-source generation collision");
     }
+    reserveLocalArtifact(input.root, "/Applications/Tweakers.app", [stagedApp, join(paths.generationsRoot,generationId,OFFICIAL_SOURCE_APP_NAME)]);
     ensurePrivateDirectory(stagingGeneration);
     (deps.cloneApp ?? cloneAppTree)(sourcePath, stagedApp);
     const clone = observeArtifact(stagedApp);
@@ -644,6 +681,7 @@ export function registerStableOfficialSource(
     writePrivateJson(join(stagingGeneration, "receipt.json"), receipt);
     fsyncTree(stagingGeneration);
     renameSync(stagingGeneration, join(paths.generationsRoot, generationId));
+    relocateLocalArtifactReservation(input.root, stagedApp, join(paths.generationsRoot,generationId,OFFICIAL_SOURCE_APP_NAME));
     fsyncDirectory(paths.generationsRoot);
     const publishedReceiptPath = join(paths.generationsRoot, generationId, "receipt.json");
     const publishedReceiptBytes = readFileSync(publishedReceiptPath);
@@ -807,6 +845,7 @@ function observeClone(path: string): OfficialSourceObservation {
   const asarHeader = readHeaderHash(join(path, "Contents", "Resources", "app.asar")).headerHash.toLowerCase();
   return {
     appPath: path,
+    backendRelativePath: relative(path, resolveBundledCodexBackend(path)),
     physicalPath,
     rootIdentity: pathIdentity(lstatSync(path), "Staged official-source artifact"),
     bundleId: "com.openai.codex",
@@ -889,7 +928,8 @@ function refreshedCanonicalEnvironment(
     teamIdentifier: source.trust.teamIdentifier,
     designatedRequirement: source.trust.designatedRequirement,
     signatureCheckedAt: now,
-    officialBackendPath: join(STABLE_DESKTOP_PATH, "Contents", "Resources", "codex"),
+    officialBackendPath: join(STABLE_DESKTOP_PATH, source.backendRelativePath ?? "Contents/Resources/codex"),
+    backendPath: join(STABLE_DESKTOP_PATH, source.backendRelativePath ?? "Contents/Resources/codex"),
     // These are separate capability surfaces. Do not carry a version/fingerprint
     // observed from an older ChatGPT build into the new official registration.
     officialBackendVersion: null,
@@ -1076,6 +1116,16 @@ function parseObservation(value: Record<string, unknown>, label: string, expecte
 }
 
 export function sealOfficialSourceTree(root: string): OfficialSourceTreeSeal {
+  return sealFilesystemTree(root, true);
+}
+
+/** Historical profiles can contain dangling sockets/cookies. Preserve each link
+ * as a link; never read its target. Executable official sources remain strict. */
+export function sealHistoricalArtifactTree(root: string): OfficialSourceTreeSeal {
+  return sealFilesystemTree(root, false);
+}
+
+function sealFilesystemTree(root: string, verifyLinkTargets: boolean): OfficialSourceTreeSeal {
   assertRealDirectory(root, "Official-source tree root");
   const lexicalRoot = resolve(root);
   const physicalRoot = realpathSync(root);
@@ -1104,7 +1154,7 @@ export function sealOfficialSourceTree(root: string): OfficialSourceTreeSeal {
     }
     if (stat.isSymbolicLink()) {
       const target = readlinkSync(path);
-      assertContainedRelativeSymlink(lexicalRoot, physicalRoot, path, target);
+      if (verifyLinkTargets) assertContainedRelativeSymlink(lexicalRoot, physicalRoot, path, target);
       hash.update("symlink\0").update(target).update("\0");
       return;
     }
@@ -1487,4 +1537,155 @@ function assertDoctorPreparedSourcePath(root: string, path: string): void {
 export function preparedOfficialSourceDigest(root: string, path: string): string {
   assertDoctorPreparedSourcePath(root, path);
   return digestObservation(observeClone(path));
+}
+
+
+interface EvidenceRegistrationV2 {
+  consumption?:{state:"moving"|"consumed"|"restoring";destination:string;at:string;reservationId?:string;jobId?:string};
+  version:2; baselinePath:string; receipt:RegisteredOfficialSourceReceipt; pointer:OfficialSourceCurrentPointer;
+}
+function readEvidenceRegistration(root:string):EvidenceRegistrationV2|null {
+  const file=join(root,"official-source","current-evidence.json");
+  if(!existsSync(file))return null;
+  const bytes=readOptionalPrivateBytes(file,"Evidence source registration");
+  if(!bytes)throw new Error("Evidence registration is unavailable");
+  const value=JSON.parse(bytes.toString()) as EvidenceRegistrationV2;
+  const receipt=value.receipt,pointer=value.pointer;
+  if(value.version!==2||!receipt||!pointer||!UUID.test(receipt.generationId)
+    ||value.baselinePath!==join(root,"official-source","baselines",receipt.generationId)
+    ||pointer.generationId!==receipt.generationId||pointer.receiptDigest!==sha256(Buffer.from(JSON.stringify(receipt)))
+    ||pointer.appPath!==receipt.source.appPath||receipt.artifact.appPath!==receipt.source.appPath
+    ||pointer.sourceDigest!==digestObservation(receipt.source))throw new Error("Invalid evidence source registration");
+  const source=receipt.source.appPath;
+  if(value.consumption && (!["moving","consumed","restoring"].includes(value.consumption.state)
+    ||typeof value.consumption.destination!=="string"||!value.consumption.destination.startsWith(join(root,"doctor","jobs")+"/")
+    ||resolve(value.consumption.destination)!==value.consumption.destination||!Number.isFinite(Date.parse(value.consumption.at))))throw new Error("Invalid source consumption journal");
+  if(source!==STABLE_DESKTOP_PATH)assertDoctorPreparedSourcePath(root,source);
+  return value;
+}
+function readEvidenceRegistrationStatus(root:string,deep:boolean):RegisteredOfficialSourceStatus|null {
+  if(!existsSync(join(root,"official-source","current-evidence.json")))return null;
+  try {
+    const value=readEvidenceRegistration(root)!;
+    const baseline=readDoctorBaseline(value.baselinePath,deep);
+    if(baseline.sourceReceiptSha256!==value.pointer.receiptDigest)throw new Error("Baseline source receipt changed");
+    const pin=JSON.parse(readFileSync(join(root,"variants","tweakers","state.json"),"utf8")).signingIdentityHash;
+    if(baseline.signingIdentityHash!==pin)throw new Error("Baseline signing identity pin changed");
+    if(value.consumption && value.consumption.state!=="consumed")throw new Error("Interrupted source consumption requires journal reconciliation");
+    if(!value.consumption && deep){const current=value.receipt.source.appPath===STABLE_DESKTOP_PATH?observeStableOfficialSource():observeClone(value.receipt.source.appPath);assertObservationContentMatches(value.receipt.source,current,"Registered source changed");}
+    else if(!value.consumption && !sameProjectedMetadata(observeOfficialSourceMetadata(value.receipt.source.appPath,"Registered source"),value.receipt.source))throw new Error("Registered source metadata changed");
+    return {state:"ready",constructionState:value.consumption ? "consumed" : "available",generationId:value.pointer.generationId,receiptDigest:value.pointer.receiptDigest,artifactPath:value.pointer.appPath,baselinePath:value.baselinePath,version:value.pointer.version,build:value.pointer.build,candidateDigest:value.pointer.sourceDigest,sourceDigest:value.pointer.sourceDigest,revision:sha256Revision(readFileSync(join(root,"official-source","current-evidence.json"))),problem:null};
+  }catch(error){return statusFailure("stale",null,null,null,null,null,null,null,"evidence-unavailable",errorMessage(error));}
+}
+/** Comparison evidence survives consumption; construction requires its exact available path. */
+export function canReuseRegisteredSourceEvidence(prior: RegisteredOfficialSourceStatus | null, sourceDigest: string, constructionPath?: string): boolean {
+  return prior?.state === "ready" && prior.sourceDigest === sourceDigest
+    && (constructionPath === undefined || prior.constructionState !== "consumed" && prior.artifactPath === constructionPath);
+}
+
+/** Retain immutable review evidence, never another full source application. */
+export async function registerOfficialSourceEvidence(input:RegisterStableOfficialSourceInput):Promise<RegisterStableOfficialSourceResult> {
+  return withLocalOperation("register source evidence",async()=>{
+    const paths=officialSourcePaths(input.root);ensurePrivateDirectory(paths.sourceRoot);
+    const lock=acquireProcessLock(paths.lockFile);
+    try {
+      assertUuid(input.operationId,"Source evidence operation");
+      const sourcePath=input.preparedSourcePath??STABLE_DESKTOP_PATH;
+      if(input.preparedSourcePath)assertDoctorPreparedSourcePath(input.root,sourcePath);
+      const before=input.preparedSourcePath?observeClone(sourcePath):observeStableOfficialSource();
+      const sourceDigest=digestObservation(before);
+      if(sourceDigest!==input.expectedSourceDigest)throw new Error("Official source changed before evidence capture");
+      const prior=readEvidenceRegistrationStatus(input.root,true);
+      if(canReuseRegisteredSourceEvidence(prior,sourceDigest,sourcePath) && prior?.baselinePath && !doctorBaselineNeedsCliContextUpgrade(prior.baselinePath))return {generationId:prior!.generationId!,receiptDigest:prior!.receiptDigest!,sourceDigest,receiptRef:join(paths.sourceRoot,"current-evidence.json")};
+      const generationId=randomUUID(),now=new Date().toISOString();
+      const receipt:RegisteredOfficialSourceReceipt={schemaVersion:1,kind:OFFICIAL_SOURCE_KIND,generationId,operationId:input.operationId,registeredAt:now,source:before,artifact:{appPath:sourcePath,physicalPath:before.physicalPath,rootIdentity:before.rootIdentity,treeSeal:before.treeSeal},manager:{id:TWEAKERS_MANAGER_ID,executablePath:input.managerExecutable.path,executableSha256:input.managerExecutable.sha256.replace(/^sha256:/,"")}};
+      const pin=JSON.parse(readFileSync(join(input.root,"variants","tweakers","state.json"),"utf8")).signingIdentityHash;
+      writeTransaction(paths.transactionFile,{schemaVersion:1,kind:OFFICIAL_SOURCE_TRANSACTION_KIND,operationId:input.operationId,sourceDigest,generationId,receiptDigest:null,phase:"preparing",createdAt:now,updatedAt:now,error:null});
+      const baselinePath=captureDoctorBaseline(input.root,receipt,pin,()=>{
+        const after=input.preparedSourcePath?observeClone(sourcePath):observeStableOfficialSource();
+        assertObservationContentMatches(before,after,"Official source changed during evidence capture");
+      });
+      const receiptDigest=sha256(Buffer.from(JSON.stringify(receipt)));
+      const pointer:OfficialSourceCurrentPointer={schemaVersion:1,kind:OFFICIAL_SOURCE_POINTER_KIND,generationId,receiptDigest,appPath:sourcePath,version:before.version,build:before.build,sourceDigest,publishedAt:now};
+      if(!input.preparedSourcePath){const {registry,selection}=refreshedCanonicalEnvironment(paths,before,now);publishEnvironmentSnapshot(paths.environmentRegistryFile,paths.environmentSelectionFile,registry,selection);}
+      writePrivateJson(join(paths.sourceRoot,"current-evidence.json"),{version:2,baselinePath,receipt,pointer});
+      writeTransaction(paths.transactionFile,{schemaVersion:1,kind:OFFICIAL_SOURCE_TRANSACTION_KIND,operationId:input.operationId,sourceDigest,generationId,receiptDigest,phase:"completed",createdAt:now,updatedAt:now,error:null});
+      return {generationId,receiptDigest,sourceDigest,receiptRef:join(paths.sourceRoot,"current-evidence.json")};
+    }finally{lock.release();}
+  });
+}
+
+/** Move a verified downloaded source into its candidate slot; never retain a clone. */
+export function consumePreparedOfficialSource(root:string,source:string,destination:string,remainingPaths:string[]):void {
+  const paths=officialSourcePaths(root),lock=acquireProcessLock(paths.lockFile);
+  try {
+    assertDoctorPreparedSourcePath(root,source);
+    const value=readEvidenceRegistration(root);
+    if(!value||value.consumption||value.receipt.source.appPath!==source)throw new Error("Prepared source is not an unconsumed registered generation");
+    const baseline=readDoctorBaseline(value.baselinePath);
+    if(baseline.sourceReceiptSha256!==value.pointer.receiptDigest)throw new Error("Prepared source baseline changed");
+    assertObservationContentMatches(value.receipt.source,observeClone(source),"Prepared source changed before consumption");
+    const reservation = readReservations(root).find(entry => entry.state !== "retired" && entry.paths.includes(source));
+    const job = readDoctorUpdateJob(root);
+    if (!reservation || !job || job.sourceGenerationId !== value.pointer.generationId || !destination.startsWith(join(root, "doctor/jobs", job.id) + "/")) throw new Error("Source consumption has no matching reservation and Doctor job");
+    value.consumption={state:"moving",destination,at:new Date().toISOString(),reservationId:reservation.id,jobId:job.id};
+    writePrivateJson(join(paths.sourceRoot,"current-evidence.json"),value);
+    moveReservedLocalArtifact(root,source,destination,remainingPaths);
+    value.consumption.state="consumed";
+    writePrivateJson(join(paths.sourceRoot,"current-evidence.json"),value);
+  }finally{lock.release();}
+}
+
+/** Restore only the same, still-unmodified vendor generation; patched candidates remain protected. */
+export function reconcilePreparedSourceConsumption(root: string, recoverConsumed = false): void {
+  const paths = officialSourcePaths(root), lock = acquireProcessLock(paths.lockFile);
+  let candidateLock: ReturnType<typeof acquireProcessLock> | undefined;
+  try {
+    candidateLock = acquireProcessLock(join(root, "doctor/candidate-mutation.lock"));
+    const value = readEvidenceRegistration(root);
+    if (!value?.consumption || value.consumption.state === "consumed" && !recoverConsumed) return;
+    const consumption = value.consumption;
+    const source = value.receipt.source.appPath;
+    const job = readDoctorUpdateJob(root);
+    if (!job || job.id !== consumption.jobId || job.sourceGenerationId !== value.pointer.generationId
+      || job.sourceReceiptDigest !== value.pointer.receiptDigest) throw new Error("Source recovery Doctor job identity changed");
+    if (job.pid !== process.pid && processAlive(job.pid)) throw new Error("Source recovery refuses a live Doctor worker");
+    const reservation = readReservations(root).find(entry => entry.id === consumption.reservationId && entry.state !== "retired");
+    if (!reservation) throw new Error("Source recovery reservation is unavailable");
+    const packet = join(root, "doctor/jobs", job.id);
+    if (reservation.paths.some(path => !path.startsWith(packet + "/"))) throw new Error("Source recovery reservation escapes its Doctor job");
+    const present = [...new Set([source, ...reservation.paths])].filter(existsSync);
+    if (present.length !== 1) throw new Error("Source recovery has ambiguous payload locations");
+    const retained = present[0]!;
+    const baseline = readDoctorBaseline(value.baselinePath);
+    if (baseline.sourceReceiptSha256 !== value.pointer.receiptDigest
+      || !sameSeal(sealOfficialSourceTree(retained), value.receipt.artifact.treeSeal)) throw new Error("Candidate was modified; preserve it for explicit candidate reconciliation");
+    value.consumption.state = "restoring";
+    writePrivateJson(join(paths.sourceRoot, "current-evidence.json"), value);
+    if (retained !== source) moveReservedLocalArtifact(root, retained, source, reservation.paths.filter(path => path !== retained));
+    assertObservationContentMatches(value.receipt.source, observeClone(source), "Restored vendor source changed");
+    const history = join(packet, "construction-recovery", consumption.at.replaceAll(":", "-"));
+    mkdirSync(history, { recursive: true, mode: 0o700 });
+    const metadata = ["candidate-inputs.json", "compatibility.json", "changes.json", "decisions.json"];
+    for (const name of metadata) {
+      const path = join(packet, name), destination = join(history, name);
+      if (existsSync(path)) { if (existsSync(destination)) throw new Error("Recovery metadata destination already exists"); renameSync(path, destination); }
+    }
+    for (const appPath of reservation.paths) {
+      const container = dirname(appPath);
+      if (container === dirname(source) || !existsSync(container)) continue;
+      if (existsSync(appPath)) throw new Error("A candidate payload appeared during recovery");
+      const target = join(history, basename(container));
+      if (existsSync(target)) throw new Error("Candidate recovery history collision");
+      renameSync(container, target);
+    }
+    if (!existsSync(join(history, "job-before-recovery.json"))) writeDoctorPrivateJson(join(history, "job-before-recovery.json"), job);
+    job.candidatePackage = null; job.candidateReceipt = null;
+    delete job.candidateQuickIdentity; delete job.reviewResultDigest; delete job.lastCompletedResult;
+    job.result = {...job.result, compatibility: undefined, candidateFingerprint: null, reviewFingerprint: null,
+      state: "review_required", phase: "source_restored", progress: "Original vendor source restored in the same slot; resume verification explicitly."};
+    writeDoctorUpdateJob(root, job);
+    delete value.consumption;
+    writePrivateJson(join(paths.sourceRoot, "current-evidence.json"), value);
+  } finally { candidateLock?.release(); lock.release(); }
 }

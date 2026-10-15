@@ -1,12 +1,21 @@
 {
   "id": "co.tweakers.user-questions",
   "name": "User Questions",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "githubRepo": "therealityreport/tweakers",
   "description": "Optional enhancement for the separately installed User Questions service. The standard MCP form remains available when enhancement is absent or incompatible.",
   "author": "hulibrands",
-  "tags": ["questions", "productivity", "forms"],
+  "tags": [
+    "questions",
+    "productivity",
+    "forms"
+  ],
   "scope": "both",
-  "permissions": ["settings", "filesystem", "ipc", "network"],
+  "permissions": [
+    "settings",
+    "filesystem",
+    "ipc",
+    "network"
+  ],
   "minRuntime": ">=1.0.0"
 }

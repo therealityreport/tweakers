@@ -5,6 +5,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -197,6 +198,32 @@ export interface CanonicalManagerEnvironmentPublication {
   restoreOnFailure(): void;
 }
 
+export interface CanonicalOfficialSourceBinding {
+  version: string;
+  build: string;
+  teamIdentifier: string;
+  designatedRequirement: string;
+  /** Separate fixed-native byte snapshot; never copied from a downloaded app. */
+  nativeBackendFingerprint?: string;
+}
+
+/** A downloaded candidate is not the installed native desktop. Snapshot the
+ * fixed native identity separately; bootstrap then rechecks it against a full
+ * trusted observation before journaled native metadata reconciliation.
+ * The candidate's sealed source lease remains independently verified. */
+export function canonicalNativeSourceBinding(sourcePath: string, binding: CanonicalOfficialSourceBinding,
+  readNativeIdentity: () => {version: string | null; build: string | null; backendFingerprint: string | null} = () => {
+    const backend = join(STABLE_DESKTOP_PATH, "Contents", "Resources", "codex");
+    if (!lstatSync(backend).isFile()) throw new Error("Canonical native ChatGPT backend is not a regular file");
+    return {...readDesktopProfileIdentity(STABLE_DESKTOP_PATH), backendFingerprint: fingerprintFile(backend)};
+  },
+): CanonicalOfficialSourceBinding {
+  if (sourcePath === STABLE_DESKTOP_PATH) return binding;
+  const native = readNativeIdentity();
+  if (!native.version || !native.build || !native.backendFingerprint || !/^[a-f0-9]{64}$/.test(native.backendFingerprint)) throw new Error("Canonical native ChatGPT identity is unavailable");
+  return {...binding, version: native.version, build: native.build, nativeBackendFingerprint: native.backendFingerprint};
+}
+
 export interface BootstrapCanonicalManagerEnvironmentDeps {
   loadState?: typeof loadEnvironmentState;
   validateOfficial?: typeof validateOfficialEnvironmentProfile;
@@ -319,12 +346,16 @@ function createEnvironmentProfileRecord(input: {
   if (backendChannel !== expectedBackendChannel) {
     throw new Error(`${input.releaseProfile} backend channel must be ${expectedBackendChannel}`);
   }
-  const officialBackendPath = join(input.selectedDesktopPath, "Contents", "Resources", "codex");
+  const supportedBackendPaths = [
+    join(input.selectedDesktopPath, "Contents", "Resources", "codex"),
+    join(input.selectedDesktopPath, "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+  ];
+  const officialBackendPath = input.evidence?.officialBackendPath ?? supportedBackendPaths[0]!;
   const backendPath = input.releaseProfile === "stable"
     ? officialBackendPath
     : join(channelRoot, "backend", "codex");
   if (input.evidence?.officialBackendPath !== undefined
-    && input.evidence.officialBackendPath !== officialBackendPath) {
+    && !supportedBackendPaths.includes(input.evidence.officialBackendPath)) {
     throw new Error(`${input.releaseProfile} official backend path must remain inside its exact desktop bundle`);
   }
   if (input.evidence?.backendPath !== undefined && input.evidence.backendPath !== backendPath) {
@@ -1434,7 +1465,11 @@ export function publishEnvironmentSnapshot(
  * published.
  */
 export function bootstrapCanonicalManagerEnvironmentSnapshot(
-  input: { sourceRoot: string; destinationRoot: string },
+  input: {
+    sourceRoot: string;
+    destinationRoot: string;
+    expectedOfficialSource?: CanonicalOfficialSourceBinding;
+  },
   deps: BootstrapCanonicalManagerEnvironmentDeps = {},
 ): CanonicalManagerEnvironmentPublication {
   const sourceRoot = requireExactEnvironmentRoot(input.sourceRoot, "Environment source root");
@@ -1472,10 +1507,48 @@ export function bootstrapCanonicalManagerEnvironmentSnapshot(
     const canonical = load(destinationRoot);
     assertCanonicalOfficialChatGPTAuthority(canonical);
     validateOfficial(canonical.current);
-    assertStoredOfficialEvidenceMatchesObservation(
-      persistedRegistry.profiles.stable,
-      canonical.registry.profiles.stable,
-    );
+    const observedStable = canonical.registry.profiles.stable;
+    if (input.expectedOfficialSource === undefined) {
+      assertStoredOfficialEvidenceMatchesObservation(
+        persistedRegistry.profiles.stable,
+        observedStable,
+      );
+    } else {
+      assertObservedOfficialSourceMatchesBinding(observedStable, input.expectedOfficialSource);
+      const reconciledFields = new Set<keyof EnvironmentProfileRecord>(["officialVersion", "officialBuild"]);
+      if (input.expectedOfficialSource.nativeBackendFingerprint !== undefined) {
+        reconciledFields.add("officialBackendVersion");
+        reconciledFields.add("officialBackendFingerprint");
+      }
+      assertStoredOfficialEvidenceMatchesObservation(persistedRegistry.profiles.stable, observedStable, reconciledFields);
+      if ([...reconciledFields].some(field => persistedRegistry.profiles.stable[field] !== observedStable[field])) {
+        const registryBefore = readFileSync(registryFile);
+        const selectionBefore = readFileSync(selectionFile);
+        publishSnapshot(registryFile, selectionFile, canonical.registry, canonical.current);
+        const registryPublished = readFileSync(registryFile);
+        const selectionPublished = readFileSync(selectionFile);
+        let restored = false;
+        return {
+          sourceRoot: destinationRoot,
+          destinationRoot,
+          registryFile,
+          selectionFile,
+          bootstrapped: true,
+          restoreOnFailure: () => {
+            if (restored) return;
+            if (!existsSync(registryFile)
+              || !existsSync(selectionFile)
+              || !readFileSync(registryFile).equals(registryPublished)
+              || !readFileSync(selectionFile).equals(selectionPublished)) {
+              throw new Error("Refusing to restore canonical manager environment over a concurrent publication");
+            }
+            restoreExactBytes(selectionFile, selectionBefore);
+            restoreExactBytes(registryFile, registryBefore);
+            restored = true;
+          },
+        };
+      }
+    }
     return {
       sourceRoot: destinationRoot,
       destinationRoot,
@@ -1596,6 +1669,7 @@ function assertCanonicalOfficialChatGPTAuthority(state: LoadedEnvironmentState):
 function assertStoredOfficialEvidenceMatchesObservation(
   stored: EnvironmentProfileRecord,
   observed: EnvironmentProfileRecord,
+  allowedChangedFields: ReadonlySet<keyof EnvironmentProfileRecord> = new Set(),
 ): void {
   const fields: Array<keyof EnvironmentProfileRecord> = [
     "selectedDesktopPath",
@@ -1620,9 +1694,27 @@ function assertStoredOfficialEvidenceMatchesObservation(
     // stored evidence must still match exactly.
     const storedBackendEvidenceIsUnknown = stored[field] === null
       && (field === "officialBackendVersion" || field === "officialBackendFingerprint");
-    if (!storedBackendEvidenceIsUnknown && stored[field] !== observed[field]) {
+    if (!storedBackendEvidenceIsUnknown
+      && !allowedChangedFields.has(field)
+      && stored[field] !== observed[field]) {
       throw new Error(`Canonical manager official ChatGPT ${field} does not match the revalidated app`);
     }
+  }
+}
+
+function assertObservedOfficialSourceMatchesBinding(
+  observed: EnvironmentProfileRecord,
+  expected: CanonicalOfficialSourceBinding,
+): void {
+  if (observed.officialVersion !== expected.version
+    || observed.officialBuild !== expected.build
+    || observed.strictSignature !== true
+    || observed.gatekeeper !== true
+    || observed.teamIdentifier !== expected.teamIdentifier
+    || observed.designatedRequirement !== expected.designatedRequirement
+    || expected.nativeBackendFingerprint !== undefined && (!/^[a-f0-9]{64}$/.test(expected.nativeBackendFingerprint)
+      || observed.officialBackendFingerprint !== expected.nativeBackendFingerprint || !observed.officialBackendVersion)) {
+    throw new Error("Canonical manager official ChatGPT does not match the sealed registered source");
   }
 }
 

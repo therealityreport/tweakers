@@ -1,9 +1,11 @@
+import { withLocalOperation } from "./local-operation.js";
 import { recordDoctorCandidateOverride } from "./doctor-store.js";
-import { isCandidateCopyPrecutoverFailure } from "./manager-operation-store.js";
+import { isCandidateCopyPrecutoverFailure, isRunningTargetPrecutoverFailure } from "./manager-operation-store.js";
 import { compatibilityFingerprint } from "./doctor-compatibility.js";
 import { acquireProcessLock } from "./process-lock.js";
 import { applyDoctorAdoptionAction, saveDoctorChangeReport } from "./doctor-adoption.js";
 import { execFileSync, spawn } from "node:child_process";
+import { resolveBundledCodexBackend } from "./platform.js";
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, renameSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -29,7 +31,11 @@ export function verifiedDoctorManagerLauncher(root = canonicalTweakersManagerRoo
   execFileSync("/usr/bin/codesign", ["--verify", "--strict", "-R", `=${TWEAKERS_MANAGER_LAUNCHER_DESIGNATED_REQUIREMENT}`, launcher], { stdio: "pipe", timeout: 10_000, env: {} });
   return launcher;
 }
-export async function runDoctorManagerCommand(input: {
+export async function runDoctorManagerCommand(input: Parameters<typeof runDoctorManagerCommandOwned>[0]):Promise<DoctorReportV1> {
+  if(input.command==="doctor-status" || input.command==="manager-open" || input.command==="doctor-open")return runDoctorManagerCommandOwned(input);
+  return withLocalOperation(`doctor command:${input.command}`,()=>runDoctorManagerCommandOwned(input));
+}
+async function runDoctorManagerCommandOwned(input: {
   command: "doctor-status" | "doctor-action" | "doctor-open" | "doctor-run" | "manager-open";
   section?: TweakersManagerSection;
   requestId: string; root: string; executable: ManagerResolvedExecutableIdentityV1; input?: unknown;
@@ -52,7 +58,7 @@ export async function runDoctorManagerCommand(input: {
     const { doctorDigest } = await import("./doctor-store.js");
     const r = report.adoption.report;
     extendDoctorReviewAllowance(join(doctorDirectory(input.root), "review-cache"), doctorDigest({ policy: 3, before: r.beforeFingerprint, after: r.afterFingerprint }), request.fingerprint);
-    startDoctorUpdateScan(input.root, input.executable, true, { resumeOnly: true });
+    await startDoctorUpdateScan(input.root, input.executable, true, { resumeOnly: true });
   }
   else if (request.action === "decide" && request.decision?.choice === "override") {
     const { titlebarOverrideEnabled, TITLEBAR_CHANGE_ID, addDoctorTitlebarOptions } = await import("./doctor-overrides.js");
@@ -107,13 +113,13 @@ export async function runDoctorManagerCommand(input: {
     const failedOperation = submitted?.operationId ? new ManagerOperationStore(input.root).read(submitted.operationId) : null;
     if (!request.scanTrigger && report.health.state === "healthy" && previous
       && submitted?.jobId === previous.id && submitted.operationId
-      && (isAccountsRecoveryPreflightFailure(failedOperation) || isCandidateCopyPrecutoverFailure(failedOperation)
+      && (isAccountsRecoveryPreflightFailure(failedOperation) || isCandidateCopyPrecutoverFailure(failedOperation) || isRunningTargetPrecutoverFailure(failedOperation)
         || (previous.installedIdentity === target.installedIdentity && failedOperation?.phase === "failed"))) {
       const history = join(doctorDirectory(input.root), "jobs", previous.id, "installation-attempts");
       mkdirSync(history, { recursive: true, mode: 0o700 });
       renameSync(operationPath, join(history, `${randomUUID()}.json`));
     }
-    startDoctorUpdateScan(input.root, input.executable, true, { trigger: request.scanTrigger ?? "manual", availableUpdateBuild: request.availableUpdateBuild });
+    await startDoctorUpdateScan(input.root, input.executable, true, { trigger: request.scanTrigger ?? "manual", availableUpdateBuild: request.availableUpdateBuild });
   }
   else if (request.action === "reconnect") {
     const auth = loadDoctorAuthPort();
@@ -125,7 +131,7 @@ export async function runDoctorManagerCommand(input: {
       prepareDesktop: async () => {
         execFileSync("/usr/bin/osascript", ["-e", 'if application "/Applications/Tweakers.app" is running then tell application "/Applications/Tweakers.app" to quit'], { stdio: "ignore", timeout: 10_000, env: {} });
       },
-      login: home => runDoctorAccountLogin(join(DOCTOR_APP, "Contents", "Resources", "codex"), home, account.label) });
+      login: home => runDoctorAccountLogin(resolveBundledCodexBackend(DOCTOR_APP), home, account.label) });
   }
   else if (request.action === "repair") {
     const storage = loadDoctorStoragePort();
@@ -168,7 +174,7 @@ export async function runIndependentDoctorCli(options: { json?: boolean; ui?: bo
   }
   if (options.json) console.log(JSON.stringify(report));
   else {
-    console.log(`Tweakers Doctor — independent ${report.target.version ?? "unavailable"} (${report.target.build ?? "unknown"})`);
+    console.log(`Tweakers Manager · Doctor — independent ${report.target.version ?? "unavailable"} (${report.target.build ?? "unknown"})`);
     console.log(`App health: ${report.health.state}. Accounts broker: ${report.health.broker}.`);
     console.log(`Update: ${report.update.state.replaceAll("_", " ")}. ${report.update.progress}`);
     for (const finding of report.findings) console.log(`${finding.title}: ${finding.detail}`);

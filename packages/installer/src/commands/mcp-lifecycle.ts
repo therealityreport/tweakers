@@ -40,6 +40,7 @@ import {
 import { targetUserHome, targetUserOwnership } from "../ownership.js";
 import { userPaths } from "../paths.js";
 import { assertLifecycleReceiptsIdle, lifecycleLockFile, withLifecycleLock } from "../lifecycle-lock.js";
+import { KNOWN_SCHEMA2_PREDECESSOR, isKnownSchema2Predecessor } from "../mcp-lifecycle-predecessor.js";
 
 export type McpLifecycleAction = "status" | "preview" | "repair" | "adopt";
 
@@ -209,12 +210,15 @@ export async function mcpLifecycle(
   const paths = userPaths();
   const targetHome = targetUserHome();
   const sourceRoot = options.source ?? defaultMcpLifecycleSourceRoot();
+  const predecessor = action === "adopt" ? readManagedReceipt(join(paths.root, "mcp-lifecycle-managed.json")) : null;
+  if (action === "adopt") assertAdoptableManagedReceipt(predecessor);
   const report = inspectMcpLifecycleHealth({
     targetHome,
     sourceRoot,
     backupRoot: join(paths.backup, "mcp-lifecycle"),
     managedReceiptPath: join(paths.root, "mcp-lifecycle-managed.json"),
     deep: options.deep === true || action !== "status",
+    allowKnownSchema2Predecessor: action === "adopt" && isKnownSchema2Predecessor(predecessor),
   });
 
   if (action === "status") {
@@ -266,6 +270,8 @@ export function repairMcpLifecycle(
     requireManagedProof?: boolean;
     /** Explicit human-requested upgrade from a valid schema-1 prior receipt only. */
     allowPriorManagedReceipt?: boolean;
+    /** Explicit first adoption, bound to reviewed installed bytes; never used by automatic reconciliation. */
+    firstAdoption?: { expectedInstalledDigests: Record<string, string>; authorization: string };
   },
   dependencies: McpLifecycleRepairDependencies = {},
 ): McpLifecycleRepairResult {
@@ -275,14 +281,19 @@ export function repairMcpLifecycle(
   }
   const inspect = dependencies.inspect ?? inspectMcpLifecycleHealth;
   const sourceRoot = input.sourceRoot ?? defaultMcpLifecycleSourceRoot();
+  const allowKnownSchema2Predecessor = input.allowPriorManagedReceipt === true
+    && isKnownSchema2Predecessor(readManagedReceipt(join(input.userRoot, "mcp-lifecycle-managed.json")));
   const report = input.report ?? inspect({
     targetHome: input.targetHome,
     sourceRoot,
     backupRoot: join(input.userRoot, "backup", "mcp-lifecycle"),
     managedReceiptPath: join(input.userRoot, "mcp-lifecycle-managed.json"),
     deep: true,
+    allowKnownSchema2Predecessor,
   });
-  const managedProofReason = managedProofDeferral(report, input.requireManagedProof === true, input.allowPriorManagedReceipt === true);
+  if (input.firstAdoption && (input.requireManagedProof || input.allowPriorManagedReceipt || !input.firstAdoption.authorization.trim()
+    || existsSync(join(input.userRoot, "mcp-lifecycle-managed.json")))) throw new Error("Invalid first-adoption authority or existing receipt.");
+  const managedProofReason = managedProofDeferral(report, input.requireManagedProof === true, input.allowPriorManagedReceipt === true || Boolean(input.firstAdoption));
   if (managedProofReason) {
     return {
       status: "deferred",
@@ -305,6 +316,19 @@ export function repairMcpLifecycle(
   // source again to this proof, but the receipt is always derived from these
   // already verified bytes rather than a later manifest read.
   const candidate = freezeMcpLifecycleCandidate(sourceRoot, input.targetHome);
+  const assertFirstAdoptionPreimage = (): void => {
+    if (!input.firstAdoption) return;
+    const expected = input.firstAdoption.expectedInstalledDigests;
+    if (Object.keys(expected).length !== candidate.verification.assets.length) throw new Error("First adoption requires every installed asset digest.");
+    for (const entry of candidate.verification.assets) {
+      const snapshot = captureAdoptionAsset(entry.destinationPath);
+      if (!/^[a-f0-9]{64}$/.test(expected[entry.asset.id] ?? "")
+        || createHash("sha256").update(snapshot.bytes).digest("hex") !== expected[entry.asset.id]) {
+        throw new Error(`First-adoption installed identity mismatch: ${entry.asset.id}`);
+      }
+    }
+  };
+  assertFirstAdoptionPreimage();
   const expectedLabelStates = expectedMcpLifecycleLabelStates(candidate.verification);
   const readExactLabelStates = (currentReport: McpLifecycleHealthReport): readonly McpLifecycleLabelState[] => {
     const observed = dependencies.labelStates?.(expectedLabelStates) ?? currentReport.preview.labelStates;
@@ -412,7 +436,20 @@ export function repairMcpLifecycle(
   const writeCurrentReceipt = (): void => {
     assertPriorReceiptUnchanged();
     assertMcpLifecycleCandidateUnchanged(candidate);
-    const installed = inspectLatest();
+    // Final proof must come from the new producer, never its predecessor.
+    let installed = inspectLatest(false);
+    if (allowKnownSchema2Predecessor) {
+      // Native app-server identity discovery can take more than five seconds.
+      // Allow up to thirty seconds of polling without accepting the old schema.
+      for (let attempt = 0; attempt < 150 && installed.checks.find((check) => check.id === "status:reaper")?.status !== "ok"; attempt++) {
+        execFileSync("/bin/sleep", ["0.2"]);
+        installed = inspectLatest(false);
+      }
+      if (installed.checks.find((check) => check.id === "status:reaper")?.status !== "ok") {
+        const status = installed.checks.find((check) => check.id === "status:reaper");
+        throw new Error(`MCP lifecycle new producer did not emit a current status after reload: ${status?.detail ?? "missing reaper check"}.`);
+      }
+    }
     if (installed.checks.some((check) => check.id.startsWith("asset:") && check.status !== "ok")) {
       throw new Error("MCP lifecycle installed-asset proof failed before receipt publication.");
     }
@@ -439,6 +476,7 @@ export function repairMcpLifecycle(
       renameSync(receiptPath, receiptRollbackPath);
     }
     writeReceipt(receiptPath, {
+      ...(input.firstAdoption ? { firstAdoption: input.firstAdoption } : {}),
       schemaVersion: 2, packageVersion: candidate.verification.manifest.package.version,
       lifecycleSchemaVersion: candidate.verification.manifest.lifecycle_schema_version,
       policyVersion: candidate.verification.manifest.policy_version,
@@ -464,12 +502,13 @@ export function repairMcpLifecycle(
       receiptRollbackPath = null;
     }
   };
-  const inspectLatest = (): McpLifecycleHealthReport => inspect({
+  const inspectLatest = (allowPredecessor = allowKnownSchema2Predecessor): McpLifecycleHealthReport => inspect({
     targetHome: input.targetHome,
     sourceRoot,
     backupRoot: join(input.userRoot, "backup", "mcp-lifecycle"),
     managedReceiptPath: join(input.userRoot, "mcp-lifecycle-managed.json"),
     deep: true,
+    allowKnownSchema2Predecessor: allowPredecessor,
   });
   const assertReloadStillEligible = (
     expectedStates: readonly McpLifecycleLabelState[],
@@ -479,7 +518,7 @@ export function repairMcpLifecycle(
     assertMcpLifecycleCandidateUnchanged(candidate);
     if (input.allowPriorManagedReceipt) readManagedReceipt(join(input.userRoot, "mcp-lifecycle-managed.json"));
     const latest = inspectLatest();
-    const latestProofReason = managedProofDeferral(latest, input.requireManagedProof === true, input.allowPriorManagedReceipt === true);
+    const latestProofReason = managedProofDeferral(latest, input.requireManagedProof === true, input.allowPriorManagedReceipt === true || Boolean(input.firstAdoption));
     if (latestProofReason) {
       throw new Error(`MCP lifecycle reload deferred: ${latestProofReason}`);
     }
@@ -560,6 +599,7 @@ export function repairMcpLifecycle(
       // Later backups intentionally do not compare their promoted plist bytes
       // against the frozen-before identity.
       if (step === "before-backup" && !firstDestructiveBoundaryChecked) {
+        assertFirstAdoptionPreimage();
         assertReloadStillEligible(frozenLabelStates);
         firstDestructiveBoundaryChecked = true;
       }
@@ -573,7 +613,7 @@ export function repairMcpLifecycle(
     activeTermination: () => {
       assertMcpLifecycleCandidateUnchanged(candidate);
       const latest = inspectLatest();
-      const latestProofReason = managedProofDeferral(latest, input.requireManagedProof === true, input.allowPriorManagedReceipt === true);
+      const latestProofReason = managedProofDeferral(latest, input.requireManagedProof === true, input.allowPriorManagedReceipt === true || Boolean(input.firstAdoption));
       if (latestProofReason) return { detail: latestProofReason };
       return latest.preview.reloadEligible
         ? lifecycleTermination(latest)
@@ -604,10 +644,24 @@ export function adoptMcpLifecycle(
   input: { targetHome: string; userRoot: string; sourceRoot?: string; report?: McpLifecycleHealthReport },
   dependencies: McpLifecycleRepairDependencies = {},
 ): McpLifecycleRepairResult {
-  // A readable schema-1 receipt is the explicit adoption boundary; malformed
-  // or absent receipts never receive the managed-proof exception.
+  // Only an exact recognized predecessor receives explicit migration authority.
   const receiptPath = join(input.userRoot, "mcp-lifecycle-managed.json");
-  assertAdoptableManagedReceipt(readManagedReceipt(receiptPath));
+  const receipt = readManagedReceipt(receiptPath);
+  assertAdoptableManagedReceipt(receipt);
+  if (isKnownSchema2Predecessor(receipt)) {
+    const candidate = verifyMcpLifecyclePackage({ sourceRoot: input.sourceRoot, targetHome: input.targetHome });
+    for (const asset of candidate.assets) {
+      const snapshot = captureAdoptionAsset(asset.destinationPath);
+      const expected = asset.asset.kind === "file"
+        ? receipt.assetDigests[asset.asset.id]
+        : asset.asset.source_sha256 === KNOWN_SCHEMA2_PREDECESSOR.assetDigests[asset.asset.id as keyof typeof KNOWN_SCHEMA2_PREDECESSOR.assetDigests]
+          ? createHash("sha256").update(asset.content).digest("hex") : null;
+      if (!expected || (snapshot.mode & 0o777) !== asset.mode
+        || createHash("sha256").update(snapshot.bytes).digest("hex") !== expected) {
+        throw new Error(`MCP lifecycle predecessor installed identity mismatch: ${asset.asset.id}`);
+      }
+    }
+  }
   return repairMcpLifecycle({ ...input, allowPriorManagedReceipt: true }, dependencies);
 }
 
@@ -683,6 +737,7 @@ function matchesAdoptablePredecessor(
 
 function assertAdoptableManagedReceipt(receipt: ManagedMcpLifecycleReceipt | null): asserts receipt is ManagedMcpLifecycleReceipt {
   if (!receipt) throw new Error("Managed MCP lifecycle receipt is required for adoption.");
+  if (receipt.schemaVersion === 2 && isKnownSchema2Predecessor(receipt)) return;
   if (receipt.schemaVersion !== 1) {
     throw new Error("Managed MCP lifecycle receipt is already current or is not an adoptable schema-v1 predecessor.");
   }
@@ -756,6 +811,21 @@ interface ManagedReceiptSnapshot {
   gid: number;
   nlink: number;
   mode: number;
+}
+
+function captureAdoptionAsset(path: string): { bytes: Buffer; mode: number } {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = fstatSync(fd);
+    const owner = targetUserOwnership();
+    if (!before.isFile() || before.nlink !== 1 || before.size > 2 * 1024 * 1024 || (before.mode & 0o022)
+      || (owner && before.uid !== owner.uid)) throw new Error(`Unsafe adoption asset: ${path}`);
+    const bytes = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      || before.mode !== after.mode || before.uid !== after.uid || bytes.length !== after.size) throw new Error(`Adoption asset changed: ${path}`);
+    return { bytes, mode: after.mode };
+  } finally { closeSync(fd); }
 }
 
 function captureManagedReceipt(path: string): ManagedReceiptSnapshot {

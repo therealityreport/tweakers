@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATE_SCHEMA_VERSION = 1
 PRODUCER_VERSION = "0.6.0"
 CLEANUP_POLICY_VERSION = "strict-detached-v5"
@@ -50,6 +50,7 @@ LANE_MODES = {
     # Generic orphan observations remain explicitly observation-only below.
     "exact_standalone_app_server": "automatic",
     "standalone_orphan": "observation_only",
+    "tweakers_keyboard_monitor": "registered_owner_exit",
     "claude_idle": "observation_only",
 }
 PROC_PIDTBSDINFO = 3
@@ -66,6 +67,14 @@ ALLOWED_WRAPPER_PAIRS = {
     "/Applications/Codex.app/Contents/Resources/cua_node/bin/node":
         "/Applications/Codex.app/Contents/Resources/codex",
 }
+# Native desktop builds also ship the CLI in its own nested application.
+# Keep wrapper-child pairing unchanged: this is exact app-server recognition,
+# not permission to adopt arbitrary descendants or listeners.
+NESTED_APP_SERVER_PATHS = {
+    f"/Applications/{app}.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+    for app in ("ChatGPT", "Codex")
+}
+ALLOWED_APP_SERVER_PATHS = set(ALLOWED_WRAPPER_PAIRS.values()) | NESTED_APP_SERVER_PATHS
 SWAP_TEXT_VNODE = re.compile(
     r"^/Applications/(ChatGPT|Codex)\.app\.tweakers-contents-swap/(.+)$"
 )
@@ -638,10 +647,39 @@ def subtree_ids(root: int, children: dict[int, list[int]]) -> list[int]:
 def is_codex_app_server(process: ProcessInfo) -> bool:
     current_path = _swap_vnode_current_path(process.executable) or process.executable
     return (
-        current_path in set(ALLOWED_WRAPPER_PAIRS.values())
+        current_path in ALLOWED_APP_SERVER_PATHS
         and Path(process.executable).name == "codex"
         and bool(APP_SERVER_WORD.search(_normalized(process.args)))
     )
+
+
+def _nested_app_server_uses_stdio(args: str) -> bool:
+    """A detached listener may still serve clients; only stdio is eligible."""
+    try:
+        argv = shlex.split(args)
+    except ValueError:
+        return False
+    if "app-server" not in argv[1:]:
+        return False
+    endpoints: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--listen":
+            index += 1
+            if index >= len(argv) or argv[index].startswith("-"):
+                return False
+            endpoints.append(argv[index])
+        elif token.startswith("--listen="):
+            endpoints.append(token.partition("=")[2])
+        elif token == "--stdio":
+            endpoints.append("stdio://")
+        elif token.startswith("--stdio="):
+            return False
+        index += 1
+    # The installed CLI documents stdio:// as its default. Ambiguous repeated
+    # or mixed selectors are protected even if they select the same endpoint.
+    return not endpoints or endpoints == ["stdio://"]
 
 
 def is_exact_standalone_app_server(process: ProcessInfo) -> bool:
@@ -654,6 +692,8 @@ def is_exact_standalone_app_server(process: ProcessInfo) -> bool:
         argv0 = shlex.split(process.args)[0]
     except (IndexError, ValueError):
         return False
+    if process.executable in NESTED_APP_SERVER_PATHS:
+        return argv0 == process.executable and _nested_app_server_uses_stdio(process.args)
     if process.executable in set(ALLOWED_WRAPPER_PAIRS.values()):
         return argv0 == process.executable
     swap_current = _swap_vnode_current_path(process.executable)
@@ -750,7 +790,10 @@ def _is_shell(process: ProcessInfo) -> bool:
 
 def _is_runtime(process: ProcessInfo) -> bool:
     return (
-        is_codex_app_server(process)
+        (is_codex_app_server(process) and (
+            process.executable not in NESTED_APP_SERVER_PATHS
+            or _nested_app_server_uses_stdio(process.args)
+        ))
         or looks_like_codex_wrapper(process)
         or process.executable in ALLOWED_CODE_MODE_HOSTS
         or process.executable in ALLOWED_NODE_REPL_PATHS
@@ -1551,10 +1594,21 @@ def classify_codex_trees(
         classifications.append(_classify_exact_tree(
             wrapper, app_server, ids, ownership, owned, children,
         ))
+    classified_app_servers = {
+        tree.app_server_identity.pid for tree in classifications
+        if tree.app_server_identity is not None
+    }
     for app_server in sorted(owned.values(), key=lambda item: item.pid):
-        if not is_exact_standalone_app_server(app_server):
+        if app_server.pid in classified_app_servers:
             continue
-        ownership = "detached" if app_server.age_seconds >= orphan_min_age else "ambiguous"
+        if is_exact_standalone_app_server(app_server):
+            ownership = "detached" if app_server.age_seconds >= orphan_min_age else "ambiguous"
+        elif is_codex_app_server(app_server) and app_server.ppid != 1 and _has_ui_owner(app_server, owned):
+            # Project live native ownership for reporting. This state never
+            # enters automatic cleanup, regardless of age, CPU or copy count.
+            ownership = "ui_owned"
+        else:
+            continue
         classifications.append(_classify_exact_tree(
             app_server,
             app_server,
