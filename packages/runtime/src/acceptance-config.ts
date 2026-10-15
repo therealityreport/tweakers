@@ -19,15 +19,21 @@ export interface AcceptanceConfig {
   readonly path: string;
   readonly directory: string;
   readonly rejectedWrites: number;
+  /** True once `close()` ran (the launch is ending); later diagnostics are skipped, not drift. */
+  readonly closed: boolean;
+  /** True once a read or write detected drift; `onDrift` has then fired exactly once. */
+  readonly drifted: boolean;
   read(): Config;
   write(value: Config): void;
   close(): void;
 }
 
 /** Acceptance diagnostics stay in memory. No diagnostic descendant is a sink,
- * even when a valid acceptance directory contains a linked diagnostic leaf. */
+ * even when a valid acceptance directory contains a linked diagnostic leaf.
+ * After the override is closed during quit there is nothing left to verify,
+ * so the operation is skipped silently instead of raising inside a quit hook. */
 export function runRuntimeDiagnosticDiskOperation<T>(acceptance: AcceptanceConfig | null, operation: () => T): T | undefined {
-  if (acceptance) { acceptance.read(); return undefined; }
+  if (acceptance) { if (!acceptance.closed) acceptance.read(); return undefined; }
   return operation();
 }
 
@@ -37,6 +43,9 @@ export function resolveAcceptanceConfig(input: {
   derivedVariant: boolean;
   healthCheckOnly: boolean;
   environment?: NodeJS.ProcessEnv;
+  /** Called once, before the drift error is rethrown, so the host can stop the
+   * launch deliberately instead of letting an event handler crash the process. */
+  onDrift?: (error: Error) => void;
 }): AcceptanceConfig | null {
   const requested = (input.environment ?? process.env)[ACCEPTANCE_CONFIG_ENV];
   if (requested === undefined) return null;
@@ -118,7 +127,15 @@ export function resolveAcceptanceConfig(input: {
     if (sameFile(identity, canonicalIdentity)) fail();
     let closed = false;
     let invalid = false;
+    let drifted = false;
     let rejectedWrites = 0;
+    function markDrift(error: unknown): void {
+      invalid = true;
+      if (drifted) return;
+      drifted = true;
+      // The host decides how to stop; its failure must not mask the drift error.
+      try { input.onDrift?.(error instanceof Error ? error : new Error(String(error))); } catch {}
+    }
     function validate(value: Config): void {
       const normalized: unknown = JSON.parse(JSON.stringify(value));
       if (!record(normalized) || !record(normalized.tweaks)) fail();
@@ -145,12 +162,14 @@ export function resolveAcceptanceConfig(input: {
           validate(value);
           return value;
         } finally { closeSync(current); }
-      } catch (error) { invalid = true; throw error; }
+      } catch (error) { markDrift(error); throw error; }
     }
     read();
     return {
       path: requested, directory, read,
       get rejectedWrites() { return rejectedWrites; },
+      get closed() { return closed; },
+      get drifted() { return drifted; },
       write(value) {
         read();
         let content: Buffer;
@@ -174,7 +193,7 @@ export function resolveAcceptanceConfig(input: {
           ftruncateSync(sink, content.length);
           fsyncSync(sink);
           read();
-        } catch (error) { invalid = true; throw error; }
+        } catch (error) { markDrift(error); throw error; }
       },
       close() { if (!closed) { closed = true; closeSync(sink); } },
     };

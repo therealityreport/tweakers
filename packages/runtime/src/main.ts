@@ -892,7 +892,10 @@ const PROMOTION_HEALTH_PRELOAD_PATH = resolve(runtimeDir, "promotion-health-prel
 const TWEAKS_DIR = join(userRoot, "tweaks");
 const LOG_DIR = join(userRoot, "log");
 const LOG_FILE = join(LOG_DIR, "main.log");
-const acceptanceConfig = resolveAcceptanceConfig({ userRoot, derivedVariant, healthCheckOnly: healthCheckOnly || process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1" });
+const acceptanceConfig = resolveAcceptanceConfig({ userRoot, derivedVariant, healthCheckOnly: healthCheckOnly || process.env.TWEAKERS_HEALTH_RUN_ORIGINAL_MAIN === "1",
+  // Drift still fails closed, but as a deliberate stop: a tweak reload or
+  // journal write inside an event handler must not end as uncaughtException.
+  onDrift: (error) => { log("error", "acceptance configuration drifted; stopping acceptance launch", { message: error.message }); app.exit(1); } });
 const CONFIG_FILE = acceptanceConfig?.path ?? join(userRoot, "config.json");
 app.once("will-quit", () => acceptanceConfig?.close());
 const MCP_RUNTIME_PATHS = resolveMcpRuntimePaths({

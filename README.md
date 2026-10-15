@@ -141,13 +141,19 @@ Tweak development commands:
 | `tweaker create-tweak ./my-tweak` | Create a new tweak folder. |
 | `tweaker validate-tweak ./my-tweak` | Validate a tweak manifest and entry file. |
 | `tweaker dev ./my-tweak` | Link a local tweak into Tweaker for development. |
-| `tweaker dev-sync` | Validate, build, and publish one safe development snapshot. |
-| `tweaker dev-sync --watch` | Watch the checkout and publish only successful validated builds. |
+| `tweaker dev-sync` | Validate, build, and publish one safe development snapshot (overlay installs only). |
+| `tweaker dev-sync --watch` | Watch the checkout and publish only successful validated builds (overlay installs only). |
+| `tweaker dev-sync --commit` | Quit Tweakers first; validate, build, and promote the tweaks as a new committed generation of the independent Tweakers app. |
 
 `dev-sync` never fetches, merges, or changes Git branches. It stages the complete
 built tweak set before changing the live snapshot, pauses runtime reloads during
 promotion, and emits one reload marker after the snapshot is complete. A failed
 validation or build leaves the last working snapshot in place.
+
+The independent `/Applications/Tweakers.app` verifies its tweak tree against a
+committed generation receipt on every launch, so plain `dev-sync` refuses to
+hot-publish into it; use `--commit`, which keeps the verified app and runtime
+and retains one rollback copy.
 
 Source checkout commands:
 

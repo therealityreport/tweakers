@@ -145,7 +145,7 @@ async function runDevTweak(target: string | undefined, opts: never): Promise<voi
   return devTweak(target, opts);
 }
 
-async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolean }): Promise<void> {
+async function runDevSync(opts: { off?: boolean; quiet?: boolean; watch?: boolean; commit?: boolean }): Promise<void> {
   const { devSync } = await import("./commands/dev-sync.js");
   return devSync(opts);
 }
@@ -531,6 +531,7 @@ prog
   .command("dev-sync")
   .describe("Validate, build, and publish the development checkout without changing Git state")
   .option("--watch", "Watch the checkout and publish each successful validated build")
+  .option("--commit", "Promote the validated build as a committed independent Tweakers generation (quit Tweakers first)")
   .option("--off", "Disable dev mode and restore the bundled tweak copies")
   .option("--quiet", "Suppress output")
   .action(wrap(runDevSync));

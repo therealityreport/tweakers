@@ -86,9 +86,12 @@ permissions, settings ownership, or maintenance, ask one structured question.
   cleanup, permissions, and tests; apply a semantic-version bump; run
   `npm run sync:tweaks`; run focused tests, catalog check, and build. Broaden to
   the full suite for shared runtime/lifecycle changes, cross-tweak effects, or
-  evidence of wider risk; then run one safe `tweaker dev-sync` snapshot and verify
-  the live app. Documentation-only changes require instruction/reference review,
-  not version bumps, regeneration, or live sync.
+  evidence of wider risk; then publish once and verify the live app. For the
+  installed independent Tweakers app, quit it and run `tweaker dev-sync --commit`
+  (a committed generation); its loader refuses any hot snapshot written into
+  `variants/tweakers/tweaks`. Plain `tweaker dev-sync` snapshots are only for
+  overlay installs. Documentation-only changes require instruction/reference
+  review, not version bumps, regeneration, or live sync.
 - **Runtime/installer:** run focused tests, typecheck/build, and full suite.
   When needed to apply the completed change, use the guarded refresh flow to
   rebuild and open the newest verified Tweakers version under the standing

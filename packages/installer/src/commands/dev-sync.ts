@@ -28,6 +28,8 @@ import { readValidManifest } from "./dev-tweak.js";
 import { registerDevelopmentCheckout } from "./refresh-local.js";
 import { stageBundledTweaks } from "./install.js";
 import { LEGACY_DEV_SNAPSHOT_FILE } from "../legacy-compat.js";
+import { canonicalTweakersManagerRoot } from "../manager-descriptor.js";
+import { fingerprintVariantGeneration, type VariantGenerationFingerprint } from "../variant-generation.js";
 
 export interface DevSyncResult {
   linked: string[];
@@ -40,12 +42,27 @@ interface DevSyncOpts {
   off?: boolean;
   quiet?: boolean;
   watch?: boolean;
+  commit?: boolean;
 }
 
 export interface DevSyncCycleOptions {
   sourceRoot: string;
   liveTweaks: string;
   build?: (sourceRoot: string) => void | Promise<void>;
+}
+
+export interface TweakRefreshPromotionInput {
+  managerRoot: string;
+  sourceTweaks: string;
+  expectedTweaksFingerprint: VariantGenerationFingerprint;
+}
+
+export interface TweakRefreshPromotionResult { id: string; target: string; rollback: string }
+
+export interface CommitDevelopmentTweaksOptions {
+  sourceRoot: string;
+  build?: (sourceRoot: string) => void | Promise<void>;
+  promote?: (input: TweakRefreshPromotionInput) => Promise<TweakRefreshPromotionResult>;
 }
 
 type SnapshotPathKind = "missing" | "file" | "directory" | "symlink";
@@ -121,6 +138,28 @@ export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
 
   clearLegacyDevMode(paths.configFile, paths.tweaks);
 
+  // The independent Tweakers app reads `variants/tweakers/tweaks`, and its
+  // loader refuses to start when that tree differs from the committed
+  // generation receipt. Hot snapshots can never satisfy that gate, so an
+  // installed independent generation only accepts a committed promotion.
+  const committedTweaks = committedIndependentTweaksRoot(paths.root);
+  if (opts.commit) {
+    if (opts.watch) throw new Error("tweaker dev-sync --commit cannot be combined with --watch.");
+    if (!committedTweaks) {
+      throw new Error("tweaker dev-sync --commit requires an installed independent Tweakers generation (no committed receipt was found).");
+    }
+    const result = await commitDevelopmentTweaks({ sourceRoot });
+    registerDevelopmentCheckout(paths.configFile, sourceRoot);
+    if (!opts.quiet) {
+      console.log(kleur.green().bold("✓ Development tweaks committed as a new Tweakers generation."));
+      console.log(`  Source: ${kleur.cyan(devTweaksRoot)}`);
+      console.log(`  Generation: ${kleur.cyan(result.id)}`);
+      console.log(kleur.dim(`  Rollback copy: ${result.rollback}`));
+    }
+    return;
+  }
+  if (committedTweaks) throw new Error(hotPublishRefusal(committedTweaks));
+
   await runDevSyncCycle({ sourceRoot, liveTweaks: paths.tweaks });
   registerDevelopmentCheckout(paths.configFile, sourceRoot);
 
@@ -131,6 +170,51 @@ export async function devSync(opts: DevSyncOpts = {}): Promise<void> {
   }
 
   if (opts.watch) await watchDevelopmentSource(sourceRoot, paths.tweaks, opts.quiet === true);
+}
+
+/** The committed generation receipt that fingerprints `liveTweaks`, when it is a gated tree. */
+export function committedGenerationReceiptPath(liveTweaks: string): string | null {
+  const receipt = join(dirname(resolve(liveTweaks)), "transactions", "variant-promotion", "active.json");
+  return existsSync(receipt) ? receipt : null;
+}
+
+/** The installed independent app's tweak tree when a committed generation owns it. */
+export function committedIndependentTweaksRoot(managerRoot: string): string | null {
+  const liveTweaks = join(managerRoot, "variants", "tweakers", "tweaks");
+  return committedGenerationReceiptPath(liveTweaks) ? liveTweaks : null;
+}
+
+function hotPublishRefusal(liveTweaks: string): string {
+  return [
+    `Refusing to hot-publish into ${liveTweaks}: it belongs to a committed independent Tweakers generation.`,
+    "Changed files there make the next Tweakers launch fail startup verification (\"generation fingerprint mismatch: tweaks\").",
+    "Quit Tweakers and run `tweaker dev-sync --commit` to promote the validated build as a new committed generation.",
+  ].join("\n");
+}
+
+/** Hot snapshots are only valid for trees that no committed generation fingerprints. */
+export function assertHotPublishAllowed(liveTweaks: string): void {
+  if (committedGenerationReceiptPath(liveTweaks)) throw new Error(hotPublishRefusal(liveTweaks));
+}
+
+/**
+ * Validate and build the checkout, then promote the built bundled tweaks as a
+ * committed independent generation. The app must be closed; the promotion
+ * keeps the verified app and runtime and retains a rollback copy.
+ */
+export async function commitDevelopmentTweaks(options: CommitDevelopmentTweaksOptions): Promise<TweakRefreshPromotionResult & { builtTweaks: string }> {
+  validateDevelopmentManifests(options.sourceRoot);
+  if (options.build) await options.build(options.sourceRoot);
+  else runDevelopmentBuild(options.sourceRoot);
+  const builtTweaks = builtTweaksRoot(options.sourceRoot);
+  if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
+  const expectedTweaksFingerprint = fingerprintVariantGeneration(builtTweaks);
+  const promote = options.promote ?? (async (input: TweakRefreshPromotionInput) => {
+    const { promoteVerifiedTweakRefresh } = await import("./create-variant.js");
+    return promoteVerifiedTweakRefresh(input);
+  });
+  const result = await promote({ managerRoot: canonicalTweakersManagerRoot(), sourceTweaks: builtTweaks, expectedTweaksFingerprint });
+  return { ...result, builtTweaks };
 }
 
 export function resolveDevSyncSourceRoot(configFile: string, invokedSourceRoot: string): string {
@@ -153,19 +237,25 @@ export function resolveDevSyncSourceRoot(configFile: string, invokedSourceRoot: 
 }
 
 export async function runDevSyncCycle(options: DevSyncCycleOptions): Promise<void> {
-  const sourceTweaks = join(options.sourceRoot, "tweaks");
+  assertHotPublishAllowed(options.liveTweaks);
+  validateDevelopmentManifests(options.sourceRoot);
+  if (options.build) await options.build(options.sourceRoot);
+  else runDevelopmentBuild(options.sourceRoot);
+  prepareDevSnapshot(builtTweaksRoot(options.sourceRoot), options.liveTweaks);
+  touchDevReloadMarker(options.liveTweaks);
+}
+
+function validateDevelopmentManifests(sourceRoot: string): void {
+  const sourceTweaks = join(sourceRoot, "tweaks");
   for (const folder of listDirectories(sourceTweaks)) {
     const manifest = join(sourceTweaks, folder, "manifest.json");
     if (!existsSync(manifest)) continue;
     readValidManifest(manifest);
   }
-  if (options.build) await options.build(options.sourceRoot);
-  else runDevelopmentBuild(options.sourceRoot);
-  prepareDevSnapshot(
-    join(options.sourceRoot, "packages", "installer", "assets", "runtime", "tweaks"),
-    options.liveTweaks,
-  );
-  touchDevReloadMarker(options.liveTweaks);
+}
+
+function builtTweaksRoot(sourceRoot: string): string {
+  return join(sourceRoot, "packages", "installer", "assets", "runtime", "tweaks");
 }
 
 export function clearLegacyDevMode(configFile: string, liveTweaks: string): void {
@@ -190,6 +280,7 @@ function runDevelopmentBuild(sourceRoot: string): void {
  * snapshot. This seam intentionally performs no build or source checkout work.
  */
 export function prepareDevSnapshot(builtTweaks: string, liveTweaks: string, recovery?: { verifiedBundledRoot: string }): DevSnapshotReceipt {
+  assertHotPublishAllowed(liveTweaks);
   if (!existsSync(builtTweaks)) throw new Error(`Built tweaks directory not found: ${builtTweaks}`);
   mkdirSync(liveTweaks, { recursive: true });
   const manifestPath = join(liveTweaks, ".tweaker-dev-snapshot.json");

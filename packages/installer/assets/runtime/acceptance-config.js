@@ -18,10 +18,13 @@ const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const digest = (bytes) => (0, node_crypto_1.createHash)("sha256").update(bytes).digest("hex");
 const record = (value) => !!value && typeof value === "object" && !Array.isArray(value);
 /** Acceptance diagnostics stay in memory. No diagnostic descendant is a sink,
- * even when a valid acceptance directory contains a linked diagnostic leaf. */
+ * even when a valid acceptance directory contains a linked diagnostic leaf.
+ * After the override is closed during quit there is nothing left to verify,
+ * so the operation is skipped silently instead of raising inside a quit hook. */
 function runRuntimeDiagnosticDiskOperation(acceptance, operation) {
     if (acceptance) {
-        acceptance.read();
+        if (!acceptance.closed)
+            acceptance.read();
         return undefined;
     }
     return operation();
@@ -132,7 +135,19 @@ function resolveAcceptanceConfig(input) {
             fail();
         let closed = false;
         let invalid = false;
+        let drifted = false;
         let rejectedWrites = 0;
+        function markDrift(error) {
+            invalid = true;
+            if (drifted)
+                return;
+            drifted = true;
+            // The host decides how to stop; its failure must not mask the drift error.
+            try {
+                input.onDrift?.(error instanceof Error ? error : new Error(String(error)));
+            }
+            catch { }
+        }
         function validate(value) {
             const normalized = JSON.parse(JSON.stringify(value));
             if (!record(normalized) || !record(normalized.tweaks))
@@ -171,7 +186,7 @@ function resolveAcceptanceConfig(input) {
                 }
             }
             catch (error) {
-                invalid = true;
+                markDrift(error);
                 throw error;
             }
         }
@@ -179,6 +194,8 @@ function resolveAcceptanceConfig(input) {
         return {
             path: requested, directory, read,
             get rejectedWrites() { return rejectedWrites; },
+            get closed() { return closed; },
+            get drifted() { return drifted; },
             write(value) {
                 read();
                 let content;
@@ -211,7 +228,7 @@ function resolveAcceptanceConfig(input) {
                     read();
                 }
                 catch (error) {
-                    invalid = true;
+                    markDrift(error);
                     throw error;
                 }
             },

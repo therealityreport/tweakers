@@ -784,6 +784,31 @@ def _has_ui_owner(process: ProcessInfo, snapshot: dict[int, ProcessInfo]) -> boo
     return False
 
 
+NATIVE_UI_EXECUTABLES = {
+    "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    "/Applications/Codex.app/Contents/MacOS/Codex",
+}
+
+
+def _has_native_ui_executable_owner(process: ProcessInfo, snapshot: dict[int, ProcessInfo]) -> bool:
+    """Exact native UI ancestry for an otherwise unclaimed app-server.
+
+    Unlike _has_ui_owner, argument text never counts: a lookalike wrapper
+    whose arguments merely name an app bundle must not project ownership.
+    """
+    current = process.ppid
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        parent = snapshot.get(current)
+        if parent is None or is_codex_app_server(parent):
+            return False
+        if parent.executable in NATIVE_UI_EXECUTABLES:
+            return True
+        current = parent.ppid
+    return False
+
+
 def _is_shell(process: ProcessInfo) -> bool:
     return Path(process.executable).name.lower() in SHELL_NAMES
 
@@ -1603,7 +1628,7 @@ def classify_codex_trees(
             continue
         if is_exact_standalone_app_server(app_server):
             ownership = "detached" if app_server.age_seconds >= orphan_min_age else "ambiguous"
-        elif is_codex_app_server(app_server) and app_server.ppid != 1 and _has_ui_owner(app_server, owned):
+        elif is_codex_app_server(app_server) and app_server.ppid != 1 and _has_native_ui_executable_owner(app_server, owned):
             # Project live native ownership for reporting. This state never
             # enters automatic cleanup, regardless of age, CPU or copy count.
             ownership = "ui_owned"

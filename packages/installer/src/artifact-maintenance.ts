@@ -190,10 +190,16 @@ export async function maintainTerminalOperationResults(
     if (apply && eligible.length) {
       if (!existsSync(trashRoot) || realpathSync(trashRoot) !== resolve(trashRoot)
         || !lstatSync(trashRoot).isDirectory()) throw new Error("Recoverable Trash is unavailable");
+      // Receipts persist across runs. Reuse only an exact private directory,
+      // and prepare it before creating any Trash destination.
+      const receipts = join(root,"retirement-receipts");
+      try { mkdirSync(receipts,{mode:0o700}); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const receiptsStat = lstatSync(receipts);
+      if (!receiptsStat.isDirectory() || receiptsStat.isSymbolicLink() || receiptsStat.uid !== process.getuid?.()
+        || (receiptsStat.mode & 0o077) !== 0) throw new Error(`Unsafe retirement receipt directory: ${receipts}`);
       const destination = join(trashRoot, `Tweakers-terminal-operations-${randomUUID()}`);
       mkdirSync(destination,{mode:0o700});
-      const receipts = join(root,"retirement-receipts");
-      mkdirSync(receipts,{mode:0o700});
       for (const path of eligible) {
         // The lifecycle owner remains held. Revalidate the exact record before
         // each move; a changed result is left in place for investigation.

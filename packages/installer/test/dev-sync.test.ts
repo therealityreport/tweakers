@@ -17,6 +17,9 @@ import {
   acceptDevSnapshot,
   verifyBundledSnapshotOwnership,
   clearLegacyDevMode,
+  commitDevelopmentTweaks,
+  committedGenerationReceiptPath,
+  committedIndependentTweaksRoot,
   prepareDevSnapshot,
   readDevSnapshotReceipt,
   reconcileDevTweaks,
@@ -28,6 +31,7 @@ import {
 } from "../src/commands/dev-sync";
 import { readConfigFile, readDevTweaksRoot, updateConfigFile } from "../src/config";
 import { isSymlinkInto } from "../src/symlinks";
+import { fingerprintVariantGeneration } from "../src/variant-generation";
 
 function fixture(): { root: string; repoTweaks: string; liveTweaks: string } {
   const root = mkdtempSync(join(tmpdir(), "tweaker-dev-sync-"));
@@ -234,6 +238,97 @@ test("validated dev sync publishes built tweaks without symlinking the checkout"
     assert.equal(receipt.folderProofs[0]?.id, "co.tweakers.followup");
     assert.equal(receipt.folderProofs[0]?.version, "0.1.0");
     assert.match(receipt.folderProofs[0]?.hash ?? "", /^[a-f0-9]{64}$/);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("dev sync refuses to hot-publish into a committed independent generation", async () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "followup", "co.tweakers.followup");
+    writeTweak(f.liveTweaks, "followup", "co.tweakers.followup");
+    const journalRoot = join(f.root, "live", "transactions", "variant-promotion");
+    mkdirSync(journalRoot, { recursive: true });
+    writeFileSync(join(journalRoot, "active.json"), JSON.stringify({ version: 3, id: "gen", entries: [] }));
+    assert.equal(committedGenerationReceiptPath(f.liveTweaks), join(journalRoot, "active.json"));
+    assert.equal(committedIndependentTweaksRoot(f.root), null);
+
+    let built = false;
+    await assert.rejects(runDevSyncCycle({
+      sourceRoot: join(f.root, "repo"),
+      liveTweaks: f.liveTweaks,
+      build: async () => { built = true; },
+    }), /committed independent Tweakers generation[\s\S]*dev-sync --commit/);
+    assert.equal(built, false);
+    const builtRoot = join(f.root, "repo", "packages", "installer", "assets", "runtime", "tweaks");
+    writeTweak(builtRoot, "followup", "co.tweakers.followup");
+    assert.throws(() => prepareDevSnapshot(builtRoot, f.liveTweaks), /committed independent Tweakers generation/);
+    assert.equal(existsSync(join(f.liveTweaks, ".tweaker-dev-snapshot.json")), false);
+    assert.equal(existsSync(join(f.liveTweaks, ".tweaker-dev-reload")), false);
+    assert.equal(readFileSync(join(f.liveTweaks, "followup", "index.js"), "utf8"), "module.exports = {};\n");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("committed independent tweaks root resolves the variant tree only when a receipt exists", () => {
+  const f = fixture();
+  try {
+    const variantTweaks = join(f.root, "variants", "tweakers", "tweaks");
+    mkdirSync(variantTweaks, { recursive: true });
+    assert.equal(committedIndependentTweaksRoot(f.root), null);
+    const journalRoot = join(f.root, "variants", "tweakers", "transactions", "variant-promotion");
+    mkdirSync(journalRoot, { recursive: true });
+    writeFileSync(join(journalRoot, "active.json"), "{}");
+    assert.equal(committedIndependentTweaksRoot(f.root), variantTweaks);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("committing development tweaks promotes the validated build with its exact fingerprint", async () => {
+  const f = fixture();
+  try {
+    writeTweak(f.repoTweaks, "followup", "co.tweakers.followup");
+    const builtRoot = join(f.root, "repo", "packages", "installer", "assets", "runtime", "tweaks");
+    const promoted: Array<{ managerRoot: string; sourceTweaks: string; expectedTweaksFingerprint: { sha256: string } }> = [];
+    const result = await commitDevelopmentTweaks({
+      sourceRoot: join(f.root, "repo"),
+      build: async () => {
+        const built = writeTweak(builtRoot, "followup", "co.tweakers.followup");
+        writeFileSync(join(built, "index.js"), "module.exports = { built: true };\n");
+      },
+      promote: async (input) => {
+        promoted.push(input);
+        return { id: "generation-1", target: "/Applications/Tweakers.app", rollback: join(f.root, "rollback") };
+      },
+    });
+    assert.equal(result.id, "generation-1");
+    assert.equal(result.builtTweaks, builtRoot);
+    assert.equal(promoted.length, 1);
+    assert.equal(promoted[0]?.sourceTweaks, builtRoot);
+    assert.deepEqual(promoted[0]?.expectedTweaksFingerprint, fingerprintVariantGeneration(builtRoot));
+    assert.match(promoted[0]?.managerRoot ?? "", /Library\/Application Support\/Tweakers$/);
+    assert.equal(existsSync(join(f.liveTweaks, ".tweaker-dev-snapshot.json")), false);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("committing development tweaks rejects an invalid source manifest before building", async () => {
+  const f = fixture();
+  try {
+    const broken = join(f.repoTweaks, "broken");
+    mkdirSync(broken, { recursive: true });
+    writeFileSync(join(broken, "manifest.json"), "{ not json");
+    let built = false;
+    await assert.rejects(commitDevelopmentTweaks({
+      sourceRoot: join(f.root, "repo"),
+      build: async () => { built = true; },
+      promote: async () => { throw new Error("promotion must not run"); },
+    }));
+    assert.equal(built, false);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

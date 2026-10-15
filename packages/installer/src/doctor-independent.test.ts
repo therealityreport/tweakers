@@ -9,7 +9,7 @@ import test from "node:test";
 import { EventEmitter } from "node:events";
 import { createTweakersVariant } from "./commands/create-variant.js";
 import { startDoctorUpdateScan, doctorReviewFindings } from "./doctor-updates.js";
-import { inspectIndependentDoctor, parseDoctorAction, type DoctorIndependentInputs } from "./doctor-independent.js";
+import { inspectIndependentDoctor, parseDoctorAction, submittedInstallationDescribesCurrentCandidate, type DoctorIndependentInputs } from "./doctor-independent.js";
 import { consumeDoctorCandidateApproval, assertDoctorReviewReady } from "./doctor-approval.js";
 import { canPrepareDoctorCandidate, doctorValidationReportFingerprint, type DoctorValidationReport } from "./doctor-validation.js";
 import type { ReviewDoctorSourceChangesResult } from "./doctor-review.js";
@@ -825,4 +825,14 @@ test("status keeps polling a bound installation while the target is temporarily 
     store.replace(operation);
     assert.equal((await inspectIndependentDoctor(root, deps)).update.state, "review_required", "another job cannot keep this installation pending");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a completed earlier installation never marks a newer verified candidate as already installed", () => {
+  const installed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", newer = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  assert.equal(submittedInstallationDescribesCurrentCandidate(installed, installed), true);
+  assert.equal(submittedInstallationDescribesCurrentCandidate(installed, newer), false);
+  assert.equal(submittedInstallationDescribesCurrentCandidate(installed, null), false);
+  const source = readFileSync(new URL("./doctor-independent.ts", import.meta.url), "utf8");
+  assert.match(source, /operation\?\.phase === "completed" && operation\.actionId === "refresh\.independent" && input && health === "healthy"\s*&& submittedInstallationDescribesCurrentCandidate\(submitted\.jobId, update\.candidateId\)/,
+    "the installed projection is gated on the submitted job being the current candidate");
 });

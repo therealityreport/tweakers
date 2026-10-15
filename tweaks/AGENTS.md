@@ -33,11 +33,16 @@ A tweak contains `manifest.json` plus a runtime-loadable JavaScript entry that e
 ## Hot reload
 
 Do not link raw checkout files into the live app. After validation and tests,
-run `npm run sync:tweaks` and one `tweaker dev-sync` snapshot; use
-`tweaker dev-sync --watch` only for an explicitly requested development
-session. The sync workflow publishes complete validated builds, and `start()`
-may be invoked again after publication. Use `stop()` to undo every DOM
-mutation, IPC handler, observer, and event listener.
+run `npm run sync:tweaks`, then publish once. The installed independent
+Tweakers app (`/Applications/Tweakers.app`) only accepts a committed
+generation: quit it and run `tweaker dev-sync --commit`. Its loader refuses to
+start when `variants/tweakers/tweaks` differs from the committed receipt, so
+never write a hot snapshot or edit files there. Plain `tweaker dev-sync`
+snapshots and `tweaker dev-sync --watch` apply only to overlay installs, and
+`--watch` only for an explicitly requested development session. The sync
+workflow publishes complete validated builds, and `start()` may be invoked
+again after publication. Use `stop()` to undo every DOM mutation, IPC handler,
+observer, and event listener.
 
 ## Inspecting the live DOM (Chrome DevTools Protocol)
 

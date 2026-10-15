@@ -4,11 +4,12 @@ import { chmodSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rea
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { planGenerationRetention, type GenerationFamily } from "../src/generation-retention.js";
+import { officialUpdateStartIsSettled, planGenerationRetention, type GenerationFamily } from "../src/generation-retention.js";
 import { createTweakersManagerGenerationId, serializeTweakersManagerTargetSeal } from "../src/manager-descriptor.js";
 import { NATIVE_REPLACEMENT_TRUSTED_LEAF_SHA1 } from "@therealityreport/tweakers-sdk";
 import { ManagerOperationStore } from "../src/manager-operation-store.js";
 import { persistManagerRecoveryBinding, type ManagerRecoveryBindingV1 } from "../src/manager-recovery-evidence.js";
+import { HISTORICAL_MANAGER_PROOF_NAMES, publishHistoricalManagerReconciliation } from "../src/manager-historical-reconciliation.js";
 import type { TweakersManagerPreparedOperationV1 } from "../src/manager-contract.js";
 
 const managerId = "com.thomashulihan.tweakers";
@@ -76,6 +77,124 @@ test("legacy recovery ambiguity protects known dependencies without pinning all 
     assert.equal(f.decision("manager-runtime-generations", f.unrelated.runtimeFingerprint), "retire");
     const plan = planGenerationRetention(f.root, f.options);
     assert.match(plan.families["variant-builds"].blocked ?? "", /no exact promotion binding/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+function publishHistoricalBatch(f: ReturnType<typeof fixture>) {
+  const batchId = "55555555-5555-4555-8555-555555555555";
+  const rawText = readFileSync(new ManagerOperationStore(f.root).file(operationId), "utf8");
+  publishHistoricalManagerReconciliation(f.root, { batchId, createdAt: "2026-10-11T00:00:00.000Z", operations: [{ record: f.operation, rawText }],
+    issuanceBaseline: { activeReceiptSha256: hex("active"), fallbackId: promotionId, configSha256: hex("config") },
+    evidenceDocuments: HISTORICAL_MANAGER_PROOF_NAMES.map(name => ({ name, rawText: JSON.stringify({ proofName: name, observations: "ceased" }) + "\n" })) });
+  return join(f.root, "transactions", "manager-historical-reconciliation", "batches", batchId);
+}
+
+test("a complete historical reconciliation batch stops an unbound recovery from blocking variant retention", () => {
+  const f = fixture();
+  try {
+    publishHistoricalBatch(f);
+    const plan = planGenerationRetention(f.root, f.options);
+    assert.equal(plan.families["variant-builds"].blocked, null);
+    assert.equal(plan.families["variant-previous"].blocked, null);
+    assert.match(plan.notes.join("\n"), /classified historical by a complete reconciliation batch/);
+    assert.equal(f.decision("manager-generations", f.old.generationId), "ambiguous", "known paths stay protected");
+    assert.equal(f.decision("manager-generations", f.unrelated.generationId), "retire");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an incomplete historical batch keeps blocking variant retention", () => {
+  const f = fixture();
+  try {
+    const batch = publishHistoricalBatch(f);
+    rmSync(join(batch, "complete.json"));
+    const plan = planGenerationRetention(f.root, f.options);
+    assert.match(plan.families["variant-builds"].blocked ?? "", /no exact promotion binding/);
+    assert.match(plan.families["variant-previous"].blocked ?? "", /no exact promotion binding/);
+    assert.match(plan.notes.join("\n"), /reconciliation is not trusted/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a historical batch whose cessation evidence drifted keeps blocking variant retention", () => {
+  const f = fixture();
+  try {
+    const batch = publishHistoricalBatch(f);
+    const proof = join(batch, "evidence", "process-and-job-cessation.json");
+    chmodSync(proof, 0o600); writeFileSync(proof, JSON.stringify({ proofName: "process-and-job-cessation", observations: "edited" }) + "\n");
+    const plan = planGenerationRetention(f.root, f.options);
+    assert.match(plan.families["variant-builds"].blocked ?? "", /no exact promotion binding/);
+    assert.match(plan.notes.join("\n"), /reconciliation is not trusted/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+const officialSelection = (requestedAt: string) => ({
+  selectedDesktopPath: "/Applications/ChatGPT.app", selectedDesktopBundleId: "com.openai.codex", releaseProfile: "stable",
+  appExperience: "chatgpt", backendLane: "official-bundled", uiFeatures: "off", mcpSafetyProvider: "official-bundled-degraded",
+  recoveryState: "pristine-openai-recovery", migrationState: "verified", quarantineReason: null, requestedAt, appliedAt: null,
+});
+function officialReceipt(transactionId: string, phase: string, createdAt: string, extra: Record<string, unknown> = {}) {
+  return { schemaVersion: 1, kind: "desktop-update", transactionId, phase, ownerPid: 4242, ownerToken: "Thu Sep  3 03:22:38 2026",
+    ownerGeneration: "66666666-6666-4666-8666-666666666666", source: officialSelection(createdAt), official: officialSelection(createdAt),
+    baseline: { marketingVersion: "26.831.21537", build: "7579" }, observed: null, nativeUpdateHandoffAt: null, refreshSource: null,
+    environmentTransactionId: null, environmentTransactionKind: null, officialMainPid: null, safeOfficialMode: true, resumable: false,
+    error: null, createdAt, updatedAt: createdAt, terminalAt: createdAt, continuationAbandonedAt: null,
+    completedAt: phase === "completed" ? createdAt : null, rolledBackAt: phase === "rolled_back" ? createdAt : null, ...extra };
+}
+const ownReceiptId = "77777777-7777-4777-8777-777777777777", laterReceiptId = "88888888-8888-4888-8888-888888888888";
+/** Replace the fixture operation with a failed official-update start and publish its receipts. */
+function officialUpdateStartFixture(own: Record<string, unknown> | null, current: Record<string, unknown>) {
+  const f = fixture();
+  const operation = { ...f.operation, actionId: "desktop-update.start", impact: "restart-app", receiptRefs: ["chatgpt-app-update:new"],
+    receiptSnapshot: [{ source: "chatgpt-app-update", receiptId: null, phase: null, revision: "missing", active: false }],
+    error: "official ChatGPT update did not reach a durable terminal receipt" };
+  const file = new ManagerOperationStore(f.root).file(operationId);
+  chmodSync(file, 0o600); writeFileSync(file, JSON.stringify(operation), { mode: 0o600 });
+  const transactions = join(f.root, "transactions");
+  if (own) writeJson(join(transactions, "chatgpt-app-update", `${own.transactionId}.json`), own);
+  writeJson(join(transactions, "chatgpt-app-update", `${current.transactionId}.json`), current);
+  writeJson(join(transactions, "chatgpt-app-update.json"), current);
+  return { ...f, operation };
+}
+// The fixture operation is consumed at 00:01:00 and marked recovery-required at 00:02:00.
+const insideWindow = "2026-10-10T00:01:00.030Z", afterWindow = "2026-10-10T00:15:00.000Z";
+
+test("a failed official update start whose own and current receipts are terminal stops blocking variant retention", () => {
+  const f = officialUpdateStartFixture(officialReceipt(ownReceiptId, "rolled_back", insideWindow), officialReceipt(laterReceiptId, "completed", afterWindow));
+  try {
+    assert.equal(officialUpdateStartIsSettled(f.root, f.operation), true);
+    const plan = planGenerationRetention(f.root, f.options);
+    assert.equal(plan.families["variant-builds"].blocked, null);
+    assert.equal(plan.families["variant-previous"].blocked, null);
+    assert.match(plan.notes.join("\n"), /settled by its terminal official ChatGPT update receipt/);
+    assert.equal(f.decision("manager-generations", f.old.generationId), "ambiguous", "known paths stay protected");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a failed official update start keeps blocking while its own receipt is resumable or absent", () => {
+  for (const own of [officialReceipt(ownReceiptId, "awaiting_native_update", insideWindow, { resumable: true, terminalAt: null }), null]) {
+    const f = officialUpdateStartFixture(own, officialReceipt(laterReceiptId, "completed", afterWindow));
+    try {
+      assert.equal(officialUpdateStartIsSettled(f.root, f.operation), false);
+      assert.match(planGenerationRetention(f.root, f.options).families["variant-builds"].blocked ?? "", /no exact promotion binding/);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
+});
+
+test("a failed official update start keeps blocking when the current receipt reports a rollback failure", () => {
+  const f = officialUpdateStartFixture(officialReceipt(ownReceiptId, "failed", insideWindow),
+    officialReceipt(laterReceiptId, "failed", afterWindow, { error: "Official update rollback failed: bytes incomplete" }));
+  try {
+    assert.equal(officialUpdateStartIsSettled(f.root, f.operation), false);
+    assert.match(planGenerationRetention(f.root, f.options).families["variant-previous"].blocked ?? "", /no exact promotion binding/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("terminal official receipts never settle a non-update operation", () => {
+  const f = fixture();
+  try {
+    writeJson(join(f.root, "transactions", "chatgpt-app-update", `${ownReceiptId}.json`), officialReceipt(ownReceiptId, "rolled_back", insideWindow));
+    writeJson(join(f.root, "transactions", "chatgpt-app-update.json"), officialReceipt(ownReceiptId, "rolled_back", insideWindow));
+    assert.equal(officialUpdateStartIsSettled(f.root, { ...f.operation, receiptRefs: ["chatgpt-app-update:new"] }), false);
+    assert.match(planGenerationRetention(f.root, f.options).families["variant-builds"].blocked ?? "", /no exact promotion binding/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

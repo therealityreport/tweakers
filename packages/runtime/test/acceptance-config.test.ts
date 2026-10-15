@@ -276,3 +276,51 @@ test("main keeps bootstrap canonical and gates diagnostic disk operations while 
   assert.match(source, /function readState\(\)[\s\S]*?if \(acceptanceConfig\) throw error/);
   assert.match(source, /function writeState\([\s\S]*?if \(acceptanceConfig\) \{[\s\S]*?acceptanceConfig\.write\(/);
 });
+
+test("drift during a lifecycle journal write reports once through onDrift and still fails closed", () => {
+  const f = fixture();
+  const drifts: Error[] = [];
+  const config = resolveAcceptanceConfig({ ...f.input, onDrift: (error) => { drifts.push(error); throw new Error("host stop failure must not mask drift"); } })!;
+  try {
+    assert.equal(config.drifted, false);
+    let wrote = false;
+    runRuntimeDiagnosticDiskOperation(config, () => { wrote = true; });
+    assert.equal(wrote, false);
+    assert.equal(drifts.length, 0);
+    writeFileSync(f.canonical, JSON.stringify({ ...f.baseline, changed: true }), { mode: 0o600 });
+    assert.throws(() => runRuntimeDiagnosticDiskOperation(config, () => { wrote = true; }), /acceptance must stop/);
+    assert.equal(wrote, false, "no diagnostic write happens after drift");
+    assert.equal(config.drifted, true);
+    assert.equal(drifts.length, 1);
+    assert.match(drifts[0]!.message, /acceptance must stop/);
+    assert.throws(() => runRuntimeDiagnosticDiskOperation(config, () => { wrote = true; }), /acceptance must stop/);
+    assert.throws(() => config.read(), /acceptance must stop/);
+    assert.equal(drifts.length, 1, "onDrift fires exactly once");
+    assert.equal(wrote, false);
+  } finally { config.close(); f.close(); }
+});
+
+test("a closed acceptance override skips quit-time diagnostics instead of raising in the quit hook", () => {
+  const f = fixture();
+  const drifts: Error[] = [];
+  const config = resolveAcceptanceConfig({ ...f.input, onDrift: (error) => { drifts.push(error); } })!;
+  try {
+    config.close();
+    assert.equal(config.closed, true);
+    let ran = false;
+    assert.equal(runRuntimeDiagnosticDiskOperation(config, () => { ran = true; return 1; }), undefined);
+    assert.equal(ran, false, "acceptance diagnostics never reach disk, even after close");
+    assert.deepEqual(drifts, [], "closing is not drift");
+    assert.equal(config.drifted, false);
+    assert.throws(() => config.read(), /acceptance must stop/, "direct reads after close still fail closed");
+  } finally { config.close(); f.close(); }
+});
+
+test("main stops a drifted acceptance launch deliberately through app.exit", () => {
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const acceptanceConfig = resolveAcceptanceConfig(");
+  const end = source.indexOf("\nconst CONFIG_FILE", start);
+  const call = source.slice(start, end);
+  assert.match(call, /onDrift: \(error\) => \{[\s\S]*?log\("error"[\s\S]*?app\.exit\(1\);/);
+  assert.ok(source.indexOf("app.once(\"will-quit\", () => acceptanceConfig?.close())") > end);
+});

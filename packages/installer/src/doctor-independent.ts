@@ -86,6 +86,14 @@ export function readDoctorIndependentInputs(root = canonicalTweakersManagerRoot(
     nativeVersion, nativeBuild, originalAsarHash: state.originalAsarHash, nativeIdentity,
     installedIdentity: doctorBundleIdentity(DOCTOR_APP), runtimeFingerprint: runtime.fingerprint };
 }
+/**
+ * The "installed" projection describes only the submitted job. A newer scan
+ * replaces the current candidate; its verified result must stay installable
+ * rather than inherit the previous job's completion.
+ */
+export function submittedInstallationDescribesCurrentCandidate(submittedJobId: string, currentCandidateId: string | null): boolean {
+  return currentCandidateId !== null && submittedJobId === currentCandidateId;
+}
 const blankUpdate = (): DoctorReportV1["update"] => ({ state: "not_checked", phase: "idle", candidateId: null,
   sourceFingerprint: null, tweakersFingerprint: null, candidateFingerprint: null, reviewFingerprint: null, progress: "No update review yet.", usage: null, handoff: null });
 export interface DoctorInspectionDependencies {
@@ -214,7 +222,8 @@ async function inspectIndependentDoctorOwned(root:string,deps:DoctorInspectionDe
       if (operation?.phase === "prepared" || operation?.phase === "consumed") {
         updateEnabled = false; update.state = "checking"; update.phase = "updating"; update.progress = "The manager is applying the approved candidate and verifying startup.";
         installationBlockers.push(update.progress);
-      } else if (operation?.phase === "completed" && operation.actionId === "refresh.independent" && input && health === "healthy") {
+      } else if (operation?.phase === "completed" && operation.actionId === "refresh.independent" && input && health === "healthy"
+        && submittedInstallationDescribesCurrentCandidate(submitted.jobId, update.candidateId)) {
         const installedJob = submitted.job;
         const active = readDoctorPrivateJson(join(input.variantRoot, "transactions", "variant-promotion", "active.json"));
         const { fingerprintVariantGeneration } = await import("./commands/create-variant.js");

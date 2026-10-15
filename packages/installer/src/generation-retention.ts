@@ -12,7 +12,9 @@ import { writeDoctorPrivateJson } from "./doctor-store.js";
 import { lifecycleLockFile, outsideLifecycleContext, withLifecycleLock } from "./lifecycle-lock-core.js";
 import { isLifecycleLockHeld } from "./lifecycle-lock.js";
 import { outsideLocalOperationContext, readLocalOperation, withLocalOperation } from "./local-operation.js";
+import { readDesktopUpdateReceipt, type DesktopUpdateReceipt } from "./desktop-update-receipt.js";
 import { TWEAKERS_MANAGER_ID } from "./manager-contract.js";
+import { inspectHistoricalManagerReconciliation, type HistoricalManagerObservedOperation } from "./manager-historical-reconciliation.js";
 import { parsePreparedOperation } from "./manager-operation-store.js";
 import { managerOperationHasSafePrepublicationFailure, managerOperationRecoveryIsVerified, readManagerRecoveryBinding } from "./manager-recovery-evidence.js";
 import { canonicalTweakersManagerRoot, readTweakersManagerGenerationBindings, tweakersManagerDescriptorPaths } from "./manager-descriptor.js";
@@ -102,6 +104,49 @@ function message(error: unknown): string { return error instanceof Error ? error
 const str = (value: unknown): string | null => typeof value === "string" ? value : null;
 function listDir(path: string): string[] {
   try { return readdirSync(path).filter(name => !JUNK.has(name)).sort(); } catch { return []; }
+}
+
+/** Terminal, non-resumable, and not a reported rollback failure (bytes may be incomplete). */
+function officialUpdateReceiptIsTerminal(receipt: DesktopUpdateReceipt): boolean {
+  if (receipt.resumable) return false;
+  if (receipt.phase === "completed" || receipt.phase === "rolled_back") return true;
+  return receipt.phase === "failed" && !/\brollback failed\b/i.test(receipt.error ?? "");
+}
+
+/**
+ * A recovery-required `desktop-update.start` is settled only when the exact
+ * official-update receipt it created inside its own consumed→recovery window
+ * is terminal, the current official-update receipt is the same or a later one
+ * and is also terminal, and no updater holds its lock. Any missing, unreadable,
+ * ambiguous, or in-flight evidence keeps the operation blocking.
+ */
+export function officialUpdateStartIsSettled(root: string, record: {
+  actionId: string; phase: string; consumedAt: string | null; recoveryRequiredAt: string | null;
+  receiptRefs: readonly string[]; receiptSnapshot: ReadonlyArray<{ source: string; receiptId: string | null; active: boolean }>;
+}): boolean {
+  if (record.actionId !== "desktop-update.start" || record.phase !== "recovery-required"
+    || record.consumedAt === null || record.recoveryRequiredAt === null
+    || record.receiptRefs.length !== 1 || record.receiptRefs[0] !== "chatgpt-app-update:new") return false;
+  const before = record.receiptSnapshot.find(receipt => receipt.source === "chatgpt-app-update");
+  const start = Date.parse(record.consumedAt), end = Date.parse(record.recoveryRequiredAt);
+  if (!before || before.active || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return false;
+  const transactions = join(root, "transactions");
+  try {
+    if (isLockHeldByLiveOwner(join(transactions, "chatgpt-app-update.lock"))) return false;
+    const current = readDesktopUpdateReceipt(join(transactions, "chatgpt-app-update.json"));
+    if (!current || !officialUpdateReceiptIsTerminal(current)) return false;
+    const archive = join(transactions, "chatgpt-app-update");
+    const created: DesktopUpdateReceipt[] = [];
+    for (const name of listDir(archive)) {
+      if (!name.endsWith(".json")) continue;
+      const receipt = readDesktopUpdateReceipt(join(archive, name));
+      if (!receipt || name !== `${receipt.transactionId}.json`) return false;
+      const createdAt = Date.parse(receipt.createdAt);
+      if (receipt.transactionId !== before.receiptId && createdAt >= start && createdAt <= end) created.push(receipt);
+    }
+    if (created.length !== 1 || !officialUpdateReceiptIsTerminal(created[0]!)) return false;
+    return Date.parse(current.createdAt) >= Date.parse(created[0]!.createdAt);
+  } catch { return false; }
 }
 function topLevelJsonTexts(dir: string, limit = 64): string[] {
   const texts: string[] = [];
@@ -408,13 +453,24 @@ export function planGenerationRetention(root: string, options: GenerationRetenti
   // closure. A stale label is not a live consumer; unresolved exact bindings
   // are recovery material, while legacy ambiguity blocks its known paths.
   const operationRoot = join(root, "transactions", "manager-operations");
+  const observedOperations: HistoricalManagerObservedOperation[] = [];
   for (const name of listDir(operationRoot)) {
     if (!name.endsWith(".json")) continue;
     const read = readJson(join(operationRoot, name), 64 * 1024);
     if (read.state !== "ok") { block(MANAGER_FAMILIES, `Manager operation ${name} is unreadable`); continue; }
-    let record;
-    try { record = parsePreparedOperation(read.value, name.slice(0, -5)); }
-    catch { block(MANAGER_FAMILIES, `Manager operation ${name} is malformed`); continue; }
+    try { observedOperations.push({ record: parsePreparedOperation(read.value, name.slice(0, -5)), rawText: read.text }); }
+    catch { block(MANAGER_FAMILIES, `Manager operation ${name} is malformed`); }
+  }
+  // A complete historical-reconciliation batch is the only authority that may
+  // classify an unbound recovery-required operation as ceased. The inspection
+  // verifies every member, seal and proof hash; any problem keeps the block.
+  let historicalIds = new Set<string>();
+  try {
+    const historical = inspectHistoricalManagerReconciliation(root, observedOperations);
+    if (historical.problems.length) notes.push(`Historical manager reconciliation is not trusted: ${historical.problems.join("; ")}`);
+    else historicalIds = new Set(historical.classifiedOperationIds);
+  } catch (error) { notes.push(`Historical manager reconciliation is unreadable: ${message(error)}`); }
+  for (const { record } of observedOperations) {
     if (!["prepared", "consumed", "recovery-required"].includes(record.phase)) continue;
     let binding;
     try { binding = readManagerRecoveryBinding(root, record.operationId); }
@@ -435,6 +491,15 @@ export function planGenerationRetention(root: string, options: GenerationRetenti
       const journal = readJson(binding.journal.path, 64 * 1024);
       if (journal.state === "ok") for (const family of GENERATION_FAMILIES) for (const generation of pathRefs(family, journal.text)) ref(family, generation, `${reason}: bound journal dependency`);
       else block([...VARIANT_FAMILIES, "doctor-jobs"], `${reason}: exact journal is unreadable`);
+    } else if (record.phase === "recovery-required" && historicalIds.has(record.operationId)) {
+      // A verified complete batch documents this unbound recovery as historical
+      // with cessation evidence; its known paths stay ambiguous, nothing blocks.
+      notes.push(`${reason}: classified historical by a complete reconciliation batch`);
+    } else if (record.phase === "recovery-required" && officialUpdateStartIsSettled(root, record)) {
+      // The official ChatGPT updater never writes the Tweakers variant, and its
+      // own receipt plus the current one are durably terminal. Known paths stay
+      // ambiguous; it no longer blocks variant retention.
+      notes.push(`${reason}: settled by its terminal official ChatGPT update receipt`);
     } else if (record.phase === "recovery-required") {
       // There is no authority to classify an unbound legacy promotion as
       // restored. Limit ambiguity to installation/recovery families.

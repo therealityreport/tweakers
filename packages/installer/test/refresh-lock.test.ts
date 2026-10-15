@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -254,6 +254,45 @@ test("terminal operation retention keeps newest 100 and recovery references", as
     assert.equal(receipt.phase,"retired");
     assert.equal(receipt.original,outcome.retired[0]);
     assert.equal(existsSync(receipt.destination),true);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("terminal operation retention can run again after its receipt directory exists", async () => {
+  const {maintainTerminalOperationResults} = await import("../src/artifact-maintenance.js");
+  const {root: temporary} = fixture();
+  const root = realpathSync(temporary), trash = join(root,"Trash");
+  const write = (index: number, year: number) => {
+    const id=`00000000-0000-0000-0000-${String(index).padStart(12,"0")}`;
+    writeFileSync(join(root,`result-${id}.json`),JSON.stringify({version:1,id,pid:1,kind:"test",
+      startedAt:new Date(Date.UTC(year,0,1,0,0,index%60)).toISOString(),state:"completed"}),{mode:0o600});
+    return id;
+  };
+  try {
+    mkdirSync(trash,{mode:0o700});
+    for(let index=0;index<103;index++) write(index,2026);
+    assert.equal((await maintainTerminalOperationResults(root,true,trash)).retired.length>0,true);
+    const older=[write(900,2024),write(901,2024)];
+    const second=await maintainTerminalOperationResults(root,true,trash);
+    for(const id of older) assert.ok(second.retired.some(path=>path.endsWith(`result-${id}.json`)),`second run retires ${id}`);
+    for(const id of older) assert.equal(JSON.parse(readFileSync(join(root,"retirement-receipts",`${id}.json`),"utf8")).phase,"retired");
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("terminal operation retention refuses an unsafe receipt directory before creating a Trash destination", async () => {
+  const {maintainTerminalOperationResults} = await import("../src/artifact-maintenance.js");
+  const {root: temporary} = fixture();
+  const root = realpathSync(temporary), trash = join(root,"Trash"), elsewhere = join(root,"elsewhere");
+  try {
+    mkdirSync(trash,{mode:0o700}); mkdirSync(elsewhere,{mode:0o700});
+    symlinkSync(elsewhere,join(root,"retirement-receipts"));
+    for(let index=0;index<103;index++) {
+      const id=`00000000-0000-0000-0000-${String(index).padStart(12,"0")}`;
+      writeFileSync(join(root,`result-${id}.json`),JSON.stringify({version:1,id,pid:1,kind:"test",
+        startedAt:new Date(Date.UTC(2026,0,1,0,0,index%60)).toISOString(),state:"completed"}),{mode:0o600});
+    }
+    await assert.rejects(maintainTerminalOperationResults(root,true,trash),/Unsafe retirement receipt directory/);
+    assert.deepEqual(readdirSync(trash),[],"no Trash destination is created");
+    assert.deepEqual(readdirSync(elsewhere),[],"no receipt is written through the link");
   } finally {rmSync(root,{recursive:true,force:true});}
 });
 

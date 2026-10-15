@@ -42,7 +42,7 @@
       "source": "assets/lib/codex_mcp_lifecycle.py",
       "destination": "{{HOME}}/.codex/lib/codex_mcp_lifecycle.py",
       "mode": "0644",
-      "source_sha256": "baf8470f7beb1f08e2558017cc464c4d1c18f1eabf527cf34efcbede1b31e95f"
+      "source_sha256": "1719054ec5a245ee38c9cc3f1656b97481b26a3967123a4b75fd729af4ce5087"
     },
     {
       "id": "idle-reaper",
